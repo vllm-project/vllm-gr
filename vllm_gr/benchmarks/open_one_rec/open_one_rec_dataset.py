@@ -70,9 +70,12 @@ class OneRecDataset(BenchmarkDataset):
 
             # Convert to expected format
             for id, data in test_data.items():
+                output_len = data.get("expected_output_len", 16)  # Default to 16
+
                 self.data.append(
                     {
                         "prompt": data["prompt"],
+                        "expected_output_len": output_len,
                         "ground_truth": data["ground_truth"],
                         "task_type": task_type,
                         "id": id,
@@ -88,11 +91,12 @@ class OneRecDataset(BenchmarkDataset):
         for i, item in enumerate(self.data[:num_requests]):
             prompt = item["prompt"]
             prompt_len = len(tokenizer(prompt).input_ids)
+            expected_output_len = item["expected_output_len"]
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
-                    expected_output_len=kwargs.get("output_len"),
+                    expected_output_len=expected_output_len,
                     request_id=f"{item['task_type']}_{item['id']}",
                 )
             )
