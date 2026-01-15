@@ -6,29 +6,32 @@ Functions for label extraction, probability processing, and AUC/wuAUC computatio
 
 import json
 import numpy as np
-from typing import Dict, Tuple, Any, List
+from typing import Dict, Any, List
 from sklearn.metrics import roc_auc_score
+
 # from benchmark.console import console
-import logging  
+import logging
+
 logger = logging.getLogger(__name__)
 
 
 def extract_after_think(text: str) -> str:
     """Extract text after the last </think> tag if present."""
-    if '</think>' in text:
-        return text.split('</think>')[-1].strip()
+    if "</think>" in text:
+        return text.split("</think>")[-1].strip()
     return text
+
 
 def extract_label_from_answer(answer: str) -> int:
     """
     Extract binary label from answer string
-    
+
     Args:
         answer: Answer string (e.g., "是<|im_end|>" or "否<|im_end|>")
-    
+
     Returns:
         1 if positive ("是"), 0 if negative ("否"), -1 if unrecognized
-    
+
     Examples:
         >>> extract_label_from_answer("是<|im_end|>")
         1
@@ -47,7 +50,7 @@ def extract_probability_from_logprobs(
     generations: List[str],
     positive_token: str = "是",
     negative_token: str = "否",
-    sample_id: str = None
+    sample_id: str = None,
 ) -> Dict[str, Any]:
     """
     Extract probability for positive class from generations list containing reasoning and JSON probabilities.
@@ -98,10 +101,14 @@ def extract_probability_from_logprobs(
                 raise ValueError(f"Parsed JSON is not a dictionary: {type(probs_dict)}")
 
             if positive_token not in probs_dict:
-                raise ValueError(f"Positive token '{positive_token}' not found in probabilities: {probs_dict}")
+                raise ValueError(
+                    f"Positive token '{positive_token}' not found in probabilities: {probs_dict}"
+                )
 
             if negative_token not in probs_dict:
-                raise ValueError(f"Negative token '{negative_token}' not found in probabilities: {probs_dict}")
+                raise ValueError(
+                    f"Negative token '{negative_token}' not found in probabilities: {probs_dict}"
+                )
 
             # Extract probabilities
             p_pos = float(probs_dict[positive_token])
@@ -117,16 +124,31 @@ def extract_probability_from_logprobs(
 
             # Store results
             parsed_list.append({positive_token: p_pos, negative_token: p_neg})
-            normalized_list.append({positive_token: p_pos_normalized, negative_token: p_neg_normalized})
+            normalized_list.append(
+                {
+                    positive_token: p_pos_normalized,
+                    negative_token: p_neg_normalized,
+                }
+            )
             scores.append(p_pos_normalized)
 
-        except (json.JSONDecodeError, TypeError, AttributeError, ValueError, KeyError) as e:
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            AttributeError,
+            ValueError,
+            KeyError,
+        ) as e:
             # Raise detailed exception
-            error_msg = f"Failed to parse generation"
+            error_msg = "Failed to parse generation"
             if sample_id:
                 error_msg += f" for sample_id '{sample_id}'"
             error_msg += f" at index {idx}:\n"
-            error_msg += f"  Generation: {generation[:200]}..." if len(generation) > 200 else f"  Generation: {generation}\n"
+            error_msg += (
+                f"  Generation: {generation[:200]}..."
+                if len(generation) > 200
+                else f"  Generation: {generation}\n"
+            )
             error_msg += f"\n  Error: {str(e)}"
             raise ValueError(error_msg)
 
@@ -142,31 +164,28 @@ def extract_probability_from_logprobs(
         return {
             "parsed_probs": parsed_list[0],
             "normalized_probs": normalized_list[0],
-            "score": scores[0]
+            "score": scores[0],
         }
     else:
         # Average the probabilities for each token
         avg_parsed = {
             positive_token: sum(p[positive_token] for p in parsed_list) / len(parsed_list),
-            negative_token: sum(p[negative_token] for p in parsed_list) / len(parsed_list)
+            negative_token: sum(p[negative_token] for p in parsed_list) / len(parsed_list),
         }
         avg_normalized = {
             positive_token: sum(p[positive_token] for p in normalized_list) / len(normalized_list),
-            negative_token: sum(p[negative_token] for p in normalized_list) / len(normalized_list)
+            negative_token: sum(p[negative_token] for p in normalized_list) / len(normalized_list),
         }
         avg_score = sum(scores) / len(scores)
 
         return {
             "parsed_probs": avg_parsed,
             "normalized_probs": avg_normalized,
-            "score": avg_score
+            "score": avg_score,
         }
 
 
-def calculate_auc(
-    predictions: Dict[str, float],
-    labels: Dict[str, int]
-) -> float:
+def calculate_auc(predictions: Dict[str, float], labels: Dict[str, int]) -> float:
     """
     Calculate AUC (Area Under ROC Curve) using sklearn
 
@@ -211,11 +230,11 @@ def get_debug_info(
     predicted_prob: float,
     ground_truth: str,
     label: int,
-    user_id: str = ""
+    user_id: str = "",
 ) -> Dict[str, Any]:
     """
     Prepare debug information for a sample
-    
+
     Args:
         sample_id: Sample ID
         logprobs_dict: Dictionary of token probabilities
@@ -223,7 +242,7 @@ def get_debug_info(
         ground_truth: Ground truth answer string
         label: Ground truth label (0 or 1)
         user_id: User ID (optional)
-    
+
     Returns:
         Debug information dictionary
     """
@@ -234,9 +253,8 @@ def get_debug_info(
         "predicted_prob": predicted_prob,
         "logprobs": logprobs_dict,
     }
-    
+
     if user_id:
         debug_item["user_id"] = user_id
-    
-    return debug_item
 
+    return debug_item

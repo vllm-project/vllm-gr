@@ -30,8 +30,11 @@ LABEL_PRED_CONFIG = {
         "num_return_sequences": 1,
         "return_logprobs": True,  # Need to return logprobs for probability extraction
         "logprobs": 10000,  # Return top-10 logprobs to ensure "是" and "否" are included
-        "target_tokens": ["是", "否"],  # Target tokens for logprobs extraction (classification)
-        "max_new_thinking_tokens": 1000
+        "target_tokens": [
+            "是",
+            "否",
+        ],  # Target tokens for logprobs extraction (classification)
+        "max_new_thinking_tokens": 1000,
     },
     "evaluation_config": {
         "metrics": ["auc"],
@@ -71,17 +74,20 @@ ITEM_UNDERSTAND_CONFIG = {
         "max_new_thinking_tokens": 1000,
     },
     "evaluation_config": {
-        "metrics": ["macro_wip_double_weighted_f1", "micro_wip_double_weighted_f1"],
+        "metrics": [
+            "macro_wip_double_weighted_f1",
+            "micro_wip_double_weighted_f1",
+        ],
         "bertscore_model_type": "bert-base-chinese",
         "bertscore_num_layers": 9,
         "bertscore_lang": "zh",
         # WIP (Weighted Information Points) evaluation config
-        "wip_enabled": True,                      # Whether to enable WIP evaluation
-        "wip_judge_model": "gemini",             # Judge LLM type: gemini/deepseek/claude
-        "wip_max_workers": 1,                      # Concurrent workers for LLM calls
-        "wip_core_threshold": 5,                   # Core threshold for importance score (1-5)
-        "wip_max_samples": 500,                    # Max samples to evaluate (None for all)
-    }
+        "wip_enabled": True,  # Whether to enable WIP evaluation
+        "wip_judge_model": "gemini",  # Judge LLM type: gemini/deepseek/claude
+        "wip_max_workers": 1,  # Concurrent workers for LLM calls
+        "wip_core_threshold": 5,  # Core threshold for importance score (1-5)
+        "wip_max_samples": 500,  # Max samples to evaluate (None for all)
+    },
 }
 
 """
@@ -117,11 +123,11 @@ REC_REASON_CONFIG = {
     "evaluation_config": {
         "metrics": ["avg_score"],
         # LLM multi-dimensional evaluation config
-        "llm_eval_enabled": True,                  # Whether to enable LLM evaluation
-        "llm_judge_model": "gemini",               # Judge LLM type: gemini/deepseek/claude
-        "llm_max_workers": 1,                      # Concurrent workers for LLM calls
-        "llm_max_samples": 470,                    # Max samples to evaluate (None for all)
-    }
+        "llm_eval_enabled": True,  # Whether to enable LLM evaluation
+        "llm_judge_model": "gemini",  # Judge LLM type: gemini/deepseek/claude
+        "llm_max_workers": 1,  # Concurrent workers for LLM calls
+        "llm_max_samples": 470,  # Max samples to evaluate (None for all)
+    },
 }
 
 """
@@ -146,7 +152,7 @@ RECOMMENDATION_GENERATION_CONFIG = {
     "max_new_tokens": 3,
     "temperature": 0.6,
     "top_p": 0.95,
-    "top_k": 50,  
+    "top_k": 50,
     "presence_penalty": 0,
     "frequency_penalty": 0,
     "prompt_token": "<|sid_begin|>",  # Token to append for two-stage generation
@@ -160,7 +166,6 @@ RECOMMENDATION_EVALUATION_CONFIG = {
     "metrics": ["pass@k", "position1_pass@k", "recall@k"],
     "k_values": [1, 32],
     "select_k": "first_k",  # Strategy for selecting k predictions: 'first_k' or 'random_k'
-
     # PID-based evaluation settings
     "evaluation_mode": "both",  # Evaluation mode: 'sid', 'pid', or 'both'
     "sid_to_pid_strategy": "most_popular_after_downsampling",  # Strategy for SID->PID conversion: 'most_popular_originally', 'most_popular_after_downsampling', or 'random'
@@ -259,4 +264,3 @@ RECOMMENDATION_TASK_CONFIGS = {
     "ad": AD_CONFIG,
     "interactive": INTERACTIVE_CONFIG,
 }
-

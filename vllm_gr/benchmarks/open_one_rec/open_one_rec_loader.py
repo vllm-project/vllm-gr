@@ -4,38 +4,47 @@ Base Loader for all task data loaders
 Provides common functionality for data loading, sampling, and file path resolution.
 """
 
+from vllm_gr.benchmarks.open_one_rec.evaluators.label_pred import (
+    LabelPredEvaluator,
+)
+from vllm_gr.benchmarks.open_one_rec.evaluators.recommendation import (
+    RecommendationEvaluator,
+)
+from vllm_gr.benchmarks.open_one_rec.evaluators.item_understand import (
+    ItemUnderstandEvaluator,
+)
+from vllm_gr.benchmarks.open_one_rec.evaluators.reco_reason import (
+    RecoReasonEvaluator,
+)
+from vllm_gr.benchmarks.open_one_rec.configs.config import (
+    LABEL_COND_CONFIG,
+    VIDEO_CONFIG,
+    PRODUCT_CONFIG,
+    AD_CONFIG,
+    INTERACTIVE_CONFIG,
+    LABEL_PRED_CONFIG,
+    ITEM_UNDERSTAND_CONFIG,
+    REC_REASON_CONFIG,
+)
 import os
 import json
+from json import JSONDecodeError
 import pandas as pd
 from typing import Dict, Any, Optional
 from abc import ABC
 from dataclasses import dataclass
-from typing import Type, Dict, Any, Optional, List, Tuple
+from typing import Type
 
 import logging
+
 logger = logging.getLogger(__name__)
 # from benchmark.console import *
 
-from vllm_gr.benchmarks.open_one_rec.evaluators.label_pred import LabelPredEvaluator
-from vllm_gr.benchmarks.open_one_rec.evaluators.recommendation import RecommendationEvaluator
-
-from vllm_gr.benchmarks.open_one_rec.evaluators.item_understand import ItemUnderstandEvaluator
-from vllm_gr.benchmarks.open_one_rec.evaluators.reco_reason import RecoReasonEvaluator
-from vllm_gr.benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
-from vllm_gr.benchmarks.open_one_rec.configs.config import (       
-    RECOMMENDATION_PROMPT_CONFIG, 
-    RECOMMENDATION_GENERATION_CONFIG,
-      RECOMMENDATION_EVALUATION_CONFIG,
-        LABEL_COND_CONFIG, 
-        RECOMMENDATION_PROMPT_CONFIG, 
-        RECOMMENDATION_GENERATION_CONFIG,
-          RECOMMENDATION_EVALUATION_CONFIG, VIDEO_CONFIG,
-           PRODUCT_CONFIG, AD_CONFIG, INTERACTIVE_CONFIG,
-            LABEL_PRED_CONFIG, ITEM_UNDERSTAND_CONFIG, REC_REASON_CONFIG)
 
 @dataclass
 class TaskRegistration:
     """Task registration information"""
+
     name: str
     config: Dict[str, Any]
     evaluator_class: Type
@@ -51,49 +60,49 @@ TASK_REGISTRY: Dict[str, TaskRegistration] = {
         name="label_cond",
         config=LABEL_COND_CONFIG,
         evaluator_class=RecommendationEvaluator,
-        category="recommendation"
+        category="recommendation",
     ),
     "video": TaskRegistration(
         name="video",
         config=VIDEO_CONFIG,
         evaluator_class=RecommendationEvaluator,
-        category="recommendation"
+        category="recommendation",
     ),
     "product": TaskRegistration(
         name="product",
         config=PRODUCT_CONFIG,
         evaluator_class=RecommendationEvaluator,
-        category="recommendation"
+        category="recommendation",
     ),
     "ad": TaskRegistration(
         name="ad",
         config=AD_CONFIG,
         evaluator_class=RecommendationEvaluator,
-        category="recommendation"
+        category="recommendation",
     ),
     "interactive": TaskRegistration(
         name="interactive",
         config=INTERACTIVE_CONFIG,
         evaluator_class=RecommendationEvaluator,
-        category="recommendation"
+        category="recommendation",
     ),
     "label_pred": TaskRegistration(
         name="label_pred",
         config=LABEL_PRED_CONFIG,
         evaluator_class=LabelPredEvaluator,
-        category="recommendation"
+        category="recommendation",
     ),
     "item_understand": TaskRegistration(
         name="item_understand",
         config=ITEM_UNDERSTAND_CONFIG,
         evaluator_class=ItemUnderstandEvaluator,
-        category="caption"
+        category="caption",
     ),
     "rec_reason": TaskRegistration(
         name="rec_reason",
         config=REC_REASON_CONFIG,
         evaluator_class=RecoReasonEvaluator,
-        category="caption"
+        category="caption",
     ),
 }
 
@@ -102,7 +111,13 @@ TASK_REGISTRY: Dict[str, TaskRegistration] = {
 # Factory Functions
 # ========================================
 
-def get_loader(task_name: str, data_dir: str, tokenizer: Optional[Any] = None, enable_thinking: Optional[bool] = None):
+
+def get_loader(
+    task_name: str,
+    data_dir: str,
+    tokenizer: Optional[Any] = None,
+    enable_thinking: Optional[bool] = None,
+):
     """
     Get loader instance for a task
 
@@ -123,10 +138,7 @@ def get_loader(task_name: str, data_dir: str, tokenizer: Optional[Any] = None, e
     """
     if task_name not in TASK_REGISTRY:
         available_tasks = ", ".join(TASK_REGISTRY.keys())
-        raise ValueError(
-            f"Unknown task: {task_name}. "
-            f"Available tasks: {available_tasks}"
-        )
+        raise ValueError(f"Unknown task: {task_name}. Available tasks: {available_tasks}")
 
     reg = TASK_REGISTRY[task_name]
 
@@ -135,16 +147,20 @@ def get_loader(task_name: str, data_dir: str, tokenizer: Optional[Any] = None, e
         task_config=reg.config,
         data_dir=data_dir,
         tokenizer=tokenizer,
-        enable_thinking=enable_thinking
+        enable_thinking=enable_thinking,
     )
-
-
-
 
 
 class DataLoaderWrapper:
     """Wrapper for unified data loading interface"""
-    def __init__(self, model_path: str, benchmark_version: str, data_dir: str, enable_thinking: Optional[bool] = None):
+
+    def __init__(
+        self,
+        model_path: str,
+        benchmark_version: str,
+        data_dir: str,
+        enable_thinking: Optional[bool] = None,
+    ):
         self.model_path = model_path
         self._tokenizer = self._create_tokenizer(model_path) if model_path else None
 
@@ -152,22 +168,25 @@ class DataLoaderWrapper:
         self.data_dir = data_dir
         self.enable_thinking = enable_thinking
         self._loader_cache = {}
-    
+
     def _create_tokenizer(self, model_path: str):
         """Create tokenizer from model path"""
         try:
             from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True
-            )
+
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             logger.info(f"Tokenizer loaded from: {model_path}")
             return tokenizer
-        except Exception as e:
-            raise RuntimeError(f"Failed to load tokenizer from {model_path}: {e}")
-    
-    def load_data(self, task_name: str, split: str = "test", sample_size: Optional[Any] = None):
-        """Load data using new loader system""" 
+        except (OSError, ValueError, ImportError) as e:
+            raise RuntimeError(f"Failed to load tokenizer from {model_path}: {e}") from e
+
+    def load_data(
+        self,
+        task_name: str,
+        split: str = "test",
+        sample_size: Optional[Any] = None,
+    ):
+        """Load data using new loader system"""
         if task_name not in self._loader_cache:
             self._loader_cache[task_name] = get_loader(
                 task_name=task_name,
@@ -182,7 +201,7 @@ class DataLoaderWrapper:
 
 class BaseLoader(ABC):
     """Base class for all task data loaders"""
-    
+
     def __init__(
         self,
         task_config: Dict[str, Any],
@@ -205,7 +224,9 @@ class BaseLoader(ABC):
                 f"Example: Benchmark(task_types=['{self.task_name}'], model_path='your-model-path')"
             )
 
-    def load_data(self, split: str = "test", sample_size: Optional[Any] = None) -> Dict[str, Dict[str, Any]]:
+    def load_data(
+        self, split: str = "test", sample_size: Optional[Any] = None
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Load data for the task in messages-based format
 
@@ -234,12 +255,16 @@ class BaseLoader(ABC):
                 effective_sample_size = int(sample_size)
         else:
             effective_sample_size = self.task_config.get("sample_size")
-        
+
         full_size = self.task_config.get("size")
 
         # Try to load cached sample dataframe
         df = None
-        if effective_sample_size is not None and full_size is not None and effective_sample_size < full_size:
+        if (
+            effective_sample_size is not None
+            and full_size is not None
+            and effective_sample_size < full_size
+        ):
             df = self._load_sample_dataframe(split, effective_sample_size)
 
         # If no cache, load and sample original data
@@ -254,14 +279,14 @@ class BaseLoader(ABC):
                 if full_size is not None and effective_sample_size < full_size:
                     self._save_sample_data(df, split, effective_sample_size)
 
-        if 'messages' not in df.columns:
+        if "messages" not in df.columns:
             raise ValueError(
                 f"{self.task_name} requires 'messages' column in data file. "
                 f"Found columns: {list(df.columns)}\n"
                 f"Please ensure your data is in messages-based format."
             )
 
-        if 'metadata' not in df.columns:
+        if "metadata" not in df.columns:
             raise ValueError(
                 f"{self.task_name} requires 'metadata' column in data file. "
                 f"Found columns: {list(df.columns)}\n"
@@ -273,28 +298,28 @@ class BaseLoader(ABC):
         result = self._process_dataframe(df)
 
         return result
-    
+
     @staticmethod
     def _is_empty_value(value) -> bool:
         """Check if a value is None, NaN, or empty"""
         if value is None:
             return True
-        
+
         if isinstance(value, float):
             try:
                 return pd.isna(value)
             except (ValueError, TypeError):
                 return False
-        
+
         if isinstance(value, str):
             return len(value.strip()) == 0
-        
+
         try:
-            if hasattr(value, '__len__'):
+            if hasattr(value, "__len__"):
                 return len(value) == 0
         except (ValueError, TypeError):
             pass
-        
+
         return False
 
     @staticmethod
@@ -302,8 +327,8 @@ class BaseLoader(ABC):
         """
         Convert message format.
 
-        {"role": "user", "content": [{"type": "text", "text": "..."}]} 
-        -> 
+        {"role": "user", "content": [{"type": "text", "text": "..."}]}
+        ->
         {"role": "user", "content": "..."}
         """
         converted = []
@@ -315,10 +340,7 @@ class BaseLoader(ABC):
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text":
                         text_parts.append(item.get("text", ""))
-                converted.append({
-                    "role": msg.get("role"),
-                    "content": "".join(text_parts)
-                })
+                converted.append({"role": msg.get("role"), "content": "".join(text_parts)})
             else:
                 # Already in old format
                 converted.append(msg)
@@ -332,10 +354,7 @@ class BaseLoader(ABC):
         prompt_config = self.task_config.get("prompt_config", {})
         custom_template = prompt_config.get("custom_chat_template")
 
-        template_path = os.path.join(
-            os.path.dirname(__file__),
-            custom_template
-        )
+        template_path = os.path.join(os.path.dirname(__file__), custom_template)
 
         if not os.path.exists(template_path):
             raise FileNotFoundError(f"✗ Custom chat template not found: {template_path}")
@@ -350,67 +369,69 @@ class BaseLoader(ABC):
             base_dir = self.data_dir
         else:
             base_dir = "./data"
-        
+
         filename = f"{self.task_name}_{split}.parquet"
-        
+
         possible_paths = [
             os.path.join(base_dir, self.task_name, filename),
         ]
-        
+
         for file_path in possible_paths:
             if os.path.exists(file_path):
                 return file_path
-        
+
         return possible_paths[0]
-    
+
     def _get_sample_data_file_path(self, split: str, sample_size: int) -> str:
         """Get sample data file path"""
         if self.data_dir:
             base_dir = self.data_dir
         else:
             base_dir = "./data"
-        
+
         possible_paths = [
-            os.path.join(base_dir, self.task_name, f"{self.task_name}_{split}_sample_{sample_size}.parquet"),
-            os.path.join(base_dir, f"{self.task_name}_{split}_sample_{sample_size}.parquet"),
+            os.path.join(
+                base_dir,
+                self.task_name,
+                f"{self.task_name}_{split}_sample_{sample_size}.parquet",
+            ),
+            os.path.join(
+                base_dir,
+                f"{self.task_name}_{split}_sample_{sample_size}.parquet",
+            ),
         ]
-        
+
         for path in possible_paths:
             if os.path.exists(path):
                 return path
-        
+
         return possible_paths[0]
-    
+
     def _load_dataframe(self, split: str) -> pd.DataFrame:
         """Load DataFrame from data file"""
         data_file = self._get_data_file_path(split)
-        
+
         if not os.path.exists(data_file):
             raise FileNotFoundError(f"Data file not found: {data_file}")
-        
+
         logger.info(f"Loading data file: {data_file}")
-        
-        if data_file.endswith('.parquet'):
+
+        if data_file.endswith(".parquet"):
             df = pd.read_parquet(data_file)
         else:
             raise ValueError(f"Unsupported file format: {data_file}")
-        
+
         return df
-    
+
     def _sample_data(self, df: pd.DataFrame, sample_size: int) -> pd.DataFrame:
         """Sample data from DataFrame"""
         if sample_size >= len(df):
             return df
-        
+
         logger.info(f"Sampling {sample_size} samples (total: {len(df)})")
         return df.head(sample_size)
-    
-    def _save_sample_data(
-        self,
-        df: pd.DataFrame,
-        split: str,
-        sample_size: int
-    ):
+
+    def _save_sample_data(self, df: pd.DataFrame, split: str, sample_size: int):
         """Save sample data in parquet format"""
         sample_file = self._get_sample_data_file_path(split, sample_size)
 
@@ -420,7 +441,7 @@ class BaseLoader(ABC):
 
         df.to_parquet(sample_file, index=False)
         logger.info(f"Sample data saved to: {sample_file}")
-    
+
     def _load_sample_dataframe(self, split: str, sample_size: int) -> Optional[pd.DataFrame]:
         """Load sample dataframe from cache if exists"""
         sample_file = self._get_sample_data_file_path(split, sample_size)
@@ -451,7 +472,7 @@ class BaseLoader(ABC):
         for idx, row in df.iterrows():
             sample_id = str(idx)
 
-            messages = row.get('messages')
+            messages = row.get("messages")
             if self._is_empty_value(messages):
                 logger.info(f"Sample {sample_id}: messages is empty, skipping")
                 continue
@@ -459,7 +480,7 @@ class BaseLoader(ABC):
             if isinstance(messages, str):
                 try:
                     messages = json.loads(messages)
-                except:
+                except JSONDecodeError:
                     logger.info(f"Sample {sample_id}: failed to parse messages, skipping")
                     continue
 
@@ -476,7 +497,7 @@ class BaseLoader(ABC):
                 logger.info(f"Sample {sample_id}: failed to apply chat template: {e}, skipping")
                 continue
 
-            metadata_raw = row.get('metadata')
+            metadata_raw = row.get("metadata")
             if self._is_empty_value(metadata_raw):
                 logger.info(f"Sample {sample_id}: metadata is empty, skipping")
                 continue
@@ -484,7 +505,7 @@ class BaseLoader(ABC):
             if isinstance(metadata_raw, str):
                 try:
                     metadata_dict = json.loads(metadata_raw)
-                except:
+                except JSONDecodeError:
                     logger.info(f"Sample {sample_id}: failed to parse metadata, skipping")
                     continue
             elif isinstance(metadata_raw, dict):
@@ -493,7 +514,7 @@ class BaseLoader(ABC):
                 logger.info(f"Sample {sample_id}: invalid metadata format, skipping")
                 continue
 
-            answer = metadata_dict.get('answer')
+            answer = metadata_dict.get("answer")
             if self._is_empty_value(answer):
                 logger.info(f"Sample {sample_id}: answer is empty in metadata, skipping")
                 continue
@@ -503,7 +524,7 @@ class BaseLoader(ABC):
             result_item = {
                 "prompt": formatted_prompt,
                 "ground_truth": ground_truth_str,
-                "metadata": self._make_metadata_serializable(idx, metadata_dict)
+                "metadata": self._make_metadata_serializable(idx, metadata_dict),
             }
 
             result[sample_id] = result_item
@@ -521,31 +542,8 @@ class BaseLoader(ABC):
         del metadata_dict["answer"]
 
         metadata = {
-            "row_index": int(idx) if hasattr(idx, '__int__') else str(idx),
+            "row_index": int(idx) if hasattr(idx, "__int__") else str(idx),
             **metadata_dict,
         }
 
-
         return metadata
-
-  
-def test_with_my_dataset(monkeypatch):  
-    # Monkeypatch the dataset_mapping  
-    original_mapping = {  
-        "onerec": lambda: OneRecDataset(  
-            dataset_path=args.dataset_path,  
-            disable_shuffle=args.disable_shuffle  
-        ).sample(  
-            num_requests=args.num_prompts,  
-            tokenizer=tokenizer,  
-            output_len=args.custom_output_len,  
-            request_id_prefix=args.request_id_prefix,  
-            no_oversample=args.no_oversample,  
-        )  
-    }  
-      
-    # Patch the dataset_mapping in get_samples function  
-    monkeypatch.setattr(  
-        "vllm.benchmarks.datasets.original_mapping",  
-        original_mapping  
-    )

@@ -16,8 +16,10 @@ from vllm_gr.benchmarks.open_one_rec.utils import (
     get_debug_info,
 )
 
-import logging  
+import logging
+
 logger = logging.getLogger(__name__)
+
 
 class LabelPredEvaluator(BaseEval):
     """
@@ -35,7 +37,9 @@ class LabelPredEvaluator(BaseEval):
         """Define required overall metrics for label prediction evaluation"""
         return ["auc"]
 
-    def _compute_metrics_from_scratch(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    def _compute_metrics_from_scratch(
+        self,
+    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """
         Compute all evaluation metrics from scratch
 
@@ -52,35 +56,37 @@ class LabelPredEvaluator(BaseEval):
         # Extract predictions and labels
         predictions = {}  # {sample_id: probability}
         labels = {}  # {sample_id: 0 or 1}
-        
+
         # Per-sample metrics
         per_sample_metrics = {}
-        
+
         # Debug information collection
         debug_info = {
             "correct_predictions": [],
             "incorrect_predictions": [],
             "invalid_samples": [],
         }
-        
+
         for sample_id, sample in self.samples.items():
             # Get ground truth answer
             ground_truth = sample.get("ground_truth", "")
-            
+
             # Extract label from ground truth
             label = extract_label_from_answer(ground_truth)
-            
+
             if label == -1:
                 # Invalid label
                 logger.info(f"Sample {sample_id}: unrecognized answer '{ground_truth}'")
                 if self.debug:
-                    debug_info["invalid_samples"].append({
-                        "sample_id": sample_id,
-                        "ground_truth": ground_truth,
-                        "reason": "unrecognized_label"
-                    })
+                    debug_info["invalid_samples"].append(
+                        {
+                            "sample_id": sample_id,
+                            "ground_truth": ground_truth,
+                            "reason": "unrecognized_label",
+                        }
+                    )
                 continue
-            
+
             labels[sample_id] = label
 
             # Get model prediction (logprobs dictionary)
@@ -96,11 +102,13 @@ class LabelPredEvaluator(BaseEval):
                 # No generation - log as invalid sample
                 logger.info(f"Sample {sample_id}: no generation found")
                 if self.debug:
-                    debug_info["invalid_samples"].append({
-                        "sample_id": sample_id,
-                        "ground_truth": ground_truth,
-                        "reason": "no_generation"
-                    })
+                    debug_info["invalid_samples"].append(
+                        {
+                            "sample_id": sample_id,
+                            "ground_truth": ground_truth,
+                            "reason": "no_generation",
+                        }
+                    )
                 # Skip this sample - don't include in predictions
                 continue
             else:
@@ -111,7 +119,7 @@ class LabelPredEvaluator(BaseEval):
                         generations,
                         positive_token="是",
                         negative_token="否",
-                        sample_id=sample_id
+                        sample_id=sample_id,
                     )
 
                     predicted_prob = prob_result["score"]
@@ -122,12 +130,14 @@ class LabelPredEvaluator(BaseEval):
                     # Parsing failed - log detailed error and skip sample
                     logger.info(f"[red]Sample {sample_id}: {str(e)}[/red]")
                     if self.debug:
-                        debug_info["invalid_samples"].append({
-                            "sample_id": sample_id,
-                            "ground_truth": ground_truth,
-                            "reason": "parsing_error",
-                            "error": str(e)
-                        })
+                        debug_info["invalid_samples"].append(
+                            {
+                                "sample_id": sample_id,
+                                "ground_truth": ground_truth,
+                                "reason": "parsing_error",
+                                "error": str(e),
+                            }
+                        )
                     # Skip this sample - don't include in predictions
                     continue
 
@@ -163,13 +173,15 @@ class LabelPredEvaluator(BaseEval):
                 )
                 # Determine if prediction is correct
                 # Correct: (predicted_prob > 0.5 and label = 1) OR (predicted_prob <= 0.5 and label = 0)
-                is_correct = (predicted_prob > 0.5 and label == 1) or (predicted_prob <= 0.5 and label == 0)
+                is_correct = (predicted_prob > 0.5 and label == 1) or (
+                    predicted_prob <= 0.5 and label == 0
+                )
 
                 if is_correct:
                     debug_info["correct_predictions"].append(debug_item)
                 else:
                     debug_info["incorrect_predictions"].append(debug_item)
-        
+
         # Calculate AUC
         auc = calculate_auc(predictions, labels)
 
@@ -220,9 +232,11 @@ class LabelPredEvaluator(BaseEval):
         logger.info(f"Incorrect predictions: {len(debug_info['incorrect_predictions'])}")
 
         # Calculate and display accuracy if we have valid predictions
-        total_predictions = len(debug_info['correct_predictions']) + len(debug_info['incorrect_predictions'])
+        total_predictions = len(debug_info["correct_predictions"]) + len(
+            debug_info["incorrect_predictions"]
+        )
         if total_predictions > 0:
-            accuracy = len(debug_info['correct_predictions']) / total_predictions * 100
+            accuracy = len(debug_info["correct_predictions"]) / total_predictions * 100
             logger.info(f"Accuracy: {accuracy:.2f}%")
 
         logger.info(f"Invalid samples: {len(debug_info['invalid_samples'])}")
@@ -233,11 +247,10 @@ class LabelPredEvaluator(BaseEval):
 
         # Show some invalid sample examples
         if debug_info["invalid_samples"]:
-            logger.info(f"\nInvalid sample examples (first 3):")
+            logger.info("\nInvalid sample examples (first 3):")
             for i, item in enumerate(debug_info["invalid_samples"][:3]):
-                logger.info(f"  Example {i+1}:")
+                logger.info(f"  Example {i + 1}:")
                 logger.info(f"    Sample ID: {item['sample_id']}")
                 logger.info(f"    Reason: {item['reason']}")
                 logger.info(f"    Ground truth: {item['ground_truth']}")
                 logger.info()
-

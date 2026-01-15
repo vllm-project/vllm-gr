@@ -6,10 +6,10 @@ Provides common interface for evaluation logic.
 
 import json
 import os
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Dict, Any, Tuple, Optional, List
-# from benchmark.console import console, success_style
 import logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,7 +25,7 @@ class BaseEval(ABC):
         task_config: Optional[Dict[str, Any]] = None,
         data_dir: Optional[str] = None,
         overwrite: bool = False,
-        cached_metrics: Optional[Dict[str, Any]] = None
+        cached_metrics: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize base evaluator
@@ -56,7 +56,7 @@ class BaseEval(ABC):
         self.data_dir = data_dir
         self.overwrite = overwrite
         self.cached_metrics = cached_metrics or {}
-    
+
     def evaluate(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """
         Evaluate the samples and return metrics
@@ -108,15 +108,14 @@ class BaseEval(ABC):
             return all(key in self.cached_metrics for key in self.required_metrics)
         return False
 
-    def _compute_metrics_from_scratch(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    def _compute_metrics_from_scratch(
+        self,
+    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """Compute metrics from scratch (override in subclasses)"""
         raise NotImplementedError("Subclasses must implement _compute_metrics_from_scratch()")
 
-
     def _save_debug_json(
-        self,
-        debug_info: Dict[str, Any],
-        filename: str = "debug.json"
+        self, debug_info: Dict[str, Any], filename: str = "debug.json"
     ) -> Optional[str]:
         """Save debug information to JSON file"""
         if not self.predictions_dir:
@@ -125,8 +124,10 @@ class BaseEval(ABC):
         debug_filename = os.path.join(self.predictions_dir, filename)
         os.makedirs(os.path.dirname(debug_filename), exist_ok=True)
 
-        with open(debug_filename, 'w', encoding='utf-8') as f:
+        with open(debug_filename, "w", encoding="utf-8") as f:
             json.dump(debug_info, f, indent=2, ensure_ascii=False)
-            
-        logger.info(f"✓ Debug information saved to: {debug_filename}", style=success_style)
+
+        logger.info(
+            f"✓ Debug information saved to: {debug_filename}",
+        )
         return debug_filename

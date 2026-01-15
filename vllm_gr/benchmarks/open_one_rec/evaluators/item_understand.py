@@ -10,8 +10,10 @@ from typing import Dict, Any, Tuple, List
 # from benchmark.console import console
 from vllm_gr.benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
 
-import logging  
+import logging
+
 logger = logging.getLogger(__name__)
+
 
 class ItemUnderstandEvaluator(BaseEval):
     """Item Understand task evaluator"""
@@ -21,8 +23,9 @@ class ItemUnderstandEvaluator(BaseEval):
         """Define required overall metrics for Item Understand evaluation"""
         return ["macro_wip_double_weighted_f1"]
 
-
-    def _compute_metrics_from_scratch(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    def _compute_metrics_from_scratch(
+        self,
+    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """
         Compute all metrics from scratch
 
@@ -60,9 +63,7 @@ class ItemUnderstandEvaluator(BaseEval):
             per_sample_metrics[sample_id] = {}
 
         # Build overall metrics
-        metrics = {
-            "num_samples": total_samples
-        }
+        metrics = {"num_samples": total_samples}
 
         # WIP Evaluation (if enabled)
         wip_enabled = eval_config.get("wip_enabled", False)
@@ -72,7 +73,7 @@ class ItemUnderstandEvaluator(BaseEval):
                 sample_ids=sample_ids,
                 predictions=predictions,
                 references=references,
-                eval_config=eval_config
+                eval_config=eval_config,
             )
 
             # Merge WIP metrics into overall metrics
@@ -94,7 +95,7 @@ class ItemUnderstandEvaluator(BaseEval):
         sample_ids: list,
         predictions: list,
         references: list,
-        eval_config: Dict[str, Any]
+        eval_config: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """
         Perform WIP (Weighted Information Points) evaluation using LLM-as-Judge.
@@ -120,7 +121,9 @@ class ItemUnderstandEvaluator(BaseEval):
         wip_max_workers = eval_config.get("wip_max_workers", 5)
         wip_max_samples = eval_config.get("wip_max_samples", 100)
         wip_core_threshold = eval_config.get("wip_core_threshold", 5)
-        wip_gt_cache_dir = os.path.join(self.data_dir, self.task_name)  # Use data_dir / task_name as GT cache directory
+        wip_gt_cache_dir = os.path.join(
+            self.data_dir, self.task_name
+        )  # Use data_dir / task_name as GT cache directory
 
         # Use BERTScore config from evaluation_config (not separate wip config)
         bertscore_model = eval_config.get("bertscore_model_type", "bert-base-chinese")
@@ -140,7 +143,7 @@ class ItemUnderstandEvaluator(BaseEval):
 
         # Get model name for cache file naming
         # Try to extract from llm_client config
-        model_name = getattr(llm_client, 'model_name', wip_judge_model)
+        model_name = getattr(llm_client, "model_name", wip_judge_model)
 
         # Run WIP evaluation
         try:
@@ -158,12 +161,15 @@ class ItemUnderstandEvaluator(BaseEval):
                 core_threshold=wip_core_threshold,
             )
 
-            logger.info(f"[green]WIP evaluation completed: {wip_metrics.get('wip_num_samples', 0)} samples evaluated[/green]")
+            logger.info(
+                f"[green]WIP evaluation completed: {wip_metrics.get('wip_num_samples', 0)} samples evaluated[/green]"
+            )
             return wip_metrics, wip_per_sample
 
         except Exception as e:
             logger.info(f"[red]WIP evaluation failed: {e}[/red]")
             import traceback
+
             traceback.print_exc()
             return {}, {}
 
@@ -172,7 +178,7 @@ class ItemUnderstandEvaluator(BaseEval):
         metrics: Dict[str, Any],
         per_sample_metrics: Dict[str, Dict[str, Any]],
         predictions: list,
-        references: list
+        references: list,
     ):
         """
         Save detailed debug information to file
@@ -195,17 +201,29 @@ class ItemUnderstandEvaluator(BaseEval):
         debug_info["examples"] = []
         for i in range(min(10, len(sample_ids))):
             sample_id = sample_ids[i]
-            debug_info["examples"].append({
-                "sample_id": sample_id,
-                "prediction": predictions[i],
-                "reference": references[i],
-                "wip_unweighted_f1": per_sample_metrics[sample_id].get("wip_unweighted_f1"),
-                "wip_unweighted_core_f1": per_sample_metrics[sample_id].get("wip_unweighted_core_f1"),
-                "wip_importance_weighted_f1": per_sample_metrics[sample_id].get("wip_importance_weighted_f1"),
-                "wip_importance_weighted_core_f1": per_sample_metrics[sample_id].get("wip_importance_weighted_core_f1"),
-                "wip_double_weighted_f1": per_sample_metrics[sample_id].get("wip_double_weighted_f1"),
-                "wip_double_weighted_core_f1": per_sample_metrics[sample_id].get("wip_double_weighted_core_f1"),
-            })
+            debug_info["examples"].append(
+                {
+                    "sample_id": sample_id,
+                    "prediction": predictions[i],
+                    "reference": references[i],
+                    "wip_unweighted_f1": per_sample_metrics[sample_id].get("wip_unweighted_f1"),
+                    "wip_unweighted_core_f1": per_sample_metrics[sample_id].get(
+                        "wip_unweighted_core_f1"
+                    ),
+                    "wip_importance_weighted_f1": per_sample_metrics[sample_id].get(
+                        "wip_importance_weighted_f1"
+                    ),
+                    "wip_importance_weighted_core_f1": per_sample_metrics[sample_id].get(
+                        "wip_importance_weighted_core_f1"
+                    ),
+                    "wip_double_weighted_f1": per_sample_metrics[sample_id].get(
+                        "wip_double_weighted_f1"
+                    ),
+                    "wip_double_weighted_core_f1": per_sample_metrics[sample_id].get(
+                        "wip_double_weighted_core_f1"
+                    ),
+                }
+            )
 
         # Save to file using base class method
         self._save_debug_json(debug_info, filename="debug.json")
@@ -214,7 +232,9 @@ class ItemUnderstandEvaluator(BaseEval):
         logger.info(f"Total samples: {metrics['num_samples']}")
 
         # Print WIP metrics if available
-        if metrics.get('macro_wip_unweighted_f1') is not None:
+        if metrics.get("macro_wip_unweighted_f1") is not None:
             logger.info(f"Macro WIP Unweighted F1: {metrics['macro_wip_unweighted_f1']:.4f}")
-        if metrics.get('macro_wip_double_weighted_f1') is not None:
-            logger.info(f"Macro WIP Double-weighted F1: {metrics['macro_wip_double_weighted_f1']:.4f}")
+        if metrics.get("macro_wip_double_weighted_f1") is not None:
+            logger.info(
+                f"Macro WIP Double-weighted F1: {metrics['macro_wip_double_weighted_f1']:.4f}"
+            )

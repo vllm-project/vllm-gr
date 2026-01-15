@@ -9,7 +9,6 @@ import json
 import random
 from typing import Set, Dict, List, Any, Tuple, Optional
 from pathlib import Path
-from collections import Counter
 
 
 # Encoding constants for (code1, code2, code3) -> single int
@@ -34,9 +33,9 @@ def load_pid_mapping(mapping_path: str) -> Dict[int, List[Dict[str, int]]]:
     if not mapping_path.exists():
         raise FileNotFoundError(f"PID mapping file not found: {mapping_path}")
 
-    with open(mapping_path, 'r') as f:
+    with open(mapping_path, "r") as f:
         sid_to_pid_json = json.load(f)
-    
+
     # Convert string keys back to integers
     code_to_pid = {int(k): v for k, v in sid_to_pid_json.items()}
 
@@ -68,7 +67,7 @@ def extract_sid_codes_from_text(text: str) -> Optional[Tuple[int, int, int]]:
         Tuple (a, b, c) representing extracted SID codes, or None if not found
         Expects exactly one SID in the text
     """
-    pattern = r'<s_a_(\d+)><s_b_(\d+)><s_c_(\d+)>'
+    pattern = r"<s_a_(\d+)><s_b_(\d+)><s_c_(\d+)>"
     matches = re.findall(pattern, text)
     if not matches:
         return None
@@ -119,14 +118,20 @@ def apply_sid_to_pid_strategy(pid_info_list: List[Dict[str, int]], strategy: str
         # Find max downsampled count
         max_count = max(info["count_after_downsample"] for info in pid_info_list)
         # Get all PIDs/IIDs with max downsampled count
-        max_pids = [_get_id_from_info(info) for info in pid_info_list if info["count_after_downsample"] == max_count]
+        max_pids = [
+            _get_id_from_info(info)
+            for info in pid_info_list
+            if info["count_after_downsample"] == max_count
+        ]
         # Randomly select one if there are ties
         return random.choice(max_pids)
     elif strategy == "random":
         # Randomly select a PID/IID
         return random.choice([_get_id_from_info(info) for info in pid_info_list])
     else:
-        raise ValueError(f"Unknown strategy: {strategy}. Must be 'most_popular_originally', 'most_popular_after_downsampling', or 'random'")
+        raise ValueError(
+            f"Unknown strategy: {strategy}. Must be 'most_popular_originally', 'most_popular_after_downsampling', or 'random'"
+        )
 
 
 def extract_ids_from_answer(answer: List[int]) -> Set[int]:
@@ -155,7 +160,7 @@ def extract_first_id_from_answer(answer: List[int]) -> int:
 def extract_id_from_generation(
     generation: str,
     code_to_pid: Dict[int, List[Dict[str, int]]],
-    strategy: str = "most_popular_originally"
+    strategy: str = "most_popular_originally",
 ) -> int:
     """
     Extract PID from model generation
@@ -179,8 +184,8 @@ def extract_id_from_generation(
     generation = generation.strip()
 
     # If generation contains </think>, only process content after it
-    if '</think>' in generation:
-        generation = generation.split('</think>')[-1].strip()
+    if "</think>" in generation:
+        generation = generation.split("</think>")[-1].strip()
 
     # Extract SID codes from the generation (should be exactly one)
     sid_codes = extract_sid_codes_from_text(generation)
@@ -196,11 +201,7 @@ def extract_id_from_generation(
     return apply_sid_to_pid_strategy(pid_freq_list, strategy)
 
 
-def compute_pass_at_k(
-    predicted_ids: List[int],
-    ground_truth_ids: Set[int],
-    k: int
-) -> bool:
+def compute_pass_at_k(predicted_ids: List[int], ground_truth_ids: Set[int], k: int) -> bool:
     """
     Compute Pass@k for a single sample using PIDs
 
@@ -231,9 +232,7 @@ def compute_pass_at_k(
 
 
 def compute_position1_pass_at_k(
-    predicted_ids: List[int],
-    first_ground_truth_id: int,
-    k: int
+    predicted_ids: List[int], first_ground_truth_id: int, k: int
 ) -> bool:
     """
     Compute Position1_Pass@k for a single sample using PIDs
@@ -265,11 +264,7 @@ def compute_position1_pass_at_k(
     return False
 
 
-def compute_recall_at_k(
-    predicted_ids: List[int],
-    ground_truth_ids: Set[int],
-    k: int
-) -> float:
+def compute_recall_at_k(predicted_ids: List[int], ground_truth_ids: Set[int], k: int) -> float:
     """
     Compute Recall@k for a single sample using PIDs
 
@@ -317,7 +312,7 @@ def get_unique_generations(
     strategy: str = "most_popular_originally",
     logprobs: List[float] = None,
     exclude_ids: Set[int] = None,
-    sources: List[str] = None
+    sources: List[str] = None,
 ):
     """
     Get first N unique PIDs from generations, optionally sorted by logprobs
@@ -398,7 +393,7 @@ def get_debug_info(
     position1_pass_results: Dict[str, bool],
     code_to_pid: Dict[int, List[Dict[str, int]]],
     strategy: str = "most_popular_originally",
-    raw_prompt: str = ""
+    raw_prompt: str = "",
 ) -> Dict[str, Any]:
     """
     Prepare debug information for a sample (PID-based)
@@ -432,6 +427,8 @@ def get_debug_info(
     }
 
     if raw_prompt:
-        debug_item["raw_prompt_snippet"] = raw_prompt[:200] + "..." if len(raw_prompt) > 200 else raw_prompt
+        debug_item["raw_prompt_snippet"] = (
+            raw_prompt[:200] + "..." if len(raw_prompt) > 200 else raw_prompt
+        )
 
     return debug_item

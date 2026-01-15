@@ -4,15 +4,16 @@ Recommendation Reason Evaluator
 Evaluates model predictions on Recommendation Reason task using LLM-based multi-dimensional evaluation.
 """
 
-import os
 from typing import Dict, Any, Tuple, List
 
 # from benchmark.console import console
 from vllm_gr.benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
 from vllm_gr.benchmarks.open_one_rec.utils import extract_after_think
 
-import logging  
+import logging
+
 logger = logging.getLogger(__name__)
+
 
 class RecoReasonEvaluator(BaseEval):
     """Recommendation Reason task evaluator"""
@@ -22,7 +23,9 @@ class RecoReasonEvaluator(BaseEval):
         """Define required overall metrics for Recommendation Reason evaluation"""
         return ["llm_score"]
 
-    def _compute_metrics_from_scratch(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    def _compute_metrics_from_scratch(
+        self,
+    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """
         Compute all metrics from scratch
 
@@ -73,7 +76,7 @@ class RecoReasonEvaluator(BaseEval):
                 sample_ids=sample_ids,
                 predictions=predictions,
                 references=references,
-                eval_config=eval_config
+                eval_config=eval_config,
             )
 
             # Merge LLM metrics into overall metrics
@@ -95,7 +98,7 @@ class RecoReasonEvaluator(BaseEval):
         sample_ids: list,
         predictions: list,
         references: list,
-        eval_config: Dict[str, Any]
+        eval_config: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """
         Perform LLM-based multi-dimensional evaluation.
@@ -109,31 +112,31 @@ class RecoReasonEvaluator(BaseEval):
         Returns:
             Tuple of (llm_metrics, llm_per_sample_metrics)
         """
-        try:
-            from api import get_client_from_config
-        except ImportError as e:
-            logger.info(f"[red]Failed to import LLM evaluation modules: {e}[/red]")
-            return {}, {}
+        # try:
+        #     from api import get_client_from_config
+        # except ImportError as e:
+        #     logger.info(f"[red]Failed to import LLM evaluation modules: {e}[/red]")
+        #     return {}, {}
 
         # Get LLM eval config
-        llm_judge_model = eval_config.get("llm_judge_model", "gemini")
-        llm_max_workers = eval_config.get("llm_max_workers", 3)
-        llm_max_samples = eval_config.get("llm_max_samples", 300)
+        # llm_judge_model = eval_config.get("llm_judge_model", "gemini")
+        # llm_max_workers = eval_config.get("llm_max_workers", 3)
+        # llm_max_samples = eval_config.get("llm_max_samples", 300)
 
-        # Create LLM client
-        try:
-            llm_client = get_client_from_config(llm_judge_model)
-            logger.info(f"[green]Using {llm_judge_model} as LLM judge[/green]")
-        except Exception as e:
-            logger.info(f"[red]Failed to create LLM client for evaluation: {e}[/red]")
-            return {}, {}
+        # # Create LLM client
+        # try:
+        #     llm_client = get_client_from_config(llm_judge_model)
+        #     logger.info(f"[green]Using {llm_judge_model} as LLM judge[/green]")
+        # except Exception as e:
+        #     logger.info(f"[red]Failed to create LLM client for evaluation: {e}[/red]")
+        #     return {}, {}
 
-        # Prepare data as dicts
-        predictions_dict = {id: pred for id, pred in zip(sample_ids, predictions)}
-        references_dict = {id: ref for id, ref in zip(sample_ids, references)}
+        # # Prepare data as dicts
+        # predictions_dict = {id: pred for id, pred in zip(sample_ids, predictions)}
+        # references_dict = {id: ref for id, ref in zip(sample_ids, references)}
 
-        # Get model name for cache file naming
-        model_name = getattr(llm_client, 'model_name', llm_judge_model)
+        # # Get model name for cache file naming
+        # model_name = getattr(llm_client, "model_name", llm_judge_model)
 
         # Run LLM evaluation
         # try:
@@ -161,7 +164,7 @@ class RecoReasonEvaluator(BaseEval):
         metrics: Dict[str, Any],
         per_sample_metrics: Dict[str, Dict[str, Any]],
         predictions: list,
-        references: list
+        references: list,
     ):
         """
         Save detailed debug information to file
@@ -184,13 +187,19 @@ class RecoReasonEvaluator(BaseEval):
         debug_info["examples"] = []
         for i in range(min(10, len(sample_ids))):
             sample_id = sample_ids[i]
-            debug_info["examples"].append({
-                "sample_id": sample_id,
-                "prediction": predictions[i][:500] + "..." if len(predictions[i]) > 500 else predictions[i],
-                "reference": references[i][:500] + "..." if len(references[i]) > 500 else references[i],
-                "llm_score": per_sample_metrics[sample_id].get("llm_score"),
-                "llm_reason": per_sample_metrics[sample_id].get("llm_reason"),
-            })
+            debug_info["examples"].append(
+                {
+                    "sample_id": sample_id,
+                    "prediction": predictions[i][:500] + "..."
+                    if len(predictions[i]) > 500
+                    else predictions[i],
+                    "reference": references[i][:500] + "..."
+                    if len(references[i]) > 500
+                    else references[i],
+                    "llm_score": per_sample_metrics[sample_id].get("llm_score"),
+                    "llm_reason": per_sample_metrics[sample_id].get("llm_reason"),
+                }
+            )
 
         # Save to file using base class method
         self._save_debug_json(debug_info, filename="debug.json")
@@ -199,5 +208,5 @@ class RecoReasonEvaluator(BaseEval):
         logger.info(f"Total samples: {metrics['num_samples']}")
 
         # Print LLM eval metrics if available
-        if metrics.get('llm_score') is not None:
+        if metrics.get("llm_score") is not None:
             logger.info(f"LLM Eval Score: {metrics['llm_score']:.4f}")

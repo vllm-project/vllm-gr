@@ -5,15 +5,14 @@ Universal evaluator for all recommendation tasks.
 Computes Pass@k and Position1_Pass@k metrics.
 """
 
-import json
-from typing import Dict, Any, Tuple, List
-import logging
-logger = logging.getLogger(__name__)
-
-# from benchmark.console import console, warning_style
 from vllm_gr.benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
 from vllm_gr.benchmarks.open_one_rec import utils as utils_sid
 from vllm_gr.benchmarks.open_one_rec import utils_by_pid as utils_pid
+import json
+from typing import Dict, Any, Tuple, List
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class RecommendationEvaluator(BaseEval):
@@ -35,7 +34,9 @@ class RecommendationEvaluator(BaseEval):
     def required_metrics(self) -> List[str]:
         """Define required overall metrics for Recommendation evaluation"""
         k_values = self.task_config.get("evaluation_config", {}).get("k_values", [128])
-        evaluation_mode = self.task_config.get("evaluation_config", {}).get("evaluation_mode", "sid")
+        evaluation_mode = self.task_config.get("evaluation_config", {}).get(
+            "evaluation_mode", "sid"
+        )
 
         metrics = []
 
@@ -45,15 +46,18 @@ class RecommendationEvaluator(BaseEval):
 
         if evaluation_mode in ("pid", "both"):
             for k in k_values:
-                metrics.extend([f"pid_pass@{k}", f"pid_position1_pass@{k}", f"pid_recall@{k}"])
+                metrics.extend(
+                    [
+                        f"pid_pass@{k}",
+                        f"pid_position1_pass@{k}",
+                        f"pid_recall@{k}",
+                    ]
+                )
 
         return metrics
 
     def _select_generations_by_strategy(
-        self,
-        generations: List[str],
-        logprobs: List[float],
-        strategy: str
+        self, generations: List[str], logprobs: List[float], strategy: str
     ) -> List[str]:
         """
         Select and reorder generations based on the specified strategy
@@ -76,8 +80,8 @@ class RecommendationEvaluator(BaseEval):
             # Validate logprobs data
             if not logprobs:
                 raise ValueError(
-                    f"Strategy 'top_k_by_logprobs' requires logprobs data, but logprobs is empty. "
-                    f"Please ensure the generation was run with logprobs enabled."
+                    "Strategy 'top_k_by_logprobs' requires logprobs data, but logprobs is empty. "
+                    "Please ensure the generation was run with logprobs enabled."
                 )
             if len(logprobs) != len(generations):
                 raise ValueError(
@@ -100,8 +104,7 @@ class RecommendationEvaluator(BaseEval):
             return unique_generations
         else:
             raise ValueError(
-                f"Unknown selection strategy: '{strategy}'. "
-                f"Supported strategies: 'first_k', 'top_k_by_logprobs'"
+                f"Unknown selection strategy: '{strategy}'. Supported strategies: 'first_k', 'top_k_by_logprobs'"
             )
 
     def _evaluate_single_mode(
@@ -110,8 +113,14 @@ class RecommendationEvaluator(BaseEval):
         evaluation_mode: str,
         select_k_strategy: str,
         code_to_pid: Dict[int, List[Tuple[int, float]]] = None,
-        sid_to_pid_strategy: str = "most_popular"
-    ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, float], Dict[str, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+        sid_to_pid_strategy: str = "most_popular",
+    ) -> Tuple[
+        Dict[str, int],
+        Dict[str, int],
+        Dict[str, float],
+        Dict[str, Dict[str, Any]],
+        Dict[str, List[Dict[str, Any]]],
+    ]:
         """
         Evaluate samples using a single mode (SID or PID)
 
@@ -170,10 +179,14 @@ class RecommendationEvaluator(BaseEval):
                 per_sample_metrics[sample_id] = create_failed_metrics()
 
                 if self.debug:
-                    debug_info["no_generation_samples"].append({
-                        "sample_id": sample_id,
-                        "ground_truth": sample.get("ground_truth", "") if evaluation_mode == "sid" else sample.get("metadata", {}).get("answer_pid", []),
-                    })
+                    debug_info["no_generation_samples"].append(
+                        {
+                            "sample_id": sample_id,
+                            "ground_truth": sample.get("ground_truth", "")
+                            if evaluation_mode == "sid"
+                            else sample.get("metadata", {}).get("answer_pid", []),
+                        }
+                    )
                 continue
 
             # Get ground truth based on mode
@@ -192,7 +205,9 @@ class RecommendationEvaluator(BaseEval):
                 first_ground_truth_id = utils.extract_first_id_from_answer(ground_truth_pids)
 
             if not ground_truth_ids:
-                logger.info(f"Sample {sample_id}: no valid ID found in ground truth ({evaluation_mode} mode)", style=warning_style)
+                logger.info(
+                    f"Sample {sample_id}: no valid ID found in ground truth ({evaluation_mode} mode)",
+                )
                 per_sample_metrics[sample_id] = create_failed_metrics()
                 continue
 
@@ -200,14 +215,19 @@ class RecommendationEvaluator(BaseEval):
             selected_generations = self._select_generations_by_strategy(
                 generations=generations,
                 logprobs=logprobs,
-                strategy=select_k_strategy
+                strategy=select_k_strategy,
             )
 
             # Extract predicted IDs from selected generations
             if evaluation_mode == "sid":
-                predicted_ids = [utils.extract_id_from_generation(gen) for gen in selected_generations]
+                predicted_ids = [
+                    utils.extract_id_from_generation(gen) for gen in selected_generations
+                ]
             else:  # pid mode
-                predicted_ids = [utils.extract_id_from_generation(gen, code_to_pid, sid_to_pid_strategy) for gen in selected_generations]
+                predicted_ids = [
+                    utils.extract_id_from_generation(gen, code_to_pid, sid_to_pid_strategy)
+                    for gen in selected_generations
+                ]
 
             # Compute metrics for each k
             sample_pass_results = {}
@@ -238,7 +258,7 @@ class RecommendationEvaluator(BaseEval):
             sample_metrics = {
                 **sample_pass_results,
                 **sample_position1_pass_results,
-                **sample_recall_results
+                **sample_recall_results,
             }
 
             # For PID mode, save pid_generations (convert None/invalid to -1)
@@ -283,7 +303,13 @@ class RecommendationEvaluator(BaseEval):
                 else:
                     debug_info["failed_samples"].append(debug_item)
 
-        return pass_at_k_counts, position1_pass_at_k_counts, recall_at_k_sums, per_sample_metrics, debug_info
+        return (
+            pass_at_k_counts,
+            position1_pass_at_k_counts,
+            recall_at_k_sums,
+            per_sample_metrics,
+            debug_info,
+        )
 
     def _calculate_metrics_from_counts(
         self,
@@ -292,7 +318,7 @@ class RecommendationEvaluator(BaseEval):
         recall_sums: Dict[int, float],
         total_samples: int,
         k_values: List[int],
-        prefix: str = ""
+        prefix: str = "",
     ) -> Dict[str, float]:
         """
         Calculate metrics from counts
@@ -310,12 +336,20 @@ class RecommendationEvaluator(BaseEval):
         """
         metrics = {}
         for k in k_values:
-            metrics[f"{prefix}pass@{k}"] = pass_counts[k] / total_samples if total_samples > 0 else 0.0
-            metrics[f"{prefix}position1_pass@{k}"] = position1_pass_counts[k] / total_samples if total_samples > 0 else 0.0
-            metrics[f"{prefix}recall@{k}"] = recall_sums[k] / total_samples if total_samples > 0 else 0.0
+            metrics[f"{prefix}pass@{k}"] = (
+                pass_counts[k] / total_samples if total_samples > 0 else 0.0
+            )
+            metrics[f"{prefix}position1_pass@{k}"] = (
+                position1_pass_counts[k] / total_samples if total_samples > 0 else 0.0
+            )
+            metrics[f"{prefix}recall@{k}"] = (
+                recall_sums[k] / total_samples if total_samples > 0 else 0.0
+            )
         return metrics
 
-    def _compute_metrics_from_scratch(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    def _compute_metrics_from_scratch(
+        self,
+    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """
         Compute all evaluation metrics from scratch
 
@@ -325,16 +359,19 @@ class RecommendationEvaluator(BaseEval):
         total_samples = len(self.samples)
 
         # Get configuration
-        evaluation_config = self.task_config.get('evaluation_config', {})
+        evaluation_config = self.task_config.get("evaluation_config", {})
         k_values = evaluation_config.get("k_values", [128])
-        select_k_strategy = evaluation_config.get('select_k', 'first_k')
-        evaluation_mode = evaluation_config.get('evaluation_mode', 'both')
-        sid_to_pid_strategy = evaluation_config.get('sid_to_pid_strategy', 'most_popular_after_downsampling')
+        select_k_strategy = evaluation_config.get("select_k", "first_k")
+        evaluation_mode = evaluation_config.get("evaluation_mode", "both")
+        sid_to_pid_strategy = evaluation_config.get(
+            "sid_to_pid_strategy", "most_popular_after_downsampling"
+        )
 
         # Load PID mapping if needed
         code_to_pid = None
         if evaluation_mode in ("pid", "both"):
             from pathlib import Path
+
             task_name = self.task_config.get("name", "")
             if task_name == "product":
                 mapping_filename = "sid2iid.json"
@@ -348,15 +385,29 @@ class RecommendationEvaluator(BaseEval):
         # Format: (mode_name, metric_prefix, debug_filename, log_message)
         modes_config = {
             "sid": [("sid", "", "debug.json", "Evaluating using SID mode...")],
-            "pid": [("pid", "pid_", "debug_pid.json", "Evaluating using PID mode...")],
+            "pid": [
+                (
+                    "pid",
+                    "pid_",
+                    "debug_pid.json",
+                    "Evaluating using PID mode...",
+                )
+            ],
             "both": [
                 ("sid", "", "debug_sid.json", "  Running SID evaluation..."),
-                ("pid", "pid_", "debug_pid.json", "  Running PID evaluation...")
-            ]
+                (
+                    "pid",
+                    "pid_",
+                    "debug_pid.json",
+                    "  Running PID evaluation...",
+                ),
+            ],
         }
 
         if evaluation_mode not in modes_config:
-            raise ValueError(f"Invalid evaluation_mode: '{evaluation_mode}'. Must be 'sid', 'pid', or 'both'")
+            raise ValueError(
+                f"Invalid evaluation_mode: '{evaluation_mode}'. Must be 'sid', 'pid', or 'both'"
+            )
 
         if evaluation_mode == "both":
             logger.info("Evaluating using both SID and PID modes...")
@@ -367,22 +418,37 @@ class RecommendationEvaluator(BaseEval):
         all_debug_info = {}
 
         # Run evaluation for each configured mode
-        for mode_name, metric_prefix, debug_filename, log_message in modes_config[evaluation_mode]:
+        for (
+            mode_name,
+            metric_prefix,
+            debug_filename,
+            log_message,
+        ) in modes_config[evaluation_mode]:
             logger.info(f"{log_message}")
 
             # Run evaluation
-            pass_counts, position1_pass_counts, recall_sums, mode_per_sample_metrics, debug_info = self._evaluate_single_mode(
+            (
+                pass_counts,
+                position1_pass_counts,
+                recall_sums,
+                mode_per_sample_metrics,
+                debug_info,
+            ) = self._evaluate_single_mode(
                 k_values=k_values,
                 evaluation_mode=mode_name,
                 select_k_strategy=select_k_strategy,
                 code_to_pid=code_to_pid if mode_name == "pid" else None,
-                sid_to_pid_strategy=sid_to_pid_strategy if mode_name == "pid" else "most_popular"
+                sid_to_pid_strategy=sid_to_pid_strategy if mode_name == "pid" else "most_popular",
             )
 
             # Calculate and add metrics
             mode_metrics = self._calculate_metrics_from_counts(
-                pass_counts, position1_pass_counts, recall_sums,
-                total_samples, k_values, metric_prefix
+                pass_counts,
+                position1_pass_counts,
+                recall_sums,
+                total_samples,
+                k_values,
+                metric_prefix,
             )
             metrics.update(mode_metrics)
 
@@ -402,16 +468,25 @@ class RecommendationEvaluator(BaseEval):
 
             # Store debug info for later saving
             if self.debug and self.predictions_dir:
-                all_debug_info[mode_name] = (debug_info, debug_filename, mode_metrics)
+                all_debug_info[mode_name] = (
+                    debug_info,
+                    debug_filename,
+                    mode_metrics,
+                )
 
         # Save debug info
         if self.debug and self.predictions_dir:
-            for mode_name, (debug_info, debug_filename, mode_metrics) in all_debug_info.items():
+            for mode_name, (
+                debug_info,
+                debug_filename,
+                mode_metrics,
+            ) in all_debug_info.items():
                 # For single mode, include all metrics; for both mode, filter by prefix
                 if evaluation_mode == "both":
                     prefix = "pid_" if mode_name == "pid" else ""
                     filtered_metrics = {
-                        k: v for k, v in mode_metrics.items()
+                        k: v
+                        for k, v in mode_metrics.items()
                         if k == "total_samples" or k.startswith(prefix)
                     }
                     filtered_metrics["total_samples"] = total_samples
@@ -428,7 +503,12 @@ class RecommendationEvaluator(BaseEval):
 
         return metrics, per_sample_metrics
 
-    def _save_debug_info(self, debug_info: Dict[str, Any], metrics: Dict[str, Any], debug_filename: str = None):
+    def _save_debug_info(
+        self,
+        debug_info: Dict[str, Any],
+        metrics: Dict[str, Any],
+        debug_filename: str = None,
+    ):
         """
         Save detailed debug information to file
 
@@ -468,15 +548,14 @@ class RecommendationEvaluator(BaseEval):
 
         # Show some failed examples
         if debug_info["failed_samples"]:
-            logger.info(f"\nFailed sample examples (first 3):")
+            logger.info("\nFailed sample examples (first 3):")
             for i, item in enumerate(debug_info["failed_samples"][:3]):
-                logger.info(f"  Example {i+1}:")
+                logger.info(f"  Example {i + 1}:")
                 logger.info(f"    Sample ID: {item['sample_id']}")
                 # Handle both SID and PID modes
-                if 'ground_truth_sids' in item:
+                if "ground_truth_sids" in item:
                     logger.info(f"    Ground truth SIDs: {item['ground_truth_sids']}")
-                elif 'ground_truth_pids' in item:
+                elif "ground_truth_pids" in item:
                     logger.info(f"    Ground truth PIDs: {item['ground_truth_pids']}")
                 logger.info(f"    Top 5 generations: {item['top_10_generations'][:5]}")
                 logger.info()
-
