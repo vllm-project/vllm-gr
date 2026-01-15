@@ -1,19 +1,14 @@
 import sys
 from vllm.entrypoints.cli.main import main as vllm_main
-#import vllm_gr.serve
 import importlib.metadata
+import logging
+logger = logging.getLogger(__name__)
 
 def main():
     if "serve" in sys.argv and "--gr" in sys.argv:
-        print("here")
+        logger.info("vLLM-gr detected --gr flag in serve command. Launching vLLM-gr specialized serving path.")
         # Launch vLLM-gr specialized serving path    
-        #vllm_gr.serve.main(sys.argv)
         from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
-        #from vllm.utils.argparse_utils import FlexibleArgumentParser
-        # import vllm_omni.entrypoints.cli.serve
-        # CMD_MODULES = [
-        #     vllm_omni.entrypoints.cli.serve,
-        # ]
 
         cli_env_setup()
 
@@ -22,7 +17,7 @@ def main():
         # Remove the flag and its value (if it has one)  
         if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--"):  
             sys.argv.pop(idx + 1)  # Remove value  
-        sys.argv.pop(idx)  # Remove flag  
+        sys.argv.pop(idx)  # Remove flag 
 
     # Delegate to original vLLM CLI
     vllm_main()
