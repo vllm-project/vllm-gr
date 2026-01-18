@@ -1,3 +1,7 @@
+# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
+# Date imported: 2026‑01‑09
+# License: Apache 2.0 License (inherited from source)
 """
 Recommendation Reason Evaluator
 
@@ -6,7 +10,6 @@ Evaluates model predictions on Recommendation Reason task using LLM-based multi-
 
 from typing import Dict, Any, Tuple, List
 
-# from benchmark.console import console
 from vllm_gr.benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
 from vllm_gr.benchmarks.open_one_rec.utils import extract_after_think
 
@@ -92,72 +95,6 @@ class RecoReasonEvaluator(BaseEval):
             self._save_debug_info(metrics, per_sample_metrics, predictions, references)
 
         return metrics, per_sample_metrics
-
-    def _evaluate_reasoning(
-        self,
-        sample_ids: list,
-        predictions: list,
-        references: list,
-        eval_config: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
-        """
-        Perform LLM-based multi-dimensional evaluation.
-
-        Args:
-            sample_ids: List of sample IDs
-            predictions: List of prediction texts
-            references: List of reference texts
-            eval_config: Evaluation configuration
-
-        Returns:
-            Tuple of (llm_metrics, llm_per_sample_metrics)
-        """
-        # try:
-        #     from api import get_client_from_config
-        # except ImportError as e:
-        #     logger.info(f"[red]Failed to import LLM evaluation modules: {e}[/red]")
-        #     return {}, {}
-
-        # Get LLM eval config
-        # llm_judge_model = eval_config.get("llm_judge_model", "gemini")
-        # llm_max_workers = eval_config.get("llm_max_workers", 3)
-        # llm_max_samples = eval_config.get("llm_max_samples", 300)
-
-        # # Create LLM client
-        # try:
-        #     llm_client = get_client_from_config(llm_judge_model)
-        #     logger.info(f"[green]Using {llm_judge_model} as LLM judge[/green]")
-        # except Exception as e:
-        #     logger.info(f"[red]Failed to create LLM client for evaluation: {e}[/red]")
-        #     return {}, {}
-
-        # # Prepare data as dicts
-        # predictions_dict = {id: pred for id, pred in zip(sample_ids, predictions)}
-        # references_dict = {id: ref for id, ref in zip(sample_ids, references)}
-
-        # # Get model name for cache file naming
-        # model_name = getattr(llm_client, "model_name", llm_judge_model)
-
-        # Run LLM evaluation
-        # try:
-        #     llm_metrics, llm_per_sample = evaluate_reasoning(
-        #         predictions=predictions_dict,
-        #         references=references_dict,
-        #         llm_client=llm_client,
-        #         max_workers=llm_max_workers,
-        #         max_samples=llm_max_samples,
-        #         model_name=model_name,
-        #         save_dir=self.predictions_dir,
-        #     )
-
-        #     logger.info(f"[green]LLM evaluation completed: {llm_metrics.get('llm_eval_num_samples', 0)} samples evaluated[/green]")
-        #     return llm_metrics, llm_per_sample
-
-        # except Exception as e:
-        #     logger.info(f"[red]LLM evaluation failed: {e}[/red]")
-        #     import traceback
-        #     traceback.print_exc()
-        #     return {}, {}
 
     def _save_debug_info(
         self,

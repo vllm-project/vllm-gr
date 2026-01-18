@@ -1,3 +1,7 @@
+# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
+# Date imported: 2026‑01‑09
+# License: Apache 2.0 License (inherited from source)
 """
 Label Prediction Task Evaluator
 
@@ -7,7 +11,6 @@ Computes AUC metric from logprobs-based predictions.
 
 from typing import Dict, Any, Tuple, List
 
-# from benchmark.console import console
 from vllm_gr.benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
 from vllm_gr.benchmarks.open_one_rec.utils import (
     extract_label_from_answer,

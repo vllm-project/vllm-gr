@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 def main():
     if "serve" in sys.argv and "--gr" in sys.argv:
         logger.info(
-            "vLLM-gr detected --gr flag in serve command. Launching vLLM-gr specialized serving path."
+            "vllm detected --gr flag in serve command. Launching vllm-gr specialized serving path."
         )
         # Launch vLLM-gr specialized serving path
         from vllm.entrypoints.utils import cli_env_setup

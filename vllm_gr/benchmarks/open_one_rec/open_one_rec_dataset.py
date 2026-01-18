@@ -35,15 +35,9 @@ class OneRecDataset(BenchmarkDataset):
 
         super().__init__(**kwargs)
 
-        # self.data_loader = DataLoaderWrapper(
-        #     task_config={"name": "onerec"},
-        #     data_dir=self.dataset_path,
-        #     tokenizer=kwargs.get("tokenizer")
-        # )
-
         self.data_loader = DataLoaderWrapper(
             model_path=model_path,
-            benchmark_version="v1.0",  # or whatever version you're using
+            benchmark_version="v1.0",
             data_dir=self.dataset_path,
             enable_thinking=None,
         )
@@ -54,14 +48,8 @@ class OneRecDataset(BenchmarkDataset):
         self.data = []
 
         # Import or instantiate your data_loader here
-        # from your_module import YourDataLoader
-        # self.data_loader = YourDataLoader()
-
         for task_type in self.task_types:
-            # Actually load the data
-
-            #
-
+            # load the data
             test_data = self.data_loader.load_data(
                 task_name=task_type,
                 split="test",
@@ -70,7 +58,9 @@ class OneRecDataset(BenchmarkDataset):
 
             # Convert to expected format
             for id, data in test_data.items():
-                output_len = data.get("expected_output_len", 16)  # Default to 16
+                output_len = data.get(
+                    "expected_output_len", 16
+                )  # Default to 16 for short GR generations
 
                 self.data.append(
                     {
