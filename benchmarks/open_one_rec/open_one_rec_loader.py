@@ -8,19 +8,19 @@ Base Loader for all task data loaders
 Provides common functionality for data loading, sampling, and file path resolution.
 """
 
-from vllm_gr.benchmarks.open_one_rec.evaluators.label_pred import (
+from benchmarks.open_one_rec.evaluators.label_pred import (
     LabelPredEvaluator,
 )
-from vllm_gr.benchmarks.open_one_rec.evaluators.recommendation import (
+from benchmarks.open_one_rec.evaluators.recommendation import (
     RecommendationEvaluator,
 )
-from vllm_gr.benchmarks.open_one_rec.evaluators.item_understand import (
+from benchmarks.open_one_rec.evaluators.item_understand import (
     ItemUnderstandEvaluator,
 )
-from vllm_gr.benchmarks.open_one_rec.evaluators.reco_reason import (
+from benchmarks.open_one_rec.evaluators.reco_reason import (
     RecoReasonEvaluator,
 )
-from vllm_gr.benchmarks.open_one_rec.configs.config import (
+from benchmarks.open_one_rec.configs.config import (
     LABEL_COND_CONFIG,
     VIDEO_CONFIG,
     PRODUCT_CONFIG,

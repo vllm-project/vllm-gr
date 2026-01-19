@@ -11,8 +11,8 @@ Computes AUC metric from logprobs-based predictions.
 
 from typing import Dict, Any, Tuple, List
 
-from vllm_gr.benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
-from vllm_gr.benchmarks.open_one_rec.utils import (
+from benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
+from benchmarks.open_one_rec.utils import (
     extract_label_from_answer,
     extract_probability_from_logprobs,
     calculate_auc,

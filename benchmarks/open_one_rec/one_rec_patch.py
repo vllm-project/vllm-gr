@@ -1,7 +1,7 @@
 import vllm.benchmarks.datasets
 import vllm.benchmarks.throughput
 
-from vllm_gr.benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
+from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 from vllm.benchmarks.datasets import get_samples as original_get_samples
 from vllm.benchmarks.datasets import add_dataset_parser as original_add_parser
 from vllm.benchmarks.throughput import add_cli_args as original_add_cli_args
@@ -128,7 +128,7 @@ def patched_add_cli_args(parser):
 def patched_get_requests(args, tokenizer):
     """Patch get_requests to handle OneRecDataset"""
     # Import your dataset
-    from vllm_gr.benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
+    from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
     # Handle onerec dataset
     if args.dataset_name == "onerec":
