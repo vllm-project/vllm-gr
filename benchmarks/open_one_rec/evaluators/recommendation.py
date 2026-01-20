@@ -9,9 +9,9 @@ Universal evaluator for all recommendation tasks.
 Computes Pass@k and Position1_Pass@k metrics.
 """
 
-from benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
-from benchmarks.open_one_rec import utils as utils_sid
-from benchmarks.open_one_rec import utils_by_pid as utils_pid
+from .base_evaluator import BaseEval
+from .. import utils as utils_sid
+from .. import utils_by_pid as utils_pid
 import json
 from typing import Dict, Any, Tuple, List
 import logging

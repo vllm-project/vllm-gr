@@ -4,7 +4,7 @@ from vllm.benchmarks.datasets import (
     TokenizerLike,
     SampleRequest,
 )
-from benchmarks.open_one_rec.open_one_rec_loader import (
+from .open_one_rec_loader import (
     DataLoaderWrapper,
 )
 
