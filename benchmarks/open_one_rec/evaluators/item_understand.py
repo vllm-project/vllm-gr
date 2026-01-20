@@ -10,7 +10,7 @@ Evaluates model predictions on Item Understand task using WIP (LLM-as-Judge).
 
 import os
 from typing import Dict, Any, Tuple, List
-from benchmarks.open_one_rec.evaluators.base_evaluator import BaseEval
+from .base_evaluator import BaseEval
 
 import logging
 
