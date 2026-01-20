@@ -79,18 +79,6 @@ def _add_onerec_arguments(parser):
         default=DEFAULT_TASK_TYPES,
         help="Comma-separated list of task types",
     )
-    onerec_group.add_argument(
-        "--data-dir",
-        type=str,
-        default=None,
-        help="Directory containing benchmark data",
-    )
-    onerec_group.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Directory to save results",
-    )
 
 
 def _add_beams_arguments(parser):
@@ -113,7 +101,7 @@ def patched_get_samples(args, tokenizer):
         dataset = OneRecDataset(
             task_types=args.task_types.split(","),
             model_path=args.model,
-            dataset_path=args.data_dir,
+            dataset_path=args.dataset_path,
             disable_shuffle=args.disable_shuffle,
             tokenizer=tokenizer,
         )
