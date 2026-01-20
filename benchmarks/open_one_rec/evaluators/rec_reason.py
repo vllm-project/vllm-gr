@@ -26,6 +26,39 @@ class RecoReasonEvaluator(BaseEval):
         """Define required overall metrics for Recommendation Reason evaluation"""
         return ["llm_score"]
 
+    def _get_vllm_client(self, eval_config: Dict[str, Any]):
+        """
+        Create vLLM OpenAI-compatible client.
+
+        Args:
+            eval_config: Evaluation configuration with vLLM endpoint settings
+
+        Returns:
+            OpenAI client configured for vLLM endpoint
+
+        Raises:
+            ImportError: If openai package not available
+            ValueError: If endpoint configuration invalid
+        """
+        try:
+            from openai import OpenAI, AsyncOpenAI
+        except ImportError:
+            raise ImportError("OpenAI client not installed. Install with: pip install openai")
+
+        # Get vLLM endpoint configuration
+        vllm_endpoint = eval_config.get("vllm_endpoint", "http://localhost:8000/v1")
+        vllm_api_key = eval_config.get("vllm_api_key", "not-needed")
+        use_async = eval_config.get("vllm_async", False)
+
+        logger.info(f"Creating vLLM client for endpoint: {vllm_endpoint}")
+
+        if use_async:
+            client = AsyncOpenAI(base_url=vllm_endpoint, api_key=vllm_api_key)
+        else:
+            client = OpenAI(base_url=vllm_endpoint, api_key=vllm_api_key)
+
+        return client
+
     def _compute_metrics_from_scratch(
         self,
     ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
@@ -95,6 +128,62 @@ class RecoReasonEvaluator(BaseEval):
             self._save_debug_info(metrics, per_sample_metrics, predictions, references)
 
         return metrics, per_sample_metrics
+
+    def _evaluate_reasoning(
+        self, sample_ids: list, predictions: list, references: list, eval_config: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+        """
+        Perform LLM-based multi-dimensional evaluation.
+
+        Args:
+            sample_ids: List of sample IDs
+            predictions: List of prediction texts
+            references: List of reference texts
+            eval_config: Evaluation configuration
+
+        Returns:
+            Tuple of (llm_metrics, llm_per_sample_metrics)
+        """
+        try:
+            llm_client = self._get_vllm_client(eval_config)
+        except Exception as e:
+            logger.info(f"[red]Failed to initialize vLLM client: {e}[/red]")
+            return {}, {}
+
+        # Get LLM eval config
+        llm_max_workers = eval_config.get("llm_max_workers", 3)
+        llm_max_samples = eval_config.get("llm_max_samples", 300)
+
+        # Prepare data as dicts
+        predictions_dict = {id: pred for id, pred in zip(sample_ids, predictions)}
+        references_dict = {id: ref for id, ref in zip(sample_ids, references)}
+
+        # Get model name for cache file naming
+        model_name = getattr(llm_client, "model_name", llm_judge_model)
+
+        # Run LLM evaluation
+        try:
+            llm_metrics, llm_per_sample = evaluate_reasoning(
+                predictions=predictions_dict,
+                references=references_dict,
+                llm_client=llm_client,
+                max_workers=llm_max_workers,
+                max_samples=llm_max_samples,
+                model_name=model_name,
+                save_dir=self.predictions_dir,
+            )
+
+            logger.info(
+                f"[green]LLM evaluation completed: {llm_metrics.get('llm_eval_num_samples', 0)} samples evaluated[/green]"
+            )
+            return llm_metrics, llm_per_sample
+
+        except Exception as e:
+            logger.info(f"[red]LLM evaluation failed: {e}[/red]")
+            import traceback
+
+            traceback.print_exc()
+            return {}, {}
 
     def _save_debug_info(
         self,

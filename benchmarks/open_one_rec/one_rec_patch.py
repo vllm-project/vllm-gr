@@ -26,7 +26,7 @@ from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 DATASET_NAME = "onerec"
 DEFAULT_TASK_TYPES = "rec_reason,item_understand,ad,product,label_cond,video,interactive,label_pred"
 _n_idx = sys.argv.index("--n") if "--n" in sys.argv else -1
-DEFAULT_N_BEAMS = int(sys.argv[_n_idx + 1]) if _n_idx != -1 and _n_idx + 1 < len(sys.argv) else 1  
+DEFAULT_N_BEAMS = int(sys.argv[_n_idx + 1]) if _n_idx != -1 and _n_idx + 1 < len(sys.argv) else 1
 USE_BEAM_SEARCH = DEFAULT_N_BEAMS > 1
 atexit.register(cleanup_dist_env_and_memory)
 
@@ -91,16 +91,18 @@ def _add_onerec_arguments(parser):
         default=None,
         help="Directory to save results",
     )
-    
+
+
 def _add_beams_arguments(parser):
     """Helper to add beam search arguments to parser."""
-    beams_group = parser.add_argument_group("beam search options")    
+    beams_group = parser.add_argument_group("beam search options")
     beams_group.add_argument(
         "--n",
         type=int,
         default=DEFAULT_N_BEAMS,
         help="Number of beams for beam search",
     )
+
 
 def patched_get_samples(args, tokenizer):
     """Patch get_samples to handle OneRecDataset."""

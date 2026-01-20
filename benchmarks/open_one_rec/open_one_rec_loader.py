@@ -17,7 +17,7 @@ from .evaluators.recommendation import (
 from .evaluators.item_understand import (
     ItemUnderstandEvaluator,
 )
-from .evaluators.reco_reason import (
+from .evaluators.rec_reason import (
     RecoReasonEvaluator,
 )
 from .configs.config import (
