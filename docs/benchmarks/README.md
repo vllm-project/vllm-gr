@@ -7,7 +7,7 @@ A comprehensive generative recommendation benchmark for evaluating large languag
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Installation](#installation)
-- [Operation Modes](#operation-modes) 
+- [Operation Modes](#operation-modes)
 - [Usage](#usage)
 - [Configuration](#configuration)
 - [Data Format](#data-format)
@@ -62,10 +62,10 @@ For quick local benchmarking without an API server:
 
 ```bash
 # Single command - everything in one process
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --task-types video \
   --num-prompts 100
 ```
@@ -78,19 +78,17 @@ For production-like testing with separate server and client:
 
 ```bash
 # Terminal 1: Start vLLM API server
-python -m vllm.entrypoints.openai.api_server \
-  --model OpenOneRec/OneRec-1.7B \
-  --host localhost \
-  --port 8000 \
-  --gpu-memory-utilization 0.8
+  vllm serve \
+  --gr \
+  --model OpenOneRec/OneRec-1.7B
 
 # Terminal 2: Run benchmark against server
-python -m vllm.benchmarks.throughput \
-  --dataset-name onerec \
-  --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --endpoint http://localhost:8000/v1 \
+  --model OpenOneRec/OneRec-1.7B \
   --backend openai-chat \
+  --dataset-name onerec \
+  --dataset-path ./data \
   --task-types video \
   --num-prompts 100
 ```
@@ -103,24 +101,31 @@ Both modes support beam search:
 
 ```bash
 # Throughput mode with beam search
-python -m vllm.benchmarks.throughput \
-  --dataset-name onerec \
+python -m  benchmarks.open_one_rec.one_rec_main bench throughput \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-name onerec \
+  --dataset-path ./data \
+  --task-types video \
+  --num-prompts 100 \
   --use-beam-search \
   --n 8 \
-  --num-prompts 100
+  --output-json results/throughput  
+
 
 # API mode with beam search (requires API server)
-python -m vllm.benchmarks.throughput \
-  --dataset-name onerec \
-  --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --endpoint http://localhost:8000/v1 \
+  --model OpenOneRec/OneRec-1.7B \
   --backend openai-chat \
+  --dataset-name onerec \
+  --dataset-path ./data \  
+  --task-types video \
+  --num-prompts 100 \
   --use-beam-search \
   --n 8 \
-  --num-prompts 100
+  --save-result \
+  --result-dir results/serve \  
+  --save-detailed  
 ```
 
 ### Operation Modes Comparison
@@ -140,7 +145,7 @@ python -m vllm.benchmarks.throughput \
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - CUDA 11.8+ (for GPU inference)
 - 32GB+ RAM (recommended)
 
@@ -160,11 +165,10 @@ python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
 
-3. **Install dependencies**
+3. **Installation**
 
 ```bash
 pip install -e .
-pip install vllm
 ```
 
 4. **Verify installation**
@@ -172,6 +176,43 @@ pip install vllm
 ```bash
 python -c "from benchmarks.open_one_rec import OneRecDataset; print('✓ Installation successful')"
 ```
+
+
+##  Open One Rec Benchmark Dataset
+### Get Dataset
+Use your huggingface username to approve this link before you download:
+
+https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF
+
+```bash
+mkdir -p OpenOneRec  
+cd OpenOneRec
+git lfs install  
+git clone https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF ./data
+cd -
+```
+
+### Data Structure
+
+OneRec expects data in **Parquet format** with the following schema:
+
+```
+├── data/
+│   ├── rec_reason/
+│   │   └── rec_reason_test.parquet
+│   ├── item_understand/
+│   │   └── item_understand_test.parquet
+│   └── ...
+```
+
+### Parquet Schema
+
+Each Parquet file must contain these columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `messages` | str/list | Chat messages in JSON format or list of dicts |
+| `metadata` | str/dict | JSON metadata containing answer and context |
 
 ## Usage
 
@@ -183,7 +224,7 @@ python -c "from benchmarks.open_one_rec import OneRecDataset; print('✓ Install
 |----------|------|---------|-------------|
 | `--dataset-name` | str | - | Must be `onerec` for OneRec benchmark |
 | `--model` | str | - | Model ID or path to load |
-| `--data-dir` | str | None | Path to benchmark data directory |
+| `--dataset-path` | str | None | Path to benchmark data directory |
 | `--num-prompts` | int | 1000 | Number of prompts to sample |
 | `--disable-shuffle` | bool | False | Disable shuffling of samples |
 
@@ -192,7 +233,6 @@ python -c "from benchmarks.open_one_rec import OneRecDataset; print('✓ Install
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--task-types` | str | All 8 tasks | Comma-separated list of task types to run |
-| `--output-dir` | str | None | Directory to save results |
 | `--use-beam-search` | bool | False | Enable beam search during generation |
 | `--n` | int | 8 | Number of beams for beam search |
 
@@ -204,53 +244,6 @@ python -c "from benchmarks.open_one_rec import OneRecDataset; print('✓ Install
 | `--temperature` | float | 0.8 | Sampling temperature |
 | `--top-p` | float | 0.95 | Nucleus sampling parameter |
 
-### Example Workflows
-
-#### 1. Single Task Evaluation
-
-```bash
-python -m vllm.benchmarks.throughput \
-  --dataset-name onerec \
-  --model qwen/qwen-72b-instruct \
-  --data-dir ./data \
-  --task-types rec_reason \
-  --num-prompts 100
-```
-
-#### 2. Multi-task Comparison
-
-```bash
-python -m vllm.benchmarks.throughput \
-  --dataset-name onerec \
-  --model meta-llama/llama-2-70b-chat-hf \
-  --data-dir ./data \
-  --task-types rec_reason,item_understand,label_pred \
-  --num-prompts 500 \
-  --output-dir ./results
-```
-
-#### 3. Beam Search Evaluation
-
-```bash
-python -m vllm.benchmarks.throughput \
-  --dataset-name onerec \
-  --model Qwen/Qwen3-32B-Instruct \
-  --data-dir ./data \
-  --use-beam-search \
-  --n 4 \
-  --num-prompts 200
-```
-
-#### 4. Thinking Mode (Qwen3)
-
-```bash
-python -m vllm.benchmarks.throughput \
-  --dataset-name onerec \
-  --model Qwen/Qwen3-32B-Instruct \
-  --data-dir ./data \
-  --task-types rec_reason \
-  --num-prompts 100
-```
 
 ## Configuration
 
@@ -301,30 +294,7 @@ dataset = OneRecDataset(
 )
 ```
 
-## Data Format
-
-### Data Structure
-
-OneRec expects data in **Parquet format** with the following schema:
-
-```
-├── data/
-│   ├── rec_reason/
-│   │   └── rec_reason_test.parquet
-│   ├── item_understand/
-│   │   └── item_understand_test.parquet
-│   └── ...
-```
-
-### Parquet Schema
-
-Each Parquet file must contain these columns:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `messages` | str/list | Chat messages in JSON format or list of dicts |
-| `metadata` | str/dict | JSON metadata containing answer and context |
-
+## API Server Interactions
 ### Message Format
 
 Messages follow the OpenAI chat format:
@@ -386,7 +356,7 @@ import json
 def create_sample_data(output_path: str, num_samples: int = 100):
     """Create sample OneRec data."""
     records = []
-    
+
     for i in range(num_samples):
         record = {
             "messages": json.dumps([
@@ -399,7 +369,7 @@ def create_sample_data(output_path: str, num_samples: int = 100):
             })
         }
         records.append(record)
-    
+
     df = pd.DataFrame(records)
     df.to_parquet(output_path, index=False)
     print(f"✓ Created sample data: {output_path}")
@@ -535,12 +505,15 @@ Binary classification of user engagement labels.
 
 ```bash
 # Evaluation runs automatically after generation
-# Results saved to output-dir
-python -m vllm.benchmarks.throughput \
+# Results saved to output-json
+
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
-  --model qwen/qwen-72b \
-  --data-dir ./data \
-  --output-dir ./results
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-name onerec \
+  --dataset-path ./data \
+  --num-prompts 100 \
+  --output-json results/throughput  
 ```
 
 ### Result Format
@@ -624,10 +597,16 @@ vllm serve qwen/qwen-72b-instruct --gpu-memory-utilization 0.9
 Enable verbose logging:
 
 ```bash
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
-  --model qwen/qwen-72b \
-  --data-dir ./data \
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-name onerec \
+  --dataset-path ./data \
+  --task-types rec_reason,item_understand,label_pred \
+  --num-prompts 100 \
+  --use-beam-search \
+  --n 8 \
+  --output-json results/throughput
   -v  # Verbose logging
 ```
 
@@ -663,7 +642,7 @@ from benchmarks.open_one_rec import OneRecDataset
 class OneRecDataset(BenchmarkDataset):
     """
     OneRec benchmark dataset.
-    
+
     Args:
         task_types: List of task types to load (default: all 8)
         model_path: Path to model for tokenizer
@@ -673,7 +652,7 @@ class OneRecDataset(BenchmarkDataset):
         sample_size: Number of samples per task
         random_seed: Random seed for reproducibility
     """
-    
+
     def __init__(
         self,
         task_types: list[str] = None,
@@ -683,11 +662,11 @@ class OneRecDataset(BenchmarkDataset):
         **kwargs
     ):
         pass
-    
+
     def load_data(self) -> None:
         """Load data from disk."""
         pass
-    
+
     def sample(
         self,
         tokenizer,
@@ -706,14 +685,14 @@ from benchmarks.open_one_rec.open_one_rec_loader import BaseLoader
 class BaseLoader:
     """
     Base data loader for OneRec tasks.
-    
+
     Handles:
     - Parquet file loading
     - Message format conversion
     - Chat template application
     - Metadata processing
     """
-    
+
     def load_data(
         self,
         split: str = "test",

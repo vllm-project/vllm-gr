@@ -68,16 +68,16 @@ REC_REASON_CONFIG = {
 {
     # Enable/disable LLM evaluation
     "llm_eval_enabled": True,
-    
+
     # vLLM Endpoint Configuration
     "vllm_endpoint": "http://localhost:8001/v1",  # Default: localhost:8000/v1
     "vllm_api_key": "not-needed",                 # API key (not needed for local)
     "vllm_async": False,                          # Use async client
-    
+
     # Evaluation Parameters
     "llm_max_workers": 4,                         # Parallel workers
     "llm_max_samples": 500,                       # Max samples (None = all)
-    
+
     # Generation Parameters (optional)
     "llm_temperature": 0.7,
     "llm_top_p": 0.95,
@@ -142,10 +142,10 @@ python -m vllm.entrypoints.openai.api_server \
 ### Step 2: Run Benchmark with Evaluation (in another terminal)
 
 ```bash
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --task-types rec_reason \
   --num-prompts 100 \
   --save-result \
@@ -211,14 +211,14 @@ async def evaluate_async():
         base_url="http://localhost:8001/v1",
         api_key="not-needed"
     )
-    
+
     response = await client.chat.completions.create(
         model="Qwen/Qwen-72B-Chat",
         messages=[
             {"role": "user", "content": "Evaluate..."}
         ]
     )
-    
+
     return response.choices[0].message.content
 
 # Run async
@@ -385,10 +385,10 @@ python -m vllm.entrypoints.openai.api_server \
 
 # Terminal 3: Run benchmark with vLLM evaluation
 sleep 5  # Wait for servers to start
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --endpoint http://localhost:8000/v1 \
   --backend openai-chat \
   --task-types rec_reason \

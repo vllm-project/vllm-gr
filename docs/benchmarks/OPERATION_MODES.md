@@ -54,7 +54,7 @@ In this mode, you:
 #### Command Format
 
 ```bash
-python -m vllm.entrypoints.openai.api_server \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput\
   --model <MODEL_ID> \
   --host <HOST> \
   --port <PORT> \
@@ -65,7 +65,7 @@ python -m vllm.entrypoints.openai.api_server \
 
 ```bash
 # Terminal 1: Start vLLM server locally
-python -m vllm.entrypoints.openai.api_server \
+python -m vllm_gr.entrypoints.openai.api_server \
   --model OpenOneRec/OneRec-1.7B \
   --host localhost \
   --port 8000 \
@@ -121,10 +121,10 @@ curl http://localhost:8000/v1/models
 #### Command Format
 
 ```bash
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
   --model <MODEL_ID> \
-  --data-dir <DATA_DIR> \
+  --dataset-path <DATA_DIR> \
   --endpoint http://<HOST>:<PORT>/v1 \
   --backend openai-chat \
   --task-types <TASKS> \
@@ -138,10 +138,10 @@ python -m vllm.benchmarks.throughput \
 
 ```bash
 # Terminal 2: Run benchmark
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --endpoint http://localhost:8000/v1 \
   --backend openai-chat \
   --task-types video \
@@ -154,10 +154,10 @@ python -m vllm.benchmarks.throughput \
 
 ```bash
 # Terminal 2: Run benchmark against remote server
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir /data/users/sefi/from_git/vllm_013/dataset/open_one/benchmark_data \
+  --dataset-path /path_to/benchmark_data \
   --endpoint http://10.10.10.174:10001/v1 \
   --backend openai-chat \
   --task-types video,interactive \
@@ -209,10 +209,10 @@ python -m vllm.entrypoints.openai.api_server \
 
 # Terminal 2: Run benchmark
 sleep 5  # Wait for server startup
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --endpoint http://localhost:8000/v1 \
   --backend openai-chat \
   --task-types rec_reason,item_understand \
@@ -262,10 +262,10 @@ In this mode, you run the benchmark directly against the model without an API se
 #### Command Format
 
 ```bash
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --dataset-name onerec \
   --model <MODEL_ID> \
-  --data-dir <DATA_DIR> \
+  --dataset-path <DATA_DIR> \
   --task-types <TASKS> \
   --num-prompts <NUM> \
   [OPTIONAL_FLAGS]
@@ -275,10 +275,10 @@ python -m vllm.benchmarks.throughput \
 
 ```bash
 # Direct throughput test (no server)
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --task-types video \
   --num-prompts 100
 ```
@@ -286,10 +286,10 @@ python -m vllm.benchmarks.throughput \
 #### Example: Throughput with Beam Search
 
 ```bash
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --task-types interactive,video \
   --num-prompts 200 \
   --use-beam-search \
@@ -299,10 +299,10 @@ python -m vllm.benchmarks.throughput \
 #### Example: Advanced Throughput Test
 
 ```bash
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir /data/users/sefi/from_git/vllm_013/dataset/open_one/benchmark_data \
+  --dataset-path /data/users/sefi/from_git/vllm_013/dataset/open_one/benchmark_data \
   --task-types rec_reason,item_understand,ad,product,label_cond,video,interactive,label_pred \
   --num-prompts 500 \
   --use-beam-search \
@@ -317,7 +317,7 @@ python -m vllm.benchmarks.throughput \
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model` | str | Required | Model ID or path (e.g., OpenOneRec/OneRec-1.7B) |
-| `--data-dir` | str | Required | Path to benchmark data |
+| `--dataset-path` | str | Required | Path to benchmark data |
 | `--dataset-name` | str | Required | Must be `onerec` |
 | `--task-types` | str | All 8 | Comma-separated task types |
 | `--num-prompts` | int | 1000 | Number of prompts to sample |
@@ -338,10 +338,10 @@ For larger models or higher throughput, use tensor parallelism:
 
 ```bash
 # Using 4 GPUs
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput\
   --dataset-name onerec \
   --model OpenOneRec/OneRec-8B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --task-types video \
   --num-prompts 500 \
   --tensor-parallel-size 4 \
@@ -352,10 +352,10 @@ python -m vllm.benchmarks.throughput \
 
 ```bash
 # Single command - everything in one process
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput
   --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
-  --data-dir ./data \
+  --dataset-path ./data \
   --task-types rec_reason,item_understand,video \
   --num-prompts 300 \
   --use-beam-search \
@@ -442,10 +442,10 @@ You can also run both modes through VS Code's launch configuration.
             "request": "launch",
             "program": "-m",
             "args": [
-                "vllm.benchmarks.throughput",
+                "benchmarks.open_one_rec.one_rec_main bench throughput",
                 "--dataset-name", "onerec",
                 "--model", "OpenOneRec/OneRec-1.7B",
-                "--data-dir", "./data",
+                "--dataset-path", "./data",
                 "--endpoint", "http://localhost:8000/v1",
                 "--backend", "openai-chat",
                 "--task-types", "video",
@@ -468,10 +468,10 @@ You can also run both modes through VS Code's launch configuration.
             "request": "launch",
             "program": "-m",
             "args": [
-                "vllm.benchmarks.throughput",
+                "benchmarks.open_one_rec.one_rec_main bench throughput",
                 "--dataset-name", "onerec",
                 "--model", "OpenOneRec/OneRec-1.7B",
-                "--data-dir", "./data",
+                "--dataset-path", "./data",
                 "--task-types", "video,interactive",
                 "--num-prompts", "200",
                 "--use-beam-search",
@@ -594,7 +594,7 @@ nvidia-smi dmon -s p
 |------|---------|
 | Start API server | `python -m vllm.entrypoints.openai.api_server --model ... --host ... --port ...` |
 | Run API mode benchmark | `python -m vllm.benchmarks.throughput --endpoint http://... --backend openai-chat ...` |
-| Run throughput mode | `python -m vllm.benchmarks.throughput --model ... --data-dir ...` |
+| Run throughput mode | `python -m vllm.benchmarks.throughput --model ... --dataset-path ...` |
 | Monitor results | `cat results/*.json \| jq '.'` |
 
 For more details, see:

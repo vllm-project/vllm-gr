@@ -335,25 +335,25 @@ from pathlib import Path
 
 def validate_onerec_data(parquet_path: str) -> bool:
     """Validate OneRec data file."""
-    
+
     try:
         # Load parquet
         df = pd.read_parquet(parquet_path)
         print(f"✓ File loaded successfully")
-        
+
         # Check columns
         if set(df.columns) != {"messages", "metadata"}:
             print(f"✗ Invalid columns: {set(df.columns)}")
             print(f"  Expected: {{'messages', 'metadata'}}")
             return False
         print(f"✓ Columns correct")
-        
+
         # Check row count
         if len(df) == 0:
             print(f"✗ Empty dataframe")
             return False
         print(f"✓ Has {len(df)} rows")
-        
+
         # Validate each row
         invalid_rows = []
         for idx, row in df.iterrows():
@@ -366,7 +366,7 @@ def validate_onerec_data(parquet_path: str) -> bool:
                     invalid_rows.append((idx, "messages must be string (JSON) or list"))
             except json.JSONDecodeError:
                 invalid_rows.append((idx, "messages JSON invalid"))
-            
+
             # Check metadata
             try:
                 metadata = row["metadata"]
@@ -377,16 +377,16 @@ def validate_onerec_data(parquet_path: str) -> bool:
                 else:
                     invalid_rows.append((idx, "metadata must be string (JSON) or dict"))
                     continue
-                
+
                 # Check for answer field
                 if "answer" not in meta_dict:
                     invalid_rows.append((idx, "metadata missing 'answer' field"))
                 elif not meta_dict["answer"]:
                     invalid_rows.append((idx, "metadata 'answer' is empty"))
-                    
+
             except json.JSONDecodeError:
                 invalid_rows.append((idx, "metadata JSON invalid"))
-        
+
         if invalid_rows:
             print(f"✗ Found {len(invalid_rows)} invalid rows:")
             for idx, error in invalid_rows[:5]:  # Show first 5
@@ -394,16 +394,16 @@ def validate_onerec_data(parquet_path: str) -> bool:
             if len(invalid_rows) > 5:
                 print(f"  ... and {len(invalid_rows) - 5} more")
             return False
-        
+
         print(f"✓ All rows valid")
-        
+
         # Check data types
         print(f"\nData types:")
         print(f"  messages: {df['messages'].dtype}")
         print(f"  metadata: {df['metadata'].dtype}")
-        
+
         return True
-        
+
     except Exception as e:
         print(f"✗ Validation failed: {e}")
         return False
@@ -417,7 +417,7 @@ validate_onerec_data("rec_reason_test.parquet")
 ```python
 def validate_all_tasks(data_dir: str) -> dict:
     """Validate all task data files."""
-    
+
     tasks = [
         "rec_reason",
         "item_understand",
@@ -428,12 +428,12 @@ def validate_all_tasks(data_dir: str) -> dict:
         "interactive",
         "label_pred"
     ]
-    
+
     results = {}
     for task in tasks:
         task_dir = Path(data_dir) / task
         parquet_file = task_dir / f"{task}_test.parquet"
-        
+
         if parquet_file.exists():
             print(f"\n{'='*50}")
             print(f"Validating: {task}")
@@ -442,14 +442,14 @@ def validate_all_tasks(data_dir: str) -> dict:
         else:
             print(f"\n✗ Missing: {parquet_file}")
             results[task] = False
-    
+
     # Summary
     print(f"\n{'='*50}")
     print(f"Summary")
     print(f"{'='*50}")
     valid = sum(1 for v in results.values() if v)
     print(f"Valid: {valid}/{len(tasks)}")
-    
+
     return results
 
 # Usage
@@ -467,7 +467,7 @@ import random
 
 def create_sample_data(output_path: str, task_name: str, num_samples: int = 100):
     """Create sample data for testing."""
-    
+
     # Task-specific templates
     templates = {
         "rec_reason": {
@@ -483,9 +483,9 @@ def create_sample_data(output_path: str, task_name: str, num_samples: int = 100)
             "answer": random.choice(["是", "否"])
         }
     }
-    
+
     template = templates.get(task_name, templates["rec_reason"])
-    
+
     records = []
     for i in range(num_samples):
         record = {
@@ -506,7 +506,7 @@ def create_sample_data(output_path: str, task_name: str, num_samples: int = 100)
             })
         }
         records.append(record)
-    
+
     df = pd.DataFrame(records)
     df.to_parquet(output_path, index=False)
     print(f"✓ Created {output_path} with {num_samples} samples")
@@ -534,12 +534,12 @@ import random
 
 def create_sample_data_polars(output_path: str, task_name: str, num_samples: int = 100):
     """Create sample data using Polars (faster)."""
-    
+
     messages_list = [
         json.dumps([{"role": "user", "content": f"Sample prompt {i}"}])
         for i in range(num_samples)
     ]
-    
+
     metadata_list = [
         json.dumps({
             "answer": f"Sample answer {i}",
@@ -548,12 +548,12 @@ def create_sample_data_polars(output_path: str, task_name: str, num_samples: int
         })
         for i in range(num_samples)
     ]
-    
+
     df = pl.DataFrame({
         "messages": messages_list,
         "metadata": metadata_list
     })
-    
+
     df.write_parquet(output_path)
     print(f"✓ Created {output_path} with {num_samples} samples")
 
@@ -569,23 +569,23 @@ import json
 
 def create_from_csv(csv_path: str, output_parquet_path: str):
     """Convert CSV to OneRec Parquet format."""
-    
+
     df = pd.read_csv(csv_path)
-    
+
     # Rename columns if needed
     if "prompt" in df.columns:
         df["messages"] = df["prompt"].apply(
             lambda x: json.dumps([{"role": "user", "content": x}])
         )
-    
+
     if "expected_output" in df.columns:
         df["metadata"] = df["expected_output"].apply(
             lambda x: json.dumps({"answer": x})
         )
-    
+
     # Keep only required columns
     df = df[["messages", "metadata"]]
-    
+
     df.to_parquet(output_parquet_path, index=False)
     print(f"✓ Converted {csv_path} to {output_parquet_path}")
 

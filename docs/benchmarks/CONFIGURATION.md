@@ -22,24 +22,24 @@ TASK_CONFIG = {
     "name": str,                    # Unique task identifier
     "source": str,                  # Data source
     "description": str,             # Human-readable description
-    
+
     # Dataset information
     "splits": list[str],            # Available splits (train, test, val)
     "size": int,                    # Total dataset size
     "sample_size": int,             # Default sample size
-    
+
     # Data structure
     "data_fields": {
         "messages_field": str,      # Column name for messages
         "metadata_field": str,       # Column name for metadata
     },
-    
+
     # Prompt handling
     "prompt_config": {
         "enable_thinking": bool,              # Enable reasoning mode
         "custom_chat_template": str,          # Path to Jinja2 template
     },
-    
+
     # Generation settings
     "generation_config": {
         "max_new_tokens": int,                # Maximum generation length
@@ -53,7 +53,7 @@ TASK_CONFIG = {
         "logprobs": int,                      # Number of logprobs
         "target_tokens": list[str],           # Tokens for classification
     },
-    
+
     # Evaluation configuration
     "evaluation_config": {
         "metrics": list[str],                 # Metrics to compute
@@ -66,7 +66,7 @@ TASK_CONFIG = {
         "wip_core_threshold": int,            # Core importance
         "wip_max_samples": int,               # Sample limit
     },
-    
+
     # Task metadata
     "task_type": str,                         # Type: generation/classification
 }
@@ -86,17 +86,17 @@ LABEL_PRED_CONFIG = {
     "size": 346190,
     "sample_size": 346190,
     "description": "Predict user engagement with video content (yes/no classification)",
-    
+
     "data_fields": {
         "messages_field": "messages",
         "metadata_field": "metadata",
     },
-    
+
     "prompt_config": {
         "enable_thinking": False,
         "custom_chat_template": "qwen3_soft_switch.jinja2",
     },
-    
+
     "generation_config": {
         "max_new_tokens": 1,
         "temperature": 1,
@@ -109,11 +109,11 @@ LABEL_PRED_CONFIG = {
         "target_tokens": ["是", "否"],  # Binary classification
         "max_new_thinking_tokens": 1000,
     },
-    
+
     "evaluation_config": {
         "metrics": ["auc", "weighted_auc"],
     },
-    
+
     "task_type": "logprobs_classification",
 }
 ```
@@ -134,12 +134,12 @@ ITEM_UNDERSTAND_CONFIG = {
     "size": 500,
     "sample_size": 500,
     "description": "Video SID to Caption generation task",
-    
+
     "prompt_config": {
         "enable_thinking": False,
         "custom_chat_template": "qwen3_soft_switch.jinja2",
     },
-    
+
     "generation_config": {
         "num_return_sequences": 1,
         "max_new_tokens": 128,
@@ -150,7 +150,7 @@ ITEM_UNDERSTAND_CONFIG = {
         "num_return_thinking_sequences": 1,
         "max_new_thinking_tokens": 1000,
     },
-    
+
     "evaluation_config": {
         "metrics": [
             "macro_wip_double_weighted_f1",
@@ -184,7 +184,7 @@ REC_REASON_CONFIG = {
     "size": 2000,
     "sample_size": 2000,
     "description": "Generate reasons for item recommendations",
-    
+
     "generation_config": {
         "max_new_tokens": 256,
         "temperature": 0.7,
@@ -192,7 +192,7 @@ REC_REASON_CONFIG = {
         "do_sample": True,
         "repetition_penalty": 1.05,
     },
-    
+
     "evaluation_config": {
         "metrics": ["bleu", "rouge_1", "rouge_2", "rouge_l", "bertscore_f1"],
         "bertscore_lang": "zh",
@@ -391,24 +391,24 @@ MY_CUSTOM_CONFIG = {
     "size": 1000,
     "sample_size": 100,
     "description": "My custom task",
-    
+
     "data_fields": {
         "messages_field": "messages",
         "metadata_field": "metadata",
     },
-    
+
     "prompt_config": {
         "enable_thinking": False,
         "custom_chat_template": "my_template.jinja2",
     },
-    
+
     "generation_config": {
         "max_new_tokens": 256,
         "temperature": 0.7,
         "top_p": 0.95,
         "do_sample": True,
     },
-    
+
     "evaluation_config": {
         "metrics": ["bleu", "rouge_1", "bertscore_f1"],
     },
@@ -430,12 +430,15 @@ TASK_REGISTRY["my_custom_task"] = TaskRegistration(
 
 ```python
 # Using command line
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
-  --model qwen/qwen-72b \
-  --data-dir ./data \
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-name onerec \
+  --dataset-path ./data \
   --task-types rec_reason \
-  --n 8  # Override beam count
+  --num-prompts 100 \
+  --output-json results/throughput  
+  --n 8 # Override beam count
 
 # In Python
 from benchmarks.open_one_rec.configs.config import LABEL_PRED_CONFIG
@@ -454,12 +457,14 @@ For quick benchmarking with reduced quality:
 
 ```python
 # Command line
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
-  --model qwen/qwen-72b \
-  --data-dir ./data \
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-name onerec \
+  --dataset-path ./data \
   --task-types rec_reason \
   --num-prompts 100 \
+  --output-json results/throughput  
   --max-tokens 64 \
   --temperature 0.01
 
@@ -472,16 +477,18 @@ For comprehensive benchmarking:
 
 ```python
 # Command line
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
-  --model qwen/qwen-72b \
-  --data-dir ./data \
+  --model OpenOneRec/OneRec-8B \
+  --dataset-name onerec \
+  --dataset-path ./data \
+  --task-types rec_reason \
   --use-beam-search \
-  --n 4 \
+  --n 256 \
   --num-prompts 500 \
   --max-tokens 256
 
-# Results: Slower (~30 min), higher quality, beam search
+# Results: Slower yet higher quality, beam search
 ```
 
 ### Example 3: Multi-task with Thinking
@@ -489,10 +496,10 @@ python -m vllm.benchmarks.throughput \
 For models supporting thinking mode:
 
 ```python
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
   --model Qwen/Qwen3-32B-Instruct \
-  --data-dir ./data \
+  --dataset-path ./data \
   --task-types rec_reason,item_understand,label_pred \
   --num-prompts 200
 
@@ -509,12 +516,14 @@ REC_REASON_CONFIG["prompt_config"]["enable_thinking"] = True
 For evaluating classification tasks:
 
 ```python
-python -m vllm.benchmarks.throughput \
+python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
-  --model qwen/qwen-72b \
-  --data-dir ./data \
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-name onerec \
+  --dataset-path ./data \
   --task-types label_pred,ad,label_cond \
-  --num-prompts 1000
+  --num-prompts 100 \
+  --output-json results/throughput  
 
 # These tasks use:
 # - Low max_new_tokens (1-10)
@@ -533,12 +542,12 @@ CUSTOM_GENERATION_CONFIG = {
     "size": 2000,
     "sample_size": 200,
     "description": "Rec reason with custom generation",
-    
+
     "prompt_config": {
         "enable_thinking": True,
         "custom_chat_template": "qwen3_soft_switch.jinja2",
     },
-    
+
     "generation_config": {
         "max_new_tokens": 512,
         "temperature": 0.3,
@@ -548,7 +557,7 @@ CUSTOM_GENERATION_CONFIG = {
         "repetition_penalty": 1.1,
         "max_new_thinking_tokens": 2000,
     },
-    
+
     "evaluation_config": {
         "metrics": ["bleu", "rouge_1", "rouge_l", "bertscore_f1"],
         "bertscore_lang": "zh",

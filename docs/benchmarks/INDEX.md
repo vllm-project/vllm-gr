@@ -23,14 +23,14 @@ Complete documentation suite for the OneRec generative recommendation benchmark.
 
 ### For Understanding Usage
 
-2. **[OPERATION_MODES.md](OPERATION_MODES.md)** 
+2. **[OPERATION_MODES.md](OPERATION_MODES.md)**
    - Two operation modes explained (Throughput and API Server)
    - Step-by-step CLI commands for each mode
    - Mode comparison and decision matrix
    - launch.json configuration examples
    - Results monitoring and analysis
 
-3. **[VLLM_EVALUATION.md](VLLM_EVALUATION.md)** 
+3. **[VLLM_EVALUATION.md](VLLM_EVALUATION.md)**
    - Using vLLM for LLM-based evaluation
    - Setting up evaluation server
    - Configuration for vLLM endpoints
@@ -190,7 +190,7 @@ Complete documentation suite for the OneRec generative recommendation benchmark.
 - Evaluation workflow
 - Common troubleshooting (defer to TROUBLESHOOTING.md for details)
 
-### OPERATION_MODES.md Sections 
+### OPERATION_MODES.md Sections
 - Overview of two modes (Throughput vs API Server)
 - Step-by-step instructions for each mode
 - Mode comparison table and decision matrix

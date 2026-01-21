@@ -24,7 +24,7 @@ class OneRecDataset(BenchmarkDataset):
     """
     Custom dataset for OneRec benchmark with multiple task types.
     Loads data using DataLoaderWrapper with task_name, split, and sample_size.
-    
+
     Inherits from: vllm.benchmarks.datasets.BenchmarkDataset
     """
 ```
@@ -102,12 +102,12 @@ dataset = OneRecDataset(
 def load_data(self) -> None:
     """
     Load data for all specified task types.
-    
+
     Processes:
     - Loads Parquet files for each task
     - Converts to standardized format
     - Shuffles if enabled
-    
+
     Raises:
         FileNotFoundError: If data files missing
         ValueError: If data format invalid
@@ -132,20 +132,20 @@ def sample(
 ) -> list[SampleRequest]:
     """
     Sample requests from loaded data.
-    
+
     Args:
         tokenizer: Tokenizer for encoding
         num_requests: Number of samples to return
         request_id_prefix: Prefix for request IDs
         **kwargs: Additional arguments (no_oversample, etc.)
-    
+
     Returns:
         List of SampleRequest objects with:
         - prompt: Formatted prompt text
         - prompt_len: Token count of prompt
         - expected_output_len: Expected generation length
         - request_id: Unique identifier (format: "{task}_{id}")
-    
+
     Example:
         requests = dataset.sample(tokenizer, num_requests=100)
         for req in requests:
@@ -205,7 +205,7 @@ from benchmarks.open_one_rec.open_one_rec_loader import BaseLoader
 class BaseLoader(ABC):
     """
     Base loader for OneRec task data.
-    
+
     Handles:
     - Parquet file loading and parsing
     - Message format conversion
@@ -227,13 +227,13 @@ def __init__(
 ) -> None:
     """
     Initialize base loader.
-    
+
     Args:
         task_config: Task configuration dictionary
         data_dir: Data directory path
         tokenizer: Tokenizer instance (optional, required for chat templates)
         enable_thinking: Enable thinking mode for supported models
-    
+
     Raises:
         ValueError: If tokenizer not provided but required
     """
@@ -277,11 +277,11 @@ def load_data(
 ) -> dict[str, dict[str, Any]]:
     """
     Load and process data.
-    
+
     Args:
         split: Dataset split (default: "test")
         sample_size: Override sample size
-    
+
     Returns:
         Dictionary of processed samples:
         {
@@ -294,7 +294,7 @@ def load_data(
                 }
             }
         }
-    
+
     Raises:
         FileNotFoundError: If data file not found
         ValueError: If data format invalid
@@ -359,7 +359,7 @@ from dataclasses import dataclass
 @dataclass
 class TaskRegistration:
     """Task registration information"""
-    
+
     name: str                  # Task name (e.g., "rec_reason")
     config: dict[str, Any]    # Task configuration
     evaluator_class: type     # Evaluator class
@@ -376,7 +376,7 @@ from benchmarks.open_one_rec.open_one_rec_loader import TASK_REGISTRY
 # Get all task names
 all_tasks = list(TASK_REGISTRY.keys())
 print(all_tasks)
-# Output: ['rec_reason', 'item_understand', 'ad', 'product', 
+# Output: ['rec_reason', 'item_understand', 'ad', 'product',
 #          'label_cond', 'video', 'interactive', 'label_pred']
 
 # Get tasks by category
@@ -452,7 +452,7 @@ from benchmarks.open_one_rec.evaluators.base_evaluator import BaseEvaluator
 
 class BaseEvaluator(ABC):
     """Base class for all evaluators."""
-    
+
     @abstractmethod
     def evaluate(
         self,
@@ -687,17 +687,17 @@ def process_dataset(
     num_samples: int = 100
 ) -> List[SampleRequest]:
     """Type-hinted function."""
-    
+
     dataset: OneRecDataset = OneRecDataset(
         task_types=task_types,
         model_path=model_path
     )
-    
+
     requests: List[SampleRequest] = dataset.sample(
         tokenizer=None,
         num_requests=num_samples
     )
-    
+
     return requests
 ```
 
