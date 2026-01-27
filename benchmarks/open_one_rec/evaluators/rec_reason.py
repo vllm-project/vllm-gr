@@ -11,7 +11,7 @@ Evaluates model predictions on Recommendation Reason task using LLM-based multi-
 from typing import Dict, Any, Tuple, List
 
 from .base_evaluator import BaseEval
-from ..utils import extract_after_think
+from ..utils import extract_after_think, evaluate_reasoning
 
 import logging
 
@@ -151,6 +151,7 @@ class RecoReasonEvaluator(BaseEval):
             return {}, {}
 
         # Get LLM eval config
+        llm_judge_model = eval_config.get("llm_judge_model", "gemini")
         llm_max_workers = eval_config.get("llm_max_workers", 3)
         llm_max_samples = eval_config.get("llm_max_samples", 300)
 
