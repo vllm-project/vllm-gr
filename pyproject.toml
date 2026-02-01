@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools", "wheel", "pybind11"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -29,7 +29,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "vllm>=0.13.0",
+    "vllm==0.14.*",
     "numpy",
     "transformers",
 ]
@@ -37,6 +37,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-asyncio",
+    "tblib",
     "pytest-cov",
     "black",
     "ruff",
