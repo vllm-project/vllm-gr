@@ -5,40 +5,39 @@ import pytest
 import time
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseModelPath
-from vllm_gr.sampling_params import BeamSearchParams
+from vllm.sampling_params import BeamSearchParams
 from vllm.inputs import TokensPrompt
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
 from transformers import AutoTokenizer
+
 
 @pytest.mark.asyncio
 async def test_serving_beam_search():
     model_name = "OpenOneRec/OneRec-1.7B"
     beam_width = 512
     max_tokens = 5
-    
+
     engine_args = AsyncEngineArgs(
         model=model_name,
         trust_remote_code=True,
         enforce_eager=True,
         enable_log_requests=False,
-        max_logprobs=2 * beam_width
+        max_logprobs=2 * beam_width,
     )
-    
+
     async with build_async_engine_client_from_engine_args(engine_args) as engine_client:
         base_model_paths = [BaseModelPath(name=model_name, model_path=model_name)]
         models = OpenAIServingModels(
-            engine_client=engine_client,
-            base_model_paths=base_model_paths,
-            lora_modules=None
+            engine_client=engine_client, base_model_paths=base_model_paths, lora_modules=None
         )
-        
+
         serving = OpenAIServing(
             engine_client=engine_client,
             models=models,
             request_logger=None,
         )
-        
+
         # Use the specific prompt
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         prompt_text = (
@@ -108,26 +107,25 @@ async def test_serving_beam_search():
         )
         prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
-        
+
         params = BeamSearchParams(
             beam_width=beam_width,
             max_tokens=max_tokens,
             ignore_eos=False,
             temperature=0.0,
             begin_token="<|sid_begin|>",
-            end_token="<|sid_end|>"
+            end_token="<|sid_end|>",
         )
-        
+
         print(f"Starting beam search with {model_name}, beam_width={beam_width}")
-        
+        start = time.perf_counter()
         generator = serving.beam_search(prompt, "req_id", params)
-        
+
         final_output = None
         async for output in generator:
             final_output = output
+        end = time.perf_counter()
+        print(f"metrics={final_output.metrics} elapsed {end - start}")
 
-        print(final_output.metrics)
-    
-        
         assert final_output is not None
         assert len(final_output.outputs) == beam_width
