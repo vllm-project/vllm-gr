@@ -1,41 +1,25 @@
 # OneRec Benchmark Documentation
 
-A comprehensive generative recommendation benchmark for evaluating large language models on multiple recommendation and understanding tasks.
+OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchmark for evaluating large language models on multiple recommendation and understanding tasks. Find more about [OpenOneRec benchmark](https://github.com/Kuaishou-OneRec/OpenOneRec/tree/main)
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Installation](#installation)
-- [Operation Modes](#operation-modes)
 - [Usage](#usage)
-- [Configuration](#configuration)
-- [Data Format](#data-format)
 - [Task Types](#task-types)
 - [Evaluation](#evaluation)
 - [Troubleshooting](#troubleshooting)
 - [API Reference](#api-reference)
 
-## Operation Modes
-
-OneRec supports two operation modes with different tradeoffs:
-
-**📘 [OPERATION_MODES.md](OPERATION_MODES.md)** - Comprehensive guide including:
-- **Mode 1: Throughput Mode** - Simple local benchmarking (1 command)
-- **Mode 2: API Server Mode** - Production-like testing (2 terminals)
-- Detailed command reference for both modes
-- When to use each mode
-- launch.json configuration examples
-- Results monitoring and analysis
-
 ## Overview
 
-OneRec is a benchmark suite designed to evaluate generative recommendation models across 8 distinct task types:
+OneRec is a benchmark suite designed to evaluate generative recommendation models across distinct task types. The most relevant of those are:
 
 | Task Type | Category | Description | Sample Size |
 |-----------|----------|-------------|------------|
 | `rec_reason` | Recommendation | Generate reasons for item recommendations | 2000 |
-| `item_understand` | Understanding | Generate captions for video items | 500 |
 | `ad` | Recommendation | Predict ad engagement | 500 |
 | `product` | Recommendation | Product recommendation reasoning | 1000 |
 | `label_cond` | Recommendation | Conditional label prediction | 800 |
@@ -67,7 +51,9 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --model OpenOneRec/OneRec-1.7B \
   --dataset-path ./data \
   --task-types video \
-  --num-prompts 100
+  --num-prompts 1000 \
+  --output-json results/throughput.json  
+
 ```
 
 **Best for**: Quick testing, development, maximizing throughput
@@ -78,19 +64,21 @@ For production-like testing with separate server and client:
 
 ```bash
 # Terminal 1: Start vLLM API server
-  vllm serve \
-  --gr \
-  --model OpenOneRec/OneRec-1.7B
+  vllm-gr serve \
+  --model OpenOneRec/OneRec-1.7B \
+  --max-logprobs 1024 \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
+
 
 # Terminal 2: Run benchmark against server
 python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --endpoint http://localhost:8000/v1 \
   --model OpenOneRec/OneRec-1.7B \
   --backend openai-chat \
-  --dataset-name onerec \
+  --dataset-name  onerec \
   --dataset-path ./data \
   --task-types video \
-  --num-prompts 100
+  --num-prompts 1000
 ```
 
 **Best for**: Production-like testing, distributed deployment, load testing
@@ -106,10 +94,10 @@ python -m  benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
   --dataset-path ./data \
   --task-types video \
-  --num-prompts 100 \
+  --num-prompts 1000 \
   --use-beam-search \
   --n 8 \
-  --output-json results/throughput  
+  --output-json results/throughput.json  
 
 
 # API mode with beam search (requires API server)
@@ -120,7 +108,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --dataset-name onerec \
   --dataset-path ./data \  
   --task-types video \
-  --num-prompts 100 \
+  --num-prompts 1000 \
   --use-beam-search \
   --n 8 \
   --save-result \
@@ -139,13 +127,14 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 | Network overhead | None | Yes (HTTP) |
 | Use case | Local testing | Deployment simulation |
 
-**See [OPERATION_MODES.md](OPERATION_MODES.md) for detailed mode documentation.**
-
 ## Installation
+
+You can refer also to [`Quickstart`](../quickstart.md) menu.
 
 ### Prerequisites
 
 - Python 3.11+
+- Pip 23+
 - CUDA 11.8+ (for GPU inference)
 - 32GB+ RAM (recommended)
 
@@ -158,31 +147,25 @@ git clone https://github.com/JiusiServe/vllm-gr.git
 cd vllm-gr
 ```
 
-2. **Create virtual environment**
-
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. **Installation**
+2. **Installation**
 
 ```bash
 pip install -e .
 ```
 
-4. **Verify installation**
+3. **Verify installation**
 
 ```bash
-python -c "from benchmarks.open_one_rec import OneRecDataset; print('✓ Installation successful')"
+python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
 ```
 
+## Open One Rec Benchmark Dataset
 
-##  Open One Rec Benchmark Dataset
 ### Get Dataset
+
 Use your huggingface username to approve this link before you download:
 
-https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF
+<https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF>
 
 ```bash
 mkdir -p OpenOneRec  
@@ -196,7 +179,7 @@ cd -
 
 OneRec expects data in **Parquet format** with the following schema:
 
-```
+```text
 ├── data/
 │   ├── rec_reason/
 │   │   └── rec_reason_test.parquet
@@ -244,57 +227,8 @@ Each Parquet file must contain these columns:
 | `--temperature` | float | 0.8 | Sampling temperature |
 | `--top-p` | float | 0.95 | Nucleus sampling parameter |
 
-
-## Configuration
-
-### Task Configuration Files
-
-Each task has a dedicated configuration file in `configs/config.py` with the following structure:
-
-```python
-TASK_CONFIG = {
-    "name": "task_name",
-    "source": "data source",
-    "splits": ["train", "test"],
-    "size": 1000,
-    "sample_size": 100,
-    "description": "Task description",
-    "data_fields": {
-        "messages_field": "messages",
-        "metadata_field": "metadata",
-    },
-    "prompt_config": {
-        "enable_thinking": False,
-        "custom_chat_template": "template.jinja2",
-    },
-    "generation_config": {
-        "max_new_tokens": 128,
-        "temperature": 0.8,
-        "top_p": 0.95,
-    },
-    "evaluation_config": {
-        "metrics": ["accuracy", "f1"],
-    },
-}
-```
-
-### Custom Configuration
-
-To use custom settings, modify the configuration in your benchmark launch script:
-
-```python
-from benchmarks.open_one_rec import OneRecDataset
-
-dataset = OneRecDataset(
-    task_types=["rec_reason", "item_understand"],
-    model_path="qwen/qwen-72b-instruct",
-    dataset_path="./data",
-    tokenizer=tokenizer,
-    enable_thinking=True,  # Enable thinking mode
-)
-```
-
 ## API Server Interactions
+
 ### Message Format
 
 Messages follow the OpenAI chat format:
@@ -401,28 +335,7 @@ Generate natural language explanations for why a specific item is recommended.
 "This video combines elements from your favorite categories..."
 ```
 
-### 2. Item Understanding (`item_understand`)
-
-Generate descriptive captions for video items based on understanding.
-
-- **Category**: Understanding
-- **Sample Size**: 500
-- **Output**: Video caption/description
-- **Metrics**: F1, BERTScore, WIP scoring
-- **Features**: Thinking mode support
-
-```python
-# Example input
-{
-    "item_features": {...},
-    "context": "Video understanding"
-}
-
-# Expected output
-"A product review video demonstrating key features..."
-```
-
-### 3. Ad Engagement (`ad`)
+### 2. Ad Engagement (`ad`)
 
 Predict and explain ad engagement for user interactions.
 
@@ -431,7 +344,7 @@ Predict and explain ad engagement for user interactions.
 - **Output**: Engagement prediction
 - **Metrics**: AUC, accuracy
 
-### 4. Product Recommendation (`product`)
+### 3. Product Recommendation (`product`)
 
 Generate product recommendations with reasoning.
 
@@ -440,7 +353,7 @@ Generate product recommendations with reasoning.
 - **Output**: Product ID + recommendation reason
 - **Metrics**: Precision@K, NDCG
 
-### 5. Label Conditional (`label_cond`)
+### 4. Label Conditional (`label_cond`)
 
 Predict item labels based on conditional information.
 
@@ -449,7 +362,7 @@ Predict item labels based on conditional information.
 - **Output**: Predicted label
 - **Metrics**: Accuracy, F1
 
-### 6. Video Recommendation (`video`)
+### 5. Video Recommendation (`video`)
 
 Score and rank videos for recommendation.
 
@@ -458,7 +371,7 @@ Score and rank videos for recommendation.
 - **Output**: Video ranking/scores
 - **Metrics**: NDCG, MAP
 
-### 7. Interactive (`interactive`)
+### 6. Interactive (`interactive`)
 
 Predict engagement in interactive scenarios.
 
@@ -467,9 +380,9 @@ Predict engagement in interactive scenarios.
 - **Output**: Engagement prediction
 - **Metrics**: AUC, F1
 
-### 8. Label Prediction (`label_pred`)
+### 7. Label Prediction (`label_pred`)
 
-Binary classification of user engagement labels.
+Binary classification (discrimination) of user engagement labels.
 
 - **Category**: Classification
 - **Sample Size**: 346190
@@ -497,9 +410,7 @@ Binary classification of user engagement labels.
 | Evaluator | Tasks | Metrics |
 |-----------|-------|---------|
 | `RecommendationEvaluator` | rec_reason, ad, product, label_cond, video, interactive | BLEU, ROUGE, BERTScore |
-| `ItemUnderstandEvaluator` | item_understand | F1, BERTScore, WIP |
 | `RecoReasonEvaluator` | rec_reason | ROUGE, customized metrics |
-| `LabelPredEvaluator` | label_pred | AUC, weighted AUC |
 
 ### Running Evaluation
 
@@ -539,11 +450,12 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
 
 #### 1. Data Not Found
 
-```
+```text
 FileNotFoundError: Data file not found: ./data/rec_reason/rec_reason_test.parquet
 ```
 
 **Solution**: Ensure data directory structure matches task names:
+
 ```bash
 ls -R ./data/
 # Output should show:
@@ -554,11 +466,12 @@ ls -R ./data/
 
 #### 2. Tokenizer Not Found
 
-```
+```text
 RuntimeError: Failed to load tokenizer from /path/to/model
 ```
 
 **Solution**: Verify model path and check tokenizer compatibility:
+
 ```bash
 python -c "from transformers import AutoTokenizer; \
   AutoTokenizer.from_pretrained('your-model-id', trust_remote_code=True)"
@@ -566,11 +479,12 @@ python -c "from transformers import AutoTokenizer; \
 
 #### 3. Out of Memory
 
-```
+```text
 torch.cuda.OutOfMemoryError: CUDA out of memory
 ```
 
 **Solution**: Reduce batch size and max tokens:
+
 ```bash
 --num-prompts 100 \
 --max-tokens 64 \
@@ -579,11 +493,12 @@ torch.cuda.OutOfMemoryError: CUDA out of memory
 
 #### 4. Beam Search Not Working
 
-```
+```text
 extra_body parameters ignored
 ```
 
 **Solution**: Use vLLM serving endpoint instead of local inference:
+
 ```bash
 # Start server
 vllm serve qwen/qwen-72b-instruct --gpu-memory-utilization 0.9
