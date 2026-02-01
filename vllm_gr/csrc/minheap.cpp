@@ -1,4 +1,7 @@
-/* /home/yoni/xGr/vllm/trc/minheap.cpp */
+/*
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+*/
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
