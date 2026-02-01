@@ -3,7 +3,6 @@
 """vllm-gr: High-throughput serving plugin for HSTU generative recommendation models."""
 
 __version__ = "0.1.0"
-print("I was here")
 
 try:
     from vllm_gr.patch import run_patch # noqa: F401

@@ -5,7 +5,6 @@ from vllm_gr.entrypoints.openai.beam_search_patch import (
 )
 
 def run_patch():
-    print("patching code")
     patch_beam_search()
     patch_sampeling()
 
