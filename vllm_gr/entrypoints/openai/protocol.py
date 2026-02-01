@@ -6,9 +6,8 @@
 
 from vllm_gr.sampling_params import BeamSearchParams
 
-def to_beam_search_params(
-    self, max_tokens: int, default_sampling_params: dict
-) -> BeamSearchParams:
+
+def to_beam_search_params(self, max_tokens: int, default_sampling_params: dict) -> BeamSearchParams:
     extra_args = self.vllm_xargs or {}
     n = self.n if self.n is not None else 1
     if (temperature := self.temperature) is None:
@@ -25,5 +24,3 @@ def to_beam_search_params(
         begin_token=extra_args.get("begin_token"),
         end_token=extra_args.get("end_token"),
     )
-
-    

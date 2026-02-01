@@ -2,6 +2,7 @@ import os
 from setuptools import setup, find_packages, Extension
 import pybind11
 
+
 def get_ext_modules():
     # The C++ extension source is expected to be in vllm_gr/csrc/
     # This is based on the import of `minheap_cpp` in the project.
@@ -13,15 +14,22 @@ def get_ext_modules():
         # This will cause a runtime error if minheap_cpp is imported,
         # but it allows installation to proceed if the C++ part is optional
         # or located elsewhere.
-        print(f"Warning: C++ extension source '{minheap_cpp_source}' not found. "
-              "Skipping C++ extension build.")
+        print(
+            f"Warning: C++ extension source '{minheap_cpp_source}' not found. "
+            "Skipping C++ extension build."
+        )
         return []
 
-    return [Extension("minheap_cpp",
-                      [minheap_cpp_source],
-                      include_dirs=[pybind11.get_include()],
-                      language="c++",
-                      extra_compile_args=["-std=c++17", "-O3", "-march=native"])]
+    return [
+        Extension(
+            "minheap_cpp",
+            [minheap_cpp_source],
+            include_dirs=[pybind11.get_include()],
+            language="c++",
+            extra_compile_args=["-std=c++17", "-O3", "-march=native"],
+        )
+    ]
+
 
 setup(
     name="vllm_gr",

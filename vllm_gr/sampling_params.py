@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from vllm.sampling_params import BeamSearchParams as BaseBeamSearchParams
 
+
 class BeamSearchParams(
     BaseBeamSearchParams,
     omit_defaults=True,  # type: ignore[call-arg]
@@ -12,4 +13,3 @@ class BeamSearchParams(
 
     begin_token: int | None = None
     end_token: int | None = None
-    

@@ -4,17 +4,12 @@ import asyncio
 import minheap_cpp as minheap
 import time
 from collections.abc import AsyncGenerator, Mapping
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, ClassVar
+from typing import Any
 
 import numpy as np
 
 from vllm.beam_search import BeamSearchSequence, create_sort_beams_key_function
-from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import apply_mistral_chat_template
-from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import VLLMValidationError
-from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
 from vllm.logprobs import Logprob
@@ -22,12 +17,9 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal import MultiModalDataDict
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
-from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
 from vllm.utils.async_utils import (
-    AsyncMicrobatchTokenizer,
     collect_from_async_generator,
-    make_async,
 )
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
@@ -39,7 +31,7 @@ async def beam_search(
     params: BeamSearchParams,
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
-    ) -> AsyncGenerator[RequestOutput, None]:
+) -> AsyncGenerator[RequestOutput, None]:
     generation_time = 0.0
     beam_width = params.beam_width
     max_tokens = params.max_tokens
@@ -60,10 +52,10 @@ async def beam_search(
         )
 
     eos_token_id: int = tokenizer.eos_token_id  # type: ignore
-    sid_begin_token_id:int|None = None
+    sid_begin_token_id: int | None = None
     if begin_token is not None:
         sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
-    sid_end_token_id:int|None = None
+    sid_end_token_id: int | None = None
     if end_token is not None:
         sid_end_token_id = tokenizer.convert_tokens_to_ids(end_token)
 
@@ -144,9 +136,7 @@ async def beam_search(
         tasks = []
         request_id_batch = f"{request_id}-{random_uuid()}"
 
-        for i, (individual_prompt,
-                lora_req) in enumerate(zip(prompts_batch, lora_req_batch)
-        ):
+        for i, (individual_prompt, lora_req) in enumerate(zip(prompts_batch, lora_req_batch)):
             request_id_item = f"{request_id_batch}-beam-{i}"
             task = asyncio.create_task(
                 collect_from_async_generator(
@@ -157,7 +147,8 @@ async def beam_search(
                         lora_request=lora_req,
                         trace_headers=trace_headers,
                     )
-                ))
+                )
+            )
             tasks.append(task)
 
         gen_start = time.perf_counter()
@@ -200,10 +191,7 @@ async def beam_search(
                 logprobs = result.outputs[0].logprobs[0]
                 all_beams_token_id.extend(list(logprobs.keys()))
                 all_beams_logprob.extend(
-                    [
-                        current_beam.cum_logprob + obj.logprob
-                        for obj in logprobs.values()
-                    ]
+                    [current_beam.cum_logprob + obj.logprob for obj in logprobs.values()]
                 )
 
         # Handle the token for the end of sentence (EOS)
@@ -220,8 +208,8 @@ async def beam_search(
                 logprobs_entry = result.outputs[0].logprobs[0]
                 completed.append(
                     BeamSearchSequence(
-                        tokens=current_beam.tokens + [eos_token_id] if
-                        include_stop_str_in_output 
+                        tokens=current_beam.tokens + [eos_token_id]
+                        if include_stop_str_in_output
                         else current_beam.tokens,
                         logprobs=current_beam.logprobs + [logprobs_entry],
                         cum_logprob=float(all_beams_logprob[idx]),
@@ -235,9 +223,9 @@ async def beam_search(
         next_beams = minheap.MinHeapTuple(beam_width)
 
         effective_eos_id = eos_token_id if not ignore_eos else -1
-        next_beams.push_candidates_striped(all_beams_logprob,
-                                            all_beams_token_id,
-                                            logprobs_num, effective_eos_id)
+        next_beams.push_candidates_striped(
+            all_beams_logprob, all_beams_token_id, logprobs_num, effective_eos_id
+        )
 
         for score, idx in next_beams.items():
             current_beam = all_beams[idx // logprobs_num]
@@ -253,7 +241,8 @@ async def beam_search(
                     cum_logprob=float(all_beams_logprob[idx]),
                     multi_modal_data=current_beam.multi_modal_data,
                     mm_processor_kwargs=current_beam.mm_processor_kwargs,
-                ))
+                )
+            )
 
         all_beams = new_beams
 
@@ -273,11 +262,12 @@ async def beam_search(
             tokens = beam.tokens[tokenized_length:]
         beam.text = tokenizer.decode(tokens)
 
-    total_beam_seach_decode_time = time.perf_counter() - beam_search_start
-    beam_search_overhead = total_beam_seach_decode_time - generation_time
+    total_beam_search_decode_time = time.perf_counter() - beam_search_start
+    beam_search_overhead = total_beam_search_decode_time - generation_time
     metrics = RequestStateStats(
         beam_search_overhead=beam_search_overhead,
-        total_beam_seach_decode_time=total_beam_seach_decode_time)
+        total_beam_search_decode_time=total_beam_search_decode_time,
+    )
     yield RequestOutput(
         request_id=request_id,
         prompt=prompt_text,
@@ -288,9 +278,7 @@ async def beam_search(
                 token_ids=beam.tokens[tokenized_length:],
                 index=i,
                 logprobs=beam.logprobs,
-                finish_reason=beam.finish_reason
-                if beam.finish_reason is not None 
-                else "length",
+                finish_reason=beam.finish_reason if beam.finish_reason is not None else "length",
                 stop_reason=beam.stop_reason,
             )
             for (i, beam) in enumerate(best_beams)

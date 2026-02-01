@@ -5,7 +5,7 @@ import pytest
 import time
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseModelPath
-from vllm.sampling_params import BeamSearchParams
+from vllm_gr.sampling_params import BeamSearchParams
 from vllm.inputs import TokensPrompt
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args

@@ -4,12 +4,11 @@
 from vllm.v1.metrics.stats import RequestStateStats as BaseRequestStateStats
 from dataclasses import dataclass
 
+
 @dataclass
 class RequestStateStats(BaseRequestStateStats):
     """Stats that need to be tracked across delta updates."""
 
     # Beam search overhead
     beam_search_overhead: float = 0.0
-    total_beam_seach_decode_time: float = 0.0
-
-
+    total_beam_search_decode_time: float = 0.0

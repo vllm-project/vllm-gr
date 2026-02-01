@@ -16,7 +16,7 @@ using ScoreTuple = std::tuple<float, int>;
 
 // Comparator for min-heap (smallest element at top).
 // We use std::greater-like logic because std::make_heap creates a max-heap by default.
-// To get a min-heap behavior with std::push_heap/pop_heap, we need a comparator 
+// To get a min-heap behavior with std::push_heap/pop_heap, we need a comparator
 // that returns true if 'a' should be closer to the root than 'b' (i.e., a > b for min-heap).
 struct PyObjectGreater {
     bool operator()(const py::object& a, const py::object& b) const {
@@ -41,7 +41,7 @@ template <typename T, typename Comparator>
 class MinHeap : public std::priority_queue<T, std::vector<T>, Comparator> {
 public:
     using Base = std::priority_queue<T, std::vector<T>, Comparator>;
-    
+
     MinHeap(size_t max_size) : max_size_(max_size) {
         this->c.reserve(max_size);
     }
@@ -78,19 +78,19 @@ public:
         }
     }
 
-    
+
     void push_candidates_striped(
         py::array_t<float> scores,
         py::array_t<int64_t> token_ids,
         int chunk_size,
         long long eos_token_id) {
-        
+
         auto scores_r = scores.unchecked<1>();
         auto token_ids_r = token_ids.unchecked<1>();
 
         size_t num_items = scores_r.size();
         if (num_items == 0 || chunk_size <= 0) return;
-        
+
         size_t num_chunks = (num_items + chunk_size - 1) / chunk_size;
         std::vector<int> active_chunks(num_chunks);
         std::iota(active_chunks.begin(), active_chunks.end(), 0);
@@ -98,12 +98,12 @@ public:
 
         for (int i = 0; i < chunk_size; ++i) {
             if (active_count == 0) break;
-            
+
             size_t write_pos = 0;
             for (size_t k = 0; k < active_count; ++k) {
                 size_t chunk_idx = active_chunks[k];
                 int idx = chunk_idx * chunk_size + i;
-                
+
                 if (idx >= num_items) continue;
 
                 if (token_ids_r(idx) == eos_token_id) {
@@ -117,8 +117,8 @@ public:
             active_count = write_pos;
         }
     }
-    
-    
+
+
     std::vector<T> sorted_items() {
         std::vector<T> copy = this->c;
         std::sort(copy.begin(), copy.end(), Comparator());
@@ -127,7 +127,7 @@ public:
 
 private:
     bool push_inplace(float score, int idx) {
-        if (this->size() < max_size_) {  
+        if (this->size() < max_size_) {
             this->emplace(score, idx);
             return true;
         } else {
