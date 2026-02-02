@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+try:
+    from vllm_gr.sampling_params import BeamSearchParams
+except ImportError:
+    from vllm.sampling_params import BeamSearchParams
 import pytest
 import time
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseModelPath
-from vllm_gr.sampling_params import BeamSearchParams
 from vllm.inputs import TokensPrompt
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
@@ -108,14 +111,17 @@ async def test_serving_beam_search():
         prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
 
-        params = BeamSearchParams(
-            beam_width=beam_width,
-            max_tokens=max_tokens,
-            ignore_eos=False,
-            temperature=0.0,
-            begin_token="<|sid_begin|>",
-            end_token="<|sid_end|>",
-        )
+        beam_search_params = {
+            "beam_width": beam_width,
+            "max_tokens": max_tokens,
+            "ignore_eos": False,
+            "temperature": 0.0,
+        }
+        if hasattr(BeamSearchParams, "begin_token"):
+            beam_search_params["begin_token"] = "<|sid_begin|>"
+            beam_search_params["end_token"] = "<|sid_end|>"
+
+        params = BeamSearchParams(**beam_search_params)
 
         print(f"Starting beam search with {model_name}, beam_width={beam_width}")
         start = time.perf_counter()
@@ -129,3 +135,11 @@ async def test_serving_beam_search():
 
         assert final_output is not None
         assert len(final_output.outputs) == beam_width
+
+
+@pytest.mark.asyncio
+async def test_serving_gr_beam_search():
+    from vllm_gr.patch import run_patch
+
+    run_patch()
+    await test_serving_beam_search()

@@ -41,7 +41,10 @@ async def beam_search(
     begin_token = params.begin_token
     end_token = params.end_token
     include_stop_str_in_output = params.include_stop_str_in_output
-
+    if beam_width == 0:
+        raise VLLMValidationError(
+            "Beam width must be greater than 0", parameter="beam_width", value=0
+        )
     input_processor = self.input_processor
     tokenizer = input_processor.tokenizer
     if tokenizer is None:
