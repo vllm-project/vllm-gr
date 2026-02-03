@@ -1,4 +1,3 @@
-# import vllm
 import aiohttp
 from tqdm import tqdm
 import vllm.benchmarks.datasets
@@ -21,7 +20,6 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     _update_headers_common,
     RequestFuncOutput,
 )
-import vllm.benchmarks.lib.endpoint_request_func
 from vllm.benchmarks.datasets import (
     get_samples as original_get_samples,
     add_dataset_parser as original_add_parser,
@@ -52,10 +50,8 @@ def _get_default_n_beams_from_argv():
     try:
         if "--n" in sys.argv:
             idx = sys.argv.index("--n")
-            n_value = sys.argv[idx + 1]
             if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
-                # sys.argv.pop(idx)  # Remove --n
-                # sys.argv.pop(idx + 1)  # Remove its value
+                n_value = sys.argv[idx + 1]
                 return int(n_value)
     except (ValueError, IndexError):
         pass  # Fallback to 1 if parsing fails
@@ -104,11 +100,12 @@ async def patched_async_request_openai_chat_completions(
         "use_beam_search": request_func_input.use_beam_search,
         "n": request_func_input.n,
         "temperature": 0.0,
-        "max_completion_tokens": request_func_input.output_len,
+        "max_tokens": request_func_input.output_len,
         "stream": True,
         "stream_options": {
             "include_usage": True,
         },
+        "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
     }
     _update_payload_common(payload, request_func_input)
 
