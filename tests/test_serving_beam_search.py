@@ -5,18 +5,27 @@ try:
     from vllm_gr.sampling_params import BeamSearchParams
 except ImportError:
     from vllm.sampling_params import BeamSearchParams
+
+try:
+    from vllm_gr.v1.metrics.stats import RequestStateStats
+except ImportError:
+    from vllm.v1.metrics.stats import RequestStateStats
+
 import pytest
 import time
+import psutil
+import torch
+from typing import Any
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseModelPath
 from vllm.inputs import TokensPrompt
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
 from transformers import AutoTokenizer
+from vllm.outputs import RequestOutput
 
 
-@pytest.mark.asyncio
-async def test_serving_beam_search():
+async def beam_search_test(loops: int):
     model_name = "OpenOneRec/OneRec-1.7B"
     beam_width = 512
     max_tokens = 5
@@ -111,7 +120,7 @@ async def test_serving_beam_search():
         prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
 
-        beam_search_params = {
+        beam_search_params: dict[str, Any] = {
             "beam_width": beam_width,
             "max_tokens": max_tokens,
             "ignore_eos": False,
@@ -123,23 +132,59 @@ async def test_serving_beam_search():
 
         params = BeamSearchParams(**beam_search_params)
 
-        print(f"Starting beam search with {model_name}, beam_width={beam_width}")
-        start = time.perf_counter()
-        generator = serving.beam_search(prompt, "req_id", params)
+        if loops <= 0:
+            loops = 1
+        print(f"Starting beam search with {model_name}, beam_width={beam_width} iterations={loops}")
+        metrics: RequestStateStats = RequestStateStats()
+        final_output: RequestOutput | None = None
+        metrics = RequestStateStats()
+        start: float = time.perf_counter()
+        for i in range(loops):
+            generator = serving.beam_search(prompt, "req_id", params)
+            async for output in generator:
+                final_output = output
+                if final_output and final_output.metrics:
+                    metrics.num_generation_tokens += final_output.metrics.num_generation_tokens
+                    if hasattr(final_output.metrics, "beam_search_overhead"):
+                        metrics.beam_search_overhead += getattr(
+                            output.metrics, "beam_search_overhead", 0
+                        )
+                    if hasattr(final_output.metrics, "beam_search_decode_time"):
+                        metrics.beam_search_decode_time += getattr(
+                            output.metrics, "beam_search_decode_time", 0
+                        )
 
-        final_output = None
-        async for output in generator:
-            final_output = output
         end = time.perf_counter()
-        print(f"metrics={final_output.metrics} elapsed {end - start}")
-
+        print(f"metrics={metrics} elapsed mean:{(end - start) / loops}")
         assert final_output is not None
         assert len(final_output.outputs) == beam_width
 
 
 @pytest.mark.asyncio
-async def test_serving_gr_beam_search():
+async def test_serving_beam_search(loops: int):
+    await beam_search_test(loops)
+
+
+@pytest.mark.asyncio
+async def test_serving_gr_beam_search(loops: int):
     from vllm_gr.patch import run_patch
 
     run_patch()
-    await test_serving_beam_search()
+    assert hasattr(BeamSearchParams, "begin_token")
+    await beam_search_test(loops)
+    before_gpu_mem: int = torch.cuda.mem_get_info()[0]
+    before_host_mem: int = psutil.Process().memory_info().rss
+    await beam_search_test(loops)
+    await beam_search_test(loops)
+    after_gpu_mem: int = torch.cuda.mem_get_info()[0]
+    after_host_mem: int = psutil.Process().memory_info().rss
+    print(
+        f"before host mem={before_host_mem / 1024**3:.2f}GB, after host mem={after_host_mem / 1024**3:.2f}GB"
+    )
+    print(
+        f"before gpu mem={before_gpu_mem / 1024**3:.2f}GB, after gpu mem={after_gpu_mem / 1024**3:.2f}GB"
+    )
+    # Allow 500MB tolerance
+    if loops > 1:
+        assert after_host_mem - before_host_mem <= 500 * 1024**2
+        assert after_gpu_mem - before_gpu_mem >= 0

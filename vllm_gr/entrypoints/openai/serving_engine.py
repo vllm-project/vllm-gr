@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import minheap_cpp as minheap
+
+try:
+    import minheap_cpp as minheap
+except ImportError:
+    minheap = None
 import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any
@@ -32,7 +36,8 @@ async def beam_search(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
-    generation_time = 0.0
+    generation_time: float = 0.0
+    num_generation_tokens: int = 0
     beam_width = params.beam_width
     max_tokens = params.max_tokens
     ignore_eos = params.ignore_eos
@@ -58,9 +63,21 @@ async def beam_search(
     sid_begin_token_id: int | None = None
     if begin_token is not None:
         sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
+        if sid_begin_token_id is None or sid_begin_token_id == -1:
+            raise VLLMValidationError(
+                "begin_token must be a valid token in the tokenizer vocabulary",
+                parameter="begin_token",
+                value=begin_token,
+            )
     sid_end_token_id: int | None = None
     if end_token is not None:
         sid_end_token_id = tokenizer.convert_tokens_to_ids(end_token)
+        if sid_begin_token_id is None or sid_begin_token_id == -1:
+            raise VLLMValidationError(
+                "end_token must be a valid token in the tokenizer vocabulary",
+                parameter="begin_token",
+                value=begin_token,
+            )
 
     if is_explicit_encoder_decoder_prompt(prompt):
         raise NotImplementedError
@@ -94,9 +111,7 @@ async def beam_search(
 
     logprobs_num = beam_width
     beam_search_params = SamplingParams(
-        logprobs=logprobs_num,
-        max_tokens=1,
-        temperature=temperature,
+        logprobs=logprobs_num, max_tokens=1, temperature=temperature, detokenize=False
     )
     initial_tokens = list(prompt_token_ids)
     initial_logprobs = []
@@ -116,12 +131,20 @@ async def beam_search(
     ]
     completed = []
 
+    beam_search_start: int = 0
     pre_calc = 0 if sid_begin_token_id is None else 1
     if sid_end_token_id is not None:
         pre_calc += 1
+    if max_tokens - pre_calc < 0:
+        raise VLLMValidationError(
+            f" max tokens should be not lower than {pre_calc}",
+            parameter="max_tokens",
+            value=max_tokens,
+        )
     for token in range(max_tokens - pre_calc):
         if token == 1:
             beam_search_start = time.perf_counter()
+
         prompts_batch, lora_req_batch = zip(
             *[
                 (
@@ -135,7 +158,8 @@ async def beam_search(
                 for beam in all_beams
             ]
         )
-
+        if token > 0:
+            num_generation_tokens += len(all_beams)
         tasks = []
         request_id_batch = f"{request_id}-{random_uuid()}"
 
@@ -223,6 +247,8 @@ async def beam_search(
 
         # Processing non-EOS tokens
         # Get indices of the top beam_width probabilities
+        if minheap is None:
+            raise ImportError("minheap_cpp is not available")
         next_beams = minheap.MinHeapTuple(beam_width)
 
         effective_eos_id = eos_token_id if not ignore_eos else -1
@@ -265,11 +291,12 @@ async def beam_search(
             tokens = beam.tokens[tokenized_length:]
         beam.text = tokenizer.decode(tokens)
 
-    total_beam_search_decode_time = time.perf_counter() - beam_search_start
-    beam_search_overhead = total_beam_search_decode_time - generation_time
+    beam_search_decode_time = time.perf_counter() - beam_search_start
+    beam_search_overhead = beam_search_decode_time - generation_time
     metrics = RequestStateStats(
         beam_search_overhead=beam_search_overhead,
-        total_beam_search_decode_time=total_beam_search_decode_time,
+        beam_search_decode_time=beam_search_decode_time,
+        num_generation_tokens=num_generation_tokens,
     )
     yield RequestOutput(
         request_id=request_id,

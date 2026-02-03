@@ -28,7 +28,7 @@ def get_ext_modules():
             [minheap_cpp_source],
             include_dirs=[pybind11.get_include()],
             language="c++",
-            extra_compile_args=["-std=c++17", "-O3", "-march=native"],
+            extra_compile_args=["-std=c++17", "-O3"],
         )
     ]
 

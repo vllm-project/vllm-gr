@@ -11,5 +11,5 @@ class BeamSearchParams(
 ):  # type: ignore[call-arg]
     """Beam search parameters for text generation."""
 
-    begin_token: int | None = None
-    end_token: int | None = None
+    begin_token: str | None = None
+    end_token: str | None = None

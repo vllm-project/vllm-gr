@@ -52,8 +52,6 @@ class MinHeap : public std::priority_queue<T, std::vector<T>, Comparator> {
       Base::push(item);
       return true;
     } else {
-      if (this->empty()) return false;
-
       Comparator comp;
       if (comp(item, this->top())) {
         Base::pop();
@@ -81,9 +79,14 @@ class MinHeap : public std::priority_queue<T, std::vector<T>, Comparator> {
     auto token_ids_r = token_ids.unchecked<1>();
 
     size_t num_items = scores_r.size();
-    if (num_items == 0 || chunk_size <= 0) return;
+    if (num_items == 0) return;
+    if (chunk_size <= 0) {
+      throw std::invalid_argument("chunk_size must be positive");
+    }
+    if (num_items % chunk_size != 0)
+      throw std::invalid_argument("num_items must be divisible by chunk_size");
 
-    size_t num_chunks = (num_items + chunk_size - 1) / chunk_size;
+    size_t num_chunks = num_items / chunk_size;
     std::vector<int> active_chunks(num_chunks);
     std::iota(active_chunks.begin(), active_chunks.end(), 0);
     size_t active_count = num_chunks;
