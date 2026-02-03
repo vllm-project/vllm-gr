@@ -26,7 +26,7 @@ uv venv --python 3.12
 source .venv/bin/activate
 python -m ensurepip --upgrade
 ln -s -r .venv/bin/pip3 .venv/bin/pip
-#make sure pip in stalled correctly
+#make sure pip is installed correctly
 pip --version
 #pip 25.0.1 from /your-path/vllm-gr/.venv/lib/python3.12/site-packages/pip (python 3.12)
 ```
@@ -50,7 +50,7 @@ python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
 
 ## Quick Start
 
-## API Server Mode (Production-like)
+### API Server Mode (Production-like)
 
 To run vllm-gr in a server--client configuration, use two terminals
 
@@ -77,7 +77,7 @@ vllm serve --gr \
 ### On the second terminal: Run single request against server with CLI
 
 ```bash
-CLI Single request Inference
+# CLI Single request Inference
 curl -X POST "http://localhost:8000/v1/chat/completions" -H "Content-Type: application/json" \
   --data '{
     "model": "OpenOneRec/OneRec-1.7B",

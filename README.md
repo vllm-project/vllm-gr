@@ -1,6 +1,6 @@
 <!-- markdownlint-disable-next-line MD033 -->
-<p align="center"> 
-  <img src="docs/assets/vLLM-GR.png" alt="vLLM-GR"> 
+<p align="center">
+  <img src="docs/assets/vLLM-GR.png" alt="vLLM-GR">
 </p>
 
 <h3 align="center">
@@ -40,7 +40,7 @@ Install vllm-gr with pip from source
 ```bash
 git clone https://github.com/JiusiServe/vllm-gr.git
 cd vllm-gr
-uv pip install --editable .
+pip install --editable .
 ```
 
 Visit the documentation pages to learn more

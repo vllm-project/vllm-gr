@@ -11,7 +11,6 @@ OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchma
 - [Task Types](#task-types)
 - [Evaluation](#evaluation)
 - [Troubleshooting](#troubleshooting)
-- [API Reference](#api-reference)
 
 ## Overview
 
@@ -19,7 +18,6 @@ OneRec is a benchmark suite designed to evaluate generative recommendation model
 
 | Task Type | Category | Description | Sample Size |
 |-----------|----------|-------------|------------|
-| `rec_reason` | Recommendation | Generate reasons for item recommendations | 2000 |
 | `ad` | Recommendation | Predict ad engagement | 500 |
 | `product` | Recommendation | Product recommendation reasoning | 1000 |
 | `label_cond` | Recommendation | Conditional label prediction | 800 |
@@ -309,33 +307,12 @@ def create_sample_data(output_path: str, num_samples: int = 100):
     print(f"✓ Created sample data: {output_path}")
 
 # Usage
-create_sample_data("./data/rec_reason/rec_reason_test.parquet", 100)
+create_sample_data("./data/video/video_test.parquet", 100)
 ```
 
 ## Task Types
 
-### 1. Recommendation Reason (`rec_reason`)
-
-Generate natural language explanations for why a specific item is recommended.
-
-- **Category**: Recommendation
-- **Sample Size**: 2000
-- **Output**: Recommendation reason text
-- **Metrics**: BLEU, ROUGE, BERTScore
-
-```python
-# Example input
-{
-    "user_history": ["Video A", "Video B"],
-    "item": "Video C",
-    "task": "Generate recommendation reason"
-}
-
-# Expected output
-"This video combines elements from your favorite categories..."
-```
-
-### 2. Ad Engagement (`ad`)
+### 1. Ad Engagement (`ad`)
 
 Predict and explain ad engagement for user interactions.
 
@@ -344,7 +321,7 @@ Predict and explain ad engagement for user interactions.
 - **Output**: Engagement prediction
 - **Metrics**: AUC, accuracy
 
-### 3. Product Recommendation (`product`)
+### 2. Product Recommendation (`product`)
 
 Generate product recommendations with reasoning.
 
@@ -353,7 +330,7 @@ Generate product recommendations with reasoning.
 - **Output**: Product ID + recommendation reason
 - **Metrics**: Precision@K, NDCG
 
-### 4. Label Conditional (`label_cond`)
+### 3. Label Conditional (`label_cond`)
 
 Predict item labels based on conditional information.
 
@@ -362,7 +339,7 @@ Predict item labels based on conditional information.
 - **Output**: Predicted label
 - **Metrics**: Accuracy, F1
 
-### 5. Video Recommendation (`video`)
+### 4. Video Recommendation (`video`)
 
 Score and rank videos for recommendation.
 
@@ -371,7 +348,7 @@ Score and rank videos for recommendation.
 - **Output**: Video ranking/scores
 - **Metrics**: NDCG, MAP
 
-### 6. Interactive (`interactive`)
+### 5. Interactive (`interactive`)
 
 Predict engagement in interactive scenarios.
 
@@ -380,7 +357,7 @@ Predict engagement in interactive scenarios.
 - **Output**: Engagement prediction
 - **Metrics**: AUC, F1
 
-### 7. Label Prediction (`label_pred`)
+### 6. Label Prediction (`label_pred`)
 
 Binary classification (discrimination) of user engagement labels.
 
@@ -407,10 +384,13 @@ Binary classification (discrimination) of user engagement labels.
 
 ### Evaluator Types
 
+For all task types listed in the [Task Types](#task-types) section
+the `RecommendationEvaluator` is the default Evaluator
+
 | Evaluator | Tasks | Metrics |
 |-----------|-------|---------|
-| `RecommendationEvaluator` | rec_reason, ad, product, label_cond, video, interactive | BLEU, ROUGE, BERTScore |
-| `RecoReasonEvaluator` | rec_reason | ROUGE, customized metrics |
+| `RecommendationEvaluator` | ad, product, label_cond, video, interactive | BLEU, ROUGE, BERTScore |
+
 
 ### Running Evaluation
 
@@ -419,7 +399,6 @@ Binary classification (discrimination) of user engagement labels.
 # Results saved to output-json
 
 python -m benchmarks.open_one_rec.one_rec_main bench throughput \
-  --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
   --dataset-name onerec \
   --dataset-path ./data \
@@ -431,8 +410,8 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
 
 ```json
 {
-  "model": "qwen/qwen-72b",
-  "task_type": "rec_reason",
+  "model": "OpenOneRec/OneRec-1.7B",
+  "task_type": "product",
   "metrics": {
     "bleu": 0.45,
     "rouge_1": 0.52,
@@ -451,7 +430,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
 #### 1. Data Not Found
 
 ```text
-FileNotFoundError: Data file not found: ./data/rec_reason/rec_reason_test.parquet
+FileNotFoundError: Data file not found: ./data/video/video_test.parquet
 ```
 
 **Solution**: Ensure data directory structure matches task names:
@@ -501,7 +480,7 @@ extra_body parameters ignored
 
 ```bash
 # Start server
-vllm serve qwen/qwen-72b-instruct --gpu-memory-utilization 0.9
+vllm serve OpenOneRec/OneRec-1.7B --gpu-memory-utilization 0.9
 
 # Use endpoint
 --endpoint http://localhost:8000/v1
@@ -513,11 +492,10 @@ Enable verbose logging:
 
 ```bash
 python -m benchmarks.open_one_rec.one_rec_main bench throughput \
-  --dataset-name onerec \
   --model OpenOneRec/OneRec-1.7B \
   --dataset-name onerec \
   --dataset-path ./data \
-  --task-types rec_reason,item_understand,label_pred \
+  --task-types ad,label_pred,video \
   --num-prompts 100 \
   --use-beam-search \
   --n 8 \
@@ -539,104 +517,14 @@ print('✓ All imports successful')
 python -c "
 from benchmarks.open_one_rec import OneRecDataset
 dataset = OneRecDataset(
-    task_types=['rec_reason'],
-    model_path='qwen/qwen-72b-instruct',
+    task_types=['video'],
+    model_path='OpenOneRec/OneRec-1.7B',
     dataset_path='./data'
 )
 print(f'✓ Loaded {len(dataset.data)} samples')
 "
 ```
 
-## API Reference
-
-### OneRecDataset
-
-```python
-from benchmarks.open_one_rec import OneRecDataset
-
-class OneRecDataset(BenchmarkDataset):
-    """
-    OneRec benchmark dataset.
-
-    Args:
-        task_types: List of task types to load (default: all 8)
-        model_path: Path to model for tokenizer
-        dataset_path: Path to data directory
-        tokenizer: Optional tokenizer instance
-        disable_shuffle: Disable data shuffling
-        sample_size: Number of samples per task
-        random_seed: Random seed for reproducibility
-    """
-
-    def __init__(
-        self,
-        task_types: list[str] = None,
-        model_path: str = None,
-        dataset_path: str = None,
-        tokenizer = None,
-        **kwargs
-    ):
-        pass
-
-    def load_data(self) -> None:
-        """Load data from disk."""
-        pass
-
-    def sample(
-        self,
-        tokenizer,
-        num_requests: int,
-        **kwargs
-    ) -> list:
-        """Sample requests from dataset."""
-        pass
-```
-
-### BaseLoader
-
-```python
-from benchmarks.open_one_rec.open_one_rec_loader import BaseLoader
-
-class BaseLoader:
-    """
-    Base data loader for OneRec tasks.
-
-    Handles:
-    - Parquet file loading
-    - Message format conversion
-    - Chat template application
-    - Metadata processing
-    """
-
-    def load_data(
-        self,
-        split: str = "test",
-        sample_size: int = None
-    ) -> dict:
-        """Load and process data."""
-        pass
-```
-
-### Task Registry
-
-```python
-from benchmarks.open_one_rec.open_one_rec_loader import TASK_REGISTRY
-
-# Access task configuration
-rec_reason_config = TASK_REGISTRY["rec_reason"].config
-
-# List all registered tasks
-print(TASK_REGISTRY.keys())
-# Output: ['rec_reason', 'item_understand', 'ad', ...]
-```
-
-## Contributing
-
-To add a new task type:
-
-1. **Create evaluator**: `benchmarks/open_one_rec/evaluators/my_task.py`
-2. **Add configuration**: Add entry to `TASK_REGISTRY` in `configs/config.py`
-3. **Register task**: Add task name to `TASK_TYPES` list
 
 ## License
 
