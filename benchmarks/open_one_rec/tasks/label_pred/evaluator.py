@@ -11,8 +11,8 @@ Computes AUC metric from logprobs-based predictions.
 
 from typing import Dict, Any, Tuple, List
 
-from .base_evaluator import BaseEval
-from ..utils import (
+from ...base_evaluator import BaseEval
+from .utils import (
     extract_label_from_answer,
     extract_probability_from_logprobs,
     calculate_auc,
@@ -245,7 +245,7 @@ class LabelPredEvaluator(BaseEval):
         logger.info(f"Invalid samples: {len(debug_info['invalid_samples'])}")
 
         # Print metrics
-        logger.info("\n[bold]Metrics:[/bold]")
+        logger.info("\nMetrics:")
         logger.info(f"  AUC: {metrics['auc']:.4f}")
 
         # Show some invalid sample examples

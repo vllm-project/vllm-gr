@@ -1,4 +1,3 @@
-# import vllm
 import aiohttp
 from tqdm import tqdm
 import vllm.benchmarks.datasets
@@ -21,7 +20,7 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     _update_headers_common,
     RequestFuncOutput,
 )
-import vllm.benchmarks.lib.endpoint_request_func
+
 from vllm.benchmarks.datasets import (
     get_samples as original_get_samples,
     add_dataset_parser as original_add_parser,
@@ -150,7 +149,9 @@ async def patched_async_request_openai_chat_completions(
                             data = json.loads(chunk)
 
                             if choices := data.get("choices"):
-                                content = choices[0]["delta"].get("content")
+                                delta = choices[0]["delta"]
+                                content = delta.get("content")
+                                reasoning_content = delta.get("reasoning_content")
                                 # First token
                                 if ttft == 0.0:
                                     ttft = timestamp - st
@@ -160,7 +161,10 @@ async def patched_async_request_openai_chat_completions(
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
 
-                                generated_text += content or ""
+                                if reasoning_content:
+                                    generated_text += reasoning_content
+                                if content:
+                                    generated_text += content
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
 
