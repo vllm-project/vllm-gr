@@ -72,7 +72,7 @@ async def beam_search(
     sid_end_token_id: int | None = None
     if end_token is not None:
         sid_end_token_id = tokenizer.convert_tokens_to_ids(end_token)
-        if sid_begin_token_id is None or sid_begin_token_id == -1:
+        if sid_end_token_id is None or sid_end_token_id == -1:
             raise VLLMValidationError(
                 "end_token must be a valid token in the tokenizer vocabulary",
                 parameter="begin_token",

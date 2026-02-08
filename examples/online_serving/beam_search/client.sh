@@ -21,7 +21,7 @@ curl -w " total time:%{time_total}s\n" -X  POST "http://localhost/v1/chat/comple
         "temperature": 0.0,
         "max_tokens": $max_tokens,
         "ignore_eos": false ,
-		"vllm_xargs": {
+		    "vllm_xargs": {
             "begin_token": "<|sid_begin|>",
             "end_token": "<|sid_end|>"
         }
