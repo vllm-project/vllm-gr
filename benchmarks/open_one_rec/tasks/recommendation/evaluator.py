@@ -10,16 +10,16 @@ Universal evaluator for all recommendation tasks.
 Computes Pass@k and Position1_Pass@k metrics.
 """
 
+from ...base_evaluator import BaseEval
+from . import utils as utils_sid
+from . import utils_by_pid as utils_pid
+
 import json
 from typing import Dict, Any, Tuple, List
 
 import logging
 
 logger = logging.getLogger(__name__)
-
-from ...base_evaluator import BaseEval
-from . import utils as utils_sid
-from . import utils_by_pid as utils_pid
 
 
 class RecommendationEvaluator(BaseEval):

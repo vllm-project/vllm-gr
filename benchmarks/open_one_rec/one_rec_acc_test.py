@@ -175,8 +175,6 @@ def main():
     task_reg = TASK_REGISTRY[args.task]
     task_config = task_reg.config
     gen_config = task_config.get("generation_config", {})
-    prompt_config = task_config.get("prompt_config", {})
-    eval_config = task_config.get("evaluation_config", {})
 
     print(f"Loaded configuration for task: {task_config['name']}")
     print(f"Description: {task_config.get('description')}")
@@ -219,14 +217,9 @@ def main():
     prompts = []
     references = {}
     sample_ids = []
-    prompt_token = ""
-    if not prompt_config.get("enable_thinking", False):
-        prompt_token = gen_config.get("prompt_token", "")
 
     for sample_id, item in dataset.items():
-        prompt = item[
-            "prompt"
-        ]  # + prompt_token ## prompt token is being filtered out in chat completion API
+        prompt = item["prompt"]
         prompts.append(prompt)
         references[sample_id] = item["ground_truth"]
         sample_ids.append(sample_id)
@@ -275,10 +268,6 @@ def main():
             "ground_truth": original_sample["ground_truth"],
             "metadata": original_sample.get("metadata", {}),
         }
-
-    # Build code_to_pid by inverting pid2sid
-    with open(args.data_dir + "/sid2pid.json", "r") as f:
-        code_to_pid = json.load(f)  # maps SID string -> PID
 
     # Instantiate evaluator and compute metrics
     evaluator_class = task_reg.evaluator_class
