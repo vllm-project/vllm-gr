@@ -10,7 +10,7 @@ Evaluates model predictions on Item Understand task using WIP (LLM-as-Judge).
 
 import os
 from typing import Dict, Any, Tuple, List
-from .base_evaluator import BaseEval
+from ...base_evaluator import BaseEval
 
 import logging
 
@@ -113,7 +113,7 @@ class ItemUnderstandEvaluator(BaseEval):
         """
         try:
             from api import get_client_from_config
-            from vllm.benchmarks.open_one_rec.utils import evaluate_wip
+            from .utils import evaluate_wip
         except ImportError as e:
             logger.info(f"[red]Failed to import WIP evaluation modules: {e}[/red]")
             return {}, {}
@@ -164,7 +164,7 @@ class ItemUnderstandEvaluator(BaseEval):
             )
 
             logger.info(
-                f"[green]WIP evaluation completed: {wip_metrics.get('wip_num_samples', 0)} samples evaluated[/green]"
+                f"WIP evaluation completed: {wip_metrics.get('wip_num_samples', 0)} samples evaluated"
             )
             return wip_metrics, wip_per_sample
 
