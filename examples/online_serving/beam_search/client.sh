@@ -19,7 +19,7 @@ curl -w " total time:%{time_total}s\n" -X  POST "http://localhost/v1/chat/comple
         "use_beam_search": true,
          "n": '"$bw"',
         "temperature": 0.0,
-        "max_tokens": $max_tokens,
+        "max_tokens": 5,
         "ignore_eos": false ,
 		    "vllm_xargs": {
             "begin_token": "<|sid_begin|>",

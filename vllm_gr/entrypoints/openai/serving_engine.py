@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from vllm.beam_search import BeamSearchSequence, create_sort_beams_key_function
+from vllm.beam_search import BeamSearchSequence
 from vllm.entrypoints.openai.protocol import VLLMValidationError
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
@@ -42,7 +42,6 @@ async def beam_search(
     max_tokens = params.max_tokens
     ignore_eos = params.ignore_eos
     temperature = params.temperature
-    length_penalty = params.length_penalty
     begin_token = params.begin_token
     end_token = params.end_token
     include_stop_str_in_output = params.include_stop_str_in_output
@@ -75,8 +74,8 @@ async def beam_search(
         if sid_end_token_id is None or sid_end_token_id == -1:
             raise VLLMValidationError(
                 "end_token must be a valid token in the tokenizer vocabulary",
-                parameter="begin_token",
-                value=begin_token,
+                parameter="end_token",
+                value=end_token,
             )
 
     if is_explicit_encoder_decoder_prompt(prompt):
@@ -106,8 +105,6 @@ async def beam_search(
     # TODO - would be ideal to handle this more gracefully.
 
     tokenized_length = len(prompt_token_ids)
-
-    sort_beams_key = create_sort_beams_key_function(eos_token_id, length_penalty)
 
     logprobs_num = beam_width
     beam_search_params = SamplingParams(
@@ -280,7 +277,7 @@ async def beam_search(
             beam.tokens.append(sid_end_token_id)
             beam.logprobs.append({sid_end_token_id: Logprob(logprob=0.0)})
     completed.extend(all_beams)
-    sorted_completed = sorted(completed, key=sort_beams_key, reverse=True)
+    sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
     best_beams = sorted_completed[:beam_width]
 
     for beam in best_beams:

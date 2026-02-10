@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from setuptools import setup, find_packages, Extension
+from setuptools import setup, Extension
 import pybind11
 
 
@@ -34,17 +34,5 @@ def get_ext_modules():
 
 
 setup(
-    name="vllm_gr",
-    version="0.1.0",
-    packages=find_packages(),
-    # This builds the extension and installs it into the package/environment
     ext_modules=get_ext_modules(),
-    install_requires=[
-        "vllm",
-        "pybind11",
-    ],
-    extras_require={
-        "test": ["pytest-asyncio"],
-    },
-    zip_safe=False,
 )

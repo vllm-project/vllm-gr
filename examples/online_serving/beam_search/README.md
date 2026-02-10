@@ -1,5 +1,5 @@
 # Installation
-refer to [quickstart.md](../../docs/quickstart.md) for installation
+refer to [quickstart.md](../../../docs/quickstart.md) for installation
 
 # running example
 - This example demonstrate using vllm-gr executing recomenandation on OneRec-1.7B model
@@ -19,7 +19,7 @@ run client (on another terminal)
 - the server would reply with **beam_width** suggested items.
 
 ```bash
-client.sh [-b beam_width ]
+./client.sh [-b beam_width ]
 
 
 ```
@@ -29,7 +29,7 @@ client.sh [-b beam_width ]
 - total execution time
 
 ```bash
-/.client.sh -b 512  
+./client.sh -b 512  
 ```
 
 Server without --gr flag
@@ -39,7 +39,7 @@ Server without --gr flag
 total time:16.198407s
 ```
 
-Server with --pr flag
+Server with --gr flag
 
 ```json
 {"id":"chatcmpl-a779679c38e57685","object":"chat.completion","created":1770297709,"model":"OpenOneRec/OneRec-1.7B","choices":
@@ -47,6 +47,6 @@ Server with --pr flag
 total time: 1.610658s
 ```
 
-- Example was tested on:
+- Example was demonstrated on:
     - Host: Intel(R) Xeon(R) Gold 5320T CPU @ 2.30GHz
     - Device: Nvidia RTX A6000 48GB
