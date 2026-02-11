@@ -430,11 +430,11 @@ class BaseLoader(ABC):
         return df
 
     def _sample_data(self, df: pd.DataFrame, sample_size: int) -> pd.DataFrame:
-        """Sample data from DataFrame"""
+        """Reproducibly sample data (take head) from DataFrame"""
         if sample_size >= len(df):
             return df
 
-        logger.info(f"Sampling {sample_size} samples (total: {len(df)})")
+        logger.info(f"Taking head {sample_size} data entries (total: {len(df)})")
         return df.head(sample_size)
 
     def _save_sample_data(self, df: pd.DataFrame, split: str, sample_size: int):
