@@ -10,8 +10,8 @@ Evaluates model predictions on Recommendation Reason task using LLM-based multi-
 
 from typing import Dict, Any, Tuple, List
 
-from .base_evaluator import BaseEval
-from ..utils import extract_after_think, evaluate_reasoning
+from ...base_evaluator import BaseEval
+from .utils import extract_after_think, evaluate_reasoning
 
 import logging
 

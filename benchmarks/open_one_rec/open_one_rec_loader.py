@@ -8,28 +8,31 @@ Base Loader for all task data loaders
 Provides common functionality for data loading, sampling, and file path resolution.
 """
 
-from .evaluators.label_pred import (
+from .tasks.label_pred import (
     LabelPredEvaluator,
 )
-from .evaluators.recommendation import (
+from .tasks.label_pred.config import LABEL_PRED_CONFIG
+
+from .tasks.recommendation.evaluator import (
     RecommendationEvaluator,
 )
-from .evaluators.item_understand import (
-    ItemUnderstandEvaluator,
-)
-from .evaluators.rec_reason import (
-    RecoReasonEvaluator,
-)
-from .configs.config import (
-    LABEL_COND_CONFIG,
+from .tasks.recommendation.config import (
     VIDEO_CONFIG,
+    LABEL_COND_CONFIG,
     PRODUCT_CONFIG,
     AD_CONFIG,
     INTERACTIVE_CONFIG,
-    LABEL_PRED_CONFIG,
-    ITEM_UNDERSTAND_CONFIG,
-    REC_REASON_CONFIG,
 )
+
+from .tasks.item_understand.evaluator import (
+    ItemUnderstandEvaluator,
+)
+from .tasks.item_understand.config import ITEM_UNDERSTAND_CONFIG
+from .tasks.rec_reason.evaluator import (
+    RecoReasonEvaluator,
+)
+from .tasks.rec_reason.config import REC_REASON_CONFIG
+
 import os
 import json
 from json import JSONDecodeError
@@ -427,12 +430,12 @@ class BaseLoader(ABC):
         return df
 
     def _sample_data(self, df: pd.DataFrame, sample_size: int) -> pd.DataFrame:
-        """Sample data from DataFrame"""
+        """Reproducibly sample data (take head) from DataFrame"""
         if sample_size >= len(df):
             return df
 
         logger.info(f"Sampling {sample_size} samples (total: {len(df)})")
-        return df.head(sample_size)
+        return df.sample(sample_size)
 
     def _save_sample_data(self, df: pd.DataFrame, split: str, sample_size: int):
         """Save sample data in parquet format"""
