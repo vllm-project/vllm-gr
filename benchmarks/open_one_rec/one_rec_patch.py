@@ -241,14 +241,6 @@ def _add_beams_arguments(parser):
                 return True
         return False
 
-    # if not _has_option("--use-beam-search"):
-    #     beams_group.add_argument(
-    #         "--use-beam-search",
-    #         action="store_true",
-    #         default=False,
-    #         help="Enable beam search during generation",
-    #     )
-
     if not _has_option("--n"):
         beams_group.add_argument(
             "--n",
@@ -394,7 +386,7 @@ def _run_offline_beam_search_benchmark(args):
     end_time = time.perf_counter()
 
     # Calculate metrics
-    total_tokens = sum(len(output.outputs) * max_tokens for output in outputs)
+    total_tokens = sum(len(output.sequences) * max_tokens for output in outputs)
     elapsed_time = end_time - start_time
 
     # Prepare results
@@ -434,9 +426,6 @@ def patched_main(args):
     is_beam_search = USE_BEAM_SEARCH or (hasattr(args, "n") and args.n and args.n > 1)
     is_offline = not hasattr(args, "endpoint") or not args.endpoint
 
-    print(
-        f"USE_BEAM_SEARCH={USE_BEAM_SEARCH}, is_beam_search={is_beam_search}, is_offline={is_offline}"
-    )
     if is_beam_search and is_offline and args.dataset_name == DATASET_NAME:
         # Use custom offline beam search benchmark
         _run_offline_beam_search_benchmark(args)

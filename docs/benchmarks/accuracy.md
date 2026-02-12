@@ -40,7 +40,7 @@ vllm serve \
 
 ```bash
 python -m benchmarks.open_one_rec.one_rec_acc_test \
-  --endpoint http://localhost:8000/v1 \
+  --endpoint /v1/chat/completions \
   --backend openai-chat \
   --model OpenOneRec/OneRec-1.7B \
   --dataset-name  onerec \

@@ -54,6 +54,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-path ./data \
   --task-types video \
   --num-prompts 1000 \
+  --max-logprobs 1024 \
   --output-json results/throughput.json  
 ```
 

@@ -47,13 +47,6 @@ def get_sampling_params(gen_config: Dict[str, Any]) -> SamplingParams:
     # use_beam_search = False
     # best_of = None
 
-    # if num_beams > 1:
-    #     use_beam_search = True
-    #     best_of = num_beams
-    #     # vLLM Constraint: best_of must be >= n
-    #     if best_of < n:
-    #         print(f"Warning: num_beams ({best_of}) < num_return_sequences ({n}). Adjusting n to {best_of}.")
-    #         n = best_of
 
     # Extract custom parameters (not passed to vLLM, but read as requested)
     num_return_thinking = gen_config.get("num_return_thinking_sequences", 0)

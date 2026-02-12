@@ -16,15 +16,16 @@ This guide explains how to run the throughput benchmark using the [`one_rec_main
 ```bash
 # Single command — everything runs in one process
 python -m benchmarks.open_one_rec.one_rec_main bench throughput \
-  --dataset-name onerec \
+  --gr \
   --model OpenOneRec/OneRec-1.7B \
+  --max-logprobs 1024 \
+  --dataset-name onerec \
   --dataset-path ./data \
   --task-types video \
   --num-prompts 100 \
   --output-json results/throughput.json  \
   --use-beam-search \
   --n 128
-
 ```
 
 ### 2. Online, API Server Mode (Production-like)
@@ -34,8 +35,8 @@ Run the server and client separately for a production‑style setup.
 #### Terminal 1 — Start the vLLM API server
 ```bash
   vllm-gr  serve \
-  --model OpenOneRec/OneRec-1.7B \
   --gr \
+  --model OpenOneRec/OneRec-1.7B \
   --max-logprobs 1024 \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
@@ -53,8 +54,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --task-types video  \
   --num-prompts 100 \
   --use-beam-search \
-  --n 128 \
-  --output-len 5
+  --n 128
 ```
 
 
@@ -62,6 +62,17 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 ## Usage
 
 ### Command Line Arguments
+
+#### Server Core Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--gr` |  |  | Whether to run vllm-gr utilities |
+| `--model` | str | - | Model ID or path to load |
+| `--max-logprobs` | int | - | Max log Probabilities output by model -- to support beam search |
+
+
+
 
 #### Core Arguments
 
@@ -75,7 +86,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 |----------|------|---------|-------------|
 | `--dataset-name` | str | - | Must be `onerec` for OneRec benchmark |
 | `--dataset-path` | str | - | Path to benchmark data directory |
-| `--num-prompts` | int | 1000 | Number of prompts to sample |
+| `--num-prompts` | int | - | Number of prompts to sample |
 | `--task-types` | str | - | Comma-separated list of task types to run |
 | `--output-json` | str | - | Path to save benchmark results as JSON |
 
@@ -84,14 +95,14 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--use-beam-search` | flag | `False` | Enable beam search during generation |
-| `--n` | int | 1 | Number of beams for beam search |
+| `--n` | int | - | Number of beams for beam search |
 
 #### Arguments for Online benchmark
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--endpoint` | str | - | API endpoint URL for online benchmark |
-| `--output-len` | int | 128 | Maximum tokens to generate |
+| `--backend` | str | 'openai-chat' | Must be `openai-chat` for OneRec online benchmark |
 
 ## Expected Output
 The output will include throughput metrics that can be used to evaluate the model's performance under load conditions.
