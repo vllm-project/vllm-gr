@@ -1,13 +1,9 @@
 import argparse
-import os
 import sys
 import json
 from typing import List, Dict, Any
 import requests
 from concurrent.futures import ThreadPoolExecutor
-
-# Ensure we can import from the local project structure
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 try:
     from vllm import LLM, SamplingParams
@@ -16,6 +12,14 @@ except ImportError:
     sys.exit(1)
 
 from benchmarks.open_one_rec.open_one_rec_loader import DataLoaderWrapper, TASK_REGISTRY
+import logging
+
+try:
+    from vllm_gr.sampling_params import BeamSearchParams
+except ImportError:
+    from vllm.sampling_params import BeamSearchParams
+
+logger = logging.getLogger(__name__)
 
 
 def get_sampling_params(gen_config: Dict[str, Any]) -> SamplingParams:
@@ -96,13 +100,13 @@ def run_api_inference(
     # Map generation config to API parameters
     api_params = {
         "model": model,
+        "use_beam_search": True if gen_config.get("num_beams", 1) > 1 else False,
         "max_tokens": gen_config.get("max_new_tokens", 1024),
-        "temperature": gen_config.get("temperature", 0.0),
-        "top_p": gen_config.get("top_p", 1.0),
+        "temperature": 0.0,  # gen_config.get("temperature", 0.0),
+        "top_p": 1.0,  # gen_config.get("top_p", 1.0),
         "n": gen_config.get("num_return_sequences", 1),
+        "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
     }
-    if gen_config.get("num_beams", 1) > 1:
-        api_params["use_beam_search"] = True
 
     def _send_request(prompt):
         payload = {"messages": [{"role": "user", "content": prompt}], **api_params}
@@ -128,6 +132,10 @@ def run_api_inference(
                 return MockRequestOutput(prompt, mock_outputs)
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
         except Exception as e:
+            print(
+                f"[DEBUG] Request failed. Status code: {response.status_code if 'response' in locals() else 'N/A'}"
+            )
+            print(f"[DEBUG] Response text: {response.text if 'response' in locals() else 'N/A'}")
             print(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
 
@@ -142,22 +150,34 @@ def run_api_inference(
 def main():
     parser = argparse.ArgumentParser(description="Run OpenOneRec Benchmark")
     parser.add_argument(
-        "--task", type=str, required=True, choices=TASK_REGISTRY.keys(), help="Task to run"
+        "--model", type=str, default="OpenOneRec/OneRec-1.7B", help="Path to model or HF hub name"
+    )
+    parser.add_argument("--dataset-name", default="onerec", help="Name of the dataset to use.")
+    parser.add_argument("--dataset-path", type=str, default="./data", help="Path to data directory")
+    parser.add_argument(
+        "--task-type", type=str, required=True, choices=TASK_REGISTRY.keys(), help="Task to run"
+    )
+    parser.add_argument("--num-prompts", type=int, help="Number of samples to run")
+
+    parser.add_argument(
+        "--endpoint", type=str, default=None, help="Endpoint URL for OpenAI-compatible API"
     )
     parser.add_argument(
-        "--model", type=str, default="facebook/opt-125m", help="Path to model or HF hub name"
+        "--host", type=str, default="localhost", help="Host for OpenAI-compatible API"
     )
-    parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to run")
-    parser.add_argument("--tensor_parallel_size", type=int, default=1, help="TP size")
-    parser.add_argument("--data_dir", type=str, default="./data", help="Path to data directory")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--backend", default="openai-chat", help="Name of the backend to use.")
     parser.add_argument(
-        "--api_url", type=str, default=None, help="Endpoint URL for OpenAI-compatible API"
-    )
-    parser.add_argument(
-        "--api_key", type=str, default="EMPTY", help="API Key for OpenAI-compatible API"
+        "--api-key", type=str, default="EMPTY", help="API Key for OpenAI-compatible API"
     )
     parser.add_argument(
-        "--predictions_dir",
+        "--use-beam-search", action="store_true", help="Whether to use beam search for generation."
+    )
+    parser.add_argument("--n", type=int, help="Beam width to use if beam search is enabled.")
+    parser.add_argument("--gr", action="store_true", help="Whether to use vllm-gr.")
+
+    parser.add_argument(
+        "--result-dir",
         type=str,
         default=None,
         help="Directory to save debug evaluation files.",
@@ -167,21 +187,38 @@ def main():
     args = parser.parse_args()
 
     # 1. Load Configuration
-    if args.task not in TASK_REGISTRY:
-        print(f"Task {args.task} not found in configuration.")
+    if args.gr:
+        logger.info(
+            "vllm detected --gr flag in serve command. Launching vllm-gr specialized serving path."
+        )
+        from vllm_gr.patch import run_patch
+
+        run_patch()
+
+    if args.task_type not in TASK_REGISTRY:
+        print(f"Task {args.task_type} not found in configuration.")
         print(f"Available tasks: {list(TASK_REGISTRY.keys())}")
         sys.exit(1)
 
-    task_reg = TASK_REGISTRY[args.task]
+    task_reg = TASK_REGISTRY[args.task_type]
     task_config = task_reg.config
     gen_config = task_config.get("generation_config", {})
 
     print(f"Loaded configuration for task: {task_config['name']}")
     print(f"Description: {task_config.get('description')}")
 
+    if args.use_beam_search and args.n:
+        gen_config["num_beams"] = args.n
+        gen_config["num_return_sequences"] = args.n  # Ensure num_return_sequences matches num_beams
+        print(f"Using beam search with beam width from CLI parameter: {args.n}")
+    else:
+        print(
+            f"Using beam search according to the config with beam width: {gen_config.get('num_beams', 1)}"
+        )
+
     # 2. Prepare Sampling Params
     sampling_params = None
-    if not args.api_url:
+    if not args.endpoint:
         try:
             sampling_params = get_sampling_params(gen_config)
         except Exception as e:
@@ -190,29 +227,33 @@ def main():
 
     # 3. Initialize Engine
     llm = None
-    if args.api_url:
-        print(f"\nUsing OpenAI-compatible API at: {args.api_url}")
+    if args.endpoint:
+        print(f"\nUsing OpenAI-compatible API at: {args.endpoint}")
         print(f"Model: {args.model}")
     else:
         print(f"\nInitializing vLLM with model: {args.model}")
         try:
             llm = LLM(
                 model=args.model,
-                tensor_parallel_size=args.tensor_parallel_size,
                 trust_remote_code=True,
+                max_logprobs=gen_config["num_beams"] * 2,
             )
         except Exception as e:
             print(f"Failed to initialize vLLM: {e}")
             sys.exit(1)
 
     # 4. Prepare Data
-    # prompts = mock_data_loader(task_config, args.num_samples)
-    print(f"Loading real data from {args.data_dir}...")
+    # prompts = mock_data_loader(task_config, args.num_prompts)  # Replace with real data loading
+    print(f"Loading real data from {args.dataset_path}...")
     loader = DataLoaderWrapper(
-        model_path=args.model, benchmark_version="v1.0", data_dir=args.data_dir
+        model_path=args.model, benchmark_version="v1.0", data_dir=args.dataset_path
     )
     split = task_config.get("splits", ["test"])[0]
-    dataset = loader.load_data(task_name=args.task, split=split, sample_size=args.num_samples)
+    dataset = loader.load_data(
+        task_name=args.task_type,
+        split=split,
+        sample_size=args.num_prompts if args.num_prompts else None,
+    )
 
     prompts = []
     references = {}
@@ -226,10 +267,43 @@ def main():
 
     # 5. Run Inference
     print("\nStarting Inference...")
-    if args.api_url:
-        outputs = run_api_inference(prompts, args.model, args.api_url, args.api_key, gen_config)
+    if args.endpoint:
+        api_url = f"http://{args.host}:{args.port}{args.endpoint}"
+        outputs = run_api_inference(prompts, args.model, api_url, args.api_key, gen_config)
     else:
-        outputs = llm.generate(prompts, sampling_params)
+        params = BeamSearchParams(
+            beam_width=gen_config["num_beams"],
+            max_tokens=sampling_params.max_tokens,
+            temperature=0.0,
+        )
+        # Add vLLM-GR specific parameters if available
+        if hasattr(BeamSearchParams, "begin_token"):
+            params.begin_token = "<|sid_begin|>"
+            params.end_token = "<|sid_end|>"
+        prompts_dict = [{"prompt": prompt} for prompt in prompts]
+
+        raw_offline_outputs = llm.beam_search(prompts_dict, params)
+
+        # Normalize beam_search outputs to match MockRequestOutput format
+        outputs = []
+        for i, raw_output in enumerate(raw_offline_outputs):
+            # beam_search returns BeamSearchOutput with .outputs containing BeamSearchSequence objects
+            # Each BeamSearchSequence has .text attribute
+            mock_completions = []
+            prompt_len = len(prompts[i])
+            if hasattr(raw_output, "sequences"):
+                for beam_seq in raw_output.sequences:
+                    text = (
+                        beam_seq.text[prompt_len:] if hasattr(beam_seq, "text") else str(beam_seq)
+                    )
+                    logprobs = getattr(beam_seq, "cum_logprob", None)
+                    mock_completions.append(MockCompletionOutput(text, logprobs))
+            else:
+                # Fallback if format is different
+                mock_completions.append(MockCompletionOutput(str(raw_output)))
+
+            prompt = raw_output.prompt if hasattr(raw_output, "prompt") else ""
+            outputs.append(MockRequestOutput(prompts[i], mock_completions))
 
     # Print a sample output
     if outputs:
@@ -273,10 +347,10 @@ def main():
     evaluator_class = task_reg.evaluator_class
     evaluator = evaluator_class(
         samples=samples_dict,
-        task_name=args.task,
+        task_name=args.task_type,
         task_config=task_config,
-        data_dir=args.data_dir,
-        predictions_dir=args.predictions_dir,
+        data_dir=args.dataset_path,
+        predictions_dir=args.result_dir,
         debug=args.debug,
     )
     metrics, per_sample_metrics = evaluator.evaluate()

@@ -30,8 +30,8 @@ RECOMMENDATION_GENERATION_CONFIG = {
     "frequency_penalty": 0,
     "prompt_token": "<|sid_begin|>",  # Token to append for two-stage generation
     "max_new_thinking_tokens": 1000,
-    "num_return_thinking_sequences": 8,  # Number of thinking candidates to generate in stage 1
-    "num_beams": 16,
+    "num_return_thinking_sequences": 1,  # Number of thinking candidates to generate in stage 1
+    "num_beams": 128,
 }
 
 # Common evaluation config for recommendation tasks

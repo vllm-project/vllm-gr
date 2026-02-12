@@ -1,15 +1,17 @@
 import aiohttp
 from tqdm import tqdm
-import vllm.benchmarks.datasets
-import vllm.benchmarks.throughput
 import atexit
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 import sys
 import time
 import traceback
 import json
 import os
+import logging
 from typing import Literal
+from vllm import LLM
+import vllm.benchmarks.datasets
+import vllm.benchmarks.throughput
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.benchmarks.lib.endpoint_request_func import (
     RequestFuncInput,
     ASYNC_REQUEST_FUNCS,
@@ -20,7 +22,6 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     _update_headers_common,
     RequestFuncOutput,
 )
-
 from vllm.benchmarks.datasets import (
     get_samples as original_get_samples,
     add_dataset_parser as original_add_parser,
@@ -36,8 +37,27 @@ from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 # ============================================================================
 # Constants
 # ============================================================================
+logger = logging.getLogger(__name__)
 DATASET_NAME = "onerec"
-DEFAULT_TASK_TYPES = "rec_reason,item_understand,ad,product,label_cond,video,interactive,label_pred"
+DEFAULT_TASK_TYPES = "ad,product,label_cond,video,interactive,label_pred"
+
+
+def _consume_use_beam_search_flag():
+    """Check for `--use-beam-search` in sys.argv, remove it, and return True if present.
+
+    This avoids argparse errors for unknown options while allowing users to pass
+    `--use-beam-search` on the command line. We intentionally consume the token
+    at import time so that the existing vLLM parsers won't see it."""
+    if "--use-beam-search" in sys.argv:
+        logger.info(
+            "Detected --use-beam-search flag in command. Enabling beam search for this benchmark run."
+        )
+        sys.argv.remove("--use-beam-search")
+        return True
+    return False
+
+
+USE_BEAM_SEARCH = _consume_use_beam_search_flag()
 
 
 def _get_default_n_beams_from_argv():
@@ -51,10 +71,8 @@ def _get_default_n_beams_from_argv():
     try:
         if "--n" in sys.argv:
             idx = sys.argv.index("--n")
-            n_value = sys.argv[idx + 1]
             if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
-                # sys.argv.pop(idx)  # Remove --n
-                # sys.argv.pop(idx + 1)  # Remove its value
+                n_value = sys.argv[idx + 1]
                 return int(n_value)
     except (ValueError, IndexError):
         pass  # Fallback to 1 if parsing fails
@@ -103,11 +121,12 @@ async def patched_async_request_openai_chat_completions(
         "use_beam_search": request_func_input.use_beam_search,
         "n": request_func_input.n,
         "temperature": 0.0,
-        "max_completion_tokens": request_func_input.output_len,
+        "max_tokens": request_func_input.output_len,
         "stream": True,
         "stream_options": {
             "include_usage": True,
         },
+        "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
     }
     _update_payload_common(payload, request_func_input)
 
@@ -213,12 +232,30 @@ def _add_onerec_arguments(parser):
 def _add_beams_arguments(parser):
     """Helper to add beam search arguments to parser."""
     beams_group = parser.add_argument_group("beam search options")
-    beams_group.add_argument(
-        "--n",
-        type=int,
-        default=DEFAULT_N_BEAMS,
-        help="Number of beams for beam search",
-    )
+
+    # Avoid adding arguments that may already be defined by vLLM's
+    # core benchmark parsers to prevent argparse conflicts.
+    def _has_option(opt: str) -> bool:
+        for a in parser._actions:
+            if hasattr(a, "option_strings") and opt in a.option_strings:
+                return True
+        return False
+
+    # if not _has_option("--use-beam-search"):
+    #     beams_group.add_argument(
+    #         "--use-beam-search",
+    #         action="store_true",
+    #         default=False,
+    #         help="Enable beam search during generation",
+    #     )
+
+    if not _has_option("--n"):
+        beams_group.add_argument(
+            "--n",
+            type=int,
+            default=DEFAULT_N_BEAMS,
+            help="Number of beams for beam search",
+        )
 
 
 def patched_get_samples(args, tokenizer):
@@ -284,18 +321,136 @@ def patched_validate_args(args):
         original_validate_args(args)
 
 
-def patched_main(args):
-    """Patch main to fix tokenizer initialization."""
-    if args.tokenizer is None and hasattr(args, "model"):
-        args.tokenizer = args.model
+def _run_offline_beam_search_benchmark(args):
+    """
+    Run offline beam search benchmark for OneRec dataset.
 
-    original_main(args)
+    This is called when --use-beam-search is specified for offline throughput mode.
+    It replaces the standard throughput benchmark for beam search scenarios.
+    """
+
+    try:
+        from vllm_gr.sampling_params import BeamSearchParams
+    except ImportError:
+        from vllm.sampling_params import BeamSearchParams
+    from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
+    from transformers import AutoTokenizer
+
+    # Initialize tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+
+    # Initialize LLM
+    logger.info(f"Initializing LLM with model: {args.model}")
+    llm = LLM(
+        model=args.model,
+        trust_remote_code=True,
+        max_logprobs=args.max_logprobs if hasattr(args, "max_logprobs") else 2048,
+        # Add other relevant vLLM arguments if available in args
+        **(
+            {"max_num_batched_tokens": getattr(args, "max_num_batched_tokens", None)}
+            if hasattr(args, "max_num_batched_tokens") and args.max_num_batched_tokens
+            else {}
+        ),
+    )
+
+    # Load dataset
+    logger.info(f"Loading OneRec dataset from {args.dataset_path}")
+    dataset = OneRecDataset(
+        dataset_path=args.dataset_path,
+        task_types=args.task_types.split(","),
+        model_path=args.model,
+        tokenizer=tokenizer,
+    )
+
+    # Sample requests
+    requests = dataset.sample(
+        num_requests=args.num_prompts,
+        tokenizer=tokenizer,
+    )
+
+    prompts = [{"prompt": req.prompt} for req in requests]
+
+    # Create beam search parameters
+    beam_width = getattr(args, "n", 8)
+    max_tokens = requests[0].expected_output_len if requests else 128
+
+    params = BeamSearchParams(
+        beam_width=beam_width,
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
+
+    # Add vLLM-GR specific parameters if available
+    if hasattr(BeamSearchParams, "begin_token"):
+        params.begin_token = "<|sid_begin|>"
+        params.end_token = "<|sid_end|>"
+
+    logger.info(f"Running beam search benchmark with {beam_width} beams on {len(prompts)} prompts")
+    logger.info(f"Max tokens per request: {max_tokens}")
+
+    # Run beam search
+    start_time = time.perf_counter()
+    outputs = llm.beam_search(prompts, params)
+    end_time = time.perf_counter()
+
+    # Calculate metrics
+    total_tokens = sum(len(output.outputs) * max_tokens for output in outputs)
+    elapsed_time = end_time - start_time
+
+    # Prepare results
+    results = {
+        "elapsed_time": elapsed_time,
+        "num_requests": len(prompts),
+        "total_num_tokens": total_tokens,
+        "requests_per_second": len(prompts) / elapsed_time,
+        "tokens_per_second": total_tokens / elapsed_time,
+        "beam_width": beam_width,
+    }
+
+    logger.info("\n" + "=" * 60)
+    logger.info("Offline Beam Search Benchmark Results")
+    logger.info("=" * 60)
+    for key, value in results.items():
+        if isinstance(value, float):
+            logger.info(f"{key}: {value:.2f}")
+        else:
+            logger.info(f"{key}: {value}")
+    logger.info("=" * 60)
+
+    # Save results if requested
+    if hasattr(args, "output_json") and args.output_json:
+        import json
+        import os
+
+        os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
+        with open(args.output_json, "w") as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"\nResults saved to: {args.output_json}")
+
+
+def patched_main(args):
+    """Patch main to handle beam search and fix tokenizer initialization."""
+    # Check if this is an offline beam search benchmark
+    is_beam_search = USE_BEAM_SEARCH or (hasattr(args, "n") and args.n and args.n > 1)
+    is_offline = not hasattr(args, "endpoint") or not args.endpoint
+
+    print(
+        f"USE_BEAM_SEARCH={USE_BEAM_SEARCH}, is_beam_search={is_beam_search}, is_offline={is_offline}"
+    )
+    if is_beam_search and is_offline and args.dataset_name == DATASET_NAME:
+        # Use custom offline beam search benchmark
+        _run_offline_beam_search_benchmark(args)
+    else:
+        # Use standard vLLM benchmark
+        if args.tokenizer is None and hasattr(args, "model"):
+            args.tokenizer = args.model
+        original_main(args)
 
 
 # ============================================================================
 # Apply Patches
 # ============================================================================
-print("Patching vllm.benchmarks for OneRec support")
+logger.info("Patching vllm.benchmarks for OneRec support")
 
 vllm.benchmarks.datasets.get_samples = patched_get_samples
 vllm.benchmarks.datasets.add_dataset_parser = patched_add_parser
