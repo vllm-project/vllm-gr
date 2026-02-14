@@ -8,6 +8,8 @@ logger = logging.getLogger(__name__)
 
 
 def main():
+    print("vllm-gr main called", flush=True)
+
     if "serve" in sys.argv and "--gr" in sys.argv:
         logger.info(
             "vllm detected --gr flag in serve command. Launching vllm-gr specialized serving path."
@@ -16,6 +18,7 @@ def main():
         from vllm.entrypoints.utils import cli_env_setup
         from vllm_gr.patch import run_patch
 
+        print("vllm-gr main: apply monkey patches", flush=True)
         run_patch()
         cli_env_setup()
         sys.argv.remove("--gr")
