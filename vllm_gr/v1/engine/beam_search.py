@@ -89,7 +89,7 @@ class BeamSearchController:
         self._sampling_params = SamplingParams(
             logprobs=req.beam_width,
             max_tokens=1,
-            temperature=req.temperature,
+            temperature=req.temperature, detokenize=False
         )
 
         # Per-step tracking
