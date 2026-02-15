@@ -95,9 +95,9 @@ def extract_refined_reasoning(text: str) -> str:
 
 
 def extract_after_think(text: str) -> str:
-    """Extract text after the last </think> tag if present."""
-    if "</think>" in text:
-        return text.split("</think>")[-1].strip()
+    """Extract text after the last  comprehend tag if present."""
+    if " comprehend" in text:
+        return text.split(" comprehend")[-1].strip()
     return text
 
 
@@ -133,7 +133,7 @@ def extract_json_from_response(response: str) -> Optional[Dict]:
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
-        logger.info(f"[yellow]Failed to parse JSON: {response[:200]}...[/yellow]")
+        logger.info(f"Failed to parse JSON: {response[:200]}...")
         return None
 
 
@@ -217,9 +217,7 @@ def evaluate_batch(
     total_attempted = len(common_ids)
     total_success = len(results)
 
-    logger.info(
-        f"[cyan]{desc} statistics: {total_attempted} attempted, {total_success} successful[/cyan]"
-    )
+    logger.info(f"{desc} statistics: {total_attempted} attempted, {total_success} successful")
 
     return results, errors
 
@@ -313,11 +311,11 @@ def load_eval_cache(cache_path: str) -> Optional[Dict[str, Dict]]:
             if "eval_result" in sample_data and sample_data["eval_result"]:
                 eval_results[sample_id] = sample_data["eval_result"]
 
-        logger.info(f"[green]Loaded {len(eval_results)} cached evaluation results[/green]")
+        logger.info(f"Loaded {len(eval_results)} cached evaluation results")
         return eval_results
 
     except Exception as e:
-        logger.info(f"[yellow]Failed to load evaluation cache: {e}[/yellow]")
+        logger.info(f"Failed to load evaluation cache: {e}")
         return None
 
 
@@ -355,7 +353,7 @@ def save_eval_results(
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(detailed_results, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"[green]Evaluation results saved to {save_path}[/green]")
+    logger.info(f"Evaluation results saved to {save_path}")
 
 
 def evaluate_reasoning(
@@ -387,13 +385,13 @@ def evaluate_reasoning(
 
     if max_samples is not None and max_samples < len(all_sample_ids):
         sample_ids = all_sample_ids[:max_samples]
-        logger.info(f"[cyan]Selected {len(sample_ids)} samples for LLM evaluation[/cyan]")
+        logger.info(f"Selected {len(sample_ids)} samples for LLM evaluation")
     else:
         sample_ids = all_sample_ids
-        logger.info(f"[cyan]Evaluating all {len(sample_ids)} samples[/cyan]")
+        logger.info(f"Evaluating all {len(sample_ids)} samples")
 
     # Extract refined reasoning from both GT and model outputs
-    logger.info("[cyan]Extracting refined reasoning...[/cyan]")
+    logger.info("Extracting refined reasoning...")
     gt_reasonings = {}
     model_reasonings = {}
 
@@ -404,7 +402,7 @@ def evaluate_reasoning(
 
         # Extract from prediction (model output)
         pred_text = predictions.get(sample_id, "")
-        pred_text = extract_after_think(pred_text)  # Remove <think> tags first
+        pred_text = extract_after_think(pred_text)  # Remove  comprehend tags first
         model_reasonings[sample_id] = extract_refined_reasoning(pred_text)
 
     # Load cached results if available
@@ -420,7 +418,7 @@ def evaluate_reasoning(
     missing_ids = {id for id in missing_ids if gt_reasonings.get(id) and model_reasonings.get(id)}
 
     if missing_ids:
-        logger.info(f"[cyan]Evaluating {len(missing_ids)} samples with LLM...[/cyan]")
+        logger.info(f"Evaluating {len(missing_ids)} samples with LLM...")
         missing_gt = {id: gt_reasonings[id] for id in missing_ids}
         missing_model = {id: model_reasonings[id] for id in missing_ids}
 
@@ -428,9 +426,9 @@ def evaluate_reasoning(
         eval_results.update(new_results)
 
         if errors:
-            logger.info(f"[red]Evaluation errors: {len(errors)} samples[/red]")
+            logger.info(f"Evaluation errors: {len(errors)} samples")
     else:
-        logger.info(f"[green]All {len(sample_ids)} samples already evaluated (from cache)[/green]")
+        logger.info(f"All {len(sample_ids)} samples already evaluated (from cache)")
 
     # Calculate metrics
     metrics = calculate_metrics(eval_results)
@@ -443,9 +441,7 @@ def evaluate_reasoning(
         )
 
     # Print summary
-    logger.info(
-        f"[green]LLM evaluation completed: {metrics.get('llm_eval_num_samples', 0)} samples[/green]"
-    )
-    logger.info(f"[green]  LLM Score: {metrics.get('llm_score', 0):.4f}[/green]")
+    logger.info(f"LLM evaluation completed: {metrics.get('llm_eval_num_samples', 0)} samples")
+    logger.info(f"  LLM Score: {metrics.get('llm_score', 0):.4f}")
 
     return metrics, per_sample_metrics

@@ -44,8 +44,6 @@ def get_sampling_params(gen_config: Dict[str, Any]) -> SamplingParams:
 
     # Handle Beam Search
     num_beams = gen_config.get("num_beams", 1)
-    # use_beam_search = False
-    # best_of = None
 
     # Extract custom parameters (not passed to vLLM, but read as requested)
     num_return_thinking = gen_config.get("num_return_thinking_sequences", 0)
@@ -180,9 +178,7 @@ def main():
 
     # 1. Load Configuration
     if args.gr:
-        logger.info(
-            "vllm detected --gr flag in serve command. Launching vllm-gr specialized serving path."
-        )
+        logger.info("Detected --gr flag, enabling vllm-gr mode for accuracy test.")
         from vllm_gr.patch import run_patch
 
         run_patch()
@@ -208,16 +204,7 @@ def main():
             f"Using beam search according to the config with beam width: {gen_config.get('num_beams', 1)}"
         )
 
-    # 2. Prepare Sampling Params
-    sampling_params = None
-    if not args.endpoint:
-        try:
-            sampling_params = get_sampling_params(gen_config)
-        except Exception as e:
-            print(f"Failed to create SamplingParams: {e}")
-            sys.exit(1)
-
-    # 3. Initialize Engine
+    # 2. Initialize Engine
     llm = None
     if args.endpoint:
         print(f"\nUsing OpenAI-compatible API at: {args.endpoint}")
@@ -234,7 +221,7 @@ def main():
             print(f"Failed to initialize vLLM: {e}")
             sys.exit(1)
 
-    # 4. Prepare Data
+    # 3. Prepare Data
     # prompts = mock_data_loader(task_config, args.num_prompts)  # Replace with real data loading
     print(f"Loading real data from {args.dataset_path}...")
     loader = DataLoaderWrapper(
@@ -257,7 +244,7 @@ def main():
         references[sample_id] = item["ground_truth"]
         sample_ids.append(sample_id)
 
-    # 5. Run Inference
+    # 4. Run Inference
     print("\nStarting Inference...")
     if args.endpoint:
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
@@ -265,7 +252,7 @@ def main():
     else:
         params = BeamSearchParams(
             beam_width=gen_config["num_beams"],
-            max_tokens=sampling_params.max_tokens,
+            max_tokens=gen_config["max_new_tokens"],
             temperature=0.0,
         )
         # Add vLLM-GR specific parameters if available
@@ -294,7 +281,6 @@ def main():
                 # Fallback if format is different
                 mock_completions.append(MockCompletionOutput(str(raw_output)))
 
-            prompt = raw_output.prompt if hasattr(raw_output, "prompt") else ""
             outputs.append(MockRequestOutput(prompts[i], mock_completions))
 
     # Print a sample output
@@ -305,7 +291,7 @@ def main():
         if outputs[0].outputs[0].logprobs:
             print("Logprobs available: Yes")
 
-    # 6. Run Evaluation
+    # 5. Run Evaluation
     print("\n--- Running Evaluation ---")
 
     # Prepare samples dictionary in the format expected by the evaluator.
@@ -347,7 +333,7 @@ def main():
     )
     metrics, per_sample_metrics = evaluator.evaluate()
 
-    print("\n--- Evaluation Results ---")
+    print(f"\n--- Evaluation Results for {args.task_type} ---")
     print(json.dumps(metrics, indent=2))
 
 
