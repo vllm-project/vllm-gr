@@ -19,7 +19,6 @@ def patch_engine_core_beam_search():
     """Inject engine-core beam search into stock vllm via monkey-patching."""
     import vllm.v1.engine as engine_mod
     from vllm.v1.engine import EngineCoreRequestType
-    from vllm.v1.engine.core import EngineCore
     from vllm.v1.engine.core_client import AsyncMPClient
     from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -28,12 +27,6 @@ def patch_engine_core_beam_search():
         BeamSearchResult,
         BeamSearchSequenceResult,
         PatchedEngineCoreOutputs,
-    )
-    from vllm_gr.v1.engine.engine_core_patch import (
-        make_patched_engine_core_init,
-        patched_handle_client_request,
-        patched_process_engine_step,
-        patched_process_input_sockets,
     )
     from vllm_gr.v1.engine.core_client_patch import (
         beam_search_async,
@@ -47,15 +40,17 @@ def patch_engine_core_beam_search():
     engine_mod.BeamSearchSequenceResult = BeamSearchSequenceResult
     engine_mod.BeamSearchResult = BeamSearchResult
 
-    # 2. Add BEAM_SEARCH to EngineCoreRequestType enum
-    beam_val = b"\x06"
-    beam_member = object.__new__(EngineCoreRequestType)
-    beam_member._name_ = "BEAM_SEARCH"
-    beam_member._value_ = beam_val
-    EngineCoreRequestType._value2member_map_[beam_val] = beam_member
-    EngineCoreRequestType._member_map_["BEAM_SEARCH"] = beam_member
-    EngineCoreRequestType._member_names_.append("BEAM_SEARCH")
-    EngineCoreRequestType.BEAM_SEARCH = beam_member
+    # 2. Add BEAM_SEARCH to EngineCoreRequestType enum (skip if already present)
+    if not hasattr(EngineCoreRequestType, "BEAM_SEARCH"):
+        beam_val = b"\x06"
+        beam_member = object.__new__(EngineCoreRequestType)
+        beam_member._name_ = "BEAM_SEARCH"
+        beam_member._value_ = beam_val
+        EngineCoreRequestType._value2member_map_[beam_val] = beam_member
+        EngineCoreRequestType._member_map_["BEAM_SEARCH"] = beam_member
+        EngineCoreRequestType._member_names_.append("BEAM_SEARCH")
+        # Bypass enum metaclass __setattr__ which blocks member assignment
+        type.__setattr__(EngineCoreRequestType, "BEAM_SEARCH", beam_member)
 
     # 3. Replace EngineCoreOutputs with patched version (adds
     #    beam_search_result field).  Also update the module-level name so
@@ -63,16 +58,17 @@ def patch_engine_core_beam_search():
     #    *after* patching picks up the new class.
     engine_mod.EngineCoreOutputs = PatchedEngineCoreOutputs
 
-    # 4. Wrap EngineCore.__init__ to add active_beam_searches
-    EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
-
-    # 5. Replace EngineCore methods
-    EngineCore._process_engine_step = patched_process_engine_step
-    EngineCore._handle_client_request = patched_handle_client_request
-
-    # 6. Replace EngineCoreProc.process_input_sockets
+    # 4-6. EngineCore and EngineCoreProc patches must run INSIDE the child
+    #       process (multiprocessing 'spawn' starts a fresh interpreter).
+    #       Replace run_engine_core with our module-level wrapper that
+    #       applies patches before the engine starts.  The wrapper is a
+    #       module-level function so multiprocessing 'spawn' can pickle it.
     from vllm.v1.engine.core import EngineCoreProc
-    EngineCoreProc.process_input_sockets = patched_process_input_sockets
+    from vllm_gr.v1.engine.engine_core_patch import (
+        patched_run_engine_core,
+    )
+
+    EngineCoreProc.run_engine_core = staticmethod(patched_run_engine_core)
 
     # 7. Wrap AsyncMPClient.__init__, replace _ensure_output_queue_task,
     #    add beam_search_async
