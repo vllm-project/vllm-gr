@@ -3,6 +3,7 @@
 import os
 from setuptools import setup, Extension
 import pybind11
+import numpy
 
 
 def get_ext_modules():
@@ -26,7 +27,7 @@ def get_ext_modules():
         Extension(
             "minheap_cpp",
             [minheap_cpp_source],
-            include_dirs=[pybind11.get_include()],
+            include_dirs=[pybind11.get_include(), numpy.get_include()],
             language="c++",
             extra_compile_args=["-std=c++17", "-O3"],
         )

@@ -128,13 +128,13 @@ async def beam_search(
     ]
     completed = []
 
-    beam_search_start: int = 0
+    beam_search_start: int = time.perf_counter()
     pre_calc = 0 if sid_begin_token_id is None else 1
     if sid_end_token_id is not None:
         pre_calc += 1
     if max_tokens - pre_calc < 0:
         raise VLLMValidationError(
-            f" max tokens should be not lower than {pre_calc}",
+            f"max tokens should be not lower than {pre_calc} to accomedate reserved begin/end tokens.",
             parameter="max_tokens",
             value=max_tokens,
         )
@@ -213,6 +213,8 @@ async def beam_search(
 
             if result.outputs[0].logprobs is not None:
                 logprobs = result.outputs[0].logprobs[0]
+                if len(logprobs) > logprobs_num:
+                    logprobs = dict(list(logprobs.items())[:logprobs_num])
                 all_beams_token_id.extend(list(logprobs.keys()))
                 all_beams_logprob.extend(
                     [current_beam.cum_logprob + obj.logprob for obj in logprobs.values()]

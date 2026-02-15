@@ -79,7 +79,6 @@ async def beam_search_test(loops: int):
         print(f"Starting beam search with {model_name}, beam_width={beam_width} iterations={loops}")
         metrics: RequestStateStats = RequestStateStats()
         final_output: RequestOutput | None = None
-        metrics = RequestStateStats()
         start: float = time.perf_counter()
         for i in range(loops):
             generator = serving.beam_search(prompt, "req_id", params)
