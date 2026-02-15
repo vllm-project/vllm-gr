@@ -57,11 +57,6 @@ async def beam_search(
             )
         eos_token_id: int = tokenizer.eos_token_id  # type: ignore
 
-        # todo: remove. should get them from client (online or offline)
-        params.begin_token = "<|sid_begin|>"
-        params.end_token = "<|sid_end|>"
-        print(f"OpenAiServing::beam_search begin_token:{params.begin_token} end_token: {params.begin_token}")
-
         # Resolve begin_token / end_token to token IDs
         sid_begin_token_id: int | None = None
         if params.begin_token is not None:

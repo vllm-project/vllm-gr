@@ -79,18 +79,7 @@ def patch_engine_core_beam_search():
     # 8. Add AsyncLLM.engine_beam_search
     AsyncLLM.engine_beam_search = engine_beam_search
 
-    # 9. Update the MsgpackDecoder type used in AsyncMPClient to decode
-    #    PatchedEngineCoreOutputs instead of the original EngineCoreOutputs.
-    #    The decoder is created in MPClient.__init__ as self.decoder, so we
-    #    need to update it *after* the client is constructed.  We do this by
-    #    further wrapping AsyncMPClient.__init__.
-    from vllm.v1.serial_utils import MsgpackDecoder
-
-    _prev_init = AsyncMPClient.__init__
-
-    def _init_with_decoder_fix(self, *args, **kwargs):
-        _prev_init(self, *args, **kwargs)
-        # Replace the decoder with one that knows about the patched type.
-        self.decoder = MsgpackDecoder(PatchedEngineCoreOutputs)
-
-    AsyncMPClient.__init__ = _init_with_decoder_fix
+    # 9. MsgpackDecoder fix is now handled inside make_patched_async_mp_init
+    #    (step 7).  The decoder must be replaced and the output queue task
+    #    restarted BEFORE _ensure_output_queue_task captures it, which
+    #    happens during original_init.

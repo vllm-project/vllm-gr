@@ -115,6 +115,21 @@ def patched_process_engine_step(self) -> bool:
     # Step the engine core.
     outputs, model_executed = self.step_fn()
 
+    if self.active_beam_searches:
+        n_pending = sum(len(c._pending_rids) for c in self.active_beam_searches)
+        n_outputs = sum(
+            len(eo.outputs) for eo in outputs.values()
+        ) if outputs else 0
+        logger.info(
+            "patched_step: active_ctrls=%d, pending_rids=%d, "
+            "outputs=%d, model_executed=%s, has_requests=%s",
+            len(self.active_beam_searches),
+            n_pending,
+            n_outputs,
+            model_executed,
+            self.scheduler.has_requests(),
+        )
+
     # Feed outputs to active beam search controllers and filter
     # beam sub-request outputs before sending to client.
     if self.active_beam_searches and outputs:
@@ -147,6 +162,13 @@ def patched_process_engine_step(self) -> bool:
         # Collect finished controllers and emit their results.
         finished = [c for c in self.active_beam_searches if c.is_done]
         for c in finished:
+            logger.info(
+                "beam_search FINISHED: req_id=%s, n_sequences=%d, "
+                "client_index=%d, queueing result",
+                c.request_id,
+                len(c.result.sequences),
+                c.client_index,
+            )
             self.output_queue.put_nowait(
                 (c.client_index,
                  _engine_mod.EngineCoreOutputs(beam_search_result=c.result))
