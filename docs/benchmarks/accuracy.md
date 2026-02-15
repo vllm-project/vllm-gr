@@ -30,7 +30,7 @@ Run the server and client separately for a production‑style setup.
 #### Terminal 1 — Start the vLLM API server
 ```bash
 vllm serve \
-  --gr
+  --gr \
   --model OpenOneRec/OneRec-1.7B \
   --max-logprobs 1024 \
   --default-chat-template-kwargs '{"enable_thinking": false}'
@@ -71,14 +71,14 @@ optionally, one can modify the beam width from the default dataset definition. S
 | `--task-type` | str | - | Task to run (ad, product, label_cond, video, interactive, label_pred)|
 | `--result-dir` | str | - | Directory to save debug evaluation files |
 | `--debug` | - | - | Enable debug mode for evaluators |
-| `--use-beam-search` | bool |  | Enable beam search during generation |
-| `--n` | int | - | Override the test default number of beams for beam search |
+| `--use-beam-search` | flag | - | Enable beam search during generation |
+| `--n` | int | dataset-specific | Override the dataset default beam width (number of beams) for beam search |
 
 #### Arguments for Online benchmark
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--endpoint` | str | - | Maximum tokens to generate |
+| `--endpoint` | str | - | API endpoint URL for the online benchmark (e.g., /v1/chat/completions) |
 | `--backend` | str | 'openai-chat' | Must be `openai-chat` for OneRec online benchmark |
 | `--api-key` | str | - | API Key for OpenAI-compatible API |
 

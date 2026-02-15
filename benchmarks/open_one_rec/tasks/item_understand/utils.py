@@ -1,4 +1,4 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
@@ -248,7 +248,7 @@ def extract_wips_batch(
     valid_results = sum(1 for wips in results.values() if wips)  # Count non-empty lists
 
     logger.info(
-        f"[cyan]{desc} statistics: {total_attempted} attempted, {total_parsed} parsed, {valid_results} valid (non-empty)[/cyan]"
+        f"{desc} statistics: {total_attempted} attempted, {total_parsed} parsed, {valid_results} valid (non-empty)"
     )
 
     return results, errors
@@ -348,7 +348,7 @@ def match_wips_batch(
                 valid_results += 1
 
     logger.info(
-        f"[cyan]Matching statistics: {total_attempted} attempted, {total_parsed} parsed, {valid_results} valid (non-empty)[/cyan]"
+        f"Matching statistics: {total_attempted} attempted, {total_parsed} parsed, {valid_results} valid (non-empty)"
     )
 
     return results, errors
@@ -691,7 +691,7 @@ def save_wip_detailed_results(
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(detailed_results, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"[green]WIP detailed results saved to {save_path}[/green]")
+    logger.info(f"WIP detailed results saved to {save_path}")
 
 
 def get_gt_cache_path(cache_dir: str, model_name: str) -> str:
@@ -734,7 +734,7 @@ def load_wip_results_cache(cache_path: str) -> Optional[Dict[str, Any]]:
         }
 
     except Exception as e:
-        logger.info(f"[yellow]Failed to load WIP results cache: {e}[/yellow]")
+        logger.info(f"Failed to load WIP results cache: {e}")
         return None
 
 
@@ -762,11 +762,11 @@ def load_gt_wips_cache(cache_path: str) -> Optional[Dict[str, List[Dict]]]:
             if wips:
                 result[sample_id] = wips
         logger.info(
-            f"[green]Loaded GT WIPs cache from {cache_path} ({len(result)} samples)[/green]"
+            f"Loaded GT WIPs cache from {cache_path} ({len(result)} samples)"
         )
         return result
     except Exception as e:
-        logger.info(f"[yellow]Failed to load GT cache: {e}[/yellow]")
+        logger.info(f"Failed to load GT cache: {e}")
         return None
 
 
@@ -786,7 +786,7 @@ def save_gt_wips_cache(gt_wips: Dict[str, List[Dict]], cache_path: str):
 
     df = pd.DataFrame(data)
     df.to_parquet(cache_path, index=False)
-    logger.info(f"[green]Saved GT WIPs cache to {cache_path} ({len(gt_wips)} samples)[/green]")
+    logger.info(f"Saved GT WIPs cache to {cache_path} ({len(gt_wips)} samples)")
 
 
 def _load_or_extract_gt_wips(
@@ -809,7 +809,7 @@ def _load_or_extract_gt_wips(
             missing_ids = set(sample_ids) - set(gt_wips.keys())
             if missing_ids:
                 logger.info(
-                    f"[yellow]Missing {len(missing_ids)} samples in GT cache, extracting...[/yellow]"
+                    f"Missing {len(missing_ids)} samples in GT cache, extracting..."
                 )
                 missing_refs = {id: references[id] for id in missing_ids}
                 new_gt_wips, gt_errors = extract_wips_batch(
@@ -820,10 +820,10 @@ def _load_or_extract_gt_wips(
                 save_gt_wips_cache(full_gt_cache, cache_path)
 
                 if gt_errors:
-                    logger.info(f"[red]GT extraction errors: {len(gt_errors)} samples[/red]")
+                    logger.info(f"GT extraction errors: {len(gt_errors)} samples")
 
     if gt_wips is None:
-        logger.info("[cyan]Extracting GT WIPs...[/cyan]")
+        logger.info("Extracting GT WIPs...")
         gt_wips, gt_errors = extract_wips_batch(
             references, llm_client, max_workers, "Extracting GT WIPs"
         )
@@ -833,16 +833,16 @@ def _load_or_extract_gt_wips(
             save_gt_wips_cache(gt_wips, cache_path)
 
         if gt_errors:
-            logger.info(f"[red]GT extraction errors: {len(gt_errors)} samples[/red]")
+            logger.info(f"GT extraction errors: {len(gt_errors)} samples")
 
     return gt_wips
 
 
-# Extract text after last </think> tag if present
+# Extract text after last と思 tag if present
 def extract_after_think(text: str) -> str:
-    """Extract text after the last </think> tag"""
-    if "</think>" in text:
-        return text.split("</think>")[-1].strip()
+    """Extract text after the last と思 tag"""
+    if "と思" in text:
+        return text.split("と思")[-1].strip()
     return text
 
 
@@ -863,14 +863,14 @@ def _load_or_extract_model_wips(
         cached_data = load_wip_results_cache(wip_cache_path)
         if cached_data:
             model_wips = cached_data.get("model_wips", {})
-            logger.info(f"[green]Loaded {len(model_wips)} cached model_wips[/green]")
+            logger.info(f"Loaded {len(model_wips)} cached model_wips")
 
     missing_model_ids = set(sample_ids) - set(model_wips.keys())
     missing_model_ids = {id for id in missing_model_ids if id in gt_wips}
 
     if missing_model_ids:
         logger.info(
-            f"[cyan]Extracting Model WIPs for {len(missing_model_ids)} missing samples...[/cyan]"
+            f"Extracting Model WIPs for {len(missing_model_ids)} missing samples..."
         )
         missing_predictions = {id: extract_after_think(predictions[id]) for id in missing_model_ids}
         new_model_wips, model_errors = extract_wips_batch(
@@ -879,10 +879,10 @@ def _load_or_extract_model_wips(
         model_wips.update(new_model_wips)
 
         if model_errors:
-            logger.info(f"[red]Model extraction errors: {len(model_errors)} samples[/red]")
+            logger.info(f"Model extraction errors: {len(model_errors)} samples")
     else:
         logger.info(
-            f"[green]All {len(sample_ids)} samples already have Model WIPs (from cache)[/green]"
+            f"All {len(sample_ids)} samples already have Model WIPs (from cache)"
         )
 
     return model_wips
@@ -905,7 +905,7 @@ def _load_or_match_wips(
         cached_data = load_wip_results_cache(wip_cache_path)
         if cached_data:
             match_results = cached_data.get("match_results", {})
-            logger.info(f"[green]Loaded {len(match_results)} cached match_results[/green]")
+            logger.info(f"Loaded {len(match_results)} cached match_results")
 
     missing_match_ids = set(sample_ids) - set(match_results.keys())
     # Only match if both gt_wips and model_wips exist and are non-empty
@@ -916,7 +916,7 @@ def _load_or_match_wips(
     }
 
     if missing_match_ids:
-        logger.info(f"[cyan]Matching WIPs for {len(missing_match_ids)} missing samples...[/cyan]")
+        logger.info(f"Matching WIPs for {len(missing_match_ids)} missing samples...")
         missing_gt_wips = {id: gt_wips[id] for id in missing_match_ids}
         missing_model_wips = {id: model_wips[id] for id in missing_match_ids}
         new_match_results, match_errors = match_wips_batch(
@@ -925,10 +925,10 @@ def _load_or_match_wips(
         match_results.update(new_match_results)
 
         if match_errors:
-            logger.info(f"[red]Matching errors: {len(match_errors)} samples[/red]")
+            logger.info(f"Matching errors: {len(match_errors)} samples")
     else:
         logger.info(
-            f"[green]All {len(sample_ids)} samples already have match results (from cache)[/green]"
+            f"All {len(sample_ids)} samples already have match results (from cache)"
         )
 
     return match_results
@@ -944,7 +944,7 @@ def _compute_bertscore_incremental(
     import torch
     from bert_score import BERTScorer
 
-    logger.info("[cyan]Computing BERTScore for matched pairs...[/cyan]")
+    logger.info("Computing BERTScore for matched pairs...")
 
     all_gt_texts = []
     all_model_texts = []
@@ -980,7 +980,7 @@ def _compute_bertscore_incremental(
 
     if all_gt_texts and all_model_texts:
         logger.info(
-            f"[cyan]Computing BERTScore for {len(all_gt_texts)} new matched pairs...[/cyan]"
+            f"Computing BERTScore for {len(all_gt_texts)} new matched pairs..."
         )
         device = "cuda" if torch.cuda.is_available() else "cpu"
         scorer = BERTScorer(
@@ -1001,14 +1001,14 @@ def _compute_bertscore_incremental(
                 ]
 
             logger.info(
-                f"[green]Computed BERTScore for {len(match_qualities)} matched pairs[/green]"
+                f"Computed BERTScore for {len(match_qualities)} matched pairs"
             )
         except Exception as e:
-            logger.info(f"[red]BERTScore computation failed: {e}[/red]")
+            logger.info(f"BERTScore computation failed: {e}")
             for sample_id, match_idx, _ in sample_match_indices:
                 match_results[sample_id]["matches"][match_idx]["match_quality"] = None
     else:
-        logger.info("[green]All matches already have BERTScore (from cache)[/green]")
+        logger.info("All matches already have BERTScore (from cache)")
 
 
 def evaluate_wip(
@@ -1056,11 +1056,11 @@ def evaluate_wip(
     if max_samples is not None and max_samples < len(all_sample_ids):
         sample_ids = all_sample_ids[:max_samples]
         logger.info(
-            f"[cyan]Selected {len(sample_ids)} samples for WIP evaluation (sorted by sample_id)[/cyan]"
+            f"Selected {len(sample_ids)} samples for WIP evaluation (sorted by sample_id)"
         )
     else:
         sample_ids = all_sample_ids
-        logger.info(f"[cyan]Evaluating all {len(sample_ids)} samples for WIP[/cyan]")
+        logger.info(f"Evaluating all {len(sample_ids)} samples for WIP")
 
     selected_predictions = {id: predictions[id] for id in sample_ids}
     selected_references = {id: references[id] for id in sample_ids}
@@ -1085,7 +1085,7 @@ def evaluate_wip(
 
     # Step 4: Calculate three types of metrics (each with overall, core, and per-sample)
     logger.info(
-        "[cyan]Computing all metrics (unweighted, importance-weighted, double-weighted)...[/cyan]"
+        "Computing all metrics (unweighted, importance-weighted, double-weighted)..."
     )
 
     # 4.1: Unweighted metrics
@@ -1141,7 +1141,7 @@ def evaluate_wip(
 
     # Step 5: Save detailed results to file
     if save_dir:
-        logger.info("[cyan]Saving WIP detailed results...[/cyan]")
+        logger.info("Saving WIP detailed results...")
         save_wip_detailed_results(
             save_dir=save_dir,
             sample_ids=sample_ids,
@@ -1154,15 +1154,15 @@ def evaluate_wip(
             filename=f"wip_{model_name}.json",
         )
 
-    logger.info(f"[green]WIP evaluation completed: {metrics['wip_num_samples']} samples[/green]")
+    logger.info(f"WIP evaluation completed: {metrics['wip_num_samples']} samples")
     logger.info(
-        f"[green]  Macro Unweighted F1: {metrics['macro_wip_unweighted_f1']:.4f} (Core: {metrics['macro_wip_unweighted_core_f1']:.4f})[/green]"
+        f"  Macro Unweighted F1: {metrics['macro_wip_unweighted_f1']:.4f} (Core: {metrics['macro_wip_unweighted_core_f1']:.4f})"
     )
     logger.info(
-        f"[green]  Macro Importance-weighted F1: {metrics['macro_wip_importance_weighted_f1']:.4f} (Core: {metrics['macro_wip_importance_weighted_core_f1']:.4f})[/green]"
+        f"  Macro Importance-weighted F1: {metrics['macro_wip_importance_weighted_f1']:.4f} (Core: {metrics['macro_wip_importance_weighted_core_f1']:.4f})"
     )
     logger.info(
-        f"[green]  Macro Double-weighted F1: {metrics['macro_wip_double_weighted_f1']:.4f} (Core: {metrics['macro_wip_double_weighted_core_f1']:.4f})[/green]"
+        f"  Macro Double-weighted F1: {metrics['macro_wip_double_weighted_f1']:.4f} (Core: {metrics['macro_wip_double_weighted_core_f1']:.4f})"
     )
 
     return metrics, per_sample_metrics

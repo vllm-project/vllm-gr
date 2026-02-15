@@ -103,9 +103,8 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --task-types video \
   --num-prompts 100 \
   --use-beam-search \
-  --n 128 \
-  --output-len 5
-
+  --n 128 
+  
 # For accuracy -- Run accuracy benchmark against server
 python -m benchmarks.open_one_rec.one_rec_acc_test \
   --endpoint /v1/chat/completions \
