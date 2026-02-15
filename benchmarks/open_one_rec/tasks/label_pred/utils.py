@@ -1,4 +1,4 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
@@ -23,13 +23,13 @@ def extract_label_from_answer(answer: str) -> int:
     Extract binary label from answer string
 
     Args:
-        answer: Answer string (e.g., "是<|im_end|>" or "否<|im_end|>")
+        answer: Answer string (e.g., "是" or "否")
 
     Returns:
         1 if positive ("是"), 0 if negative ("否"), -1 if unrecognized
 
     Examples:
-        >>> extract_label_from_answer("是<|im_end|>")
+        >>> extract_label_from_answer("是")
         1
         >>> extract_label_from_answer("否")
         0
@@ -68,7 +68,7 @@ def extract_probability_from_logprobs(
         ValueError: If JSON parsing fails or required tokens are missing
 
     Examples:
-        >>> generations = ['</think>\\n{"是": 0.7, "否": 0.3}']
+        >>> generations = ['{"是": 0.7, "否": 0.3}']
         >>> result = extract_probability_from_logprobs(generations)
         >>> result['score']
         0.7
@@ -80,12 +80,12 @@ def extract_probability_from_logprobs(
     scores = []
 
     for idx, generation in enumerate(generations):
-        # Extract JSON part: check for </think> tag first
-        if "</think>" in generation:
-            # Extract content after </think>
-            json_str = generation.split("</think>")[-1].strip()
+        # Extract JSON part: check for  tag first
+        if "ground_truth" in generation:
+            # Extract content after  tag
+            json_str = generation.split("ground_truth")[-1].strip()
         else:
-            # No </think> tag, try to parse the entire string
+            # No  tag, try to parse the entire string
             json_str = generation.strip()
 
         # Parse JSON and extract probability
@@ -180,14 +180,14 @@ def calculate_auc(predictions: Dict[str, float], labels: Dict[str, int]) -> floa
         AUC value (float between 0 and 1)
     """
     if not predictions or not labels:
-        logger.info("[red]✗ Predictions or labels are empty[/red]")
+        logger.info("✗ Predictions or labels are empty")
         return 0.0
 
     # Align predictions and labels
     sample_ids = sorted(set(predictions.keys()) & set(labels.keys()))
 
     if len(sample_ids) == 0:
-        logger.info("[red]✗ No overlapping samples between predictions and labels[/red]")
+        logger.info("✗ No overlapping samples between predictions and labels")
         return 0.0
 
     y_true = np.array([labels[id] for id in sample_ids])
@@ -195,7 +195,7 @@ def calculate_auc(predictions: Dict[str, float], labels: Dict[str, int]) -> floa
 
     # Check if we have both positive and negative samples
     if len(np.unique(y_true)) < 2:
-        logger.info("[yellow]⚠ Only one class present in labels, AUC is not defined[/yellow]")
+        logger.info("⚠ Only one class present in labels, AUC is not defined")
         return 0.5
 
     try:
@@ -203,7 +203,7 @@ def calculate_auc(predictions: Dict[str, float], labels: Dict[str, int]) -> floa
         auc = roc_auc_score(y_true, y_scores)
         return float(auc)
     except ValueError as e:
-        logger.info(f"[red]✗ Error calculating AUC: {e}[/red]")
+        logger.info(f"✗ Error calculating AUC: {e}")
         return 0.5
 
 
