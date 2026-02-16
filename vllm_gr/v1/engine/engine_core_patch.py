@@ -223,8 +223,36 @@ def patched_handle_client_request(
             (client_idx, _engine_mod.EngineCoreOutputs(utility_output=output))
         )
     elif request_type == EngineCoreRequestType.BEAM_SEARCH:
-        controller = BeamSearchController(self, request)
-        controller.submit_step()
+        try:
+            controller = BeamSearchController(self, request)
+            controller.submit_step()
+        except BaseException as e:
+            # Ensure that beam search failures do not silently leave client
+            # futures hanging. Log and make a best-effort attempt to notify
+            # the client of the error, if routing information is available.
+            logger.exception("Beam search request handling failed")
+            client_idx = getattr(request, "client_idx", None)
+            if client_idx is not None and hasattr(_engine_mod, "BeamSearchResult"):
+                try:
+                    # Attempt to construct an error-style BeamSearchResult.
+                    # This is best-effort and guarded to avoid secondary
+                    # failures if the constructor signature differs.
+                    error_result = _engine_mod.BeamSearchResult(
+                        error=str(e)
+                    )
+                    self.output_queue.put_nowait(
+                        (
+                            client_idx,
+                            _engine_mod.EngineCoreOutputs(
+                                beam_search_result=error_result
+                            ),
+                        )
+                    )
+                except BaseException:
+                    logger.exception(
+                        "Failed to send beam search error result to client"
+                    )
+            return
         self.active_beam_searches.append(controller)
     elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
         raise RuntimeError("Executor failed.")
