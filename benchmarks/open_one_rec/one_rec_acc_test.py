@@ -1,6 +1,9 @@
 import argparse
-import sys
 import json
+import logging
+import os
+import sys
+import time
 from typing import List, Dict, Any
 import requests
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +15,6 @@ except ImportError:
     sys.exit(1)
 
 from benchmarks.open_one_rec.open_one_rec_loader import DataLoaderWrapper, TASK_REGISTRY
-import logging
 
 try:
     from vllm_gr.sampling_params import BeamSearchParams
@@ -148,7 +150,7 @@ def main():
         "--task-type", type=str, required=True, choices=TASK_REGISTRY.keys(), help="Task to run"
     )
     parser.add_argument("--num-prompts", type=int, help="Number of samples to run")
-
+    parser.add_argument("--temperature", type=float, help="Temperature for generation")
     parser.add_argument(
         "--endpoint", type=str, default=None, help="Endpoint URL for OpenAI-compatible API"
     )
@@ -195,7 +197,10 @@ def main():
     print(f"Loaded configuration for task: {task_config['name']}")
     print(f"Description: {task_config.get('description')}")
 
-    if args.use_beam_search and args.n:
+    if hasattr(args, "temperature") and args.temperature is not None:
+        gen_config["temperature"] = args.temperature
+        print(f"Using temperature from CLI parameter: {args.temperature}")
+    if hasattr(args, "n"):
         gen_config["num_beams"] = args.n
         gen_config["num_return_sequences"] = args.n  # Ensure num_return_sequences matches num_beams
         print(f"Using beam search with beam width from CLI parameter: {args.n}")
@@ -246,6 +251,7 @@ def main():
 
     # 4. Run Inference
     print("\nStarting Inference...")
+    gen_start = time.perf_counter()
     if args.endpoint:
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         outputs = run_api_inference(prompts, args.model, api_url, args.api_key, gen_config)
@@ -253,7 +259,7 @@ def main():
         params = BeamSearchParams(
             beam_width=gen_config["num_beams"],
             max_tokens=gen_config["max_new_tokens"],
-            temperature=0.0,
+            temperature=gen_config["temperature"],
         )
         # Add vLLM-GR specific parameters if available
         if hasattr(BeamSearchParams, "begin_token"):
@@ -282,6 +288,8 @@ def main():
                 mock_completions.append(MockCompletionOutput(str(raw_output)))
 
             outputs.append(MockRequestOutput(prompts[i], mock_completions))
+
+    gen_end = time.perf_counter()
 
     # Print a sample output
     if outputs:
@@ -333,8 +341,25 @@ def main():
     )
     metrics, per_sample_metrics = evaluator.evaluate()
 
-    print(f"\n--- Evaluation Results for {args.task_type} ---")
+    print(f"\n--- Evaluation Results for {args.task_type} on model {args.model} ---")
+
+    model_params = {}
+    model_params["model"] = args.model
+    model_params["task"] = args.task_type
+    model_params["beam_width"] = gen_config.get("num_beams", 1)
+    model_params["temperature"] = gen_config.get("temperature", 0.0)
+    model_params["time_per_sample"] = (gen_end - gen_start) / len(prompts) if prompts else 0.0
+    metrics = {**model_params, **metrics}
     print(json.dumps(metrics, indent=2))
+    if hasattr(args, "result_dir"):
+        os.makedirs(args.result_dir, exist_ok=True)
+        bw = model_params["beam_width"]
+        filename = f"{args.model.split('/')[-1]}_{args.task_type}_bw{bw}_{len(prompts)}.json"
+        output_path = os.path.join(args.result_dir, filename)
+        # Save metrics (a Python dict) as JSON
+        with open(output_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Saved metrics to {output_path}")
 
 
 if __name__ == "__main__":

@@ -22,11 +22,11 @@ OneRec is a benchmark suite designed to evaluate generative recommendation model
 
 | Task Type | Category | Description | Sample Size |
 |-----------|----------|-------------|------------|
-| `ad` | Recommendation | Predict ad engagement | 500 |
-| `product` | Recommendation | Product recommendation reasoning | 1000 |
-| `label_cond` | Recommendation | Conditional label prediction | 800 |
-| `video` | Recommendation | Video recommendation scoring | 1500 |
-| `interactive` | Recommendation | Interactive engagement prediction | 600 |
+| `ad` | Recommendation | Predict ad engagement | 27677 |
+| `product` | Recommendation | Product recommendation reasoning | 27910 |
+| `label_cond` | Recommendation | Conditional label prediction | 34891 |
+| `video` | Recommendation | Video recommendation scoring | 38781 |
+| `interactive` | Recommendation | Interactive engagement prediction | 1000 |
 | `label_pred` | Classification | User engagement classification | 346190 |
 
 ### Key Features
