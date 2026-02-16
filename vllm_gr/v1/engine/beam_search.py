@@ -175,7 +175,7 @@ class BeamSearchController:
         self._beam_selection()
         t3 = time.monotonic()
 
-        logger.info(
+        logger.debug(
             "beam step %d: %d beams, "
             "create=%.1fms, step=%.1fms, select=%.1fms, "
             "total=%.1fms",

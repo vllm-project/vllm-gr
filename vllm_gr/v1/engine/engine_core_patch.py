@@ -71,7 +71,7 @@ def apply_engine_core_child_patches():
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = patched_process_input_sockets
 
-    logger.info("Beam search engine-core patches applied in child process.")
+    logger.debug("Beam search engine-core patches applied in child process.")
 
 
 def patched_run_engine_core(*args, **kwargs):
@@ -120,7 +120,7 @@ def patched_process_engine_step(self) -> bool:
         n_outputs = sum(
             len(eo.outputs) for eo in outputs.values()
         ) if outputs else 0
-        logger.info(
+        logger.debug(
             "patched_step: active_ctrls=%d, pending_rids=%d, "
             "outputs=%d, model_executed=%s, has_requests=%s",
             len(self.active_beam_searches),
@@ -162,7 +162,7 @@ def patched_process_engine_step(self) -> bool:
         # Collect finished controllers and emit their results.
         finished = [c for c in self.active_beam_searches if c.is_done]
         for c in finished:
-            logger.info(
+            logger.debug(
                 "beam_search FINISHED: req_id=%s, n_sequences=%d, "
                 "client_index=%d, queueing result",
                 c.request_id,
@@ -275,7 +275,6 @@ def patched_process_input_sockets(
 ):
     """Replacement for EngineCoreProc.process_input_sockets with beam search
     decoder."""
-    import threading
     from contextlib import ExitStack
 
     import zmq

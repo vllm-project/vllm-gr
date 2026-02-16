@@ -8,7 +8,6 @@ import msgspec
 
 from vllm.v1.engine import (
     EngineCoreOutput,
-    EngineCoreOutputs,
     SchedulerStats,
     UtilityOutput,
 )
@@ -64,7 +63,7 @@ class PatchedEngineCoreOutputs(
     """Drop-in replacement for EngineCoreOutputs with beam_search_result."""
 
     engine_index: int = 0
-    outputs: list[EngineCoreOutput] = []
+    outputs: list[EngineCoreOutput] = msgspec.field(default_factory=list)
     scheduler_stats: SchedulerStats | None = None
     timestamp: float = 0.0
     utility_output: UtilityOutput | None = None

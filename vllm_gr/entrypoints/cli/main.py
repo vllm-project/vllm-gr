@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    print("vllm-gr main called", flush=True)
+    logger.debug("vllm-gr main called")
 
     if "serve" in sys.argv and "--gr" in sys.argv:
         logger.info(
@@ -18,7 +18,7 @@ def main():
         from vllm.entrypoints.utils import cli_env_setup
         from vllm_gr.patch import run_patch
 
-        print("vllm-gr main: apply monkey patches", flush=True)
+        logger.debug("vllm-gr main: apply monkey patches")
         run_patch()
         cli_env_setup()
         sys.argv.remove("--gr")

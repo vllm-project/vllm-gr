@@ -9,8 +9,7 @@ except ImportError:
 import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any
-
-import numpy as np
+import logging
 
 from vllm.beam_search import BeamSearchSequence
 from vllm.entrypoints.openai.protocol import VLLMValidationError
@@ -28,6 +27,8 @@ from vllm.utils.async_utils import (
 
 from vllm_gr.v1.engine.types import BeamSearchRequest
 
+logger = logging.getLogger(__name__)
+
 async def beam_search(
     self,
     prompt: PromptType,
@@ -36,6 +37,12 @@ async def beam_search(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
+    if params.beam_width is None or params.beam_width <= 0:
+        raise VLLMValidationError(
+            "beam_width must be a positive integer",
+            parameter="beam_width",
+            value=params.beam_width,
+        )
     beam_width = params.beam_width
     max_tokens = params.max_tokens
     ignore_eos = params.ignore_eos
@@ -150,4 +157,7 @@ async def beam_search(
             prompt_token_ids=prompt_token_ids,
             prompt_logprobs=None,
         )
+    else:
+        logger.error("missing engine_beam_search method to handle beam search in EngineCore")
+
 
