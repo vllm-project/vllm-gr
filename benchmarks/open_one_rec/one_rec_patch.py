@@ -8,6 +8,7 @@ import json
 import os
 import logging
 from typing import Literal
+import vllm
 from vllm import LLM
 import vllm.benchmarks.datasets
 import vllm.benchmarks.throughput
