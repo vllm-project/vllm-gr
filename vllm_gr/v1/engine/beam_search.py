@@ -29,8 +29,16 @@ def _get_beam_search_score(
     length_penalty: float = 1.0,
 ) -> float:
     seq_len = len(tokens)
+    # If there are no tokens, or if all tokens are effectively EOS (seq_len
+    # becomes 0 after EOS adjustment), avoid division by zero. In these
+    # edge cases we simply return the cumulative log probability without
+    # applying a length penalty.
+    if seq_len == 0:
+        return cumulative_logprob
     if tokens[-1] == eos_token_id:
         seq_len -= 1
+        if seq_len <= 0:
+            return cumulative_logprob
     return cumulative_logprob / (seq_len**length_penalty)
 
 

@@ -134,9 +134,24 @@ def patched_ensure_output_queue_task(self):
                 if outputs.outputs or outputs.scheduler_stats:
                     outputs_queue.put_nowait(outputs)
         except Exception as e:
+            # Propagate the exception to all pending beam search futures so
+            # that callers do not hang waiting for results that will never
+            # arrive.
+            for future in beam_search_futures.values():
+                if not future.done():
+                    future.set_exception(e)
+            beam_search_futures.clear()
             outputs_queue.put_nowait(e)
         except asyncio.CancelledError:
-            outputs_queue.put_nowait(EngineDeadError())
+            # If the output processing task is cancelled (for example,
+            # because the engine died), fail all pending beam search futures
+            # with an EngineDeadError.
+            err = EngineDeadError()
+            for future in beam_search_futures.values():
+                if not future.done():
+                    future.set_exception(err)
+            beam_search_futures.clear()
+            outputs_queue.put_nowait(err)
 
     resources.output_queue_task = asyncio.create_task(
         process_outputs_socket(), name="EngineCoreOutputQueueTask"
