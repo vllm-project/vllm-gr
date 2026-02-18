@@ -133,10 +133,13 @@ def patched_process_engine_step(self) -> bool:
     # Feed outputs to active beam search controllers and filter
     # beam sub-request outputs before sending to client.
     if self.active_beam_searches and outputs:
-        # Collect all pending beam request IDs to filter them out.
+        # Snapshot all beam request IDs for the current step BEFORE
+        # on_outputs(), which mutates _pending_rids and may trigger
+        # submit_step() for the next step.  We need the full set of
+        # current-step IDs to filter them from client-bound outputs.
         beam_rids: set[str] = set()
         for ctrl in self.active_beam_searches:
-            beam_rids.update(ctrl._pending_rids)
+            beam_rids.update(ctrl._beam_req_ids)
 
         for ctrl in self.active_beam_searches:
             ctrl.on_outputs(outputs)
