@@ -309,6 +309,19 @@ class BeamSearchController:
         )
         req = self._req
 
+        if not self._completed and not self._all_beams:
+            logger.warning(
+                "_finish: req_id=%s, all beams were pruned — "
+                "returning empty result",
+                req.request_id,
+            )
+            self._result = BeamSearchResult(
+                request_id=req.request_id,
+                sequences=[],
+            )
+            self._done = True
+            return
+
         # Track which beams completed naturally via EOS BEFORE appending
         # sid_end_token_id, to avoid misidentifying finish_reason when
         # sid_end_token_id == eos_token_id.
