@@ -8,6 +8,7 @@ import json
 import os
 import logging
 from typing import Literal
+import vllm
 from vllm import LLM
 import vllm.benchmarks.datasets
 import vllm.benchmarks.throughput
@@ -94,6 +95,25 @@ def _get_output_len_from_argv():
     return int(0)
 
 
+def _get_output_len_from_argv():
+    """
+    Parses sys.argv to find the value for --output-len.
+    NOTE: This is a workaround. Reading directly from sys.argv at module import
+    is fragile. A more robust solution would involve passing the parsed 'output_len'
+    argument from the benchmark's main function down to where RequestFuncInput
+    is created.
+    """
+    try:
+        if "--output-len" in sys.argv:
+            idx = sys.argv.index("--output-len")
+            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
+                output_len_value = sys.argv[idx + 1]
+                return int(output_len_value)
+    except (ValueError, IndexError):
+        pass  # Fallback to 1 if parsing fails
+    return int(0)
+
+
 USE_BEAM_SEARCH = _consume_use_beam_search_flag()
 ARGS_N_BEAMS = _get_n_beams_from_argv()
 ARGS_OUTPUT_LEN = _get_output_len_from_argv()
@@ -104,12 +124,19 @@ atexit.register(cleanup_dist_env_and_memory)
 # ============================================================================
 original_init = RequestFuncInput.__init__
 
-def __init__(self, *args, use_beam_search=USE_BEAM_SEARCH, n=ARGS_N_BEAMS, args_output_len=ARGS_OUTPUT_LEN, **kwargs):
+def __init__(
+    self,
+    *args,
+    use_beam_search=USE_BEAM_SEARCH,
+    n=ARGS_N_BEAMS,
+    args_output_len=ARGS_OUTPUT_LEN,
+    **kwargs,
+):
     """Patched init to support beam search parameters."""
     original_init(self, *args, **kwargs)
     self.use_beam_search = use_beam_search
     self.n = n
-    if (args_output_len > 0):
+    if args_output_len > 0:
         print(f"Setting output_len to {args_output_len} based on command line argument")
         self.output_len = args_output_len
 
@@ -430,7 +457,6 @@ def _run_offline_beam_search_benchmark(args):
 
     # Save results if requested
     if hasattr(args, "output_json") and args.output_json:
-
         os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
         with open(args.output_json, "w") as f:
             json.dump(results, f, indent=2)

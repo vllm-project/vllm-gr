@@ -73,6 +73,8 @@ optionally, one can modify the beam width from the default dataset definition. S
 | `--debug` | - | - | Enable debug mode for evaluators |
 | `--use-beam-search` | flag | - | Enable beam search during generation |
 | `--n` | int | dataset-specific | Override the dataset default beam width (number of beams) for beam search |
+| `--temperature` | float | dataset-specific | Override the dataset default temperature |
+
 
 #### Arguments for Online benchmark
 

@@ -217,9 +217,7 @@ def evaluate_batch(
     total_attempted = len(common_ids)
     total_success = len(results)
 
-    logger.info(
-        f"{desc} statistics: {total_attempted} attempted, {total_success} successful"
-    )
+    logger.info(f"{desc} statistics: {total_attempted} attempted, {total_success} successful")
 
     return results, errors
 
@@ -443,9 +441,7 @@ def evaluate_reasoning(
         )
 
     # Print summary
-    logger.info(
-        f"LLM evaluation completed: {metrics.get('llm_eval_num_samples', 0)} samples"
-    )
+    logger.info(f"LLM evaluation completed: {metrics.get('llm_eval_num_samples', 0)} samples")
     logger.info(f"  LLM Score: {metrics.get('llm_score', 0):.4f}")
 
     return metrics, per_sample_metrics

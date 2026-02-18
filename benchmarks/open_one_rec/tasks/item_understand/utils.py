@@ -761,9 +761,7 @@ def load_gt_wips_cache(cache_path: str) -> Optional[Dict[str, List[Dict]]]:
                 wips = json.loads(wips)
             if wips:
                 result[sample_id] = wips
-        logger.info(
-            f"Loaded GT WIPs cache from {cache_path} ({len(result)} samples)"
-        )
+        logger.info(f"Loaded GT WIPs cache from {cache_path} ({len(result)} samples)")
         return result
     except Exception as e:
         logger.info(f"Failed to load GT cache: {e}")
@@ -808,9 +806,7 @@ def _load_or_extract_gt_wips(
 
             missing_ids = set(sample_ids) - set(gt_wips.keys())
             if missing_ids:
-                logger.info(
-                    f"Missing {len(missing_ids)} samples in GT cache, extracting..."
-                )
+                logger.info(f"Missing {len(missing_ids)} samples in GT cache, extracting...")
                 missing_refs = {id: references[id] for id in missing_ids}
                 new_gt_wips, gt_errors = extract_wips_batch(
                     missing_refs, llm_client, max_workers, "Extracting GT WIPs"
@@ -869,9 +865,7 @@ def _load_or_extract_model_wips(
     missing_model_ids = {id for id in missing_model_ids if id in gt_wips}
 
     if missing_model_ids:
-        logger.info(
-            f"Extracting Model WIPs for {len(missing_model_ids)} missing samples..."
-        )
+        logger.info(f"Extracting Model WIPs for {len(missing_model_ids)} missing samples...")
         missing_predictions = {id: extract_after_think(predictions[id]) for id in missing_model_ids}
         new_model_wips, model_errors = extract_wips_batch(
             missing_predictions, llm_client, max_workers, "Extracting Model WIPs"
@@ -881,9 +875,7 @@ def _load_or_extract_model_wips(
         if model_errors:
             logger.info(f"Model extraction errors: {len(model_errors)} samples")
     else:
-        logger.info(
-            f"All {len(sample_ids)} samples already have Model WIPs (from cache)"
-        )
+        logger.info(f"All {len(sample_ids)} samples already have Model WIPs (from cache)")
 
     return model_wips
 
@@ -927,9 +919,7 @@ def _load_or_match_wips(
         if match_errors:
             logger.info(f"Matching errors: {len(match_errors)} samples")
     else:
-        logger.info(
-            f"All {len(sample_ids)} samples already have match results (from cache)"
-        )
+        logger.info(f"All {len(sample_ids)} samples already have match results (from cache)")
 
     return match_results
 
@@ -979,9 +969,7 @@ def _compute_bertscore_incremental(
                     sample_match_indices.append((sample_id, match_idx, batch_idx))
 
     if all_gt_texts and all_model_texts:
-        logger.info(
-            f"Computing BERTScore for {len(all_gt_texts)} new matched pairs..."
-        )
+        logger.info(f"Computing BERTScore for {len(all_gt_texts)} new matched pairs...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         scorer = BERTScorer(
             model_type=bertscore_model,
@@ -1000,9 +988,7 @@ def _compute_bertscore_incremental(
                     batch_idx
                 ]
 
-            logger.info(
-                f"Computed BERTScore for {len(match_qualities)} matched pairs"
-            )
+            logger.info(f"Computed BERTScore for {len(match_qualities)} matched pairs")
         except Exception as e:
             logger.info(f"BERTScore computation failed: {e}")
             for sample_id, match_idx, _ in sample_match_indices:
@@ -1055,9 +1041,7 @@ def evaluate_wip(
 
     if max_samples is not None and max_samples < len(all_sample_ids):
         sample_ids = all_sample_ids[:max_samples]
-        logger.info(
-            f"Selected {len(sample_ids)} samples for WIP evaluation (sorted by sample_id)"
-        )
+        logger.info(f"Selected {len(sample_ids)} samples for WIP evaluation (sorted by sample_id)")
     else:
         sample_ids = all_sample_ids
         logger.info(f"Evaluating all {len(sample_ids)} samples for WIP")
@@ -1084,9 +1068,7 @@ def evaluate_wip(
     _compute_bertscore_incremental(sample_ids, match_results, bertscore_model, bertscore_num_layers)
 
     # Step 4: Calculate three types of metrics (each with overall, core, and per-sample)
-    logger.info(
-        "Computing all metrics (unweighted, importance-weighted, double-weighted)..."
-    )
+    logger.info("Computing all metrics (unweighted, importance-weighted, double-weighted)...")
 
     # 4.1: Unweighted metrics
     unweighted_metrics = calculate_unweighted_metrics(match_results, core_threshold=core_threshold)

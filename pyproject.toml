@@ -1,5 +1,9 @@
 [build-system]
+<<<<<<< HEAD
 requires = ["setuptools>=61.0", "wheel", "pybind11"]
+=======
+requires = ["setuptools>=61.0", "wheel", "pybind11","numpy"]
+>>>>>>> accuracy_benchmark_pr
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -27,7 +31,10 @@ classifiers = [
 ]
 
 dependencies = [
-    "vllm==0.14.*"
+    "vllm==0.14.*",
+    "pandas>=3.0.0",
+    "scikit-learn>=1.8.0",
+    "pyarrow>=23.0.0"
 ]
 
 [project.optional-dependencies]
@@ -39,6 +46,7 @@ dev = [
     "black",
     "ruff",
     "mypy",
+    "psutil"
 ]
 
 [project.scripts]
@@ -57,7 +65,11 @@ target-version = ["py310", "py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
+
+[tool.mypy]
+strict = true
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
