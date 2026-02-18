@@ -6,6 +6,8 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
@@ -231,10 +233,120 @@ class BeamSearchController:
             self._finish()
 
     def _beam_selection(self) -> None:
-        """Select top beams from candidates (identical to original logic)."""
+        """Select top beams from candidates using numpy vectorization."""
         req = self._req
-        # Each candidate is a (logprob, parent_idx, token_id) tuple.
-        # Tuples are lighter than dicts and sort naturally by first element.
+
+        # Phase 1 — Collect numpy arrays from outputs
+        cum_logprobs: list[float] = []
+        all_top_logprobs: list[np.ndarray] = []
+        all_top_token_ids: list[np.ndarray] = []
+        beam_map: list[int] = []  # maps numpy row → original beam index
+        k_per_beam: int = -1
+
+        for i, beam in enumerate(self._all_beams):
+            rid = self._beam_req_ids[i]
+            if rid not in self._output_by_rid:
+                continue
+            new_token_ids, new_logprobs = self._output_by_rid[rid]
+            if new_logprobs is None:
+                continue
+
+            lp_token_ids = new_logprobs.logprob_token_ids
+            lp_values = new_logprobs.logprobs
+
+            top_token_ids = (
+                lp_token_ids[0] if lp_token_ids.ndim == 2 else lp_token_ids
+            )
+            top_logprobs = (
+                lp_values[0] if lp_values.ndim == 2 else lp_values
+            )
+
+            k = len(top_token_ids)
+            if k_per_beam == -1:
+                k_per_beam = k
+            elif k != k_per_beam:
+                # Non-uniform sizes — fall back to pure-Python path
+                self._beam_selection_python()
+                return
+
+            cum_logprobs.append(beam.cum_logprob)
+            all_top_logprobs.append(np.asarray(top_logprobs))
+            all_top_token_ids.append(np.asarray(top_token_ids))
+            beam_map.append(i)
+
+        if not cum_logprobs:
+            self._all_beams = []
+            return
+
+        n_valid = len(cum_logprobs)
+
+        # Phase 2 — Vectorized candidate generation
+        cum_arr = np.array(cum_logprobs)               # (n_valid,)
+        lp_mat = np.vstack(all_top_logprobs)            # (n_valid, k)
+        tid_mat = np.vstack(all_top_token_ids)          # (n_valid, k)
+        combined = cum_arr[:, np.newaxis] + lp_mat      # (n_valid, k)
+
+        # Mask out -inf values
+        combined[~np.isfinite(combined)] = -np.inf
+
+        # Phase 3 — Top-k partial sort
+        flat = combined.ravel()
+        n_total = flat.shape[0]
+        top_k = min(req.beam_width * 3, n_total)
+
+        # argpartition is O(n) — much faster than full sort for large arrays
+        if top_k < n_total:
+            part_idx = np.argpartition(-flat, top_k)[:top_k]
+        else:
+            part_idx = np.arange(n_total)
+
+        # Sort only the top_k candidates
+        top_vals = flat[part_idx]
+        sorted_order = np.argsort(-top_vals)
+        sorted_flat_idx = part_idx[sorted_order]
+
+        # Convert flat indices back to (beam_row, token_offset)
+        k = k_per_beam
+        beam_rows = sorted_flat_idx // k
+        token_offsets = sorted_flat_idx % k
+
+        # Phase 4 — Build beams (dedup/EOS logic, ~beam_width iterations)
+        new_beams: list[_Beam] = []
+        seen_sequences: set[tuple[int, ...]] = set()
+
+        for idx in range(len(sorted_flat_idx)):
+            if len(new_beams) >= req.beam_width:
+                break
+
+            row = int(beam_rows[idx])
+            col = int(token_offsets[idx])
+            cum_lp = float(flat[sorted_flat_idx[idx]])
+            if cum_lp == float("-inf"):
+                continue
+
+            parent_idx = beam_map[row]
+            token_id = int(tid_mat[row, col])
+
+            parent = self._all_beams[parent_idx]
+            new_tokens = parent.tokens + [token_id]
+            seq_tuple = tuple(new_tokens)
+
+            if seq_tuple not in seen_sequences:
+                if not req.ignore_eos and token_id == req.eos_token_id:
+                    self._completed.append(
+                        _Beam(tokens=new_tokens, cum_logprob=cum_lp)
+                    )
+                else:
+                    new_beams.append(
+                        _Beam(tokens=new_tokens, cum_logprob=cum_lp)
+                    )
+                    seen_sequences.add(seq_tuple)
+
+        self._all_beams = new_beams
+
+    def _beam_selection_python(self) -> None:
+        """Pure-Python fallback for non-uniform logprob sizes."""
+        req = self._req
         all_candidates: list[tuple[float, int, int]] = []
 
         for i, beam in enumerate(self._all_beams):
@@ -283,17 +395,11 @@ class BeamSearchController:
             if seq_tuple not in seen_sequences:
                 if not req.ignore_eos and token_id == req.eos_token_id:
                     self._completed.append(
-                        _Beam(
-                            tokens=new_tokens,
-                            cum_logprob=cum_lp,
-                        )
+                        _Beam(tokens=new_tokens, cum_logprob=cum_lp)
                     )
                 else:
                     new_beams.append(
-                        _Beam(
-                            tokens=new_tokens,
-                            cum_logprob=cum_lp,
-                        )
+                        _Beam(tokens=new_tokens, cum_logprob=cum_lp)
                     )
                     seen_sequences.add(seq_tuple)
 
