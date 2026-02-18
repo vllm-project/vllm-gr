@@ -143,10 +143,13 @@ def patched_ensure_output_queue_task(self):
             outputs_queue.put_nowait(e)
         except asyncio.CancelledError:
             # Task was cancelled (e.g. during init restart to swap the
-            # decoder).  Exit quietly — the replacement task will take
-            # over processing and the shared beam_search_futures dict
-            # remains intact for it.
-            pass
+            # decoder).  Fail any pending beam search futures so they
+            # don't hang, but do NOT enqueue into outputs_queue to
+            # avoid surfacing a spurious error to consumers.
+            for future in beam_search_futures.values():
+                if not future.done():
+                    future.cancel()
+            beam_search_futures.clear()
 
     resources.output_queue_task = asyncio.create_task(
         process_outputs_socket(), name="EngineCoreOutputQueueTask"
