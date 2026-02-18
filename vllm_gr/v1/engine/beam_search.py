@@ -123,6 +123,12 @@ class BeamSearchController:
         """Create Request objects for current beams and add to scheduler."""
         from vllm.v1.request import Request
 
+        # If effective_max_tokens is 0, finish immediately without
+        # submitting any scheduler requests (honour the max_tokens contract).
+        if self._step >= self._effective_max_tokens:
+            self._finish()
+            return
+
         self._step_t0 = time.monotonic()
         self._beam_req_ids = []
         self._output_by_rid = {}
