@@ -202,6 +202,27 @@ def patched_process_engine_step(self) -> bool:
             )
             self.active_beam_searches.remove(c)
 
+    # Check for timed-out controllers (scheduler never produced output).
+    if self.active_beam_searches:
+        timed_out = [c for c in self.active_beam_searches if c.is_timed_out]
+        for ctrl in timed_out:
+            logger.error(
+                "beam_search controller timed out: req_id=%s, step=%d, "
+                "pending_rids=%d",
+                ctrl.request_id, ctrl._step, len(ctrl._pending_rids),
+            )
+            error_result = BeamSearchResult(
+                request_id=ctrl.request_id,
+                sequences=[],
+                error="beam search step timed out waiting for scheduler",
+            )
+            self.output_queue.put_nowait(
+                (ctrl.client_index,
+                 _engine_mod.EngineCoreOutputs(
+                     beam_search_result=error_result))
+            )
+            self.active_beam_searches.remove(ctrl)
+
     # Put EngineCoreOutputs into the output queue.
     for output in outputs.items() if outputs else ():
         self.output_queue.put_nowait(output)

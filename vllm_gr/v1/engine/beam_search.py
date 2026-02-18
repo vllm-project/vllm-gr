@@ -50,6 +50,9 @@ class _Beam:
         self.cum_logprob = cum_logprob
 
 
+_STEP_TIMEOUT_S = 120  # seconds before a pending step is considered stuck
+
+
 class BeamSearchController:
     """Non-blocking beam search controller (state machine).
 
@@ -126,6 +129,15 @@ class BeamSearchController:
     @property
     def request_id(self) -> str:
         return self._req.request_id
+
+    @property
+    def is_timed_out(self) -> bool:
+        """True if the current step has been pending longer than the timeout."""
+        return (
+            bool(self._pending_rids)
+            and self._step_t0 > 0
+            and (time.monotonic() - self._step_t0) > _STEP_TIMEOUT_S
+        )
 
     def submit_step(self) -> None:
         """Create Request objects for current beams and add to scheduler."""
