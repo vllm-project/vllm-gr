@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.engine.core_client import _process_utility_output
-from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_gr.v1.engine.types import (
     BeamSearchRequest,
@@ -143,15 +142,11 @@ def patched_ensure_output_queue_task(self):
             beam_search_futures.clear()
             outputs_queue.put_nowait(e)
         except asyncio.CancelledError:
-            # If the output processing task is cancelled (for example,
-            # because the engine died), fail all pending beam search futures
-            # with an EngineDeadError.
-            err = EngineDeadError()
-            for future in beam_search_futures.values():
-                if not future.done():
-                    future.set_exception(err)
-            beam_search_futures.clear()
-            outputs_queue.put_nowait(err)
+            # Task was cancelled (e.g. during init restart to swap the
+            # decoder).  Exit quietly — the replacement task will take
+            # over processing and the shared beam_search_futures dict
+            # remains intact for it.
+            pass
 
     resources.output_queue_task = asyncio.create_task(
         process_outputs_socket(), name="EngineCoreOutputQueueTask"
