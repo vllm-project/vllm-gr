@@ -52,6 +52,7 @@ class BeamSearchResult(
 ):
     request_id: str
     sequences: list[BeamSearchSequenceResult]
+    error: str | None = None
 
 
 class PatchedEngineCoreOutputs(

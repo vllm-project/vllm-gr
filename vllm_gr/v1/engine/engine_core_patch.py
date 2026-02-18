@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.v1.engine.beam_search import BeamSearchController
+from vllm_gr.v1.engine.types import BeamSearchResult
 
 logger = init_logger(__name__)
 
@@ -141,8 +142,31 @@ def patched_process_engine_step(self) -> bool:
         for ctrl in self.active_beam_searches:
             beam_rids.update(ctrl._beam_req_ids)
 
+        failed_ctrls: list[BeamSearchController] = []
         for ctrl in self.active_beam_searches:
-            ctrl.on_outputs(outputs)
+            try:
+                ctrl.on_outputs(outputs)
+            except Exception:
+                logger.exception(
+                    "beam_search controller failed: req_id=%s",
+                    ctrl.request_id,
+                )
+                failed_ctrls.append(ctrl)
+
+        # Send error results for failed controllers and remove them
+        # so they don't stay stuck in active_beam_searches.
+        for ctrl in failed_ctrls:
+            error_result = BeamSearchResult(
+                request_id=ctrl.request_id,
+                sequences=[],
+                error="internal beam search error",
+            )
+            self.output_queue.put_nowait(
+                (ctrl.client_index,
+                 _engine_mod.EngineCoreOutputs(
+                     beam_search_result=error_result))
+            )
+            self.active_beam_searches.remove(ctrl)
 
         # Filter beam sub-request outputs from client-bound outputs.
         if beam_rids:
@@ -230,31 +254,17 @@ def patched_handle_client_request(
             controller = BeamSearchController(self, request)
             controller.submit_step()
         except BaseException as e:
-            # Ensure that beam search failures do not silently leave client
-            # futures hanging. Log and make a best-effort attempt to notify
-            # the client of the error, if routing information is available.
             logger.exception("Beam search request handling failed")
-            client_idx = getattr(request, "client_idx", None)
-            if client_idx is not None and hasattr(_engine_mod, "BeamSearchResult"):
-                try:
-                    # Attempt to construct an error-style BeamSearchResult.
-                    # This is best-effort and guarded to avoid secondary
-                    # failures if the constructor signature differs.
-                    error_result = _engine_mod.BeamSearchResult(
-                        error=str(e)
-                    )
-                    self.output_queue.put_nowait(
-                        (
-                            client_idx,
-                            _engine_mod.EngineCoreOutputs(
-                                beam_search_result=error_result
-                            ),
-                        )
-                    )
-                except BaseException:
-                    logger.exception(
-                        "Failed to send beam search error result to client"
-                    )
+            error_result = BeamSearchResult(
+                request_id=request.request_id,
+                sequences=[],
+                error=str(e),
+            )
+            self.output_queue.put_nowait(
+                (request.client_index,
+                 _engine_mod.EngineCoreOutputs(
+                     beam_search_result=error_result))
+            )
             return
         self.active_beam_searches.append(controller)
     elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
