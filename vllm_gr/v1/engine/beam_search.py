@@ -54,6 +54,11 @@ class _Beam:
 
 _STEP_TIMEOUT_S = 120  # seconds before a pending step is considered stuck
 
+# Below this candidate count, pure-Python sort is faster than numpy due to
+# per-call overhead (array creation, vstack, argpartition, GC pressure).
+# bw=64 → 4096 candidates (Python wins), bw=512 → 262144 (numpy wins).
+_NUMPY_THRESHOLD = 10_000
+
 
 class BeamSearchController:
     """Non-blocking beam search controller (state machine).
@@ -234,6 +239,13 @@ class BeamSearchController:
 
     def _beam_selection(self) -> None:
         """Select top beams from candidates using numpy vectorization."""
+        # For small candidate counts, numpy overhead exceeds its
+        # vectorization benefit.  Dispatch to pure-Python path.
+        n_candidates = len(self._all_beams) * self._req.beam_width
+        if n_candidates <= _NUMPY_THRESHOLD:
+            self._beam_selection_python()
+            return
+
         req = self._req
 
         # Phase 1 — Collect numpy arrays from outputs
