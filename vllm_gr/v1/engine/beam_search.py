@@ -329,9 +329,19 @@ class BeamSearchController:
                 finish_reason = "length"
                 stop_reason = None
 
+            output_tokens = beam.tokens[prompt_len:]
+            # Strip the EOS token from output unless explicitly requested.
+            if (
+                finish_reason == "stop"
+                and not req.include_stop_str_in_output
+                and output_tokens
+                and output_tokens[-1] == req.eos_token_id
+            ):
+                output_tokens = output_tokens[:-1]
+
             sequences.append(
                 BeamSearchSequenceResult(
-                    token_ids=beam.tokens[prompt_len:],
+                    token_ids=output_tokens,
                     cumulative_logprob=beam.cum_logprob,
                     finish_reason=finish_reason,
                     stop_reason=stop_reason,
