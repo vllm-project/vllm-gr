@@ -233,7 +233,9 @@ class BeamSearchController:
     def _beam_selection(self) -> None:
         """Select top beams from candidates (identical to original logic)."""
         req = self._req
-        all_candidates: list[dict] = []
+        # Each candidate is a (logprob, parent_idx, token_id) tuple.
+        # Tuples are lighter than dicts and sort naturally by first element.
+        all_candidates: list[tuple[float, int, int]] = []
 
         for i, beam in enumerate(self._all_beams):
             rid = self._beam_req_ids[i]
@@ -259,42 +261,38 @@ class BeamSearchController:
                 if lp == float("-inf"):
                     continue
 
-                all_candidates.append({
-                    "logprob": beam.cum_logprob + lp,
-                    "parent_idx": i,
-                    "token_id": tid,
-                })
+                all_candidates.append((beam.cum_logprob + lp, i, tid))
 
         if not all_candidates:
             self._all_beams = []
             return
 
-        all_candidates.sort(key=lambda x: x["logprob"], reverse=True)
+        all_candidates.sort(reverse=True)
 
         new_beams: list[_Beam] = []
         seen_sequences: set[tuple[int, ...]] = set()
 
-        for cand in all_candidates:
+        for cum_lp, parent_idx, token_id in all_candidates:
             if len(new_beams) >= req.beam_width:
                 break
 
-            parent = self._all_beams[cand["parent_idx"]]
-            new_tokens = parent.tokens + [cand["token_id"]]
+            parent = self._all_beams[parent_idx]
+            new_tokens = parent.tokens + [token_id]
             seq_tuple = tuple(new_tokens)
 
             if seq_tuple not in seen_sequences:
-                if not req.ignore_eos and cand["token_id"] == req.eos_token_id:
+                if not req.ignore_eos and token_id == req.eos_token_id:
                     self._completed.append(
                         _Beam(
                             tokens=new_tokens,
-                            cum_logprob=cand["logprob"],
+                            cum_logprob=cum_lp,
                         )
                     )
                 else:
                     new_beams.append(
                         _Beam(
                             tokens=new_tokens,
-                            cum_logprob=cand["logprob"],
+                            cum_logprob=cum_lp,
                         )
                     )
                     seen_sequences.add(seq_tuple)
