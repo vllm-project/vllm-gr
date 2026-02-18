@@ -309,6 +309,11 @@ class BeamSearchController:
         )
         req = self._req
 
+        # Track which beams completed naturally via EOS BEFORE appending
+        # sid_end_token_id, to avoid misidentifying finish_reason when
+        # sid_end_token_id == eos_token_id.
+        eos_completed: set[int] = {id(b) for b in self._completed}
+
         # Append end_token to all beams if provided
         if req.sid_end_token_id is not None:
             for beam in self._completed:
@@ -328,11 +333,7 @@ class BeamSearchController:
         prompt_len = len(req.prompt_token_ids)
         sequences = []
         for beam in best:
-            if (
-                not req.ignore_eos
-                and beam.tokens
-                and beam.tokens[-1] == req.eos_token_id
-            ):
+            if not req.ignore_eos and id(beam) in eos_completed:
                 finish_reason = "stop"
                 stop_reason: int | str | None = req.eos_token_id
             else:
