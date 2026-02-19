@@ -4,7 +4,7 @@ refer to [quickstart.md](../../../docs/quickstart.md) for installation
 # running example
 - This example demonstrates using vllm-gr for executing generative recommendation system based OneRec-1.7B model
 
-- Run vllm-gr server
+## Run vllm-gr server
 ```bash
 vllm serve --gr \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
@@ -14,7 +14,7 @@ vllm serve --gr \
     OpenOneRec/OneRec-1.7B
 ```
 
-run client (on another terminal)
+## Run client (on another terminal)
 - the client execute a predefined 120 items prompt and ask for item recommendations.
 - the server would reply with **beam_width** suggested items.
 
