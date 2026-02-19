@@ -198,6 +198,8 @@ def beam_search(
                 for i, (current_beam, result) in enumerate(zip(all_beams[start:end], beam_outputs)):
                     if result.outputs[0].logprobs is not None:
                         logprobs = result.outputs[0].logprobs[0]
+                        if len(logprobs) > logprobs_num:
+                            logprobs = dict(list(logprobs.items())[:logprobs_num])
                         all_beams_token_id.extend(list(logprobs.keys()))
                         all_beams_logprob.extend(
                             [current_beam.cum_logprob + obj.logprob for obj in logprobs.values()]

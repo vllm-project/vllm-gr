@@ -3,8 +3,9 @@ import pytest
 import time
 import torch
 import psutil
-from typing import List, Dict, Any
+from typing import Dict, Any
 from vllm import LLM
+
 try:
     from vllm_gr.sampling_params import BeamSearchParams
 except ImportError:
@@ -13,10 +14,12 @@ except ImportError:
 if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 
+
 def _load_prompt_text() -> str:
     prompt_file = os.path.join(os.path.dirname(__file__), "prompt.txt")
     with open(prompt_file, "r") as f:
         return f.read()
+
 
 def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     model_name = "OpenOneRec/OneRec-1.7B"
@@ -24,8 +27,8 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     max_tokens = 5
 
     if use_patch:
-        from vllm_gr.patch import run_patch
-        run_patch()
+        import vllm_gr.init  # noqa: F401
+
         assert hasattr(BeamSearchParams, "begin_token")
 
     params_dict: Dict[str, Any] = {
@@ -48,7 +51,7 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
         model=model_name,
         trust_remote_code=True,
         max_logprobs=2 * beam_width,
-    ) 
+    )
     final_output = None
     start = time.perf_counter()
     for _ in range(max(1, loops)):
@@ -59,9 +62,11 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     end = time.perf_counter()
     print(f"Elapsed mean: {(end - start) / max(1, loops):.4f}s")
 
+
 @pytest.mark.slow
 def test_offline_beam_search(loops: int):
     _run_offline_beam_search(loops, use_patch=False)
+
 
 @pytest.mark.slow
 def test_offline_gr_beam_search(loops: int):

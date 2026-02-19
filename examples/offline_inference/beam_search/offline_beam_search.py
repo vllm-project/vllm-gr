@@ -1,6 +1,5 @@
 import time
 import argparse
-from vllm_gr.entrypoints.beam_search_patch import patch_offline_beam_search
 from vllm.entrypoints.llm import LLM
 
 try:
@@ -42,7 +41,6 @@ def beam_search_example(model, beam_width: int, compare: str):
                         f"Generated text {index}:{i} : {generated_text[len(long_recommendation_texts[index]) :]}"
                     )
 
-    patch_offline_beam_search()
     params = BeamSearchParams(beam_width=beam_width, max_tokens=5)
     if hasattr(BeamSearchParams, "begin_token"):
         params.begin_token = "<|sid_begin|>"
