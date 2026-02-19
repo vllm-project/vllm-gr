@@ -3,10 +3,7 @@
 import os
 from setuptools import setup, Extension
 import pybind11
-<<<<<<< HEAD
-=======
 import numpy
->>>>>>> accuracy_benchmark_pr
 
 
 def get_ext_modules():

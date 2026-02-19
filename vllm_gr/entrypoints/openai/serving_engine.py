@@ -175,8 +175,23 @@ async def beam_search(
             )
             tasks.append(task)
 
+        catalog_tasks = []
+        if self.models.catalog is not None:
+
+            def get_valid_tokens_set(beam)->set[int]:
+                generated_tokens = beam.tokens[len(prompt_token_ids) :]
+                return self.models.catalog.valid(generated_tokens)
+
+            for beam in all_beams:
+                catalog_tasks.append(asyncio.to_thread(get_valid_tokens_set, beam))
+
         gen_start = time.perf_counter()
-        output = [x[0] for x in await asyncio.gather(*tasks)]
+        if catalog_tasks:
+            all_results = await asyncio.gather(*(tasks + catalog_tasks))
+            output = [x[0] for x in all_results[: len(tasks)]]
+            valid_tokens_sets = all_results[len(tasks) :]
+        else:
+            output = [x[0] for x in await asyncio.gather(*tasks)]
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         new_beams = []
@@ -213,8 +228,11 @@ async def beam_search(
 
             if result.outputs[0].logprobs is not None:
                 logprobs = result.outputs[0].logprobs[0]
-                if len(logprobs) > logprobs_num:
-                    logprobs = dict(list(logprobs.items())[:logprobs_num])
+                if self.models.catalog is not None:
+                    valid_tokens_set = valid_tokens_sets[i]
+                    for token_id in list(logprobs.keys()):
+                        if token_id not in valid_tokens_set:
+                            logprobs[token_id].logprob = -float("inf")
                 all_beams_token_id.extend(list(logprobs.keys()))
                 all_beams_logprob.extend(
                     [current_beam.cum_logprob + obj.logprob for obj in logprobs.values()]
@@ -224,7 +242,7 @@ async def beam_search(
         all_beams_token_id = np.array(all_beams_token_id)
         all_beams_logprob = np.array(all_beams_logprob)
 
-        if not ignore_eos:
+        if not ignore_eos and self.models.catalog is None:  # no need to check eos if catalog exist
             # Get the index position of eos token in all generated results
             eos_idx = np.where(all_beams_token_id == eos_token_id)[0]
             for idx in eos_idx:
@@ -243,19 +261,18 @@ async def beam_search(
                         stop_reason=eos_token_id,
                     )
                 )
+            # After processing, set the log probability of the eos condition
+            # to negative infinity.
+            all_beams_logprob[eos_idx] = -np.inf
 
         # Processing non-EOS tokens
         # Get indices of the top beam_width probabilities
-        if minheap is None:
-            raise ImportError("minheap_cpp is not available")
-        next_beams = minheap.MinHeapTuple(beam_width)
+        if all_beams_logprob.size > beam_width:
+            topn_idx = np.argpartition(np.negative(all_beams_logprob), beam_width)[:beam_width]
+        else:
+            topn_idx = np.arange(all_beams_logprob.size)
 
-        effective_eos_id = eos_token_id if not ignore_eos else -1
-        next_beams.push_candidates_striped(
-            all_beams_logprob, all_beams_token_id, logprobs_num, effective_eos_id
-        )
-
-        for score, idx in next_beams.items():
+        for idx in topn_idx:
             current_beam = all_beams[idx // logprobs_num]
             result = output[idx // logprobs_num]
             token_id = int(all_beams_token_id[idx])
@@ -290,14 +307,14 @@ async def beam_search(
             tokens = beam.tokens[tokenized_length:]
         beam.text = tokenizer.decode(tokens)
 
-    beam_search_decode_time = time.perf_counter() - beam_search_start
-    beam_search_overhead = beam_search_decode_time - generation_time
-    metrics = RequestStateStats(
-        beam_search_overhead=beam_search_overhead,
-        beam_search_decode_time=beam_search_decode_time,
-        num_generation_tokens=num_generation_tokens,
-    )
-    yield RequestOutput(
+        total_beam_search_decode_time = time.perf_counter() - beam_search_start
+        beam_search_overhead = total_beam_search_decode_time - generation_time
+        metrics = RequestStateStats(
+            beam_search_overhead=beam_search_overhead,
+            total_beam_search_decode_time=total_beam_search_decode_time,
+        )
+
+    out = RequestOutput(
         request_id=request_id,
         prompt=prompt_text,
         outputs=[
@@ -317,3 +334,4 @@ async def beam_search(
         prompt_logprobs=None,
         metrics=metrics,
     )
+    yield out

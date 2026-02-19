@@ -76,6 +76,7 @@ def _get_n_beams_from_argv():
         pass  # Fallback to 1 if parsing fails
     return 1
 
+
 def _get_output_len_from_argv():
     """
     Parses sys.argv to find the value for --output-len.
@@ -123,6 +124,7 @@ atexit.register(cleanup_dist_env_and_memory)
 # Beam Search Patching
 # ============================================================================
 original_init = RequestFuncInput.__init__
+
 
 def __init__(
     self,
