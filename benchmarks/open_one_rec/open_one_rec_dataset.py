@@ -59,8 +59,8 @@ class OneRecDataset(BenchmarkDataset):
             # Convert to expected format
             for id, data in test_data.items():
                 output_len = data.get(
-                    "expected_output_len", 5
-                )  # Default to 5 for short GR generations
+                    "expected_output_len", 16
+                )  # Default to 16 for short GR generations
 
                 self.data.append(
                     {

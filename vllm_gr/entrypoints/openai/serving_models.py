@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from typing import Any
 from vllm.tokenizers import TokenizerLike
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.serving_models import BaseModelPath, LoRAModulePath, OpenAIServingModels
