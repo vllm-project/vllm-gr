@@ -31,7 +31,9 @@ class Catalog:
         for seq in catalog_data:
             token_ids = self.tokenizer.convert_tokens_to_ids(seq)
             node = self.trie
-            for token_id in token_ids:
+            for i, token_id in enumerate(token_ids):
+                if token_id < 0:
+                    raise ValueError(f"Invalid token ID: {seq[i]} at index {i}")
                 if token_id not in node:
                     node[token_id] = {}
                 node = node[token_id]
@@ -42,8 +44,8 @@ class Catalog:
             if tid in node:
                 node = node[tid]
             else:
-                return []
-        return set(list(node.keys()))
+                return set()
+        return set(node.keys())
 
 
 def initGr(
@@ -56,9 +58,10 @@ def initGr(
     _original_init(self, engine_client, base_model_paths, lora_modules=lora_modules)
     self.catalog = None
     tokenizer = self.input_processor.tokenizer
-    if self.model_config.catalog_path:
+    catalog_path = getattr(getattr(self, "model_config", None), "catalog_path", None)
+    if catalog_path:
         self.catalog = Catalog(tokenizer)
-        self.catalog.load(self.model_config.catalog_path)
+        self.catalog.load(catalog_path)
 
 
 def patch_OpenAIServingModels_init():

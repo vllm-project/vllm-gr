@@ -3,10 +3,9 @@ import os
 import tempfile
 from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 
-from vllm.entrypoints.openai.serving_models import Catalog
+from vllm_gr.entrypoints.openai.serving_models import Catalog
 
 
 @pytest.fixture
@@ -56,14 +55,12 @@ def test_catalog_functionality(mock_tokenizer):
         assert set(catalog.valid([1, 2, 3, 4])) == {5}
 
         # Case 4: Full sequence [1, 2, 3, 4, 5] -> returns []
-        assert catalog.valid([1, 2, 3, 4, 5]) == []
+        assert catalog.valid([1, 2, 3, 4, 5]) == set()
 
         # Case 5: Invalid start token
-        assert catalog.valid([99]) == []
-
+        assert catalog.valid([99]) == set()
         # Case 6: Valid start, invalid continuation
-        assert catalog.valid([1, 99]) == []
-
+        assert catalog.valid([1, 99]) == set()
 
     finally:
         if os.path.exists(catalog_path):

@@ -309,12 +309,12 @@ async def beam_search(
             tokens = beam.tokens[tokenized_length:]
         beam.text = tokenizer.decode(tokens)
 
-        beam_search_decode_time = time.perf_counter() - beam_search_start
-        beam_search_overhead = beam_search_decode_time - generation_time
-        metrics = RequestStateStats(
-            beam_search_overhead=beam_search_overhead,
-            beam_search_decode_time=beam_search_decode_time,
-        )
+    beam_search_decode_time = time.perf_counter() - beam_search_start
+    beam_search_overhead = beam_search_decode_time - generation_time
+    metrics = RequestStateStats(
+        beam_search_overhead=beam_search_overhead,
+        beam_search_decode_time=beam_search_decode_time,
+    )
 
     out = RequestOutput(
         request_id=request_id,

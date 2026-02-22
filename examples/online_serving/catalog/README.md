@@ -35,10 +35,10 @@ python convert_catalog.py ${OpenOneRecFolder}/benchmark_data/sid2pid.json ${MyFo
     --max_num_seqs 1024 \
     --max_num_batched_tokens 16384 \
     --catalog-path ${MyFolder}/catalog.json \
-     OpenOneRec/OneRec-8B-pro
+     OpenOneRec/OneRec-1.7B
 ```
 ## Invoking the Client
-- Client execution is not change
+- Client execution does not change
 - see beam_search example [README.md](../beam_search/README.md#run-client-on-another-terminal) for client single prompt execution.
 - see benchmark documentation [README.md](../../../docs/benchmarks/README.md) for available benchmarks for online serving.
 

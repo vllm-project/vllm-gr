@@ -4,6 +4,7 @@ import sys
 import os
 import argparse
 
+
 def main():
     parser = argparse.ArgumentParser(description="Verify generated results against a catalog.")
     parser.add_argument("result_path", help="Path to the result JSON file.")
@@ -24,9 +25,9 @@ def main():
     # Load results
     print(f"Loading results from {RESULT_PATH}...")
     try:
-        with open(RESULT_PATH, 'r') as f:
+        with open(RESULT_PATH, "r") as f:
             content = f.read()
-        start_idx = content.find('{')
+        start_idx = content.find("{")
         if start_idx == -1:
             print("Error: No JSON object found in result file")
             sys.exit(1)
@@ -39,7 +40,7 @@ def main():
     # Load catalog
     print(f"Loading catalog from {CATALOG_PATH}...")
     try:
-        with open(CATALOG_PATH, 'r') as f:
+        with open(CATALOG_PATH, "r") as f:
             catalog = json.load(f)
     except json.JSONDecodeError as e:
         print(f"Error decoding catalog JSON: {e}")
@@ -53,7 +54,7 @@ def main():
     except TypeError:
         print("Error: Catalog format not supported. Expected a list of lists (or iterables).")
         sys.exit(1)
-    
+
     print(f"Catalog loaded with {len(catalog_set)} items.")
     print(f"First 10 items in catalog: {list(catalog_set)[:10]}")
 
@@ -82,6 +83,7 @@ def main():
         sys.exit(1)
     else:
         print("\nSUCCESS: All generated items exist in the catalog.")
+
 
 if __name__ == "__main__":
     main()
