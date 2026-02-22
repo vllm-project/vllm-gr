@@ -27,10 +27,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "vllm==0.14.*",
-    "pandas>=3.0.0",
-    "scikit-learn>=1.8.0",
-    "pyarrow>=23.0.0"
+    "vllm==0.14.*"
 ]
 
 [project.optional-dependencies]

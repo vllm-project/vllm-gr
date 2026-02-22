@@ -1,9 +1,10 @@
 import json
 import sys
 
+
 def process_json(input_file_path, output_file_path):
     try:
-        with open(input_file_path, 'r') as f:
+        with open(input_file_path, "r") as f:
             data = json.load(f)
     except FileNotFoundError:
         print(f"Error: The file '{input_file_path}' was not found.")
@@ -41,25 +42,26 @@ def process_json(input_file_path, output_file_path):
             f"<s_a_{val_a}>",
             f"<s_b_{val_b}>",
             f"<s_c_{val_c}>",
-            "<|sid_end|>"
+            "<|sid_end|>",
         ]
 
         result_list.append(tokens)
 
     # Write the result to the output file
-    with open(output_file_path, 'w') as f:
+    with open(output_file_path, "w") as f:
         json.dump(result_list, f, indent=2)
-    
-    print(f"Successfully processed {len(result_list)} items. Output written to '{output_file_path}'.")
+
+    print(
+        f"Successfully processed {len(result_list)} items. Output written to '{output_file_path}'."
+    )
+
 
 if __name__ == "__main__":
-    
     if len(sys.argv) >= 3:
         input_json = sys.argv[1]
         output_json = sys.argv[2]
     else:
         print("Usage: python script.py <input_file> <output_file>")
         sys.exit(1)
-
 
     process_json(input_json, output_json)

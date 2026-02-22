@@ -5,12 +5,16 @@ import json
 from typing import Any
 from vllm.tokenizers import TokenizerLike
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.openai.serving_models import BaseModelPath, LoRAModulePath, OpenAIServingModels
+from vllm.entrypoints.openai.serving_models import (
+    BaseModelPath,
+    LoRAModulePath,
+    OpenAIServingModels,
+)
 
+_original_init = OpenAIServingModels.__init__
 
 
 class Catalog:
-
     def __init__(self, tokenizer: TokenizerLike):
         self.tokenizer = tokenizer
         self.trie: dict[int, Any] = {}
@@ -40,14 +44,17 @@ class Catalog:
             else:
                 return []
         return set(list(node.keys()))
-    
-def initGr(self,
-        engine_client: EngineClient,
-        base_model_paths: list[BaseModelPath],
-        *,
-        lora_modules: list[LoRAModulePath] | None = None):
-    original_init = OpenAIServingModels.__init__
-    original_init(self, engine_client, base_model_paths, lora_modules=lora_modules)
+
+
+def initGr(
+    self,
+    engine_client: EngineClient,
+    base_model_paths: list[BaseModelPath],
+    *,
+    lora_modules: list[LoRAModulePath] | None = None,
+):
+    _original_init(self, engine_client, base_model_paths, lora_modules=lora_modules)
+    self.catalog = None
     tokenizer = self.input_processor.tokenizer
     if self.model_config.catalog_path:
         self.catalog = Catalog(tokenizer)

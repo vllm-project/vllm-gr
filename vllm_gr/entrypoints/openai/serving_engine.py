@@ -178,7 +178,7 @@ async def beam_search(
         catalog_tasks = []
         if self.models.catalog is not None:
 
-            def get_valid_tokens_set(beam)->set[int]:
+            def get_valid_tokens_set(beam) -> set[int]:
                 generated_tokens = beam.tokens[len(prompt_token_ids) :]
                 return self.models.catalog.valid(generated_tokens)
 
@@ -228,6 +228,8 @@ async def beam_search(
 
             if result.outputs[0].logprobs is not None:
                 logprobs = result.outputs[0].logprobs[0]
+                if len(logprobs) > logprobs_num:
+                    logprobs = dict(list(logprobs.items())[:logprobs_num])
                 if self.models.catalog is not None:
                     valid_tokens_set = valid_tokens_sets[i]
                     for token_id in list(logprobs.keys()):
@@ -307,11 +309,11 @@ async def beam_search(
             tokens = beam.tokens[tokenized_length:]
         beam.text = tokenizer.decode(tokens)
 
-        total_beam_search_decode_time = time.perf_counter() - beam_search_start
-        beam_search_overhead = total_beam_search_decode_time - generation_time
+        beam_search_decode_time = time.perf_counter() - beam_search_start
+        beam_search_overhead = beam_search_decode_time - generation_time
         metrics = RequestStateStats(
             beam_search_overhead=beam_search_overhead,
-            total_beam_search_decode_time=total_beam_search_decode_time,
+            beam_search_decode_time=beam_search_decode_time,
         )
 
     out = RequestOutput(
