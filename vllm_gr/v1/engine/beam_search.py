@@ -52,7 +52,7 @@ class _Beam:
         self.cum_logprob = cum_logprob
 
 
-_STEP_TIMEOUT_S = 120  # seconds before a pending step is considered stuck
+_STEP_TIMEOUT_S = 2400  # seconds before a pending step is considered stuck
 
 # Below this candidate count, pure-Python sort is faster than numpy due to
 # per-call overhead (array creation, vstack, argpartition, GC pressure).
