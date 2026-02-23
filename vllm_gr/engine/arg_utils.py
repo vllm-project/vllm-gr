@@ -30,12 +30,13 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
 def create_model_config(self) -> ModelConfig:
     config = origin_create_model_config(self)
     config.__class__ = ModelConfigGr
-    config.catalog_path = self.catalog_path
+    config.catalog_path = getattr(self, "catalog_path", None)
     return config
 
 
 def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args = origin_from_cli_args(cls, args)
+    engine_args.catalog_path = None
     if hasattr(args, "catalog_path"):
         engine_args.catalog_path = args.catalog_path
     return engine_args
