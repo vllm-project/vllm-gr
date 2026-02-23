@@ -45,14 +45,14 @@ def beam_search(
     """
     # TODO: how does beam search work together with length penalty,
     # frequency, penalty, and stopping criteria, etc.?
-    print("Called beam_search")
+    logger.debug("Called beam_search")
     beam_width = params.beam_width
     max_tokens = params.max_tokens
     temperature = params.temperature
     ignore_eos = params.ignore_eos
     length_penalty = params.length_penalty
-    begin_token = params.begin_token
-    end_token = params.end_token
+    begin_token = params.begin_token if hasattr(params, "begin_token") else None
+    end_token = params.end_token if hasattr(params, "end_token") else None
 
     lora_requests = self._get_beam_search_lora_requests(lora_request, prompts)
 
@@ -152,6 +152,7 @@ def beam_search(
             "max_tokens is less than the number of tokens to be pre-calculated. "
             "Setting max_tokens to the number of pre-calculated tokens."
         )
+        max_tokens = pre_calc
     for prompt_start in range(0, len(prompts), concurrency_limit):
         instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
 
@@ -203,6 +204,12 @@ def beam_search(
                         all_beams_token_id.extend(list(logprobs.keys()))
                         all_beams_logprob.extend(
                             [current_beam.cum_logprob + obj.logprob for obj in logprobs.values()]
+                        )
+                    else:
+                        raise ValueError(
+                            "Beam search generation expected non-empty logprobs for each beam, "
+                            "but received 'None'. Please ensure that sampling parameters are "
+                            "configured to return logprobs when using beam search."
                         )
 
                 # Convert to numpy for efficient processing
@@ -260,11 +267,14 @@ def beam_search(
 
     outputs = []
     for instance in instances:
+        # Move any remaining active beams into the completed list first.
+        instance.completed.extend(instance.beams)
         if sid_end_token_id is not None:
-            for beam in instance.beams:
+            # Append the special end token to all completed beams to ensure
+            # a consistent output format, even if instance.beams is empty.
+            for beam in instance.completed:
                 beam.tokens.append(sid_end_token_id)
                 beam.logprobs.append({sid_end_token_id: Logprob(logprob=0.0)})
-        instance.completed.extend(instance.beams)
         sorted_completed = sorted(instance.completed, key=sort_beams_key, reverse=True)
         best_beams = sorted_completed[:beam_width]
 

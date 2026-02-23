@@ -32,6 +32,6 @@ Example:
 python offline_beam_search.py --model OpenOneRec/OneRec-1.7B --compare latency
 ...
 ...
-Vannila vLLM with BW=128 took 4.882346 seconds
+Vanilla vLLM with BW=128 took 4.882346 seconds
 vLLM-gr with BW=128 took 0.627150 seconds
 ```

@@ -23,14 +23,18 @@ def beam_search_example(model, beam_width: int, compare: str):
         max_num_batched_tokens=4096 * 5,
     )
 
+    params = BeamSearchParams(beam_width=beam_width, max_tokens=5)
+    if hasattr(BeamSearchParams, "begin_token"):
+        params.begin_token = "<|sid_begin|>"
+        params.end_token = "<|sid_end|>"
+
     if compare != "none":
-        params = BeamSearchParams(beam_width=beam_width, max_tokens=5)
-        # Send beam search request
+        # Send beam search request to Vanilla vLLM
         start = time.perf_counter()
         outputs = llm.beam_search(prompts, params)
         end = time.perf_counter()
         if compare in ["latency", "both"]:
-            print(f"Vannila vLLM with BW={beam_width} took {end - start:.6f} seconds")
+            print(f"Vanilla vLLM with BW={beam_width} took {end - start:.6f} seconds")
 
         if compare in ["output", "both"]:
             # Print results
@@ -41,11 +45,10 @@ def beam_search_example(model, beam_width: int, compare: str):
                         f"Generated text {index}:{i} : {generated_text[len(long_recommendation_texts[index]) :]}"
                     )
 
-    params = BeamSearchParams(beam_width=beam_width, max_tokens=5)
-    if hasattr(BeamSearchParams, "begin_token"):
-        params.begin_token = "<|sid_begin|>"
-        params.end_token = "<|sid_end|>"
-    # Send beam search request
+    # import vllm-gr.init module to apply the vllm-gr patch to vLLM.
+    import vllm_gr.init  # noqa: F401
+
+    # Send beam search request to vllm-gr
     start = time.perf_counter()
     outputs = llm.beam_search(prompts, params)
     end = time.perf_counter()

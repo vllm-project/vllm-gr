@@ -47,10 +47,14 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     prompts = [{"prompt": prompt_text}]
     print(f"Running offline beam search (patch={use_patch}) loops={loops}")
 
+    # vllm-gr is designed to use beam_width for max_logprobs (not 2 * beam_width)
+    # to improve performance. Reflect that here when use_patch is True.
+    max_logprobs = beam_width if use_patch else 2 * beam_width
+
     llm = LLM(
         model=model_name,
         trust_remote_code=True,
-        max_logprobs=2 * beam_width,
+        max_logprobs=max_logprobs,
     )
     final_output = None
     start = time.perf_counter()
