@@ -36,4 +36,5 @@ def get_ext_modules():
 
 setup(
     ext_modules=get_ext_modules(),
+    packages=["vllm_gr", "vllm_gr.csrc"],
 )
