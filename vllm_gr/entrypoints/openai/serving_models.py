@@ -48,7 +48,7 @@ class Catalog:
         return set(node.keys())
 
 
-def initGr(
+def init_gr(
     self,
     engine_client: EngineClient,
     base_model_paths: list[BaseModelPath],
@@ -65,4 +65,4 @@ def initGr(
 
 
 def patch_OpenAIServingModels_init():
-    OpenAIServingModels.__init__ = initGr
+    OpenAIServingModels.__init__ = init_gr
