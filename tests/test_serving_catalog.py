@@ -19,13 +19,14 @@ from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseMode
 from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
 from vllm.inputs import TokensPrompt
 from transformers import AutoTokenizer
+from typing import Any
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 
 
-@pytest.mark.slow
-@pytest.mark.asyncio
+@pytest.mark.slow  # type: ignore
+@pytest.mark.asyncio  # type: ignore
 async def test_serving_catalog_generation(loops: int):
     from vllm_gr.patch import run_patch
 
@@ -86,7 +87,7 @@ async def test_serving_catalog_generation(loops: int):
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
 
             beam_width = 1024
-            beam_search_params_dict = {
+            beam_search_params_dict: dict[str, Any] = {
                 "beam_width": beam_width,
                 "max_tokens": 5,
                 "ignore_eos": False,
