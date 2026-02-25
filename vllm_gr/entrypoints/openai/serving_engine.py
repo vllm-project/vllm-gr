@@ -44,6 +44,11 @@ async def beam_search(
     temperature = params.temperature
     begin_token = params.begin_token
     end_token = params.end_token
+
+    # All beams from the same logical beam search will share the same priority value
+    # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
+    priority = int(time.perf_counter() * 1000000)  # us granularity
+
     include_stop_str_in_output = params.include_stop_str_in_output
     if beam_width == 0:
         raise VLLMValidationError(
@@ -170,6 +175,7 @@ async def beam_search(
                         request_id_item,
                         lora_request=lora_req,
                         trace_headers=trace_headers,
+                        priority=priority,
                     )
                 )
             )
