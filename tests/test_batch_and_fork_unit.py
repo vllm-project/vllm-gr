@@ -34,13 +34,17 @@ from vllm_gr.v1.engine.core_client_patch_2 import (
     prepare_request_fn,
     register_beam_output_fn,
 )
+
 from vllm_gr.v1.engine.engine_core_patch_2 import (
     _add_enum_member,
-    _cache_beam_request,
-    _handle_beam_fork,
+    run_engine_core,
     apply_engine_core_child_patches,
     make_patched_engine_core_init,
-    patched_run_engine_core,
+)
+
+from vllm_gr.v1.engine.core import (
+    _cache_beam_request,
+    _handle_beam_fork,
 )
 from vllm_gr.v1.engine.types import (
     BeamForkRequest,
@@ -1353,7 +1357,7 @@ class TestPatchWiring:
         )
 
         patch_batch_and_fork()
-        assert EngineCoreProc.run_engine_core is patched_run_engine_core
+        assert EngineCoreProc.run_engine_core is run_engine_core
 
     # 6.2
     def test_patch_batch_and_fork_calls_apply(self):
@@ -1388,7 +1392,7 @@ class TestPatchWiring:
             mock_bf.assert_called_once()
 
     # 6.4
-    def test_patched_run_engine_core_applies_child_patches(self):
+    def test_run_engine_core_applies_child_patches(self):
         with (
             patch(
                 "vllm_gr.v1.engine.engine_core_patch_2.apply_engine_core_child_patches"
@@ -1400,7 +1404,7 @@ class TestPatchWiring:
             original_run = MagicMock()
             MockProc.run_engine_core = original_run
 
-            patched_run_engine_core("arg1", key="val")
+            run_engine_core("arg1", key="val")
 
             mock_apply.assert_called_once()
             original_run.assert_called_once_with("arg1", key="val")
