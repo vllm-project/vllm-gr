@@ -173,7 +173,7 @@ async def beam_search(
         # Helper to drain output queue until finished.
         async def _collect_beam_result(q):
             while True:
-                out = q.get_nowait() or await q.get()
+                out = await q.get()
                 if out.finished:
                     return out
 
@@ -196,7 +196,7 @@ async def beam_search(
                 # Register output queue (no ZMQ send).
                 q = self.engine_client.register_beam_output(
                     child_id,
-                    all_beams[new_idx].tokens,
+                    all_beams[parent_beam_idx].tokens,
                     beam_search_params,
                     eos_token_id=eos_token_id,
                     lora_request=lora_request,
