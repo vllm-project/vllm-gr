@@ -34,10 +34,13 @@ pip --version
 3. **Installation**
 
 For standard installation, run
+
 ```bash
 pip install -e .
 ```
+
 Alternatively, for developer mode, run
+
 ```bash
 pip install -e .[dev]
 ```

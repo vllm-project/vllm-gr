@@ -29,7 +29,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 
 
-async def beam_search_test(loops: int):
+async def beam_search_test(loops: int) -> None:
     model_name = "OpenOneRec/OneRec-1.7B"
     beam_width = 512
     max_tokens = 5
@@ -101,15 +101,15 @@ async def beam_search_test(loops: int):
         assert len(final_output.outputs) == beam_width
 
 
-@pytest.mark.slow
-@pytest.mark.asyncio
-async def test_serving_beam_search(loops: int):
+@pytest.mark.slow  # type: ignore
+@pytest.mark.asyncio  # type: ignore
+async def test_serving_beam_search(loops: int) -> None:
     await beam_search_test(loops)
 
 
-@pytest.mark.slow
-@pytest.mark.asyncio
-async def test_serving_gr_beam_search(loops: int):
+@pytest.mark.slow  # type: ignore
+@pytest.mark.asyncio  # type: ignore
+async def test_serving_gr_beam_search(loops: int) -> None:
     from vllm_gr.patch import run_patch
 
     run_patch()
