@@ -9,8 +9,6 @@ import time
 from functools import partial
 from typing import Any
 
-import vllm.v1.engine as _engine_mod
-
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
 

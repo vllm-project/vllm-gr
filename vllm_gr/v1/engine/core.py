@@ -10,10 +10,13 @@ import time
 from functools import partial
 from typing import Any
 
-import vllm.v1.engine as _engine_mod
-
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine import (
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    EngineCoreRequestType,
+    FinishReason,
+)
 
 logger = init_logger(__name__)
 
@@ -46,6 +49,22 @@ def _handle_beam_fork(self, fork_req) -> None:
         cached = self.beam_cache.get(parent_id)
         if cached is None:
             logger.error("BEAM_FORK: parent %s not in cache", parent_id)
+            self.output_queue.put_nowait(
+                (
+                    fork_req.client_index,
+                    EngineCoreOutputs(
+                        engine_index=self.engine_index,
+                        finished_requests={child_id},
+                        outputs=[
+                            EngineCoreOutput(
+                                request_id=child_id,
+                                new_token_ids=[],
+                                finish_reason=FinishReason.ERROR,
+                            )
+                        ],
+                    ),
+                )
+            )
             continue
 
         child_token_ids = cached['all_token_ids'] + [token_id]

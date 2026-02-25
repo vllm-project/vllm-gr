@@ -94,6 +94,8 @@ def _make_engine_self(beam_cache=None, block_hasher=None):
         beam_cache=beam_cache if beam_cache is not None else {},
         request_block_hasher=block_hasher,
         input_queue=queue.SimpleQueue(),
+        output_queue=queue.SimpleQueue(),
+        engine_index=0,
         _cache_beam_request=lambda req: _cache_beam_request(self, req),
     )
     # Re-bind so the lambda captures the right self
@@ -489,6 +491,19 @@ class TestBeamCache:
         while not eng.input_queue.empty():
             items.append(eng.input_queue.get_nowait())
         assert len(items) == 1
+
+        # The missing parent should have produced an error output
+        # so the client doesn't hang waiting for child "c0".
+        from vllm.v1.engine import FinishReason
+        error_items = []
+        while not eng.output_queue.empty():
+            error_items.append(eng.output_queue.get_nowait())
+        assert len(error_items) == 1
+        client_index, error_outputs = error_items[0]
+        assert len(error_outputs.outputs) == 1
+        assert error_outputs.outputs[0].request_id == "c0"
+        assert error_outputs.outputs[0].finish_reason == FinishReason.ERROR
+        assert "c0" in error_outputs.finished_requests
 
     # 3.8
     def test_handle_beam_fork_cleans_cache(self):
