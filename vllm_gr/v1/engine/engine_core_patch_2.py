@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Monkey-patches for EngineCore / EngineCoreProc to support
-ADD_BATCH, BEAM_FORK, and BEAM_SEARCH."""
+ADD_BATCH and BEAM_FORK."""
 
 from __future__ import annotations
 
@@ -50,25 +50,14 @@ def apply_engine_core_child_patches():
 
     from vllm_gr.v1.engine.types import (
         BeamForkRequest,
-        BeamSearchRequest,
-        BeamSearchResult,
-        BeamSearchSequenceResult,
-        PatchedEngineCoreOutputs,
     )
 
     # Inject types into vllm.v1.engine module
     engine_mod.BeamForkRequest = BeamForkRequest
-    engine_mod.BeamSearchRequest = BeamSearchRequest
-    engine_mod.BeamSearchSequenceResult = BeamSearchSequenceResult
-    engine_mod.BeamSearchResult = BeamSearchResult
 
-    # Add new enum members: ADD_BATCH, BEAM_FORK, BEAM_SEARCH
+    # Add new enum members: ADD_BATCH, BEAM_FORK
     _add_enum_member("ADD_BATCH", b"\x05")
     _add_enum_member("BEAM_FORK", b"\x06")
-    _add_enum_member("BEAM_SEARCH", b"\x07")
-
-    # Replace EngineCoreOutputs with patched version
-    engine_mod.EngineCoreOutputs = PatchedEngineCoreOutputs
 
     # Wrap EngineCore.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
@@ -79,17 +68,10 @@ def apply_engine_core_child_patches():
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_fork = _handle_beam_fork
 
-    # Replace methods on BOTH EngineCore and EngineCoreProc to ensure
-    # the patched version is found regardless of MRO resolution.
-    EngineCore._process_engine_step = patched_process_engine_step
-    EngineCore._handle_client_request = patched_handle_client_request
-    EngineCoreProc._process_engine_step = patched_process_engine_step
-    EngineCoreProc._handle_client_request = patched_handle_client_request
-
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = patched_process_input_sockets
 
-    logger.info("Engine-core patches (ADD_BATCH, BEAM_FORK, BEAM_SEARCH) "
+    logger.info("Engine-core patches (ADD_BATCH, BEAM_FORK) "
                 "applied in child process.")
 
 
@@ -119,9 +101,7 @@ def make_patched_engine_core_init(original_init):
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         self.beam_cache: dict[str, dict] = {}
-        # For BEAM_SEARCH-in-engine (lazy import to avoid missing module)
-        self.active_beam_searches: list = []
-
+        
     return patched_init
 
 
@@ -194,114 +174,6 @@ def _handle_beam_fork(self, fork_req) -> None:
 
 
 # ---------------------------------------------------------------------------
-# EngineCore._process_engine_step replacement
-# ---------------------------------------------------------------------------
-
-def patched_process_engine_step(self) -> bool:
-    """Replacement for EngineCore._process_engine_step with beam search."""
-
-    # Step the engine core.
-    outputs, model_executed = self.step_fn()
-
-    # Feed outputs to active beam search controllers and filter
-    # beam sub-request outputs before sending to client.
-    if self.active_beam_searches and outputs:
-        # Collect all pending beam request IDs to filter them out.
-        beam_rids: set[str] = set()
-        for ctrl in self.active_beam_searches:
-            beam_rids.update(ctrl._pending_rids)
-
-        for ctrl in self.active_beam_searches:
-            ctrl.on_outputs(outputs)
-
-        # Filter beam sub-request outputs from client-bound outputs.
-        if beam_rids:
-            filtered_outputs: dict[int, _engine_mod.EngineCoreOutputs] = {}
-            for client_idx, engine_outputs in outputs.items():
-                non_beam = [
-                    o for o in engine_outputs.outputs
-                    if o.request_id not in beam_rids
-                ]
-                if non_beam or engine_outputs.scheduler_stats:
-                    filtered = _engine_mod.EngineCoreOutputs(
-                        engine_index=engine_outputs.engine_index,
-                        outputs=non_beam,
-                        scheduler_stats=engine_outputs.scheduler_stats,
-                        timestamp=engine_outputs.timestamp,
-                    )
-                    filtered_outputs[client_idx] = filtered
-            outputs = filtered_outputs
-
-        # Collect finished controllers and emit their results.
-        finished = [c for c in self.active_beam_searches if c.is_done]
-        for c in finished:
-            self.output_queue.put_nowait(
-                (c.client_index,
-                 _engine_mod.EngineCoreOutputs(beam_search_result=c.result))
-            )
-            self.active_beam_searches.remove(c)
-
-    # Put EngineCoreOutputs into the output queue.
-    for output in outputs.items() if outputs else ():
-        self.output_queue.put_nowait(output)
-
-    # Post-step hook.
-    self.post_step(model_executed)
-
-    # If no model execution happened but there are waiting requests
-    # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
-    # background threads (like NIXL handshake) to make progress.
-    # Without this, the tight polling loop can starve background threads.
-    if not model_executed and self.scheduler.has_unfinished_requests():
-        time.sleep(0.001)
-
-    return model_executed
-
-
-# ---------------------------------------------------------------------------
-# EngineCore._handle_client_request replacement
-# ---------------------------------------------------------------------------
-
-def patched_handle_client_request(
-    self, request_type: EngineCoreRequestType, request: Any
-) -> None:
-    """Replacement for EngineCore._handle_client_request with beam search."""
-    from vllm.v1.engine import UtilityOutput, UtilityResult
-
-    if request_type == EngineCoreRequestType.ADD:
-        req, request_wave = request
-        self.add_request(req, request_wave)
-    elif request_type == EngineCoreRequestType.ABORT:
-        self.abort_requests(request)
-    elif request_type == EngineCoreRequestType.UTILITY:
-        client_idx, call_id, method_name, args = request
-        output = UtilityOutput(call_id)
-        try:
-            method = getattr(self, method_name)
-            result = method(*self._convert_msgspec_args(method, args))
-            output.result = UtilityResult(result)
-        except BaseException as e:
-            logger.exception("Invocation of %s method failed", method_name)
-            output.failure_message = (
-                f"Call to {method_name} method failed: {str(e)}"
-            )
-        self.output_queue.put_nowait(
-            (client_idx, _engine_mod.EngineCoreOutputs(utility_output=output))
-        )
-    elif request_type == EngineCoreRequestType.BEAM_SEARCH:
-        from vllm_gr.v1.engine.beam_search_2 import BeamSearchController
-        controller = BeamSearchController(self, request)
-        controller.submit_step()
-        self.active_beam_searches.append(controller)
-    elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
-        raise RuntimeError("Executor failed.")
-    else:
-        logger.error(
-            "Unrecognized input request type encountered: %s", request_type
-        )
-
-
-# ---------------------------------------------------------------------------
 # EngineCoreProc.process_input_sockets replacement
 # ---------------------------------------------------------------------------
 
@@ -313,7 +185,7 @@ def patched_process_input_sockets(
     ready_event,
 ):
     """Replacement for EngineCoreProc.process_input_sockets with
-    ADD_BATCH, BEAM_FORK, and BEAM_SEARCH decoders."""
+    ADD_BATCH and BEAM_FORK decoders."""
     from contextlib import ExitStack
 
     import zmq
@@ -322,13 +194,12 @@ def patched_process_input_sockets(
     from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
     from vllm.v1.serial_utils import MsgpackDecoder
 
-    from vllm_gr.v1.engine.types import BeamForkRequest, BeamSearchRequest
+    from vllm_gr.v1.engine.types import BeamForkRequest
 
     # Msgpack serialization decoding.
     add_request_decoder = MsgpackDecoder(EngineCoreRequest)
     add_batch_decoder = MsgpackDecoder(list[EngineCoreRequest])
     beam_fork_decoder = MsgpackDecoder(BeamForkRequest)
-    beam_search_decoder = MsgpackDecoder(BeamSearchRequest)
     generic_decoder = MsgpackDecoder()
 
     with ExitStack() as stack, zmq.Context() as ctx:
@@ -407,9 +278,6 @@ def patched_process_input_sockets(
                         beam_fork_decoder.decode(data_frames))
                     self._handle_beam_fork(fork_req)
                     continue
-
-                elif request_type == EngineCoreRequestType.BEAM_SEARCH:
-                    request = beam_search_decoder.decode(data_frames)
 
                 else:
                     request = generic_decoder.decode(data_frames)

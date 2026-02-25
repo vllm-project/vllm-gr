@@ -44,10 +44,6 @@ from vllm_gr.v1.engine.engine_core_patch_2 import (
 )
 from vllm_gr.v1.engine.types import (
     BeamForkRequest,
-    BeamSearchRequest,
-    BeamSearchResult,
-    BeamSearchSequenceResult,
-    PatchedEngineCoreOutputs,
 )
 
 
@@ -216,114 +212,6 @@ class TestTypesSerialization:
         assert got.child_ids == []
         assert got.token_ids == []
         assert got.abort_ids == []
-
-    # 1.4
-    def test_beam_search_request_roundtrip(self):
-        req = BeamSearchRequest(
-            request_id="bs-1",
-            prompt_token_ids=[10, 20, 30],
-            beam_width=5,
-            max_tokens=20,
-            temperature=0.7,
-            length_penalty=0.9,
-            ignore_eos=True,
-            include_stop_str_in_output=True,
-            eos_token_id=3,
-            sid_begin_token_id=100,
-            sid_end_token_id=200,
-            n_best=2,
-            client_index=4,
-        )
-        data = msgspec.msgpack.encode(req)
-        dec = msgspec.msgpack.Decoder(BeamSearchRequest)
-        got = dec.decode(data)
-
-        assert got.request_id == "bs-1"
-        assert got.prompt_token_ids == [10, 20, 30]
-        assert got.beam_width == 5
-        assert got.max_tokens == 20
-        assert got.temperature == pytest.approx(0.7)
-        assert got.length_penalty == pytest.approx(0.9)
-        assert got.ignore_eos is True
-        assert got.include_stop_str_in_output is True
-        assert got.eos_token_id == 3
-        assert got.sid_begin_token_id == 100
-        assert got.sid_end_token_id == 200
-        assert got.n_best == 2
-        assert got.client_index == 4
-
-    # 1.5
-    def test_beam_search_result_roundtrip(self):
-        seqs = [
-            BeamSearchSequenceResult(
-                token_ids=[1, 2, 3],
-                cumulative_logprob=-1.5,
-                finish_reason="stop",
-                stop_reason=2,
-            ),
-            BeamSearchSequenceResult(
-                token_ids=[4, 5],
-                cumulative_logprob=-2.0,
-                finish_reason="length",
-                stop_reason=None,
-            ),
-            BeamSearchSequenceResult(
-                token_ids=[6],
-                cumulative_logprob=-3.3,
-                finish_reason="stop",
-                stop_reason="custom",
-            ),
-        ]
-        result = BeamSearchResult(request_id="res-1", sequences=seqs)
-        data = msgspec.msgpack.encode(result)
-        dec = msgspec.msgpack.Decoder(BeamSearchResult)
-        got = dec.decode(data)
-
-        assert got.request_id == "res-1"
-        assert len(got.sequences) == 3
-        assert got.sequences[0].token_ids == [1, 2, 3]
-        assert got.sequences[0].cumulative_logprob == pytest.approx(-1.5)
-        assert got.sequences[0].finish_reason == "stop"
-        assert got.sequences[0].stop_reason == 2
-        assert got.sequences[1].finish_reason == "length"
-        assert got.sequences[1].stop_reason is None
-        assert got.sequences[2].stop_reason == "custom"
-
-    # 1.6
-    def test_patched_outputs_without_beam_result(self):
-        out = PatchedEngineCoreOutputs(engine_index=1)
-        data = msgspec.msgpack.encode(out)
-        # Should be decodable as base EngineCoreOutputs because the
-        # trailing beam_search_result=None is omitted by omit_defaults.
-        dec = msgspec.msgpack.Decoder(EngineCoreOutputs)
-        base = dec.decode(data)
-        assert base.engine_index == 1
-
-    # 1.7
-    def test_patched_outputs_with_beam_result(self):
-        seq = BeamSearchSequenceResult(
-            token_ids=[7, 8], cumulative_logprob=-0.5
-        )
-        br = BeamSearchResult(request_id="br-1", sequences=[seq])
-        out = PatchedEngineCoreOutputs(engine_index=0, beam_search_result=br)
-        data = msgspec.msgpack.encode(out)
-        dec = msgspec.msgpack.Decoder(PatchedEngineCoreOutputs)
-        got = dec.decode(data)
-
-        assert got.beam_search_result is not None
-        assert got.beam_search_result.request_id == "br-1"
-        assert got.beam_search_result.sequences[0].token_ids == [7, 8]
-
-    # 1.8
-    def test_patched_outputs_field_order(self):
-        base_fields = EngineCoreOutputs.__struct_fields__
-        patched_fields = PatchedEngineCoreOutputs.__struct_fields__
-        # First N fields of patched must exactly match base.
-        assert patched_fields[: len(base_fields)] == base_fields
-        # beam_search_result is appended.
-        assert "beam_search_result" in patched_fields
-        assert patched_fields[-1] == "beam_search_result"
-
 
 # ---------------------------------------------------------------------------
 # 2. Enum Patching  (engine_core_patch_2.py)
@@ -1582,24 +1470,3 @@ class TestIntegrationCrossProcess:
         assert got.abort_ids == ["a0"]
         assert got.eos_token_id == 2
         assert got.sampling_params.max_tokens == sp.max_tokens
-
-    # 7.3
-    def test_patched_outputs_backward_compat(self):
-        """Child encodes PatchedEngineCoreOutputs (no beam result).
-        Parent decodes as base EngineCoreOutputs."""
-        from vllm.v1.serial_utils import MsgpackDecoder
-
-        encoder = msgspec.msgpack.Encoder()
-        patched = PatchedEngineCoreOutputs(
-            engine_index=5,
-            timestamp=123.456,
-        )
-        data = encoder.encode(patched)
-
-        # Parent decodes as base type.
-        decoder = MsgpackDecoder(EngineCoreOutputs)
-        base = decoder.decode(data)
-
-        assert base.engine_index == 5
-        assert base.timestamp == pytest.approx(123.456)
-        assert base.outputs == []
