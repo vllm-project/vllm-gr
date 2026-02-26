@@ -10,6 +10,7 @@ from vllm_gr.v1.engine.types import (
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
 # ---------------------------------------------------------------------------
 
+
 async def add_requests_async(self, requests, force_batch=False):
     """Send multiple requests to EngineCore.
 
@@ -29,6 +30,7 @@ async def add_requests_async(self, requests, force_batch=False):
 # ---------------------------------------------------------------------------
 # AsyncMPClient.beam_fork_async  (new method — BEAM_FORK path)
 # ---------------------------------------------------------------------------
+
 
 async def beam_fork_async(self, fork_request: BeamForkRequest) -> None:
     """Send BEAM_FORK to EngineCore."""

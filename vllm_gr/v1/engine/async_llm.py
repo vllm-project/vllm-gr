@@ -111,6 +111,7 @@ def prepare_request_fn(
 
     return queue, request
 
+
 async def _add_requests_batch_fn(
     self,
     requests,
@@ -164,7 +165,6 @@ def register_beam_output_fn(
     queue = RequestOutputCollector(sampling_params.output_kind, request_id)
     self.output_processor.add_request(ec_request, None, None, 0, queue)
     return queue
-
 
 
 async def beam_fork_fn(self, fork_request: BeamForkRequest) -> None:
