@@ -19,6 +19,7 @@ from vllm.sampling_params import SamplingParams
 # BeamForkRequest — lightweight beam fork (ADD_BATCH + BEAM_FORK path)
 # ---------------------------------------------------------------------------
 
+
 class BeamForkRequest(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]

@@ -5,16 +5,12 @@ ADD_BATCH and BEAM_FORK."""
 
 from __future__ import annotations
 
-import asyncio
 import time
-import weakref
-from collections.abc import Awaitable, Callable, Mapping
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, cast
 
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
-from vllm.v1.engine.core_client import _process_utility_output
-from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.v1.engine.types import (
     BeamForkRequest,
@@ -23,12 +19,13 @@ from vllm_gr.v1.engine.types import (
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
-    from vllm.v1.engine.core_client import AsyncMPClient
+    pass
 
 
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
 # ---------------------------------------------------------------------------
+
 
 async def add_requests_async(self, requests, force_batch=False):
     """Send multiple requests to EngineCore.
@@ -50,17 +47,18 @@ async def add_requests_async(self, requests, force_batch=False):
 # AsyncMPClient.beam_fork_async  (new method — BEAM_FORK path)
 # ---------------------------------------------------------------------------
 
+
 async def beam_fork_async(self, fork_request: BeamForkRequest) -> None:
     """Send BEAM_FORK to EngineCore."""
     fork_request.client_index = self.client_index
-    await self._send_input(
-        EngineCoreRequestType.BEAM_FORK, fork_request)
+    await self._send_input(EngineCoreRequestType.BEAM_FORK, fork_request)
     self._ensure_output_queue_task()
 
 
 # ---------------------------------------------------------------------------
 # AsyncLLM methods for ADD_BATCH / BEAM_FORK
 # ---------------------------------------------------------------------------
+
 
 def prepare_request_fn(
     self,
@@ -90,6 +88,7 @@ def prepare_request_fn(
 
     if self.errored:
         from vllm.v1.engine.exceptions import EngineDeadError
+
         raise EngineDeadError()
 
     is_pooling = isinstance(params, PoolingParams)
@@ -108,6 +107,7 @@ def prepare_request_fn(
     if tokenization_kwargs is None:
         tokenization_kwargs = {}
     from vllm.entrypoints.utils import _validate_truncation_size
+
     _validate_truncation_size(
         self.model_config.max_model_len,
         params.truncate_prompt_tokens,
@@ -119,9 +119,7 @@ def prepare_request_fn(
         request = prompt
     else:
         if prompt_text is not None:
-            raise ValueError(
-                "should only provide prompt_text with EngineCoreRequest"
-            )
+            raise ValueError("should only provide prompt_text with EngineCoreRequest")
         request = self.input_processor.process_inputs(
             request_id,
             prompt,
@@ -147,8 +145,7 @@ def prepare_request_fn(
 
     # Register the request in OutputProcessor (this process) but
     # do NOT send to EngineCore yet.
-    self.output_processor.add_request(
-        request, prompt_text, None, 0, queue)
+    self.output_processor.add_request(request, prompt_text, None, 0, queue)
 
     if self.log_requests:
         logger.info("Prepared request %s.", request.request_id)
@@ -167,8 +164,7 @@ async def _add_requests_batch_fn(
         use_batch_message: If True, always send as ADD_BATCH (needed for
             beam cache). If False, send individual ADD messages.
     """
-    await self.engine_core.add_requests_async(
-        requests, force_batch=use_batch_message)
+    await self.engine_core.add_requests_async(requests, force_batch=use_batch_message)
 
 
 def register_beam_output_fn(
@@ -179,7 +175,7 @@ def register_beam_output_fn(
     eos_token_id=None,
     lora_request=None,
     trace_headers=None,
-    priority=0
+    priority=0,
 ):
     """Register output queue for a beam fork child (no ZMQ send).
 
@@ -207,8 +203,7 @@ def register_beam_output_fn(
     ec_request.external_req_id = request_id
 
     self._run_output_handler()
-    queue = RequestOutputCollector(
-        sampling_params.output_kind, request_id)
+    queue = RequestOutputCollector(sampling_params.output_kind, request_id)
     self.output_processor.add_request(ec_request, None, None, 0, queue)
     return queue
 
@@ -221,6 +216,7 @@ async def beam_fork_fn(self, fork_request: BeamForkRequest) -> None:
 # ---------------------------------------------------------------------------
 # apply_batch_fork_patches — wire ADD_BATCH / BEAM_FORK into client classes
 # ---------------------------------------------------------------------------
+
 
 def apply_batch_fork_patches():
     """Monkey-patch AsyncMPClient and AsyncLLM with ADD_BATCH/BEAM_FORK

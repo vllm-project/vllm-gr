@@ -23,7 +23,7 @@ import msgspec
 import pytest
 
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
+from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.v1.engine.core_client_patch_2 import (
     _add_requests_batch_fn,
@@ -38,8 +38,6 @@ from vllm_gr.v1.engine.core_client_patch_2 import (
 from vllm_gr.v1.engine.engine_core_patch_2 import (
     _add_enum_member,
     run_engine_core,
-    apply_engine_core_child_patches,
-    make_patched_engine_core_init,
 )
 
 from vllm_gr.v1.engine.core import (
@@ -54,6 +52,7 @@ from vllm_gr.v1.engine.types import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _sampling_params(**overrides) -> SamplingParams:
     """Create a SamplingParams with sensible test defaults."""
@@ -126,6 +125,7 @@ def _make_fork_request(
 # ---------------------------------------------------------------------------
 # 1. Types Serialization  (vllm_gr/v1/engine/types.py)
 # ---------------------------------------------------------------------------
+
 
 class TestTypesSerialization:
     """Section 1: msgspec round-trip tests for all custom types."""
@@ -219,9 +219,11 @@ class TestTypesSerialization:
         assert got.token_ids == []
         assert got.abort_ids == []
 
+
 # ---------------------------------------------------------------------------
 # 2. Enum Patching  (engine_core_patch_2.py)
 # ---------------------------------------------------------------------------
+
 
 class TestEnumPatching:
     """Section 2: runtime enum injection via _add_enum_member."""
@@ -241,10 +243,7 @@ class TestEnumPatching:
         _add_enum_member("ADD_BATCH", b"\x05")
         assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
         # Should appear only once in _member_names_ (or at least resolve).
-        assert (
-            EngineCoreRequestType(b"\x05")
-            is EngineCoreRequestType.ADD_BATCH
-        )
+        assert EngineCoreRequestType(b"\x05") is EngineCoreRequestType.ADD_BATCH
 
     # 2.3
     def test_add_enum_member_beam_fork(self):
@@ -258,15 +257,13 @@ class TestEnumPatching:
         assert EngineCoreRequestType.BEAM_SEARCH.value == b"\x07"
         assert EngineCoreRequestType(b"\x07") is EngineCoreRequestType.BEAM_SEARCH
         # No collision with BEAM_FORK.
-        assert (
-            EngineCoreRequestType(b"\x06")
-            is not EngineCoreRequestType(b"\x07")
-        )
+        assert EngineCoreRequestType(b"\x06") is not EngineCoreRequestType(b"\x07")
 
 
 # ---------------------------------------------------------------------------
 # 3. EngineCore Beam Cache  (engine_core_patch_2.py)
 # ---------------------------------------------------------------------------
+
 
 class TestBeamCache:
     """Section 3: _cache_beam_request and _handle_beam_fork."""
@@ -307,18 +304,20 @@ class TestBeamCache:
 
     # 3.3
     def test_handle_beam_fork_creates_children(self):
-        eng = _make_engine_self(beam_cache={
-            "p0": {
-                "all_token_ids": [10, 20],
-                "block_hashes": [],
-                "eos_token_id": 2,
-                "lora_request": None,
-                "cache_salt": None,
-                "mm_features": None,
-                "prompt_embeds": None,
-                "num_prompt_tokens": 2,
-            },
-        })
+        eng = _make_engine_self(
+            beam_cache={
+                "p0": {
+                    "all_token_ids": [10, 20],
+                    "block_hashes": [],
+                    "eos_token_id": 2,
+                    "lora_request": None,
+                    "cache_salt": None,
+                    "mm_features": None,
+                    "prompt_embeds": None,
+                    "num_prompt_tokens": 2,
+                },
+            }
+        )
         fork = _make_fork_request(
             parent_ids=["p0", "p0"],
             child_ids=["c0", "c1"],
@@ -352,18 +351,20 @@ class TestBeamCache:
 
     # 3.4
     def test_handle_beam_fork_clones_block_hashes(self):
-        eng = _make_engine_self(beam_cache={
-            "p0": {
-                "all_token_ids": [10, 20],
-                "block_hashes": [0xAA, 0xBB],
-                "eos_token_id": 2,
-                "lora_request": None,
-                "cache_salt": None,
-                "mm_features": None,
-                "prompt_embeds": None,
-                "num_prompt_tokens": 2,
-            },
-        })
+        eng = _make_engine_self(
+            beam_cache={
+                "p0": {
+                    "all_token_ids": [10, 20],
+                    "block_hashes": [0xAA, 0xBB],
+                    "eos_token_id": 2,
+                    "lora_request": None,
+                    "cache_salt": None,
+                    "mm_features": None,
+                    "prompt_embeds": None,
+                    "num_prompt_tokens": 2,
+                },
+            }
+        )
         fork = _make_fork_request(
             parent_ids=["p0"],
             child_ids=["c0"],
@@ -459,18 +460,20 @@ class TestBeamCache:
 
     # 3.7
     def test_handle_beam_fork_missing_parent(self):
-        eng = _make_engine_self(beam_cache={
-            "valid": {
-                "all_token_ids": [10],
-                "block_hashes": [],
-                "eos_token_id": 2,
-                "lora_request": None,
-                "cache_salt": None,
-                "mm_features": None,
-                "prompt_embeds": None,
-                "num_prompt_tokens": 1,
-            },
-        })
+        eng = _make_engine_self(
+            beam_cache={
+                "valid": {
+                    "all_token_ids": [10],
+                    "block_hashes": [],
+                    "eos_token_id": 2,
+                    "lora_request": None,
+                    "cache_salt": None,
+                    "mm_features": None,
+                    "prompt_embeds": None,
+                    "num_prompt_tokens": 1,
+                },
+            }
+        )
         fork = _make_fork_request(
             parent_ids=["missing", "valid"],
             child_ids=["c0", "c1"],
@@ -495,6 +498,7 @@ class TestBeamCache:
         # The missing parent should have produced an error output
         # so the client doesn't hang waiting for child "c0".
         from vllm.v1.engine import FinishReason
+
         error_items = []
         while not eng.output_queue.empty():
             error_items.append(eng.output_queue.get_nowait())
@@ -507,28 +511,30 @@ class TestBeamCache:
 
     # 3.8
     def test_handle_beam_fork_cleans_cache(self):
-        eng = _make_engine_self(beam_cache={
-            "A": {
-                "all_token_ids": [1],
-                "block_hashes": [],
-                "eos_token_id": 2,
-                "lora_request": None,
-                "cache_salt": None,
-                "mm_features": None,
-                "prompt_embeds": None,
-                "num_prompt_tokens": 1,
-            },
-            "B": {
-                "all_token_ids": [2],
-                "block_hashes": [],
-                "eos_token_id": 2,
-                "lora_request": None,
-                "cache_salt": None,
-                "mm_features": None,
-                "prompt_embeds": None,
-                "num_prompt_tokens": 1,
-            },
-        })
+        eng = _make_engine_self(
+            beam_cache={
+                "A": {
+                    "all_token_ids": [1],
+                    "block_hashes": [],
+                    "eos_token_id": 2,
+                    "lora_request": None,
+                    "cache_salt": None,
+                    "mm_features": None,
+                    "prompt_embeds": None,
+                    "num_prompt_tokens": 1,
+                },
+                "B": {
+                    "all_token_ids": [2],
+                    "block_hashes": [],
+                    "eos_token_id": 2,
+                    "lora_request": None,
+                    "cache_salt": None,
+                    "mm_features": None,
+                    "prompt_embeds": None,
+                    "num_prompt_tokens": 1,
+                },
+            }
+        )
         fork = _make_fork_request(
             parent_ids=["A"],
             child_ids=["C"],
@@ -551,18 +557,20 @@ class TestBeamCache:
 
     # 3.9
     def test_handle_beam_fork_inherits_eos(self):
-        eng = _make_engine_self(beam_cache={
-            "p0": {
-                "all_token_ids": [10],
-                "block_hashes": [],
-                "eos_token_id": 42,
-                "lora_request": None,
-                "cache_salt": None,
-                "mm_features": None,
-                "prompt_embeds": None,
-                "num_prompt_tokens": 1,
-            },
-        })
+        eng = _make_engine_self(
+            beam_cache={
+                "p0": {
+                    "all_token_ids": [10],
+                    "block_hashes": [],
+                    "eos_token_id": 42,
+                    "lora_request": None,
+                    "cache_salt": None,
+                    "mm_features": None,
+                    "prompt_embeds": None,
+                    "num_prompt_tokens": 1,
+                },
+            }
+        )
         fork = _make_fork_request(
             parent_ids=["p0"],
             child_ids=["c0"],
@@ -583,18 +591,20 @@ class TestBeamCache:
 
     # 3.10
     def test_handle_beam_fork_overrides_eos(self):
-        eng = _make_engine_self(beam_cache={
-            "p0": {
-                "all_token_ids": [10],
-                "block_hashes": [],
-                "eos_token_id": 42,
-                "lora_request": None,
-                "cache_salt": None,
-                "mm_features": None,
-                "prompt_embeds": None,
-                "num_prompt_tokens": 1,
-            },
-        })
+        eng = _make_engine_self(
+            beam_cache={
+                "p0": {
+                    "all_token_ids": [10],
+                    "block_hashes": [],
+                    "eos_token_id": 42,
+                    "lora_request": None,
+                    "cache_salt": None,
+                    "mm_features": None,
+                    "prompt_embeds": None,
+                    "num_prompt_tokens": 1,
+                },
+            }
+        )
         fork = _make_fork_request(
             parent_ids=["p0"],
             child_ids=["c0"],
@@ -614,18 +624,20 @@ class TestBeamCache:
 
     # 3.11
     def test_handle_beam_fork_block_hasher_none(self):
-        eng = _make_engine_self(beam_cache={
-            "p0": {
-                "all_token_ids": [10],
-                "block_hashes": [],
-                "eos_token_id": 2,
-                "lora_request": None,
-                "cache_salt": None,
-                "mm_features": None,
-                "prompt_embeds": None,
-                "num_prompt_tokens": 1,
-            },
-        })
+        eng = _make_engine_self(
+            beam_cache={
+                "p0": {
+                    "all_token_ids": [10],
+                    "block_hashes": [],
+                    "eos_token_id": 2,
+                    "lora_request": None,
+                    "cache_salt": None,
+                    "mm_features": None,
+                    "prompt_embeds": None,
+                    "num_prompt_tokens": 1,
+                },
+            }
+        )
         fork = _make_fork_request(
             parent_ids=["p0"],
             child_ids=["c0"],
@@ -647,6 +659,7 @@ class TestBeamCache:
 # ---------------------------------------------------------------------------
 # 4. Client-Side Patches  (core_client_patch_2.py)
 # ---------------------------------------------------------------------------
+
 
 class TestClientPatches:
     """Section 4: AsyncMPClient and AsyncLLM patch functions."""
@@ -755,9 +768,7 @@ class TestClientPatches:
         mock_self._run_output_handler = MagicMock()
         mock_self.log_requests = False
 
-        queue_obj, returned_req = prepare_request_fn(
-            mock_self, "prep-1", "hello", sp
-        )
+        queue_obj, returned_req = prepare_request_fn(mock_self, "prep-1", "hello", sp)
 
         assert returned_req is ec_req
         mock_self.output_processor.add_request.assert_called_once()
@@ -770,9 +781,7 @@ class TestClientPatches:
         mock_self.errored = True
 
         with pytest.raises(EngineDeadError):
-            prepare_request_fn(
-                mock_self, "err-1", "prompt", _sampling_params()
-            )
+            prepare_request_fn(mock_self, "err-1", "prompt", _sampling_params())
 
     # 4.8
     def test_add_requests_batch_delegates(self):
@@ -780,13 +789,9 @@ class TestClientPatches:
         mock_self.engine_core.add_requests_async = AsyncMock()
         reqs = [MagicMock(), MagicMock()]
 
-        asyncio.run(
-            _add_requests_batch_fn(mock_self, reqs, use_batch_message=True)
-        )
+        asyncio.run(_add_requests_batch_fn(mock_self, reqs, use_batch_message=True))
 
-        mock_self.engine_core.add_requests_async.assert_awaited_once_with(
-            reqs, force_batch=True
-        )
+        mock_self.engine_core.add_requests_async.assert_awaited_once_with(reqs, force_batch=True)
 
     # 4.9
     def test_register_beam_output_sets_external_id(self):
@@ -844,6 +849,7 @@ class TestClientPatches:
 # ---------------------------------------------------------------------------
 # 5. Beam Search Orchestration  (serving_engine.py)
 # ---------------------------------------------------------------------------
+
 
 def _make_beam_search_params(**overrides):
     """Create a SimpleNamespace that mimics BeamSearchParams attributes."""
@@ -907,11 +913,7 @@ class TestBeamSearchOrchestration:
         params = _make_beam_search_params(beam_width=0)
 
         with pytest.raises(VLLMValidationError):
-            asyncio.run(
-                _collect_beam_search(
-                    beam_search(mock_self, "hello", "req-1", params)
-                )
-            )
+            asyncio.run(_collect_beam_search(beam_search(mock_self, "hello", "req-1", params)))
 
     # 5.2
     def test_beam_search_validation_no_tokenizer(self):
@@ -924,11 +926,7 @@ class TestBeamSearchOrchestration:
         params = _make_beam_search_params(beam_width=3)
 
         with pytest.raises(VLLMValidationError):
-            asyncio.run(
-                _collect_beam_search(
-                    beam_search(mock_self, "hello", "req-1", params)
-                )
-            )
+            asyncio.run(_collect_beam_search(beam_search(mock_self, "hello", "req-1", params)))
 
     # 5.3
     def test_beam_search_invalid_begin_token(self):
@@ -937,17 +935,11 @@ class TestBeamSearchOrchestration:
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
         mock_self = _make_serving_self()
-        mock_self.input_processor.tokenizer.convert_tokens_to_ids.return_value = (
-            None
-        )
+        mock_self.input_processor.tokenizer.convert_tokens_to_ids.return_value = None
         params = _make_beam_search_params(begin_token="NONEXISTENT")
 
         with pytest.raises(VLLMValidationError):
-            asyncio.run(
-                _collect_beam_search(
-                    beam_search(mock_self, "hello", "req-1", params)
-                )
-            )
+            asyncio.run(_collect_beam_search(beam_search(mock_self, "hello", "req-1", params)))
 
     # 5.4
     def test_beam_search_max_tokens_too_small(self):
@@ -958,40 +950,28 @@ class TestBeamSearchOrchestration:
         mock_self = _make_serving_self()
         tokenizer = mock_self.input_processor.tokenizer
         tokenizer.convert_tokens_to_ids.return_value = 100
-        params = _make_beam_search_params(
-            max_tokens=1, begin_token="<s>", end_token="</s>"
-        )
+        params = _make_beam_search_params(max_tokens=1, begin_token="<s>", end_token="</s>")
 
         with pytest.raises(VLLMValidationError):
-            asyncio.run(
-                _collect_beam_search(
-                    beam_search(mock_self, "hello", "req-1", params)
-                )
-            )
+            asyncio.run(_collect_beam_search(beam_search(mock_self, "hello", "req-1", params)))
 
     # 5.5
     def test_capability_detection_both(self):
-        mock_self = _make_serving_self(
-            has_prepare_request=True, has_beam_fork=True
-        )
+        mock_self = _make_serving_self(has_prepare_request=True, has_beam_fork=True)
         ec = mock_self.engine_client
         assert hasattr(ec, "prepare_request")
         assert hasattr(ec, "beam_fork")
 
     # 5.6
     def test_capability_detection_batch_only(self):
-        mock_self = _make_serving_self(
-            has_prepare_request=True, has_beam_fork=False
-        )
+        mock_self = _make_serving_self(has_prepare_request=True, has_beam_fork=False)
         ec = mock_self.engine_client
         assert hasattr(ec, "prepare_request")
         assert not hasattr(ec, "beam_fork")
 
     # 5.7
     def test_capability_detection_neither(self):
-        mock_self = _make_serving_self(
-            has_prepare_request=False, has_beam_fork=False
-        )
+        mock_self = _make_serving_self(has_prepare_request=False, has_beam_fork=False)
         ec = mock_self.engine_client
         assert not hasattr(ec, "prepare_request")
         assert not hasattr(ec, "beam_fork")
@@ -1002,9 +982,7 @@ class TestBeamSearchOrchestration:
         prepare_request for each beam then _add_requests_batch."""
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
-        mock_self = _make_serving_self(
-            has_prepare_request=True, has_beam_fork=True
-        )
+        mock_self = _make_serving_self(has_prepare_request=True, has_beam_fork=True)
         ec = mock_self.engine_client
 
         # prepare_request returns (queue, request).
@@ -1019,9 +997,7 @@ class TestBeamSearchOrchestration:
         # Queue must return a finished output.
         mock_output = MagicMock()
         mock_output.finished = True
-        mock_output.outputs = [
-            MagicMock(finish_reason="length", logprobs=None)
-        ]
+        mock_output.outputs = [MagicMock(finish_reason="length", logprobs=None)]
         mock_queue.get_nowait.return_value = mock_output
 
         prompt = {"prompt_token_ids": [10, 20]}
@@ -1031,11 +1007,7 @@ class TestBeamSearchOrchestration:
         # The loop runs once (max_tokens=1, pre_calc=0), then exits.
         # We just verify the right methods were called.
         try:
-            asyncio.run(
-                _collect_beam_search(
-                    beam_search(mock_self, prompt, "req-1", params)
-                )
-            )
+            asyncio.run(_collect_beam_search(beam_search(mock_self, prompt, "req-1", params)))
         except Exception:
             pass  # minheap or other downstream errors are expected
 
@@ -1052,9 +1024,7 @@ class TestBeamSearchOrchestration:
         """After step 0 sets fork_info, step 1 should use BEAM_FORK path."""
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
-        mock_self = _make_serving_self(
-            has_prepare_request=True, has_beam_fork=True
-        )
+        mock_self = _make_serving_self(has_prepare_request=True, has_beam_fork=True)
         ec = mock_self.engine_client
 
         # Step 0: prepare_request path.
@@ -1084,20 +1054,14 @@ class TestBeamSearchOrchestration:
 
         step1_output = MagicMock()
         step1_output.finished = True
-        step1_output.outputs = [
-            MagicMock(finish_reason="length", logprobs=None)
-        ]
+        step1_output.outputs = [MagicMock(finish_reason="length", logprobs=None)]
         fork_queue.get_nowait.return_value = step1_output
 
         prompt = {"prompt_token_ids": [10, 20]}
         params = _make_beam_search_params(beam_width=1, max_tokens=2)
 
         try:
-            asyncio.run(
-                _collect_beam_search(
-                    beam_search(mock_self, prompt, "req-1", params)
-                )
-            )
+            asyncio.run(_collect_beam_search(beam_search(mock_self, prompt, "req-1", params)))
         except Exception:
             pass
 
@@ -1124,17 +1088,13 @@ class TestBeamSearchOrchestration:
         """Without prepare_request/beam_fork, falls back to generate()."""
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
-        mock_self = _make_serving_self(
-            has_prepare_request=False, has_beam_fork=False
-        )
+        mock_self = _make_serving_self(has_prepare_request=False, has_beam_fork=False)
         ec = mock_self.engine_client
 
         # generate() returns an async generator.
         mock_output = MagicMock()
         mock_output.finished = True
-        mock_output.outputs = [
-            MagicMock(finish_reason="length", logprobs=None)
-        ]
+        mock_output.outputs = [MagicMock(finish_reason="length", logprobs=None)]
 
         async def mock_generate(*args, **kwargs):
             yield mock_output
@@ -1145,11 +1105,7 @@ class TestBeamSearchOrchestration:
         params = _make_beam_search_params(beam_width=1, max_tokens=1)
 
         try:
-            asyncio.run(
-                _collect_beam_search(
-                    beam_search(mock_self, prompt, "req-1", params)
-                )
-            )
+            asyncio.run(_collect_beam_search(beam_search(mock_self, prompt, "req-1", params)))
         except Exception:
             pass
 
@@ -1158,9 +1114,7 @@ class TestBeamSearchOrchestration:
         """Error finish_reason should yield error and return immediately."""
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
-        mock_self = _make_serving_self(
-            has_prepare_request=False, has_beam_fork=False
-        )
+        mock_self = _make_serving_self(has_prepare_request=False, has_beam_fork=False)
         ec = mock_self.engine_client
 
         error_output = MagicMock()
@@ -1175,11 +1129,7 @@ class TestBeamSearchOrchestration:
         prompt = {"prompt_token_ids": [10, 20]}
         params = _make_beam_search_params(beam_width=1, max_tokens=5)
 
-        results = asyncio.run(
-            _collect_beam_search(
-                beam_search(mock_self, prompt, "req-1", params)
-            )
-        )
+        results = asyncio.run(_collect_beam_search(beam_search(mock_self, prompt, "req-1", params)))
 
         assert len(results) == 1
         assert results[0].finished is True
@@ -1196,9 +1146,7 @@ class TestBeamSearchOrchestration:
         eos_token_id = 2
         logprobs_num = 3
         all_beams_token_id = np.array([50, 51, 2, 60, 61, 62])
-        all_beams_logprob = np.array(
-            [-1.0, -1.5, -0.5, -2.0, -2.5, -3.0]
-        )
+        all_beams_logprob = np.array([-1.0, -1.5, -0.5, -2.0, -2.5, -3.0])
         all_beams = [
             BeamSearchSequence(tokens=[10, 20], cum_logprob=-0.5, logprobs=[]),
             BeamSearchSequence(tokens=[10, 30], cum_logprob=-1.0, logprobs=[]),
@@ -1253,8 +1201,7 @@ class TestBeamSearchOrchestration:
         selected_items = [(-0.5, 3), (-1.0, 0), (-1.5, 4)]
 
         fork_info = [
-            (idx // logprobs_num, int(all_beams_token_id[idx]))
-            for _, idx in selected_items
+            (idx // logprobs_num, int(all_beams_token_id[idx])) for _, idx in selected_items
         ]
 
         assert fork_info == [(1, 60), (0, 50), (1, 61)]
@@ -1296,12 +1243,8 @@ class TestBeamSearchOrchestration:
 
         sid_end_token_id = 200
         all_beams = [
-            BeamSearchSequence(
-                tokens=[10, 20, 50], cum_logprob=-1.0, logprobs=[]
-            ),
-            BeamSearchSequence(
-                tokens=[10, 20, 60], cum_logprob=-2.0, logprobs=[]
-            ),
+            BeamSearchSequence(tokens=[10, 20, 50], cum_logprob=-1.0, logprobs=[]),
+            BeamSearchSequence(tokens=[10, 20, 60], cum_logprob=-2.0, logprobs=[]),
         ]
 
         # Simulate the end-token logic.
@@ -1327,9 +1270,7 @@ class TestBeamSearchOrchestration:
         ]
         beam_width = 3
 
-        sorted_completed = sorted(
-            completed, key=lambda x: x.cum_logprob, reverse=True
-        )
+        sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
         best_beams = sorted_completed[:beam_width]
 
         assert len(best_beams) == 3
@@ -1360,6 +1301,7 @@ class TestBeamSearchOrchestration:
 # 6. Patch Wiring  (beam_search_patch.py, patch.py)
 # ---------------------------------------------------------------------------
 
+
 class TestPatchWiring:
     """Section 6: patch orchestration."""
 
@@ -1388,15 +1330,9 @@ class TestPatchWiring:
     # 6.3
     def test_run_patch_calls_all_three(self):
         with (
-            patch(
-                "vllm_gr.patch.patch_beam_search"
-            ) as mock_bs,
-            patch(
-                "vllm_gr.patch.patch_sampling"
-            ) as mock_samp,
-            patch(
-                "vllm_gr.patch.patch_batch_and_fork"
-            ) as mock_bf,
+            patch("vllm_gr.patch.patch_beam_search") as mock_bs,
+            patch("vllm_gr.patch.patch_sampling") as mock_samp,
+            patch("vllm_gr.patch.patch_batch_and_fork") as mock_bf,
         ):
             from vllm_gr.patch import run_patch
 
@@ -1412,9 +1348,7 @@ class TestPatchWiring:
             patch(
                 "vllm_gr.v1.engine.engine_core_patch_2.apply_engine_core_child_patches"
             ) as mock_apply,
-            patch(
-                "vllm.v1.engine.core.EngineCoreProc"
-            ) as MockProc,
+            patch("vllm.v1.engine.core.EngineCoreProc") as MockProc,
         ):
             original_run = MagicMock()
             MockProc.run_engine_core = original_run
@@ -1428,6 +1362,7 @@ class TestPatchWiring:
 # ---------------------------------------------------------------------------
 # 7. Integration / Cross-Process
 # ---------------------------------------------------------------------------
+
 
 class TestIntegrationCrossProcess:
     """Section 7: cross-process serialization and enum consistency."""

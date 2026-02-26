@@ -5,9 +5,6 @@ ADD_BATCH and BEAM_FORK."""
 
 from __future__ import annotations
 
-import time
-from functools import partial
-from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
@@ -18,6 +15,7 @@ logger = init_logger(__name__)
 # EngineCore.__init__ wrapper
 # ---------------------------------------------------------------------------
 
+
 def make_patched_engine_core_init(original_init):
     """Wrap EngineCore.__init__ to add beam state."""
 
@@ -27,9 +25,11 @@ def make_patched_engine_core_init(original_init):
 
     return patched_init
 
+
 # ---------------------------------------------------------------------------
 # Helpers: add an enum member to EngineCoreRequestType at runtime
 # ---------------------------------------------------------------------------
+
 
 def _add_enum_member(name: str, value: bytes) -> None:
     """Dynamically add a member to EngineCoreRequestType if absent."""
@@ -48,6 +48,7 @@ def _add_enum_member(name: str, value: bytes) -> None:
 # Child-process patch applicator — called from patched run_engine_core
 # ---------------------------------------------------------------------------
 
+
 def apply_engine_core_child_patches():
     """Apply all patches inside the EngineCore child process.
 
@@ -62,11 +63,7 @@ def apply_engine_core_child_patches():
         BeamForkRequest,
     )
 
-    from vllm_gr.v1.engine.core import (
-        _cache_beam_request,
-        _handle_beam_fork,
-        process_input_sockets
-    )
+    from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_fork, process_input_sockets
 
     # Inject types into vllm.v1.engine module
     engine_mod.BeamForkRequest = BeamForkRequest
@@ -87,8 +84,7 @@ def apply_engine_core_child_patches():
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
 
-    logger.info("Engine-core patches (ADD_BATCH, BEAM_FORK) "
-                "applied in child process.")
+    logger.info("Engine-core patches (ADD_BATCH, BEAM_FORK) applied in child process.")
 
 
 def run_engine_core(*args, **kwargs):
@@ -101,8 +97,8 @@ def run_engine_core(*args, **kwargs):
     We apply our patches first, then delegate to the original.
     """
     from vllm.v1.engine.core import EngineCoreProc
+
     # Save reference to original before applying patches
     original_run = EngineCoreProc.run_engine_core
     apply_engine_core_child_patches()
     original_run(*args, **kwargs)
-

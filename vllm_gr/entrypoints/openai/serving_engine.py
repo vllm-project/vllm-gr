@@ -43,9 +43,18 @@ async def _gather_beam_results(queues):
     return list(await asyncio.gather(*tasks))
 
 
-async def _beam_fork_step(engine_client, fork_info, prev_beam_internal_ids,
-                          all_beams, request_id_batch, beam_search_params,
-                          eos_token_id, lora_request, trace_headers, priority=0):
+async def _beam_fork_step(
+    engine_client,
+    fork_info,
+    prev_beam_internal_ids,
+    all_beams,
+    request_id_batch,
+    beam_search_params,
+    eos_token_id,
+    lora_request,
+    trace_headers,
+    priority=0,
+):
     """BEAM_FORK path: fork parent beams into children (steps 1+).
 
     Returns (output_list, new_internal_ids).
@@ -73,70 +82,76 @@ async def _beam_fork_step(engine_client, fork_info, prev_beam_internal_ids,
         queues.append(q)
 
     used = set(parent_ids)
-    abort_ids = [
-        pid for pid in prev_beam_internal_ids if pid not in used
-    ]
+    abort_ids = [pid for pid in prev_beam_internal_ids if pid not in used]
 
-    await engine_client.beam_fork(BeamForkRequest(
-        parent_ids=parent_ids,
-        child_ids=child_ids,
-        token_ids=child_token_ids,
-        abort_ids=abort_ids,
-        sampling_params=beam_search_params,
-        eos_token_id=eos_token_id,
-        lora_request=lora_request,
-        trace_headers=trace_headers,
-    ))
+    await engine_client.beam_fork(
+        BeamForkRequest(
+            parent_ids=parent_ids,
+            child_ids=child_ids,
+            token_ids=child_token_ids,
+            abort_ids=abort_ids,
+            sampling_params=beam_search_params,
+            eos_token_id=eos_token_id,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+        )
+    )
 
     output = await _gather_beam_results(queues)
     return output, child_ids
 
 
-async def _add_batch_step(engine_client, prompts_batch, lora_req_batch,
-                          request_id_batch, beam_search_params,
-                          use_beam_fork, trace_headers, priority=0):
+async def _add_batch_step(
+    engine_client,
+    prompts_batch,
+    lora_req_batch,
+    request_id_batch,
+    beam_search_params,
+    use_beam_fork,
+    trace_headers,
+    priority=0,
+):
     """ADD_BATCH path: prepare and batch-send requests (step 0).
 
     Returns (output_list, new_internal_ids).
     """
     queues = []
     engine_core_requests = []
-    for i, (individual_prompt, lora_req) in enumerate(
-        zip(prompts_batch, lora_req_batch)
-    ):
+    for i, (individual_prompt, lora_req) in enumerate(zip(prompts_batch, lora_req_batch)):
         request_id_item = f"{request_id_batch}-beam-{i}"
         q, ec_req = engine_client.prepare_request(
             request_id_item,
             individual_prompt,
             beam_search_params,
             lora_request=lora_req,
-            trace_headers=trace_headers, 
-            priority=priority
+            trace_headers=trace_headers,
+            priority=priority,
         )
         queues.append(q)
         engine_core_requests.append(ec_req)
 
-    await engine_client._add_requests_batch(
-        engine_core_requests, use_batch_message=use_beam_fork)
+    await engine_client._add_requests_batch(engine_core_requests, use_batch_message=use_beam_fork)
 
-    internal_ids = (
-        [r.request_id for r in engine_core_requests]
-        if use_beam_fork else []
-    )
+    internal_ids = [r.request_id for r in engine_core_requests] if use_beam_fork else []
     output = await _gather_beam_results(queues)
     return output, internal_ids
 
 
-async def _generate_step(engine_client, prompts_batch, lora_req_batch,
-                         request_id_batch, beam_search_params, trace_headers, priority=0):
+async def _generate_step(
+    engine_client,
+    prompts_batch,
+    lora_req_batch,
+    request_id_batch,
+    beam_search_params,
+    trace_headers,
+    priority=0,
+):
     """Fallback path: individual generate() calls.
 
     Returns (output_list, []).
     """
     tasks = []
-    for i, (individual_prompt, lora_req) in enumerate(
-        zip(prompts_batch, lora_req_batch)
-    ):
+    for i, (individual_prompt, lora_req) in enumerate(zip(prompts_batch, lora_req_batch)):
         request_id_item = f"{request_id_batch}-beam-{i}"
         task = asyncio.create_task(
             collect_from_async_generator(
@@ -146,7 +161,7 @@ async def _generate_step(engine_client, prompts_batch, lora_req_batch,
                     request_id_item,
                     lora_request=lora_req,
                     trace_headers=trace_headers,
-                    priority=priority
+                    priority=priority,
                 )
             )
         )
@@ -267,8 +282,8 @@ async def beam_search(
         )
 
     # Check once if the engine supports batch submission / beam fork.
-    use_batch = hasattr(self.engine_client, 'prepare_request')
-    use_beam_fork = hasattr(self.engine_client, 'beam_fork')
+    use_batch = hasattr(self.engine_client, "prepare_request")
+    use_beam_fork = hasattr(self.engine_client, "beam_fork")
 
     # BEAM_FORK tracking: internal IDs from previous step + fork info
     prev_beam_internal_ids: list[str] = []
@@ -300,22 +315,36 @@ async def beam_search(
 
         if use_beam_fork and fork_info is not None:
             output, prev_beam_internal_ids = await _beam_fork_step(
-                self.engine_client, fork_info, prev_beam_internal_ids,
-                all_beams, request_id_batch, beam_search_params,
-                eos_token_id, lora_request, trace_headers,
+                self.engine_client,
+                fork_info,
+                prev_beam_internal_ids,
+                all_beams,
+                request_id_batch,
+                beam_search_params,
+                eos_token_id,
+                lora_request,
+                trace_headers,
             )
         elif use_batch:
             output, new_ids = await _add_batch_step(
-                self.engine_client, prompts_batch, lora_req_batch,
-                request_id_batch, beam_search_params, use_beam_fork,
+                self.engine_client,
+                prompts_batch,
+                lora_req_batch,
+                request_id_batch,
+                beam_search_params,
+                use_beam_fork,
                 trace_headers,
             )
             if new_ids:
                 prev_beam_internal_ids = new_ids
         else:
             output, _ = await _generate_step(
-                self.engine_client, prompts_batch, lora_req_batch,
-                request_id_batch, beam_search_params, trace_headers,
+                self.engine_client,
+                prompts_batch,
+                lora_req_batch,
+                request_id_batch,
+                beam_search_params,
+                trace_headers,
             )
 
         if token > 0:
@@ -419,21 +448,22 @@ async def beam_search(
         # Build fork_info for next iteration's BEAM_FORK.
         if use_beam_fork:
             fork_info = [
-                (idx // logprobs_num, int(all_beams_token_id[idx]))
-                for _, idx in selected_items
+                (idx // logprobs_num, int(all_beams_token_id[idx])) for _, idx in selected_items
             ]
 
         all_beams = new_beams
 
     # Cleanup: remove remaining beam cache entries.
     if use_beam_fork and prev_beam_internal_ids:
-        await self.engine_client.beam_fork(BeamForkRequest(
-            parent_ids=[],
-            child_ids=[],
-            token_ids=[],
-            abort_ids=prev_beam_internal_ids,
-            sampling_params=beam_search_params,
-        ))
+        await self.engine_client.beam_fork(
+            BeamForkRequest(
+                parent_ids=[],
+                child_ids=[],
+                token_ids=[],
+                abort_ids=prev_beam_internal_ids,
+                sampling_params=beam_search_params,
+            )
+        )
 
     if sid_end_token_id is not None:
         for beam in all_beams:
