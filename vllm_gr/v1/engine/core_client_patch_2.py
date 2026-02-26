@@ -179,6 +179,7 @@ def register_beam_output_fn(
     eos_token_id=None,
     lora_request=None,
     trace_headers=None,
+    priority=0
 ):
     """Register output queue for a beam fork child (no ZMQ send).
 
@@ -198,6 +199,8 @@ def register_beam_output_fn(
         lora_request=lora_request,
         cache_salt=None,
         data_parallel_rank=None,
+        trace_headers=trace_headers,
+        priority=priority,
     )
     # Set external_req_id directly (skip assign_request_id which
     # would mangle the ID that EngineCore already knows about).

@@ -45,7 +45,7 @@ async def _gather_beam_results(queues):
 
 async def _beam_fork_step(engine_client, fork_info, prev_beam_internal_ids,
                           all_beams, request_id_batch, beam_search_params,
-                          eos_token_id, lora_request, trace_headers):
+                          eos_token_id, lora_request, trace_headers, priority=0):
     """BEAM_FORK path: fork parent beams into children (steps 1+).
 
     Returns (output_list, new_internal_ids).
@@ -94,7 +94,7 @@ async def _beam_fork_step(engine_client, fork_info, prev_beam_internal_ids,
 
 async def _add_batch_step(engine_client, prompts_batch, lora_req_batch,
                           request_id_batch, beam_search_params,
-                          use_beam_fork, trace_headers):
+                          use_beam_fork, trace_headers, priority=0):
     """ADD_BATCH path: prepare and batch-send requests (step 0).
 
     Returns (output_list, new_internal_ids).
@@ -110,7 +110,8 @@ async def _add_batch_step(engine_client, prompts_batch, lora_req_batch,
             individual_prompt,
             beam_search_params,
             lora_request=lora_req,
-            trace_headers=trace_headers,
+            trace_headers=trace_headers, 
+            priority=priority
         )
         queues.append(q)
         engine_core_requests.append(ec_req)
@@ -127,7 +128,7 @@ async def _add_batch_step(engine_client, prompts_batch, lora_req_batch,
 
 
 async def _generate_step(engine_client, prompts_batch, lora_req_batch,
-                         request_id_batch, beam_search_params, trace_headers):
+                         request_id_batch, beam_search_params, trace_headers, priority=0):
     """Fallback path: individual generate() calls.
 
     Returns (output_list, []).
@@ -145,6 +146,7 @@ async def _generate_step(engine_client, prompts_batch, lora_req_batch,
                     request_id_item,
                     lora_request=lora_req,
                     trace_headers=trace_headers,
+                    priority=priority
                 )
             )
         )
