@@ -25,7 +25,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.v1.engine.core_client_patch_2 import (
+from vllm_gr.v1.engine.core_client_patch import (
     _add_requests_batch_fn,
     add_requests_async,
     apply_batch_fork_patches,
@@ -35,7 +35,7 @@ from vllm_gr.v1.engine.core_client_patch_2 import (
     register_beam_output_fn,
 )
 
-from vllm_gr.v1.engine.engine_core_patch_2 import (
+from vllm_gr.v1.engine.engine_core_patch import (
     _add_enum_member,
     run_engine_core,
 )
@@ -221,7 +221,7 @@ class TestTypesSerialization:
 
 
 # ---------------------------------------------------------------------------
-# 2. Enum Patching  (engine_core_patch_2.py)
+# 2. Enum Patching  (engine_core_patch.py)
 # ---------------------------------------------------------------------------
 
 
@@ -261,7 +261,7 @@ class TestEnumPatching:
 
 
 # ---------------------------------------------------------------------------
-# 3. EngineCore Beam Cache  (engine_core_patch_2.py)
+# 3. EngineCore Beam Cache  (engine_core_patch.py)
 # ---------------------------------------------------------------------------
 
 
@@ -657,7 +657,7 @@ class TestBeamCache:
 
 
 # ---------------------------------------------------------------------------
-# 4. Client-Side Patches  (core_client_patch_2.py)
+# 4. Client-Side Patches  (core_client_patch.py)
 # ---------------------------------------------------------------------------
 
 
@@ -1346,7 +1346,7 @@ class TestPatchWiring:
     def test_run_engine_core_applies_child_patches(self):
         with (
             patch(
-                "vllm_gr.v1.engine.engine_core_patch_2.apply_engine_core_child_patches"
+                "vllm_gr.v1.engine.engine_core_patch.apply_engine_core_child_patches"
             ) as mock_apply,
             patch("vllm.v1.engine.core.EngineCoreProc") as MockProc,
         ):

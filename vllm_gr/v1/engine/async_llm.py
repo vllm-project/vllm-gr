@@ -1,59 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Monkey-patches for AsyncMPClient / AsyncLLM to support
-ADD_BATCH and BEAM_FORK."""
-
-from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, cast
-
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequestType
-
 from vllm_gr.v1.engine.types import (
     BeamForkRequest,
 )
+from typing import TYPE_CHECKING, cast
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     pass
-
-
-# ---------------------------------------------------------------------------
-# AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
-# ---------------------------------------------------------------------------
-
-
-async def add_requests_async(self, requests, force_batch=False):
-    """Send multiple requests to EngineCore.
-
-    If single and not forced, delegate to add_request_async.
-    Otherwise send as ADD_BATCH.
-    """
-    if not requests:
-        return
-    if len(requests) == 1 and not force_batch:
-        return await self.add_request_async(requests[0])
-    for request in requests:
-        request.client_index = self.client_index
-    await self._send_input(EngineCoreRequestType.ADD_BATCH, requests)
-    self._ensure_output_queue_task()
-
-
-# ---------------------------------------------------------------------------
-# AsyncMPClient.beam_fork_async  (new method — BEAM_FORK path)
-# ---------------------------------------------------------------------------
-
-
-async def beam_fork_async(self, fork_request: BeamForkRequest) -> None:
-    """Send BEAM_FORK to EngineCore."""
-    fork_request.client_index = self.client_index
-    await self._send_input(EngineCoreRequestType.BEAM_FORK, fork_request)
-    self._ensure_output_queue_task()
-
 
 # ---------------------------------------------------------------------------
 # AsyncLLM methods for ADD_BATCH / BEAM_FORK
@@ -152,7 +111,6 @@ def prepare_request_fn(
 
     return queue, request
 
-
 async def _add_requests_batch_fn(
     self,
     requests,
@@ -208,36 +166,7 @@ def register_beam_output_fn(
     return queue
 
 
+
 async def beam_fork_fn(self, fork_request: BeamForkRequest) -> None:
     """Send BEAM_FORK to EngineCore."""
     await self.engine_core.beam_fork_async(fork_request)
-
-
-# ---------------------------------------------------------------------------
-# apply_batch_fork_patches — wire ADD_BATCH / BEAM_FORK into client classes
-# ---------------------------------------------------------------------------
-
-
-def apply_batch_fork_patches():
-    """Monkey-patch AsyncMPClient and AsyncLLM with ADD_BATCH/BEAM_FORK
-    methods. Must be called after the enum members exist (i.e. after
-    _add_enum_member has been called for ADD_BATCH and BEAM_FORK in the
-    parent process)."""
-    from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.v1.engine.core_client import AsyncMPClient
-
-    from vllm_gr.v1.engine.engine_core_patch_2 import _add_enum_member
-
-    # Ensure enum members exist in parent process
-    _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_FORK", b"\x06")
-
-    # Patch AsyncMPClient
-    AsyncMPClient.add_requests_async = add_requests_async
-    AsyncMPClient.beam_fork_async = beam_fork_async
-
-    # Patch AsyncLLM
-    AsyncLLM.prepare_request = prepare_request_fn
-    AsyncLLM._add_requests_batch = _add_requests_batch_fn
-    AsyncLLM.register_beam_output = register_beam_output_fn
-    AsyncLLM.beam_fork = beam_fork_fn

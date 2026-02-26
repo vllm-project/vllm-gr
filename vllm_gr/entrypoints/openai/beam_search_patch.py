@@ -19,8 +19,8 @@ def patch_batch_and_fork():
     """Wire ADD_BATCH + BEAM_FORK into the engine pipeline."""
     from vllm.v1.engine.core import EngineCoreProc
 
-    from vllm_gr.v1.engine.core_client_patch_2 import apply_batch_fork_patches
-    from vllm_gr.v1.engine.engine_core_patch_2 import run_engine_core
+    from vllm_gr.v1.engine.core_client_patch import apply_batch_fork_patches
+    from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
     apply_batch_fork_patches()
     EngineCoreProc.run_engine_core = run_engine_core
