@@ -1,23 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import numpy as np
 import itertools
 from typing import cast
 
+import numpy as np
 from tqdm.auto import tqdm
-
 from vllm.beam_search import (
     BeamSearchInstance,
     BeamSearchOutput,
     BeamSearchSequence,
     create_sort_beams_key_function,
 )
-
 from vllm.inputs import TextPrompt, TokensPrompt
-from vllm.lora.request import LoRARequest
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.lora.request import LoRARequest
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 
 logger = init_logger(__name__)

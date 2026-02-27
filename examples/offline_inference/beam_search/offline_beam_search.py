@@ -1,5 +1,6 @@
-import time
 import argparse
+import time
+
 from vllm.entrypoints.llm import LLM
 
 try:
