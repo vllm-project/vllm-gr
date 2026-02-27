@@ -13,19 +13,19 @@ Universal module for all recommendation tasks including:
 - ad: Predict next clicked advertisement
 """
 
+from . import utils
 from .config import (
-    LABEL_COND_CONFIG,
-    VIDEO_CONFIG,
-    PRODUCT_CONFIG,
     AD_CONFIG,
     INTERACTIVE_CONFIG,
+    LABEL_COND_CONFIG,
+    PRODUCT_CONFIG,
+    RECOMMENDATION_EVALUATION_CONFIG,
+    RECOMMENDATION_GENERATION_CONFIG,
     RECOMMENDATION_PROMPT_CONFIG,
     RECOMMENDATION_TASK_CONFIGS,
-    RECOMMENDATION_GENERATION_CONFIG,
-    RECOMMENDATION_EVALUATION_CONFIG,
+    VIDEO_CONFIG,
 )
 from .evaluator import RecommendationEvaluator
-from . import utils
 
 __all__ = [
     # Configs

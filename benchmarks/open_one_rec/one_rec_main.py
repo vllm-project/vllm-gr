@@ -1,6 +1,7 @@
-from vllm.entrypoints.cli.main import main as vllm_main
-import sys
 import logging
+import sys
+
+from vllm.entrypoints.cli.main import main as vllm_main
 
 logger = logging.getLogger(__name__)
 

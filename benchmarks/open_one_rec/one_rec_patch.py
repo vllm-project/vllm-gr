@@ -1,38 +1,36 @@
-import aiohttp
-from tqdm import tqdm
 import atexit
+import json
+import logging
+import os
 import sys
 import time
 import traceback
-import json
-import os
-import logging
 from typing import Literal
+
+import aiohttp
 import vllm
-from vllm import LLM
 import vllm.benchmarks.datasets
 import vllm.benchmarks.throughput
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+from tqdm import tqdm
+from vllm import LLM
+from vllm.benchmarks.datasets import add_dataset_parser as original_add_parser
+from vllm.benchmarks.datasets import get_samples as original_get_samples
 from vllm.benchmarks.lib.endpoint_request_func import (
-    RequestFuncInput,
     ASYNC_REQUEST_FUNCS,
+    RequestFuncInput,
+    RequestFuncOutput,
+    StreamedResponseHandler,
+    _get_chat_content,
+    _update_headers_common,
     _update_payload_common,
     _validate_api_url,
-    _get_chat_content,
-    StreamedResponseHandler,
-    _update_headers_common,
-    RequestFuncOutput,
 )
-from vllm.benchmarks.datasets import (
-    get_samples as original_get_samples,
-    add_dataset_parser as original_add_parser,
-)
-from vllm.benchmarks.throughput import (
-    add_cli_args as original_add_cli_args,
-    get_requests as original_get_requests,
-    validate_args as original_validate_args,
-    main as original_main,
-)
+from vllm.benchmarks.throughput import add_cli_args as original_add_cli_args
+from vllm.benchmarks.throughput import get_requests as original_get_requests
+from vllm.benchmarks.throughput import main as original_main
+from vllm.benchmarks.throughput import validate_args as original_validate_args
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+
 from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
 # ============================================================================
@@ -93,7 +91,7 @@ def _get_output_len_from_argv():
                 return int(output_len_value)
     except (ValueError, IndexError):
         pass  # Fallback to 1 if parsing fails
-    return int(0)
+    return 0
 
 
 USE_BEAM_SEARCH = _consume_use_beam_search_flag()
@@ -120,7 +118,7 @@ def __init__(
     self.use_beam_search = use_beam_search
     self.n = n
     if args_output_len > 0:
-        print(f"Setting output_len to {args_output_len} based on command line argument")
+        logger.info(f"Setting output_len to {args_output_len} based on command line argument")
         self.output_len = args_output_len
 
 
@@ -138,6 +136,15 @@ async def patched_async_request_openai_chat_completions(
     _validate_api_url(api_url, "OpenAI Chat Completions API", "chat/completions")
 
     content = _get_chat_content(request_func_input, mm_position=mm_position)
+    temperature = 0.0
+    if hasattr(request_func_input, "temperature") and request_func_input.temperature is not None:
+        temperature = request_func_input.temperature
+    elif hasattr(request_func_input, "extra_body") and request_func_input.extra_body is not None:
+        if (
+            hasattr(request_func_input.extra_body, "temperature")
+            and request_func_input.extra_body.temperature is not None
+        ):
+            temperature = request_func_input.extra_body.temperature
     payload = {
         "model": request_func_input.model_name
         if request_func_input.model_name
@@ -147,7 +154,7 @@ async def patched_async_request_openai_chat_completions(
         ],
         "use_beam_search": request_func_input.use_beam_search,
         "n": request_func_input.n,
-        "temperature": 0.0,
+        "temperature": temperature,
         "max_tokens": request_func_input.output_len,
         "stream": True,
         "stream_options": {
@@ -352,8 +359,9 @@ def _run_offline_beam_search_benchmark(args):
         from vllm_gr.sampling_params import BeamSearchParams
     except ImportError:
         from vllm.sampling_params import BeamSearchParams
-    from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
     from transformers import AutoTokenizer
+
+    from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)

@@ -4,14 +4,13 @@
 # License: Apache 2.0 License (inherited from source)
 
 import json
+import logging
 import os
-from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from tqdm import tqdm
-
-import logging
 
 logger = logging.getLogger(__name__)
 

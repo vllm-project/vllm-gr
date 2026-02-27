@@ -10,10 +10,11 @@ Functions for label extraction, probability processing, and AUC/wuAUC computatio
 """
 
 import json
-import numpy as np
-from typing import Dict, Any, List
-from sklearn.metrics import roc_auc_score
 import logging
+from typing import Any, Dict, List
+
+import numpy as np
+from sklearn.metrics import roc_auc_score
 
 logger = logging.getLogger(__name__)
 

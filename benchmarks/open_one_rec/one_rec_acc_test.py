@@ -4,9 +4,10 @@ import logging
 import os
 import sys
 import time
-from typing import List, Dict, Any
-import requests
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List
+
+import requests
 
 try:
     from vllm import LLM, SamplingParams
@@ -14,7 +15,7 @@ except ImportError:
     print("Error: vLLM is not installed. Please install it to run this benchmark.")
     sys.exit(1)
 
-from benchmarks.open_one_rec.open_one_rec_loader import DataLoaderWrapper, TASK_REGISTRY
+from benchmarks.open_one_rec.open_one_rec_loader import TASK_REGISTRY, DataLoaderWrapper
 
 try:
     from vllm_gr.sampling_params import BeamSearchParams
@@ -101,6 +102,7 @@ def run_api_inference(
     }
 
     def _send_request(prompt):
+        response = None
         payload = {"messages": [{"role": "user", "content": prompt}], **api_params}
         try:
             response = requests.post(api_url, headers=headers, json=payload)
@@ -124,15 +126,17 @@ def run_api_inference(
                 return MockRequestOutput(prompt, mock_outputs)
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
         except Exception as e:
-            print(
-                f"[DEBUG] Request failed. Status code: {response.status_code if 'response' in locals() else 'N/A'}"
+            logger.error(
+                f"Request failed. Status code: {response.status_code if 'response' in locals() else 'N/A'}"
             )
-            print(f"[DEBUG] Response text: {response.text if 'response' in locals() else 'N/A'}")
-            print(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
+            logger.error(
+                f"[DEBUG] Response text: {response.text if 'response' in locals() else 'N/A'}"
+            )
+            logger.error(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
 
     # Run in parallel
-    print(f"Sending {len(prompts)} requests to {api_url}...")
+    logger.info(f"Sending {len(prompts)} requests to {api_url}...")
     with ThreadPoolExecutor(max_workers=min(len(prompts), 16)) as executor:
         results = list(executor.map(_send_request, prompts))
 
@@ -197,10 +201,10 @@ def main():
     print(f"Loaded configuration for task: {task_config['name']}")
     print(f"Description: {task_config.get('description')}")
 
-    if hasattr(args, "temperature") and args.temperature is not None:
+    if args.temperature is not None:
         gen_config["temperature"] = args.temperature
         print(f"Using temperature from CLI parameter: {args.temperature}")
-    if hasattr(args, "n") and args.n is not None:
+    if args.n is not None:
         gen_config["num_beams"] = args.n
         gen_config["num_return_sequences"] = args.n  # Ensure num_return_sequences matches num_beams
         print(f"Using beam search with beam width from CLI parameter: {args.n}")
@@ -220,7 +224,7 @@ def main():
             llm = LLM(
                 model=args.model,
                 trust_remote_code=True,
-                max_logprobs=gen_config["num_beams"] * 2,
+                max_logprobs=gen_config.get("num_beams", 1) * 2,
             )
         except Exception as e:
             print(f"Failed to initialize vLLM: {e}")
@@ -351,7 +355,7 @@ def main():
     model_params["time_per_sample"] = (gen_end - gen_start) / len(prompts) if prompts else 0.0
     metrics = {**model_params, **metrics}
     print(json.dumps(metrics, indent=2))
-    if hasattr(args, "result_dir") and args.result_dir is not None:
+    if args.result_dir is not None:
         os.makedirs(args.result_dir, exist_ok=True)
         bw = model_params["beam_width"]
         filename = f"{args.model.split('/')[-1]}_{args.task_type}_bw{bw}_{len(prompts)}.json"

@@ -9,7 +9,7 @@ Recommendation Task Utilities
 Functions for SID extraction and recommendation metrics computation.
 """
 
-from typing import Set, Dict, List, Any
+from typing import Any, Dict, List, Set
 
 
 def extract_ids_from_answer(answer: str) -> Set[str]:

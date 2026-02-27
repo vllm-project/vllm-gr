@@ -9,10 +9,10 @@ Provides common interface for evaluation logic.
 """
 
 import json
+import logging
 import os
 from abc import ABC
-from typing import Dict, Any, Tuple, Optional, List
-import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

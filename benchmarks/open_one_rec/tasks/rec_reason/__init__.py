@@ -7,9 +7,9 @@
 Recommendation Reason Task Module
 """
 
+from . import utils
 from .config import REC_REASON_CONFIG
 from .evaluator import RecoReasonEvaluator
-from . import utils
 
 __all__ = [
     "REC_REASON_CONFIG",

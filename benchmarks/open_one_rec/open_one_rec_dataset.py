@@ -1,12 +1,8 @@
 import random
-from vllm.benchmarks.datasets import (
-    BenchmarkDataset,
-    TokenizerLike,
-    SampleRequest,
-)
-from .open_one_rec_loader import (
-    DataLoaderWrapper,
-)
+
+from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest, TokenizerLike
+
+from .open_one_rec_loader import DataLoaderWrapper
 
 # -----------------------------------------------------------------------------
 # OpenOneRec Dataset Implementation

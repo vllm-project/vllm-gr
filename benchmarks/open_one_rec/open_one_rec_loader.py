@@ -8,41 +8,30 @@ Base Loader for all task data loaders
 Provides common functionality for data loading, sampling, and file path resolution.
 """
 
-from .tasks.label_pred import (
-    LabelPredEvaluator,
-)
-from .tasks.label_pred.config import LABEL_PRED_CONFIG
-
-from .tasks.recommendation.evaluator import (
-    RecommendationEvaluator,
-)
-from .tasks.recommendation.config import (
-    VIDEO_CONFIG,
-    LABEL_COND_CONFIG,
-    PRODUCT_CONFIG,
-    AD_CONFIG,
-    INTERACTIVE_CONFIG,
-)
-
-from .tasks.item_understand.evaluator import (
-    ItemUnderstandEvaluator,
-)
-from .tasks.item_understand.config import ITEM_UNDERSTAND_CONFIG
-from .tasks.rec_reason.evaluator import (
-    RecoReasonEvaluator,
-)
-from .tasks.rec_reason.config import REC_REASON_CONFIG
-
-import os
 import json
-from json import JSONDecodeError
-import pandas as pd
-from typing import Dict, Any, Optional
+import logging
+import os
 from abc import ABC
 from dataclasses import dataclass
-from typing import Type
+from json import JSONDecodeError
+from typing import Any, Dict, Optional, Type
 
-import logging
+import pandas as pd
+
+from .tasks.item_understand.config import ITEM_UNDERSTAND_CONFIG
+from .tasks.item_understand.evaluator import ItemUnderstandEvaluator
+from .tasks.label_pred import LabelPredEvaluator
+from .tasks.label_pred.config import LABEL_PRED_CONFIG
+from .tasks.rec_reason.config import REC_REASON_CONFIG
+from .tasks.rec_reason.evaluator import RecoReasonEvaluator
+from .tasks.recommendation.config import (
+    AD_CONFIG,
+    INTERACTIVE_CONFIG,
+    LABEL_COND_CONFIG,
+    PRODUCT_CONFIG,
+    VIDEO_CONFIG,
+)
+from .tasks.recommendation.evaluator import RecommendationEvaluator
 
 logger = logging.getLogger(__name__)
 
