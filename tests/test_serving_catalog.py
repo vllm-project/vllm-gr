@@ -1,24 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import pytest
-import os
 import json
-import tempfile
-import torch
+import os
 import random
+import tempfile
+
+import pytest
+import torch
 
 try:
     from vllm_gr.sampling_params import BeamSearchParams
 except ImportError:
     from vllm.sampling_params import BeamSearchParams
 
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
-from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseModelPath
-from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
-from vllm.inputs import TokensPrompt
 from transformers import AutoTokenizer
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
+from vllm.entrypoints.openai.serving_engine import OpenAIServing
+from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.inputs import TokensPrompt
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
