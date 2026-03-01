@@ -368,8 +368,6 @@ async def beam_search(
             all_results = await asyncio.gather(*(tasks + catalog_tasks))
             output = [x[0] for x in all_results[: len(tasks)]]
             valid_tokens_sets = all_results[len(tasks) :]
-        else:
-            output = [x[0] for x in await asyncio.gather(*tasks)]
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         new_beams = []
@@ -472,7 +470,7 @@ async def beam_search(
         # Build fork_info for next iteration's BEAM_FORK.
         if use_beam_fork:
             fork_info = [
-                (idx // logprobs_num, int(all_beams_token_id[idx])) for _, idx in selected_items
+                (idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx
             ]
 
         all_beams = new_beams
