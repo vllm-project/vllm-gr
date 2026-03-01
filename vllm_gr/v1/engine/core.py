@@ -10,12 +10,7 @@ from functools import partial
 from typing import Any
 
 from vllm.logger import init_logger
-from vllm.v1.engine import (
-    EngineCoreOutput,
-    EngineCoreOutputs,
-    EngineCoreRequestType,
-    FinishReason,
-)
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequestType, FinishReason
 
 logger = init_logger(__name__)
 
@@ -121,7 +116,6 @@ def process_input_sockets(
     from contextlib import ExitStack
 
     import zmq
-
     from vllm.utils.network_utils import make_zmq_socket
     from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
     from vllm.v1.serial_utils import MsgpackDecoder

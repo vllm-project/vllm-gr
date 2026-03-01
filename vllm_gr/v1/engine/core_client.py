@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from vllm.v1.engine import EngineCoreRequestType
-from vllm_gr.v1.engine.types import (
-    BeamForkRequest,
-)
+
+from vllm_gr.v1.engine.types import BeamForkRequest
 
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)

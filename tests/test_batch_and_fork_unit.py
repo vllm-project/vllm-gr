@@ -21,10 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
 import pytest
-
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
 
+from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_fork
 from vllm_gr.v1.engine.core_client_patch import (
     _add_requests_batch_fn,
     add_requests_async,
@@ -34,20 +34,8 @@ from vllm_gr.v1.engine.core_client_patch import (
     prepare_request_fn,
     register_beam_output_fn,
 )
-
-from vllm_gr.v1.engine.engine_core_patch import (
-    _add_enum_member,
-    run_engine_core,
-)
-
-from vllm_gr.v1.engine.core import (
-    _cache_beam_request,
-    _handle_beam_fork,
-)
-from vllm_gr.v1.engine.types import (
-    BeamForkRequest,
-)
-
+from vllm_gr.v1.engine.engine_core_patch import _add_enum_member, run_engine_core
+from vllm_gr.v1.engine.types import BeamForkRequest
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1139,7 +1127,6 @@ class TestBeamSearchOrchestration:
     def test_eos_handling(self):
         """EOS tokens should be moved to 'completed' list when ignore_eos=False."""
         import numpy as np
-
         from vllm.beam_search import BeamSearchSequence
 
         # Simulate the EOS detection logic from beam_search().
@@ -1309,18 +1296,14 @@ class TestPatchWiring:
     def test_patch_batch_and_fork_wires_run_engine_core(self):
         from vllm.v1.engine.core import EngineCoreProc
 
-        from vllm_gr.entrypoints.openai.beam_search_patch import (
-            patch_batch_and_fork,
-        )
+        from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
         patch_batch_and_fork()
         assert EngineCoreProc.run_engine_core is run_engine_core
 
     # 6.2
     def test_patch_batch_and_fork_calls_apply(self):
-        from vllm_gr.entrypoints.openai.beam_search_patch import (
-            patch_batch_and_fork,
-        )
+        from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
         patch_batch_and_fork()
         # After calling, enum members should exist.

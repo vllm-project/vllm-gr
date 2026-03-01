@@ -10,10 +10,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import msgspec
-
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
-
 
 # ---------------------------------------------------------------------------
 # BeamForkRequest — lightweight beam fork (ADD_BATCH + BEAM_FORK path)

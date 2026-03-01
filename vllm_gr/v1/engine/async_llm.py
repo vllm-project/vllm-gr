@@ -3,11 +3,11 @@
 
 import time
 from collections.abc import Mapping
-from vllm.logger import init_logger
-from vllm_gr.v1.engine.types import (
-    BeamForkRequest,
-)
 from typing import TYPE_CHECKING, cast
+
+from vllm.logger import init_logger
+
+from vllm_gr.v1.engine.types import BeamForkRequest
 
 logger = init_logger(__name__)
 

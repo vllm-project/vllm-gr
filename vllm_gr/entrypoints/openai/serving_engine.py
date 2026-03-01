@@ -11,7 +11,6 @@ from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 import numpy as np
-
 from vllm.beam_search import BeamSearchSequence
 from vllm.entrypoints.openai.protocol import VLLMValidationError
 from vllm.inputs.data import PromptType, TokensPrompt
@@ -22,9 +21,8 @@ from vllm.multimodal import MultiModalDataDict
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
-from vllm.utils.async_utils import (
-    collect_from_async_generator,
-)
+from vllm.utils.async_utils import collect_from_async_generator
+
 from vllm_gr.v1.engine.types import BeamForkRequest
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
