@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 from dataclasses import dataclass
-from vllm.engine.arg_utils import EngineArgs
+
 from vllm.config import ModelConfig
-from vllm.engine.arg_utils import get_kwargs
+from vllm.engine.arg_utils import EngineArgs, get_kwargs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 

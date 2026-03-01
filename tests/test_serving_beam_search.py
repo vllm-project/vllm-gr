@@ -4,7 +4,7 @@
 try:
     from vllm_gr.sampling_params import BeamSearchParams
 except ImportError:
-    from vllm.sampling_params import BeamSearchParams
+    from vllm.sampling_params import BeamSearchParams  # ignore type
 
 try:
     from vllm_gr.v1.metrics.stats import RequestStateStats
