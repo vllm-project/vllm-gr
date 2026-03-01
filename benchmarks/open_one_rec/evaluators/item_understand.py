@@ -8,11 +8,11 @@ Item Understand Evaluator
 Evaluates model predictions on Item Understand task using WIP (LLM-as-Judge).
 """
 
-import os
-from typing import Dict, Any, Tuple, List
-from .base_evaluator import BaseEval
-
 import logging
+import os
+from typing import Any, Dict, List, Tuple
+
+from .base_evaluator import BaseEval
 
 logger = logging.getLogger(__name__)
 

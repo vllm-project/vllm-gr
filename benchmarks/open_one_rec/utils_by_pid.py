@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
@@ -10,12 +8,11 @@ Recommendation Task Utilities (PID-based)
 Functions for PID extraction and recommendation metrics computation using PIDs.
 """
 
-import re
 import json
 import random
-from typing import Set, Dict, List, Any, Tuple, Optional
+import re
 from pathlib import Path
-
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Encoding constants for (code1, code2, code3) -> single int
 # Each code is in range [0, 8192], needs 13 bits

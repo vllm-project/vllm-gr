@@ -9,17 +9,16 @@ Evaluator for label_pred classification task.
 Computes AUC metric from logprobs-based predictions.
 """
 
-from typing import Dict, Any, Tuple, List
+import logging
+from typing import Any, Dict, List, Tuple
 
-from .base_evaluator import BaseEval
 from ..utils import (
+    calculate_auc,
     extract_label_from_answer,
     extract_probability_from_logprobs,
-    calculate_auc,
     get_debug_info,
 )
-
-import logging
+from .base_evaluator import BaseEval
 
 logger = logging.getLogger(__name__)
 

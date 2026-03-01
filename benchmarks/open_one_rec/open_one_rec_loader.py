@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
@@ -10,38 +8,38 @@ Base Loader for all task data loaders
 Provides common functionality for data loading, sampling, and file path resolution.
 """
 
-from .evaluators.label_pred import (
-    LabelPredEvaluator,
-)
-from .evaluators.recommendation import (
-    RecommendationEvaluator,
+import json
+import logging
+import os
+from abc import ABC
+from dataclasses import dataclass
+from json import JSONDecodeError
+from typing import Any, Dict, Optional, Type
+
+import pandas as pd
+
+from .configs.config import (
+    AD_CONFIG,
+    INTERACTIVE_CONFIG,
+    ITEM_UNDERSTAND_CONFIG,
+    LABEL_COND_CONFIG,
+    LABEL_PRED_CONFIG,
+    PRODUCT_CONFIG,
+    REC_REASON_CONFIG,
+    VIDEO_CONFIG,
 )
 from .evaluators.item_understand import (
     ItemUnderstandEvaluator,
 )
+from .evaluators.label_pred import (
+    LabelPredEvaluator,
+)
 from .evaluators.rec_reason import (
     RecoReasonEvaluator,
 )
-from .configs.config import (
-    LABEL_COND_CONFIG,
-    VIDEO_CONFIG,
-    PRODUCT_CONFIG,
-    AD_CONFIG,
-    INTERACTIVE_CONFIG,
-    LABEL_PRED_CONFIG,
-    ITEM_UNDERSTAND_CONFIG,
-    REC_REASON_CONFIG,
+from .evaluators.recommendation import (
+    RecommendationEvaluator,
 )
-import os
-import json
-from json import JSONDecodeError
-import pandas as pd
-from typing import Dict, Any, Optional
-from abc import ABC
-from dataclasses import dataclass
-from typing import Type
-
-import logging
 
 logger = logging.getLogger(__name__)
 

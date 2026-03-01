@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import random
+
 from vllm.benchmarks.datasets import (
     BenchmarkDataset,
-    TokenizerLike,
     SampleRequest,
+    TokenizerLike,
 )
+
 from .open_one_rec_loader import (
     DataLoaderWrapper,
 )
