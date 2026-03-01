@@ -9,13 +9,14 @@ Functions for label extraction, probability processing, and AUC/wuAUC computatio
 """
 
 import json
-import numpy as np
-from typing import Dict, Any, List, Optional, Tuple
-from sklearn.metrics import roc_auc_score
+import logging
 import os
 import re
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)

@@ -8,38 +8,24 @@ Base Loader for all task data loaders
 Provides common functionality for data loading, sampling, and file path resolution.
 """
 
-from .evaluators.label_pred import (
-    LabelPredEvaluator,
-)
-from .evaluators.recommendation import (
-    RecommendationEvaluator,
-)
-from .evaluators.item_understand import (
-    ItemUnderstandEvaluator,
-)
-from .evaluators.rec_reason import (
-    RecoReasonEvaluator,
-)
-from .configs.config import (
-    LABEL_COND_CONFIG,
-    VIDEO_CONFIG,
-    PRODUCT_CONFIG,
-    AD_CONFIG,
-    INTERACTIVE_CONFIG,
-    LABEL_PRED_CONFIG,
-    ITEM_UNDERSTAND_CONFIG,
-    REC_REASON_CONFIG,
-)
-import os
 import json
-from json import JSONDecodeError
-import pandas as pd
-from typing import Dict, Any, Optional
+import logging
+import os
 from abc import ABC
 from dataclasses import dataclass
-from typing import Type
+from json import JSONDecodeError
+from typing import Any, Dict, Optional, Type
 
-import logging
+import pandas as pd
+
+from .configs.config import (AD_CONFIG, INTERACTIVE_CONFIG,
+                             ITEM_UNDERSTAND_CONFIG, LABEL_COND_CONFIG,
+                             LABEL_PRED_CONFIG, PRODUCT_CONFIG,
+                             REC_REASON_CONFIG, VIDEO_CONFIG)
+from .evaluators.item_understand import ItemUnderstandEvaluator
+from .evaluators.label_pred import LabelPredEvaluator
+from .evaluators.rec_reason import RecoReasonEvaluator
+from .evaluators.recommendation import RecommendationEvaluator
 
 logger = logging.getLogger(__name__)
 

@@ -1,35 +1,31 @@
-import aiohttp
-from tqdm import tqdm
-import vllm.benchmarks.datasets
-import vllm.benchmarks.throughput
 import atexit
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+import json
+import os
 import sys
 import time
 import traceback
-import json
-import os
 from typing import Literal
-from vllm.benchmarks.lib.endpoint_request_func import (
-    RequestFuncInput,
-    ASYNC_REQUEST_FUNCS,
-    _update_payload_common,
-    _validate_api_url,
-    _get_chat_content,
-    StreamedResponseHandler,
-    _update_headers_common,
-    RequestFuncOutput,
-)
-from vllm.benchmarks.datasets import (
-    get_samples as original_get_samples,
-    add_dataset_parser as original_add_parser,
-)
-from vllm.benchmarks.throughput import (
-    add_cli_args as original_add_cli_args,
-    get_requests as original_get_requests,
-    validate_args as original_validate_args,
-    main as original_main,
-)
+
+import aiohttp
+import vllm.benchmarks.datasets
+import vllm.benchmarks.throughput
+from tqdm import tqdm
+from vllm.benchmarks.datasets import add_dataset_parser as original_add_parser
+from vllm.benchmarks.datasets import get_samples as original_get_samples
+from vllm.benchmarks.lib.endpoint_request_func import (ASYNC_REQUEST_FUNCS,
+                                                       RequestFuncInput,
+                                                       RequestFuncOutput,
+                                                       StreamedResponseHandler,
+                                                       _get_chat_content,
+                                                       _update_headers_common,
+                                                       _update_payload_common,
+                                                       _validate_api_url)
+from vllm.benchmarks.throughput import add_cli_args as original_add_cli_args
+from vllm.benchmarks.throughput import get_requests as original_get_requests
+from vllm.benchmarks.throughput import main as original_main
+from vllm.benchmarks.throughput import validate_args as original_validate_args
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+
 from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
 # ============================================================================
