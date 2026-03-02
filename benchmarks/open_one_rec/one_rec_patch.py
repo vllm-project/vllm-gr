@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import atexit
 import json
 import logging
@@ -11,7 +13,6 @@ import aiohttp
 import vllm
 import vllm.benchmarks.datasets
 import vllm.benchmarks.throughput
-from tqdm import tqdm
 from vllm import LLM
 from vllm.benchmarks.datasets import add_dataset_parser as original_add_parser
 from vllm.benchmarks.datasets import get_samples as original_get_samples

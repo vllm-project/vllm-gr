@@ -648,7 +648,6 @@ class TestBeamCache:
 # 4. Client-Side Patches  (core_client_patch.py)
 # ---------------------------------------------------------------------------
 
-
 class TestClientPatches:
     """Section 4: AsyncMPClient and AsyncLLM patch functions."""
 
@@ -1299,20 +1298,31 @@ class TestPatchWiring:
 
         from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
-        patch_batch_and_fork()
-        assert EngineCoreProc.run_engine_core is run_engine_core
+        original = EngineCoreProc.run_engine_core
+        try:
+            patch_batch_and_fork()
+            assert EngineCoreProc.run_engine_core is run_engine_core
+        finally:
+            EngineCoreProc.run_engine_core = original
 
     # 6.2
     def test_patch_batch_and_fork_calls_apply(self):
+        from vllm.v1.engine.core import EngineCoreProc
+
         from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
-        patch_batch_and_fork()
-        # After calling, enum members should exist.
-        assert hasattr(EngineCoreRequestType, "ADD_BATCH")
-        assert hasattr(EngineCoreRequestType, "BEAM_FORK")
+        original = EngineCoreProc.run_engine_core
+        try:
+            with patch(
+                "vllm_gr.v1.engine.core_client_patch.apply_batch_fork_patches"
+            ) as mock_apply:
+                patch_batch_and_fork()
+                mock_apply.assert_called_once()
+        finally:
+            EngineCoreProc.run_engine_core = original
 
     # 6.3
-    def test_run_patch_calls_all_three(self):
+    def test_run_patch_calls_all(self):
         with (
             patch("vllm_gr.patch.patch_beam_search") as mock_bs,
             patch("vllm_gr.patch.patch_sampling") as mock_samp,

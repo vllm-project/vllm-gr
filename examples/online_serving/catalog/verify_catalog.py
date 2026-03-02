@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import json
 import os
@@ -33,6 +35,9 @@ def main():
             sys.exit(1)
         decoder = json.JSONDecoder()
         results, _ = decoder.raw_decode(content[start_idx:])
+        if not isinstance(results, dict):
+            print("Error: Result JSON content must be a dictionary")
+            sys.exit(1)
     except json.JSONDecodeError as e:
         print(f"Error decoding result JSON: {e}")
         sys.exit(1)
@@ -42,6 +47,9 @@ def main():
     try:
         with open(CATALOG_PATH, "r") as f:
             catalog = json.load(f)
+        if not isinstance(catalog, list):
+            print("Error: Catalog JSON content must be a list")
+            sys.exit(1)
     except json.JSONDecodeError as e:
         print(f"Error decoding catalog JSON: {e}")
         sys.exit(1)
@@ -60,6 +68,9 @@ def main():
 
     # Verify choices
     choices = results.get("choices", [])
+    if not isinstance(choices, list):
+        print("Error: 'choices' field in result JSON must be a list")
+        sys.exit(1)
     print(f"Verifying {len(choices)} generated choices...")
 
     failures = []

@@ -4,13 +4,14 @@
 try:
     from vllm_gr.sampling_params import BeamSearchParams
 except ImportError:
-    from vllm.sampling_params import BeamSearchParams
+    from vllm.sampling_params import BeamSearchParams  # ignore type
 
 try:
     from vllm_gr.v1.metrics.stats import RequestStateStats
 except ImportError:
     from vllm.v1.metrics.stats import RequestStateStats
 
+import multiprocessing
 import os
 import time
 from typing import Any
@@ -32,7 +33,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 
 
-async def beam_search_test(loops: int):
+async def beam_search_test(loops: int) -> None:
     model_name = "OpenOneRec/OneRec-1.7B"
     beam_width = 512
     max_tokens = 5
@@ -104,36 +105,49 @@ async def beam_search_test(loops: int):
         assert len(final_output.outputs) == beam_width
 
 
-@pytest.mark.slow
-@pytest.mark.asyncio
-async def test_serving_beam_search(loops: int):
+@pytest.mark.slow  # type: ignore
+@pytest.mark.asyncio  # type: ignore
+async def test_serving_beam_search(loops: int) -> None:
     await beam_search_test(loops)
 
 
-@pytest.mark.slow
-@pytest.mark.asyncio
-async def test_serving_gr_beam_search(loops: int):
+def _run_gr_beam_search_target(loops: int) -> None:
+    import asyncio
+
     from vllm_gr.patch import run_patch
 
     run_patch()
     assert hasattr(BeamSearchParams, "begin_token")
-    await beam_search_test(loops)
-    torch.cuda.synchronize()
-    before_gpu_mem: int = torch.cuda.memory_allocated()
-    before_host_mem: int = psutil.Process().memory_info().rss
-    await beam_search_test(loops)
-    await beam_search_test(loops)
-    torch.cuda.synchronize()
-    after_gpu_mem: int = torch.cuda.memory_allocated()
-    after_host_mem: int = psutil.Process().memory_info().rss
-    print(
-        f"before host mem={before_host_mem / 1024**3:.2f}GB, after host mem={after_host_mem / 1024**3:.2f}GB"
-    )
-    print(
-        f"before gpu mem={before_gpu_mem / 1024**3:.2f}GB, after gpu mem={after_gpu_mem / 1024**3:.2f}GB"
-    )
-    if loops > 1:
-        # Allow 500MB tolerance
-        assert after_host_mem - before_host_mem <= 500 * 1024**2
-        # Allow 50MB tolerance
-        assert after_gpu_mem - before_gpu_mem <= 50 * 1024**2
+
+    async def run_test():
+        await beam_search_test(loops)
+        torch.cuda.synchronize()
+        before_gpu_mem: int = torch.cuda.memory_allocated()
+        before_host_mem: int = psutil.Process().memory_info().rss
+        await beam_search_test(loops)
+        await beam_search_test(loops)
+        torch.cuda.synchronize()
+        after_gpu_mem: int = torch.cuda.memory_allocated()
+        after_host_mem: int = psutil.Process().memory_info().rss
+        print(
+            f"before host mem={before_host_mem / 1024**3:.2f}GB, after host mem={after_host_mem / 1024**3:.2f}GB"
+        )
+        print(
+            f"before gpu mem={before_gpu_mem / 1024**3:.2f}GB, after gpu mem={after_gpu_mem / 1024**3:.2f}GB"
+        )
+        if loops > 1:
+            # Allow 500MB tolerance
+            assert after_host_mem - before_host_mem <= 500 * 1024**2
+            # Allow 50MB tolerance
+            assert after_gpu_mem - before_gpu_mem <= 50 * 1024**2
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.slow  # type: ignore
+def test_serving_gr_beam_search(loops: int) -> None:
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=_run_gr_beam_search_target, args=(loops,))
+    p.start()
+    p.join()
+    assert p.exitcode == 0
