@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-
 import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any
@@ -468,9 +467,7 @@ async def beam_search(
 
         # Build fork_info for next iteration's BEAM_FORK.
         if use_beam_fork:
-            fork_info = [
-                (idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx
-            ]
+            fork_info = [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
 
         all_beams = new_beams
 
