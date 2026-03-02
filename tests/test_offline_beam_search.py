@@ -70,13 +70,13 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     print(f"Elapsed mean: {(end - start) / max(1, loops):.4f}s")
 
 
-@pytest.mark.slow
-def test_offline_beam_search(loops: int):
+@pytest.mark.slow  # type: ignore[misc]
+def test_offline_beam_search(loops: int) -> None:
     _run_offline_beam_search(loops, use_patch=False)
 
 
-@pytest.mark.slow
-def test_offline_gr_beam_search(loops: int):
+@pytest.mark.slow  # type: ignore[misc]
+def test_offline_gr_beam_search(loops: int) -> None:
     before_gpu = torch.cuda.memory_allocated()
     before_host = psutil.Process().memory_info().rss
     _run_offline_beam_search(loops, use_patch=True)

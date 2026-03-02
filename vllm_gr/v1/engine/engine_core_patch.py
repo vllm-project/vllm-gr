@@ -84,7 +84,7 @@ def apply_engine_core_child_patches():
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
 
-    logger.info("Engine-core patches (ADD_BATCH, BEAM_FORK) applied in child process.")
+    logger.debug("Engine-core patches (ADD_BATCH, BEAM_FORK) applied in child process.")
 
 
 def run_engine_core(*args, **kwargs):

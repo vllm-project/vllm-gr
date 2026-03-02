@@ -119,7 +119,7 @@ def _run_gr_beam_search_target(loops: int) -> None:
     run_patch()
     assert hasattr(BeamSearchParams, "begin_token")
 
-    async def run_test():
+    async def run_test() -> None:
         await beam_search_test(loops)
         torch.cuda.synchronize()
         before_gpu_mem: int = torch.cuda.memory_allocated()
