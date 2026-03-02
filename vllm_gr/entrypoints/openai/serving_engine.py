@@ -353,21 +353,15 @@ async def beam_search(
                 priority=priority,
             )
 
-        catalog_tasks = []
+        valid_tokens_sets = None
         if self.models.catalog is not None:
 
             def get_valid_tokens_set(beam) -> set[int]:
                 generated_tokens = beam.tokens[len(prompt_token_ids) :]
                 return self.models.catalog.valid(generated_tokens)
 
-            for beam in all_beams:
-                catalog_tasks.append(asyncio.to_thread(get_valid_tokens_set, beam))
-
-        gen_start = time.perf_counter()
-        if catalog_tasks:
-            all_results = await asyncio.gather(*(tasks + catalog_tasks))
-            output = [x[0] for x in all_results[: len(tasks)]]
-            valid_tokens_sets = all_results[len(tasks) :]
+            catalog_coros = [asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams]
+            valid_tokens_sets = await asyncio.gather(*catalog_coros)
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         new_beams = []
@@ -406,7 +400,7 @@ async def beam_search(
                 logprobs = result.outputs[0].logprobs[0]
                 if len(logprobs) > logprobs_num:
                     logprobs = dict(list(logprobs.items())[:logprobs_num])
-                if self.models.catalog is not None:
+                if valid_tokens_sets is not None:
                     valid_tokens_set = valid_tokens_sets[i]
                     for token_id in list(logprobs.keys()):
                         if token_id not in valid_tokens_set:
