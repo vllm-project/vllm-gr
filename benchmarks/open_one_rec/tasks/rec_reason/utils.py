@@ -95,8 +95,8 @@ def extract_refined_reasoning(text: str) -> str:
 
 def extract_after_think(text: str) -> str:
     """Extract text after the last  comprehend tag if present."""
-    if " comprehend" in text:
-        return text.split(" comprehend")[-1].strip()
+    if "</think>" in text:
+        return text.split("</think>")[-1].strip()
     return text
 
 

@@ -12,8 +12,8 @@ Computes AUC metric from logprobs-based predictions.
 import logging
 from typing import Any, Dict, List, Tuple
 
-from ...base_evaluator import BaseEval
-from .utils import (
+from benchmarks.open_one_rec.base_evaluator import BaseEval
+from benchmarks.open_one_rec.tasks.label_pred.utils import (
     calculate_auc,
     extract_label_from_answer,
     extract_probability_from_logprobs,
@@ -255,4 +255,4 @@ class LabelPredEvaluator(BaseEval):
                 logger.info(f"    Sample ID: {item['sample_id']}")
                 logger.info(f"    Reason: {item['reason']}")
                 logger.info(f"    Ground truth: {item['ground_truth']}")
-                logger.info()
+                logger.info("")
