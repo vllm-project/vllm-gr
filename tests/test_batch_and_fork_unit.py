@@ -648,6 +648,7 @@ class TestBeamCache:
 # 4. Client-Side Patches  (core_client_patch.py)
 # ---------------------------------------------------------------------------
 
+
 class TestClientPatches:
     """Section 4: AsyncMPClient and AsyncLLM patch functions."""
 
