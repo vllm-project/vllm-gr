@@ -2,10 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 
-try:
-    import minheap_cpp as minheap
-except ImportError:
-    minheap = None
 import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any
@@ -314,6 +310,21 @@ async def beam_search(
             num_generation_tokens += len(all_beams)
         request_id_batch = f"{request_id}-{random_uuid()}"
 
+        # Launch catalog filtering in parallel with the engine step.
+        catalog_task = None
+        if self.models.catalog is not None:
+
+            def get_valid_tokens_set(beam) -> set[int]:
+                generated_tokens = beam.tokens[len(prompt_token_ids) :]
+                return self.models.catalog.valid(generated_tokens)
+
+            async def _run_catalog(coros):
+                return list(await asyncio.gather(*coros))
+
+            catalog_task = asyncio.create_task(
+                _run_catalog([asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams])
+            )
+
         gen_start = time.perf_counter()
 
         if use_beam_fork and fork_info is not None:
@@ -354,14 +365,8 @@ async def beam_search(
             )
 
         valid_tokens_sets = None
-        if self.models.catalog is not None:
-
-            def get_valid_tokens_set(beam) -> set[int]:
-                generated_tokens = beam.tokens[len(prompt_token_ids) :]
-                return self.models.catalog.valid(generated_tokens)
-
-            catalog_coros = [asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams]
-            valid_tokens_sets = await asyncio.gather(*catalog_coros)
+        if catalog_task is not None:
+            valid_tokens_sets = await catalog_task
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         new_beams = []

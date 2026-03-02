@@ -877,6 +877,7 @@ def _make_serving_self(
     mock_self = MagicMock()
     mock_self.input_processor = input_proc
     mock_self.engine_client = engine_client
+    mock_self.models.catalog = None
     return mock_self
 
 
