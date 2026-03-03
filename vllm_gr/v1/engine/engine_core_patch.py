@@ -98,7 +98,19 @@ def run_engine_core(*args, **kwargs):
     """
     from vllm.v1.engine.core import EngineCoreProc
 
-    # Save reference to original before applying patches
-    original_run = EngineCoreProc.run_engine_core
+    # Guard against recursion: if vllm_gr/init.py was auto-imported in
+    # the child process, run_patch() will have replaced
+    # EngineCoreProc.run_engine_core with *this* function again.
+    # Use the saved original stashed by patch_batch_and_fork() if
+    # available; otherwise fall back to the current class attribute
+    # (which is the unpatched original in a fresh child interpreter).
+    original_run = getattr(run_engine_core, "_original_run_engine_core", None)
+    if original_run is None or original_run is run_engine_core:
+        original_run = EngineCoreProc.run_engine_core
+    if original_run is run_engine_core:
+        raise RuntimeError(
+            "run_engine_core recursion detected: cannot resolve the "
+            "original EngineCoreProc.run_engine_core"
+        )
     apply_engine_core_child_patches()
     original_run(*args, **kwargs)

@@ -24,4 +24,7 @@ def patch_batch_and_fork():
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
     apply_batch_fork_patches()
+    # Save the original so the wrapper can delegate without recursion
+    # even if run_patch() is called again in a spawned child process.
+    run_engine_core._original_run_engine_core = EngineCoreProc.run_engine_core
     EngineCoreProc.run_engine_core = run_engine_core

@@ -10,10 +10,10 @@ import traceback
 from typing import Literal
 
 import aiohttp
-from tqdm import tqdm
 import vllm
 import vllm.benchmarks.datasets
 import vllm.benchmarks.throughput
+from tqdm import tqdm
 from vllm import LLM
 from vllm.benchmarks.datasets import add_dataset_parser as original_add_parser
 from vllm.benchmarks.datasets import get_samples as original_get_samples
