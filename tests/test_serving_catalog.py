@@ -31,7 +31,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 
 
-async def _serving_catalog_generation_impl(loops: int):
+async def _serving_catalog_generation_impl(loops: int) -> None:
     # Mockup catalog: list of 10 lists of 5 tokens
     # We use tokens that are compatible with the model's tokenizer/format
     catalog_data = []
@@ -128,7 +128,7 @@ async def _serving_catalog_generation_impl(loops: int):
             os.remove(catalog_path)
 
 
-def _run_serving_catalog_generation_target(loops: int):
+def _run_serving_catalog_generation_target(loops: int) -> None:
     from vllm_gr.patch import run_patch
 
     run_patch()
@@ -136,7 +136,7 @@ def _run_serving_catalog_generation_target(loops: int):
 
 
 @pytest.mark.slow  # type: ignore
-def test_serving_catalog_generation(loops: int):
+def test_serving_catalog_generation(loops: int) -> None:
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_run_serving_catalog_generation_target, args=(loops,))
     p.start()

@@ -19,7 +19,7 @@ import multiprocessing
 import queue
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
@@ -116,7 +116,7 @@ def _make_fork_request(
     )
 
 
-def _run_in_process(target):
+def _run_in_process(target: Callable[[], None]) -> None:
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=target)
     p.start()
@@ -125,7 +125,7 @@ def _run_in_process(target):
         pytest.fail(f"Test failed in subprocess with exit code {p.exitcode}")
 
 
-def _test_handle_beam_fork_creates_children_impl():
+def _test_handle_beam_fork_creates_children_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "p0": {
@@ -172,7 +172,7 @@ def _test_handle_beam_fork_creates_children_impl():
     assert calls[1].kwargs["prompt_token_ids"] == [10, 20, 200]
 
 
-def _test_handle_beam_fork_clones_block_hashes_impl():
+def _test_handle_beam_fork_clones_block_hashes_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "p0": {
@@ -209,7 +209,7 @@ def _test_handle_beam_fork_clones_block_hashes_impl():
     assert MockReq.call_args.kwargs["block_hasher"] is None
 
 
-def _test_handle_beam_fork_incremental_hash_impl():
+def _test_handle_beam_fork_incremental_hash_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "p0": {
@@ -245,7 +245,7 @@ def _test_handle_beam_fork_incremental_hash_impl():
     assert eng.request_block_hasher is not None
 
 
-def _test_handle_beam_fork_no_hasher_impl():
+def _test_handle_beam_fork_no_hasher_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "p0": {
@@ -281,7 +281,7 @@ def _test_handle_beam_fork_no_hasher_impl():
     # (The function checks self.request_block_hasher before setting it.)
 
 
-def _test_handle_beam_fork_missing_parent_impl():
+def _test_handle_beam_fork_missing_parent_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "valid": {
@@ -332,7 +332,7 @@ def _test_handle_beam_fork_missing_parent_impl():
     assert "c0" in error_outputs.finished_requests
 
 
-def _test_handle_beam_fork_cleans_cache_impl():
+def _test_handle_beam_fork_cleans_cache_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "A": {
@@ -378,7 +378,7 @@ def _test_handle_beam_fork_cleans_cache_impl():
     assert "C" in eng.beam_cache
 
 
-def _test_handle_beam_fork_inherits_eos_impl():
+def _test_handle_beam_fork_inherits_eos_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "p0": {
@@ -412,7 +412,7 @@ def _test_handle_beam_fork_inherits_eos_impl():
     assert MockReq.call_args.kwargs["eos_token_id"] == 42
 
 
-def _test_handle_beam_fork_overrides_eos_impl():
+def _test_handle_beam_fork_overrides_eos_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "p0": {
@@ -445,7 +445,7 @@ def _test_handle_beam_fork_overrides_eos_impl():
     assert MockReq.call_args.kwargs["eos_token_id"] == 99
 
 
-def _test_handle_beam_fork_block_hasher_none_impl():
+def _test_handle_beam_fork_block_hasher_none_impl() -> None:
     eng = _make_engine_self(
         beam_cache={
             "p0": {
@@ -659,39 +659,39 @@ class TestBeamCache:
         assert eng.beam_cache["r0"]["all_token_ids"] == [3, 4, 5]
 
     # 3.3
-    def test_handle_beam_fork_creates_children(self):
+    def test_handle_beam_fork_creates_children(self) -> None:
         _run_in_process(_test_handle_beam_fork_creates_children_impl)
 
     # 3.4
-    def test_handle_beam_fork_clones_block_hashes(self):
+    def test_handle_beam_fork_clones_block_hashes(self) -> None:
         _run_in_process(_test_handle_beam_fork_clones_block_hashes_impl)
 
     # 3.5
-    def test_handle_beam_fork_incremental_hash(self):
+    def test_handle_beam_fork_incremental_hash(self) -> None:
         _run_in_process(_test_handle_beam_fork_incremental_hash_impl)
 
     # 3.6
-    def test_handle_beam_fork_no_hasher(self):
+    def test_handle_beam_fork_no_hasher(self) -> None:
         _run_in_process(_test_handle_beam_fork_no_hasher_impl)
 
     # 3.7
-    def test_handle_beam_fork_missing_parent(self):
+    def test_handle_beam_fork_missing_parent(self) -> None:
         _run_in_process(_test_handle_beam_fork_missing_parent_impl)
 
     # 3.8
-    def test_handle_beam_fork_cleans_cache(self):
+    def test_handle_beam_fork_cleans_cache(self) -> None:
         _run_in_process(_test_handle_beam_fork_cleans_cache_impl)
 
     # 3.9
-    def test_handle_beam_fork_inherits_eos(self):
+    def test_handle_beam_fork_inherits_eos(self) -> None:
         _run_in_process(_test_handle_beam_fork_inherits_eos_impl)
 
     # 3.10
-    def test_handle_beam_fork_overrides_eos(self):
+    def test_handle_beam_fork_overrides_eos(self) -> None:
         _run_in_process(_test_handle_beam_fork_overrides_eos_impl)
 
     # 3.11
-    def test_handle_beam_fork_block_hasher_none(self):
+    def test_handle_beam_fork_block_hasher_none(self) -> None:
         _run_in_process(_test_handle_beam_fork_block_hasher_none_impl)
 
 
@@ -700,12 +700,12 @@ class TestBeamCache:
 # ---------------------------------------------------------------------------
 
 
-def _setup_client_patches_env():
+def _setup_client_patches_env() -> None:
     _add_enum_member("ADD_BATCH", b"\x05")
     _add_enum_member("BEAM_FORK", b"\x06")
 
 
-def _test_add_requests_async_empty_impl():
+def _test_add_requests_async_empty_impl() -> None:
     _setup_client_patches_env()
     mock_self = MagicMock()
     mock_self._send_input = AsyncMock()
@@ -715,7 +715,7 @@ def _test_add_requests_async_empty_impl():
     mock_self.add_request_async.assert_not_called()
 
 
-def _test_add_requests_async_single_no_force_impl():
+def _test_add_requests_async_single_no_force_impl() -> None:
     _setup_client_patches_env()
     mock_self = MagicMock()
     mock_self.client_index = 0
@@ -729,7 +729,7 @@ def _test_add_requests_async_single_no_force_impl():
     mock_self._send_input.assert_not_called()
 
 
-def _test_add_requests_async_single_force_impl():
+def _test_add_requests_async_single_force_impl() -> None:
     _setup_client_patches_env()
     mock_self = MagicMock()
     mock_self.client_index = 2
@@ -746,7 +746,7 @@ def _test_add_requests_async_single_force_impl():
     assert req.client_index == 2  # set by function
 
 
-def _test_add_requests_async_multiple_impl():
+def _test_add_requests_async_multiple_impl() -> None:
     _setup_client_patches_env()
     mock_self = MagicMock()
     mock_self.client_index = 7
@@ -763,7 +763,7 @@ def _test_add_requests_async_multiple_impl():
         assert r.client_index == 7
 
 
-def _test_beam_fork_async_sets_client_index_impl():
+def _test_beam_fork_async_sets_client_index_impl() -> None:
     _setup_client_patches_env()
     mock_self = MagicMock()
     mock_self.client_index = 5
@@ -780,7 +780,7 @@ def _test_beam_fork_async_sets_client_index_impl():
     assert call_args[0][0] == EngineCoreRequestType.BEAM_FORK
 
 
-def _test_prepare_request_returns_queue_and_request_impl():
+def _test_prepare_request_returns_queue_and_request_impl() -> None:
     _setup_client_patches_env()
     from vllm.v1.engine import EngineCoreRequest
 
@@ -814,7 +814,7 @@ def _test_prepare_request_returns_queue_and_request_impl():
     mock_self.output_processor.add_request.assert_called_once()
 
 
-def _test_prepare_request_errored_engine_impl():
+def _test_prepare_request_errored_engine_impl() -> None:
     _setup_client_patches_env()
     from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -825,7 +825,7 @@ def _test_prepare_request_errored_engine_impl():
         prepare_request_fn(mock_self, "err-1", "prompt", _sampling_params())
 
 
-def _test_add_requests_batch_delegates_impl():
+def _test_add_requests_batch_delegates_impl() -> None:
     _setup_client_patches_env()
     mock_self = MagicMock()
     mock_self.engine_core.add_requests_async = AsyncMock()
@@ -836,7 +836,7 @@ def _test_add_requests_batch_delegates_impl():
     mock_self.engine_core.add_requests_async.assert_awaited_once_with(reqs, force_batch=True)
 
 
-def _test_register_beam_output_sets_external_id_impl():
+def _test_register_beam_output_sets_external_id_impl() -> None:
     _setup_client_patches_env()
     sp = _sampling_params()
     mock_self = MagicMock()
@@ -859,7 +859,7 @@ def _test_register_beam_output_sets_external_id_impl():
     assert queue_obj is not None
 
 
-def _test_apply_batch_fork_patches_enum_impl():
+def _test_apply_batch_fork_patches_enum_impl() -> None:
     apply_batch_fork_patches()
     assert hasattr(EngineCoreRequestType, "ADD_BATCH")
     assert hasattr(EngineCoreRequestType, "BEAM_FORK")
@@ -867,7 +867,7 @@ def _test_apply_batch_fork_patches_enum_impl():
     assert EngineCoreRequestType.BEAM_FORK.value == b"\x06"
 
 
-def _test_apply_batch_fork_patches_methods_impl():
+def _test_apply_batch_fork_patches_methods_impl() -> None:
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.v1.engine.core_client import AsyncMPClient
 
@@ -893,47 +893,47 @@ class TestClientPatches:
     """Section 4: AsyncMPClient and AsyncLLM patch functions."""
 
     # 4.1
-    def test_add_requests_async_empty(self):
+    def test_add_requests_async_empty(self) -> None:
         _run_in_process(_test_add_requests_async_empty_impl)
 
     # 4.2
-    def test_add_requests_async_single_no_force(self):
+    def test_add_requests_async_single_no_force(self) -> None:
         _run_in_process(_test_add_requests_async_single_no_force_impl)
 
     # 4.3
-    def test_add_requests_async_single_force(self):
+    def test_add_requests_async_single_force(self) -> None:
         _run_in_process(_test_add_requests_async_single_force_impl)
 
     # 4.4
-    def test_add_requests_async_multiple(self):
+    def test_add_requests_async_multiple(self) -> None:
         _run_in_process(_test_add_requests_async_multiple_impl)
 
     # 4.5
-    def test_beam_fork_async_sets_client_index(self):
+    def test_beam_fork_async_sets_client_index(self) -> None:
         _run_in_process(_test_beam_fork_async_sets_client_index_impl)
 
     # 4.6
-    def test_prepare_request_returns_queue_and_request(self):
+    def test_prepare_request_returns_queue_and_request(self) -> None:
         _run_in_process(_test_prepare_request_returns_queue_and_request_impl)
 
     # 4.7
-    def test_prepare_request_errored_engine(self):
+    def test_prepare_request_errored_engine(self) -> None:
         _run_in_process(_test_prepare_request_errored_engine_impl)
 
     # 4.8
-    def test_add_requests_batch_delegates(self):
+    def test_add_requests_batch_delegates(self) -> None:
         _run_in_process(_test_add_requests_batch_delegates_impl)
 
     # 4.9
-    def test_register_beam_output_sets_external_id(self):
+    def test_register_beam_output_sets_external_id(self) -> None:
         _run_in_process(_test_register_beam_output_sets_external_id_impl)
 
     # 4.10
-    def test_apply_batch_fork_patches_enum(self):
+    def test_apply_batch_fork_patches_enum(self) -> None:
         _run_in_process(_test_apply_batch_fork_patches_enum_impl)
 
     # 4.11
-    def test_apply_batch_fork_patches_methods(self):
+    def test_apply_batch_fork_patches_methods(self) -> None:
         _run_in_process(_test_apply_batch_fork_patches_methods_impl)
 
 
@@ -1393,7 +1393,7 @@ class TestBeamSearchOrchestration:
 # ---------------------------------------------------------------------------
 
 
-def _test_patch_batch_and_fork_wires_run_engine_core_impl():
+def _test_patch_batch_and_fork_wires_run_engine_core_impl() -> None:
     from vllm.v1.engine.core import EngineCoreProc
 
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
@@ -1406,7 +1406,7 @@ def _test_patch_batch_and_fork_wires_run_engine_core_impl():
         EngineCoreProc.run_engine_core = original
 
 
-def _test_patch_batch_and_fork_calls_apply_impl():
+def _test_patch_batch_and_fork_calls_apply_impl() -> None:
     from vllm.v1.engine.core import EngineCoreProc
 
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
@@ -1420,7 +1420,7 @@ def _test_patch_batch_and_fork_calls_apply_impl():
         EngineCoreProc.run_engine_core = original
 
 
-def _test_run_patch_calls_all_impl():
+def _test_run_patch_calls_all_impl() -> None:
     with (
         patch("vllm_gr.patch.patch_beam_search") as mock_bs,
         patch("vllm_gr.patch.patch_sampling") as mock_samp,
@@ -1439,15 +1439,15 @@ class TestPatchWiring:
     """Section 6: patch orchestration."""
 
     # 6.1
-    def test_patch_batch_and_fork_wires_run_engine_core(self):
+    def test_patch_batch_and_fork_wires_run_engine_core(self) -> None:
         _run_in_process(_test_patch_batch_and_fork_wires_run_engine_core_impl)
 
     # 6.2
-    def test_patch_batch_and_fork_calls_apply(self):
+    def test_patch_batch_and_fork_calls_apply(self) -> None:
         _run_in_process(_test_patch_batch_and_fork_calls_apply_impl)
 
     # 6.3
-    def test_run_patch_calls_all(self):
+    def test_run_patch_calls_all(self) -> None:
         _run_in_process(_test_run_patch_calls_all_impl)
 
     # 6.4

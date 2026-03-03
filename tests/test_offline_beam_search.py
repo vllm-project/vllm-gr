@@ -71,12 +71,12 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     print(f"Elapsed mean: {(end - start) / max(1, loops):.4f}s")
 
 
-def _run_offline_beam_search_target(loops: int):
+def _run_offline_beam_search_target(loops: int) -> None:
     _run_offline_beam_search(loops, use_patch=False)
 
 
-@pytest.mark.slow
-def test_offline_beam_search(loops: int):
+@pytest.mark.slow  # type: ignore
+def test_offline_beam_search(loops: int) -> None:
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_run_offline_beam_search_target, args=(loops,))
     p.start()
@@ -84,7 +84,7 @@ def test_offline_beam_search(loops: int):
     assert p.exitcode == 0
 
 
-def _run_offline_gr_beam_search_target(loops: int):
+def _run_offline_gr_beam_search_target(loops: int) -> None:
     before_gpu = torch.cuda.memory_allocated()
     before_host = psutil.Process().memory_info().rss
     _run_offline_beam_search(loops, use_patch=True)
@@ -101,8 +101,8 @@ def _run_offline_gr_beam_search_target(loops: int):
         assert after_gpu - before_gpu <= 50 * 1024**2
 
 
-@pytest.mark.slow
-def test_offline_gr_beam_search(loops: int):
+@pytest.mark.slow  # type: ignore
+def test_offline_gr_beam_search(loops: int) -> None:
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_run_offline_gr_beam_search_target, args=(loops,))
     p.start()
