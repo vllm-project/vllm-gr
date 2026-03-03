@@ -10,6 +10,7 @@ import traceback
 from typing import Literal
 
 import aiohttp
+import tqdm
 import vllm
 import vllm.benchmarks.datasets
 import vllm.benchmarks.throughput

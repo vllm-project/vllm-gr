@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import queue
+from collections.abc import AsyncGenerator
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
@@ -43,7 +45,7 @@ from vllm_gr.v1.engine.types import BeamForkRequest
 # ---------------------------------------------------------------------------
 
 
-def _sampling_params(**overrides) -> SamplingParams:
+def _sampling_params(**overrides: Any) -> SamplingParams:
     """Create a SamplingParams with sensible test defaults."""
     defaults = dict(max_tokens=1, logprobs=3, temperature=0.0, detokenize=False)
     defaults.update(overrides)
@@ -51,16 +53,16 @@ def _sampling_params(**overrides) -> SamplingParams:
 
 
 def _make_mock_request(
-    request_id="parent-0",
-    token_ids=None,
-    block_hashes=None,
-    eos_token_id=2,
-    lora_request=None,
-    cache_salt=None,
-    mm_features=None,
-    prompt_embeds=None,
-    num_prompt_tokens=3,
-):
+    request_id: str = "parent-0",
+    token_ids: list[int] | None = None,
+    block_hashes: list[int] | None = None,
+    eos_token_id: int = 2,
+    lora_request: Any = None,
+    cache_salt: str | None = None,
+    mm_features: Any = None,
+    prompt_embeds: Any = None,
+    num_prompt_tokens: int = 3,
+) -> SimpleNamespace:
     """Create a lightweight mock that looks like vllm.v1.request.Request."""
     req = SimpleNamespace(
         request_id=request_id,
@@ -76,7 +78,10 @@ def _make_mock_request(
     return req
 
 
-def _make_engine_self(beam_cache=None, block_hasher=None):
+def _make_engine_self(
+    beam_cache: dict[str, dict[str, Any]] | None = None,
+    block_hasher: Any = None,
+) -> SimpleNamespace:
     """Create a mock 'self' for EngineCore methods."""
     self = SimpleNamespace(
         beam_cache=beam_cache if beam_cache is not None else {},
@@ -84,7 +89,7 @@ def _make_engine_self(beam_cache=None, block_hasher=None):
         input_queue=queue.SimpleQueue(),
         output_queue=queue.SimpleQueue(),
         engine_index=0,
-        _cache_beam_request=lambda req: _cache_beam_request(self, req),
+        _cache_beam_request=lambda req: _cache_beam_request(self, req),  # type: ignore[has-type]
     )
     # Re-bind so the lambda captures the right self
     self._cache_beam_request = lambda req: _cache_beam_request(self, req)
@@ -92,14 +97,14 @@ def _make_engine_self(beam_cache=None, block_hasher=None):
 
 
 def _make_fork_request(
-    parent_ids=None,
-    child_ids=None,
-    token_ids=None,
-    abort_ids=None,
-    sampling_params=None,
-    eos_token_id=None,
-    current_wave=0,
-):
+    parent_ids: list[str] | None = None,
+    child_ids: list[str] | None = None,
+    token_ids: list[int] | None = None,
+    abort_ids: list[str] | None = None,
+    sampling_params: SamplingParams | None = None,
+    eos_token_id: int | None = None,
+    current_wave: int = 0,
+) -> BeamForkRequest:
     return BeamForkRequest(
         parent_ids=parent_ids or [],
         child_ids=child_ids or [],
@@ -482,7 +487,7 @@ class TestTypesSerialization:
     """Section 1: msgspec round-trip tests for all custom types."""
 
     # 1.1
-    def test_beam_fork_request_roundtrip(self):
+    def test_beam_fork_request_roundtrip(self) -> None:
         sp = _sampling_params()
         req = BeamForkRequest(
             parent_ids=["p0", "p1"],
@@ -510,7 +515,7 @@ class TestTypesSerialization:
         assert got.sampling_params.max_tokens == sp.max_tokens
 
     # 1.2
-    def test_beam_fork_request_defaults_omitted(self):
+    def test_beam_fork_request_defaults_omitted(self) -> None:
         sp = _sampling_params()
         req_full = BeamForkRequest(
             parent_ids=["p0"],
@@ -552,7 +557,7 @@ class TestTypesSerialization:
         assert data != data_explicit
 
     # 1.3
-    def test_beam_fork_request_empty_arrays(self):
+    def test_beam_fork_request_empty_arrays(self) -> None:
         sp = _sampling_params()
         req = BeamForkRequest(
             parent_ids=[],
@@ -580,7 +585,7 @@ class TestEnumPatching:
     """Section 2: runtime enum injection via _add_enum_member."""
 
     # 2.1
-    def test_add_enum_member_creates_member(self):
+    def test_add_enum_member_creates_member(self) -> None:
         _add_enum_member("ADD_BATCH", b"\x05")
         member = EngineCoreRequestType.ADD_BATCH
         assert member.value == b"\x05"
@@ -589,7 +594,7 @@ class TestEnumPatching:
         assert "ADD_BATCH" in EngineCoreRequestType._member_map_
 
     # 2.2
-    def test_add_enum_member_idempotent(self):
+    def test_add_enum_member_idempotent(self) -> None:
         _add_enum_member("ADD_BATCH", b"\x05")
         _add_enum_member("ADD_BATCH", b"\x05")
         assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
@@ -597,13 +602,13 @@ class TestEnumPatching:
         assert EngineCoreRequestType(b"\x05") is EngineCoreRequestType.ADD_BATCH
 
     # 2.3
-    def test_add_enum_member_beam_fork(self):
+    def test_add_enum_member_beam_fork(self) -> None:
         _add_enum_member("BEAM_FORK", b"\x06")
         assert EngineCoreRequestType(b"\x06").name == "BEAM_FORK"
         assert EngineCoreRequestType.BEAM_FORK.value == b"\x06"
 
     # 2.4
-    def test_beam_search_bumped_to_x07(self):
+    def test_beam_search_bumped_to_x07(self) -> None:
         _add_enum_member("BEAM_SEARCH", b"\x07")
         assert EngineCoreRequestType.BEAM_SEARCH.value == b"\x07"
         assert EngineCoreRequestType(b"\x07") is EngineCoreRequestType.BEAM_SEARCH
@@ -620,7 +625,7 @@ class TestBeamCache:
     """Section 3: _cache_beam_request and _handle_beam_fork."""
 
     # 3.1
-    def test_cache_beam_request_stores_state(self):
+    def test_cache_beam_request_stores_state(self) -> None:
         eng = _make_engine_self()
         req = _make_mock_request(
             request_id="r0",
@@ -643,7 +648,7 @@ class TestBeamCache:
         assert cached["num_prompt_tokens"] == 3
 
     # 3.2
-    def test_cache_beam_request_overwrites(self):
+    def test_cache_beam_request_overwrites(self) -> None:
         eng = _make_engine_self()
         req1 = _make_mock_request(request_id="r0", token_ids=[1, 2])
         _cache_beam_request(eng, req1)
@@ -937,7 +942,7 @@ class TestClientPatches:
 # ---------------------------------------------------------------------------
 
 
-def _make_beam_search_params(**overrides):
+def _make_beam_search_params(**overrides: Any) -> SimpleNamespace:
     """Create a SimpleNamespace that mimics BeamSearchParams attributes."""
     defaults = dict(
         beam_width=3,
@@ -953,10 +958,10 @@ def _make_beam_search_params(**overrides):
 
 
 def _make_serving_self(
-    has_prepare_request=False,
-    has_beam_fork=False,
-    tokenizer_eos_id=2,
-):
+    has_prepare_request: bool = False,
+    has_beam_fork: bool = False,
+    tokenizer_eos_id: int = 2,
+) -> MagicMock:
     """Create a mock 'self' for beam_search (OpenAIServing instance)."""
     tokenizer = MagicMock()
     tokenizer.eos_token_id = tokenizer_eos_id
@@ -979,7 +984,7 @@ def _make_serving_self(
     return mock_self
 
 
-async def _collect_beam_search(gen):
+async def _collect_beam_search(gen: Any) -> list[Any]:
     """Drain an async generator and return all yielded values."""
     results = []
     async for item in gen:
@@ -991,7 +996,7 @@ class TestBeamSearchOrchestration:
     """Section 5: beam_search function in serving_engine.py."""
 
     # 5.1
-    def test_beam_search_validation_zero_width(self):
+    def test_beam_search_validation_zero_width(self) -> None:
         from vllm.entrypoints.openai.protocol import VLLMValidationError
 
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
@@ -1003,7 +1008,7 @@ class TestBeamSearchOrchestration:
             asyncio.run(_collect_beam_search(beam_search(mock_self, "hello", "req-1", params)))
 
     # 5.2
-    def test_beam_search_validation_no_tokenizer(self):
+    def test_beam_search_validation_no_tokenizer(self) -> None:
         from vllm.entrypoints.openai.protocol import VLLMValidationError
 
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
@@ -1016,7 +1021,7 @@ class TestBeamSearchOrchestration:
             asyncio.run(_collect_beam_search(beam_search(mock_self, "hello", "req-1", params)))
 
     # 5.3
-    def test_beam_search_invalid_begin_token(self):
+    def test_beam_search_invalid_begin_token(self) -> None:
         from vllm.entrypoints.openai.protocol import VLLMValidationError
 
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
@@ -1029,7 +1034,7 @@ class TestBeamSearchOrchestration:
             asyncio.run(_collect_beam_search(beam_search(mock_self, "hello", "req-1", params)))
 
     # 5.4
-    def test_beam_search_max_tokens_too_small(self):
+    def test_beam_search_max_tokens_too_small(self) -> None:
         from vllm.entrypoints.openai.protocol import VLLMValidationError
 
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
@@ -1043,28 +1048,28 @@ class TestBeamSearchOrchestration:
             asyncio.run(_collect_beam_search(beam_search(mock_self, "hello", "req-1", params)))
 
     # 5.5
-    def test_capability_detection_both(self):
+    def test_capability_detection_both(self) -> None:
         mock_self = _make_serving_self(has_prepare_request=True, has_beam_fork=True)
         ec = mock_self.engine_client
         assert hasattr(ec, "prepare_request")
         assert hasattr(ec, "beam_fork")
 
     # 5.6
-    def test_capability_detection_batch_only(self):
+    def test_capability_detection_batch_only(self) -> None:
         mock_self = _make_serving_self(has_prepare_request=True, has_beam_fork=False)
         ec = mock_self.engine_client
         assert hasattr(ec, "prepare_request")
         assert not hasattr(ec, "beam_fork")
 
     # 5.7
-    def test_capability_detection_neither(self):
+    def test_capability_detection_neither(self) -> None:
         mock_self = _make_serving_self(has_prepare_request=False, has_beam_fork=False)
         ec = mock_self.engine_client
         assert not hasattr(ec, "prepare_request")
         assert not hasattr(ec, "beam_fork")
 
     # 5.8
-    def test_step0_uses_add_batch(self):
+    def test_step0_uses_add_batch(self) -> None:
         """With use_batch=True and use_beam_fork=True, step 0 should call
         prepare_request for each beam then _add_requests_batch."""
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
@@ -1107,7 +1112,7 @@ class TestBeamSearchOrchestration:
         )
 
     # 5.9
-    def test_step1_uses_beam_fork(self):
+    def test_step1_uses_beam_fork(self) -> None:
         """After step 0 sets fork_info, step 1 should use BEAM_FORK path."""
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
@@ -1158,7 +1163,7 @@ class TestBeamSearchOrchestration:
         ec.prepare_request.assert_called()
 
     # 5.10
-    def test_beam_fork_abort_ids(self):
+    def test_beam_fork_abort_ids(self) -> None:
         """Abort IDs should contain unused parent IDs."""
         # This tests the logic:
         #   used = set(parent_ids)
@@ -1171,7 +1176,7 @@ class TestBeamSearchOrchestration:
         assert sorted(abort_ids) == ["beam-1", "beam-3"]
 
     # 5.11
-    def test_fallback_uses_generate(self):
+    def test_fallback_uses_generate(self) -> None:
         """Without prepare_request/beam_fork, falls back to generate()."""
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
@@ -1183,7 +1188,7 @@ class TestBeamSearchOrchestration:
         mock_output.finished = True
         mock_output.outputs = [MagicMock(finish_reason="length", logprobs=None)]
 
-        async def mock_generate(*args, **kwargs):
+        async def mock_generate(*args: Any, **kwargs: Any) -> AsyncGenerator[Any, None]:
             yield mock_output
 
         ec.generate = mock_generate
@@ -1197,7 +1202,7 @@ class TestBeamSearchOrchestration:
             pass
 
     # 5.12
-    def test_error_finish_reason_aborts(self):
+    def test_error_finish_reason_aborts(self) -> None:
         """Error finish_reason should yield error and return immediately."""
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
@@ -1208,7 +1213,7 @@ class TestBeamSearchOrchestration:
         error_output.finished = True
         error_output.outputs = [MagicMock(finish_reason="error")]
 
-        async def mock_generate(*args, **kwargs):
+        async def mock_generate(*args: Any, **kwargs: Any) -> AsyncGenerator[Any, None]:
             yield error_output
 
         ec.generate = mock_generate
@@ -1223,7 +1228,7 @@ class TestBeamSearchOrchestration:
         assert results[0].outputs[0].finish_reason == "error"
 
     # 5.13
-    def test_eos_handling(self):
+    def test_eos_handling(self) -> None:
         """EOS tokens should be moved to 'completed' list when ignore_eos=False."""
         import numpy as np
         from vllm.beam_search import BeamSearchSequence
@@ -1260,7 +1265,7 @@ class TestBeamSearchOrchestration:
         assert completed[0].finish_reason == "stop"
 
     # 5.14
-    def test_ignore_eos(self):
+    def test_ignore_eos(self) -> None:
         """With ignore_eos=True, EOS is treated as regular token."""
         import numpy as np
 
@@ -1277,7 +1282,7 @@ class TestBeamSearchOrchestration:
         assert len(completed) == 0
 
     # 5.15
-    def test_fork_info_built_from_selection(self):
+    def test_fork_info_built_from_selection(self) -> None:
         """fork_info should map (parent_beam_idx, token_id)."""
         import numpy as np
 
@@ -1293,7 +1298,7 @@ class TestBeamSearchOrchestration:
         assert fork_info == [(1, 60), (0, 50), (1, 61)]
 
     # 5.16
-    def test_cleanup_aborts_remaining_cache(self):
+    def test_cleanup_aborts_remaining_cache(self) -> None:
         """After the loop, remaining beam IDs should be aborted."""
         prev_beam_internal_ids = ["id-0", "id-1", "id-2"]
         use_beam_fork = True
@@ -1310,7 +1315,7 @@ class TestBeamSearchOrchestration:
         assert cleanup_abort_ids == ["id-0", "id-1", "id-2"]
 
     # 5.17
-    def test_cleanup_skipped_when_no_fork(self):
+    def test_cleanup_skipped_when_no_fork(self) -> None:
         """With use_beam_fork=False, no cleanup beam_fork call."""
         prev_beam_internal_ids = ["id-0"]
         use_beam_fork = False
@@ -1322,7 +1327,7 @@ class TestBeamSearchOrchestration:
         assert cleanup_called is False
 
     # 5.18
-    def test_end_token_appended(self):
+    def test_end_token_appended(self) -> None:
         """After loop, end_token should be appended to remaining beams."""
         from vllm.beam_search import BeamSearchSequence
         from vllm.logprobs import Logprob
@@ -1343,7 +1348,7 @@ class TestBeamSearchOrchestration:
         assert sid_end_token_id in all_beams[0].logprobs[-1]
 
     # 5.19
-    def test_output_sorted_by_logprob(self):
+    def test_output_sorted_by_logprob(self) -> None:
         """Best beams should be top-K by cum_logprob descending."""
         from vllm.beam_search import BeamSearchSequence
 
@@ -1365,7 +1370,7 @@ class TestBeamSearchOrchestration:
         assert best_beams[2].cum_logprob == pytest.approx(-2.0)
 
     # 5.20
-    def test_eos_stripped_from_text(self):
+    def test_eos_stripped_from_text(self) -> None:
         """When best beam ends with EOS and ignore_eos=False, EOS should be
         stripped before decoding."""
         eos_token_id = 2
@@ -1446,7 +1451,7 @@ class TestPatchWiring:
         _run_in_process(_test_run_patch_calls_all_impl)
 
     # 6.4
-    def test_run_engine_core_applies_child_patches(self):
+    def test_run_engine_core_applies_child_patches(self) -> None:
         with (
             patch(
                 "vllm_gr.v1.engine.engine_core_patch.apply_engine_core_child_patches"
@@ -1471,13 +1476,13 @@ class TestIntegrationCrossProcess:
     """Section 7: cross-process serialization and enum consistency."""
 
     @classmethod
-    def setup_class(cls):
+    def setup_class(cls) -> None:
         _add_enum_member("ADD_BATCH", b"\x05")
         _add_enum_member("BEAM_FORK", b"\x06")
         _add_enum_member("BEAM_SEARCH", b"\x07")
 
     # 7.1
-    def test_enum_values_no_collision(self):
+    def test_enum_values_no_collision(self) -> None:
         expected = {
             "ADD": b"\x00",
             "ABORT": b"\x01",
@@ -1500,7 +1505,7 @@ class TestIntegrationCrossProcess:
             seen_values.add(member.value)
 
     # 7.2
-    def test_beam_fork_request_encode_decode_cross_process(self):
+    def test_beam_fork_request_encode_decode_cross_process(self) -> None:
         """Simulate parent→child ZMQ transport with encoder/decoder."""
         from vllm.v1.serial_utils import MsgpackDecoder
 
