@@ -6,9 +6,9 @@ OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchma
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
-  - [Offline Throughput Mode](#mode-1-offline-throughput-mode-simple-local)
-  - [Offline Accuracy Mode](#mode-2-offline-accuracy-mode-simple-local)
-  - [Online, API Server Mode](#mode-3-online-api-server-mode-production-like)
+    - [Offline Throughput Mode](#mode-1-offline-throughput-mode-simple-local)
+    - [Offline Accuracy Mode](#mode-2-offline-accuracy-mode-simple-local)
+    - [Online, API Server Mode](#mode-3-online-api-server-mode-production-like)
 - [Installation](#installation)
 - [Open One Rec Benchmark Dataset](#open-one-rec-benchmark-dataset)
 - [Usage](#usage)
@@ -55,7 +55,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --task-types video \
   --num-prompts 1000 \
   --max-logprobs 1024 \
-  --output-json results/throughput.json  
+  --output-json results/throughput.json
 ```
 
 **Best for**: Quick testing, development, maximizing throughput
@@ -174,9 +174,9 @@ Use your huggingface username to approve this link before you download:
 <https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF>
 
 ```bash
-mkdir -p OpenOneRec  
+mkdir -p OpenOneRec
 cd OpenOneRec
-git lfs install  
+git lfs install
 git clone https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF ./data
 cd -
 ```
@@ -410,7 +410,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
   --dataset-path ./data \
   --num-prompts 100 \
-  --output-json results/throughput  
+  --output-json results/throughput
 ```
 
 ### Result Format
