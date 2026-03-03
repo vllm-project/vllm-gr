@@ -9,9 +9,10 @@ and fails if any are found, as pickle can execute arbitrary code and is
 a security risk.
 """
 
-import regex as re
 import sys
 from pathlib import Path
+
+import regex as re
 
 # Patterns to match pickle/cloudpickle imports
 PICKLE_PATTERNS = [

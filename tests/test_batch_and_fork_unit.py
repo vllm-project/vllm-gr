@@ -15,6 +15,7 @@ Covers all 7 sections of the test plan:
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import queue
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -108,6 +109,368 @@ def _make_fork_request(
         eos_token_id=eos_token_id,
         current_wave=current_wave,
     )
+
+
+def _run_in_process(target):
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=target)
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        pytest.fail(f"Test failed in subprocess with exit code {p.exitcode}")
+
+
+def _test_handle_beam_fork_creates_children_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "p0": {
+                "all_token_ids": [10, 20],
+                "block_hashes": [],
+                "eos_token_id": 2,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 2,
+            },
+        }
+    )
+    fork = _make_fork_request(
+        parent_ids=["p0", "p0"],
+        child_ids=["c0", "c1"],
+        token_ids=[100, 200],
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        mock_child_0 = MagicMock()
+        mock_child_0.request_id = "c0"
+        mock_child_0.block_hashes = []
+        mock_child_0._all_token_ids = [10, 20, 100]
+        mock_child_1 = MagicMock()
+        mock_child_1.request_id = "c1"
+        mock_child_1.block_hashes = []
+        mock_child_1._all_token_ids = [10, 20, 200]
+        MockReq.side_effect = [mock_child_0, mock_child_1]
+
+        _handle_beam_fork(eng, fork)
+
+    # 2 items in the input queue.
+    items = []
+    while not eng.input_queue.empty():
+        items.append(eng.input_queue.get_nowait())
+    assert len(items) == 2
+    assert items[0][0] == EngineCoreRequestType.ADD
+    assert items[1][0] == EngineCoreRequestType.ADD
+
+    # Verify prompt_token_ids passed to Request().
+    calls = MockReq.call_args_list
+    assert calls[0].kwargs["prompt_token_ids"] == [10, 20, 100]
+    assert calls[1].kwargs["prompt_token_ids"] == [10, 20, 200]
+
+
+def _test_handle_beam_fork_clones_block_hashes_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "p0": {
+                "all_token_ids": [10, 20],
+                "block_hashes": [0xAA, 0xBB],
+                "eos_token_id": 2,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 2,
+            },
+        }
+    )
+    fork = _make_fork_request(
+        parent_ids=["p0"],
+        child_ids=["c0"],
+        token_ids=[100],
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        mock_child = MagicMock()
+        mock_child.request_id = "c0"
+        mock_child.block_hashes = []
+        mock_child._all_token_ids = [10, 20, 100]
+        MockReq.return_value = mock_child
+
+        _handle_beam_fork(eng, fork)
+
+    # After fork, child's block_hashes should start with parent's.
+    mock_child.block_hashes = [0xAA, 0xBB]  # assigned by the function
+    # The function does: req.block_hashes = list(cached['block_hashes'])
+    # Verify the call set block_hashes.
+    # Since we mock, check the assignment happened via the call args.
+    assert MockReq.call_args.kwargs["block_hasher"] is None
+
+
+def _test_handle_beam_fork_incremental_hash_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "p0": {
+                "all_token_ids": [10, 20],
+                "block_hashes": [0xAA],
+                "eos_token_id": 2,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 2,
+            },
+        },
+        block_hasher=MagicMock(return_value=[0xCC]),
+    )
+    fork = _make_fork_request(
+        parent_ids=["p0"],
+        child_ids=["c0"],
+        token_ids=[100],
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        child = MagicMock()
+        child.request_id = "c0"
+        child.block_hashes = []
+        child._all_token_ids = [10, 20, 100]
+        # The function will call get_hash_new_full_blocks()
+        child.get_hash_new_full_blocks = MagicMock(return_value=[0xCC])
+        MockReq.return_value = child
+
+        _handle_beam_fork(eng, fork)
+
+    # request_block_hasher was used to create the partial.
+    assert eng.request_block_hasher is not None
+
+
+def _test_handle_beam_fork_no_hasher_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "p0": {
+                "all_token_ids": [10, 20],
+                "block_hashes": [0xAA],
+                "eos_token_id": 2,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 2,
+            },
+        },
+        block_hasher=None,
+    )
+    fork = _make_fork_request(
+        parent_ids=["p0"],
+        child_ids=["c0"],
+        token_ids=[100],
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        child = MagicMock()
+        child.request_id = "c0"
+        child.block_hashes = []
+        child._all_token_ids = [10, 20, 100]
+        MockReq.return_value = child
+
+        _handle_beam_fork(eng, fork)
+
+    # block_hasher=None → Request created with block_hasher=None.
+    assert MockReq.call_args.kwargs["block_hasher"] is None
+    # get_hash_new_full_blocks should NOT have been set/called.
+    # (The function checks self.request_block_hasher before setting it.)
+
+
+def _test_handle_beam_fork_missing_parent_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "valid": {
+                "all_token_ids": [10],
+                "block_hashes": [],
+                "eos_token_id": 2,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 1,
+            },
+        }
+    )
+    fork = _make_fork_request(
+        parent_ids=["missing", "valid"],
+        child_ids=["c0", "c1"],
+        token_ids=[100, 200],
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        child = MagicMock()
+        child.request_id = "c1"
+        child.block_hashes = []
+        child._all_token_ids = [10, 200]
+        MockReq.return_value = child
+
+        # Should not raise even though "missing" is not in cache.
+        _handle_beam_fork(eng, fork)
+
+    # Only 1 child created (the valid parent).
+    items = []
+    while not eng.input_queue.empty():
+        items.append(eng.input_queue.get_nowait())
+    assert len(items) == 1
+
+    # The missing parent should have produced an error output
+    # so the client doesn't hang waiting for child "c0".
+    from vllm.v1.engine import FinishReason
+
+    error_items = []
+    while not eng.output_queue.empty():
+        error_items.append(eng.output_queue.get_nowait())
+    assert len(error_items) == 1
+    client_index, error_outputs = error_items[0]
+    assert len(error_outputs.outputs) == 1
+    assert error_outputs.outputs[0].request_id == "c0"
+    assert error_outputs.outputs[0].finish_reason == FinishReason.ERROR
+    assert "c0" in error_outputs.finished_requests
+
+
+def _test_handle_beam_fork_cleans_cache_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "A": {
+                "all_token_ids": [1],
+                "block_hashes": [],
+                "eos_token_id": 2,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 1,
+            },
+            "B": {
+                "all_token_ids": [2],
+                "block_hashes": [],
+                "eos_token_id": 2,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 1,
+            },
+        }
+    )
+    fork = _make_fork_request(
+        parent_ids=["A"],
+        child_ids=["C"],
+        token_ids=[100],
+        abort_ids=["B"],
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        child = MagicMock()
+        child.request_id = "C"
+        child.block_hashes = []
+        child._all_token_ids = [1, 100]
+        MockReq.return_value = child
+
+        _handle_beam_fork(eng, fork)
+
+    # Parents A and aborted B removed. Child C added (via _cache_beam_request).
+    assert "A" not in eng.beam_cache
+    assert "B" not in eng.beam_cache
+    assert "C" in eng.beam_cache
+
+
+def _test_handle_beam_fork_inherits_eos_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "p0": {
+                "all_token_ids": [10],
+                "block_hashes": [],
+                "eos_token_id": 42,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 1,
+            },
+        }
+    )
+    fork = _make_fork_request(
+        parent_ids=["p0"],
+        child_ids=["c0"],
+        token_ids=[100],
+        eos_token_id=None,  # Not set → inherit from parent.
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        child = MagicMock()
+        child.request_id = "c0"
+        child.block_hashes = []
+        child._all_token_ids = [10, 100]
+        MockReq.return_value = child
+
+        _handle_beam_fork(eng, fork)
+
+    # eos_token_id should be inherited from parent (42).
+    assert MockReq.call_args.kwargs["eos_token_id"] == 42
+
+
+def _test_handle_beam_fork_overrides_eos_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "p0": {
+                "all_token_ids": [10],
+                "block_hashes": [],
+                "eos_token_id": 42,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 1,
+            },
+        }
+    )
+    fork = _make_fork_request(
+        parent_ids=["p0"],
+        child_ids=["c0"],
+        token_ids=[100],
+        eos_token_id=99,  # Explicit override.
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        child = MagicMock()
+        child.request_id = "c0"
+        child.block_hashes = []
+        child._all_token_ids = [10, 100]
+        MockReq.return_value = child
+
+        _handle_beam_fork(eng, fork)
+
+    assert MockReq.call_args.kwargs["eos_token_id"] == 99
+
+
+def _test_handle_beam_fork_block_hasher_none_impl():
+    eng = _make_engine_self(
+        beam_cache={
+            "p0": {
+                "all_token_ids": [10],
+                "block_hashes": [],
+                "eos_token_id": 2,
+                "lora_request": None,
+                "cache_salt": None,
+                "mm_features": None,
+                "prompt_embeds": None,
+                "num_prompt_tokens": 1,
+            },
+        }
+    )
+    fork = _make_fork_request(
+        parent_ids=["p0"],
+        child_ids=["c0"],
+        token_ids=[100],
+    )
+    with patch("vllm.v1.request.Request") as MockReq:
+        child = MagicMock()
+        child.request_id = "c0"
+        child.block_hashes = []
+        child._all_token_ids = [10, 100]
+        MockReq.return_value = child
+
+        _handle_beam_fork(eng, fork)
+
+    # block_hasher=None always passed to skip O(N) hash in constructor.
+    assert MockReq.call_args.kwargs["block_hasher"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -292,545 +655,281 @@ class TestBeamCache:
 
     # 3.3
     def test_handle_beam_fork_creates_children(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "p0": {
-                    "all_token_ids": [10, 20],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 2,
-                },
-            }
-        )
-        fork = _make_fork_request(
-            parent_ids=["p0", "p0"],
-            child_ids=["c0", "c1"],
-            token_ids=[100, 200],
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            mock_child_0 = MagicMock()
-            mock_child_0.request_id = "c0"
-            mock_child_0.block_hashes = []
-            mock_child_0._all_token_ids = [10, 20, 100]
-            mock_child_1 = MagicMock()
-            mock_child_1.request_id = "c1"
-            mock_child_1.block_hashes = []
-            mock_child_1._all_token_ids = [10, 20, 200]
-            MockReq.side_effect = [mock_child_0, mock_child_1]
-
-            _handle_beam_fork(eng, fork)
-
-        # 2 items in the input queue.
-        items = []
-        while not eng.input_queue.empty():
-            items.append(eng.input_queue.get_nowait())
-        assert len(items) == 2
-        assert items[0][0] == EngineCoreRequestType.ADD
-        assert items[1][0] == EngineCoreRequestType.ADD
-
-        # Verify prompt_token_ids passed to Request().
-        calls = MockReq.call_args_list
-        assert calls[0].kwargs["prompt_token_ids"] == [10, 20, 100]
-        assert calls[1].kwargs["prompt_token_ids"] == [10, 20, 200]
+        _run_in_process(_test_handle_beam_fork_creates_children_impl)
 
     # 3.4
     def test_handle_beam_fork_clones_block_hashes(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "p0": {
-                    "all_token_ids": [10, 20],
-                    "block_hashes": [0xAA, 0xBB],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 2,
-                },
-            }
-        )
-        fork = _make_fork_request(
-            parent_ids=["p0"],
-            child_ids=["c0"],
-            token_ids=[100],
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            mock_child = MagicMock()
-            mock_child.request_id = "c0"
-            mock_child.block_hashes = []
-            mock_child._all_token_ids = [10, 20, 100]
-            MockReq.return_value = mock_child
-
-            _handle_beam_fork(eng, fork)
-
-        # After fork, child's block_hashes should start with parent's.
-        mock_child.block_hashes = [0xAA, 0xBB]  # assigned by the function
-        # The function does: req.block_hashes = list(cached['block_hashes'])
-        # Verify the call set block_hashes.
-        # Since we mock, check the assignment happened via the call args.
-        assert MockReq.call_args.kwargs["block_hasher"] is None
+        _run_in_process(_test_handle_beam_fork_clones_block_hashes_impl)
 
     # 3.5
     def test_handle_beam_fork_incremental_hash(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "p0": {
-                    "all_token_ids": [10, 20],
-                    "block_hashes": [0xAA],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 2,
-                },
-            },
-            block_hasher=MagicMock(return_value=[0xCC]),
-        )
-        fork = _make_fork_request(
-            parent_ids=["p0"],
-            child_ids=["c0"],
-            token_ids=[100],
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            child = MagicMock()
-            child.request_id = "c0"
-            child.block_hashes = []
-            child._all_token_ids = [10, 20, 100]
-            # The function will call get_hash_new_full_blocks()
-            child.get_hash_new_full_blocks = MagicMock(return_value=[0xCC])
-            MockReq.return_value = child
-
-            _handle_beam_fork(eng, fork)
-
-        # request_block_hasher was used to create the partial.
-        assert eng.request_block_hasher is not None
+        _run_in_process(_test_handle_beam_fork_incremental_hash_impl)
 
     # 3.6
     def test_handle_beam_fork_no_hasher(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "p0": {
-                    "all_token_ids": [10, 20],
-                    "block_hashes": [0xAA],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 2,
-                },
-            },
-            block_hasher=None,
-        )
-        fork = _make_fork_request(
-            parent_ids=["p0"],
-            child_ids=["c0"],
-            token_ids=[100],
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            child = MagicMock()
-            child.request_id = "c0"
-            child.block_hashes = []
-            child._all_token_ids = [10, 20, 100]
-            MockReq.return_value = child
-
-            _handle_beam_fork(eng, fork)
-
-        # block_hasher=None → Request created with block_hasher=None.
-        assert MockReq.call_args.kwargs["block_hasher"] is None
-        # get_hash_new_full_blocks should NOT have been set/called.
-        # (The function checks self.request_block_hasher before setting it.)
+        _run_in_process(_test_handle_beam_fork_no_hasher_impl)
 
     # 3.7
     def test_handle_beam_fork_missing_parent(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "valid": {
-                    "all_token_ids": [10],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
-            }
-        )
-        fork = _make_fork_request(
-            parent_ids=["missing", "valid"],
-            child_ids=["c0", "c1"],
-            token_ids=[100, 200],
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            child = MagicMock()
-            child.request_id = "c1"
-            child.block_hashes = []
-            child._all_token_ids = [10, 200]
-            MockReq.return_value = child
-
-            # Should not raise even though "missing" is not in cache.
-            _handle_beam_fork(eng, fork)
-
-        # Only 1 child created (the valid parent).
-        items = []
-        while not eng.input_queue.empty():
-            items.append(eng.input_queue.get_nowait())
-        assert len(items) == 1
-
-        # The missing parent should have produced an error output
-        # so the client doesn't hang waiting for child "c0".
-        from vllm.v1.engine import FinishReason
-
-        error_items = []
-        while not eng.output_queue.empty():
-            error_items.append(eng.output_queue.get_nowait())
-        assert len(error_items) == 1
-        client_index, error_outputs = error_items[0]
-        assert len(error_outputs.outputs) == 1
-        assert error_outputs.outputs[0].request_id == "c0"
-        assert error_outputs.outputs[0].finish_reason == FinishReason.ERROR
-        assert "c0" in error_outputs.finished_requests
+        _run_in_process(_test_handle_beam_fork_missing_parent_impl)
 
     # 3.8
     def test_handle_beam_fork_cleans_cache(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "A": {
-                    "all_token_ids": [1],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
-                "B": {
-                    "all_token_ids": [2],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
-            }
-        )
-        fork = _make_fork_request(
-            parent_ids=["A"],
-            child_ids=["C"],
-            token_ids=[100],
-            abort_ids=["B"],
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            child = MagicMock()
-            child.request_id = "C"
-            child.block_hashes = []
-            child._all_token_ids = [1, 100]
-            MockReq.return_value = child
-
-            _handle_beam_fork(eng, fork)
-
-        # Parents A and aborted B removed. Child C added (via _cache_beam_request).
-        assert "A" not in eng.beam_cache
-        assert "B" not in eng.beam_cache
-        assert "C" in eng.beam_cache
+        _run_in_process(_test_handle_beam_fork_cleans_cache_impl)
 
     # 3.9
     def test_handle_beam_fork_inherits_eos(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "p0": {
-                    "all_token_ids": [10],
-                    "block_hashes": [],
-                    "eos_token_id": 42,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
-            }
-        )
-        fork = _make_fork_request(
-            parent_ids=["p0"],
-            child_ids=["c0"],
-            token_ids=[100],
-            eos_token_id=None,  # Not set → inherit from parent.
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            child = MagicMock()
-            child.request_id = "c0"
-            child.block_hashes = []
-            child._all_token_ids = [10, 100]
-            MockReq.return_value = child
-
-            _handle_beam_fork(eng, fork)
-
-        # eos_token_id should be inherited from parent (42).
-        assert MockReq.call_args.kwargs["eos_token_id"] == 42
+        _run_in_process(_test_handle_beam_fork_inherits_eos_impl)
 
     # 3.10
     def test_handle_beam_fork_overrides_eos(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "p0": {
-                    "all_token_ids": [10],
-                    "block_hashes": [],
-                    "eos_token_id": 42,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
-            }
-        )
-        fork = _make_fork_request(
-            parent_ids=["p0"],
-            child_ids=["c0"],
-            token_ids=[100],
-            eos_token_id=99,  # Explicit override.
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            child = MagicMock()
-            child.request_id = "c0"
-            child.block_hashes = []
-            child._all_token_ids = [10, 100]
-            MockReq.return_value = child
-
-            _handle_beam_fork(eng, fork)
-
-        assert MockReq.call_args.kwargs["eos_token_id"] == 99
+        _run_in_process(_test_handle_beam_fork_overrides_eos_impl)
 
     # 3.11
     def test_handle_beam_fork_block_hasher_none(self):
-        eng = _make_engine_self(
-            beam_cache={
-                "p0": {
-                    "all_token_ids": [10],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
-            }
-        )
-        fork = _make_fork_request(
-            parent_ids=["p0"],
-            child_ids=["c0"],
-            token_ids=[100],
-        )
-        with patch("vllm.v1.request.Request") as MockReq:
-            child = MagicMock()
-            child.request_id = "c0"
-            child.block_hashes = []
-            child._all_token_ids = [10, 100]
-            MockReq.return_value = child
-
-            _handle_beam_fork(eng, fork)
-
-        # block_hasher=None always passed to skip O(N) hash in constructor.
-        assert MockReq.call_args.kwargs["block_hasher"] is None
+        _run_in_process(_test_handle_beam_fork_block_hasher_none_impl)
 
 
 # ---------------------------------------------------------------------------
 # 4. Client-Side Patches  (core_client_patch.py)
 # ---------------------------------------------------------------------------
 
+
+def _setup_client_patches_env():
+    _add_enum_member("ADD_BATCH", b"\x05")
+    _add_enum_member("BEAM_FORK", b"\x06")
+
+
+def _test_add_requests_async_empty_impl():
+    _setup_client_patches_env()
+    mock_self = MagicMock()
+    mock_self._send_input = AsyncMock()
+    mock_self.add_request_async = AsyncMock()
+    asyncio.run(add_requests_async(mock_self, []))
+    mock_self._send_input.assert_not_called()
+    mock_self.add_request_async.assert_not_called()
+
+
+def _test_add_requests_async_single_no_force_impl():
+    _setup_client_patches_env()
+    mock_self = MagicMock()
+    mock_self.client_index = 0
+    mock_self.add_request_async = AsyncMock()
+    mock_self._send_input = AsyncMock()
+    req = MagicMock()
+
+    asyncio.run(add_requests_async(mock_self, [req], force_batch=False))
+
+    mock_self.add_request_async.assert_awaited_once_with(req)
+    mock_self._send_input.assert_not_called()
+
+
+def _test_add_requests_async_single_force_impl():
+    _setup_client_patches_env()
+    mock_self = MagicMock()
+    mock_self.client_index = 2
+    mock_self._send_input = AsyncMock()
+    mock_self._ensure_output_queue_task = MagicMock()
+    req = MagicMock()
+    req.client_index = 0
+
+    asyncio.run(add_requests_async(mock_self, [req], force_batch=True))
+
+    mock_self._send_input.assert_awaited_once()
+    call_args = mock_self._send_input.call_args
+    assert call_args[0][0] == EngineCoreRequestType.ADD_BATCH
+    assert req.client_index == 2  # set by function
+
+
+def _test_add_requests_async_multiple_impl():
+    _setup_client_patches_env()
+    mock_self = MagicMock()
+    mock_self.client_index = 7
+    mock_self._send_input = AsyncMock()
+    mock_self._ensure_output_queue_task = MagicMock()
+    reqs = [MagicMock(client_index=0) for _ in range(3)]
+
+    asyncio.run(add_requests_async(mock_self, reqs))
+
+    mock_self._send_input.assert_awaited_once()
+    call_args = mock_self._send_input.call_args
+    assert call_args[0][0] == EngineCoreRequestType.ADD_BATCH
+    for r in reqs:
+        assert r.client_index == 7
+
+
+def _test_beam_fork_async_sets_client_index_impl():
+    _setup_client_patches_env()
+    mock_self = MagicMock()
+    mock_self.client_index = 5
+    mock_self._send_input = AsyncMock()
+    mock_self._ensure_output_queue_task = MagicMock()
+    fork_req = MagicMock()
+    fork_req.client_index = 0
+
+    asyncio.run(beam_fork_async(mock_self, fork_req))
+
+    assert fork_req.client_index == 5
+    mock_self._send_input.assert_awaited_once()
+    call_args = mock_self._send_input.call_args
+    assert call_args[0][0] == EngineCoreRequestType.BEAM_FORK
+
+
+def _test_prepare_request_returns_queue_and_request_impl():
+    _setup_client_patches_env()
+    from vllm.v1.engine import EngineCoreRequest
+
+    sp = _sampling_params()
+    ec_req = EngineCoreRequest(
+        request_id="prep-1",
+        prompt_token_ids=[10, 20],
+        mm_features=None,
+        sampling_params=sp,
+        pooling_params=None,
+        eos_token_id=2,
+        arrival_time=1.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+    mock_self = MagicMock()
+    mock_self.errored = False
+    mock_self.vllm_config.cache_config.kv_sharing_fast_prefill = False
+    mock_self.model_config.max_model_len = 1024
+    mock_self.input_processor.process_inputs = MagicMock(return_value=ec_req)
+    mock_self.input_processor.assign_request_id = MagicMock()
+    mock_self.output_processor.add_request = MagicMock()
+    mock_self._run_output_handler = MagicMock()
+    mock_self.log_requests = False
+
+    queue_obj, returned_req = prepare_request_fn(mock_self, "prep-1", "hello", sp)
+
+    assert returned_req is ec_req
+    mock_self.output_processor.add_request.assert_called_once()
+
+
+def _test_prepare_request_errored_engine_impl():
+    _setup_client_patches_env()
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    mock_self = MagicMock()
+    mock_self.errored = True
+
+    with pytest.raises(EngineDeadError):
+        prepare_request_fn(mock_self, "err-1", "prompt", _sampling_params())
+
+
+def _test_add_requests_batch_delegates_impl():
+    _setup_client_patches_env()
+    mock_self = MagicMock()
+    mock_self.engine_core.add_requests_async = AsyncMock()
+    reqs = [MagicMock(), MagicMock()]
+
+    asyncio.run(_add_requests_batch_fn(mock_self, reqs, use_batch_message=True))
+
+    mock_self.engine_core.add_requests_async.assert_awaited_once_with(reqs, force_batch=True)
+
+
+def _test_register_beam_output_sets_external_id_impl():
+    _setup_client_patches_env()
+    sp = _sampling_params()
+    mock_self = MagicMock()
+    mock_self._run_output_handler = MagicMock()
+    mock_self.output_processor.add_request = MagicMock()
+
+    queue_obj = register_beam_output_fn(
+        mock_self,
+        request_id="fork-child-1",
+        prompt_token_ids=[10, 20, 30],
+        sampling_params=sp,
+        eos_token_id=2,
+    )
+
+    # Verify add_request was called with ec_request that has external_req_id set.
+    call_args = mock_self.output_processor.add_request.call_args
+    ec_request = call_args[0][0]
+    assert ec_request.external_req_id == "fork-child-1"
+    assert ec_request.request_id == "fork-child-1"
+    assert queue_obj is not None
+
+
+def _test_apply_batch_fork_patches_enum_impl():
+    apply_batch_fork_patches()
+    assert hasattr(EngineCoreRequestType, "ADD_BATCH")
+    assert hasattr(EngineCoreRequestType, "BEAM_FORK")
+    assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
+    assert EngineCoreRequestType.BEAM_FORK.value == b"\x06"
+
+
+def _test_apply_batch_fork_patches_methods_impl():
+    from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.v1.engine.core_client import AsyncMPClient
+
+    apply_batch_fork_patches()
+
+    assert hasattr(AsyncMPClient, "add_requests_async")
+    assert hasattr(AsyncMPClient, "beam_fork_async")
+    assert hasattr(AsyncLLM, "prepare_request")
+    assert hasattr(AsyncLLM, "_add_requests_batch")
+    assert hasattr(AsyncLLM, "register_beam_output")
+    assert hasattr(AsyncLLM, "beam_fork")
+
+    # Verify they point to the right functions.
+    assert AsyncMPClient.add_requests_async is add_requests_async
+    assert AsyncMPClient.beam_fork_async is beam_fork_async
+    assert AsyncLLM.prepare_request is prepare_request_fn
+    assert AsyncLLM._add_requests_batch is _add_requests_batch_fn
+    assert AsyncLLM.register_beam_output is register_beam_output_fn
+    assert AsyncLLM.beam_fork is beam_fork_fn
+
+
 class TestClientPatches:
     """Section 4: AsyncMPClient and AsyncLLM patch functions."""
 
-    # Ensure enum members exist for all tests in this section.
-    @classmethod
-    def setup_class(cls):
-        _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("BEAM_FORK", b"\x06")
-
     # 4.1
     def test_add_requests_async_empty(self):
-        mock_self = MagicMock()
-        mock_self._send_input = AsyncMock()
-        mock_self.add_request_async = AsyncMock()
-        asyncio.run(add_requests_async(mock_self, []))
-        mock_self._send_input.assert_not_called()
-        mock_self.add_request_async.assert_not_called()
+        _run_in_process(_test_add_requests_async_empty_impl)
 
     # 4.2
     def test_add_requests_async_single_no_force(self):
-        mock_self = MagicMock()
-        mock_self.client_index = 0
-        mock_self.add_request_async = AsyncMock()
-        mock_self._send_input = AsyncMock()
-        req = MagicMock()
-
-        asyncio.run(add_requests_async(mock_self, [req], force_batch=False))
-
-        mock_self.add_request_async.assert_awaited_once_with(req)
-        mock_self._send_input.assert_not_called()
+        _run_in_process(_test_add_requests_async_single_no_force_impl)
 
     # 4.3
     def test_add_requests_async_single_force(self):
-        mock_self = MagicMock()
-        mock_self.client_index = 2
-        mock_self._send_input = AsyncMock()
-        mock_self._ensure_output_queue_task = MagicMock()
-        req = MagicMock()
-        req.client_index = 0
-
-        asyncio.run(add_requests_async(mock_self, [req], force_batch=True))
-
-        mock_self._send_input.assert_awaited_once()
-        call_args = mock_self._send_input.call_args
-        assert call_args[0][0] == EngineCoreRequestType.ADD_BATCH
-        assert req.client_index == 2  # set by function
+        _run_in_process(_test_add_requests_async_single_force_impl)
 
     # 4.4
     def test_add_requests_async_multiple(self):
-        mock_self = MagicMock()
-        mock_self.client_index = 7
-        mock_self._send_input = AsyncMock()
-        mock_self._ensure_output_queue_task = MagicMock()
-        reqs = [MagicMock(client_index=0) for _ in range(3)]
-
-        asyncio.run(add_requests_async(mock_self, reqs))
-
-        mock_self._send_input.assert_awaited_once()
-        call_args = mock_self._send_input.call_args
-        assert call_args[0][0] == EngineCoreRequestType.ADD_BATCH
-        for r in reqs:
-            assert r.client_index == 7
+        _run_in_process(_test_add_requests_async_multiple_impl)
 
     # 4.5
     def test_beam_fork_async_sets_client_index(self):
-        mock_self = MagicMock()
-        mock_self.client_index = 5
-        mock_self._send_input = AsyncMock()
-        mock_self._ensure_output_queue_task = MagicMock()
-        fork_req = MagicMock()
-        fork_req.client_index = 0
-
-        asyncio.run(beam_fork_async(mock_self, fork_req))
-
-        assert fork_req.client_index == 5
-        mock_self._send_input.assert_awaited_once()
-        call_args = mock_self._send_input.call_args
-        assert call_args[0][0] == EngineCoreRequestType.BEAM_FORK
+        _run_in_process(_test_beam_fork_async_sets_client_index_impl)
 
     # 4.6
     def test_prepare_request_returns_queue_and_request(self):
-        from vllm.v1.engine import EngineCoreRequest
-
-        sp = _sampling_params()
-        ec_req = EngineCoreRequest(
-            request_id="prep-1",
-            prompt_token_ids=[10, 20],
-            mm_features=None,
-            sampling_params=sp,
-            pooling_params=None,
-            eos_token_id=2,
-            arrival_time=1.0,
-            lora_request=None,
-            cache_salt=None,
-            data_parallel_rank=None,
-        )
-
-        mock_self = MagicMock()
-        mock_self.errored = False
-        mock_self.vllm_config.cache_config.kv_sharing_fast_prefill = False
-        mock_self.model_config.max_model_len = 1024
-        mock_self.input_processor.process_inputs = MagicMock(return_value=ec_req)
-        mock_self.input_processor.assign_request_id = MagicMock()
-        mock_self.output_processor.add_request = MagicMock()
-        mock_self._run_output_handler = MagicMock()
-        mock_self.log_requests = False
-
-        queue_obj, returned_req = prepare_request_fn(mock_self, "prep-1", "hello", sp)
-
-        assert returned_req is ec_req
-        mock_self.output_processor.add_request.assert_called_once()
+        _run_in_process(_test_prepare_request_returns_queue_and_request_impl)
 
     # 4.7
     def test_prepare_request_errored_engine(self):
-        from vllm.v1.engine.exceptions import EngineDeadError
-
-        mock_self = MagicMock()
-        mock_self.errored = True
-
-        with pytest.raises(EngineDeadError):
-            prepare_request_fn(mock_self, "err-1", "prompt", _sampling_params())
+        _run_in_process(_test_prepare_request_errored_engine_impl)
 
     # 4.8
     def test_add_requests_batch_delegates(self):
-        mock_self = MagicMock()
-        mock_self.engine_core.add_requests_async = AsyncMock()
-        reqs = [MagicMock(), MagicMock()]
-
-        asyncio.run(_add_requests_batch_fn(mock_self, reqs, use_batch_message=True))
-
-        mock_self.engine_core.add_requests_async.assert_awaited_once_with(reqs, force_batch=True)
+        _run_in_process(_test_add_requests_batch_delegates_impl)
 
     # 4.9
     def test_register_beam_output_sets_external_id(self):
-        sp = _sampling_params()
-        mock_self = MagicMock()
-        mock_self._run_output_handler = MagicMock()
-        mock_self.output_processor.add_request = MagicMock()
-
-        queue_obj = register_beam_output_fn(
-            mock_self,
-            request_id="fork-child-1",
-            prompt_token_ids=[10, 20, 30],
-            sampling_params=sp,
-            eos_token_id=2,
-        )
-
-        # Verify add_request was called with ec_request that has external_req_id set.
-        call_args = mock_self.output_processor.add_request.call_args
-        ec_request = call_args[0][0]
-        assert ec_request.external_req_id == "fork-child-1"
-        assert ec_request.request_id == "fork-child-1"
-        assert queue_obj is not None
+        _run_in_process(_test_register_beam_output_sets_external_id_impl)
 
     # 4.10
     def test_apply_batch_fork_patches_enum(self):
-        apply_batch_fork_patches()
-        assert hasattr(EngineCoreRequestType, "ADD_BATCH")
-        assert hasattr(EngineCoreRequestType, "BEAM_FORK")
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
-        assert EngineCoreRequestType.BEAM_FORK.value == b"\x06"
+        _run_in_process(_test_apply_batch_fork_patches_enum_impl)
 
     # 4.11
     def test_apply_batch_fork_patches_methods(self):
-        from vllm.v1.engine.async_llm import AsyncLLM
-        from vllm.v1.engine.core_client import AsyncMPClient
-
-        apply_batch_fork_patches()
-
-        assert hasattr(AsyncMPClient, "add_requests_async")
-        assert hasattr(AsyncMPClient, "beam_fork_async")
-        assert hasattr(AsyncLLM, "prepare_request")
-        assert hasattr(AsyncLLM, "_add_requests_batch")
-        assert hasattr(AsyncLLM, "register_beam_output")
-        assert hasattr(AsyncLLM, "beam_fork")
-
-        # Verify they point to the right functions.
-        assert AsyncMPClient.add_requests_async is add_requests_async
-        assert AsyncMPClient.beam_fork_async is beam_fork_async
-        assert AsyncLLM.prepare_request is prepare_request_fn
-        assert AsyncLLM._add_requests_batch is _add_requests_batch_fn
-        assert AsyncLLM.register_beam_output is register_beam_output_fn
-        assert AsyncLLM.beam_fork is beam_fork_fn
+        _run_in_process(_test_apply_batch_fork_patches_methods_impl)
 
 
 # ---------------------------------------------------------------------------
@@ -1289,52 +1388,62 @@ class TestBeamSearchOrchestration:
 # ---------------------------------------------------------------------------
 
 
+def _test_patch_batch_and_fork_wires_run_engine_core_impl():
+    from vllm.v1.engine.core import EngineCoreProc
+
+    from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
+
+    original = EngineCoreProc.run_engine_core
+    try:
+        patch_batch_and_fork()
+        assert EngineCoreProc.run_engine_core is run_engine_core
+    finally:
+        EngineCoreProc.run_engine_core = original
+
+
+def _test_patch_batch_and_fork_calls_apply_impl():
+    from vllm.v1.engine.core import EngineCoreProc
+
+    from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
+
+    original = EngineCoreProc.run_engine_core
+    try:
+        with patch("vllm_gr.v1.engine.core_client_patch.apply_batch_fork_patches") as mock_apply:
+            patch_batch_and_fork()
+            mock_apply.assert_called_once()
+    finally:
+        EngineCoreProc.run_engine_core = original
+
+
+def _test_run_patch_calls_all_impl():
+    with (
+        patch("vllm_gr.patch.patch_beam_search") as mock_bs,
+        patch("vllm_gr.patch.patch_sampling") as mock_samp,
+        patch("vllm_gr.patch.patch_batch_and_fork") as mock_bf,
+    ):
+        from vllm_gr.patch import run_patch
+
+        run_patch()
+
+        mock_bs.assert_called_once()
+        mock_samp.assert_called_once()
+        mock_bf.assert_called_once()
+
+
 class TestPatchWiring:
     """Section 6: patch orchestration."""
 
     # 6.1
     def test_patch_batch_and_fork_wires_run_engine_core(self):
-        from vllm.v1.engine.core import EngineCoreProc
-
-        from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
-
-        original = EngineCoreProc.run_engine_core
-        try:
-            patch_batch_and_fork()
-            assert EngineCoreProc.run_engine_core is run_engine_core
-        finally:
-            EngineCoreProc.run_engine_core = original
+        _run_in_process(_test_patch_batch_and_fork_wires_run_engine_core_impl)
 
     # 6.2
     def test_patch_batch_and_fork_calls_apply(self):
-        from vllm.v1.engine.core import EngineCoreProc
-
-        from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
-
-        original = EngineCoreProc.run_engine_core
-        try:
-            with patch(
-                "vllm_gr.v1.engine.core_client_patch.apply_batch_fork_patches"
-            ) as mock_apply:
-                patch_batch_and_fork()
-                mock_apply.assert_called_once()
-        finally:
-            EngineCoreProc.run_engine_core = original
+        _run_in_process(_test_patch_batch_and_fork_calls_apply_impl)
 
     # 6.3
     def test_run_patch_calls_all(self):
-        with (
-            patch("vllm_gr.patch.patch_beam_search") as mock_bs,
-            patch("vllm_gr.patch.patch_sampling") as mock_samp,
-            patch("vllm_gr.patch.patch_batch_and_fork") as mock_bf,
-        ):
-            from vllm_gr.patch import run_patch
-
-            run_patch()
-
-            mock_bs.assert_called_once()
-            mock_samp.assert_called_once()
-            mock_bf.assert_called_once()
+        _run_in_process(_test_run_patch_calls_all_impl)
 
     # 6.4
     def test_run_engine_core_applies_child_patches(self):
