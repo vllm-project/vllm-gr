@@ -152,8 +152,7 @@ repos:
       # Keep `suggestion` last
     - id: run-tests
       name: Run all tests
-      entry: bash -c 'if [ -n "$GITHUB_ACTIONS" ]; then exit 0; fi; bash tools/pre_commit/run_tests.sh'
-      stages: [pre-commit] # Don't run in CI
+      entry: bash tools/pre_commit/run_tests.sh
       language: system
       pass_filenames: false
       verbose: true
