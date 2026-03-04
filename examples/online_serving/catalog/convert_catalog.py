@@ -14,7 +14,7 @@ def process_json(input_file_path, output_file_path):
         return
 
     result_list = []
-    BASE = 8192
+    BASE = 8192  # 8K Base for sid2pid decode
 
     # Iterate through each key in the dictionary
     for key_str in data:

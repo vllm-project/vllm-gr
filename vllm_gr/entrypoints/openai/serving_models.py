@@ -5,9 +5,11 @@ import json
 from typing import Any
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.openai.serving_models import (BaseModelPath,
-                                                    LoRAModulePath,
-                                                    OpenAIServingModels)
+from vllm.entrypoints.openai.serving_models import (
+    BaseModelPath,
+    LoRAModulePath,
+    OpenAIServingModels,
+)
 from vllm.tokenizers import TokenizerLike
 
 _original_init = OpenAIServingModels.__init__

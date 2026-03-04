@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-
-try:
-    import minheap_cpp as minheap
-except ImportError:
-    minheap = None
 import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any
@@ -228,7 +223,7 @@ async def beam_search(
                 logprobs = result.outputs[0].logprobs[0]
                 if len(logprobs) > logprobs_num:
                     logprobs = dict(list(logprobs.items())[:logprobs_num])
-                if self.models.catalog is not None:
+                if self.models.catalog is not None and catalog_tasks:
                     valid_tokens_set = valid_tokens_sets[i]
                     for token_id in list(logprobs.keys()):
                         if token_id not in valid_tokens_set:
@@ -242,7 +237,7 @@ async def beam_search(
         all_beams_token_id = np.array(all_beams_token_id)
         all_beams_logprob = np.array(all_beams_logprob)
 
-        if not ignore_eos and self.models.catalog is None:  # no need to check eos if catalog exist
+        if not ignore_eos:
             # Get the index position of eos token in all generated results
             eos_idx = np.where(all_beams_token_id == eos_token_id)[0]
             for idx in eos_idx:
@@ -312,6 +307,7 @@ async def beam_search(
     metrics = RequestStateStats(
         beam_search_overhead=beam_search_overhead,
         beam_search_decode_time=beam_search_decode_time,
+        num_generation_tokens=num_generation_tokens,
     )
 
     out = RequestOutput(
