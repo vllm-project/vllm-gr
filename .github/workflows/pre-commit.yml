@@ -24,8 +24,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: 'pip'
-      
-      - name: Install optional dependencies  
-        run: pip install .[dev]  
-      
+
+      - name: Install optional dependencies
+        run: pip install .[dev]
+
       - uses: pre-commit/action@v3.0.1

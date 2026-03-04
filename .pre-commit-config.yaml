@@ -141,7 +141,7 @@ repos:
       entry: python tools/pre_commit/validate_config.py
       language: python
       additional_dependencies: [regex]
-    
+
     # Insert new entries above the `suggestion` entry
       # Keep `suggestion` last
     - id: run-tests
