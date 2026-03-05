@@ -10,10 +10,13 @@ Functions for PID extraction and recommendation metrics computation using PIDs.
 """
 
 import json
+import logging
 import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Encoding constants for (code1, code2, code3) -> single int
 # Each code is in range [0, 8192], needs 13 bits

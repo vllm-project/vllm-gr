@@ -121,11 +121,10 @@ Note, that for benchmark accuracy results, the test itself sets a default beam w
 
 **Best for**: Production-like testing, distributed deployment, load testing
 ```
+
 Note, that for benchmark accuracy results, the test itself sets a default beam width
 
-
 **Best for**: Production-like testing, distributed deployment, load testing
-
 
 ### Operation Modes Comparison
 

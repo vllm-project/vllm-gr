@@ -48,6 +48,7 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
     for i in range(8000):
         item = ["<|sid_begin|>", "<s_a_7514>", "<s_b_3217>", f"<s_c_{i}>", "<|sid_end|>"]
         catalog_data.append(item)
+    catalog_data.append("<|sid_begin|><s_a_5719><s_b_4192><s_c_2621><|sid_end|>")
 
     print(f"catalog created with {len(catalog_data)} items")
     # Create temporary catalog file
@@ -116,12 +117,18 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
                 assert len(final_output.outputs) == beam_width
 
                 print(f"Loop {i}: Verifying {len(final_output.outputs)} generated choices...")
-                for j, choice in enumerate(final_output.outputs):
+                not_in_catalog = []
+                for choice in final_output.outputs:
                     content = choice.text
                     # print(f"Choice {j}: {content}")
-                    assert content in catalog_set, (
-                        f"Generated content '{content}' not found in catalog."
-                    )
+                    if content not in catalog_set:
+                        not_in_catalog.append(content)
+                if not_in_catalog:
+                    print(f"Generated content not found in catalog:")
+                    for i,content in enumerate(not_in_catalog):
+                        print(f"{i}: {content}")
+                    assert False, "Some Generated content not found in catalog."
+
 
     finally:
         if os.path.exists(catalog_path):
