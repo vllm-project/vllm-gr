@@ -6,7 +6,7 @@ while getopts "b:" opt; do
   esac
 done
 
-curl -w " total time:%{time_total}s\n" -X  POST "http://localhost/v1/chat/completions" \
+curl -w " total time:%{time_total}s\n" -X  POST "http://localhost:8000/v1/chat/completions" \
 	-H "Content-Type: application/json" \
 	--data '{
 		"model": "OpenOneRec/OneRec-1.7B",

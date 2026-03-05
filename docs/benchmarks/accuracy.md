@@ -31,7 +31,6 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
 Run the server and client separately for a production‑style setup.
 
 #### Terminal 1 — Start the vLLM API server
-
 ```bash
 vllm serve \
   --gr \

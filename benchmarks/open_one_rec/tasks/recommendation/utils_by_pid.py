@@ -10,6 +10,7 @@ Functions for PID extraction and recommendation metrics computation using PIDs.
 """
 
 import json
+import logging
 import random
 import re
 from pathlib import Path
@@ -43,7 +44,7 @@ def load_pid_mapping(mapping_path: str) -> Dict[int, List[Dict[str, int]]]:
     # Convert string keys back to integers
     code_to_pid = {int(k): v for k, v in sid_to_pid_json.items()}
 
-    print(f"[INFO] Loaded {len(code_to_pid)} SID to PID mappings from {mapping_path}")
+    logger.info(f"[INFO] Loaded {len(code_to_pid)} SID to PID mappings from {mapping_path}")
     return code_to_pid
 
 
@@ -77,7 +78,7 @@ def extract_sid_codes_from_text(text: str) -> Optional[Tuple[int, int, int]]:
         return None
     if len(matches) > 1:
         # Log warning but use first match
-        print(f"[WARNING] Expected 1 SID code, got {len(matches)}, using first")
+        logger.warning(f"[WARNING] Expected 1 SID code, got {len(matches)}, using first")
     return (int(matches[0][0]), int(matches[0][1]), int(matches[0][2]))
 
 

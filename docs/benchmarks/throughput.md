@@ -17,7 +17,6 @@ This guide explains how to run the throughput benchmark using the [`one_rec_main
 ### 1. Offline Throughput Mode (Simple, Local)
 
 ```bash
-
 # Single command — everything runs in one process
 python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --gr \

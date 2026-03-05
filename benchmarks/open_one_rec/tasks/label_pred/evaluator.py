@@ -255,4 +255,4 @@ class LabelPredEvaluator(BaseEval):
                 logger.info(f"    Sample ID: {item['sample_id']}")
                 logger.info(f"    Reason: {item['reason']}")
                 logger.info(f"    Ground truth: {item['ground_truth']}")
-                logger.info()
+                logger.info("")
