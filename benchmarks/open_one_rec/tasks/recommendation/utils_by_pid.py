@@ -10,7 +10,6 @@ Functions for PID extraction and recommendation metrics computation using PIDs.
 """
 
 import json
-import logging
 import random
 import re
 from pathlib import Path
