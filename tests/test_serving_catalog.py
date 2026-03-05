@@ -46,10 +46,12 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
         ]
         catalog_data.append(item)
     for i in range(8000):
-        item = ["<|sid_begin|>", "<s_a_7514>", "<s_b_3217>", f"<s_c_{i}>", "<|sid_end|>"]
-        catalog_data.append(item)
-    catalog_data.append(["<|sid_begin|>", "<s_a_5719>", "<s_b_4192>", "<s_c_2621>", "<|sid_end|>"])
-    catalog_data.append(["<|sid_begin|>", "<s_a_5719>", "<s_b_4533>", "<s_c_787>", "<|sid_end|>"])
+        catalog_data.append(
+            ["<|sid_begin|>", "<s_a_7514>", "<s_b_3217>", f"<s_c_{i}>", "<|sid_end|>"]
+        )
+        catalog_data.append(
+            ["<|sid_begin|>", "<s_a_5719>", "<s_b_1421>", f"<s_c_{i}>", "<|sid_end|>"]
+        )
 
     print(f"catalog created with {len(catalog_data)} items")
     # Create temporary catalog file
