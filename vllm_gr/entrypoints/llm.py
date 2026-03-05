@@ -60,19 +60,17 @@ def beam_search(
         sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
         if sid_begin_token_id is None or sid_begin_token_id == -1:
             logger.warning(
-                "begin_token must be a valid token in the tokenizer vocabulary",
-                parameter="begin_token",
-                value=begin_token,
+                f"begin_token must be a valid token in the tokenizer vocabulary, got token {begin_token}"
             )
+            sid_begin_token_id = None
     sid_end_token_id: int | None = None
     if end_token is not None:
         sid_end_token_id = tokenizer.convert_tokens_to_ids(end_token)
         if sid_end_token_id is None or sid_end_token_id == -1:
             logger.warning(
-                "end_token must be a valid token in the tokenizer vocabulary",
-                parameter="end_token",
-                value=end_token,
+                f"end_token must be a valid token in the tokenizer vocabulary, got token {end_token}"
             )
+            sid_end_token_id = None
     sort_beams_key = create_sort_beams_key_function(
         tokenizer.eos_token_id,
         length_penalty,
@@ -104,7 +102,6 @@ def beam_search(
         temperature=temperature,
         skip_clone=True,  # Internal beam search, safe to skip clone
         detokenize=False,
-        seed=0,
     )
     instances: list[BeamSearchInstance] = []
 
@@ -195,7 +192,9 @@ def beam_search(
                 beam_outputs = output[start:end]  # outputs for this instance's beams
 
                 for i, (current_beam, result) in enumerate(zip(all_beams[start:end], beam_outputs)):
-                    if result.outputs[0].logprobs is not None:
+                    if (result.outputs[0].logprobs is not None) or (
+                        len(result.outputs[0].logprobs[0]) < logprobs_num
+                    ):
                         logprobs = result.outputs[0].logprobs[0]
                         if len(logprobs) > logprobs_num:
                             logprobs = dict(list(logprobs.items())[:logprobs_num])
@@ -206,8 +205,8 @@ def beam_search(
                     else:
                         raise ValueError(
                             "Beam search generation expected non-empty logprobs for each beam, "
-                            "but received 'None'. Please ensure that sampling parameters are "
-                            "configured to return logprobs when using beam search."
+                            "but received 'None' or a too short reply. Please ensure that sampling"
+                            "parameters are configured to return logprobs when using beam search."
                         )
 
                 # Convert to numpy for efficient processing

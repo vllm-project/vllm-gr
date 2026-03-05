@@ -20,7 +20,7 @@ if not torch.cuda.is_available():
 
 
 def _load_prompt_text() -> str:
-    prompt_file = os.path.join(os.path.dirname(__file__), "prompt.txt")
+    prompt_file = os.path.join(os.path.dirname(__file__), "resources/single_one_rec_prompt.txt")
     with open(prompt_file, "r") as f:
         return f.read()
 
@@ -96,6 +96,9 @@ def _run_offline_gr_beam_search_target(loops: int) -> None:
         f"host mem delta={(after_host - before_host) / 1024**3:.2f}GB, "
         f"gpu mem delta={(after_gpu - before_gpu) / 1024**3:.2f}GB"
     )
+    # These thresholds (500MB host RAM, 50MB GPU RAM) match the minimum safe
+    # memory headroom required for the 1.7B model to load and run without OOM.
+    # They are intentionally conservative to avoid instability on smaller machines.
     if loops > 1:
         assert after_host - before_host <= 500 * 1024**2
         assert after_gpu - before_gpu <= 50 * 1024**2

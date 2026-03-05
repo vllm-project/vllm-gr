@@ -4,8 +4,8 @@ This directory contains a standalone example demonstrating how to run beam searc
 
 ## Installation
 
-Follow the instructions in
-[`docs/quickstart.md`](../../docs/quickstart.md)
+Follow the instructions in  
+[`docs/quickstart.md`](../../../docs/quickstart.md)  
 to install the required dependencies and set up your environment.
 
 ## Running the Example
@@ -20,20 +20,15 @@ python offline_beam_search.py \
 ```
 
 Key arguments:
-
 - `--model`: Name or path of the model to load (required).
-
 - `--beam_width`: Beam width used during beam search (default: 128).
 - `--compare`: Comparison mode against vanilla vLLM. Options: none, latency, output, both (default: none).
 
-## Expected result
-
+# Expected result
 The script prints the latency of running the predefined input through vllm-gr, and—if comparison is enabled—also reports the latency of vanilla vLLM.
 
 Example:
-
 ```bash
-
 python offline_beam_search.py --model OpenOneRec/OneRec-1.7B --compare latency
 ...
 ...

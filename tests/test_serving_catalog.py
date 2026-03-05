@@ -47,13 +47,7 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
         catalog_data.append(item)
     for i in range(8000):
         catalog_data.append(
-            ["<|sid_begin|>", "<s_a_7514>", "<s_b_3217>", f"<s_c_{i}>", "<|sid_end|>"]
-        )
-        catalog_data.append(
-            ["<|sid_begin|>", "<s_a_5719>", "<s_b_1421>", f"<s_c_{i}>", "<|sid_end|>"]
-        )
-        catalog_data.append(
-            ["<|sid_begin|>", "<s_a_3125>", "<s_b_5248>", f"<s_c_{i}>", "<|sid_end|>"]
+            ["<|sid_begin|>", "<s_a_4247>", "<s_b_6120>", f"<s_c_{i}>", "<|sid_end|>"]
         )
 
     print(f"catalog created with {len(catalog_data)} items")
@@ -89,7 +83,11 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
 
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             # Dummy prompt
-            prompt_text = "User: Recommend.\nAssistant:"
+            prompt_file = os.path.join(
+                os.path.dirname(__file__), "resources/single_one_rec_prompt.txt"
+            )
+            with open(prompt_file, "r") as f:
+                prompt_text = f.read()
             prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
 
@@ -126,7 +124,6 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
                 not_in_catalog = []
                 for choice in final_output.outputs:
                     content = choice.text
-                    # print(f"Choice {j}: {content}")
                     if content not in catalog_set:
                         not_in_catalog.append(content)
                 if not_in_catalog:
