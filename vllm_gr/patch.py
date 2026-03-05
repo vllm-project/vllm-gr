@@ -7,6 +7,7 @@ from vllm_gr.entrypoints.openai.beam_search_patch import (
     patch_sampling,
 )
 from vllm_gr.entrypoints.openai.serving_models import patch_OpenAIServingModels_init
+from vllm_gr.entrypoints.beam_search_patch import patch_offline_beam_search
 
 
 def run_patch():
@@ -14,3 +15,4 @@ def run_patch():
     patch_sampling()
     patch_add_cli_args()
     patch_OpenAIServingModels_init()
+    patch_offline_beam_search()
