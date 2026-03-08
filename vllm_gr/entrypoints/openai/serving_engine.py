@@ -71,6 +71,7 @@ async def _beam_fork_step(
             eos_token_id=eos_token_id,
             lora_request=lora_request,
             trace_headers=trace_headers,
+            priority=priority,
         )
         queues.append(q)
 
@@ -323,6 +324,16 @@ async def beam_search(
             catalog_task = asyncio.create_task(
                 _run_catalog([asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams])
             )
+
+        catalog_tasks = []
+        if self.models.catalog is not None:
+
+            def get_valid_tokens_set(beam) -> set[int]:
+                generated_tokens = beam.tokens[len(prompt_token_ids) :]
+                return self.models.catalog.valid(generated_tokens)
+
+            for beam in all_beams:
+                catalog_tasks.append(asyncio.to_thread(get_valid_tokens_set, beam))
 
         gen_start = time.perf_counter()
 
