@@ -12,7 +12,7 @@ import logging
 import os
 from typing import Any, Dict, List, Tuple
 
-from ...base_evaluator import BaseEval
+from benchmarks.open_one_rec.base_evaluator import BaseEval
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ class ItemUnderstandEvaluator(BaseEval):
         try:
             from api import get_client_from_config
 
-            from .utils import evaluate_wip
+            from benchmarks.open_one_rec.tasks.item_understand.utils import evaluate_wip
         except ImportError as e:
             logger.info(f"[red]Failed to import WIP evaluation modules: {e}[/red]")
             return {}, {}

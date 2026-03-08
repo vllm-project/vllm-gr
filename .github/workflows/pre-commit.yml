@@ -26,10 +26,10 @@ jobs:
           cache: 'pip'
       
       - name: Check for single commit
-        if: github.event.pull_request.commits != 1
+        if: github.event_name == 'pull_request'  &&  github.event.pull_request.commits != 1
         run: |
           echo "Error: The PR has ${{ github.event.pull_request.commits }} commits. Please squash them into a single commit."     
-      
+          exit 1     
       - name: Install optional dependencies
         run: pip install .[dev]
 

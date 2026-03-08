@@ -424,7 +424,7 @@ class BaseLoader(ABC):
             return df
 
         logger.info(f"Sampling {sample_size} samples (total: {len(df)})")
-        return df.sample(sample_size)
+        return df.sample(sample_size, random_state=42)
 
     def _save_sample_data(self, df: pd.DataFrame, split: str, sample_size: int):
         """Save sample data in parquet format"""

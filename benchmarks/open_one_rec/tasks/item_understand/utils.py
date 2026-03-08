@@ -175,7 +175,7 @@ def extract_json_from_response(response: str) -> Optional[Dict]:
         response = response.rstrip("```").lstrip("```json")
         return json.loads(response.strip())
     except json.JSONDecodeError:
-        print(response)
+        logger.error(response)
         return None
 
 

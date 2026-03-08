@@ -14,9 +14,9 @@ import json
 import logging
 from typing import Any, Dict, List, Tuple
 
-from ...base_evaluator import BaseEval
-from . import utils as utils_sid
-from . import utils_by_pid as utils_pid
+from benchmarks.open_one_rec.base_evaluator import BaseEval
+from benchmarks.open_one_rec.tasks.recommendation import utils as utils_sid
+from benchmarks.open_one_rec.tasks.recommendation import utils_by_pid as utils_pid
 
 logger = logging.getLogger(__name__)
 

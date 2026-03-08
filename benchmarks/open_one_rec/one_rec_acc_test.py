@@ -52,10 +52,12 @@ def get_sampling_params(gen_config: Dict[str, Any]) -> SamplingParams:
     num_return_thinking = gen_config.get("num_return_thinking_sequences", 0)
     max_thinking_tokens = gen_config.get("max_new_thinking_tokens", 0)
 
-    print(f"  [Config Read] num_return_sequences: {n}")
-    print(f"  [Config Read] num_beams: {num_beams}")
-    print(f"  [Config Read] num_return_thinking_sequences: {num_return_thinking} (Custom param)")
-    print(f"  [Config Read] max_new_thinking_tokens: {max_thinking_tokens} (Custom param)")
+    logger.info(f"  [Config Read] num_return_sequences: {n}")
+    logger.info(f"  [Config Read] num_beams: {num_beams}")
+    logger.info(
+        f"  [Config Read] num_return_thinking_sequences: {num_return_thinking} (Custom param)"
+    )
+    logger.info(f"  [Config Read] max_new_thinking_tokens: {max_thinking_tokens} (Custom param)")
 
     return SamplingParams(
         n=n,
@@ -126,12 +128,10 @@ def run_api_inference(
                 return MockRequestOutput(prompt, mock_outputs)
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
         except Exception as e:
-            logger.error(
-                f"Request failed. Status code: {response.status_code if 'response' in locals() else 'N/A'}"
-            )
-            logger.error(
-                f"[DEBUG] Response text: {response.text if 'response' in locals() else 'N/A'}"
-            )
+            status_code = response.status_code if response is not None else "N/A"
+            response_text = response.text if response is not None else "N/A"
+            logger.error(f"Request failed. Status code: {status_code}")
+            logger.error(f"[DEBUG] Response text: {response_text}")
             logger.error(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
 
@@ -198,28 +198,28 @@ def main():
     task_config = task_reg.config
     gen_config = task_config.get("generation_config", {})
 
-    print(f"Loaded configuration for task: {task_config['name']}")
-    print(f"Description: {task_config.get('description')}")
+    logger.info(f"Loaded configuration for task: {task_config['name']}")
+    logger.info(f"Description: {task_config.get('description')}")
 
     if args.temperature is not None:
         gen_config["temperature"] = args.temperature
-        print(f"Using temperature from CLI parameter: {args.temperature}")
+        logger.info(f"Using temperature from CLI parameter: {args.temperature}")
     if args.n is not None:
         gen_config["num_beams"] = args.n
         gen_config["num_return_sequences"] = args.n  # Ensure num_return_sequences matches num_beams
-        print(f"Using beam search with beam width from CLI parameter: {args.n}")
+        logger.info(f"Using beam search with beam width from CLI parameter: {args.n}")
     else:
-        print(
+        logger.info(
             f"Using beam search according to the config with beam width: {gen_config.get('num_beams', 1)}"
         )
 
     # 2. Initialize Engine
     llm = None
     if args.endpoint:
-        print(f"\nUsing OpenAI-compatible API at: {args.endpoint}")
-        print(f"Model: {args.model}")
+        logger.info(f"\nUsing OpenAI-compatible API at: {args.endpoint}")
+        logger.info(f"Model: {args.model}")
     else:
-        print(f"\nInitializing vLLM with model: {args.model}")
+        logger.info(f"\nInitializing vLLM with model: {args.model}")
         try:
             llm = LLM(
                 model=args.model,
@@ -227,12 +227,12 @@ def main():
                 max_logprobs=gen_config.get("num_beams", 1) * 2,
             )
         except Exception as e:
-            print(f"Failed to initialize vLLM: {e}")
+            logger.error(f"Failed to initialize vLLM: {e}")
             sys.exit(1)
 
     # 3. Prepare Data
     # prompts = mock_data_loader(task_config, args.num_prompts)  # Replace with real data loading
-    print(f"Loading real data from {args.dataset_path}...")
+    logger.info(f"Loading real data from {args.dataset_path}...")
     loader = DataLoaderWrapper(
         model_path=args.model, benchmark_version="v1.0", data_dir=args.dataset_path
     )
@@ -254,7 +254,7 @@ def main():
         sample_ids.append(sample_id)
 
     # 4. Run Inference
-    print("\nStarting Inference...")
+    logger.info("\nStarting Inference...")
     gen_start = time.perf_counter()
     if args.endpoint:
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
@@ -297,14 +297,14 @@ def main():
 
     # Print a sample output
     if outputs:
-        print("\nSample Output [0]:")
-        print(f"Prompt: {outputs[0].prompt}")
-        print(f"Generated Text: {outputs[0].outputs[0].text}")
+        logger.info("\nSample Output [0]:")
+        logger.info(f"Prompt: {outputs[0].prompt}")
+        logger.info(f"Generated Text: {outputs[0].outputs[0].text}")
         if outputs[0].outputs[0].logprobs:
-            print("Logprobs available: Yes")
+            logger.info(f"Logprobs available: {outputs[0].outputs[0].logprobs}")
 
     # 5. Run Evaluation
-    print("\n--- Running Evaluation ---")
+    logger.info("\n--- Running Evaluation ---")
 
     # Prepare samples dictionary in the format expected by the evaluator.
     # This mimics the structure of a test_generated.json file.
@@ -315,7 +315,7 @@ def main():
         # Get original data from the loaded dataset
         original_sample = dataset.get(sample_id)
         if not original_sample:
-            print(
+            logger.warning(
                 f"Warning: Could not find original sample data for sample_id {sample_id}. Skipping."
             )
             continue
@@ -363,7 +363,7 @@ def main():
         # Save metrics (a Python dict) as JSON
         with open(output_path, "w") as f:
             json.dump(metrics, f, indent=2)
-        print(f"Saved metrics to {output_path}")
+        logger.info(f"Saved metrics to {output_path}")
 
 
 if __name__ == "__main__":
