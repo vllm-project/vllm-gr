@@ -9,6 +9,7 @@
 - [Invoking the Client](#invoking-the-client)
 
 ## Overview
+
 This example demonstrates using an items catalog to eliminate non-existing items given by the recommendation system.
 Limiting the available items increases accuracy and enables reducing the search space to get the same accuracy but with less latency.
 
@@ -22,6 +23,7 @@ Limiting the available items increases accuracy and enables reducing the search 
 
 - Use `convert_catalog.py` script to convert OpenOneRec catalog to vllm-gr catalog format.
 - OpenOneRec catalog is in `<OpenOneRecFolder>/benchmark_data/sid2pid.json`
+
 ```bash
 python convert_catalog.py ${OpenOneRecFolder}/benchmark_data/sid2pid.json ${MyFolder}/catalog.json
 ```
@@ -50,6 +52,7 @@ python convert_catalog.py ${OpenOneRecFolder}/benchmark_data/sid2pid.json ${MyFo
 ## Result verification
 
 A utility was added to check if client results are all within the catalog
+
 ```bash
 bash examples/online_serving/beam_search/client.sh > result.json
 python examples/online_serving/catalog/verify_catalog.py result.json ${MyFolder}/catalog.json
