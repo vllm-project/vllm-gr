@@ -97,6 +97,7 @@ repos:
       entry: tools/pre_commit/shellcheck.sh
       language: script
       types: [shell]
+      require_serial: true
     - id: png-lint
       name: Lint PNG exports from excalidraw
       entry: tools/pre_commit/png-lint.sh
