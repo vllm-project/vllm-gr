@@ -1,0 +1,56 @@
+name: Benchmark Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    # Ensure the runner has an idle GPU attached and matches environment requirements
+    runs-on: [self-hosted, gpu]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install vllm-gr
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Download OpenOneRec dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "Error: HF_TOKEN secret is not set. The OpenOneRec dataset is gated and requires a Hugging Face token."
+            exit 1
+          fi
+          pip install huggingface_hub
+          huggingface-cli login --token $HF_TOKEN --add-to-git-credential
+          mkdir -p OpenOneRec
+          cd OpenOneRec
+          git lfs install
+          git clone https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF ./benchmark_data
+
+      - name: Create catalog from dataset
+        id: catalog
+        run: |
+          mkdir -p generated_data
+          python examples/online_serving/catalog/convert_catalog.py ${{ github.workspace }}/OpenOneRec/benchmark_data/sid2pid.json generated_data/catalog.json
+          echo "path=${{ github.workspace }}/generated_data/catalog.json" >> $GITHUB_OUTPUT
+
+      - name: Execute benchmark test and verify KPI
+        env:
+          DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
+          CATALOG_PATH: ${{ steps.catalog.outputs.path }}
+        run: |
+          ./tests/system/run_benchmark_and_verify.sh
