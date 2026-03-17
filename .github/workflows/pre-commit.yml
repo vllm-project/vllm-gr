@@ -1,4 +1,4 @@
-name: pre-commit
+name: Pre-commit and Benchmark
 
 on:
   pull_request:
@@ -30,7 +30,62 @@ jobs:
         run: |
           echo "Error: The PR has ${{ github.event.pull_request.commits }} commits. Please squash them into a single commit."
           exit 1
-      - name: Install optional dependencies
-        run: pip install .[dev]
+
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+          echo "${{ github.workspace }}/.venv/bin" >> $GITHUB_PATH
+          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev]
 
       - uses: pre-commit/action@v3.0.1
+
+      - name: Save installation and data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-env-data
+          path: |
+            .venv/
+            OpenOneRec/
+            generated_data/
+          include-hidden-files: true
+
+  benchmark:
+    needs: pre-commit
+    runs-on: [self-hosted, gpu]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download installation and data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-env-data
+      
+      - name: Download OpenOneRec dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "Error: HF_TOKEN secret is not set. The OpenOneRec dataset is gated and requires a Hugging Face token."
+            exit 1
+          fi
+          pip install huggingface_hub
+          huggingface-cli login --token $HF_TOKEN --add-to-git-credential
+          mkdir -p OpenOneRec
+          cd OpenOneRec
+          git lfs install
+          git clone https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF ./benchmark_data
+
+      - name: Execute benchmark test and verify KPI
+        env:
+          DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
+          CATALOG_PATH: ${{ github.workspace }}/generated_data/catalog.json
+        run: |
+          echo "${{ github.workspace }}/.venv/bin" >> $GITHUB_PATH
+          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> $GITHUB_ENV
+          ./tests/system/run_benchmark_and_verify.sh
