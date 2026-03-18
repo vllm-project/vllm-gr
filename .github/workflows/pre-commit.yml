@@ -93,7 +93,7 @@ jobs:
         run: |
           mkdir -p generated_data
           python ./examples/online_serving/catalog/convert_catalog.py ./OpenOneRec/benchmark_data/sid2pid.json generated_data/catalog.json
-          
+
       - name: Execute benchmark test and verify KPI
         env:
           DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
