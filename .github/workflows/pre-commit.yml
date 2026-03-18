@@ -1,5 +1,4 @@
 name: Pre-commit and Benchmark
-
 on:
   pull_request:
     branches: [main]
@@ -43,35 +42,7 @@ jobs:
         run: |
           uv pip install .[dev]
 
-      - uses: pre-commit/action@v3.0.1
-
-      - name: Save installation and data as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-env-data
-          path: |
-            .venv/
-            OpenOneRec/
-            generated_data/
-          include-hidden-files: true
-
-  benchmark:
-    needs: pre-commit
-    runs-on: self-hosted
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v1
-
-      - name: Download installation and data artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: benchmark-env-data
+     # - uses: pre-commit/action@v3.0.1
 
       - name: Download OpenOneRec dataset
         env:
@@ -81,13 +52,11 @@ jobs:
             echo "Error: HF_TOKEN secret is not set. The OpenOneRec dataset is gated and requires a Hugging Face token."
             exit 1
           fi
-          git config --global credential.helper store
-          pip install huggingface_hub
-          huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
+          uv tool install hf
+          hf auth login --token "$HF_TOKEN" 
           mkdir -p OpenOneRec
-          cd OpenOneRec
-          git lfs install
-          git clone https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF ./benchmark_data
+          hf download OpenOneRec/OpenOneRec-RecIF --local-dir ./OpenOneRec --repo-type=dataset
+          
 
       - name: Build Catalog
         run: |
@@ -99,6 +68,4 @@ jobs:
           DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           CATALOG_PATH: ${{ github.workspace }}/generated_data/catalog.json
         run: |
-          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
           ./tests/system/run_benchmark_and_verify.sh
