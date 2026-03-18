@@ -31,5 +31,5 @@ curl -w " total time:%{time_total}s\n" -X  POST "http://localhost:$run_port/v1/c
         "vllm_xargs": {
         "begin_token": "<|sid_begin|>",
         "end_token": "<|sid_end|>"
-    } 
+    }
 	}'

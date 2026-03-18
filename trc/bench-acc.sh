@@ -13,5 +13,3 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
 --endpoint /v1/chat/completions \
 --port $run_port \
 --n 128
-
-

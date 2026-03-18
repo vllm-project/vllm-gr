@@ -15,4 +15,3 @@ vllm_gr --debug $debug_port serve \
     --port $run_port \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     OpenOneRec/OneRec-1.7B
-     

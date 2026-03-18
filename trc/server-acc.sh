@@ -21,5 +21,3 @@ vllm serve --gr \
     --scheduling-policy priority \
     --catalog-path /home/yoni/OpenOneRec/benchmark_data/catalog.json \
      OpenOneRec/OneRec-1.7B
-     
-

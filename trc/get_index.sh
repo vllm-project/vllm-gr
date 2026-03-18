@@ -32,12 +32,12 @@ do
     # 1. Get detailed info for just this GPU
     # We capture the standard table output to see the "ERR!" flags
     gpu_status=$(nvidia-smi -i $i)
-    
+
     # 2. Extract utilization for this GPU
     util=$(nvidia-smi -i $i --query-gpu=utilization.gpu --format=csv,noheader,nounits)
     # 2. Extract memory usage for this GPU
     mem_used=$(nvidia-smi -i $i --query-gpu=memory.used --format=csv,noheader,nounits)
-    
+
     # 3. CRITERIA CHECK:
     # - Is utilization 0?
     # - Is memory used < 2 MiB?

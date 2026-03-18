@@ -15,5 +15,3 @@ vllm serve \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     OpenOneRec/OneRec-1.7B
-     
-

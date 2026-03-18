@@ -3,8 +3,6 @@ run_port=7000
 # Ensure we clean up the background server process if the script exits early
 trap 'kill -9 $SERVER_PID 2>/dev/null' EXIT
 
-echo "Starting server on port $run_port using CUDA device $cuda_dev debug port $debug_port"
-
 vllm serve --gr \
     --port $run_port \
     --seed 123 \
@@ -13,19 +11,18 @@ vllm serve --gr \
     --max_num_seqs 1024 \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
-    --catalog-path $CATALOG_PATH \
+    --catalog-path "$CATALOG_PATH" \
     OpenOneRec/OneRec-1.7B &
 
 SERVER_PID=$!
 
 echo "Waiting for server to be ready on port $run_port..."
 # Check health/models endpoint until it responds
-timeout 1200 bash -c "
+if ! timeout 1200 bash -c "
   until curl -s http://localhost:${run_port}/v1/models > /dev/null; do
     sleep 2
   done
-"
-if [ $? -ne 0 ]; then
+"; then
   echo "Server failed to start within the timeout limit."
   exit 1
 fi
@@ -37,7 +34,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   --backend openai-chat  \
   --model OpenOneRec/OneRec-1.7B  \
   --dataset-name onerec \
-  --dataset-path $DATASET_PATH \
+  --dataset-path "$DATASET_PATH" \
   --task-type video  \
   --num-prompts 100 \
   --use-beam-search \

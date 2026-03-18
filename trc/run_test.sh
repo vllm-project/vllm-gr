@@ -9,4 +9,3 @@ echo "running on device $cuda_dev"
 CUDA_VISIBLE_DEVICES=$cuda_dev \
 pre-commit run --all-files
 #pytest -s tests/test_serving_catalog.py --loops 1 --run-slow
- 
