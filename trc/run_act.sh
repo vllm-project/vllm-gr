@@ -1,4 +1,3 @@
-set -x
 source "$(dirname "$0")/get_index.sh"
 idle_gpu=$(get_gpu 4)
 
@@ -20,5 +19,5 @@ trap 'echo "Unlocking GPU $idle_gpu (PID: $lock_pid)..."; unlock_gpu "$lock_pid"
 
 cuda_dev=$idle_gpu
 echo "running on device $cuda_dev"
-act -s HF_TOKEN=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  --container-options "--runtime=nvidia --gpus device=$cuda_dev" --artifact-server-path /home/yoni/xGr/artifacts \
+act --verbose -s HF_TOKEN=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  --container-options "--runtime=nvidia --gpus device=$cuda_dev" --artifact-server-path /home/yoni/xGr/artifacts \
 -P self-hosted=ghcr.io/catthehacker/ubuntu:act-latest

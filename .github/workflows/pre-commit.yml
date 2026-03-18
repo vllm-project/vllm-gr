@@ -81,6 +81,7 @@ jobs:
             echo "Error: HF_TOKEN secret is not set. The OpenOneRec dataset is gated and requires a Hugging Face token."
             exit 1
           fi
+          git config --global credential.helper store
           pip install huggingface_hub
           huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
           mkdir -p OpenOneRec
@@ -88,6 +89,11 @@ jobs:
           git lfs install
           git clone https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF ./benchmark_data
 
+      - name: Build Catalog
+        run: |
+          mkdir -p generated_data
+          python ./examples/online_serving/catalog/convert_catalog.py ./OpenOneRec/benchmark_data/sid2pid.json generated_data/catalog.json
+          
       - name: Execute benchmark test and verify KPI
         env:
           DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
