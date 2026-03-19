@@ -19,5 +19,11 @@ trap 'echo "Unlocking GPU $idle_gpu (PID: $lock_pid)..."; unlock_gpu "$lock_pid"
 
 cuda_dev=$idle_gpu
 echo "running on device $cuda_dev"
-act -s HF_TOKEN=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  --container-options "--runtime=nvidia --gpus device=$cuda_dev" --artifact-server-path /home/yoni/xGr/artifacts \
+if [ -z "HF_TOKEN"]; then
+    token="-s $HF_TOKEN"
+else
+    token=" "
+fi
+
+act $token  --container-options "--runtime=nvidia --gpus device=$cuda_dev" --artifact-server-path /home/yoni/xGr/artifacts \
 -P self-hosted=ghcr.io/catthehacker/ubuntu:act-latest
