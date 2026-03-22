@@ -6,6 +6,8 @@ function get_index() {
     "shira"
     "haim"
     "yoni"
+    "david"
+    "sagiv"
 )
 # Find index of user
 index=-1
@@ -62,8 +64,8 @@ function lock_gpu() {
         echo "Invalid GPU ID: $gpu_id" >&2
         return 1
     fi
-    # Allocate 10MB, which is > 4MB threshold in get_gpu, to mark it as busy.
-    local mem_to_alloc_mb=10
+    # Allocate 4MB, which is > 4MB threshold in get_gpu, to mark it as busy.
+    local mem_to_alloc_mb=4
 
     local python_cmd="
 import torch, time, sys
