@@ -35,7 +35,7 @@ SERVER_PID=$!
 
 echo "Waiting for server to be ready on port $run_port..."
 # Check health/models endpoint until it responds
-timeout 1200 bash -c "
+timeout 120 bash -c "
   until curl -s http://localhost:${run_port}/v1/models > /dev/null; do
     sleep 2
   done

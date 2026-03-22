@@ -13,4 +13,4 @@ python -m benchmarks.open_one_rec.one_rec_main \
   --num-prompts 100 \
   --use-beam-search \
   --port $run_port \
-  --n 128 
+  --n 128

@@ -1,3 +1,4 @@
+set -x
 source "$(dirname "$0")/get_index.sh"
 idle_gpu=$(get_gpu 4)
 
@@ -19,10 +20,10 @@ trap 'echo "Unlocking GPU $idle_gpu (PID: $lock_pid)..."; unlock_gpu "$lock_pid"
 
 cuda_dev=$idle_gpu
 echo "running on device $cuda_dev"
-if [ -z "HF_TOKEN"]; then
-    token="-s $HF_TOKEN"
+if [ -z "$HF_TOKEN" ]; then
+    token=""
 else
-    token=" "
+    token="-s HF_TOKEN=$HF_TOKEN"
 fi
 
 act $token  --container-options "--runtime=nvidia --gpus device=$cuda_dev" --artifact-server-path /home/yoni/xGr/artifacts \

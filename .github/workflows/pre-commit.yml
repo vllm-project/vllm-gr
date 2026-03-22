@@ -22,13 +22,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'
 
       - uses: astral-sh/setup-uv@v1
+        with:
+          enable-cache: true
+
+      - name: Cache virtual environment
+        uses: actions/cache@v4
+        id: cache-venv
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
 
       - name: Create virtual environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
             uv venv --seed .venv
+
+      - name: Set up virtual environment
+        run: |
             echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
             echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
 
@@ -39,12 +51,26 @@ jobs:
           exit 1
 
       - name: Install dependencies
+        if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
+          # Install all dependencies and the package concurrently (fast)
           uv pip install .[dev]
+         
+      - name: Install vllm-gr
+        run: |
+          uv pip install --reinstall --no-deps .
 
      # - uses: pre-commit/action@v3.0.1
 
+      - name: Cache OpenOneRec dataset
+        uses: actions/cache@v4
+        id: cache-dataset
+        with:
+          path: OpenOneRec
+          key: dataset-openonerec-${{ runner.os }}
+
       - name: Download OpenOneRec dataset
+        if: steps.cache-dataset.outputs.cache-hit != 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -53,10 +79,10 @@ jobs:
             exit 1
           fi
           uv tool install hf
-          hf auth login --token "$HF_TOKEN" 
+          hf auth login --token "$HF_TOKEN"
           mkdir -p OpenOneRec
           hf download OpenOneRec/OpenOneRec-RecIF --local-dir ./OpenOneRec --repo-type=dataset
-          
+
 
       - name: Build Catalog
         run: |

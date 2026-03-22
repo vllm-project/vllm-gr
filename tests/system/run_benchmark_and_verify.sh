@@ -1,5 +1,7 @@
 #!/bin/bash
 run_port=7000
+timeout=600
+
 # Ensure we clean up the background server process if the script exits early
 trap 'kill -9 $SERVER_PID 2>/dev/null' EXIT
 
@@ -18,12 +20,12 @@ SERVER_PID=$!
 
 echo "Waiting for server to be ready on port $run_port..."
 # Check health/models endpoint until it responds
-if ! timeout 1200 bash -c "
+if ! timeout $timeout bash -c "
   until curl -s http://localhost:${run_port}/v1/models > /dev/null; do
     sleep 2
   done
 "; then
-  echo "Server failed to start within the timeout limit."
+  echo "Server failed to start within the timeout limit of $timeout seconds."
   exit 1
 fi
 echo "Server is ready! Running benchmark..."
