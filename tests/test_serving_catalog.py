@@ -17,7 +17,6 @@ try:
 except ImportError:
     from vllm.sampling_params import BeamSearchParams
 
-from typing import Any
 
 from transformers import AutoTokenizer
 from vllm.engine.arg_utils import AsyncEngineArgs

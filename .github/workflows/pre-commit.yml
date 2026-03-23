@@ -55,7 +55,7 @@ jobs:
         run: |
           # Install all dependencies and the package concurrently (fast)
           uv pip install .[dev]
-         
+
       - name: Install vllm-gr
         run: |
           uv pip install --reinstall --no-deps .
