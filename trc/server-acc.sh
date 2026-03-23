@@ -19,5 +19,6 @@ vllm serve --gr \
     --max_num_seqs 1024 \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
+    --attention-backend CUSTOM \
     --catalog-path /home/yoni/OpenOneRec/benchmark_data/catalog.json \
      OpenOneRec/OneRec-1.7B

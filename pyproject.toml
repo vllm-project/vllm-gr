@@ -41,7 +41,8 @@ dev = [
     "black",
     "ruff",
     "mypy",
-    "psutil"
+    "psutil",
+    "torch-c-dlpack-ext"
 ]
 
 [project.scripts]
