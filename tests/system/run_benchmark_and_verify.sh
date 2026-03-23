@@ -141,3 +141,5 @@ else
     echo "FAILURE: recall@32 ($recall_32) is less than $recall_32_th."
     exit 1
 fi
+
+exit 0
