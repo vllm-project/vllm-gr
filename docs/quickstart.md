@@ -59,8 +59,6 @@ To run vllm-gr in a server--client configuration, use two terminals
 
 ### On the first terminal: Run the server
 
-
-
 Use vllm serve with the plugin
 
 ```bash
