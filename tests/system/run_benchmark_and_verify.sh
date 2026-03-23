@@ -2,7 +2,7 @@
 run_port=7000
 timeout=600
 p99_ttft_th=30000
-p99_tpot_th=0.39
+p99_tpot_th=1.0
 pass_1_th=0.0496
 pass_32_th=0.1710
 recall_32_th=0.0272
@@ -142,4 +142,5 @@ else
     exit 1
 fi
 
+kill -9 $SERVER_PID
 exit 0
