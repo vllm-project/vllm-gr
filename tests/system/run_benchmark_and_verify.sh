@@ -14,6 +14,7 @@ vllm serve --gr \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
     --catalog-path "$CATALOG_PATH" \
+    --attention-backend CUSTOM \
     OpenOneRec/OneRec-1.7B &
 
 SERVER_PID=$!

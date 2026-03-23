@@ -68,13 +68,21 @@ function lock_gpu() {
     local mem_to_alloc_mb=4
 
     local python_cmd="
-import torch, time, sys
+import ctypes, time, sys
 try:
-    _ = torch.empty(${mem_to_alloc_mb} * 1024 * 1024 // 4, dtype=torch.float32, device='cuda:0')
+    cuda = ctypes.CDLL('libcuda.so.1')
+    if cuda.cuInit(0) != 0: raise Exception('cuInit failed')
+    dev = ctypes.c_int()
+    if cuda.cuDeviceGet(ctypes.byref(dev), 0) != 0: raise Exception('cuDeviceGet failed')
+    ctx = ctypes.c_void_p()
+    if cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev) != 0: raise Exception('cuCtxCreate failed')
+    ptr = ctypes.c_void_p()
+    size = ctypes.c_size_t(${mem_to_alloc_mb} * 1024 * 1024)
+    if cuda.cuMemAlloc_v2(ctypes.byref(ptr), size) != 0: raise Exception('cuMemAlloc failed')
     time.sleep(31536000) # Sleep for a year, waiting to be killed.
 except Exception as e:
     print(f'ERROR: Failed to lock GPU ${gpu_id}: {e}', file=sys.stderr)
-    exit(1)
+    sys.exit(1)
 "
     # The python process will print to stderr on failure.
     CUDA_VISIBLE_DEVICES=$gpu_id python -c "$python_cmd" > /dev/null 2>&1 &
