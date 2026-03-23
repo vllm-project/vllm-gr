@@ -7,7 +7,7 @@ pass_1_th=0.0496
 pass_32_th=0.1710
 recall_32_th=0.0272
 # Ensure we clean up the background server process if the script exits early
-trap 'kill -9 $SERVER_PID 2>/dev/null' EXIT
+trap 'kill $SERVER_PID 2>/dev/null; sleep 2; pkill -9 -f "VLLM::" 2>/dev/null || true' EXIT
 
 vllm serve --gr \
     --port $run_port \
@@ -142,5 +142,4 @@ else
     exit 1
 fi
 
-kill -9 $SERVER_PID
 exit 0
