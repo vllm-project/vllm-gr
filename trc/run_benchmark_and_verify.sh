@@ -81,3 +81,5 @@ else
     echo "FAILURE: P99 TTFT ($p99_ttft ms) is greater than or equal to 30000 ms."
     exit 1
 fi
+
+kill -9 $SERVER_PID 2>/dev/null
