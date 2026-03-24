@@ -7,7 +7,7 @@ pass_1_th=0.0496
 pass_32_th=0.1710
 recall_32_th=0.0272
 # Ensure we clean up the background server process if the script exits early
-trap 'kill $SERVER_PID 2>/dev/null; sleep 2; pkill -9 -f "VLLM::" 2>/dev/null || true' EXIT
+trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; sleep 2; pkill -P "$SERVER_PID" 2>/dev/null || true; fi' EXIT
 
 vllm serve --gr \
     --port $run_port \
@@ -91,7 +91,7 @@ fi
 
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
 --model OpenOneRec/OneRec-1.7B \
---dataset-path ./OpenOneRec/benchmark_data \
+--dataset-path "$DATASET_PATH" \
 --dataset-name  onerec \
 --num-prompts 100 \
 --use-beam-search \

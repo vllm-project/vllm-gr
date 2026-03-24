@@ -86,9 +86,8 @@ jobs:
             exit 1
           fi
           uv tool install hf
-          hf auth login --token "$HF_TOKEN"
           mkdir -p OpenOneRec
-          hf download OpenOneRec/OpenOneRec-RecIF --local-dir ./OpenOneRec --repo-type=dataset
+          hf download OpenOneRec/OpenOneRec-RecIF --token "$HF_TOKEN" --local-dir ./OpenOneRec --repo-type=dataset
 
 
       - name: Build Catalog
