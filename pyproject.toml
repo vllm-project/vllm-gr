@@ -43,6 +43,9 @@ dev = [
     "mypy",
     "psutil"
 ]
+lmcache = [
+    "lmcache==0.4.1"
+]
 
 [project.scripts]
 vllm = "vllm_gr.entrypoints.cli.main:main"

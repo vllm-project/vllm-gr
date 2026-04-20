@@ -5,6 +5,8 @@ ADD_BATCH and BEAM_FORK."""
 
 from __future__ import annotations
 
+import os
+
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
 
@@ -186,7 +188,22 @@ def _add_enum_member(name: str, value: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 
-def apply_engine_core_child_patches():
+def _is_lmcache_patch_enabled(vllm_config=None) -> bool:
+    if vllm_config is not None:
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        if kv_transfer_config is not None:
+            if getattr(kv_transfer_config, "kv_connector", None) == "LMCacheConnectorV1":
+                return True
+
+    return os.getenv("VLLM_GR_LMCACHE_PATCH", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+    )
+
+
+def apply_engine_core_child_patches(vllm_config=None):
     """Apply all patches inside the EngineCore child process.
 
     This must be called at the start of run_engine_core (the child process
@@ -227,6 +244,19 @@ def apply_engine_core_child_patches():
 
     # Apply worker patches (e.g., GPUModelRunner)
     apply_worker_patches()
+
+    # Apply LMCache patches
+    if _is_lmcache_patch_enabled(vllm_config):
+        try:
+            from vllm_gr.patch import patch_lmcache_adapter
+
+            patch_lmcache_adapter()
+            logger.debug("vllm_gr lmcache child patch applied in EngineCore process.")
+        except Exception as exc:
+            logger.warning(
+                "Unable to apply vllm_gr lmcache child patch in EngineCore: %s",
+                exc,
+            )
 
     logger.debug("Engine-core patches (ADD_BATCH, BEAM_FORK) applied in child process.")
 
@@ -309,7 +339,7 @@ def run_engine_core(*args, **kwargs):
     # Set re-entry guard and apply patches
     _run_engine_core_active = True
     try:
-        apply_engine_core_child_patches()
+        apply_engine_core_child_patches(kwargs.get("vllm_config"))
         original_run(*args, **kwargs)
     finally:
         _run_engine_core_active = False

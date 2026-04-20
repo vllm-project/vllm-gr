@@ -85,13 +85,17 @@ curl -X POST "http://localhost:8000/v1/chat/completions" -H "Content-Type: appli
         "content": "这是一个视频：<|sid_begin|><s_a_346><s_b_6566><s_c_5603><|sid_end|>，帮我总结一下这个视频讲述了什么内容"
       }
     ],
-    "use_beam_search": true,  
-    "n": 5,  
-    "temperature": 0.5,  
-    "max_tokens": 100,  
-    "ignore_eos": false,  
-    "length_penalty": 1.0  
+    "use_beam_search": true,
+    "n": 5,
+    "temperature": 0.5,
+    "max_tokens": 100,
+    "ignore_eos": false,
+    "length_penalty": 1.0
   }'
 ```
 
 Or use the [benchmark](benchmarks/README.md) to run a more complete benchmark test.
+
+### LMCache
+
+To run 'vllm serve --gr' with LMCache, please see [lmcache.md](lmcache.md)
