@@ -10,7 +10,6 @@ from vllm.beam_search import (
     BeamSearchInstance,
     BeamSearchOutput,
     BeamSearchSequence,
-    create_sort_beams_key_function,
 )
 from vllm.inputs import TextPrompt, TokensPrompt
 from vllm.logger import init_logger
@@ -19,6 +18,16 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 
 logger = init_logger(__name__)
+
+
+def create_tokens_prompt_from_beam(beam: BeamSearchSequence) -> TokensPrompt:
+    token_prompt_kwargs: TokensPrompt = {"prompt_token_ids": beam.tokens}
+    if beam.multi_modal_data is not None:
+        token_prompt_kwargs["multi_modal_data"] = beam.multi_modal_data
+
+    if beam.mm_processor_kwargs is not None:
+        token_prompt_kwargs["mm_processor_kwargs"] = beam.mm_processor_kwargs
+    return TokensPrompt(**token_prompt_kwargs)
 
 
 def beam_search(
@@ -48,7 +57,6 @@ def beam_search(
     max_tokens = params.max_tokens
     temperature = params.temperature
     ignore_eos = params.ignore_eos
-    length_penalty = params.length_penalty
     begin_token = params.begin_token if hasattr(params, "begin_token") else None
     end_token = params.end_token if hasattr(params, "end_token") else None
 
@@ -71,10 +79,6 @@ def beam_search(
                 f"end_token must be a valid token in the tokenizer vocabulary, got token {end_token}"
             )
             sid_end_token_id = None
-    sort_beams_key = create_sort_beams_key_function(
-        tokenizer.eos_token_id,
-        length_penalty,
-    )
 
     if use_tqdm and concurrency_limit is not None:
         logger.warning(
@@ -84,15 +88,6 @@ def beam_search(
 
     if concurrency_limit is None:
         concurrency_limit = len(prompts)
-
-    def create_tokens_prompt_from_beam(beam: BeamSearchSequence) -> TokensPrompt:
-        token_prompt_kwargs: TokensPrompt = {"prompt_token_ids": beam.tokens}
-        if beam.multi_modal_data is not None:
-            token_prompt_kwargs["multi_modal_data"] = beam.multi_modal_data
-
-        if beam.mm_processor_kwargs is not None:
-            token_prompt_kwargs["mm_processor_kwargs"] = beam.mm_processor_kwargs
-        return TokensPrompt(**token_prompt_kwargs)
 
     logprobs_num = beam_width
     # generate beam_width candidates at each step
@@ -130,14 +125,16 @@ def beam_search(
                 prompt_tokens.append(sid_begin_token_id)
                 initial_logprobs.append({sid_begin_token_id: Logprob(logprob=0.0)})
 
-        instances.append(
-            BeamSearchInstance(
-                prompt_tokens,
-                lora_request=lora_req,
-                logprobs=initial_logprobs,
-                **mm_kwargs,
-            ),
+        instance = BeamSearchInstance(
+            prompt_tokens,
+            lora_request=lora_req,
+            logprobs=initial_logprobs,
+            **mm_kwargs,
         )
+        instance.prompt_len = (
+            len(prompt_tokens) - 1 if sid_begin_token_id is not None else len(prompt_tokens)
+        )
+        instances.append(instance)
 
     pre_calc = 0 if sid_begin_token_id is None else 1
     if sid_end_token_id is not None:
@@ -185,6 +182,15 @@ def beam_search(
                 lora_request=lora_req_batch,
             )
 
+            valid_tokens_sets = []
+            has_catalog = getattr(self, "catalog", None) is not None
+            if has_catalog:
+                for instance in instances_batch:
+                    prompt_len = instance.prompt_len
+                    for beam in instance.beams:
+                        generated_tokens = beam.tokens[prompt_len:]
+                        valid_tokens_sets.append(self.catalog.valid(generated_tokens))
+
             for (start, end), instance in zip(instance_start_and_end, instances_batch):
                 # Gather all logprobs and cumulative scores for this instance
                 all_beams_token_id = []
@@ -198,6 +204,12 @@ def beam_search(
                         logprobs = result.outputs[0].logprobs[0]
                         if len(logprobs) > logprobs_num:
                             logprobs = dict(list(logprobs.items())[:logprobs_num])
+                        if has_catalog:
+                            valid_tokens_set = valid_tokens_sets[start + i]
+                            for token_id in list(logprobs.keys()):
+                                if token_id not in valid_tokens_set:
+                                    logprobs[token_id].logprob = -float("inf")
+
                         all_beams_token_id.extend(list(logprobs.keys()))
                         all_beams_logprob.extend(
                             [current_beam.cum_logprob + obj.logprob for obj in logprobs.values()]
@@ -272,7 +284,7 @@ def beam_search(
             for beam in instance.completed:
                 beam.tokens.append(sid_end_token_id)
                 beam.logprobs.append({sid_end_token_id: Logprob(logprob=0.0)})
-        sorted_completed = sorted(instance.completed, key=sort_beams_key, reverse=True)
+        sorted_completed = sorted(instance.completed, key=lambda x: x.cum_logprob, reverse=True)
         best_beams = sorted_completed[:beam_width]
 
         for beam in best_beams:

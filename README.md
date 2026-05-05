@@ -47,6 +47,9 @@ Visit the documentation pages to learn more
 * [`Quickstart`](docs/quickstart.md):
   Instructions for setting up vLLM-GR and an example showing how to run a GR workload with vLLM-GR enabled.
 
+* [`Quickstart-Ascend`](docs/quickstart-ascend.md):
+  Instructions for setting up vLLM-GR on Huawei Ascend NPU environnment
+
 * [`Benchmark`](docs/benchmarks/README.md):
   Performance results and methodology, including GR-focused benchmarks (e.g. Open One Rec).
 
