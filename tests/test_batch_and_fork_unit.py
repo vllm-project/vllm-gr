@@ -71,9 +71,11 @@ def _make_mock_request(
     num_prompt_tokens: int = 3,
 ) -> SimpleNamespace:
     """Create a lightweight mock that looks like vllm.v1.request.Request."""
+    tids = token_ids or [10, 20, 30]
     req = SimpleNamespace(
         request_id=request_id,
-        _all_token_ids=token_ids or [10, 20, 30],
+        prompt_token_ids=tids,
+        _all_token_ids=tids,
         block_hashes=list(block_hashes or []),
         eos_token_id=eos_token_id,
         lora_request=lora_request,
@@ -83,6 +85,29 @@ def _make_mock_request(
         num_prompt_tokens=num_prompt_tokens,
     )
     return req
+
+
+def _make_cache_entry(
+    token_ids: list[int] | None = None,
+    block_hashes: list[int] | None = None,
+    eos_token_id: int = 2,
+    lora_request: Any | None = None,
+    cache_salt: Any | None = None,
+    mm_features: Any | None = None,
+    prompt_embeds: Any | None = None,
+) -> tuple[Any, list[int]]:
+    """Create a ``(request_like, block_hashes)`` beam cache entry."""
+    return (
+        SimpleNamespace(
+            prompt_token_ids=token_ids or [10, 20, 30],
+            eos_token_id=eos_token_id,
+            lora_request=lora_request,
+            cache_salt=cache_salt,
+            mm_features=mm_features,
+            prompt_embeds=prompt_embeds,
+        ),
+        list(block_hashes or []),
+    )
 
 
 def _make_engine_self(
@@ -274,41 +299,30 @@ class TestBeamCache:
         )
         _cache_beam_request(eng, req)
 
-        cached = eng.beam_cache["r0"]
-        assert cached["all_token_ids"] == [10, 20, 30]
-        assert cached["block_hashes"] == [111, 222]
-        assert cached["eos_token_id"] == 2
-        assert cached["lora_request"] is None
-        assert cached["cache_salt"] == "salt"
-        assert cached["mm_features"] is None
-        assert cached["prompt_embeds"] is None
-        assert cached["num_prompt_tokens"] == 3
+        cached_req, cached_hashes = eng.beam_cache["r0"]
+        assert cached_req is req
+        assert cached_hashes == [111, 222]
+        # block_hashes snapshot is independent of the original
+        assert cached_hashes is not req.block_hashes
 
     # 3.2
     def test_cache_beam_request_overwrites(self) -> None:
         eng = _make_engine_self()
         req1 = _make_mock_request(request_id="r0", token_ids=[1, 2])
         _cache_beam_request(eng, req1)
-        assert eng.beam_cache["r0"]["all_token_ids"] == [1, 2]
+        cached_req1, _ = eng.beam_cache["r0"]
+        assert cached_req1 is req1
 
         req2 = _make_mock_request(request_id="r0", token_ids=[3, 4, 5])
         _cache_beam_request(eng, req2)
-        assert eng.beam_cache["r0"]["all_token_ids"] == [3, 4, 5]
+        cached_req2, _ = eng.beam_cache["r0"]
+        assert cached_req2 is req2
 
     # 3.3
     def test_handle_beam_fork_creates_children(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "p0": {
-                    "all_token_ids": [10, 20],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 2,
-                },
+                "p0": _make_cache_entry(token_ids=[10, 20], block_hashes=[]),
             }
         )
         fork = _make_fork_request(
@@ -316,18 +330,7 @@ class TestBeamCache:
             child_ids=["c0", "c1"],
             token_ids=[100, 200],
         )
-        with patch("vllm.v1.request.Request") as MockReq:
-            mock_child_0 = MagicMock()
-            mock_child_0.request_id = "c0"
-            mock_child_0.block_hashes = []
-            mock_child_0._all_token_ids = [10, 20, 100]
-            mock_child_1 = MagicMock()
-            mock_child_1.request_id = "c1"
-            mock_child_1.block_hashes = []
-            mock_child_1._all_token_ids = [10, 20, 200]
-            MockReq.side_effect = [mock_child_0, mock_child_1]
-
-            _handle_beam_fork(eng, fork)
+        _handle_beam_fork(eng, fork)
 
         # 2 items in the input queue.
         items = []
@@ -337,25 +340,28 @@ class TestBeamCache:
         assert items[0][0] == EngineCoreRequestType.ADD
         assert items[1][0] == EngineCoreRequestType.ADD
 
-        # Verify prompt_token_ids passed to Request().
-        calls = MockReq.call_args_list
-        assert calls[0].kwargs["prompt_token_ids"] == [10, 20, 100]
-        assert calls[1].kwargs["prompt_token_ids"] == [10, 20, 200]
+        req0 = items[0][1][0]  # (req, wave) tuple
+        req1 = items[1][1][0]
+
+        # Correct request IDs
+        assert req0.request_id == "c0"
+        assert req1.request_id == "c1"
+
+        # Correct prompt_token_ids
+        assert req0.prompt_token_ids == [10, 20, 100]
+        assert req1.prompt_token_ids == [10, 20, 200]
+
+        # Independence: mutable lists must not alias
+        assert req0._all_token_ids is not req1._all_token_ids
+        assert req0._output_token_ids is not req1._output_token_ids
+        assert req0.events is not req1.events
+        assert req0.spec_token_ids is not req1.spec_token_ids
 
     # 3.4
     def test_handle_beam_fork_clones_block_hashes(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "p0": {
-                    "all_token_ids": [10, 20],
-                    "block_hashes": [0xAA, 0xBB],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 2,
-                },
+                "p0": _make_cache_entry(token_ids=[10, 20], block_hashes=[0xAA, 0xBB]),
             }
         )
         fork = _make_fork_request(
@@ -372,27 +378,14 @@ class TestBeamCache:
 
             _handle_beam_fork(eng, fork)
 
-        # After fork, child's block_hashes should start with parent's.
-        mock_child.block_hashes = [0xAA, 0xBB]  # assigned by the function
-        # The function does: req.block_hashes = list(cached['block_hashes'])
-        # Verify the call set block_hashes.
-        # Since we mock, check the assignment happened via the call args.
+        # block_hasher=None always passed to skip O(N) hash in constructor.
         assert MockReq.call_args.kwargs["block_hasher"] is None
 
     # 3.5
     def test_handle_beam_fork_incremental_hash(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "p0": {
-                    "all_token_ids": [10, 20],
-                    "block_hashes": [0xAA],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 2,
-                },
+                "p0": _make_cache_entry(token_ids=[10, 20], block_hashes=[0xAA]),
             },
             block_hasher=MagicMock(return_value=[0xCC]),
         )
@@ -419,16 +412,7 @@ class TestBeamCache:
     def test_handle_beam_fork_no_hasher(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "p0": {
-                    "all_token_ids": [10, 20],
-                    "block_hashes": [0xAA],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 2,
-                },
+                "p0": _make_cache_entry(token_ids=[10, 20], block_hashes=[0xAA]),
             },
             block_hasher=None,
         )
@@ -455,16 +439,7 @@ class TestBeamCache:
     def test_handle_beam_fork_missing_parent(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "valid": {
-                    "all_token_ids": [10],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
+                "valid": _make_cache_entry(token_ids=[10], block_hashes=[]),
             }
         )
         fork = _make_fork_request(
@@ -506,26 +481,8 @@ class TestBeamCache:
     def test_handle_beam_fork_cleans_cache(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "A": {
-                    "all_token_ids": [1],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
-                "B": {
-                    "all_token_ids": [2],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
+                "A": _make_cache_entry(token_ids=[1], block_hashes=[]),
+                "B": _make_cache_entry(token_ids=[2], block_hashes=[]),
             }
         )
         fork = _make_fork_request(
@@ -552,16 +509,7 @@ class TestBeamCache:
     def test_handle_beam_fork_inherits_eos(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "p0": {
-                    "all_token_ids": [10],
-                    "block_hashes": [],
-                    "eos_token_id": 42,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
+                "p0": _make_cache_entry(token_ids=[10], block_hashes=[], eos_token_id=42),
             }
         )
         fork = _make_fork_request(
@@ -586,16 +534,7 @@ class TestBeamCache:
     def test_handle_beam_fork_overrides_eos(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "p0": {
-                    "all_token_ids": [10],
-                    "block_hashes": [],
-                    "eos_token_id": 42,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
+                "p0": _make_cache_entry(token_ids=[10], block_hashes=[], eos_token_id=42),
             }
         )
         fork = _make_fork_request(
@@ -619,16 +558,7 @@ class TestBeamCache:
     def test_handle_beam_fork_block_hasher_none(self) -> None:
         eng = _make_engine_self(
             beam_cache={
-                "p0": {
-                    "all_token_ids": [10],
-                    "block_hashes": [],
-                    "eos_token_id": 2,
-                    "lora_request": None,
-                    "cache_salt": None,
-                    "mm_features": None,
-                    "prompt_embeds": None,
-                    "num_prompt_tokens": 1,
-                },
+                "p0": _make_cache_entry(token_ids=[10], block_hashes=[]),
             }
         )
         fork = _make_fork_request(
