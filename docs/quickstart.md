@@ -96,6 +96,10 @@ curl -X POST "http://localhost:8000/v1/chat/completions" -H "Content-Type: appli
 
 Or use the [benchmark](benchmarks/README.md) to run a more complete benchmark test.
 
+### Data Parallelism
+
+To run 'vllm serve --gr' with data parallelism, please see [data_parallelism.md](data_parallelism.md)
+
 ### LMCache
 
 To run 'vllm serve --gr' with LMCache, please see [lmcache.md](lmcache.md)
