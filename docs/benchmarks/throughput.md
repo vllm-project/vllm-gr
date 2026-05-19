@@ -39,12 +39,13 @@ Run the server and client separately for a production‑style setup.
 
 ```bash
 
-  vllm-gr  serve OpenOneRec/OneRec-1.7B \
+  vllm serve OpenOneRec/OneRec-1.7B \
   --gr \
   --max-logprobs 1024 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
-  --max_num_seqs 1024 \
-  --max_num_batched_tokens 16384 \
+  --max-num-seqs 1024 \
+  --max-num-batched-tokens 16384 \
+  --attention-backend CUSTOM \
   --scheduling-policy priority
 ```
 
@@ -76,12 +77,6 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 | `--model`        | str  | -       | Model ID or path to load                                        |
 | `--max-logprobs` | int  | -       | Max log Probabilities output by model -- to support beam search |
 
-#### Core Arguments
-
-| Argument  | Type | Default | Description              |
-|-----------|------|---------|--------------------------|
-| `--model` | str  | -       | Model ID or path to load |
-
 #### Benchmark related parameters
 
 | Argument             | Type | Default | Description                                             |
@@ -108,10 +103,12 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 
 #### Arguments for Online benchmark
 
-| Argument     | Type | Default       | Description                                       |
-|--------------|------|---------------|---------------------------------------------------|
-| `--endpoint` | str  | -             | API endpoint URL for online benchmark             |
-| `--backend`  | str  | 'openai-chat' | Must be `openai-chat` for OneRec online benchmark |
+| Argument            | Type  | Default       | Description                                                                                      |
+|---------------------|-------|---------------|--------------------------------------------------------------------------------------------------|
+| `--endpoint`        | str   | -             | API endpoint URL for online benchmark                                                            |
+| `--backend`         | str   | 'openai-chat' | Must be `openai-chat` for OneRec online benchmark                                                |
+| `--max-concurrency` | int   | `None`        | Maximum number of concurrent requests; if not set, requests are sent as fast as possible         |
+| `--request-rate`    | float | `inf`         | Number of requests per second to send; `inf` means all requests are sent as soon as possible     |
 
 ## Expected Output
 

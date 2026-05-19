@@ -33,10 +33,13 @@ Run the server and client separately for a production‑style setup.
 #### Terminal 1 — Start the vLLM API server
 
 ```bash
-vllm serve \
+vllm serve OpenOneRec/OneRec-1.7B \
   --gr \
-  --model OpenOneRec/OneRec-1.7B \
   --max-logprobs 1024 \
+  --max-num-seqs 1024 \
+  --max-num-batched-tokens 16384 \
+  --scheduling-policy priority \
+  --attention-backend CUSTOM \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
 

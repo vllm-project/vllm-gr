@@ -11,12 +11,14 @@ refer to [quickstart.md](../../../docs/quickstart.md) for installation
 - Run vllm-gr server
 
 ```bash
-vllm serve --gr \
+vllm serve OpenOneRec/OneRec-1.7B \
+    --gr \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
-    --max-logprobs 2048 \
-    --max_num_seqs 1024 \
-    --max_num_batched_tokens 16384 \
-    OpenOneRec/OneRec-1.7B
+    --max-logprobs 1024 \
+    --max-num-seqs 1024 \
+    --max-num-batched-tokens 16384 \
+    --scheduling-policy priority \
+    --attention-backend CUSTOM
 ```
 
 run client (on another terminal)

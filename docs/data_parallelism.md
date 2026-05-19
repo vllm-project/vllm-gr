@@ -25,6 +25,7 @@ vllm serve --gr \
     --max_num_seqs 1024 \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
+    --attention-backend CUSTOM \
     OpenOneRec/OneRec-1.7B
 ```
 
@@ -39,6 +40,7 @@ vllm serve --gr \
     --max_num_seqs 1024 \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
+    --attention-backend CUSTOM \
     OpenOneRec/OneRec-1.7B
 ```
 

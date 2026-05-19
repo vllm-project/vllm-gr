@@ -45,6 +45,8 @@ Alternatively, for developer mode, run
 pip install -e .[dev]
 ```
 
+> **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
+
 4. **Verify installation**
 
 ```bash
@@ -62,11 +64,11 @@ To run vllm-gr in a server--client configuration, use two terminals
 Use vllm serve with the plugin
 
 ```bash
-vllm serve --gr \
-  --model OpenOneRec/OneRec-1.7B \
+vllm serve OpenOneRec/OneRec-1.7B \
+  --gr \
   --max-logprobs 1024 \
-  --max_num_seqs 1024 \
-  --max_num_batched_tokens 16384 \
+  --max-num-seqs 1024 \
+  --max-num-batched-tokens 16384 \
   --scheduling-policy priority \
   --attention-backend CUSTOM \
   --default-chat-template-kwargs '{"enable_thinking": false}'
@@ -88,9 +90,10 @@ curl -X POST "http://localhost:8000/v1/chat/completions" -H "Content-Type: appli
     "use_beam_search": true,
     "n": 5,
     "temperature": 0.5,
-    "max_tokens": 100,
+    "max_tokens": 5,
     "ignore_eos": false,
-    "length_penalty": 1.0
+    "length_penalty": 1.0,
+    "vllm_xargs": { "begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>" }
   }'
 ```
 

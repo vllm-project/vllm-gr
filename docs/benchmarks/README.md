@@ -86,14 +86,20 @@ For production-like testing with separate server and client:
 
 ```bash
 # On Terminal 1: Start vLLM API server
-  vllm-gr serve OpenOneRec/OneRec-1.7B \
+vllm serve OpenOneRec/OneRec-1.7B \
     --gr \
+    --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
-    --default-chat-template-kwargs '{"enable_thinking": false}'
+    --max-num-seqs 1024 \
+    --max-num-batched-tokens 16384 \
+    --scheduling-policy priority \
+    --attention-backend CUSTOM
+```
 
-
+```bash
 # On Terminal 2:
 # For throughput -- Run throughput benchmark against server
+
 python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --endpoint /v1/chat/completions \
   --backend openai-chat \
@@ -104,7 +110,11 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --num-prompts 100 \
   --use-beam-search \
   --n 128
+```
 
+Or
+
+```bash
 # For accuracy -- Run accuracy benchmark against server
 python -m benchmarks.open_one_rec.one_rec_acc_test \
   --endpoint /v1/chat/completions \
@@ -116,10 +126,6 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
   --num-prompts 100 \
   --result-dir results/acc_test_results
 
-```text
-Note, that for benchmark accuracy results, the test itself sets a default beam width
-
-**Best for**: Production-like testing, distributed deployment, load testing
 ```
 
 Note, that for benchmark accuracy results, the test itself sets a default beam width
