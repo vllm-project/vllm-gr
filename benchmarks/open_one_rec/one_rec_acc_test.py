@@ -162,7 +162,7 @@ def main():
         "--host", type=str, default="localhost", help="Host for OpenAI-compatible API"
     )
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--backend", default="openai-chat", help="Name of the backend to use.")
+    parser.add_argument("--backend", default=None, help="Name of the attention backend to use.")
     parser.add_argument(
         "--api-key", type=str, default="EMPTY", help="API Key for OpenAI-compatible API"
     )
@@ -179,7 +179,12 @@ def main():
         help="Directory to save debug evaluation files.",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug mode for evaluators.")
-
+    parser.add_argument(
+        "--catalog-path", type=str, default=None, help="Path to item validation (catalog) json file"
+    )
+    parser.add_argument(
+        "--concurrency-limit", type=int, default=None, help="maximum prompts to run concurrently"
+    )
     args = parser.parse_args()
 
     # 1. Load Configuration
@@ -225,6 +230,8 @@ def main():
                 model=args.model,
                 trust_remote_code=True,
                 max_logprobs=gen_config.get("num_beams", 1) * 2,
+                catalog_path=args.catalog_path if args.catalog_path is not None else None,
+                attention_config={"backend": args.backend} if args.backend is not None else None,
             )
         except Exception as e:
             logger.error(f"Failed to initialize vLLM: {e}")
@@ -255,10 +262,13 @@ def main():
 
     # 4. Run Inference
     logger.info("\nStarting Inference...")
-    gen_start = time.perf_counter()
+    gen_start = 0.0
+    gen_end = 0.0
     if args.endpoint:
+        gen_start = time.perf_counter()
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         outputs = run_api_inference(prompts, args.model, api_url, args.api_key, gen_config)
+        gen_end = time.perf_counter()
     else:
         params = BeamSearchParams(
             beam_width=gen_config["num_beams"],
@@ -270,8 +280,12 @@ def main():
             params.begin_token = "<|sid_begin|>"
             params.end_token = "<|sid_end|>"
         prompts_dict = [{"prompt": prompt} for prompt in prompts]
-
-        raw_offline_outputs = llm.beam_search(prompts_dict, params)
+        gen_start = time.perf_counter()
+        raw_offline_outputs = llm.beam_search(
+            prompts_dict, params, concurrency_limit=args.concurrency_limit
+        )
+        assert len(raw_offline_outputs) == len(prompts)
+        gen_end = time.perf_counter()
 
         # Normalize beam_search outputs to match MockRequestOutput format
         outputs = []
@@ -292,8 +306,6 @@ def main():
                 mock_completions.append(MockCompletionOutput(str(raw_output)))
 
             outputs.append(MockRequestOutput(prompts[i], mock_completions))
-
-    gen_end = time.perf_counter()
 
     # Print a sample output
     if outputs:
@@ -344,6 +356,7 @@ def main():
         debug=args.debug,
     )
     metrics, per_sample_metrics = evaluator.evaluate()
+    metrics["elapsed_time"] = gen_end - gen_start
 
     print(f"\n--- Evaluation Results for {args.task_type} on model {args.model} ---")
 

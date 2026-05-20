@@ -1,4 +1,5 @@
 #!/bin/bash
+set -x
 set -euo pipefail
 
 source "./tools/resource.sh"
@@ -23,14 +24,13 @@ trap 'echo "Unlocking GPU $idle_gpu (PID: $lock_pid)..."; unlock_gpu "$lock_pid"
 cuda_dev=$idle_gpu
 echo "running on device $cuda_dev"
 if [ -z "${HF_TOKEN:-}" ]; then
-    token=""
+    token=()
 else
     secret_file=$(mktemp)
     echo "HF_TOKEN=$HF_TOKEN" > "$secret_file"
-    token="--secret-file $secret_file"
+    token=("--secret-file" "$secret_file")
     # Update trap to also clean up the secret file
     trap 'rm -f "$secret_file"; echo "Unlocking GPU $idle_gpu (PID: $lock_pid)..."; unlock_gpu "$lock_pid"' EXIT
 fi
-
-act "$token" --container-options "--runtime=nvidia --gpus device=$cuda_dev" --artifact-server-path "${HOME}/artifacts" \
+act "${token[@]}"  --container-options "--runtime=nvidia --gpus device=$cuda_dev"  --env NVIDIA_DRIVER_CAPABILITIES=all --artifact-server-path "${HOME}"/artifacts \
 -P self-hosted=ghcr.io/catthehacker/ubuntu:act-latest

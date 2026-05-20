@@ -1,5 +1,14 @@
 #!/bin/bash
 
+run_port=7000
+timeout=600 # time for waiting server to go up
+p99_ttft_th=600
+p99_tpot_th=0.01
+pass_1_th=0.09
+pass_32_th=0.2
+recall_32_th=0.04
+elapsed_time_ol=70
+
 validate_metric() {
     local metric_name="$1"
     local metric_value="$2"
@@ -23,13 +32,54 @@ validate_metric() {
     fi
 }
 
-run_port=7000
-timeout=600 # time for waiting server to go up
-p99_ttft_th=600
-p99_tpot_th=0.01
-pass_1_th=0.09
-pass_32_th=0.2
-recall_32_th=0.04
+echo "offline test"
+
+output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+--gr \
+--model OpenOneRec/OneRec-1.7B \
+--dataset-path "$DATASET_PATH" \
+--dataset-name  onerec \
+--num-prompts 100 \
+--use-beam-search \
+--task-type video \
+--catalog-path "$CATALOG_PATH" \
+--n 128)
+
+echo "$output"
+
+pass_1=$(echo "$output" | grep -E '^[[:space:]]*"pass@1":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
+pass_32=$(echo "$output" | grep -E '^[[:space:]]*"pass@32":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
+recall_32=$(echo "$output" | grep -E '^[[:space:]]*"recall@32":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
+elaped_time=$(echo "$output" | grep -E '^[[:space:]]*"elapsed_time":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
+
+
+if [ -z "$pass_1" ] || [ -z "$pass_32" ] || [ -z "$recall_32" ] || [ -z "$elaped_time" ]; then
+    echo "Error: Could not extract accuracy metrics from the output."
+    exit 1
+fi
+
+echo "Parsed pass@1: $pass_1"
+echo "Parsed pass@32: $pass_32"
+echo "Parsed recall@32: $recall_32"
+echo "Parsed elapsed_time: $elaped_time"
+
+
+# Validate pass@1
+validate_metric "pass@1" "$pass_1" "$pass_1_th" "ge"
+
+# Validate pass@32
+validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
+
+# Validate recall@32
+validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
+
+# Validate elapsed_time
+validate_metric "elapsed_time" "$elaped_time" "$elapsed_time_ol" "le"
+
+
+# online tests
+
+
 # Ensure we clean up the background server process if the script exits early
 trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; sleep 2; pkill -P "$SERVER_PID" 2>/dev/null || true; fi' EXIT
 
@@ -93,7 +143,6 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
 
 echo "$output"
 
-
 # Extract P99 TTFT
 p99_ttft=$(echo "$output" | grep "P99 TTFT (ms):" | awk '{print $4}')
 p99_tpot=$(echo "$output" | grep "P99 TPOT (ms):" | awk '{print $4}')
@@ -152,5 +201,7 @@ validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
 
 # Validate recall@32
 validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
+
+
 
 exit 0
