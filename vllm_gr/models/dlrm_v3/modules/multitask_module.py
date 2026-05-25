@@ -2,6 +2,9 @@
 # Ported to vllm-GR with modifications.
 # Licensed under the Apache License, Version 2.0
 
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Multitask module for HSTU model.
 
 This fork keeps the inference-time prediction path and intentionally omits the

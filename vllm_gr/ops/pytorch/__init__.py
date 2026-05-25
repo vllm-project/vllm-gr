@@ -1,6 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Original code from Meta Platforms, Inc. (generative-recommenders)
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """PyTorch reference implementations of HSTU operators"""
 

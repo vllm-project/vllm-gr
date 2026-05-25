@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Re-export from new location for backward compatibility.
 from vllm_gr.inputs.hstu.schema import (
     attach_schema_fingerprint,

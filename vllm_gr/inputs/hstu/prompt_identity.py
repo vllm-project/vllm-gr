@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """HSTU prompt identity helpers for vLLM native prefix caching.
 
 This module lives near the input pipeline on purpose: it builds

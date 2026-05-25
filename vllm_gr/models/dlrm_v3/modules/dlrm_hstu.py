@@ -2,6 +2,9 @@
 # Ported to vllm-GR — restored to match original generative-recommenders interface.
 # Licensed under the Apache License, Version 2.0
 
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 DlrmHSTU Main Model Class
 
