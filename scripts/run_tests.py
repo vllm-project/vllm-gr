@@ -45,6 +45,10 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
             "test_output_contract.py",
             "test_positional_encoder_parity.py",
             "test_run_tests_script.py",
+            # vLLM runtime merge Phase 0/1
+            "runtime/test_runtime_selection.py",
+            "runtime/test_static_descriptors.py",
+            "tools/test_check_spdx_header.py",
             "test_hstu_attention_contract.py",
             "test_hstu_vllm_native_kv_contract.py",
             "test_hstu_prefix_cache_contract.py",
