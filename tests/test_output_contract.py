@@ -803,6 +803,7 @@ class TestOutputContract(unittest.TestCase):
             "vllm_gr.patch",
             "vllm_gr.config.hstu_vllm_registration",
             "vllm_gr.model_executor.models.registry",
+            "vllm_gr.runtime.activation",
         )
 
         fake_patch = types.ModuleType("vllm_gr.patch")
@@ -832,6 +833,7 @@ class TestOutputContract(unittest.TestCase):
                 "vllm_gr.patch",
                 "vllm_gr.config.hstu_vllm_registration",
                 "vllm_gr.model_executor.models.registry",
+                "vllm_gr.runtime.activation",
             )
             _restore_modules(saved)
 

@@ -48,6 +48,14 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
             # vLLM runtime merge Phase 0/1
             "runtime/test_runtime_selection.py",
             "runtime/test_static_descriptors.py",
+            # Phase 2 — plugin two-phase split
+            "runtime/test_patch_plan.py",
+            "runtime/test_activation.py",
+            "runtime/test_plugin_register_integration.py",
+            # Phase 2 — subprocess isolation tests (§9.2)
+            "native/test_import_hygiene.py",
+            "native/test_native_protection.py",
+            "hstu/test_hstu_patch_guard.py",
             "tools/test_check_spdx_header.py",
             "test_hstu_attention_contract.py",
             "test_hstu_vllm_native_kv_contract.py",

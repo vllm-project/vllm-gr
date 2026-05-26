@@ -20,6 +20,8 @@ class GRNPUWorker(NPUWorker):
         super().init_device()
 
         from vllm_gr.patch import re_apply_patches
+        # TODO(Phase 4): gate on propagated RuntimeSelection — only re-apply
+        # when the selection indicates gr_recommend or llm+gr_beam.
         re_apply_patches()
 
         from vllm_gr.worker.gr_npu_model_runner import GRNPUModelRunner

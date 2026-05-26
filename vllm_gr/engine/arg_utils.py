@@ -24,6 +24,104 @@ from vllm.platforms import current_platform
 logger = logging.getLogger(__name__)
 
 
+def _normalize_model_family_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def _read_local_config_dict(model: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not model or not os.path.isdir(model):
+        return None
+
+    config_path = os.path.join(model, "config.json")
+    if not os.path.exists(config_path):
+        return None
+
+    try:
+        with open(config_path, "r") as f:
+            return json.load(f)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read local model config at {config_path}: {exc}"
+        ) from exc
+
+
+def _read_model_type_from_hf_overrides(
+    hf_overrides: Optional[object],
+) -> Optional[str]:
+    if isinstance(hf_overrides, dict):
+        model_type = hf_overrides.get("model_type")
+        if isinstance(model_type, str):
+            return _normalize_model_family_value(model_type)
+    return None
+
+
+def _read_model_type_from_local_config(model: Optional[str]) -> Optional[str]:
+    config = _read_local_config_dict(model)
+    if config is None:
+        return None
+    model_type = config.get("model_type")
+    if isinstance(model_type, str):
+        return _normalize_model_family_value(model_type)
+    return None
+
+
+def resolve_model_family_from_inputs(
+    *,
+    model: Optional[str],
+    model_family: Optional[str] = None,
+    hf_overrides: Optional[object] = None,
+) -> Optional[str]:
+    """Resolve a GR model family before constructing vLLM EngineArgs."""
+    explicit = _normalize_model_family_value(model_family)
+    if explicit is not None:
+        return explicit
+
+    override_model_type = _read_model_type_from_hf_overrides(hf_overrides)
+    if override_model_type is not None:
+        return override_model_type
+
+    config_model_type = _read_model_type_from_local_config(model)
+    if config_model_type is not None:
+        return config_model_type
+
+    if not model:
+        # The in-repo no-path flow is still the current HSTU bootstrap path.
+        return "hstu"
+
+    return None
+
+
+def activate_gr_recommend_for_model(
+    *,
+    model: Optional[str],
+    model_family: Optional[str] = None,
+    hf_overrides: Optional[object] = None,
+) -> dict[str, int | bool]:
+    """Activate GR recommend for the resolved model family.
+
+    This keeps HSTU-specific activation out of entrypoint/runtime backbone
+    code: callers provide user inputs, and this resolver turns them into a
+    model_arch only when it can do so without asking vLLM to load config.
+    """
+    from vllm_gr.runtime.activation import activate_gr_recommend_runtime
+
+    model_arch = resolve_model_family_from_inputs(
+        model=model,
+        model_family=model_family,
+        hf_overrides=hf_overrides,
+    )
+    if model_arch is None:
+        raise ValueError(
+            "Unable to resolve GR model family before vLLM config loading. "
+            "Pass model_family='hstu' or use a local model directory whose "
+            "config.json declares a supported model_type."
+        )
+    return activate_gr_recommend_runtime(model_arch)
+
+
 class GRCommonEngineArgsMixin:
     """
     GR Engine Arguments - Inherits from vLLM EngineArgs.
@@ -113,42 +211,16 @@ class GRCommonEngineArgsMixin:
 
     @staticmethod
     def _normalize_model_family(value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        normalized = value.strip().lower()
-        return normalized or None
+        return _normalize_model_family_value(value)
 
     def _read_model_type_from_hf_overrides(self) -> Optional[str]:
-        if isinstance(self.hf_overrides, dict):
-            model_type = self.hf_overrides.get("model_type")
-            if isinstance(model_type, str):
-                return self._normalize_model_family(model_type)
-        return None
+        return _read_model_type_from_hf_overrides(self.hf_overrides)
 
     def _read_model_type_from_local_config(self) -> Optional[str]:
-        config = self._read_local_config_dict()
-        if config is None:
-            return None
-        model_type = config.get("model_type")
-        if isinstance(model_type, str):
-            return self._normalize_model_family(model_type)
-        return None
+        return _read_model_type_from_local_config(self.model)
 
     def _read_local_config_dict(self) -> Optional[Dict[str, Any]]:
-        if not self.model or not os.path.isdir(self.model):
-            return None
-
-        config_path = os.path.join(self.model, "config.json")
-        if not os.path.exists(config_path):
-            return None
-
-        try:
-            with open(config_path, "r") as f:
-                return json.load(f)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to read local model config at {config_path}: {exc}"
-            ) from exc
+        return _read_local_config_dict(self.model)
 
     def _resolve_model_family(self) -> Optional[str]:
         """Resolve the GR model family without assuming unknown == HSTU."""
@@ -241,14 +313,22 @@ class GRCommonEngineArgsMixin:
         """
         Create the vLLM engine config for GR models.
 
-        ``initialize_runtime`` must run in the current process before the base
-        vLLM engine config path so custom registrations and plugins are active.
-        Dataset overrides have already been merged into ``hf_overrides`` during
-        ``__post_init__``.
-        """
-        from vllm_gr.plugin import initialize_runtime
+        Phase 2: activation uses the new ``activate(PatchPlan)`` path.
+        ``register()`` handles subprocess activation via ENV propagation;
+        this is the explicit main-process activation point.
 
-        initialize_runtime()
+        Dataset overrides have already been merged into ``hf_overrides``
+        during ``__post_init__``.
+        """
+        # Phase 2: explicit main-process activation with gr_recommend.
+        # Phase 4+ will resolve the selection from CLI/API/ENV and
+        # propagate it to subprocesses via write_propagation_env().
+        activate_gr_recommend_for_model(
+            model=self.model,
+            model_family=self.model_family,
+            hf_overrides=self.hf_overrides,
+        )
+
         logger.info("Creating engine config for model: %s", self.model)
         return super().create_engine_config(
             usage_context=usage_context,

@@ -9,9 +9,12 @@ Top-level ``import vllm_gr`` is intentionally lightweight:
 - it does not register models/configs
 - it does not require NPU-specific dependencies
 
-Runtime initialization is performed explicitly by
-``vllm_gr.plugin.initialize_runtime()`` and by the vLLM general plugin entry
-point ``vllm_gr.plugin:register``.
+Runtime activation is performed exclusively by
+:func:`~vllm_gr.runtime.activation.activate`, called either by
+``GREngineArgs.create_engine_config()`` in the main process or via
+ENV-propagated ``RuntimeSelection`` in subprocesses (Phase 4).  The vLLM
+general plugin entry point ``vllm_gr.plugin:register`` performs only
+lightweight Layer 1 adapter metadata registration.
 """
 
 from importlib import import_module

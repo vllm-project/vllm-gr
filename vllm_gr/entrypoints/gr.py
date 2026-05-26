@@ -23,7 +23,7 @@ from vllm.pooling_params import PoolingParams
 
 from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
 from vllm_gr.outputs import GRRequestOutput
-from vllm_gr.engine.arg_utils import GREngineArgs
+from vllm_gr.engine.arg_utils import GREngineArgs, activate_gr_recommend_for_model
 from vllm_gr.engine.gr_engine import GRLLMEngine
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 
@@ -47,6 +47,14 @@ class GRLLM(LLM):
         gpu_memory_utilization: float = 0.9,
         **kwargs,
     ):
+        # Activate before constructing EngineArgs so model-specific AutoConfig
+        # mappings are available even if vLLM reads config during arg init.
+        activate_gr_recommend_for_model(
+            model=model,
+            model_family=model_family,
+            hf_overrides=kwargs.get("hf_overrides"),
+        )
+
         engine_args = GREngineArgs(
             model=model,
             model_family=model_family,

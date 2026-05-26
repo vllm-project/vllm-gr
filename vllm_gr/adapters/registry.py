@@ -14,7 +14,11 @@ Actual ``GRModelAdapter`` subclasses that import torch/torchrec.
 from __future__ import annotations
 
 import importlib
+import logging
+from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
+
+logger = logging.getLogger("vllm_gr.adapters.registry")
 
 if TYPE_CHECKING:
     from vllm_gr.adapters.base import GRModelAdapter
@@ -232,3 +236,37 @@ def _reset() -> None:
     """Clear all registrations.  Only for use in tests."""
     _FAMILY_ENTRIES.clear()
     _ADAPTER_CLASSES.clear()
+
+
+# ── Adapter discovery ───────────────────────────────────────────
+
+def register_adapter_layer1_only() -> None:
+    """Import adapter ``__init__.py`` files (Layer 1) without ``adapter.py``.
+
+    Scans ``vllm_gr/adapters/`` for sub-packages.  Each sub-package
+    ``__init__.py`` calls :func:`register_family` (pure Python, no heavy
+    imports).  The ``adapter.py`` (Layer 2, heavy) is *not* imported.
+    """
+    registered = get_registered_families()
+    adapters_dir = Path(__file__).resolve().parent
+
+    for entry in sorted(adapters_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name.startswith("_") or entry.name == "__pycache__":
+            continue
+        if not (entry / "__init__.py").exists():
+            continue
+        family = entry.name
+        if family in registered:
+            continue
+        try:
+            importlib.import_module(f"vllm_gr.adapters.{family}")
+        except ModuleNotFoundError as exc:
+            if exc.name == f"vllm_gr.adapters.{family}":
+                logger.debug(
+                    "Adapter package vllm_gr.adapters.%s not found, skipping",
+                    family,
+                )
+            else:
+                raise

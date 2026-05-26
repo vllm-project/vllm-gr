@@ -7,9 +7,16 @@ GR Model Registry.
 Registers GR-specific model architectures with vLLM's global ModelRegistry
 using the stable public API (ModelRegistry.register_model).
 
+Called during activation when the PatchPlan has ``needs_model_registry=True``
+(i.e. ``gr_recommend`` family).  In the main process this is triggered by
+``GREngineArgs.create_engine_config()``.
+
 Usage:
-    from vllm_gr.plugin import initialize_runtime
-    initialize_runtime()
+    from vllm_gr.runtime.patch_plan import build_patch_plan
+    from vllm_gr.runtime.activation import activate
+
+    plan = build_patch_plan(selection)
+    activate(plan)
 
     # Or manually:
     from vllm_gr.model_executor.models.registry import (

@@ -7,27 +7,34 @@ Registered via ``pyproject.toml`` under ``[project.entry-points."vllm.general_pl
 vLLM calls ``load_general_plugins()`` in every process (main, EngineCore subprocess,
 Worker subprocess), which discovers and executes this entry point.
 
-This module is the formal runtime initialization boundary for vllm-GR.
-It is responsible only for:
+Phase 2 — ``register()`` is metadata-only.  It registers Layer 1 adapter
+strings (pure Python, no heavy imports) and, if the environment variable
+``_VLLM_GR_RUNTIME_SELECTION`` is set (Phase 4 subprocess propagation),
+calls ``activate()`` with the deserialized selection.
 
-- applying GR monkey patches
-- registering GR config hooks
-- registering GR model architectures with vLLM
+Runtime activation (patches, config, model registry, adapter Layer 2)
+is performed exclusively by :func:`~vllm_gr.runtime.activation.activate`,
+called either:
+
+1. Explicitly by ``GREngineArgs.create_engine_config()`` in the main process.
+2. Via ENV propagation in subprocesses (Phase 4).
+
+``register()`` **never** performs activation in the absence of an explicit
+ENV signal — the native vLLM path remains zero-pollution.
 """
 
-from importlib import import_module
 import logging
+import os
+import warnings
+from importlib import import_module
+from pathlib import Path
+
+from vllm_gr.adapters.registry import register_adapter_layer1_only
 
 logger = logging.getLogger("vllm_gr.plugin")
 
 
-def register_gr_configs() -> bool:
-    """Register all GR config integrations with the active runtime."""
-    from vllm_gr.config.hstu_vllm_registration import (
-        ensure_hstu_config_registered,
-    )
-
-    return ensure_hstu_config_registered()
+# ── Adapter registration helpers ─────────────────────────────────
 
 
 def register_gr_model_architectures() -> bool:
@@ -45,23 +52,17 @@ def register_gr_model_architectures() -> bool:
 
 
 def _register_adapter_families() -> None:
-    """Discover and register all adapter families.
+    """Discover and register all adapter families (Layer 1 + Layer 2).
 
-    Scans ``vllm_gr.adapters`` for sub-packages.  Each sub-package
-    (e.g. ``hstu/``) should have:
-
-    - ``__init__.py`` calling ``register_family()`` (Layer 1, pure Python)
-    - ``adapter.py`` calling ``register_adapter_class()`` (Layer 2, heavy)
-
-    Adding a new model family requires only creating the adapter package
-    directory under ``vllm_gr/adapters/`` — no changes to this function.
+    Layer 1 delegates to
+    :func:`~vllm_gr.adapters.registry.register_adapter_layer1_only`.
+    Layer 2 scans for ``adapter.py`` in each adapter sub-package.
     """
-    from pathlib import Path
+    # Layer 1: import __init__.py files (pure Python metadata).
+    register_adapter_layer1_only()
 
-    from vllm_gr.adapters.registry import get_registered_families
-
+    # Layer 2: import adapter.py files (heavy, guarded by _ADAPTER_CLASSES).
     adapters_dir = Path(__file__).resolve().parent / "adapters"
-    registered = get_registered_families()
 
     for entry in sorted(adapters_dir.iterdir()):
         if not entry.is_dir():
@@ -71,68 +72,84 @@ def _register_adapter_families() -> None:
         if not (entry / "__init__.py").exists():
             continue
         family = entry.name
-        if family in registered:
-            continue
         try:
-            # Layer 1: register_family() in __init__.py (pure Python)
-            import_module(f"vllm_gr.adapters.{family}")
-            # Layer 2: register_adapter_class() in adapter.py (heavy)
             import_module(f"vllm_gr.adapters.{family}.adapter")
         except ModuleNotFoundError as exc:
-            # Only suppress if the adapter package itself is missing.
-            # If a transitive dependency is missing, exc.name will
-            # point to that dependency — let it propagate.
             adapter_module = f"vllm_gr.adapters.{family}.adapter"
             if exc.name in (f"vllm_gr.adapters.{family}", adapter_module):
                 logger.debug(
-                    "Adapter package vllm_gr.adapters.%s not found, skipping",
-                    family,
+                    "Adapter module %s not found, skipping",
+                    adapter_module,
                 )
             else:
                 raise
 
 
+# ── Deprecated backward-compat shim ──────────────────────────────
+
+
 def initialize_runtime() -> dict[str, int | bool]:
-    """Initialize the current process for vllm-GR runtime usage.
+    """Deprecated: use ``activate(build_patch_plan(selection))`` instead.
 
-    Safe to call repeatedly. The underlying patch and registration helpers are
-    idempotent, so this can be used both by the vLLM plugin loader and by
-    explicit engine startup paths in the main process.
+    Kept for backward compatibility.  Internally constructs a
+    ``gr_recommend`` PatchPlan and delegates to
+    :func:`~vllm_gr.runtime.activation.activate`.
     """
-    from vllm_gr.patch import re_apply_patches
-
-    patch_count = re_apply_patches()
-    config_registered = register_gr_configs()
-    models_registered = register_gr_model_architectures()
-
-    _register_adapter_families()
-
-    state = {
-        "patch_count": patch_count,
-        "config_registered": config_registered,
-        "models_registered": models_registered,
-    }
-    if not config_registered:
-        raise RuntimeError(
-            "vllm-GR runtime initialization failed: "
-            "HSTU config registration did not succeed"
-        )
-    if not models_registered:
-        raise RuntimeError(
-            "vllm-GR runtime initialization failed: "
-            "GR model architecture registration did not succeed"
-        )
-    logger.debug(
-        "vllm-GR runtime initialized: patches=%d, config_registered=%s, "
-        "models_registered=%s",
-        patch_count,
-        config_registered,
-        models_registered,
+    warnings.warn(
+        "initialize_runtime() is deprecated; "
+        "use activate() with an explicit PatchPlan",
+        DeprecationWarning,
+        stacklevel=2,
     )
-    return state
+    from vllm_gr.runtime.activation import activate
+    from vllm_gr.runtime.patch_plan import PatchPlan
+
+    plan = PatchPlan(
+        family="gr_recommend",
+        capabilities=frozenset(),
+        model_arch="hstu",
+        needs_core_patches=True,
+        needs_hstu_config=True,
+        needs_model_registry=True,
+        needs_adapter_layer2=True,
+    )
+    return activate(plan)
+
+
+# ── Plugin entry point ───────────────────────────────────────────
 
 
 def register() -> None:
-    """Entry point used by vLLM's general plugin loader."""
-    state = initialize_runtime()
-    logger.debug("vllm-GR plugin loaded (%d patches applied)", state["patch_count"])
+    """Entry point used by vLLM's general plugin loader.
+
+    Metadata-only: registers Layer 1 adapter strings (pure Python).
+    Does **not** apply patches, register configs, or import heavy
+    dependencies.  The native vLLM path remains zero-pollution.
+
+    If ``_VLLM_GR_RUNTIME_SELECTION`` is set in the environment
+    (Phase 4 subprocess propagation), deserializes the selection and
+    calls ``activate()``.  Otherwise does nothing beyond Layer 1.
+    """
+    register_adapter_layer1_only()
+
+    # Subprocess propagation (Phase 4): if the main process has written
+    # a serialized RuntimeSelection to the environment, deserialize and
+    # activate accordingly.
+    from vllm_gr._runtime_selection import (
+        ENV_PROPAGATION_RUNTIME_SELECTION,
+        RuntimeSelection,
+    )
+
+    serialized = os.environ.get(ENV_PROPAGATION_RUNTIME_SELECTION)
+    if serialized:
+        selection = RuntimeSelection.deserialize(serialized)
+        from vllm_gr.runtime.activation import activate
+        from vllm_gr.runtime.patch_plan import build_patch_plan
+
+        plan = build_patch_plan(selection)
+        state = activate(plan)
+        logger.debug(
+            "vllm-GR plugin activated from ENV: family=%s (%d patches)",
+            selection.family,
+            state.get("patch_count", 0),
+        )

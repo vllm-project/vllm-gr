@@ -20,7 +20,10 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.system_utils import decorate_logs
 
 from vllm_gr.config.gr_config import GRConfig
-from vllm_gr.engine.arg_utils import GRAsyncEngineArgs
+from vllm_gr.engine.arg_utils import (
+    GRAsyncEngineArgs,
+    activate_gr_recommend_for_model,
+)
 from vllm_gr.engine.async_gr_engine import GRAsyncLLM
 from vllm_gr.entrypoints.pooling import register_gr_pooling_api_routers
 from vllm_gr.entrypoints.pooling.recommend.serving import GRServingRecommendation
@@ -78,6 +81,11 @@ async def build_async_gr_engine_client(
     disable_frontend_multiprocessing: bool | None = None,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
+    activate_gr_recommend_for_model(
+        model=getattr(args, "model", None),
+        model_family=getattr(args, "model_family", None),
+        hf_overrides=getattr(args, "hf_overrides", None),
+    )
     engine_args = GRAsyncEngineArgs.from_cli_args(args)
     _apply_client_process_config(engine_args, client_config)
 
@@ -103,6 +111,11 @@ async def build_async_gr_engine_client_from_engine_args(
     disable_frontend_multiprocessing: bool = False,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
+    activate_gr_recommend_for_model(
+        model=engine_args.model,
+        model_family=engine_args.model_family,
+        hf_overrides=engine_args.hf_overrides,
+    )
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
     gr_config = GRConfig(
         max_seq_len=engine_args.max_seq_len,

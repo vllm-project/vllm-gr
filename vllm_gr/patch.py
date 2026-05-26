@@ -9,17 +9,19 @@ Replaces vLLM's core types with GR-extended variants in all loaded modules:
   - Request → GRRequest
   - NewRequestData → GRNewRequestData
 
-Activation:
-  Primary — vLLM plugin system.  ``vllm_gr.plugin:register`` is registered
-  under ``[project.entry-points."vllm.general_plugins"]`` in pyproject.toml.
-  ``load_general_plugins()`` calls it in every process (main, EngineCore
-  subprocess, Worker subprocess) *before* any MsgpackDecoder is created.
+Activation is controlled by :func:`~vllm_gr.runtime.activation.activate`,
+which is called:
 
-  Explicit main-process init — ``vllm_gr.plugin.initialize_runtime()`` is
-  called by ``GREngineArgs.create_engine_config()`` before engine creation.
+1. By ``GREngineArgs.create_engine_config()`` in the main process (after
+   the user has selected a GR model family).
+2. Via ENV-propagated ``RuntimeSelection`` in subprocesses (Phase 4).
 
-  Defense-in-depth — ``GRWorker.init_device()`` calls ``re_apply_patches()``
-  to cover modules loaded after the initial plugin execution.
+The vLLM plugin entry point ``vllm_gr.plugin:register`` performs only
+lightweight Layer 1 adapter registration and does **not** apply patches
+unless the ENV propagation signal is present.
+
+Defense-in-depth — ``GRWorker.init_device()`` calls ``re_apply_patches()``
+to cover modules loaded after the initial activation.
 
 Safety features:
   - Source modules (vllm.v1.request, etc.) are patched first so that any
