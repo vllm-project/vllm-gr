@@ -29,6 +29,11 @@ _PUBLIC_EXPORTS: dict[str, tuple[str, str, bool]] = {
 }
 
 _COMPAT_EXPORTS: dict[str, tuple[str, str, bool]] = {
+    "BeamAttentionBackend": (
+        "vllm_gr.v1.attention.backends.beam_attn",
+        "BeamAttentionBackend",
+        False,
+    ),
     "HSTUConfig": ("vllm_gr.config.hstu_config", "HSTUConfig", False),
     "ensure_hstu_config_registered": (
         "vllm_gr.config.hstu_vllm_registration",

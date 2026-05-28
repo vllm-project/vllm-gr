@@ -321,6 +321,160 @@ def _apply_yuanrong_npu_patch(force: bool = False) -> int:
 
 
 _KV_MERGE_PATCHES_APPLIED = False
+_GR_BEAM_PATCHES_APPLIED = False
+
+
+def _apply_gr_beam_patches(force: bool = False) -> int:
+    """Apply beam-search related patches from vllm-gr.
+
+    These patches are independent from the GR core type replacement patches
+    and can be safely applied alongside them.
+    """
+    global _GR_BEAM_PATCHES_APPLIED
+
+    if _GR_BEAM_PATCHES_APPLIED and not force:
+        return 0
+
+    patch_count = 0
+
+    try:
+        from vllm_gr.logprobs_patch import patch_flat_logprobs
+        patch_flat_logprobs()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_flat_logprobs")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_flat_logprobs: %s", exc)
+
+    try:
+        from vllm_gr.entrypoints.openai.beam_search_patch import (
+            patch_beam_search,
+            patch_sampling,
+        )
+        patch_beam_search()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_beam_search")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_beam_search: %s", exc)
+
+    try:
+        from vllm_gr.entrypoints.openai.beam_search_patch import patch_sampling
+        patch_sampling()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_sampling")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_sampling: %s", exc)
+
+    try:
+        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+        patch_add_cli_args()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_add_cli_args")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_add_cli_args: %s", exc)
+
+    try:
+        from vllm_gr.entrypoints.openai.serving_models import (
+            patch_OpenAIServingModels_init,
+        )
+        patch_OpenAIServingModels_init()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_OpenAIServingModels_init")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_OpenAIServingModels_init: %s", exc)
+
+    try:
+        from vllm_gr.entrypoints.beam_search_patch import patch_offline_beam_search
+        patch_offline_beam_search()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_offline_beam_search")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_offline_beam_search: %s", exc)
+
+    try:
+        from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
+        patch_batch_and_fork()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_batch_and_fork")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_batch_and_fork: %s", exc)
+
+    # Optional: LMCache adapter patch
+    try:
+        import importlib.util
+        from pathlib import Path
+
+        adapter_path = (
+            Path(__file__).resolve().parent
+            / "3rd_party"
+            / "lmcache"
+            / "integration"
+            / "vllm"
+            / "vllm_v1_adapter.py"
+        )
+        if adapter_path.exists():
+            import os
+            import sys
+
+            should_patch = False
+            if os.getenv("VLLM_GR_LMCACHE_PATCH", "").lower() in (
+                "1", "true", "yes", "y",
+            ):
+                should_patch = True
+            elif any("LMCacheConnectorV1" in arg for arg in sys.argv):
+                should_patch = True
+
+            if should_patch:
+                spec = importlib.util.spec_from_file_location(
+                    "vllm_gr_3rd_party_lmcache_integration_vllm_v1_adapter",
+                    adapter_path,
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                module.patch_installed_lmcache_adapter()
+                patch_count += 1
+                logger.debug("vllm_gr: Applied LMCache adapter patch")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping LMCache adapter patch: %s", exc)
+
+    _GR_BEAM_PATCHES_APPLIED = True
+
+    if patch_count > 0:
+        logger.info(
+            "vllm_gr: Applied %d beam-search monkey patch(es)",
+            patch_count,
+        )
+    return patch_count
+
+
+def patch_lmcache_adapter():
+    """Apply LMCache adapter patch.
+
+    Public helper used by engine_core_patch.py in child processes where
+    only the LMCache monkey patch must be installed, without re-running
+    the full patch sequence.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    module_path = (
+        Path(__file__).resolve().parent
+        / "3rd_party"
+        / "lmcache"
+        / "integration"
+        / "vllm"
+        / "vllm_v1_adapter.py"
+    )
+    if not module_path.exists():
+        return
+    spec = importlib.util.spec_from_file_location(
+        "vllm_gr_3rd_party_lmcache_integration_vllm_v1_adapter",
+        module_path,
+    )
+    if spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.patch_installed_lmcache_adapter()
 
 
 def _apply_kv_merge_patch(force: bool = False) -> int:
@@ -549,7 +703,8 @@ def _apply_patches(force: bool = False) -> int:
     core_count = _apply_gr_core_patches(force=force)
     yuanrong_count = _apply_yuanrong_npu_patch(force=force)
     kv_merge_count = _apply_kv_merge_patch(force=force)
-    return core_count + yuanrong_count + kv_merge_count
+    beam_count = _apply_gr_beam_patches(force=force)
+    return core_count + yuanrong_count + kv_merge_count + beam_count
 
 
 def verify_patches() -> list[str]:
