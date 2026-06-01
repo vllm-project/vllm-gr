@@ -34,7 +34,7 @@ vllm serve \
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
-vllm serve --gr \
+vllm serve \
     --port 9002 \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \

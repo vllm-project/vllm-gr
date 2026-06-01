@@ -39,7 +39,6 @@ python benchmarks/open_one_rec/tools/convert_catalog.py \
 
 ```bash
  vllm serve OpenOneRec/OneRec-1.7B \
-    --gr \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \

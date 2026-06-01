@@ -8,11 +8,10 @@ refer to [quickstart.md](../../../docs/quickstart.md) for installation
 
 - This example demonstrates using vllm-gr for executing generative recommendation system based OneRec-1.7B model
 
-- Run vllm-gr server
+- Run server (beam search patches are auto-loaded via plugin)
 
 ```bash
 vllm serve OpenOneRec/OneRec-1.7B \
-    --gr \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \
@@ -39,14 +38,7 @@ bash ./client.sh [-b beam_width ]
 ./client.sh -b 512  
 ```
 
-Server without --gr flag
-
-```json
-{"id":"chatcmpl-8b52e35966c0f8a1","object":"chat.completion","created":1770557950,"model":"OpenOneRec/OneRec-1.7B","choices":[{"index":0,"message":{"role":"assistant","content":"<|sid_begin|><s_a_6240><s_b_101><s_c_3136><|sid_end|>","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":[],"reasoning":null,"reasoning_content":null},"logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null}...{"index":511...}}
-total time:16.198407s
-```
-
-Server with --gr flag
+Results of vllm-gr looks like this
 
 ```json
 {"id":"chatcmpl-a779679c38e57685","object":"chat.completion","created":1770297709,"model":"OpenOneRec/OneRec-1.7B","choices":
