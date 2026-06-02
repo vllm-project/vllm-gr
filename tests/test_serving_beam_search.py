@@ -29,8 +29,8 @@ from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingM
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 
-if not torch.cuda.is_available():
-    pytest.skip("CUDA is not available", allow_module_level=True)
+if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is_available()):
+    pytest.skip("GPU/NPU is not available", allow_module_level=True)
 
 
 async def beam_search_test(loops: int) -> None:
@@ -120,14 +120,17 @@ def _run_gr_beam_search_target(loops: int) -> None:
     assert hasattr(BeamSearchParams, "begin_token")
 
     async def run_test() -> None:
+        device = torch.cuda
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            device = torch.npu
         await beam_search_test(loops)
-        torch.cuda.synchronize()
-        before_gpu_mem: int = torch.cuda.memory_allocated()
+        device.synchronize()
+        before_gpu_mem: int = device.memory_allocated()
         before_host_mem: int = psutil.Process().memory_info().rss
         await beam_search_test(loops)
         await beam_search_test(loops)
-        torch.cuda.synchronize()
-        after_gpu_mem: int = torch.cuda.memory_allocated()
+        device.synchronize()
+        after_gpu_mem: int = device.memory_allocated()
         after_host_mem: int = psutil.Process().memory_info().rss
         print(
             f"before host mem={before_host_mem / 1024**3:.2f}GB, after host mem={after_host_mem / 1024**3:.2f}GB"
