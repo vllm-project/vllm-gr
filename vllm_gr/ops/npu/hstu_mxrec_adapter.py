@@ -1,4 +1,5 @@
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -236,8 +237,7 @@ def can_run_hstu_jagged(
         return False
     if q.device.type != "npu" or k.device.type != "npu" or v.device.type != "npu":
         logger.warning(
-            "[HSTU] mxrec.hstu_jagged skipped: q/k/v must be on NPU, "
-            "got q=%s k=%s v=%s",
+            "[HSTU] mxrec.hstu_jagged skipped: q/k/v must be on NPU, got q=%s k=%s v=%s",
             q.device,
             k.device,
             v.device,
@@ -309,7 +309,10 @@ def run_hstu_jagged(
 
     logger.debug(
         "[HSTU] Calling mxrec.hstu_jagged: batch=%d max_seq=%d alpha=%.4f mask_type=%d",
-        batch_size, max_seq_len, alpha, mask_type,
+        batch_size,
+        max_seq_len,
+        alpha,
+        mask_type,
     )
 
     return torch.ops.mxrec.hstu_jagged(
@@ -327,4 +330,3 @@ def run_hstu_jagged(
         int(target_group_size),
         float(alpha),
     )
-

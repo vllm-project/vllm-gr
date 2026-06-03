@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Layer bridge that exposes HSTU attention to vLLM KV cache runtime."""
 
@@ -9,7 +9,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
@@ -27,7 +26,7 @@ from vllm_gr.model_executor.kv_cache_utils import (
 )
 
 
-class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):
+class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):  # type: ignore[misc]
     """Thin bridge so vLLM can discover and bind HSTU KV cache specs."""
 
     def __init__(
@@ -47,7 +46,7 @@ class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):
         self.num_kv_heads = num_heads
         self.head_size = head_size
         self.head_size_v = head_size_v
-        self.scale = head_size ** -0.5
+        self.scale = head_size**-0.5
         self.attn_type = AttentionType.DECODER
         self.kv_cache_torch_dtype = _resolve_torch_dtype(dtype)
         self.enable_kv_cache = enable_kv_cache
@@ -69,7 +68,7 @@ class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         HSTUAttentionBackend.set_head_size_v(self.head_size_v)
-        return HSTUAttentionBackend
+        return HSTUAttentionBackend  # type: ignore[no-any-return]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         if not self.enable_kv_cache:

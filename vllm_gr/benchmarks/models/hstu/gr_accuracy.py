@@ -1,16 +1,16 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Offline HSTU GR accuracy benchmark runner for vllm-GR."""
 
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 import json
 import logging
-from pathlib import Path
 import sys
+from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from tqdm.auto import tqdm
@@ -75,8 +75,7 @@ def build_accuracy_records(
     )
     if len(ordered_outputs) != len(requests):
         raise ValueError(
-            f"Output count mismatch: got {len(ordered_outputs)}, "
-            f"expected {len(requests)}"
+            f"Output count mismatch: got {len(ordered_outputs)}, expected {len(requests)}"
         )
 
     records: list[dict[str, Any]] = []
@@ -106,9 +105,7 @@ def summarize_gr_accuracy_records(
 ) -> dict[str, Any]:
     """Aggregate per-request records into benchmark summary metrics."""
     if dataset_name is not None:
-        records = [
-            record for record in records if record["dataset_name"] == dataset_name
-        ]
+        records = [record for record in records if record["dataset_name"] == dataset_name]
     if not records:
         raise ValueError("No accuracy records found.")
 
@@ -177,10 +174,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dataset-candidate-count must be > 0")
     if args.max_candidates is not None and args.max_candidates <= 0:
         raise ValueError("--max-candidates must be > 0 when provided")
-    if (
-        args.max_candidates is not None
-        and args.max_candidates < args.dataset_candidate_count
-    ):
+    if args.max_candidates is not None and args.max_candidates < args.dataset_candidate_count:
         raise ValueError(
             "--max-candidates must be >= --dataset-candidate-count: "
             f"{args.max_candidates} < {args.dataset_candidate_count}"
@@ -233,10 +227,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--max-candidates",
         type=int,
         default=5,
-        help=(
-            "Runtime GR candidate limit passed to GRLLM. Must be >= "
-            "--dataset-candidate-count."
-        ),
+        help=("Runtime GR candidate limit passed to GRLLM. Must be >= --dataset-candidate-count."),
     )
     parser.add_argument(
         "--disable-shuffle",

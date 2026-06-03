@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Engine arguments for generative recommendation.
@@ -11,12 +11,12 @@ contract intact.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Any, Dict
-import os
-import json
 import glob
+import json
 import logging
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.platforms import current_platform
@@ -27,30 +27,30 @@ logger = logging.getLogger(__name__)
 class GRCommonEngineArgsMixin:
     """
     GR Engine Arguments - Inherits from vLLM EngineArgs.
-    
+
     Extends vLLM's EngineArgs with GR-specific parameters while maintaining
     full compatibility with vLLM's configuration system.
-    
+
     Inherited from EngineArgs (commonly used):
         model: Model name or path
         tensor_parallel_size: Tensor parallelism degree
         gpu_memory_utilization: GPU memory utilization fraction
         disable_log_stats: Whether to disable logging statistics
         max_model_len: Maximum scheduler-visible model length
-        
+
     GR-specific parameters:
         max_seq_len: Maximum user history sequence length
         max_candidates: Maximum number of candidate items
-    
+
     Feature names (uih, candidate, primary_id, task_names) are read
     directly from HSTUConfig (hf_config), which is the single source of
     truth.  Override via hf_overrides or config.json, not here.
-    
+
     Model architecture parameters (num_layers, embedding_dim, etc.) live in
     config.json / HSTUConfig and are loaded via hf_config, following vLLM's
     convention.  They are NOT duplicated here.
     """
-    
+
     # GR-specific: Sequence configuration
     max_seq_len: int = 512
     max_candidates: int = 1000
@@ -58,7 +58,7 @@ class GRCommonEngineArgsMixin:
     # GR-specific: HSTU NPU fused runtime policy
     enable_npu_fused_prefill: Optional[bool] = None
     force_hammer_npu: Optional[bool] = None
-    
+
     # GR-specific: Dataset identifier (drives config overrides)
     dataset: Optional[str] = None
 
@@ -107,7 +107,10 @@ class GRCommonEngineArgsMixin:
             return False
 
         hf_patterns = [
-            "*.safetensors", "*.bin", "*.pt", "*.pth",
+            "*.safetensors",
+            "*.bin",
+            "*.pt",
+            "*.pth",
         ]
         for pattern in hf_patterns:
             if glob.glob(os.path.join(self.model, pattern)):
@@ -200,6 +203,7 @@ class GRCommonEngineArgsMixin:
             return
 
         import importlib
+
         target = f"vllm_gr.adapters.{model_family}"
         try:
             importlib.import_module(target)
@@ -223,8 +227,8 @@ class GRCommonEngineArgsMixin:
             return
 
         from vllm_gr.config.dataset_configs import (
-            get_hstu_config_overrides,
             get_embedding_table_overrides,
+            get_hstu_config_overrides,
         )
 
         overrides = get_hstu_config_overrides(self.dataset)
@@ -238,7 +242,7 @@ class GRCommonEngineArgsMixin:
             self.hf_overrides = merged
         elif self.hf_overrides is None:
             self.hf_overrides = overrides
-    
+
         logger.info("Applied dataset=%s overrides via hf_overrides", self.dataset)
 
     def create_engine_config(self, usage_context=None, headless: bool = False):

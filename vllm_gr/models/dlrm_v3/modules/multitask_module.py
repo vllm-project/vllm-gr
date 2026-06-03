@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """Multitask module for HSTU model.
 
@@ -11,17 +12,18 @@ parity is out of scope for the inference-only recommendation runtime.
 
 import abc
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from vllm_gr.logger import init_logger
 from vllm_gr.config.multitask_types import MultitaskTaskType
+from vllm_gr.logger import init_logger
 from vllm_gr.models.dlrm_v3.common import HammerModule
 
 logger = init_logger(__name__)
+
 
 @dataclass
 class TaskConfig:
@@ -32,7 +34,7 @@ class TaskConfig:
 
 class MultitaskModule(HammerModule):
     """Abstract base class for multitask modules."""
-    
+
     @abc.abstractmethod
     def forward(
         self,
@@ -54,15 +56,15 @@ def _compute_pred_and_logits(
     """Compute predictions and logits for all tasks."""
     mt_logits = prediction_module(encoded_user_embeddings * item_embeddings).transpose(0, 1)
     mt_preds_list: List[torch.Tensor] = []
-    
+
     for task_type in MultitaskTaskType:
-        logits = mt_logits[task_offsets[task_type]:task_offsets[task_type + 1], :]
+        logits = mt_logits[task_offsets[task_type] : task_offsets[task_type + 1], :]
         if task_offsets[task_type + 1] - task_offsets[task_type] > 0:
             if task_type == MultitaskTaskType.REGRESSION:
                 mt_preds_list.append(logits)
             else:
                 mt_preds_list.append(F.sigmoid(logits))
-    
+
     if has_multiple_task_types:
         mt_preds: torch.Tensor = torch.concat(mt_preds_list, dim=0)
     else:
@@ -77,7 +79,7 @@ class DefaultMultitaskModule(MultitaskModule):
     Only prediction tensors are produced. Training labels, weights, and losses
     are not materialized in this inference-oriented fork.
     """
-    
+
     def __init__(
         self,
         task_configs: List[TaskConfig],
@@ -86,17 +88,18 @@ class DefaultMultitaskModule(MultitaskModule):
         causal_multitask_weights: float,
     ) -> None:
         super().__init__()
-        
-        assert sorted(task_configs, key=lambda x: x.task_type) == task_configs, \
+
+        assert sorted(task_configs, key=lambda x: x.task_type) == task_configs, (
             "task_configs must be sorted by task_type."
+        )
         assert len(task_configs) > 0, "task_configs must be non-empty."
-        
+
         self._task_configs: List[TaskConfig] = task_configs
         self._task_offsets: List[int] = [0] * (len(MultitaskTaskType) + 1)
-        
+
         for task in self._task_configs:
             self._task_offsets[task.task_type + 1] += 1
-        
+
         self._has_multiple_task_types: bool = self._task_offsets.count(0) < len(MultitaskTaskType)
         self._task_offsets[1:] = np.cumsum(self._task_offsets[1:]).tolist()
         self._causal_multitask_weights: float = causal_multitask_weights
@@ -107,7 +110,6 @@ class DefaultMultitaskModule(MultitaskModule):
         encoded_user_embeddings: torch.Tensor,
         item_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-
         mt_preds, mt_logits = _compute_pred_and_logits(
             prediction_module=self._prediction_module,
             encoded_user_embeddings=encoded_user_embeddings,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Minimal Yuanrong datasystem smoke test for NPU D2H/H2D KV transfer.
 
@@ -26,7 +26,6 @@ import time
 from pathlib import Path
 
 import torch
-
 from runtime_utils import add_repo_root_to_path, add_runtime_args, describe_runtime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -98,9 +97,7 @@ def _resolve_worker_addr(cli_value: str | None) -> str:
 
 def _split_host_port(worker_addr: str) -> tuple[str, int]:
     if ":" not in worker_addr:
-        raise ValueError(
-            f"Invalid worker address {worker_addr!r}. Expected host:port format."
-        )
+        raise ValueError(f"Invalid worker address {worker_addr!r}. Expected host:port format.")
     host, port = worker_addr.rsplit(":", 1)
     return host, int(port)
 
@@ -118,19 +115,10 @@ def _torch_dtype(name: str) -> torch.dtype:
 def _print_environment(worker_addr: str) -> None:
     print("\n[Environment]")
     print(f"   worker_addr={worker_addr or '<unset>'}")
-    print(
-        "   YUANRONG_DS_WORKER_ADDR="
-        f"{os.getenv('YUANRONG_DS_WORKER_ADDR', '<unset>')}"
-    )
+    print(f"   YUANRONG_DS_WORKER_ADDR={os.getenv('YUANRONG_DS_WORKER_ADDR', '<unset>')}")
     print(f"   DS_WORKER_ADDR={os.getenv('DS_WORKER_ADDR', '<unset>')}")
-    print(
-        "   DS_ENABLE_EXCLUSIVE_CONNECTION="
-        f"{os.getenv('DS_ENABLE_EXCLUSIVE_CONNECTION', '0')}"
-    )
-    print(
-        "   DS_ENABLE_REMOTE_H2D="
-        f"{os.getenv('DS_ENABLE_REMOTE_H2D', '0')}"
-    )
+    print(f"   DS_ENABLE_EXCLUSIVE_CONNECTION={os.getenv('DS_ENABLE_EXCLUSIVE_CONNECTION', '0')}")
+    print(f"   DS_ENABLE_REMOTE_H2D={os.getenv('DS_ENABLE_REMOTE_H2D', '0')}")
 
 
 def _find_packaged_acl_plugin() -> str:
@@ -164,15 +152,17 @@ def main() -> int:
 
     _print_environment(worker_addr)
 
-    from yr.datasystem.hetero_client import Blob, DeviceBlobList, HeteroClient  # type: ignore
+    import acl  # type: ignore
+    from yr.datasystem.hetero_client import (  # type: ignore
+        Blob,
+        DeviceBlobList,
+        HeteroClient,
+    )
     from yr.datasystem.kv_client import SetParam  # type: ignore
     from yr.datasystem.object_client import WriteMode  # type: ignore
-    import acl  # type: ignore
 
     host, port = _split_host_port(worker_addr)
-    enable_exclusive_connection = bool(
-        int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0"))
-    )
+    enable_exclusive_connection = bool(int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0")))
     enable_remote_h2d = bool(int(os.getenv("DS_ENABLE_REMOTE_H2D", "0")))
 
     print("\n[Client Init]")
@@ -204,11 +194,15 @@ def main() -> int:
     print(f"   dtype={torch_dtype}")
     print(f"   shape=({args.rows}, {args.cols})")
 
-    write_tensor = torch.arange(
-        args.rows * args.cols,
-        device=device,
-        dtype=torch.float32,
-    ).reshape(args.rows, args.cols).to(torch_dtype)
+    write_tensor = (
+        torch.arange(
+            args.rows * args.cols,
+            device=device,
+            dtype=torch.float32,
+        )
+        .reshape(args.rows, args.cols)
+        .to(torch_dtype)
+    )
     read_tensor = torch.zeros_like(write_tensor)
 
     write_blob_list = DeviceBlobList(
@@ -245,9 +239,7 @@ def main() -> int:
     print(f"   failed_keys={failed_keys}")
 
     print("\n[Step 5] compare")
-    max_abs_diff = (
-        (write_tensor.float() - read_tensor.float()).abs().max().item()
-    )
+    max_abs_diff = (write_tensor.float() - read_tensor.float()).abs().max().item()
     allclose = torch.allclose(
         write_tensor.float(),
         read_tensor.float(),
@@ -259,8 +251,7 @@ def main() -> int:
 
     if not allclose:
         raise RuntimeError(
-            "Yuanrong datasystem smoke test failed: readback mismatch. "
-            f"max_abs_diff={max_abs_diff}"
+            f"Yuanrong datasystem smoke test failed: readback mismatch. max_abs_diff={max_abs_diff}"
         )
 
     print("\nSmoke test completed successfully.")

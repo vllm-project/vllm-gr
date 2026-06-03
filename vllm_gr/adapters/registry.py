@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Two-layer adapter registry for GR model families.
@@ -14,7 +14,7 @@ Actual ``GRModelAdapter`` subclasses that import torch/torchrec.
 from __future__ import annotations
 
 import importlib
-from typing import Any, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from vllm_gr.adapters.base import GRModelAdapter
@@ -103,14 +103,11 @@ def get_payload_type(model_type: str) -> type:
     if entry is None:
         registered = sorted(_FAMILY_ENTRIES.keys())
         raise KeyError(
-            f"No family registered for model_type={model_type!r}. "
-            f"Registered families: {registered}"
+            f"No family registered for model_type={model_type!r}. Registered families: {registered}"
         )
     pt_path: str | None = entry.get("payload_type")
     if pt_path is None:
-        raise KeyError(
-            f"Family {model_type!r} has no payload_type registered"
-        )
+        raise KeyError(f"Family {model_type!r} has no payload_type registered")
     return _import_dotted_path(pt_path)
 
 
@@ -195,6 +192,7 @@ def ensure_adapter_class_registered(model_type: str) -> None:
 
 # ── Internal helpers ─────────────────────────────────────────────
 
+
 def resolve_model_type(vllm_config: Any) -> str:
     """Resolve the GR model type from a vllm_config.
 
@@ -203,13 +201,19 @@ def resolve_model_type(vllm_config: Any) -> str:
     """
     model_type = getattr(
         getattr(getattr(vllm_config, "model_config", None), "hf_config", None),
-        "model_type", None,
+        "model_type",
+        None,
     )
     if model_type:
         return model_type
-    return getattr(
-        getattr(vllm_config, "gr_config", None), "model_family", None,
-    ) or "hstu"
+    return (
+        getattr(
+            getattr(vllm_config, "gr_config", None),
+            "model_family",
+            None,
+        )
+        or "hstu"
+    )
 
 
 def _import_dotted_path(dotted_path: str) -> Callable:
@@ -227,6 +231,7 @@ def _import_dotted_path(dotted_path: str) -> Callable:
 
 
 # ── Reset (for testing) ─────────────────────────────────────────
+
 
 def _reset() -> None:
     """Clear all registrations.  Only for use in tests."""

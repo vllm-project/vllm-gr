@@ -58,10 +58,7 @@ class ConfigValidator(ast.NodeVisitor):
         decorators = [
             id
             for d in node.decorator_list
-            if (
-                isinstance(d, ast.Name)
-                and ((id := d.id) == "config" or id == "dataclass")
-            )
+            if (isinstance(d, ast.Name) and ((id := d.id) == "config" or id == "dataclass"))
             or (
                 isinstance(d, ast.Call)
                 and (isinstance(d.func, ast.Name) and (id := d.func.id) == "dataclass")

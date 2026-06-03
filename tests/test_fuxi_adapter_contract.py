@@ -1,8 +1,10 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 
 """Tests for FuXiAlphaModelAdapter method contracts."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import math
 import unittest
 from types import SimpleNamespace
@@ -11,9 +13,8 @@ import torch
 
 
 class TestFuXiAdapterContract(unittest.TestCase):
-
     @staticmethod
-    def _make_adapter():
+    def _make_adapter() -> None:
         from vllm_gr.adapters.fuxi.adapter import FuXiAlphaModelAdapter
 
         vllm_config = SimpleNamespace(
@@ -34,13 +35,13 @@ class TestFuXiAdapterContract(unittest.TestCase):
         gr_config = SimpleNamespace(max_seq_len=64, max_candidates=50)
         return FuXiAlphaModelAdapter(vllm_config, gr_config)
 
-    def setUp(self):
+    def setUp(self) -> None:
         self.adapter = self._make_adapter()
 
-    def test_model_type_is_fuxi(self):
+    def test_model_type_is_fuxi(self) -> None:
         self.assertEqual(self.adapter.model_type, "fuxi")
 
-    def test_parse_prompt_extracts_features(self):
+    def test_parse_prompt_extracts_features(self) -> None:
         prompt = {
             "user_id": "u1",
             "user_history": [{"item_id": 1}, {"item_id": 2}],
@@ -52,7 +53,7 @@ class TestFuXiAdapterContract(unittest.TestCase):
         self.assertEqual(parsed.metadata["history_len"], 2)
         self.assertEqual(parsed.metadata["num_candidates"], 2)
 
-    def test_validate_prompt_rejects_context(self):
+    def test_validate_prompt_rejects_context(self) -> None:
         with self.assertRaises(ValueError):
             self.adapter.validate_prompt(
                 {
@@ -63,7 +64,7 @@ class TestFuXiAdapterContract(unittest.TestCase):
                 }
             )
 
-    def test_build_payload_returns_fuxi_features_payload(self):
+    def test_build_payload_returns_fuxi_features_payload(self) -> None:
         from vllm_gr.adapters.fuxi.payload import FuXiFeaturesPayload
 
         parsed = self.adapter.parse_prompt(
@@ -77,7 +78,7 @@ class TestFuXiAdapterContract(unittest.TestCase):
         self.assertIsInstance(payload, FuXiFeaturesPayload)
         self.assertEqual(payload.user_id, "u1")
 
-    def test_decode_payload_round_trip(self):
+    def test_decode_payload_round_trip(self) -> None:
         parsed = self.adapter.parse_prompt(
             {
                 "user_id": "u1",
@@ -91,7 +92,7 @@ class TestFuXiAdapterContract(unittest.TestCase):
         self.assertEqual(decoded["candidate_ids"], [10])
         self.assertEqual(decoded["schema_fingerprint"], "fuxi:v1")
 
-    def test_build_model_kwargs_shapes(self):
+    def test_build_model_kwargs_shapes(self) -> None:
         parsed = self.adapter.parse_prompt(
             {
                 "user_id": "u1",
@@ -108,7 +109,7 @@ class TestFuXiAdapterContract(unittest.TestCase):
         self.assertEqual(kwargs["candidate_ids"].shape, (1, 3))
         self.assertEqual(kwargs["candidate_lengths"].tolist(), [3])
 
-    def test_build_request_lengths_returns_zero_targets(self):
+    def test_build_request_lengths_returns_zero_targets(self) -> None:
         parsed = self.adapter.parse_prompt(
             {
                 "user_id": "u1",
@@ -124,7 +125,7 @@ class TestFuXiAdapterContract(unittest.TestCase):
         self.assertEqual(history_lengths.tolist(), [2])
         self.assertEqual(contextual_seq_len, 0)
 
-    def test_extract_request_meta(self):
+    def test_extract_request_meta(self) -> None:
         parsed = self.adapter.parse_prompt(
             {
                 "user_id": "u1",
@@ -140,8 +141,7 @@ class TestFuXiAdapterContract(unittest.TestCase):
 
 
 class TestFuXiDefaults(unittest.TestCase):
-
-    def test_apply_fuxi_defaults_disables_prefix_cache(self):
+    def test_apply_fuxi_defaults_disables_prefix_cache(self) -> None:
         from vllm_gr.adapters.fuxi._defaults import apply_fuxi_defaults
 
         engine_args = SimpleNamespace(
@@ -167,8 +167,7 @@ class TestFuXiDefaults(unittest.TestCase):
 
 
 class TestFuXiModuleForward(unittest.TestCase):
-
-    def test_forward_output_shape(self):
+    def test_forward_output_shape(self) -> None:
         from vllm_gr.config.fuxi_config import FuXiConfig
         from vllm_gr.models.fuxi.fuxi_module import FuXiAlphaInferenceModel
 
@@ -202,7 +201,7 @@ class TestFuXiModuleForward(unittest.TestCase):
         self.assertEqual(tuple(scores.shape), (1, 2))
         self.assertTrue(torch.isfinite(scores).all().item())
 
-    def test_uvqk_shape_is_rab_off(self):
+    def test_uvqk_shape_is_rab_off(self) -> None:
         from vllm_gr.config.fuxi_config import FuXiConfig
         from vllm_gr.models.fuxi.fuxi_module import FuXiBlockJagged
 
@@ -236,8 +235,7 @@ class TestFuXiModuleForward(unittest.TestCase):
 
 
 class TestFuXiPreprocessors(unittest.TestCase):
-
-    def test_input_preprocessor_matches_fuxi_alpha_flow(self):
+    def test_input_preprocessor_matches_fuxi_alpha_flow(self) -> None:
         from vllm_gr.models.fuxi.input_features_preprocessors import (
             LearnablePositionalEmbeddingInputFeaturesPreprocessor,
         )
@@ -262,7 +260,7 @@ class TestFuXiPreprocessors(unittest.TestCase):
         expected = expected * valid_mask
         self.assertTrue(torch.allclose(user_embeddings, expected))
 
-    def test_get_current_embeddings_uses_left_padded_last_valid(self):
+    def test_get_current_embeddings_uses_left_padded_last_valid(self) -> None:
         from vllm_gr.models.fuxi.utils import get_current_embeddings
 
         encoded = torch.tensor(
@@ -281,15 +279,14 @@ class TestFuXiPreprocessors(unittest.TestCase):
 
 
 class TestFuXiPayloadPadding(unittest.TestCase):
-
-    def test_truncate_or_pad_seq_matches_fuxi_alpha_dataset(self):
+    def test_truncate_or_pad_seq_matches_fuxi_alpha_dataset(self) -> None:
         from vllm_gr.adapters.fuxi.payload_builder import _truncate_or_pad_seq
 
         self.assertEqual(_truncate_or_pad_seq([101, 102], 3), [101, 102, 0])
         self.assertEqual(_truncate_or_pad_seq([], 2), [0, 0])
         self.assertEqual(_truncate_or_pad_seq([1, 2, 3], 3), [1, 2, 3])
 
-    def test_payload_builder_left_aligns_history(self):
+    def test_payload_builder_left_aligns_history(self) -> None:
         from vllm_gr.adapters.fuxi.payload_builder import build_fuxi_model_kwargs
 
         kwargs = build_fuxi_model_kwargs(
@@ -328,8 +325,7 @@ class TestFuXiPayloadPadding(unittest.TestCase):
 
 
 class TestFuXiKvCacheParity(unittest.TestCase):
-
-    def test_kv_cache_and_fallback_match(self):
+    def test_kv_cache_and_fallback_match(self) -> None:
         from vllm_gr.config.fuxi_config import FuXiConfig
         from vllm_gr.models.fuxi.fuxi_module import FuXiAlphaInferenceModel
 

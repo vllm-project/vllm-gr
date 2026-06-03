@@ -1,13 +1,16 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """FuXiAlphaModelAdapter — concrete adapter for FuXi-alpha recommendation models."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm_gr.inputs.base import GRParsedInput
 
 from vllm_gr.adapters.base import GRModelAdapter
 from vllm_gr.adapters.capabilities import GRPoolingModel, GRScoringModel
@@ -38,9 +41,7 @@ class FuXiAlphaModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel):
             getattr(hf, "max_num_candidates_inference", gr_config.max_candidates)
         )
         self.use_rating: bool = bool(getattr(hf, "use_rating_embedding", False))
-        self.use_timestamp_payload: bool = bool(
-            getattr(hf, "use_timestamp_payload", False)
-        )
+        self.use_timestamp_payload: bool = bool(getattr(hf, "use_timestamp_payload", False))
         self.item_id_key: str = getattr(hf, "item_id_feature_name", None) or "item_id"
         self.rating_key: str = getattr(hf, "rating_feature_name", None) or "rating"
         self.ts_key: str = getattr(hf, "timestamp_feature_name", None) or "timestamp"
@@ -61,14 +62,12 @@ class FuXiAlphaModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel):
 
         if len(user_history) > self.max_seq_len:
             raise ValueError(
-                f"user_history length {len(user_history)} exceeds max_seq_len "
-                f"{self.max_seq_len}"
+                f"user_history length {len(user_history)} exceeds max_seq_len {self.max_seq_len}"
             )
 
         if len(candidates) > self.max_candidates:
             raise ValueError(
-                f"candidates length {len(candidates)} exceeds max_candidates "
-                f"{self.max_candidates}"
+                f"candidates length {len(candidates)} exceeds max_candidates {self.max_candidates}"
             )
 
     def parse_prompt(self, prompt: dict) -> "GRParsedInput":
@@ -77,7 +76,7 @@ class FuXiAlphaModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel):
         user_id = str(prompt.get("user_id", ""))
         user_history = prompt.get("user_history", [])
         candidates = prompt.get("candidates", [])
-        recent_history = user_history[-self.max_seq_len:]
+        recent_history = user_history[-self.max_seq_len :]
 
         past_ids, past_ratings, past_timestamps = extract_fuxi_history_features(
             recent_history,
@@ -154,9 +153,7 @@ class FuXiAlphaModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel):
             "past_lengths": torch.tensor(history_len, dtype=torch.int64),
             "schema_fingerprint": FUXI_SCHEMA_FINGERPRINT,
             "user_id": getattr(payload, "user_id", ""),
-            "original_candidates": list(
-                getattr(payload, "original_candidates", []) or []
-            ),
+            "original_candidates": list(getattr(payload, "original_candidates", []) or []),
         }
 
     def build_model_kwargs(
@@ -201,10 +198,7 @@ class FuXiAlphaModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel):
         elif scores.dim() == 1:
             primary_scores = scores
         else:
-            raise ValueError(
-                "FuXi pooling output must be 1D or 2D: "
-                f"shape={tuple(scores.shape)}"
-            )
+            raise ValueError(f"FuXi pooling output must be 1D or 2D: shape={tuple(scores.shape)}")
 
         if len(candidates) != len(primary_scores):
             raise ValueError(
@@ -257,15 +251,13 @@ class FuXiAlphaModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel):
     def extract_request_meta(self, payload: Any) -> dict:
         return {
             "user_id": getattr(payload, "user_id", None),
-            "original_candidates": list(
-                getattr(payload, "original_candidates", []) or []
-            ),
+            "original_candidates": list(getattr(payload, "original_candidates", []) or []),
             "task_names": self.task_names,
             "primary_task": self.primary_task,
             "primary_id_key": self.item_id_key,
         }
 
 
-from vllm_gr.adapters.registry import register_adapter_class
+from vllm_gr.adapters.registry import register_adapter_class  # noqa: E402
 
 register_adapter_class("fuxi", FuXiAlphaModelAdapter)

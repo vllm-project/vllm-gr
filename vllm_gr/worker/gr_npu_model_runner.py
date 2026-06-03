@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Ascend NPU GR model runner."""
 
@@ -94,10 +94,9 @@ class GRNPUModelRunner(GRFeatureRunnerMixin, NPUModelRunner):
         ).items():
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        num_attn_module = (
-            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
-        )
+        num_attn_module = 2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         from vllm.v1.worker.utils import bind_kv_cache
+
         compilation_config = getattr(
             self,
             "compilation_config",

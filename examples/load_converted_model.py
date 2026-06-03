@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Verify converted DLRM_v3 checkpoint by loading it and running inference.
@@ -26,9 +26,8 @@ For a lightweight demo without real weights, use simple_inference.py instead.
 
 import argparse
 import glob
-import os
-import sys
 import logging
+import os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +35,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from runtime_utils import add_repo_root_to_path, add_runtime_args, describe_runtime
+from runtime_utils import (  # noqa: E402
+    add_repo_root_to_path,
+    add_runtime_args,
+    describe_runtime,
+)
 
 add_repo_root_to_path(__file__)
 
@@ -53,9 +56,7 @@ def check_model_dir(model_path: str) -> dict:
     if not os.path.isdir(model_path):
         raise FileNotFoundError(f"Model directory not found: {model_path}")
 
-    info["has_config"] = os.path.exists(
-        os.path.join(model_path, "config.json")
-    )
+    info["has_config"] = os.path.exists(os.path.join(model_path, "config.json"))
 
     weight_files = []
     for pattern in ["*.safetensors", "*.bin", "*.pt", "*.pth"]:
@@ -66,8 +67,7 @@ def check_model_dir(model_path: str) -> dict:
         info["has_weights"] = True
         info["weight_files"] = weight_files
         info["weight_size_mb"] = sum(
-            os.path.getsize(os.path.join(model_path, filename))
-            for filename in weight_files
+            os.path.getsize(os.path.join(model_path, filename)) for filename in weight_files
         ) / (1024 * 1024)
 
     return info
@@ -85,12 +85,12 @@ def run_inference(model_path: str, expected_device: str | None = None):
     print(f"\n  Model path:   {info['path']}")
     print(f"  config.json:  {'found' if info['has_config'] else 'MISSING'}")
     if info["has_weights"]:
-        print(f"  Weights:      {', '.join(info['weight_files'])} "
-              f"({info['weight_size_mb']:.1f} MB)")
+        print(
+            f"  Weights:      {', '.join(info['weight_files'])} ({info['weight_size_mb']:.1f} MB)"
+        )
     else:
         raise FileNotFoundError(
-            f"No weight file found in {model_path}. "
-            "Run convert_gr_checkpoint.py first."
+            f"No weight file found in {model_path}. Run convert_gr_checkpoint.py first."
         )
 
     if not info["has_config"]:
@@ -129,18 +129,78 @@ def run_inference(model_path: str, expected_device: str | None = None):
     prompt: GRPrompt = {
         "user_id": "user_42",
         "user_history": [
-            {"movie_id": 1,    "movie_rating": 5, "action_timestamp": 978300760, "item_weights": 1, "dummy_watch_time": 0},
-            {"movie_id": 260,  "movie_rating": 4, "action_timestamp": 978301398, "item_weights": 1, "dummy_watch_time": 0},
-            {"movie_id": 1196, "movie_rating": 5, "action_timestamp": 978302174, "item_weights": 2, "dummy_watch_time": 0},
-            {"movie_id": 1210, "movie_rating": 4, "action_timestamp": 978302983, "item_weights": 1, "dummy_watch_time": 0},
-            {"movie_id": 2028, "movie_rating": 5, "action_timestamp": 978303390, "item_weights": 4, "dummy_watch_time": 0},
+            {
+                "movie_id": 1,
+                "movie_rating": 5,
+                "action_timestamp": 978300760,
+                "item_weights": 1,
+                "dummy_watch_time": 0,
+            },
+            {
+                "movie_id": 260,
+                "movie_rating": 4,
+                "action_timestamp": 978301398,
+                "item_weights": 1,
+                "dummy_watch_time": 0,
+            },
+            {
+                "movie_id": 1196,
+                "movie_rating": 5,
+                "action_timestamp": 978302174,
+                "item_weights": 2,
+                "dummy_watch_time": 0,
+            },
+            {
+                "movie_id": 1210,
+                "movie_rating": 4,
+                "action_timestamp": 978302983,
+                "item_weights": 1,
+                "dummy_watch_time": 0,
+            },
+            {
+                "movie_id": 2028,
+                "movie_rating": 5,
+                "action_timestamp": 978303390,
+                "item_weights": 4,
+                "dummy_watch_time": 0,
+            },
         ],
         "candidates": [
-            {"item_movie_id": 3114, "item_query_time": 978310000, "item_dummy_watchtime": 0, "item_movie_rating": 0, "item_action_weights": 0},
-            {"item_movie_id": 2571, "item_query_time": 978310000, "item_dummy_watchtime": 0, "item_movie_rating": 0, "item_action_weights": 0},
-            {"item_movie_id": 1580, "item_query_time": 978310000, "item_dummy_watchtime": 0, "item_movie_rating": 0, "item_action_weights": 0},
-            {"item_movie_id": 1270, "item_query_time": 978310000, "item_dummy_watchtime": 0, "item_movie_rating": 0, "item_action_weights": 0},
-            {"item_movie_id": 593,  "item_query_time": 978310000, "item_dummy_watchtime": 0, "item_movie_rating": 0, "item_action_weights": 0},
+            {
+                "item_movie_id": 3114,
+                "item_query_time": 978310000,
+                "item_dummy_watchtime": 0,
+                "item_movie_rating": 0,
+                "item_action_weights": 0,
+            },
+            {
+                "item_movie_id": 2571,
+                "item_query_time": 978310000,
+                "item_dummy_watchtime": 0,
+                "item_movie_rating": 0,
+                "item_action_weights": 0,
+            },
+            {
+                "item_movie_id": 1580,
+                "item_query_time": 978310000,
+                "item_dummy_watchtime": 0,
+                "item_movie_rating": 0,
+                "item_action_weights": 0,
+            },
+            {
+                "item_movie_id": 1270,
+                "item_query_time": 978310000,
+                "item_dummy_watchtime": 0,
+                "item_movie_rating": 0,
+                "item_action_weights": 0,
+            },
+            {
+                "item_movie_id": 593,
+                "item_query_time": 978310000,
+                "item_dummy_watchtime": 0,
+                "item_movie_rating": 0,
+                "item_action_weights": 0,
+            },
         ],
         "context": {
             "user_id": 42,
@@ -151,7 +211,7 @@ def run_inference(model_path: str, expected_device: str | None = None):
         },
     }
 
-    print(f"\n  Running inference...")
+    print("\n  Running inference...")
     print(f"  User history:  {len(prompt['user_history'])} interactions")
     print(f"  Candidates:    {len(prompt['candidates'])} items")
     print(f"  Context:       {list(prompt['context'].keys())}")
@@ -196,9 +256,10 @@ def main():
         ),
     )
     parser.add_argument(
-        "--model", type=str, required=True,
-        help="Path to converted model directory "
-             "(with config.json + converted weight files)",
+        "--model",
+        type=str,
+        required=True,
+        help="Path to converted model directory (with config.json + converted weight files)",
     )
     add_runtime_args(parser, include_model=False)
     args = parser.parse_args()

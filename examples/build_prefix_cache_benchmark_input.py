@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Build a prefix-cache-friendly replay input JSON from an existing dataset.
 
@@ -27,7 +27,6 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
-
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -70,10 +69,7 @@ def _parse_args() -> argparse.Namespace:
         "--keep-candidate-prefix",
         type=int,
         default=2,
-        help=(
-            "Keep this many leading candidates unchanged in partial variants "
-            "(default: 2)."
-        ),
+        help=("Keep this many leading candidates unchanged in partial variants (default: 2)."),
     )
     parser.add_argument(
         "--case-id",

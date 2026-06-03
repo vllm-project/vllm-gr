@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """
 DLRM_v3 Model Common Utilities
@@ -31,6 +32,7 @@ class HammerKernel(Enum):
     guarantee that every operator in this fork has a specialized implementation
     for that backend.
     """
+
     TRITON = "TRITON"
     TLX = "TLX"
     PYTORCH = "PYTORCH"
@@ -42,13 +44,14 @@ class HammerKernel(Enum):
 class HammerModule(torch.nn.Module, abc.ABC):
     """
     HSTU Module Base Class
-    
+
     Provides kernel selection and inference mode control.
     Tracks the desired kernel selection and inference mode control.
     The current fork still executes most operators through the PyTorch path,
     but we preserve the kernel-selection semantics so runtime policy and tests
     stay aligned with the upstream contract.
     """
+
     _use_triton_cc: bool = False
     _training_dtype: torch.dtype = torch.float32
     _hammer_kernel: Optional[HammerKernel] = None
@@ -96,7 +99,7 @@ class HammerModule(torch.nn.Module, abc.ABC):
 
     @property
     def is_eval(self) -> bool:
-        return (not self.training)
+        return not self.training
 
     @property
     def is_train(self) -> bool:
@@ -139,7 +142,7 @@ def prev_power_of_2(x: int) -> int:
 
 def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
     global USE_RUNTIME_MAX_SEQ_LEN
-    
+
     if USE_RUNTIME_MAX_SEQ_LEN:
         return prev_power_of_2(runtime_max_seq_len)
     else:
@@ -209,7 +212,7 @@ def jagged_to_padded_dense(
 ) -> torch.Tensor:
     """
     Convert Jagged Tensor to padded dense tensor
-    
+
     Prefers fbgemm, falls back to PyTorch implementation if unavailable.
     """
     return ReliableOps.jagged_to_padded_dense(
@@ -219,6 +222,7 @@ def jagged_to_padded_dense(
         padding_value=padding_value,
     )
 
+
 @torch.fx.wrap
 def dense_to_jagged(
     dense: torch.Tensor,
@@ -226,7 +230,7 @@ def dense_to_jagged(
 ) -> torch.Tensor:
     """
     Convert padded dense tensor to Jagged Tensor
-    
+
     Prefers fbgemm, falls back to PyTorch implementation if unavailable.
     """
     return ReliableOps.dense_to_jagged(

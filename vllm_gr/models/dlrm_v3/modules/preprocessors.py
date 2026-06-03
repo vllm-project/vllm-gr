@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,9 +21,10 @@ from math import sqrt
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
 from vllm_gr.models.dlrm_v3.common import (
-    fx_unwrap_optional_tensor,
     HammerModule,
+    fx_unwrap_optional_tensor,
     init_mlp_weights_optional_bias,
     jagged_to_padded_dense,
 )
@@ -127,36 +130,24 @@ class ContextualPreprocessor(InputPreprocessor):
         self._output_embedding_dim: int = output_embedding_dim
         self._input_embedding_dim: int = input_embedding_dim
         self._hidden_dim: int = hidden_dim
-        self._contextual_feature_to_max_length: Dict[str, int] = (
-            contextual_feature_to_max_length
-        )
-        self._max_contextual_seq_len: int = sum(
-            contextual_feature_to_max_length.values()
-        )
+        self._contextual_feature_to_max_length: Dict[str, int] = contextual_feature_to_max_length
+        self._max_contextual_seq_len: int = sum(contextual_feature_to_max_length.values())
         self._contextual_feature_to_min_uih_length: Dict[str, int] = (
             contextual_feature_to_min_uih_length
         )
         if self._max_contextual_seq_len > 0:
-            std = 1.0 * sqrt(
-                2.0 / float(input_embedding_dim + self._output_embedding_dim)
+            std = 1.0 * sqrt(2.0 / float(input_embedding_dim + self._output_embedding_dim))
+            self._batched_contextual_linear_weights: torch.nn.Parameter = torch.nn.Parameter(
+                torch.empty(
+                    (
+                        self._max_contextual_seq_len,
+                        input_embedding_dim,
+                        self._output_embedding_dim,
+                    )
+                ).normal_(0.0, std)
             )
-            self._batched_contextual_linear_weights: torch.nn.Parameter = (
-                torch.nn.Parameter(
-                    torch.empty(
-                        (
-                            self._max_contextual_seq_len,
-                            input_embedding_dim,
-                            self._output_embedding_dim,
-                        )
-                    ).normal_(0.0, std)
-                )
-            )
-            self._batched_contextual_linear_bias: torch.nn.Parameter = (
-                torch.nn.Parameter(
-                    torch.empty(
-                        (self._max_contextual_seq_len, self._output_embedding_dim)
-                    ).fill_(0.0)
-                )
+            self._batched_contextual_linear_bias: torch.nn.Parameter = torch.nn.Parameter(
+                torch.empty((self._max_contextual_seq_len, self._output_embedding_dim)).fill_(0.0)
             )
         self._content_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
@@ -173,8 +164,7 @@ class ContextualPreprocessor(InputPreprocessor):
         self._additional_embedding_features: List[str] = additional_embedding_features
         self._additional_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
-                in_features=self._input_embedding_dim
-                * len(additional_embedding_features),
+                in_features=self._input_embedding_dim * len(additional_embedding_features),
                 out_features=self._hidden_dim,
             ),
             SwishLayerNorm(self._hidden_dim),
@@ -231,15 +221,11 @@ class ContextualPreprocessor(InputPreprocessor):
         output_seq_embeddings = self._content_embedding_mlp(seq_embeddings)
         if len(self._additional_embedding_features) > 0:
             additional_embeddings = torch.cat(
-                [
-                    seq_payloads[feature]
-                    for feature in self._additional_embedding_features
-                ],
+                [seq_payloads[feature] for feature in self._additional_embedding_features],
                 dim=1,
             )
-            output_seq_embeddings = (
-                output_seq_embeddings
-                + self._additional_embedding_mlp(additional_embeddings)
+            output_seq_embeddings = output_seq_embeddings + self._additional_embedding_mlp(
+                additional_embeddings
             )
         max_seq_len = max_uih_len + max_targets
         target_offsets = complete_cumsum(num_targets)
@@ -274,15 +260,13 @@ class ContextualPreprocessor(InputPreprocessor):
                 dtype=seq_embeddings.dtype,
             )
             contextual_embeddings = torch.baddbmm(
-                self._batched_contextual_linear_bias.view(
-                    -1, 1, self._output_embedding_dim
-                ).to(contextual_input_embeddings.dtype),
+                self._batched_contextual_linear_bias.view(-1, 1, self._output_embedding_dim).to(
+                    contextual_input_embeddings.dtype
+                ),
                 contextual_input_embeddings.view(
                     -1, self._max_contextual_seq_len, self._input_embedding_dim
                 ).transpose(0, 1),
-                self._batched_contextual_linear_weights.to(
-                    contextual_input_embeddings.dtype
-                ),
+                self._batched_contextual_linear_weights.to(contextual_input_embeddings.dtype),
             ).transpose(0, 1)
             output_seq_embeddings = concat_2D_jagged(
                 max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
@@ -314,8 +298,7 @@ class ContextualPreprocessor(InputPreprocessor):
             output_seq_lengths = output_seq_lengths + self._max_contextual_seq_len
             output_seq_offsets = complete_cumsum(output_seq_lengths)
             output_total_uih_len = (
-                output_total_uih_len
-                + self._max_contextual_seq_len * output_seq_lengths.size(0)
+                output_total_uih_len + self._max_contextual_seq_len * output_seq_lengths.size(0)
             )
 
         return (

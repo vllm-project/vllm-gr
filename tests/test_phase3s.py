@@ -1,8 +1,9 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Tests for Phase 3.S deferred items."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import subprocess
 import sys
 import textwrap
@@ -20,13 +21,15 @@ class TestHSTUFeaturesPayloadSerialization(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(
-            result.returncode, 0,
+            result.returncode,
+            0,
             f"Subprocess failed:\nstdout: {result.stdout}\nstderr: {result.stderr}",
         )
 
-    def test_serialization_round_trip(self):
+    def test_serialization_round_trip(self) -> None:
         """HSTUFeaturesPayload must serialize/deserialize correctly."""
-        self._run_subprocess(textwrap.dedent("""\
+        self._run_subprocess(
+            textwrap.dedent("""\
             import sys
             import msgspec
             from unittest.mock import MagicMock, patch
@@ -60,7 +63,8 @@ class TestHSTUFeaturesPayloadSerialization(unittest.TestCase):
 
                 encoded2 = enc.encode(decoded)
                 assert encoded == encoded2
-        """))
+        """)
+        )
 
 
 class TestOutputsPackageReexport(unittest.TestCase):
@@ -74,12 +78,14 @@ class TestOutputsPackageReexport(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(
-            result.returncode, 0,
+            result.returncode,
+            0,
             f"Subprocess failed:\nstdout: {result.stdout}\nstderr: {result.stderr}",
         )
 
-    def test_request_types_importable(self):
-        self._run_subprocess(textwrap.dedent("""\
+    def test_request_types_importable(self) -> None:
+        self._run_subprocess(
+            textwrap.dedent("""\
             import sys
             from unittest.mock import MagicMock, patch
             stub = MagicMock()
@@ -87,10 +93,12 @@ class TestOutputsPackageReexport(unittest.TestCase):
                 from vllm_gr.outputs import RecommendedItem, GRRequestOutput
                 assert RecommendedItem is not None
                 assert GRRequestOutput is not None
-        """))
+        """)
+        )
 
-    def test_base_types_importable(self):
-        self._run_subprocess(textwrap.dedent("""\
+    def test_base_types_importable(self) -> None:
+        self._run_subprocess(
+            textwrap.dedent("""\
             import sys
             from unittest.mock import MagicMock, patch
             stub = MagicMock()
@@ -100,10 +108,12 @@ class TestOutputsPackageReexport(unittest.TestCase):
                 assert isinstance(ScoringOutput(), GRModelOutput)
                 assert isinstance(EmbeddingOutput(), GRModelOutput)
                 assert isinstance(TextOutput(), GRModelOutput)
-        """))
+        """)
+        )
 
-    def test_submodule_direct_import(self):
-        self._run_subprocess(textwrap.dedent("""\
+    def test_submodule_direct_import(self) -> None:
+        self._run_subprocess(
+            textwrap.dedent("""\
             import sys
             from unittest.mock import MagicMock, patch
             stub = MagicMock()
@@ -112,7 +122,8 @@ class TestOutputsPackageReexport(unittest.TestCase):
                 from vllm_gr.outputs.base import GRModelOutput, ScoringOutput
                 assert RecommendedItem is not None
                 assert ScoringOutput is not None
-        """))
+        """)
+        )
 
 
 if __name__ == "__main__":

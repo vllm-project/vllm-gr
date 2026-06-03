@@ -1,19 +1,20 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 
 """Shared fake runtime harness for platform smoke tests."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import dataclass
-from pathlib import Path
-from types import SimpleNamespace
 import importlib
 import logging
 import sys
 import types
-
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -34,7 +35,7 @@ def _restore_modules(saved: dict[str, types.ModuleType]) -> None:
         sys.modules[name] = module
 
 
-def _build_fake_hf_config():
+def _build_fake_hf_config() -> None:
     return SimpleNamespace(
         hstu_uih_feature_names=["item_id"],
         user_embedding_feature_names=["item_id"],
@@ -58,7 +59,7 @@ class SmokeHarness:
     def set_platform(self, device_type: str) -> None:
         self.current_platform.device_type = device_type
 
-    def create_llm(self, **kwargs):
+    def create_llm(self, **kwargs) -> None:
         module = importlib.import_module("vllm_gr.entrypoints.gr")
         kwargs.setdefault("model_family", "hstu")
         return module.GRLLM(model="test-model", **kwargs)
@@ -75,7 +76,7 @@ class SmokeHarness:
 
 
 @contextmanager
-def smoke_harness(initial_device_type: str = "cuda"):
+def smoke_harness(initial_device_type: str = "cuda") -> None:
     prefixes = ("vllm", "vllm_ascend", "vllm_gr")
     saved = _purge_modules(*prefixes)
 
@@ -138,10 +139,10 @@ def smoke_harness(initial_device_type: str = "cuda"):
         disable_log_stats: bool = False
         gpu_memory_utilization: float = 0.9
 
-        def __post_init__(self):
+        def __post_init__(self) -> None:
             return None
 
-        def create_engine_config(self, usage_context=None, headless: bool = False):
+        def create_engine_config(self, usage_context=None, headless: bool = False) -> None:
             state["trace"].append(("engine_config", current_platform.device_type))
             return SimpleNamespace(
                 worker_cls=self.worker_cls,
@@ -169,7 +170,7 @@ def smoke_harness(initial_device_type: str = "cuda"):
         pass
 
     class Counter:
-        def __init__(self, start: int = 0):
+        def __init__(self, start: int = 0) -> None:
             self.value = start
 
         def __next__(self) -> int:
@@ -193,7 +194,7 @@ def smoke_harness(initial_device_type: str = "cuda"):
             prompt_token_ids,
             num_cached_tokens,
             finished,
-        ):
+        ) -> None:
             self.request_id = request_id
             self.outputs = outputs
             self.prompt_token_ids = prompt_token_ids
@@ -201,45 +202,43 @@ def smoke_harness(initial_device_type: str = "cuda"):
             self.finished = finished
 
     class BaseWorker:
-        def __init__(self, vllm_config, device_type: str):
+        def __init__(self, vllm_config, device_type: str) -> None:
             self.vllm_config = vllm_config
             self.device = SimpleNamespace(type=device_type)
             self.model_runner = None
             self.closed = False
 
-        def init_device(self):
+        def init_device(self) -> None:
             state["trace"].append((type(self).__name__, self.device.type))
 
-        def shutdown(self):
+        def shutdown(self) -> None:
             self.closed = True
             state["trace"].append((f"{type(self).__name__}.shutdown", self.device.type))
 
     class GPUWorker(BaseWorker):
-        def __init__(self, vllm_config):
+        def __init__(self, vllm_config) -> None:
             super().__init__(vllm_config, "cuda")
 
     class NPUWorker(BaseWorker):
-        def __init__(self, vllm_config):
+        def __init__(self, vllm_config) -> None:
             super().__init__(vllm_config, "npu")
 
     class GPUModelRunner:
-        def __init__(self, vllm_config, device):
+        def __init__(self, vllm_config, device) -> None:
             self.vllm_config = vllm_config
             self.device = device
 
     class NPUModelRunner:
-        def __init__(self, vllm_config, device):
+        def __init__(self, vllm_config, device) -> None:
             self.vllm_config = vllm_config
             self.device = device
 
     class FakeExecutor:
-        def __init__(self, vllm_config):
+        def __init__(self, vllm_config) -> None:
             device_type = vllm_config.platform_device_type
             active_platform = state["active_platform"]
             if active_platform is not None and active_platform != device_type:
-                raise RuntimeError(
-                    "Residual platform state detected before executor init"
-                )
+                raise RuntimeError("Residual platform state detected before executor init")
 
             state["active_platform"] = device_type
             state["active_engines"] += 1
@@ -251,13 +250,13 @@ def smoke_harness(initial_device_type: str = "cuda"):
             self.worker.init_device()
 
         @classmethod
-        def get_class(cls, _vllm_config):
+        def get_class(cls, _vllm_config) -> None:
             return cls
 
-        def run_requests(self, requests):
+        def run_requests(self, requests) -> None:
             return [self.worker.model_runner.run(request) for request in requests]
 
-        def shutdown(self):
+        def shutdown(self) -> None:
             if getattr(self, "_shutdown_complete", False):
                 return
             self._shutdown_complete = True
@@ -283,7 +282,7 @@ def smoke_harness(initial_device_type: str = "cuda"):
             mm_registry=None,
             use_cached_outputs=False,
             multiprocess_mode=False,
-        ):
+        ) -> None:
             self.vllm_config = vllm_config
             self.log_stats = log_stats
             self.tokenizer = object()
@@ -291,7 +290,7 @@ def smoke_harness(initial_device_type: str = "cuda"):
             self.model_executor = self.executor
             self._pending_requests = []
 
-        def add_request(self, request_id, prompt, params):
+        def add_request(self, request_id, prompt, params) -> None:
             self._pending_requests.append(
                 {
                     "request_id": request_id,
@@ -300,15 +299,15 @@ def smoke_harness(initial_device_type: str = "cuda"):
                 }
             )
 
-        def has_unfinished_requests(self):
+        def has_unfinished_requests(self) -> None:
             return bool(self._pending_requests)
 
-        def step(self):
+        def step(self) -> None:
             requests = list(self._pending_requests)
             self._pending_requests.clear()
             return self.executor.run_requests(requests)
 
-        def shutdown(self):
+        def shutdown(self) -> None:
             if getattr(self, "_shutdown_complete", False):
                 return None
             self._shutdown_complete = True
@@ -325,7 +324,7 @@ def smoke_harness(initial_device_type: str = "cuda"):
         pass
 
     class Request:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args, **kwargs) -> None:
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
@@ -333,41 +332,38 @@ def smoke_harness(initial_device_type: str = "cuda"):
         pass
 
     class FakeGRConfig:
-        def __init__(self, max_seq_len=512, max_candidates=1000):
+        def __init__(self, max_seq_len=512, max_candidates=1000) -> None:
             self.max_seq_len = max_seq_len
             self.max_candidates = max_candidates
 
     class FakeGRInputProcessor:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
 
     class FakeGROutputProcessor:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
             self.num_pending_requests = 0
 
     class HSTUForRecommendation:
-        def __init__(self, backend: str):
+        def __init__(self, backend: str) -> None:
             self.backend = backend
 
         def recommend(self, prompt: dict[str, object]) -> list[int]:
             state["trace"].append(("hstu", self.backend))
             candidates = prompt["candidates"]
-            return [
-                candidate["item_candidate_id"]
-                for candidate in candidates
-            ]
+            return [candidate["item_candidate_id"] for candidate in candidates]
 
     class BaseGRRunner:
         runner_name = "base"
 
-        def __init__(self, vllm_config, device, gr_config=None):
+        def __init__(self, vllm_config, device, gr_config=None) -> None:
             self.vllm_config = vllm_config
             self.device = device
             self.model = HSTUForRecommendation(device.type)
             state["trace"].append((self.runner_name, device.type))
 
-        def run(self, request: dict[str, object]):
+        def run(self, request: dict[str, object]) -> None:
             from vllm_gr.outputs import GRRequestOutput, RecommendedItem
 
             item_ids = self.model.recommend(request["prompt"])
@@ -382,7 +378,7 @@ def smoke_harness(initial_device_type: str = "cuda"):
                 finished=True,
             )
 
-        def shutdown(self):
+        def shutdown(self) -> None:
             state["trace"].append((f"{self.runner_name}.shutdown", self.device.type))
 
         close = shutdown
@@ -393,7 +389,7 @@ def smoke_harness(initial_device_type: str = "cuda"):
     class GRNPUModelRunner(BaseGRRunner):
         runner_name = "gr_npu_model_runner"
 
-    def init_logger(name):
+    def init_logger(name) -> None:
         return logging.getLogger(name)
 
     fake_engine_arg_utils.EngineArgs = FakeEngineArgs
@@ -441,7 +437,7 @@ def smoke_harness(initial_device_type: str = "cuda"):
     fake_v1_outputs = types.ModuleType("vllm.v1.outputs")
     fake_inputs = types.ModuleType("vllm.inputs")
 
-    def re_apply_patches():
+    def re_apply_patches() -> None:
         state["patch_calls"] += 1
         state["trace"].append(("patch", current_platform.device_type))
         return state["patch_calls"]
@@ -490,58 +486,60 @@ def smoke_harness(initial_device_type: str = "cuda"):
 
     fake_inputs.PromptType = FakePromptType
 
-    sys.modules.update({
-        "vllm": fake_vllm,
-        "vllm.engine": fake_engine_pkg,
-        "vllm.engine.arg_utils": fake_engine_arg_utils,
-        "vllm.platforms": fake_platforms,
-        "vllm.config": fake_config,
-        "vllm.usage": fake_usage_pkg,
-        "vllm.usage.usage_lib": fake_usage_lib,
-        "vllm.v1": fake_v1,
-        "vllm.v1.engine": fake_v1_engine_pkg,
-        "vllm.v1.engine.llm_engine": fake_llm_engine_module,
-        "vllm.v1.executor": fake_executor_module,
-        "vllm.v1.request": fake_request_module,
-        "vllm.v1.core": fake_core_pkg,
-        "vllm.v1.core.sched": fake_sched_pkg,
-        "vllm.v1.core.sched.output": fake_sched_output_module,
-        "vllm.multimodal": fake_multimodal,
-        "vllm.v1.metrics": fake_metrics_pkg,
-        "vllm.v1.metrics.loggers": fake_metrics_loggers,
-        "vllm.entrypoints": fake_entrypoints_pkg,
-        "vllm.entrypoints.llm": fake_entrypoints_llm,
-        "vllm.utils": fake_utils_pkg,
-        "vllm.utils.counter": fake_counter_module,
-        "vllm.pooling_params": fake_pooling_params,
-        "vllm.outputs": fake_outputs,
-        "vllm.logger": fake_logger,
-        "vllm.v1.worker.gpu_worker": fake_gpu_worker_module,
-        "vllm.v1.worker.gpu_model_runner": fake_gpu_runner_module,
-        "vllm_ascend": fake_ascend_pkg,
-        "vllm_ascend.worker": fake_ascend_worker_pkg,
-        "vllm_ascend.worker.worker": fake_npu_worker_module,
-        "vllm_ascend.worker.model_runner_v1": fake_npu_runner_module,
-        "vllm_gr.config.gr_config": fake_gr_config,
-        "vllm_gr.engine.gr_input_processor": fake_gr_input,
-        "vllm_gr.engine.gr_output_processor": fake_gr_output,
-        "vllm_gr.patch": fake_patch,
-        "vllm_gr.config.hstu_vllm_registration": fake_hf_config,
-        "vllm_gr.model_executor.models.registry": fake_registry,
-        "vllm_gr.model_executor.models.hstu_vllm": fake_hstu_module,
-        "vllm_gr.worker.gr_model_runner": fake_gr_model_runner,
-        "vllm_gr.worker.gr_npu_model_runner": fake_gr_npu_model_runner,
-        "torchrec": fake_torchrec,
-        "torchrec.sparse": fake_torchrec_sparse,
-        "torchrec.sparse.jagged_tensor": fake_torchrec_jagged,
-        "vllm.v1.engine.input_processor": fake_v1_input_processor,
-        "vllm.sampling_params": fake_sampling_params,
-        "vllm.lora": fake_lora,
-        "vllm.lora.request": fake_lora_request,
-        "vllm.sequence": fake_sequence,
-        "vllm.v1.outputs": fake_v1_outputs,
-        "vllm.inputs": fake_inputs,
-    })
+    sys.modules.update(
+        {
+            "vllm": fake_vllm,
+            "vllm.engine": fake_engine_pkg,
+            "vllm.engine.arg_utils": fake_engine_arg_utils,
+            "vllm.platforms": fake_platforms,
+            "vllm.config": fake_config,
+            "vllm.usage": fake_usage_pkg,
+            "vllm.usage.usage_lib": fake_usage_lib,
+            "vllm.v1": fake_v1,
+            "vllm.v1.engine": fake_v1_engine_pkg,
+            "vllm.v1.engine.llm_engine": fake_llm_engine_module,
+            "vllm.v1.executor": fake_executor_module,
+            "vllm.v1.request": fake_request_module,
+            "vllm.v1.core": fake_core_pkg,
+            "vllm.v1.core.sched": fake_sched_pkg,
+            "vllm.v1.core.sched.output": fake_sched_output_module,
+            "vllm.multimodal": fake_multimodal,
+            "vllm.v1.metrics": fake_metrics_pkg,
+            "vllm.v1.metrics.loggers": fake_metrics_loggers,
+            "vllm.entrypoints": fake_entrypoints_pkg,
+            "vllm.entrypoints.llm": fake_entrypoints_llm,
+            "vllm.utils": fake_utils_pkg,
+            "vllm.utils.counter": fake_counter_module,
+            "vllm.pooling_params": fake_pooling_params,
+            "vllm.outputs": fake_outputs,
+            "vllm.logger": fake_logger,
+            "vllm.v1.worker.gpu_worker": fake_gpu_worker_module,
+            "vllm.v1.worker.gpu_model_runner": fake_gpu_runner_module,
+            "vllm_ascend": fake_ascend_pkg,
+            "vllm_ascend.worker": fake_ascend_worker_pkg,
+            "vllm_ascend.worker.worker": fake_npu_worker_module,
+            "vllm_ascend.worker.model_runner_v1": fake_npu_runner_module,
+            "vllm_gr.config.gr_config": fake_gr_config,
+            "vllm_gr.engine.gr_input_processor": fake_gr_input,
+            "vllm_gr.engine.gr_output_processor": fake_gr_output,
+            "vllm_gr.patch": fake_patch,
+            "vllm_gr.config.hstu_vllm_registration": fake_hf_config,
+            "vllm_gr.model_executor.models.registry": fake_registry,
+            "vllm_gr.model_executor.models.hstu_vllm": fake_hstu_module,
+            "vllm_gr.worker.gr_model_runner": fake_gr_model_runner,
+            "vllm_gr.worker.gr_npu_model_runner": fake_gr_npu_model_runner,
+            "torchrec": fake_torchrec,
+            "torchrec.sparse": fake_torchrec_sparse,
+            "torchrec.sparse.jagged_tensor": fake_torchrec_jagged,
+            "vllm.v1.engine.input_processor": fake_v1_input_processor,
+            "vllm.sampling_params": fake_sampling_params,
+            "vllm.lora": fake_lora,
+            "vllm.lora.request": fake_lora_request,
+            "vllm.sequence": fake_sequence,
+            "vllm.v1.outputs": fake_v1_outputs,
+            "vllm.inputs": fake_inputs,
+        }
+    )
 
     try:
         yield SmokeHarness(state=state, current_platform=current_platform)

@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """HSTU Positional Encoder"""
 
@@ -18,7 +19,7 @@ class HSTUPositionalEncoder(HammerModule):
     Positional encoder for HSTU model.
     Adds position and timestamp embeddings to sequence embeddings.
     """
-    
+
     def __init__(
         self,
         num_position_buckets: int,
@@ -29,7 +30,7 @@ class HSTUPositionalEncoder(HammerModule):
         super().__init__()
         self._embedding_dim: int = embedding_dim
         self._contextual_seq_len: int = contextual_seq_len
-        
+
         self._position_embeddings_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(num_position_buckets, embedding_dim).uniform_(
                 -sqrt(1.0 / num_position_buckets),

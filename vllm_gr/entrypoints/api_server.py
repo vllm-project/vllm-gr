@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -9,11 +9,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from starlette.datastructures import State
-
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai import api_server as openai_api_server
-from vllm_gr.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tool_parsers import ToolParserManager
 from vllm.usage.usage_lib import UsageContext
@@ -24,6 +22,7 @@ from vllm_gr.engine.arg_utils import GRAsyncEngineArgs
 from vllm_gr.engine.async_gr_engine import GRAsyncLLM
 from vllm_gr.entrypoints.pooling import register_gr_pooling_api_routers
 from vllm_gr.entrypoints.pooling.recommend.serving import GRServingRecommendation
+from vllm_gr.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -53,14 +52,10 @@ def _log_disabled_recommend_api(
             "--model-family hstu."
         )
     elif model_family != "hstu":
-        reasons.append(
-            "Recommend API is mounted only for model_family='hstu'."
-        )
+        reasons.append("Recommend API is mounted only for model_family='hstu'.")
 
     if "embed" not in supported_tasks:
-        reasons.append(
-            "The model does not advertise the required 'embed' task."
-        )
+        reasons.append("The model does not advertise the required 'embed' task.")
 
     logger.warning(
         "Recommend API disabled: model_family=%r, supported_tasks=%s. %s",

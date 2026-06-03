@@ -125,9 +125,7 @@ def main():
             continue
 
     # Collect all files that need fixing
-    all_files_to_fix = (
-        files_missing_both + files_missing_copyright + files_missing_license
-    )
+    all_files_to_fix = files_missing_both + files_missing_copyright + files_missing_license
     if all_files_to_fix:
         print("The following files are missing the SPDX header:")
         if files_missing_both:

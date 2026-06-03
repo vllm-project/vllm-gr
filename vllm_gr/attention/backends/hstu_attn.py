@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """HSTU attention backend that runs on top of vLLM paged KV cache."""
 
@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -50,9 +49,7 @@ def _resolve_hstu_attention_mode(
         "delta": delta_positions,
         "full": full_positions,
     }
-    expected_tokens = {
-        mode: int(positions.numel()) for mode, positions in token_positions.items()
-    }
+    expected_tokens = {mode: int(positions.numel()) for mode, positions in token_positions.items()}
 
     if attn_mode is None:
         for candidate_mode in ("full", "prefix", "delta"):
@@ -74,8 +71,10 @@ def _resolve_hstu_attention_mode(
             f"{attn_mode}, got query={query.shape[0]} key={key.shape[0]}."
         )
     return attn_mode, token_positions[attn_mode]
+
+
 @dataclass
-class HSTUAttentionMetadata(AttentionMetadata):
+class HSTUAttentionMetadata(AttentionMetadata):  # type: ignore[misc]
     """HSTU-specific metadata layered on top of vLLM common attention metadata."""
 
     common_attn_metadata: CommonAttentionMetadata
@@ -150,9 +149,7 @@ class HSTUAttentionMetadata(AttentionMetadata):
         device: torch.device | None = None,
     ) -> None:
         target_device = (
-            device
-            if device is not None
-            else self.common_attn_metadata.slot_mapping.device
+            device if device is not None else self.common_attn_metadata.slot_mapping.device
         )
         device_key = self._device_key(target_device)
         if (
@@ -173,9 +170,8 @@ class HSTUAttentionMetadata(AttentionMetadata):
         if query_start_loc.device.type != "cpu":
             query_start_loc = query_start_loc.cpu()
 
-        prefix_seq_lens = (
-            self.history_lengths.to(device=target_device, dtype=torch.int64)
-            + int(self.contextual_seq_len)
+        prefix_seq_lens = self.history_lengths.to(device=target_device, dtype=torch.int64) + int(
+            self.contextual_seq_len
         )
         delta_lengths = self.num_targets.to(device=target_device, dtype=torch.int64)
         full_seq_lens = common.seq_lens.to(device=target_device, dtype=torch.int64)
@@ -219,15 +215,9 @@ class HSTUAttentionMetadata(AttentionMetadata):
         empty = torch.empty(0, device=target_device, dtype=torch.long)
         slot_mapping = common.slot_mapping.to(device=target_device, dtype=torch.long)
         self._cached_position_device = device_key
-        self._cached_prefix_positions = (
-            torch.cat(prefix_positions) if prefix_positions else empty
-        )
-        self._cached_delta_positions = (
-            torch.cat(delta_positions) if delta_positions else empty
-        )
-        self._cached_full_positions = (
-            torch.cat(full_positions) if full_positions else empty
-        )
+        self._cached_prefix_positions = torch.cat(prefix_positions) if prefix_positions else empty
+        self._cached_delta_positions = torch.cat(delta_positions) if delta_positions else empty
+        self._cached_full_positions = torch.cat(full_positions) if full_positions else empty
         self._cached_prefix_slot_mapping = slot_mapping[self._cached_prefix_positions]
         self._cached_delta_slot_mapping = slot_mapping[self._cached_delta_positions]
         self._cached_full_slot_mapping = slot_mapping[self._cached_full_positions]
@@ -275,7 +265,7 @@ class HSTUAttentionMetadata(AttentionMetadata):
         raise ValueError(f"Unsupported HSTU attention mode: {mode}")
 
 
-class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadata]):
+class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadata]):  # type: ignore[misc]
     """Build complete HSTU metadata for vLLM attention layers."""
 
     supports_update_block_table = True
@@ -359,7 +349,7 @@ class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadat
         )
 
 
-class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):
+class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[misc]
     """HSTU attention impl that consumes vLLM paged KV cache."""
 
     def __init__(
@@ -415,17 +405,13 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):
         prefix_seq_lens, full_seq_lens = attn_metadata.get_seq_lens(
             device=query.device,
         )
-        total_delta_tokens = int(
-            attn_metadata.num_targets.to(dtype=torch.int64).sum().item()
-        )
+        total_delta_tokens = int(attn_metadata.num_targets.to(dtype=torch.int64).sum().item())
         total_full_tokens = int(full_seq_lens.sum().item())
         if kv_cache.numel() == 0:
             if output is not None:
                 return output
             target_tokens = (
-                total_delta_tokens
-                if query.shape[0] == total_delta_tokens
-                else total_full_tokens
+                total_delta_tokens if query.shape[0] == total_delta_tokens else total_full_tokens
             )
             return torch.zeros(
                 target_tokens,
@@ -452,11 +438,7 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):
         # but the underlying attention kernels are still invoked with
         # contextual_seq_len=0 in the regular full-forward implementation.
         contextual_seq_len = 0
-        runtime_kernel = (
-            HammerKernel.NPU
-            if query.device.type == "npu"
-            else HammerKernel.PYTORCH
-        )
+        runtime_kernel = HammerKernel.NPU if query.device.type == "npu" else HammerKernel.PYTORCH
 
         if mode == "delta":
             if total_delta_tokens == 0:
@@ -483,22 +465,18 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):
                 kernel=runtime_kernel,
             )
             if output is not None:
-                output[:delta_output.shape[0]].copy_(delta_output)
+                output[: delta_output.shape[0]].copy_(delta_output)
                 return output
             return delta_output
 
         if mode == "prefix":
-            prefix_k, prefix_v, prefix_max_seq_len, prefix_offsets = (
-                layer.read_from_paged_cache(
-                    attn_metadata.common_attn_metadata.block_table_tensor,
-                    prefix_seq_lens,
-                    kv_cache=kv_cache,
-                )
+            prefix_k, prefix_v, prefix_max_seq_len, prefix_offsets = layer.read_from_paged_cache(
+                attn_metadata.common_attn_metadata.block_table_tensor,
+                prefix_seq_lens,
+                kv_cache=kv_cache,
             )
             del prefix_max_seq_len
-            full_max_seq_len = (
-                int(full_seq_lens.max().item()) if full_seq_lens.numel() > 0 else 0
-            )
+            full_max_seq_len = int(full_seq_lens.max().item()) if full_seq_lens.numel() > 0 else 0
             prefix_output = hstu_mha(
                 max_seq_len=full_max_seq_len,
                 alpha=self.scale,
@@ -512,7 +490,7 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):
                 kernel=runtime_kernel,
             )
             if output is not None:
-                output[:prefix_output.shape[0]].copy_(prefix_output)
+                output[: prefix_output.shape[0]].copy_(prefix_output)
                 return output
             return prefix_output
 
@@ -534,12 +512,12 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):
             kernel=runtime_kernel,
         )
         if output is not None:
-            output[:full_output.shape[0]].copy_(full_output)
+            output[: full_output.shape[0]].copy_(full_output)
             return output
         return full_output
 
 
-class HSTUAttentionBackend(AttentionBackend):
+class HSTUAttentionBackend(AttentionBackend):  # type: ignore[misc]
     """vLLM backend descriptor for HSTU KV cache pages."""
 
     head_size_v: int = 128

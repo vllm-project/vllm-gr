@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """
 HSTU Compute Operators
@@ -47,7 +48,7 @@ def hstu_compute_uqvk(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute U, Q, V, K for HSTU layer.
-    
+
     Args:
         x: Input tensor (L, E)
         norm_weight, norm_bias: LayerNorm parameters
@@ -58,16 +59,16 @@ def hstu_compute_uqvk(
         uvqk_weight, uvqk_bias: Projection parameters
         kernel: Requested kernel type. Specialized paths are not implemented
             here beyond the downstream PyTorch-backed attention entry point.
-    
+
     Returns:
         (u, q, k, v) tensors
     """
     # Layer normalization
     normed_x = layer_norm(x, weight=norm_weight, bias=norm_bias, eps=norm_eps, kernel=kernel)
-    
+
     # Project to U, V, Q, K
     uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
-    
+
     # Split into components
     u, v, q, k = torch.split(
         uvqk,
@@ -79,15 +80,15 @@ def hstu_compute_uqvk(
         ],
         dim=1,
     )
-    
+
     # Apply SiLU activation to gate
     u = F.silu(u)
-    
+
     # Reshape Q, K, V
     q = q.view(-1, num_heads, attn_dim)
     k = k.view(-1, num_heads, attn_dim)
     v = v.view(-1, num_heads, hidden_dim)
-    
+
     return u, q, k, v
 
 
@@ -179,7 +180,7 @@ def hstu_preprocess_and_attention(
         uvqk_bias=uvqk_bias,
         kernel=kernel,
     )
-    
+
     # Compute attention
     attn_output = hstu_mha(
         max_seq_len=max_seq_len,
@@ -197,5 +198,5 @@ def hstu_preprocess_and_attention(
         sort_by_length=sort_by_length,
         kernel=kernel,
     ).view(-1, hidden_dim * num_heads)
-    
+
     return u, attn_output, k, v

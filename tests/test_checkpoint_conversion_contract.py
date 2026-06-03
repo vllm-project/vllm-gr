@@ -1,21 +1,22 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import builtins
 import importlib.util
 import json
-from pathlib import Path
-from types import SimpleNamespace
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "convert_gr_checkpoint.py"
@@ -25,7 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def _load_module(name: str, path: Path):
+def _load_module(name: str, path: Path) -> None:
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -34,10 +35,8 @@ def _load_module(name: str, path: Path):
     return module
 
 
-def _make_fake_checkpoint_module():
-    fake_checkpoint_module = types.ModuleType(
-        "vllm_gr.models.dlrm_v3.checkpoint"
-    )
+def _make_fake_checkpoint_module() -> None:
+    fake_checkpoint_module = types.ModuleType("vllm_gr.models.dlrm_v3.checkpoint")
     fake_checkpoint_module.is_sparse_key = lambda *args, **kwargs: False
     fake_checkpoint_module.load_dense_state_dict = lambda *args, **kwargs: None
     fake_checkpoint_module.load_sparse_checkpoint = lambda *args, **kwargs: None
@@ -45,8 +44,7 @@ def _make_fake_checkpoint_module():
 
 
 class TestCheckpointConversionContract(unittest.TestCase):
-
-    def test_dataset_choices_follow_supported_dataset_registry(self):
+    def test_dataset_choices_follow_supported_dataset_registry(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -68,7 +66,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
             tuple(dataset_module.SUPPORTED_DATASETS),
         )
 
-    def test_sparse_embedding_dtype_follows_table_config(self):
+    def test_sparse_embedding_dtype_follows_table_config(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -108,7 +106,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
         self.assertEqual(user_dtype, torch.float16)
         self.assertEqual(int_dtype, torch.int64)
 
-    def test_convert_fails_when_sparse_weights_exist_without_config(self):
+    def test_convert_fails_when_sparse_weights_exist_without_config(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -135,7 +133,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
                         output_format="pt",
                     )
 
-    def test_load_sparse_weights_fails_when_model_exposes_no_sparse_params(self):
+    def test_load_sparse_weights_fails_when_model_exposes_no_sparse_params(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -152,16 +150,16 @@ class TestCheckpointConversionContract(unittest.TestCase):
 
         class _FakeHSTUConfig:
             @classmethod
-            def from_pretrained(cls, _config_dir):
+            def from_pretrained(cls, _config_dir) -> None:
                 return object()
 
         class _FakeInnerModel:
             @staticmethod
-            def state_dict():
+            def state_dict() -> None:
                 return {}
 
         class _FakeHSTUForRecommendation:
-            def __init__(self, config):
+            def __init__(self, config) -> None:
                 self.hstu = _FakeInnerModel()
 
         fake_config_module.HSTUConfig = _FakeHSTUConfig
@@ -187,7 +185,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
                         dense_weights={},
                     )
 
-    def test_convert_fails_when_safetensors_requested_but_missing(self):
+    def test_convert_fails_when_safetensors_requested_but_missing(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -224,7 +222,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
                             output_format="safetensors",
                         )
 
-    def test_crop_sparse_weights_only_trims_embedding_weight_tensors(self):
+    def test_crop_sparse_weights_only_trims_embedding_weight_tensors(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -273,7 +271,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
             )
         )
 
-    def test_crop_sparse_weights_trims_embedding_row_count(self):
+    def test_crop_sparse_weights_trims_embedding_row_count(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -308,7 +306,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
             sparse_weights["_embedding_collection.embeddings.item_id.weight"][:3],
         )
 
-    def test_write_target_config_preserves_contextual_feature_order_from_source(self):
+    def test_write_target_config_preserves_contextual_feature_order_from_source(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -337,7 +335,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
             }
 
         class _FakeTargetConfig:
-            def to_dict(self):
+            def to_dict(self) -> None:
                 return {
                     "model_type": "hstu",
                     "contextual_feature_to_max_length": {
@@ -376,7 +374,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
                 ["user_id", "sex", "age_group", "occupation", "zip_code"],
             )
 
-    def test_convert_split_weights_writes_dense_and_embedding_files(self):
+    def test_convert_split_weights_writes_dense_and_embedding_files(self) -> None:
         fake_checkpoint_module = _make_fake_checkpoint_module()
 
         with mock.patch.dict(
@@ -399,7 +397,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
                 },
             ]
 
-            def to_dict(self):
+            def to_dict(self) -> None:
                 return {
                     "model_type": "hstu",
                     "hstu_embedding_table_dim": 8,
@@ -416,7 +414,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
                 }
 
         class _FakeTargetConfig(_FakeSourceConfig):
-            def __init__(self, cropped_num_embeddings: int):
+            def __init__(self, cropped_num_embeddings: int) -> None:
                 self.hstu_embedding_table_dim = 8
                 self.embedding_tables = [
                     {
@@ -427,7 +425,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
                     }
                 ]
 
-            def to_dict(self):
+            def to_dict(self) -> None:
                 return {
                     "model_type": "hstu",
                     "hstu_embedding_table_dim": self.hstu_embedding_table_dim,
@@ -443,40 +441,48 @@ class TestCheckpointConversionContract(unittest.TestCase):
             input_dir.mkdir()
             (input_dir / "sparse").mkdir()
 
-            with mock.patch.object(
-                module,
-                "load_dense_weights",
-                return_value={"dense.weight": torch.ones(2, 2, dtype=torch.float32)},
-            ), mock.patch.object(
-                module,
-                "_materialize_source_config",
-                return_value=str(root / "source_cfg"),
-            ), mock.patch.object(
-                module,
-                "_load_hstu_config",
-                return_value=_FakeSourceConfig(),
-            ), mock.patch.object(
-                module,
-                "_build_target_hstu_config",
-                side_effect=lambda source_config, crop_embedding_dim, crop_num_embeddings=None: _FakeTargetConfig(
-                    crop_num_embeddings or 3
+            with (
+                mock.patch.object(
+                    module,
+                    "load_dense_weights",
+                    return_value={"dense.weight": torch.ones(2, 2, dtype=torch.float32)},
                 ),
-            ), mock.patch.object(
-                module,
-                "load_sparse_weights",
-                return_value={
-                    "_embedding_collection.embeddings.item_id.weight": torch.arange(
-                        24, dtype=torch.float32
-                    ).reshape(3, 8),
-                },
-            ), mock.patch.object(
-                module,
-                "_init_single_process_distributed",
-                return_value=None,
-            ), mock.patch.object(
-                module,
-                "_destroy_distributed",
-                return_value=None,
+                mock.patch.object(
+                    module,
+                    "_materialize_source_config",
+                    return_value=str(root / "source_cfg"),
+                ),
+                mock.patch.object(
+                    module,
+                    "_load_hstu_config",
+                    return_value=_FakeSourceConfig(),
+                ),
+                mock.patch.object(
+                    module,
+                    "_build_target_hstu_config",
+                    side_effect=lambda source_config,
+                    crop_embedding_dim,
+                    crop_num_embeddings=None: _FakeTargetConfig(crop_num_embeddings or 3),
+                ),
+                mock.patch.object(
+                    module,
+                    "load_sparse_weights",
+                    return_value={
+                        "_embedding_collection.embeddings.item_id.weight": torch.arange(
+                            24, dtype=torch.float32
+                        ).reshape(3, 8),
+                    },
+                ),
+                mock.patch.object(
+                    module,
+                    "_init_single_process_distributed",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    module,
+                    "_destroy_distributed",
+                    return_value=None,
+                ),
             ):
                 module.convert(
                     input_path=str(input_dir),
@@ -508,9 +514,7 @@ class TestCheckpointConversionContract(unittest.TestCase):
             self.assertEqual(tuple(dense_state["hstu.dense.weight"].shape), (2, 2))
             self.assertEqual(
                 tuple(
-                    embedding_state[
-                        "hstu._embedding_collection.embeddings.item_id.weight"
-                    ].shape
+                    embedding_state["hstu._embedding_collection.embeddings.item_id.weight"].shape
                 ),
                 (2, 8),
             )

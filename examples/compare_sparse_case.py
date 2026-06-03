@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Compare one selected case across golden/native and converted sparse paths.
 
@@ -181,9 +181,7 @@ def _truncate_table_config_num_embeddings(
     if max_num_embeddings is None:
         return
     if max_num_embeddings <= 0:
-        raise ValueError(
-            f"--max-num-embeddings must be > 0, got {max_num_embeddings}"
-        )
+        raise ValueError(f"--max-num-embeddings must be > 0, got {max_num_embeddings}")
     for emb_cfg in table_config.values():
         emb_cfg.num_embeddings = min(int(emb_cfg.num_embeddings), max_num_embeddings)
 
@@ -592,9 +590,7 @@ def _compare_payload_features(
     preview_dim: int,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {}
-    all_keys = sorted(
-        set(native_payload_features.keys()) | set(converted_payload_features.keys())
-    )
+    all_keys = sorted(set(native_payload_features.keys()) | set(converted_payload_features.keys()))
 
     for key in all_keys:
         native_value = native_payload_features.get(key)
@@ -688,7 +684,9 @@ def _load_converted_context(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _build_config_compare(native_ctx: dict[str, Any], converted_ctx: dict[str, Any]) -> dict[str, Any]:
+def _build_config_compare(
+    native_ctx: dict[str, Any], converted_ctx: dict[str, Any]
+) -> dict[str, Any]:
     native_hstu_config = native_ctx["hstu_config"]
     converted_config = converted_ctx["config"]
 
@@ -770,7 +768,6 @@ def _print_summary(report: dict[str, Any]) -> None:
             f"native_dtype={entry['native_dtype']} converted_dtype={entry['converted_dtype']} "
             f"mean_abs={entry.get('mean_abs_error')} max_abs={entry.get('max_abs_error')}"
         )
-
 
     print("\n== Payload Features ==")
     for key, entry in report["payload_features"].items():

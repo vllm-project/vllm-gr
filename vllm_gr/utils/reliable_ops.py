@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Backend-aware operator wrappers with conservative fallbacks."""
 
@@ -167,7 +167,7 @@ class ReliableOps:
             end = int(offsets[idx + 1].item())
             length = min(end - start, max_length)
             if length > 0:
-                output[idx, :length] = values[start:start + length]
+                output[idx, :length] = values[start : start + length]
 
         if width == 1:
             output = output.squeeze(-1)

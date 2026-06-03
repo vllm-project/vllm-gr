@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Analyze prediction-vs-GT error for acc_test JSON outputs."""
 
@@ -10,7 +10,6 @@ import argparse
 import json
 import math
 from collections import Counter
-from pathlib import Path
 from typing import Any
 
 
@@ -102,9 +101,7 @@ def _build_input_case_meta_map(payload: dict[str, Any]) -> dict[str, dict[str, i
         user_history = case.get("user_history")
         candidates = case.get("candidates")
         if not isinstance(user_history, list) or not isinstance(candidates, list):
-            raise ValueError(
-                "input JSON cases must contain list fields: user_history, candidates"
-            )
+            raise ValueError("input JSON cases must contain list fields: user_history, candidates")
         out[case_id] = {
             "user_history_len": len(user_history),
             "input_num_candidates": len(candidates),
@@ -114,8 +111,7 @@ def _build_input_case_meta_map(payload: dict[str, Any]) -> dict[str, dict[str, i
 
 def _candidate_id_keys(row: dict[str, Any]) -> list[str]:
     return sorted(
-        key for key in row.keys()
-        if key not in {"score", "candidate_index", "task_scores"}
+        key for key in row.keys() if key not in {"score", "candidate_index", "task_scores"}
     )
 
 
@@ -128,16 +124,13 @@ def _validate_row_alignment(
     pred_idx = pred_row.get("candidate_index")
     gt_idx = gt_row.get("candidate_index")
     if pred_idx != gt_idx:
-        raise ValueError(
-            f"case={case_id} candidate_index mismatch: pred={pred_idx} gt={gt_idx}"
-        )
+        raise ValueError(f"case={case_id} candidate_index mismatch: pred={pred_idx} gt={gt_idx}")
 
     pred_id_keys = _candidate_id_keys(pred_row)
     gt_id_keys = _candidate_id_keys(gt_row)
     if pred_id_keys != gt_id_keys:
         raise ValueError(
-            f"case={case_id} candidate id key mismatch: "
-            f"pred={pred_id_keys} gt={gt_id_keys}"
+            f"case={case_id} candidate id key mismatch: pred={pred_id_keys} gt={gt_id_keys}"
         )
 
     for key in pred_id_keys:
@@ -166,9 +159,7 @@ def main() -> int:
     pred_payload = _load_json(args.pred_json)
     gt_payload = _load_json(args.gt_json)
     input_case_meta = (
-        _build_input_case_meta_map(_load_json(args.input_json))
-        if args.input_json
-        else {}
+        _build_input_case_meta_map(_load_json(args.input_json)) if args.input_json else {}
     )
 
     pred_cases = _build_case_map(pred_payload, label="prediction")
@@ -198,8 +189,7 @@ def main() -> int:
             raise ValueError(f"case={case_id} missing scores list")
         if len(pred_scores) != len(gt_scores):
             raise ValueError(
-                f"case={case_id} score length mismatch: "
-                f"pred={len(pred_scores)} gt={len(gt_scores)}"
+                f"case={case_id} score length mismatch: pred={len(pred_scores)} gt={len(gt_scores)}"
             )
 
         case_rel_errors: list[float] = []
@@ -220,8 +210,7 @@ def main() -> int:
             rel_err = abs_err / max(abs(gt_score), args.eps)
             if not math.isfinite(abs_err) or not math.isfinite(rel_err):
                 raise ValueError(
-                    f"case={case_id} has non-finite error values: "
-                    f"pred={pred_score} gt={gt_score}"
+                    f"case={case_id} has non-finite error values: pred={pred_score} gt={gt_score}"
                 )
 
             rel_errors.append(rel_err)
@@ -263,9 +252,7 @@ def main() -> int:
     case_summaries.sort(key=lambda x: (x["mean_rel_error"], x["max_rel_error"]), reverse=True)
     entry_summaries.sort(key=lambda x: (x["rel_error"], x["abs_error"]), reverse=True)
 
-    top_entry_case_hits = Counter(
-        row["case_id"] for row in entry_summaries[: args.top_k_entries]
-    )
+    top_entry_case_hits = Counter(row["case_id"] for row in entry_summaries[: args.top_k_entries])
     for row in case_summaries:
         row["worst_entry_hits"] = top_entry_case_hits.get(row["case_id"], 0)
 
@@ -303,8 +290,10 @@ def main() -> int:
     print("\n== Worst Candidate Entries ==")
     for row in entry_summaries[: args.top_k_entries]:
         id_fields = [
-            f"{key}={row[key]}" for key in sorted(row.keys())
-            if key not in {
+            f"{key}={row[key]}"
+            for key in sorted(row.keys())
+            if key
+            not in {
                 "case_id",
                 "candidate_index",
                 "pred_score",

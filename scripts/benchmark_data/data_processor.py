@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Shared helpers for benchmark dataset download and extraction."""
 
@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import abc
 import logging
-from pathlib import Path
 import ssl
 import tarfile
+from pathlib import Path
 from urllib.request import urlopen
 from zipfile import ZipFile
 
@@ -51,9 +51,7 @@ class DataProcessor(abc.ABC):
         if self.archive_path.exists():
             return
         if self.insecure:
-            self.log.warning(
-                "Downloading %s with SSL verification disabled", self.download_url
-            )
+            self.log.warning("Downloading %s with SSL verification disabled", self.download_url)
         else:
             self.log.info("Downloading %s", self.download_url)
 

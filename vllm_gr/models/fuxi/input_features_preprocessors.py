@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with minimal modifications.
-# Licensed under the Apache License, Version 2.0
 
 # pyre-unsafe
 
@@ -13,7 +14,6 @@ import torch.nn as nn
 
 
 class InputFeaturesPreprocessorModule(torch.nn.Module):
-
     @abc.abstractmethod
     def debug_str(self) -> str:
         pass
@@ -33,10 +33,7 @@ def _truncated_normal_(tensor: torch.Tensor, mean: float, std: float) -> None:
     nn.init.trunc_normal_(tensor, mean=mean, std=std, a=mean - 2 * std, b=mean + 2 * std)
 
 
-class LearnablePositionalEmbeddingInputFeaturesPreprocessor(
-    InputFeaturesPreprocessorModule
-):
-
+class LearnablePositionalEmbeddingInputFeaturesPreprocessor(InputFeaturesPreprocessorModule):
     def __init__(
         self,
         max_sequence_len: int,
@@ -85,10 +82,7 @@ class LearnablePositionalEmbeddingInputFeaturesPreprocessor(
         return past_lengths, user_embeddings, valid_mask
 
 
-class LearnablePositionalEmbeddingRatedInputFeaturesPreprocessor(
-    InputFeaturesPreprocessorModule
-):
-
+class LearnablePositionalEmbeddingRatedInputFeaturesPreprocessor(InputFeaturesPreprocessorModule):
     def __init__(
         self,
         max_sequence_len: int,

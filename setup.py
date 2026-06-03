@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Setup script for vllm-GR.
@@ -17,15 +17,14 @@ Uninstallation:
     pip uninstall vllm-gr
 """
 
-import os
 from setuptools import setup
 
 # Try to build the C++ minheap extension.
 # If pybind11 or numpy is not available, skip silently (e.g. during metadata generation).
 ext_modules = []
 try:
-    import pybind11
     import numpy as np
+    import pybind11
     from setuptools import Extension
 
     ext_modules = [

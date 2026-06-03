@@ -1,18 +1,17 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Yuanrong KV pool backend implementation for Ascend/NPU runtimes."""
 
 import hashlib
 import os
-import re
 from typing import Any
 
+import regex as re
 import torch
 from vllm.config import ParallelConfig
 from vllm.logger import logger
 from vllm.utils.network_utils import split_host_port
-
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import (
     Backend,
 )
@@ -22,12 +21,8 @@ class YuanrongBackend(Backend):
     """Backend implementation mirrored from the upstream vllm-ascend patch."""
 
     _DS_KEY_MAX_LEN = 255
-    _DS_KEY_ALLOWED_PATTERN = re.compile(
-        r"^[a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]+$"
-    )
-    _DS_KEY_INVALID_CHAR_PATTERN = re.compile(
-        r"[^a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]"
-    )
+    _DS_KEY_ALLOWED_PATTERN = re.compile(r"^[a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]+$")
+    _DS_KEY_INVALID_CHAR_PATTERN = re.compile(r"[^a-zA-Z0-9\-_!@#%\^\*\(\)\+\=\:;]")
     _DS_KEY_HASH_SUFFIX_LEN = 16
     _TRANSFER_PREVIEW_LIMIT = 8
 
@@ -42,15 +37,12 @@ class YuanrongBackend(Backend):
             from yr.datasystem.object_client import WriteMode  # type: ignore
         except ImportError as exc:
             raise ImportError(
-                "Please install openyuanrong-datasystem to use the "
-                "yuanrong datasystem backend."
+                "Please install openyuanrong-datasystem to use the yuanrong datasystem backend."
             ) from exc
 
         worker_addr = os.getenv("DS_WORKER_ADDR", "")
         host, port = split_host_port(worker_addr)
-        enable_exclusive_connection = bool(
-            int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0"))
-        )
+        enable_exclusive_connection = bool(int(os.getenv("DS_ENABLE_EXCLUSIVE_CONNECTION", "0")))
         enable_remote_h2d = bool(int(os.getenv("DS_ENABLE_REMOTE_H2D", "0")))
         self._hetero_client = HeteroClient(
             host,
@@ -69,16 +61,13 @@ class YuanrongBackend(Backend):
     def _normalize_ds_keys(self, keys: list[str]) -> list[str]:
         normalized: list[str] = []
         for key in keys:
-            if (
-                len(key) <= self._DS_KEY_MAX_LEN
-                and self._DS_KEY_ALLOWED_PATTERN.match(key)
-            ):
+            if len(key) <= self._DS_KEY_MAX_LEN and self._DS_KEY_ALLOWED_PATTERN.match(key):
                 normalized.append(key)
                 continue
 
             sanitized = self._DS_KEY_INVALID_CHAR_PATTERN.sub("_", key)
             hash_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-            suffix = f"__{hash_digest[:self._DS_KEY_HASH_SUFFIX_LEN]}"
+            suffix = f"__{hash_digest[: self._DS_KEY_HASH_SUFFIX_LEN]}"
             max_prefix_len = self._DS_KEY_MAX_LEN - len(suffix)
             normalized.append(sanitized[:max_prefix_len] + suffix)
         return normalized
@@ -98,16 +87,13 @@ class YuanrongBackend(Backend):
             raise ValueError("Address list and size list length mismatch.")
         if self._ds_device_id is None:
             logger.error(
-                "Device id is not set. Call set_device() before using the "
-                "yuanrong backend."
+                "Device id is not set. Call set_device() before using the yuanrong backend."
             )
             raise RuntimeError("Yuanrong backend device id is not initialized.")
         blobs = [self._ds_blob_cls(addr, size) for addr, size in zip(addrs, sizes)]
         return self._ds_blob_list_cls(self._ds_device_id, blobs)
 
-    def _summarize_transfer(
-        self, sizes: list[list[int]]
-    ) -> tuple[int, int, list[int]]:
+    def _summarize_transfer(self, sizes: list[list[int]]) -> tuple[int, int, list[int]]:
         per_key_bytes = [sum(size_list) for size_list in sizes]
         blob_count = sum(len(size_list) for size_list in sizes)
         total_bytes = sum(per_key_bytes)
@@ -139,9 +125,7 @@ class YuanrongBackend(Backend):
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         normalized_keys = self._normalize_ds_keys(keys)
         try:
-            blob_count, total_bytes, per_key_bytes = self._summarize_transfer(
-                sizes
-            )
+            blob_count, total_bytes, per_key_bytes = self._summarize_transfer(sizes)
             logger.info(
                 "Calling Yuanrong mget_h2d with key_count=%d, blob_count=%d, "
                 "total_size=%s, per_key_mb=%s",
@@ -167,9 +151,7 @@ class YuanrongBackend(Backend):
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         normalized_keys = self._normalize_ds_keys(keys)
         try:
-            blob_count, total_bytes, per_key_bytes = self._summarize_transfer(
-                sizes
-            )
+            blob_count, total_bytes, per_key_bytes = self._summarize_transfer(sizes)
             logger.info(
                 "Calling Yuanrong mset_d2h with key_count=%d, blob_count=%d, "
                 "total_size=%s, per_key_mb=%s",

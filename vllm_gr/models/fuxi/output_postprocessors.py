@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR without modification.
-# Licensed under the Apache License, Version 2.0
 
 # pyre-unsafe
 
@@ -11,7 +12,6 @@ import torch.nn.functional as F
 
 
 class OutputPostprocessorModule(torch.nn.Module):
-
     @abc.abstractmethod
     def debug_str(self) -> str:
         pass
@@ -25,7 +25,6 @@ class OutputPostprocessorModule(torch.nn.Module):
 
 
 class L2NormEmbeddingPostprocessor(OutputPostprocessorModule):
-
     def __init__(
         self,
         embedding_dim: int,
@@ -50,7 +49,6 @@ class L2NormEmbeddingPostprocessor(OutputPostprocessorModule):
 
 
 class LayerNormEmbeddingPostprocessor(OutputPostprocessorModule):
-
     def __init__(
         self,
         embedding_dim: int,

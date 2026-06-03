@@ -1,14 +1,14 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """FuXi-alpha inference model implementation."""
 
 from vllm_gr.models.fuxi.fuxi_module import (
+    TIMESTAMPS_KEY,
     FuXiAlphaInferenceModel,
     FuXiBlockJagged,
     FuXiJagged,
     MultistageFeedforwardNeuralNetwork,
-    TIMESTAMPS_KEY,
     build_input_features_preprocessor,
     build_output_postprocessor,
 )

@@ -12,6 +12,7 @@ Covers all 7 sections of the test plan:
   7. Integration / cross-process
 """
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import asyncio

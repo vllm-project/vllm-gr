@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -92,9 +94,7 @@ def _group_keys_by_module(keys: set) -> Dict[str, list]:
 def load_dense_state_dict(model: torch.nn.Module, state_dict: Dict[str, Any]) -> None:
     own_state = model.state_dict()
     own_state_dense_keys = {k for k, v in own_state.items() if not is_sparse_key(k, v)}
-    state_dict_dense_keys = {
-        k for k, v in state_dict.items() if not is_sparse_key(k, v)
-    }
+    state_dict_dense_keys = {k for k, v in state_dict.items() if not is_sparse_key(k, v)}
 
     if own_state_dense_keys != state_dict_dense_keys:
         missing_in_model = sorted(state_dict_dense_keys - own_state_dense_keys)
@@ -177,7 +177,7 @@ def save_dmp_checkpoint(
     if path == "":
         return
     now = datetime.now()
-    formatted_datetime = now.strftime("%Y_%m_%d_%H_%M_%S")
+    _formatted_datetime = now.strftime("%Y_%m_%d_%H_%M_%S")
     path = f"{path}/{batch_idx}"
     if not os.path.exists(path) and rank == 0:
         os.makedirs(path)
@@ -186,23 +186,17 @@ def save_dmp_checkpoint(
         os.makedirs(sparse_path)
     non_sparse_ckpt = f"{path}/non_sparse.ckpt"
 
-    sparse_tensor_keys = {
-        k for k, v in model.state_dict().items() if isinstance(v, ShardedTensor)
-    }
+    sparse_tensor_keys = {k for k, v in model.state_dict().items() if isinstance(v, ShardedTensor)}
     if rank == 0:
         dense_state_dict = {
-            k: v
-            for k, v in model.state_dict().items()
-            if not isinstance(v, ShardedTensor)
+            k: v for k, v in model.state_dict().items() if not isinstance(v, ShardedTensor)
         }
         class_metric_state_dict = {
             "train": [m.state_dict() for m in metric_logger.class_metrics["train"]],
             "eval": [m.state_dict() for m in metric_logger.class_metrics["eval"]],
         }
         regression_metric_state_dict = {
-            "train": [
-                m.state_dict() for m in metric_logger.regression_metrics["train"]
-            ],
+            "train": [m.state_dict() for m in metric_logger.regression_metrics["train"]],
             "eval": [m.state_dict() for m in metric_logger.regression_metrics["eval"]],
         }
         torch.save(
@@ -234,9 +228,7 @@ def load_sparse_checkpoint(
         return
     sparse_path = f"{path}/sparse/"
 
-    sparse_tensor_keys = {
-        k for k, v in model.state_dict().items() if is_sparse_key(k, v)
-    }
+    sparse_tensor_keys = {k for k, v in model.state_dict().items() if is_sparse_key(k, v)}
     sparse_dict = {"sparse_dict": SparseState(model, sparse_tensor_keys)}
     gc.collect()
     torch.distributed.checkpoint.load(
@@ -271,7 +263,9 @@ def load_nonsparse_checkpoint(
     non_sparse_ckpt = f"{path}/non_sparse.ckpt"
 
     non_sparse_state_dict = torch.load(
-        non_sparse_ckpt, map_location=device, weights_only=False,
+        non_sparse_ckpt,
+        map_location=device,
+        weights_only=False,
     )
     load_dense_state_dict(model, non_sparse_state_dict["dense_dict"])
     print("dense checkpoint successfully loaded")

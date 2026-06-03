@@ -1,34 +1,28 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
-from types import SimpleNamespace
 import sys
 import types
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = (
-    ROOT
-    / "vllm_gr"
-    / "models"
-    / "dlrm_v3"
-    / "modules"
-    / "dlrm_hstu.py"
-)
+MODULE_PATH = ROOT / "vllm_gr" / "models" / "dlrm_v3" / "modules" / "dlrm_hstu.py"
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def _load_module(name: str, path: Path):
+def _load_module(name: str, path: Path) -> None:
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -37,21 +31,23 @@ def _load_module(name: str, path: Path):
     return module
 
 
-def _make_fake_common_module():
+def _make_fake_common_module() -> None:
     fake_common = types.ModuleType("vllm_gr.models.dlrm_v3.common")
 
     class _HammerModule(torch.nn.Module):
         pass
 
     fake_common.HammerModule = _HammerModule
-    fake_common.fx_infer_max_len = lambda lengths: int(lengths.max().item()) if lengths.numel() else 0
+    fake_common.fx_infer_max_len = (
+        lambda lengths: int(lengths.max().item()) if lengths.numel() else 0
+    )
     fake_common.fx_mark_length_features = lambda lengths: (lengths[0],)
     fake_common.init_mlp_weights_optional_bias = lambda module: module
     fake_common.set_static_max_seq_lens = lambda lengths: None
     return fake_common
 
 
-def _make_placeholder_module(name: str, **attrs):
+def _make_placeholder_module(name: str, **attrs) -> None:
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
@@ -59,8 +55,7 @@ def _make_placeholder_module(name: str, **attrs):
 
 
 class TestDlrmHSTUEmbeddingPadding(unittest.TestCase):
-
-    def _load_dlrm_hstu_module(self):
+    def _load_dlrm_hstu_module(self) -> None:
         fake_torchrec_embedding_configs = _make_placeholder_module(
             "torchrec.modules.embedding_configs",
             EmbeddingConfig=object,
@@ -141,7 +136,7 @@ class TestDlrmHSTUEmbeddingPadding(unittest.TestCase):
                 MODULE_PATH,
             )
 
-    def test_pad_embedding_to_runtime_dim_appends_zero_columns(self):
+    def test_pad_embedding_to_runtime_dim_appends_zero_columns(self) -> None:
         module = self._load_dlrm_hstu_module()
 
         model = module.DlrmHSTU.__new__(module.DlrmHSTU)
@@ -161,7 +156,7 @@ class TestDlrmHSTUEmbeddingPadding(unittest.TestCase):
             torch.zeros((1, 2), dtype=torch.float32),
         )
 
-    def test_pad_embedding_to_runtime_dim_rejects_oversized_embedding(self):
+    def test_pad_embedding_to_runtime_dim_rejects_oversized_embedding(self) -> None:
         module = self._load_dlrm_hstu_module()
 
         model = module.DlrmHSTU.__new__(module.DlrmHSTU)

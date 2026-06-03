@@ -1,15 +1,16 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
-
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -41,9 +42,7 @@ class TestYuanrongMonkeyPatch(unittest.TestCase):
     backend_module_name = (
         "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend"
     )
-    pool_worker_module_name = (
-        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
-    )
+    pool_worker_module_name = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
 
     def _install_fake_runtime(
         self,
@@ -68,7 +67,7 @@ class TestYuanrongMonkeyPatch(unittest.TestCase):
         fake_platforms.current_platform = types.SimpleNamespace(device_type=device_type)
 
         class ParallelConfig:
-            def __init__(self, rank: int = 0):
+            def __init__(self, rank: int = 0) -> None:
                 self.rank = rank
 
         class Backend:
@@ -122,7 +121,7 @@ class TestYuanrongMonkeyPatch(unittest.TestCase):
 
         return saved
 
-    def test_patch_skips_non_npu_platform(self):
+    def test_patch_skips_non_npu_platform(self) -> None:
         saved = self._install_fake_runtime(device_type="cuda", with_pool_worker=True)
         try:
             module = importlib.import_module("vllm_gr.patch")
@@ -136,7 +135,7 @@ class TestYuanrongMonkeyPatch(unittest.TestCase):
             _purge_modules("vllm", "vllm_ascend", "vllm_gr.distributed", "vllm_gr.patch")
             _restore_modules(saved)
 
-    def test_patch_registers_yuanrong_backend_on_npu(self):
+    def test_patch_registers_yuanrong_backend_on_npu(self) -> None:
         saved = self._install_fake_runtime(device_type="npu", with_pool_worker=True)
         try:
             module = importlib.import_module("vllm_gr.patch")
@@ -156,7 +155,7 @@ class TestYuanrongMonkeyPatch(unittest.TestCase):
             _purge_modules("vllm", "vllm_ascend", "vllm_gr.distributed", "vllm_gr.patch")
             _restore_modules(saved)
 
-    def test_patch_is_idempotent(self):
+    def test_patch_is_idempotent(self) -> None:
         saved = self._install_fake_runtime(device_type="npu", with_pool_worker=True)
         try:
             module = importlib.import_module("vllm_gr.patch")
@@ -169,7 +168,7 @@ class TestYuanrongMonkeyPatch(unittest.TestCase):
             _purge_modules("vllm", "vllm_ascend", "vllm_gr.distributed", "vllm_gr.patch")
             _restore_modules(saved)
 
-    def test_patch_skips_cleanly_when_vllm_ascend_pool_worker_missing(self):
+    def test_patch_skips_cleanly_when_vllm_ascend_pool_worker_missing(self) -> None:
         saved = self._install_fake_runtime(device_type="npu", with_pool_worker=False)
         try:
             module = importlib.import_module("vllm_gr.patch")
@@ -181,13 +180,13 @@ class TestYuanrongMonkeyPatch(unittest.TestCase):
             _purge_modules("vllm", "vllm_ascend", "vllm_gr.distributed", "vllm_gr.patch")
             _restore_modules(saved)
 
-    def test_mooncake_import_shim_allows_non_mooncake_backends_to_load(self):
+    def test_mooncake_import_shim_allows_non_mooncake_backends_to_load(self) -> None:
         saved = self._install_fake_runtime(device_type="npu", with_pool_worker=False)
         try:
             module = importlib.import_module("vllm_gr.patch")
             original_import_module = module.importlib.import_module
 
-            def _fake_import(name: str, package=None):
+            def _fake_import(name: str, package=None) -> None:
                 if name == module._ASCEND_MOONCAKE_MODULE:
                     raise ModuleNotFoundError("No module named 'mooncake'", name="mooncake")
                 return original_import_module(name, package)

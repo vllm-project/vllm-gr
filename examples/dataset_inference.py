@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Dataset-specific inference examples for vllm-GR.
@@ -24,26 +24,31 @@ Usage:
     python dataset_inference.py kuairand-1k streaming
 """
 
+import argparse
+import logging
 import os
 import time
-import argparse
-from typing import TYPE_CHECKING, List, Dict, Any
+from typing import TYPE_CHECKING, Any, Dict, List
 
-import logging
-logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
 
-from runtime_utils import add_repo_root_to_path, add_runtime_args, describe_runtime
+from runtime_utils import (  # noqa: E402
+    add_repo_root_to_path,
+    add_runtime_args,
+    describe_runtime,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 add_repo_root_to_path(__file__)
 
 if TYPE_CHECKING:
-    from vllm_gr import GRPrompt, GRRequestOutput
+    from vllm_gr import GRPrompt
 
 
 # =========================================================================
 # Dataset-specific GRPrompt builders
 # =========================================================================
+
 
 def build_movielens_1m_prompts() -> Dict[str, Any]:
     """MovieLens-1M: movie rating prediction with user demographics.
@@ -64,27 +69,85 @@ def build_movielens_1m_prompts() -> Dict[str, Any]:
         {
             "user_id": "ml_user_001",
             "user_history": [
-                {"movie_id": 1193, "movie_rating": 5, "action_timestamp": 978300760,
-                 "item_weights": 1, "dummy_watch_time": 0},
-                {"movie_id": 661,  "movie_rating": 3, "action_timestamp": 978302109,
-                 "item_weights": 1, "dummy_watch_time": 0},
-                {"movie_id": 914,  "movie_rating": 3, "action_timestamp": 978301968,
-                 "item_weights": 2, "dummy_watch_time": 0},
-                {"movie_id": 3408, "movie_rating": 4, "action_timestamp": 978300275,
-                 "item_weights": 1, "dummy_watch_time": 0},
-                {"movie_id": 2355, "movie_rating": 5, "action_timestamp": 978824291,
-                 "item_weights": 4, "dummy_watch_time": 0},
+                {
+                    "movie_id": 1193,
+                    "movie_rating": 5,
+                    "action_timestamp": 978300760,
+                    "item_weights": 1,
+                    "dummy_watch_time": 0,
+                },
+                {
+                    "movie_id": 661,
+                    "movie_rating": 3,
+                    "action_timestamp": 978302109,
+                    "item_weights": 1,
+                    "dummy_watch_time": 0,
+                },
+                {
+                    "movie_id": 914,
+                    "movie_rating": 3,
+                    "action_timestamp": 978301968,
+                    "item_weights": 2,
+                    "dummy_watch_time": 0,
+                },
+                {
+                    "movie_id": 3408,
+                    "movie_rating": 4,
+                    "action_timestamp": 978300275,
+                    "item_weights": 1,
+                    "dummy_watch_time": 0,
+                },
+                {
+                    "movie_id": 2355,
+                    "movie_rating": 5,
+                    "action_timestamp": 978824291,
+                    "item_weights": 4,
+                    "dummy_watch_time": 0,
+                },
             ],
             "candidates": [
-                {"item_movie_id": 1,   "item_movie_rating": 0, "item_query_time": 978830000, "item_action_weights": 0, "item_dummy_watchtime": 0},
-                {"item_movie_id": 48,  "item_movie_rating": 0, "item_query_time": 978830000, "item_action_weights": 0, "item_dummy_watchtime": 0},
-                {"item_movie_id": 150, "item_movie_rating": 0, "item_query_time": 978830000, "item_action_weights": 0, "item_dummy_watchtime": 0},
-                {"item_movie_id": 260, "item_movie_rating": 0, "item_query_time": 978830000, "item_action_weights": 0, "item_dummy_watchtime": 0},
-                {"item_movie_id": 527, "item_movie_rating": 0, "item_query_time": 978830000, "item_action_weights": 0, "item_dummy_watchtime": 0},
+                {
+                    "item_movie_id": 1,
+                    "item_movie_rating": 0,
+                    "item_query_time": 978830000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                },
+                {
+                    "item_movie_id": 48,
+                    "item_movie_rating": 0,
+                    "item_query_time": 978830000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                },
+                {
+                    "item_movie_id": 150,
+                    "item_movie_rating": 0,
+                    "item_query_time": 978830000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                },
+                {
+                    "item_movie_id": 260,
+                    "item_movie_rating": 0,
+                    "item_query_time": 978830000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                },
+                {
+                    "item_movie_id": 527,
+                    "item_movie_rating": 0,
+                    "item_query_time": 978830000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                },
             ],
             "context": {
-                "user_id": 1, "sex": 0, "age_group": 3,
-                "occupation": 7, "zip_code": 567,
+                "user_id": 1,
+                "sex": 0,
+                "age_group": 3,
+                "occupation": 7,
+                "zip_code": 567,
             },
         },
     ]
@@ -93,12 +156,18 @@ def build_movielens_1m_prompts() -> Dict[str, Any]:
         "config_dir": os.path.join(SCRIPT_DIR, "configs", "movielens-1m"),
         "prompts": prompts,
         "uih_feature_names": [
-            "movie_id", "movie_rating", "action_timestamp",
-            "item_weights", "dummy_watch_time",
+            "movie_id",
+            "movie_rating",
+            "action_timestamp",
+            "item_weights",
+            "dummy_watch_time",
         ],
         "candidate_feature_names": [
-            "item_movie_id", "item_movie_rating", "item_query_time",
-            "item_action_weights", "item_dummy_watchtime",
+            "item_movie_id",
+            "item_movie_rating",
+            "item_query_time",
+            "item_action_weights",
+            "item_dummy_watchtime",
         ],
         "primary_id": "movie_id",
     }
@@ -117,35 +186,112 @@ def build_kuairand_1k_prompts() -> Dict[str, Any]:
         {
             "user_id": "kr_user_001",
             "user_history": [
-                {"video_id": 101, "action_timestamp": 1640000000,
-                 "action_weight": 1, "watch_time": 30000},
-                {"video_id": 203, "action_timestamp": 1640003600,
-                 "action_weight": 2, "watch_time": 15000},
-                {"video_id": 55,  "action_timestamp": 1640007200,
-                 "action_weight": 4, "watch_time": 60000},
-                {"video_id": 789, "action_timestamp": 1640010800,
-                 "action_weight": 1, "watch_time": 5000},
-                {"video_id": 412, "action_timestamp": 1640014400,
-                 "action_weight": 8, "watch_time": 45000},
-                {"video_id": 67,  "action_timestamp": 1640018000,
-                 "action_weight": 2, "watch_time": 25000},
+                {
+                    "video_id": 101,
+                    "action_timestamp": 1640000000,
+                    "action_weight": 1,
+                    "watch_time": 30000,
+                },
+                {
+                    "video_id": 203,
+                    "action_timestamp": 1640003600,
+                    "action_weight": 2,
+                    "watch_time": 15000,
+                },
+                {
+                    "video_id": 55,
+                    "action_timestamp": 1640007200,
+                    "action_weight": 4,
+                    "watch_time": 60000,
+                },
+                {
+                    "video_id": 789,
+                    "action_timestamp": 1640010800,
+                    "action_weight": 1,
+                    "watch_time": 5000,
+                },
+                {
+                    "video_id": 412,
+                    "action_timestamp": 1640014400,
+                    "action_weight": 8,
+                    "watch_time": 45000,
+                },
+                {
+                    "video_id": 67,
+                    "action_timestamp": 1640018000,
+                    "action_weight": 2,
+                    "watch_time": 25000,
+                },
             ],
             "candidates": [
-                {"item_video_id": 1001, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1002, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1003, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1004, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1005, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1006, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1007, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1008, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1009, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
-                {"item_video_id": 1010, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 1640020000},
+                {
+                    "item_video_id": 1001,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1002,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1003,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1004,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1005,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1006,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1007,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1008,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1009,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
+                {
+                    "item_video_id": 1010,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 1640020000,
+                },
             ],
             "context": {
-                "user_id": 42, "user_active_degree": 3,
-                "follow_user_num_range": 5, "fans_user_num_range": 4,
-                "friend_user_num_range": 2, "register_days_range": 6,
+                "user_id": 42,
+                "user_active_degree": 3,
+                "follow_user_num_range": 5,
+                "fans_user_num_range": 4,
+                "friend_user_num_range": 2,
+                "register_days_range": 6,
             },
         },
     ]
@@ -154,11 +300,16 @@ def build_kuairand_1k_prompts() -> Dict[str, Any]:
         "config_dir": os.path.join(SCRIPT_DIR, "configs", "kuairand-1k"),
         "prompts": prompts,
         "uih_feature_names": [
-            "video_id", "action_timestamp", "action_weight", "watch_time",
+            "video_id",
+            "action_timestamp",
+            "action_weight",
+            "watch_time",
         ],
         "candidate_feature_names": [
-            "item_video_id", "item_action_weight",
-            "item_target_watchtime", "item_query_time",
+            "item_video_id",
+            "item_action_weight",
+            "item_target_watchtime",
+            "item_query_time",
         ],
         "primary_id": "video_id",
     }
@@ -178,24 +329,104 @@ def build_streaming_prompts() -> Dict[str, Any]:
         {
             "user_id": "stream_user_001",
             "user_history": [
-                {"item_id": 500, "item_rating": 4, "action_timestamp": 1650000000,
-                 "item_weights": 1, "dummy_watch_time": 0, "item_category_id": 3},
-                {"item_id": 501, "item_rating": 5, "action_timestamp": 1650003600,
-                 "item_weights": 2, "dummy_watch_time": 0, "item_category_id": 7},
-                {"item_id": 502, "item_rating": 3, "action_timestamp": 1650007200,
-                 "item_weights": 1, "dummy_watch_time": 0, "item_category_id": 3},
-                {"item_id": 503, "item_rating": 4, "action_timestamp": 1650010800,
-                 "item_weights": 4, "dummy_watch_time": 0, "item_category_id": 12},
+                {
+                    "item_id": 500,
+                    "item_rating": 4,
+                    "action_timestamp": 1650000000,
+                    "item_weights": 1,
+                    "dummy_watch_time": 0,
+                    "item_category_id": 3,
+                },
+                {
+                    "item_id": 501,
+                    "item_rating": 5,
+                    "action_timestamp": 1650003600,
+                    "item_weights": 2,
+                    "dummy_watch_time": 0,
+                    "item_category_id": 7,
+                },
+                {
+                    "item_id": 502,
+                    "item_rating": 3,
+                    "action_timestamp": 1650007200,
+                    "item_weights": 1,
+                    "dummy_watch_time": 0,
+                    "item_category_id": 3,
+                },
+                {
+                    "item_id": 503,
+                    "item_rating": 4,
+                    "action_timestamp": 1650010800,
+                    "item_weights": 4,
+                    "dummy_watch_time": 0,
+                    "item_category_id": 12,
+                },
             ],
             "candidates": [
-                {"item_candidate_id": 2001, "item_candidate_rating": 0, "item_query_time": 1650020000, "item_action_weights": 0, "item_dummy_watchtime": 0, "item_candidate_category_id": 3},
-                {"item_candidate_id": 2002, "item_candidate_rating": 0, "item_query_time": 1650020000, "item_action_weights": 0, "item_dummy_watchtime": 0, "item_candidate_category_id": 7},
-                {"item_candidate_id": 2003, "item_candidate_rating": 0, "item_query_time": 1650020000, "item_action_weights": 0, "item_dummy_watchtime": 0, "item_candidate_category_id": 3},
-                {"item_candidate_id": 2004, "item_candidate_rating": 0, "item_query_time": 1650020000, "item_action_weights": 0, "item_dummy_watchtime": 0, "item_candidate_category_id": 12},
-                {"item_candidate_id": 2005, "item_candidate_rating": 0, "item_query_time": 1650020000, "item_action_weights": 0, "item_dummy_watchtime": 0, "item_candidate_category_id": 5},
-                {"item_candidate_id": 2006, "item_candidate_rating": 0, "item_query_time": 1650020000, "item_action_weights": 0, "item_dummy_watchtime": 0, "item_candidate_category_id": 7},
-                {"item_candidate_id": 2007, "item_candidate_rating": 0, "item_query_time": 1650020000, "item_action_weights": 0, "item_dummy_watchtime": 0, "item_candidate_category_id": 3},
-                {"item_candidate_id": 2008, "item_candidate_rating": 0, "item_query_time": 1650020000, "item_action_weights": 0, "item_dummy_watchtime": 0, "item_candidate_category_id": 12},
+                {
+                    "item_candidate_id": 2001,
+                    "item_candidate_rating": 0,
+                    "item_query_time": 1650020000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                    "item_candidate_category_id": 3,
+                },
+                {
+                    "item_candidate_id": 2002,
+                    "item_candidate_rating": 0,
+                    "item_query_time": 1650020000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                    "item_candidate_category_id": 7,
+                },
+                {
+                    "item_candidate_id": 2003,
+                    "item_candidate_rating": 0,
+                    "item_query_time": 1650020000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                    "item_candidate_category_id": 3,
+                },
+                {
+                    "item_candidate_id": 2004,
+                    "item_candidate_rating": 0,
+                    "item_query_time": 1650020000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                    "item_candidate_category_id": 12,
+                },
+                {
+                    "item_candidate_id": 2005,
+                    "item_candidate_rating": 0,
+                    "item_query_time": 1650020000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                    "item_candidate_category_id": 5,
+                },
+                {
+                    "item_candidate_id": 2006,
+                    "item_candidate_rating": 0,
+                    "item_query_time": 1650020000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                    "item_candidate_category_id": 7,
+                },
+                {
+                    "item_candidate_id": 2007,
+                    "item_candidate_rating": 0,
+                    "item_query_time": 1650020000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                    "item_candidate_category_id": 3,
+                },
+                {
+                    "item_candidate_id": 2008,
+                    "item_candidate_rating": 0,
+                    "item_query_time": 1650020000,
+                    "item_action_weights": 0,
+                    "item_dummy_watchtime": 0,
+                    "item_candidate_category_id": 12,
+                },
             ],
             "context": {"user_id": 100},
         },
@@ -205,13 +436,20 @@ def build_streaming_prompts() -> Dict[str, Any]:
         "config_dir": os.path.join(SCRIPT_DIR, "configs", "streaming"),
         "prompts": prompts,
         "uih_feature_names": [
-            "item_id", "item_rating", "action_timestamp",
-            "item_weights", "dummy_watch_time", "item_category_id",
+            "item_id",
+            "item_rating",
+            "action_timestamp",
+            "item_weights",
+            "dummy_watch_time",
+            "item_category_id",
         ],
         "candidate_feature_names": [
-            "item_candidate_id", "item_candidate_rating",
-            "item_query_time", "item_action_weights",
-            "item_dummy_watchtime", "item_candidate_category_id",
+            "item_candidate_id",
+            "item_candidate_rating",
+            "item_query_time",
+            "item_action_weights",
+            "item_dummy_watchtime",
+            "item_candidate_category_id",
         ],
         "primary_id": "item_id",
     }
@@ -233,22 +471,80 @@ def build_synthetic_prompts() -> Dict[str, Any]:
         {
             "user_id": "synthetic_user_001",
             "user_history": [
-                {"uih_post_id": 10, "uih_action_time": 1000, "uih_weight": 1,
-                 "uih_owner_id": 100, "uih_watchtime": 500,
-                 "uih_video_length": 60, "uih_surface_type": 1},
-                {"uih_post_id": 20, "uih_action_time": 2000, "uih_weight": 2,
-                 "uih_owner_id": 200, "uih_watchtime": 300,
-                 "uih_video_length": 120, "uih_surface_type": 2},
-                {"uih_post_id": 30, "uih_action_time": 3000, "uih_weight": 1,
-                 "uih_owner_id": 100, "uih_watchtime": 800,
-                 "uih_video_length": 90, "uih_surface_type": 1},
+                {
+                    "uih_post_id": 10,
+                    "uih_action_time": 1000,
+                    "uih_weight": 1,
+                    "uih_owner_id": 100,
+                    "uih_watchtime": 500,
+                    "uih_video_length": 60,
+                    "uih_surface_type": 1,
+                },
+                {
+                    "uih_post_id": 20,
+                    "uih_action_time": 2000,
+                    "uih_weight": 2,
+                    "uih_owner_id": 200,
+                    "uih_watchtime": 300,
+                    "uih_video_length": 120,
+                    "uih_surface_type": 2,
+                },
+                {
+                    "uih_post_id": 30,
+                    "uih_action_time": 3000,
+                    "uih_weight": 1,
+                    "uih_owner_id": 100,
+                    "uih_watchtime": 800,
+                    "uih_video_length": 90,
+                    "uih_surface_type": 1,
+                },
             ],
             "candidates": [
-                {"item_post_id": 50, "item_owner_id": 500, "item_surface_type": 0, "item_video_length": 0, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 4000},
-                {"item_post_id": 60, "item_owner_id": 600, "item_surface_type": 0, "item_video_length": 0, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 4000},
-                {"item_post_id": 70, "item_owner_id": 500, "item_surface_type": 0, "item_video_length": 0, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 4000},
-                {"item_post_id": 80, "item_owner_id": 700, "item_surface_type": 0, "item_video_length": 0, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 4000},
-                {"item_post_id": 90, "item_owner_id": 600, "item_surface_type": 0, "item_video_length": 0, "item_action_weight": 0, "item_target_watchtime": 0, "item_query_time": 4000},
+                {
+                    "item_post_id": 50,
+                    "item_owner_id": 500,
+                    "item_surface_type": 0,
+                    "item_video_length": 0,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 4000,
+                },
+                {
+                    "item_post_id": 60,
+                    "item_owner_id": 600,
+                    "item_surface_type": 0,
+                    "item_video_length": 0,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 4000,
+                },
+                {
+                    "item_post_id": 70,
+                    "item_owner_id": 500,
+                    "item_surface_type": 0,
+                    "item_video_length": 0,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 4000,
+                },
+                {
+                    "item_post_id": 80,
+                    "item_owner_id": 700,
+                    "item_surface_type": 0,
+                    "item_video_length": 0,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 4000,
+                },
+                {
+                    "item_post_id": 90,
+                    "item_owner_id": 600,
+                    "item_surface_type": 0,
+                    "item_video_length": 0,
+                    "item_action_weight": 0,
+                    "item_target_watchtime": 0,
+                    "item_query_time": 4000,
+                },
             ],
             "context": {"viewer_id": 42, "dummy_contexual": 1},
         },
@@ -258,14 +554,22 @@ def build_synthetic_prompts() -> Dict[str, Any]:
         "config_dir": os.path.join(SCRIPT_DIR, "configs", "debug"),
         "prompts": prompts,
         "uih_feature_names": [
-            "uih_post_id", "uih_action_time", "uih_weight",
-            "uih_owner_id", "uih_watchtime", "uih_surface_type",
+            "uih_post_id",
+            "uih_action_time",
+            "uih_weight",
+            "uih_owner_id",
+            "uih_watchtime",
+            "uih_surface_type",
             "uih_video_length",
         ],
         "candidate_feature_names": [
-            "item_post_id", "item_owner_id",
-            "item_surface_type", "item_video_length",
-            "item_action_weight", "item_target_watchtime", "item_query_time",
+            "item_post_id",
+            "item_owner_id",
+            "item_surface_type",
+            "item_video_length",
+            "item_action_weight",
+            "item_target_watchtime",
+            "item_query_time",
         ],
         "primary_id": "uih_post_id",
     }
@@ -283,9 +587,11 @@ DATASET_BUILDERS = {
 # Runner
 # =========================================================================
 
+
 def run_dataset(spec: Dict[str, Any], args: argparse.Namespace) -> None:
     """Run inference for a single dataset specification."""
     from vllm_gr import GRLLM, GRRequestOutput
+
     dataset = spec["dataset"]
     config_dir = spec["config_dir"]
     prompts = spec["prompts"]
@@ -299,7 +605,7 @@ def run_dataset(spec: Dict[str, Any], args: argparse.Namespace) -> None:
     print(f"  Candidate features: {spec['candidate_feature_names']}")
     print(f"  Primary ID:         {spec['primary_id']}")
 
-    print(f"\n  Initializing GRLLM...")
+    print("\n  Initializing GRLLM...")
     with GRLLM(
         model=config_dir,
         max_seq_len=args.max_seq_len,
@@ -318,10 +624,7 @@ def run_dataset(spec: Dict[str, Any], args: argparse.Namespace) -> None:
 
         for output in outputs:
             print(f"\n  User: {output.user_id}")
-            print(
-                "  Returned scores for all candidates "
-                f"({len(output.recommendations)}):"
-            )
+            print(f"  Returned scores for all candidates ({len(output.recommendations)}):")
             pid = spec["primary_id"]
             for item in output.recommendations:
                 display_line = f"{pid}={item.item_id} score={item.score:.4f}"
@@ -352,8 +655,12 @@ def main():
         choices=sorted(DATASET_BUILDERS.keys()),
         help=f"Datasets to run. Choices: {list(DATASET_BUILDERS.keys())}",
     )
-    parser.add_argument("--max-seq-len", type=int, default=64, help="Maximum user history sequence length.")
-    parser.add_argument("--max-candidates", type=int, default=50, help="Maximum number of candidate items.")
+    parser.add_argument(
+        "--max-seq-len", type=int, default=64, help="Maximum user history sequence length."
+    )
+    parser.add_argument(
+        "--max-candidates", type=int, default=50, help="Maximum number of candidate items."
+    )
     args = parser.parse_args()
 
     print("=" * 60)

@@ -1,12 +1,11 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
 import argparse
 
 import uvloop
-
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG

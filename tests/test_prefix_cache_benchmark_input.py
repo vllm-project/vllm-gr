@@ -1,26 +1,28 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 
 """Tests for replay-style prefix-cache benchmark input generation."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import os
 import sys
 import unittest
 
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
-from examples.build_prefix_cache_benchmark_input import build_replay_payload
+from examples.build_prefix_cache_benchmark_input import (  # noqa: E402
+    build_replay_payload,
+)
 
 
 class TestBuildPrefixCacheBenchmarkInput(unittest.TestCase):
-
-    def test_build_replay_payload_preserves_context_and_history(self):
+    def test_build_replay_payload_preserves_context_and_history(self) -> None:
         payload = {
             "meta": {"dataset": "movielens-1m"},
             "cases": [

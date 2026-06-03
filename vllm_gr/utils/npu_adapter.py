@@ -1,16 +1,16 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Device detection and backend selection helpers."""
 
 from __future__ import annotations
 
-import logging
 import os
 import sysconfig
 from typing import Optional
 
 import torch
+
 from vllm_gr.logger import init_logger
 
 logger = init_logger(__name__)
@@ -43,6 +43,7 @@ def is_npu_available() -> bool:
     """Return whether torch_npu is installed and the runtime is available."""
     try:
         import torch_npu  # noqa: F401
+
         return torch.npu.is_available()
     except (ImportError, AttributeError):
         return False
@@ -60,7 +61,9 @@ def load_mxrec_ops() -> bool:
     try:
         torch.npu.config.allow_internal_format = False
     except AttributeError:
-        logger.warning("mxrec ops preload skipped: torch.npu.config.allow_internal_format unavailable")
+        logger.warning(
+            "mxrec ops preload skipped: torch.npu.config.allow_internal_format unavailable"
+        )
 
     candidate_paths = []
     env_path = os.getenv("LIB_FBGEMM_NPU_API_SO_PATH")
@@ -116,6 +119,7 @@ def check_torchrec_available() -> bool:
     """Return whether the torchrec or torchrec-npu runtime is available."""
     try:
         import torchrec  # noqa: F401
+
         return True
     except ImportError:
         return False

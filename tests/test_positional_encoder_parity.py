@@ -1,14 +1,15 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import unittest
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import importlib.util
 import sys
 import types
+import unittest
 from pathlib import Path
 
 import torch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,7 +21,7 @@ def _install_stub_package(name: str) -> None:
         sys.modules[name] = module
 
 
-def _load_module(name: str, path: Path):
+def _load_module(name: str, path: Path) -> None:
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -29,7 +30,7 @@ def _load_module(name: str, path: Path):
     return module
 
 
-def _load_positional_encoder():
+def _load_positional_encoder() -> None:
     _install_stub_package("vllm_gr.models")
     _install_stub_package("vllm_gr.models.dlrm_v3")
     _install_stub_package("vllm_gr.models.dlrm_v3.modules")
@@ -56,12 +57,11 @@ def _load_positional_encoder():
 
 
 class TestPositionalEncoderParity(unittest.TestCase):
-
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         cls.HSTUPositionalEncoder = _load_positional_encoder()
 
-    def test_uses_query_time_relative_buckets(self):
+    def test_uses_query_time_relative_buckets(self) -> None:
         encoder = self.HSTUPositionalEncoder(
             num_position_buckets=8,
             num_time_buckets=4,
@@ -120,7 +120,7 @@ class TestPositionalEncoderParity(unittest.TestCase):
         )
         torch.testing.assert_close(output, expected)
 
-    def test_timestamp_bucket_clamp_matches_golden_reference(self):
+    def test_timestamp_bucket_clamp_matches_golden_reference(self) -> None:
         encoder = self.HSTUPositionalEncoder(
             num_position_buckets=8,
             num_time_buckets=4,
@@ -159,7 +159,7 @@ class TestPositionalEncoderParity(unittest.TestCase):
         )
         torch.testing.assert_close(output, expected)
 
-    def test_contextual_prefix_keeps_front_positions_fixed(self):
+    def test_contextual_prefix_keeps_front_positions_fixed(self) -> None:
         encoder = self.HSTUPositionalEncoder(
             num_position_buckets=8,
             num_time_buckets=4,

@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Batch tensor construction for FuXi-alpha model kwargs."""
 
@@ -33,9 +33,7 @@ def _truncate_or_pad_seq(values: list[int], target_len: int, *, pad_value: int =
     row is padded to ``n_max`` / ``k_max`` within the batch.
     """
     if len(values) > target_len:
-        raise ValueError(
-            f"Sequence length {len(values)} exceeds padded max length {target_len}"
-        )
+        raise ValueError(f"Sequence length {len(values)} exceeds padded max length {target_len}")
     if not values:
         return [pad_value] * target_len
     if len(values) < target_len:
@@ -81,11 +79,15 @@ def build_fuxi_model_kwargs(
     past_payloads: dict[str, torch.Tensor] = {}
     if use_timestamp:
         past_payloads["timestamps"] = torch.tensor(
-            past_timestamps_rows, dtype=torch.int64, device=device,
+            past_timestamps_rows,
+            dtype=torch.int64,
+            device=device,
         )
     if use_rating:
         past_payloads["ratings"] = torch.tensor(
-            past_ratings_rows, dtype=torch.int64, device=device,
+            past_ratings_rows,
+            dtype=torch.int64,
+            device=device,
         )
 
     return {
@@ -93,9 +95,13 @@ def build_fuxi_model_kwargs(
         "past_ids": torch.tensor(past_ids_rows, dtype=torch.int64, device=device),
         "past_payloads": past_payloads,
         "candidate_ids": torch.tensor(
-            candidate_id_rows, dtype=torch.int64, device=device,
+            candidate_id_rows,
+            dtype=torch.int64,
+            device=device,
         ),
         "candidate_lengths": torch.tensor(
-            candidate_lens, dtype=torch.int64, device=device,
+            candidate_lens,
+            dtype=torch.int64,
+            device=device,
         ),
     }

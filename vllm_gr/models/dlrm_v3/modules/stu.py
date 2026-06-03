@@ -1,18 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """STU (Sequential Transducer Unit) module for HSTU model."""
 
 import abc
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 import torch
 from torch.autograd.profiler import record_function
 
 from vllm_gr.models.dlrm_v3.common import HammerModule
-from vllm_gr.ops.hstu_compute import hstu_compute_output, hstu_compute_uqvk, hstu_preprocess_and_attention
+from vllm_gr.ops.hstu_compute import (
+    hstu_compute_output,
+    hstu_compute_uqvk,
+    hstu_preprocess_and_attention,
+)
 from vllm_gr.utils import ReliableOps
 
 
@@ -52,6 +57,7 @@ class STU(HammerModule, abc.ABC):
 @dataclass
 class STULayerConfig:
     """Configuration for STU layer."""
+
     embedding_dim: int
     num_heads: int
     hidden_dim: int
@@ -144,7 +150,7 @@ class STULayer(STU):
         self._target_aware: bool = config.target_aware
         self._causal: bool = config.causal
         self._max_attn_len: int = config.max_attn_len or 0
-        self._attn_alpha: float = config.attn_alpha or 1.0 / (self._attention_dim ** 0.5)
+        self._attn_alpha: float = config.attn_alpha or 1.0 / (self._attention_dim**0.5)
         self._use_group_norm: bool = config.use_group_norm
         self._recompute_normed_x: bool = config.recompute_normed_x
         self._recompute_uvqk: bool = config.recompute_uvqk
@@ -154,17 +160,19 @@ class STULayer(STU):
 
         # U, V, Q, K projection weights
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
-            torch.empty((
-                self._embedding_dim,
-                (self._hidden_dim * 2 + self._attention_dim * 2) * self._num_heads,
-            )),
+            torch.empty(
+                (
+                    self._embedding_dim,
+                    (self._hidden_dim * 2 + self._attention_dim * 2) * self._num_heads,
+                )
+            ),
         )
         torch.nn.init.xavier_uniform_(self._uvqk_weight)
-        
+
         self._uvqk_beta: torch.nn.Parameter = torch.nn.Parameter(
             torch.zeros((self._hidden_dim * 2 + self._attention_dim * 2) * self._num_heads),
         )
-        
+
         # Input layer norm
         self._input_norm_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.ones((self._embedding_dim,)),
@@ -172,12 +180,12 @@ class STULayer(STU):
         self._input_norm_bias: torch.nn.Parameter = torch.nn.Parameter(
             torch.zeros((self._embedding_dim,)),
         )
-        
+
         # Output projection
         # When concat_u=True and concat_x=True in pytorch_norm_mul_dropout:
         #   y = torch.cat([u, x, y], dim=1)  where x is actually attn
         # u dim: num_heads * hidden_dim
-        # x (attn) dim: num_heads * hidden_dim  
+        # x (attn) dim: num_heads * hidden_dim
         # y (u * normalized(attn)) dim: num_heads * hidden_dim
         # Total: 3 * num_heads * hidden_dim
         # output_weight shape: (y_dim, embedding_dim) for torch.addmm
@@ -185,12 +193,10 @@ class STULayer(STU):
             torch.empty((self._hidden_dim * self._num_heads * 3, self._embedding_dim)),
         )
         torch.nn.init.xavier_uniform_(self._output_weight)
-        
+
         # Output layer norm
         output_norm_shape: int = (
-            self._hidden_dim * self._num_heads
-            if not self._use_group_norm
-            else self._num_heads
+            self._hidden_dim * self._num_heads if not self._use_group_norm else self._num_heads
         )
         self._output_norm_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.ones((output_norm_shape,)),
@@ -420,14 +426,13 @@ class STULayer(STU):
                 hstu_attention_mode=hstu_attention_mode,
             )
         raise RuntimeError(
-            "STULayer.cached_forward requires native vLLM KV metadata and "
-            "runtime paged KV cache."
+            "STULayer.cached_forward requires native vLLM KV metadata and runtime paged KV cache."
         )
 
 
 class STUStack(STU):
     """Stack of multiple STU layers."""
-    
+
     def __init__(
         self,
         stu_list: List[STU],
@@ -456,9 +461,7 @@ class STUStack(STU):
         """Forward pass through all STU layers."""
         cache_layers = self._resolve_cache_layers(hstu_attn_metadata)
         for layer_idx, layer in enumerate(self._stu_layers):
-            cache_layer = (
-                cache_layers[layer_idx] if layer_idx < len(cache_layers) else None
-            )
+            cache_layer = cache_layers[layer_idx] if layer_idx < len(cache_layers) else None
             x = layer(
                 x=x,
                 x_lengths=x_lengths,
@@ -480,9 +483,7 @@ class STUStack(STU):
     ) -> torch.Tensor:
         cache_layers = self._resolve_cache_layers(hstu_attn_metadata)
         for layer_idx, layer in enumerate(self._stu_layers):
-            cache_layer = (
-                cache_layers[layer_idx] if layer_idx < len(cache_layers) else None
-            )
+            cache_layer = cache_layers[layer_idx] if layer_idx < len(cache_layers) else None
             delta_x = layer.cached_forward(
                 delta_x=delta_x,
                 num_targets=num_targets,

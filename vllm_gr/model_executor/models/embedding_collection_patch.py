@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Inference-time TorchRec compatibility helpers for HSTU embedding lookup."""
 
@@ -20,9 +20,7 @@ def _resolve_embedding_index_upper_bound(embedding_module: Any) -> int:
     if num_embeddings is not None:
         return max(int(num_embeddings) - 1, 0)
 
-    raise AttributeError(
-        "Embedding module does not expose weight.shape[0] or num_embeddings"
-    )
+    raise AttributeError("Embedding module does not expose weight.shape[0] or num_embeddings")
 
 
 def _validate_embedding_indices(

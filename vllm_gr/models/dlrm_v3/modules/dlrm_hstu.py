@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR — restored to match original generative-recommenders interface.
-# Licensed under the Apache License, Version 2.0
 
 """
 DlrmHSTU Main Model Class
@@ -42,7 +43,6 @@ from vllm_gr.ops.jagged_tensors import concat_2D_jagged
 from vllm_gr.ops.layer_norm import LayerNorm, SwishLayerNorm
 from vllm_gr.utils import ReliableOps
 
-
 logger = init_logger(__name__)
 
 
@@ -53,6 +53,7 @@ def _cumsum(lengths: torch.Tensor) -> torch.Tensor:
 
 class SequenceEmbedding(NamedTuple):
     """Container for sequence embeddings with lengths."""
+
     lengths: torch.Tensor
     embedding: torch.Tensor
 
@@ -60,6 +61,7 @@ class SequenceEmbedding(NamedTuple):
 @dataclass
 class DlrmHSTUConfig:
     """Configuration for DLRM HSTU model."""
+
     max_seq_len: int = 16384
     max_num_candidates: int = 10
     max_num_candidates_inference: int = 5
@@ -93,6 +95,7 @@ class DlrmHSTUConfig:
     enable_postprocessor: bool = True
     use_layer_norm_postprocessor: bool = False
     enable_kv_cache: bool = True
+
 
 class DlrmHSTU(HammerModule):
     """
@@ -147,10 +150,7 @@ class DlrmHSTU(HammerModule):
                 uih_feature_name,
                 candidate_feature_name,
             ) in self._hstu_configs.merge_uih_candidate_feature_mapping
-            if (
-                candidate_feature_name
-                in self._hstu_configs.item_embedding_feature_names
-            )
+            if (candidate_feature_name in self._hstu_configs.item_embedding_feature_names)
             and (uih_feature_name in self._hstu_configs.user_embedding_feature_names)
             and (uih_feature_name != self._hstu_configs.uih_post_id_feature_name)
         ]
@@ -161,10 +161,8 @@ class DlrmHSTU(HammerModule):
                 candidate_feature_name,
             ) in self._hstu_configs.merge_uih_candidate_feature_mapping
             if (
-                candidate_feature_name
-                not in self._hstu_configs.item_embedding_feature_names
-                and uih_feature_name
-                not in self._hstu_configs.user_embedding_feature_names
+                candidate_feature_name not in self._hstu_configs.item_embedding_feature_names
+                and uih_feature_name not in self._hstu_configs.user_embedding_feature_names
             )
         ]
         self._merged_sequence_feature_names: List[str] = []
@@ -186,9 +184,7 @@ class DlrmHSTU(HammerModule):
             num_position_buckets=8192,
             num_time_buckets=2048,
             embedding_dim=hstu_configs.hstu_transducer_embedding_dim,
-            contextual_seq_len=sum(
-                dict(hstu_configs.contextual_feature_to_max_length).values()
-            ),
+            contextual_seq_len=sum(dict(hstu_configs.contextual_feature_to_max_length).values()),
         )
 
         if hstu_configs.enable_postprocessor:
@@ -290,22 +286,21 @@ class DlrmHSTU(HammerModule):
         merged_sparse_features = KeyedJaggedTensor.from_lengths_sync(
             keys=uih_features.keys() + candidates_features.keys(),
             values=torch.cat(
-                [uih_features.values(), candidates_features.values()], dim=0,
+                [uih_features.values(), candidates_features.values()],
+                dim=0,
             ),
             lengths=torch.cat(
-                [uih_features.lengths(), candidates_features.lengths()], dim=0,
+                [uih_features.lengths(), candidates_features.lengths()],
+                dim=0,
             ),
         )
         seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
 
         num_candidates = fx_mark_length_features(
-            candidates_features.lengths().view(
-                len(candidates_features.keys()), -1)
+            candidates_features.lengths().view(len(candidates_features.keys()), -1)
         )[0]
         max_num_candidates = fx_infer_max_len(num_candidates)
-        uih_seq_lengths = uih_features[
-            self._hstu_configs.uih_post_id_feature_name
-        ].lengths()
+        uih_seq_lengths = uih_features[self._hstu_configs.uih_post_id_feature_name].lengths()
         max_uih_len = fx_infer_max_len(uih_seq_lengths)
 
         payload_features: Dict[str, torch.Tensor] = {}
@@ -314,15 +309,12 @@ class DlrmHSTU(HammerModule):
             candidate_feature_name,
         ) in self._hstu_configs.merge_uih_candidate_feature_mapping:
             if (
-                candidate_feature_name
-                not in self._hstu_configs.item_embedding_feature_names
-                and uih_feature_name
-                not in self._hstu_configs.user_embedding_feature_names
+                candidate_feature_name not in self._hstu_configs.item_embedding_feature_names
+                and uih_feature_name not in self._hstu_configs.user_embedding_feature_names
             ):
                 values_left = uih_features[uih_feature_name].values()
                 if (
-                    candidate_feature_name
-                    == self._hstu_configs.candidates_weight_feature_name
+                    candidate_feature_name == self._hstu_configs.candidates_weight_feature_name
                     or candidate_feature_name
                     == self._hstu_configs.candidates_watchtime_feature_name
                 ):
@@ -369,9 +361,7 @@ class DlrmHSTU(HammerModule):
     ) -> torch.Tensor:
         target_dim = int(self._hstu_configs.hstu_embedding_table_dim)
         if embedding.ndim == 0:
-            raise ValueError(
-                f"Embedding tensor for feature={feature_name!r} must have rank >= 1"
-            )
+            raise ValueError(f"Embedding tensor for feature={feature_name!r} must have rank >= 1")
 
         current_dim = int(embedding.shape[-1])
         if current_dim == target_dim:
@@ -403,9 +393,7 @@ class DlrmHSTU(HammerModule):
         if len(self._hstu_configs.contextual_feature_to_max_length) > 0:
             contextual_offsets: List[torch.Tensor] = []
             for x in self._hstu_configs.contextual_feature_to_max_length.keys():
-                contextual_offsets.append(
-                    _cumsum(seq_embeddings[x].lengths)
-                )
+                contextual_offsets.append(_cumsum(seq_embeddings[x].lengths))
         else:
             contextual_offsets = torch.empty((0, 0))  # type: ignore[assignment]
         return {
@@ -420,10 +408,7 @@ class DlrmHSTU(HammerModule):
                     list(self._hstu_configs.contextual_feature_to_max_length.keys())
                 )
             },
-            **{
-                x: seq_embeddings[x].embedding
-                for x in self._additional_embedding_features
-            },
+            **{x: seq_embeddings[x].embedding for x in self._additional_embedding_features},
         }
 
     def _merge_uih_and_candidate_embeddings(
@@ -449,9 +434,7 @@ class DlrmHSTU(HammerModule):
                         values_left=seq_embeddings[uih_feature_name].embedding,
                         max_len_right=max_num_candidates,
                         offsets_right=_cumsum(num_candidates),
-                        values_right=seq_embeddings[
-                            candidate_feature_name
-                        ].embedding,
+                        values_right=seq_embeddings[candidate_feature_name].embedding,
                         kernel=self.hammer_kernel(),
                     ),
                 )
@@ -486,17 +469,15 @@ class DlrmHSTU(HammerModule):
         num_candidates: torch.Tensor,
         hstu_attn_metadata: Optional[Any] = None,
     ) -> torch.Tensor:
-        source_lengths = seq_embeddings[
-            self._hstu_configs.uih_post_id_feature_name
-        ].lengths
+        source_lengths = seq_embeddings[self._hstu_configs.uih_post_id_feature_name].lengths
 
         source_timestamps = concat_2D_jagged(
             max_seq_len=max_uih_len + max_candidates,
             max_len_left=max_uih_len,
             offsets_left=payload_features["uih_offsets"],
-            values_left=payload_features[
-                self._hstu_configs.uih_action_time_feature_name
-            ].unsqueeze(-1),
+            values_left=payload_features[self._hstu_configs.uih_action_time_feature_name].unsqueeze(
+                -1
+            ),
             max_len_right=max_candidates,
             offsets_right=payload_features["candidate_offsets"],
             values_right=payload_features[
@@ -506,11 +487,8 @@ class DlrmHSTU(HammerModule):
         ).squeeze(-1)
 
         total_targets = int(num_candidates.sum().item())
-        embedding = seq_embeddings[
-            self._hstu_configs.uih_post_id_feature_name
-        ].embedding
+        embedding = seq_embeddings[self._hstu_configs.uih_post_id_feature_name].embedding
         dtype = embedding.dtype
-
 
         seq_payloads = self._construct_payload(
             payload_features=payload_features,

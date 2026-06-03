@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from http import HTTPStatus
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from typing_extensions import assert_never
-
 from vllm.entrypoints.openai.protocol import ErrorResponse
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
@@ -40,9 +39,7 @@ async def create_recommend(request: GRRecommendRequest, raw_request: Request):
     handler = recommend(raw_request)
     if handler is None:
         base_server = raw_request.app.state.openai_serving_tokenization
-        return base_server.create_error_response(
-            message="The model does not support Recommend API"
-        )
+        return base_server.create_error_response(message="The model does not support Recommend API")
 
     try:
         result = await handler.create_recommend(request, raw_request)

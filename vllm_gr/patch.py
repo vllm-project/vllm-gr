@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Monkey-patch mechanism for vllm-GR.
@@ -80,20 +80,12 @@ _CRITICAL_CONSUMERS = {
 }
 
 
-_ASCEND_BACKEND_PACKAGE = (
-    "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend"
-)
-_ASCEND_POOL_WORKER_MODULE = (
-    "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
-)
-_ASCEND_CONFIG_DATA_MODULE = (
-    "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data"
-)
+_ASCEND_BACKEND_PACKAGE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend"
+_ASCEND_POOL_WORKER_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+_ASCEND_CONFIG_DATA_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data"
 _ASCEND_MOONCAKE_MODULE = f"{_ASCEND_BACKEND_PACKAGE}.mooncake_backend"
 _ASCEND_YUANRONG_MODULE = f"{_ASCEND_BACKEND_PACKAGE}.yuanrong_backend"
-_LOCAL_YUANRONG_BACKEND_MODULE = (
-    "vllm_gr.distributed.kv_transfer.kv_pool.backend.yuanrong_backend"
-)
+_LOCAL_YUANRONG_BACKEND_MODULE = "vllm_gr.distributed.kv_transfer.kv_pool.backend.yuanrong_backend"
 
 
 def _is_npu_platform() -> bool:
@@ -126,9 +118,9 @@ def _apply_gr_core_patches(force: bool = False) -> int:
         _PATCHES_APPLIED = True
         return 0
 
+    from vllm_gr.core.sched.output import GRNewRequestData
     from vllm_gr.engine import GREngineCoreRequest
     from vllm_gr.request import GRRequest
-    from vllm_gr.core.sched.output import GRNewRequestData
 
     replacements = [
         (_OriginalEngineCoreRequest, GREngineCoreRequest, "EngineCoreRequest"),
@@ -168,7 +160,8 @@ def _apply_gr_core_patches(force: bool = False) -> int:
     if patched_count > 0:
         logger.info(
             "vllm_gr: Applied %d monkey patches: %s",
-            patched_count, patched_modules,
+            patched_count,
+            patched_modules,
         )
 
     return patched_count
@@ -232,9 +225,7 @@ def _install_yuanrong_module(backend_cls: type[Any]) -> int:
     if existing is not None and getattr(existing, "YuanrongBackend", None) is backend_cls:
         return 0
 
-    module = existing if existing is not None else types.ModuleType(
-        _ASCEND_YUANRONG_MODULE
-    )
+    module = existing if existing is not None else types.ModuleType(_ASCEND_YUANRONG_MODULE)
     module.__package__ = _ASCEND_BACKEND_PACKAGE
     module.YuanrongBackend = backend_cls
     module.__all__ = ["YuanrongBackend"]
@@ -298,8 +289,7 @@ def _apply_yuanrong_npu_patch(force: bool = False) -> int:
         backend_cls = _build_yuanrong_backend_class()
     except (ModuleNotFoundError, ImportError, AttributeError) as exc:
         logger.debug(
-            "Skipping Yuanrong backend monkey-patch because dependencies are "
-            "unavailable: %s",
+            "Skipping Yuanrong backend monkey-patch because dependencies are unavailable: %s",
             exc,
         )
         return 0
@@ -339,6 +329,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
     try:
         from vllm_gr.logprobs_patch import patch_flat_logprobs
+
         patch_flat_logprobs()
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_flat_logprobs")
@@ -350,6 +341,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
             patch_beam_search,
             patch_sampling,
         )
+
         patch_beam_search()
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_beam_search")
@@ -358,6 +350,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
     try:
         from vllm_gr.entrypoints.openai.beam_search_patch import patch_sampling
+
         patch_sampling()
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_sampling")
@@ -366,6 +359,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
     try:
         from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+
         patch_add_cli_args()
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_add_cli_args")
@@ -376,6 +370,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         from vllm_gr.entrypoints.openai.serving_models import (
             patch_OpenAIServingModels_init,
         )
+
         patch_OpenAIServingModels_init()
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_OpenAIServingModels_init")
@@ -384,6 +379,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
     try:
         from vllm_gr.entrypoints.beam_search_patch import patch_offline_beam_search
+
         patch_offline_beam_search()
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_offline_beam_search")
@@ -392,6 +388,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
     try:
         from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
+
         patch_batch_and_fork()
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_batch_and_fork")
@@ -417,7 +414,10 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
             should_patch = False
             if os.getenv("VLLM_GR_LMCACHE_PATCH", "").lower() in (
-                "1", "true", "yes", "y",
+                "1",
+                "true",
+                "yes",
+                "y",
             ):
                 should_patch = True
             elif any("LMCacheConnectorV1" in arg for arg in sys.argv):
@@ -532,6 +532,7 @@ def _apply_kv_merge_patch(force: bool = False) -> int:
         logger.debug("vllm_gr: Patched ChunkedTokenDatabase.__init__ to add kv_cache_per_layer")
 
     if not hasattr(ChunkedTokenDatabase, "set_kv_cache_per_layer"):
+
         def set_kv_cache_per_layer(self, kv_cache_per_layer: int):
             self.kv_cache_per_layer = kv_cache_per_layer
 
@@ -541,7 +542,10 @@ def _apply_kv_merge_patch(force: bool = False) -> int:
 
     original_prepare_value_layer = getattr(ChunkedTokenDatabase, "prepare_value_layer", None)
     if original_prepare_value_layer is not None:
-        def patched_prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
+
+        def patched_prepare_value_layer(
+            self, start: int, end: int, block_ids: list[int], layer_id: int
+        ):
             block_id = block_ids[start // self.block_size]
             kv_cache_per_layer = getattr(self, "kv_cache_per_layer", 2)
             if kv_cache_per_layer == 1:
@@ -552,16 +556,23 @@ def _apply_kv_merge_patch(force: bool = False) -> int:
 
         ChunkedTokenDatabase.prepare_value_layer = patched_prepare_value_layer
         patch_count += 1
-        logger.debug("vllm_gr: Patched ChunkedTokenDatabase.prepare_value_layer for kv_cache_per_layer=1")
+        logger.debug(
+            "vllm_gr: Patched ChunkedTokenDatabase.prepare_value_layer for kv_cache_per_layer=1"
+        )
 
     original_prepare_value = getattr(ChunkedTokenDatabase, "prepare_value", None)
     if original_prepare_value is not None:
+
         def patched_prepare_value(self, start: int, end: int, block_ids: list[int]):
             addr_list = []
             size_list = []
             block_id = block_ids[start // self.block_size]
             for index, base_addr in enumerate(self.kv_caches_base_addr):
-                block_len = self.block_len[index % len(self.block_len)] if self.use_mla else self.block_len[0]
+                block_len = (
+                    self.block_len[index % len(self.block_len)]
+                    if self.use_mla
+                    else self.block_len[0]
+                )
                 addr = base_addr + block_id * block_len
                 length = int(block_len / self.block_size * (end - start))
                 addr_list.append(addr)
@@ -570,7 +581,9 @@ def _apply_kv_merge_patch(force: bool = False) -> int:
 
         ChunkedTokenDatabase.prepare_value = patched_prepare_value
         patch_count += 1
-        logger.debug("vllm_gr: Patched ChunkedTokenDatabase.prepare_value for block_len indexing fix")
+        logger.debug(
+            "vllm_gr: Patched ChunkedTokenDatabase.prepare_value for block_len indexing fix"
+        )
 
     original_register_kv_caches = getattr(KVPoolWorker, "register_kv_caches", None)
     if original_register_kv_caches is not None:
@@ -686,7 +699,9 @@ def _apply_kv_merge_patch(force: bool = False) -> int:
 
         KVPoolWorker.register_kv_caches = patched_register_kv_caches
         patch_count += 1
-        logger.debug("vllm_gr: Patched KVPoolWorker.register_kv_caches for kv_cache_per_layer detection")
+        logger.debug(
+            "vllm_gr: Patched KVPoolWorker.register_kv_caches for kv_cache_per_layer detection"
+        )
 
     _KV_MERGE_PATCHES_APPLIED = True
 
@@ -713,9 +728,9 @@ def verify_patches() -> list[str]:
     Returns a list of warning messages for any unpatched sites.
     Safe to call at any time; does not modify anything.
     """
+    from vllm_gr.core.sched.output import GRNewRequestData
     from vllm_gr.engine import GREngineCoreRequest
     from vllm_gr.request import GRRequest
-    from vllm_gr.core.sched.output import GRNewRequestData
 
     expected = {
         "EngineCoreRequest": GREngineCoreRequest,

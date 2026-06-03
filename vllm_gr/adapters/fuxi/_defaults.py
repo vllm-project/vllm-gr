@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """FuXi family defaults for engine args."""
 
@@ -39,7 +39,8 @@ def apply_fuxi_defaults(engine_args: "GRCommonEngineArgsMixin") -> None:
         )
 
     worker_cls = get_worker_cls_path(
-        "fuxi", is_npu=engine_args._is_ascend_platform(),
+        "fuxi",
+        is_npu=engine_args._is_ascend_platform(),
     )
     if worker_cls is not None:
         engine_args.worker_cls = worker_cls
@@ -79,12 +80,7 @@ def _validate_fuxi_config_fields(engine_args: "GRCommonEngineArgsMixin") -> None
     dqk = int(local_config.get("dqk", 0))
     dv = int(local_config.get("dv", 0))
     if dqk <= 0 or dv <= 0:
-        raise ValueError(
-            "FuXi config requires positive dqk and dv values; "
-            f"got dqk={dqk}, dv={dv}"
-        )
+        raise ValueError(f"FuXi config requires positive dqk and dv values; got dqk={dqk}, dv={dv}")
 
     if bool(local_config.get("enable_relative_attention_bias", False)):
-        raise ValueError(
-            "FuXi-RAB-off adapter only supports enable_relative_attention_bias=False"
-        )
+        raise ValueError("FuXi-RAB-off adapter only supports enable_relative_attention_bias=False")

@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GRNewRequestData — extends NewRequestData to carry GR features from
@@ -10,7 +10,6 @@ from dataclasses import dataclass
 
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.request import Request
-
 
 
 @dataclass

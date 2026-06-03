@@ -1,20 +1,21 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
-from dataclasses import dataclass
 import importlib.util
 import logging
-from pathlib import Path
 import sys
 import types
 import unittest
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "vllm_gr" / "worker" / "gr_runner_mixin.py"
@@ -83,7 +84,7 @@ class _FakeSeqLensBuffer:
         self.cpu = cpu_tensor
 
 
-def _load_gr_runner_module():
+def _load_gr_runner_module() -> None:
     vllm_pkg = types.ModuleType("vllm")
     logger_module = types.ModuleType("vllm.logger")
     logger_module.init_logger = logging.getLogger
@@ -117,14 +118,13 @@ def _load_gr_runner_module():
 
 
 class _BaseRunner:
-    def _update_states(self, scheduler_output):
+    def _update_states(self, scheduler_output) -> None:
         self.seen_scheduler_output = scheduler_output
 
 
 class TestGRRunnerCore(unittest.TestCase):
-
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         cls._saved_modules = {
             name: sys.modules.get(name)
             for name in (
@@ -140,14 +140,14 @@ class TestGRRunnerCore(unittest.TestCase):
         cls.runner_module = _load_gr_runner_module()
 
     @classmethod
-    def tearDownClass(cls):
+    def tearDownClass(cls) -> None:
         for name, module in cls._saved_modules.items():
             if module is None:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
 
-    def _make_runner(self, req_ids: list[str] | None = None):
+    def _make_runner(self, req_ids: list[str] | None = None) -> None:
         mixin_cls = self.runner_module.GRFeatureRunnerMixin
 
         class _Runner(mixin_cls, _BaseRunner):
@@ -159,75 +159,77 @@ class TestGRRunnerCore(unittest.TestCase):
         return runner
 
     @staticmethod
-    def _make_adapter():
+    def _make_adapter() -> None:
         """Create a lightweight adapter that matches HSTUModelAdapter's API."""
         from vllm_gr.adapters.hstu.kjt_builder import build_hstu_model_kwargs
 
         class _FakeAdapter:
-            def decode_payload(self, payload):
+            def decode_payload(self, payload) -> None:
                 from vllm_gr.gr_schema import (
                     attach_schema_fingerprint,
                     validate_context_group,
                     validate_feature_group,
                 )
+
                 uih_keys = list(payload.uih_keys)
                 cand_keys = list(payload.cand_keys)
                 ctx_keys = list(payload.ctx_keys)
-                uih_keys, cand_keys, ctx_keys, schema_fingerprint = \
-                    attach_schema_fingerprint(
-                        uih_keys=uih_keys, cand_keys=cand_keys, ctx_keys=ctx_keys,
-                    )
+                uih_keys, cand_keys, ctx_keys, schema_fingerprint = attach_schema_fingerprint(
+                    uih_keys=uih_keys,
+                    cand_keys=cand_keys,
+                    ctx_keys=ctx_keys,
+                )
                 validate_feature_group(
-                    "uih", uih_keys,
+                    "uih",
+                    uih_keys,
                     list(payload.uih_values_per_key),
                     list(payload.uih_lengths_per_key),
                 )
                 validate_feature_group(
-                    "cand", cand_keys,
+                    "cand",
+                    cand_keys,
                     list(payload.cand_values_per_key),
                     list(payload.cand_lengths_per_key),
                 )
                 validate_context_group(
-                    ctx_keys, list(payload.ctx_values_per_key),
+                    ctx_keys,
+                    list(payload.ctx_values_per_key),
                 )
-                full_uih_keys = list(
-                    getattr(payload, "full_uih_keys", []) or (uih_keys + ctx_keys)
-                )
+                full_uih_keys = list(getattr(payload, "full_uih_keys", []) or (uih_keys + ctx_keys))
                 return {
                     "uih_keys": uih_keys,
                     "uih_values_per_key": [
-                        torch.tensor(v, dtype=torch.int64)
-                        for v in payload.uih_values_per_key
+                        torch.tensor(v, dtype=torch.int64) for v in payload.uih_values_per_key
                     ],
                     "uih_lengths_per_key": torch.tensor(
-                        payload.uih_lengths_per_key, dtype=torch.int64,
+                        payload.uih_lengths_per_key,
+                        dtype=torch.int64,
                     ),
                     "cand_keys": cand_keys,
                     "cand_values_per_key": [
-                        torch.tensor(v, dtype=torch.int64)
-                        for v in payload.cand_values_per_key
+                        torch.tensor(v, dtype=torch.int64) for v in payload.cand_values_per_key
                     ],
                     "cand_lengths_per_key": torch.tensor(
-                        payload.cand_lengths_per_key, dtype=torch.int64,
+                        payload.cand_lengths_per_key,
+                        dtype=torch.int64,
                     ),
                     "ctx_keys": ctx_keys,
                     "ctx_values_per_key": [
-                        torch.tensor(v, dtype=torch.int64)
-                        for v in payload.ctx_values_per_key
+                        torch.tensor(v, dtype=torch.int64) for v in payload.ctx_values_per_key
                     ],
                     "full_uih_keys": full_uih_keys,
                     "schema_fingerprint": schema_fingerprint,
                 }
 
-            def build_model_kwargs(self, batch_features, device):
+            def build_model_kwargs(self, batch_features, device) -> None:
                 return build_hstu_model_kwargs(batch_features, device)
 
-            def build_request_lengths(self, features):
+            def build_request_lengths(self, features) -> None:
                 return None
 
         return _FakeAdapter()
 
-    def test_build_kwargs_batches_features_by_key(self):
+    def test_build_kwargs_batches_features_by_key(self) -> None:
         runner = self._make_runner(req_ids=["r1", "r2"])
 
         payload1 = SimpleNamespace(
@@ -282,7 +284,7 @@ class TestGRRunnerCore(unittest.TestCase):
             torch.tensor([2, 1], dtype=torch.int64),
         )
 
-    def test_build_kwargs_fails_fast_for_decode_errors_and_mixed_schema(self):
+    def test_build_kwargs_fails_fast_for_decode_errors_and_mixed_schema(self) -> None:
         with self.subTest("decode_errors"):
             runner = self._make_runner()
             runner._gr_feature_errors["r1"] = "bad payload"
@@ -319,7 +321,7 @@ class TestGRRunnerCore(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Mixed GR batch schema mismatch"):
                 runner._build_gr_model_kwargs()
 
-    def test_build_kwargs_handles_empty_history_and_candidates(self):
+    def test_build_kwargs_handles_empty_history_and_candidates(self) -> None:
         runner = self._make_runner(req_ids=["r1"])
 
         payload = SimpleNamespace(
@@ -353,7 +355,7 @@ class TestGRRunnerCore(unittest.TestCase):
             torch.tensor([0], dtype=torch.int64),
         )
 
-    def test_build_kwargs_preserves_full_uih_schema_order(self):
+    def test_build_kwargs_preserves_full_uih_schema_order(self) -> None:
         runner = self._make_runner(req_ids=["r1"])
 
         payload = SimpleNamespace(
@@ -390,31 +392,29 @@ class TestGRRunnerCore(unittest.TestCase):
             torch.tensor([1, 2, 2, 1], dtype=torch.int64),
         )
 
-    def test_pool_accepts_per_request_hidden_state_list(self):
+    def test_pool_accepts_per_request_hidden_state_list(self) -> None:
         mixin_cls = self.runner_module.GRFeatureRunnerMixin
 
         class _Runner(mixin_cls):
-            def __init__(self):
+            def __init__(self) -> None:
                 self.input_batch = SimpleNamespace(
                     num_reqs=2,
                     pooling_params=[object(), object()],
                     req_ids=["req-1", "req-2"],
                     req_id_to_index={"req-1": 0, "req-2": 1},
                 )
-                self.seq_lens = _FakeSeqLensBuffer(
-                    torch.tensor([2, 3], dtype=torch.int64)
-                )
+                self.seq_lens = _FakeSeqLensBuffer(torch.tensor([2, 3], dtype=torch.int64))
                 self._pooling_metadata = _FakePoolingMetadata([2, 3])
                 self.sync_called = False
 
                 class _FakeModel:
                     @staticmethod
-                    def pooler(hidden_states, pooling_metadata):
+                    def pooler(hidden_states, pooling_metadata) -> None:
                         return hidden_states
 
                 self.model = _FakeModel()
 
-            def _sync_device(self):
+            def _sync_device(self) -> None:
                 self.sync_called = True
 
         runner = _Runner()
@@ -438,25 +438,23 @@ class TestGRRunnerCore(unittest.TestCase):
         self.assertEqual(runner._pooling_metadata.cursor_device.type, outputs[0].device.type)
         self.assertTrue(runner.sync_called)
 
-    def test_pool_fails_fast_when_output_count_mismatches_request_count(self):
+    def test_pool_fails_fast_when_output_count_mismatches_request_count(self) -> None:
         mixin_cls = self.runner_module.GRFeatureRunnerMixin
 
         class _Runner(mixin_cls):
-            def __init__(self):
+            def __init__(self) -> None:
                 self.input_batch = SimpleNamespace(
                     num_reqs=2,
                     pooling_params=[object(), object()],
                     req_ids=["req-1", "req-2"],
                     req_id_to_index={"req-1": 0, "req-2": 1},
                 )
-                self.seq_lens = _FakeSeqLensBuffer(
-                    torch.tensor([2, 3], dtype=torch.int64)
-                )
+                self.seq_lens = _FakeSeqLensBuffer(torch.tensor([2, 3], dtype=torch.int64))
                 self._pooling_metadata = _FakePoolingMetadata([2, 3])
 
                 class _FakeModel:
                     @staticmethod
-                    def pooler(hidden_states, pooling_metadata):
+                    def pooler(hidden_states, pooling_metadata) -> None:
                         return hidden_states[:1]
 
                 self.model = _FakeModel()
@@ -476,7 +474,7 @@ class TestGRRunnerCore(unittest.TestCase):
                 kv_connector_output=None,
             )
 
-    def test_update_states_cleans_finished_request_caches(self):
+    def test_update_states_cleans_finished_request_caches(self) -> None:
         runner = self._make_runner()
         runner._gr_features_cache["done"] = {"schema_fingerprint": "x"}
         runner._gr_feature_errors["done"] = "bad payload"

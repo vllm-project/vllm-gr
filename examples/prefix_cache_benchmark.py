@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """End-to-end prefix-cache benchmark for HSTU on vLLM-GR.
 
@@ -171,8 +171,7 @@ def _snapshot_prefix_cache_counters(llm) -> dict[str, int]:
 
 def _diff_counters(after: dict[str, int], before: dict[str, int]) -> dict[str, int]:
     return {
-        key: int(after.get(key, 0) - before.get(key, 0))
-        for key in ("requests", "queries", "hits")
+        key: int(after.get(key, 0) - before.get(key, 0)) for key in ("requests", "queries", "hits")
     }
 
 
@@ -250,14 +249,10 @@ def _print_runtime_cache_diagnostics(
     for row in case_diagnostics[: max(show_case_limit, 0)]:
         print(
             "  case_id={case_id} prompt_len={prompt_len} "
-            "max_cacheable_prefix_tokens={max_cacheable_prefix_tokens}".format(
-                **row
-            )
+            "max_cacheable_prefix_tokens={max_cacheable_prefix_tokens}".format(**row)
         )
     if len(case_diagnostics) > max(show_case_limit, 0):
-        print(
-            f"  ... ({len(case_diagnostics) - max(show_case_limit, 0)} more cases)"
-        )
+        print(f"  ... ({len(case_diagnostics) - max(show_case_limit, 0)} more cases)")
 
     if case_diagnostics and all(
         row["max_cacheable_prefix_tokens"] == 0 for row in case_diagnostics
@@ -356,8 +351,7 @@ def _assert_nonzero_hit_rate(
         )
 
     has_reusable_prefix = any(
-        int(row.get("max_cacheable_prefix_tokens", 0)) > 0
-        for row in case_diagnostics
+        int(row.get("max_cacheable_prefix_tokens", 0)) > 0 for row in case_diagnostics
     )
     if not has_reusable_prefix:
         raise RuntimeError(
@@ -367,8 +361,7 @@ def _assert_nonzero_hit_rate(
 
     if summary["prefix_hit_rate"] <= 0.0:
         raise RuntimeError(
-            f"{summary['pass_name']} prefix_hit_rate is 0; "
-            "treat this benchmark run as a failure."
+            f"{summary['pass_name']} prefix_hit_rate is 0; treat this benchmark run as a failure."
         )
 
 
@@ -457,8 +450,7 @@ def main() -> int:
             hot = report["passes"][1]
             latency_gain = cold["avg_latency_ms"] - hot["avg_latency_ms"]
             print(
-                "first_hot_vs_cold: latency_delta_ms={:.3f} "
-                "hit_rate_delta={:.4%}".format(
+                "first_hot_vs_cold: latency_delta_ms={:.3f} hit_rate_delta={:.4%}".format(
                     latency_gain,
                     hot["prefix_hit_rate"] - cold["prefix_hit_rate"],
                 )

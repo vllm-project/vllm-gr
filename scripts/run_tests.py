@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Unified test runner for the reduced core vllm-GR test matrix.
 
@@ -119,10 +119,7 @@ def detect_runtime_backend() -> str:
         if is_cuda_available():
             return "gpu"
     except Exception as exc:
-        print(
-            "  [WARN] Failed while probing runtime backend; "
-            f"defaulting to CPU ({exc})."
-        )
+        print(f"  [WARN] Failed while probing runtime backend; defaulting to CPU ({exc}).")
     return "cpu"
 
 
@@ -207,10 +204,7 @@ def build_pytest_command(files: list[str], verbose: bool = False) -> list[str]:
 
 def build_unittest_command(files: list[str], verbose: bool = False) -> list[str]:
     del verbose
-    modules = [
-        f"tests.{os.path.splitext(file_name)[0]}"
-        for file_name in files
-    ]
+    modules = [f"tests.{os.path.splitext(file_name)[0]}" for file_name in files]
     return [sys.executable, "-m", "unittest", *modules]
 
 
@@ -392,8 +386,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset",
         nargs="*",
         help=(
-            "Dataset(s) for dataset_inference.py "
-            "(e.g. debug, movielens-1m, kuairand-1k, streaming)"
+            "Dataset(s) for dataset_inference.py (e.g. debug, movielens-1m, kuairand-1k, streaming)"
         ),
     )
     parser.add_argument(
@@ -422,15 +415,9 @@ def main() -> None:
     if args.auto_platform:
         auto_suite = runtime_backend_to_platform_suite(runtime_backend or "cpu")
         if auto_suite is None:
-            print(
-                "  Auto platform backend: cpu "
-                "(platform-all will be skipped)"
-            )
+            print("  Auto platform backend: cpu (platform-all will be skipped)")
         else:
-            print(
-                "  Auto platform backend: "
-                f"{runtime_backend} ({auto_suite})"
-            )
+            print(f"  Auto platform backend: {runtime_backend} ({auto_suite})")
 
     if requested_suites:
         print(f"  Selected suites: {', '.join(requested_suites)}")
@@ -452,13 +439,15 @@ def main() -> None:
         results.append((suite_label, passed))
 
     if args.all or args.examples_only:
-        results.append((
-            "Examples",
-            run_examples(
-                args.dataset,
-                expected_device=runtime_backend if args.auto_platform else None,
-            ),
-        ))
+        results.append(
+            (
+                "Examples",
+                run_examples(
+                    args.dataset,
+                    expected_device=runtime_backend if args.auto_platform else None,
+                ),
+            )
+        )
 
     elapsed = time.time() - start
 

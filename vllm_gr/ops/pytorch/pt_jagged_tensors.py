@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """PyTorch implementation of jagged tensor operations"""
 
@@ -28,7 +29,7 @@ def _pytorch_jagged_to_padded_dense(
         end = int(offsets[idx + 1].item())
         length = min(end - start, max_length)
         if length > 0:
-            output[idx, :length] = values[start:start + length]
+            output[idx, :length] = values[start : start + length]
 
     return output
 
@@ -89,20 +90,12 @@ def pytorch_concat_2D_jagged(
         offsets_right_non_optional = offsets_right
 
     max_len_left = (
-        int(
-            (offsets_left_non_optional[1:] - offsets_left_non_optional[:-1])
-            .max()
-            .item()
-        )
+        int((offsets_left_non_optional[1:] - offsets_left_non_optional[:-1]).max().item())
         if max_len_left is None
         else max_len_left
     )
     max_len_right = (
-        int(
-            (offsets_right_non_optional[1:] - offsets_right_non_optional[:-1])
-            .max()
-            .item()
-        )
+        int((offsets_right_non_optional[1:] - offsets_right_non_optional[:-1]).max().item())
         if max_len_right is None
         else max_len_right
     )

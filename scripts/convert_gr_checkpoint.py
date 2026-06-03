@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Convert DLRM_v3 training checkpoints to HuggingFace-compatible format.
@@ -71,7 +71,6 @@ Usage:
 """
 
 import argparse
-from collections import OrderedDict
 import importlib.util
 import json
 import logging
@@ -79,6 +78,7 @@ import os
 import shutil
 import sys
 import tempfile
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -159,9 +159,7 @@ def _build_embedding_table_dtype_map(config: Any) -> Dict[str, torch.dtype]:
 def _build_embedding_table_num_embeddings_map(config: Any) -> Dict[str, int]:
     table_num_embeddings: Dict[str, int] = {}
     for table_cfg in getattr(config, "embedding_tables", []) or []:
-        table_num_embeddings[str(table_cfg["name"])] = int(
-            table_cfg["num_embeddings"]
-        )
+        table_num_embeddings[str(table_cfg["name"])] = int(table_cfg["num_embeddings"])
     return table_num_embeddings
 
 
@@ -299,9 +297,7 @@ def load_sparse_weights(
     load_dense_state_dict(hstu, dense_weights)
     logger.info("Pre-loaded dense weights into model for sparse loading")
 
-    sparse_keys_before = {
-        k for k, v in hstu.state_dict().items() if is_sparse_key(k, v)
-    }
+    sparse_keys_before = {k for k, v in hstu.state_dict().items() if is_sparse_key(k, v)}
     if not sparse_keys_before:
         raise RuntimeError(
             "Sparse checkpoint/config mismatch: checkpoint contains sparse weights, "
@@ -329,11 +325,11 @@ def generate_config_from_dataset(
     output_dir: str,
 ) -> None:
     """Generate a config.json for the given dataset using vllm-GR dataset configs."""
-    from vllm_gr.config.hstu_config import HSTUConfig
     from vllm_gr.config.dataset_configs import (
-        get_hstu_config_overrides,
         get_embedding_table_overrides,
+        get_hstu_config_overrides,
     )
+    from vllm_gr.config.hstu_config import HSTUConfig
 
     overrides = get_hstu_config_overrides(dataset)
     tables = get_embedding_table_overrides(dataset)
@@ -376,9 +372,7 @@ def _load_hstu_config(config_dir: str) -> Any:
 def _resolve_embedding_table_dim(config: Any) -> int:
     target_dim = int(getattr(config, "hstu_embedding_table_dim", 0))
     if target_dim <= 0:
-        raise ValueError(
-            "config.hstu_embedding_table_dim must be a positive integer"
-        )
+        raise ValueError("config.hstu_embedding_table_dim must be a positive integer")
 
     embedding_tables = list(getattr(config, "embedding_tables", []) or [])
     if not embedding_tables:
@@ -411,9 +405,7 @@ def _validate_crop_embedding_dim(
         return source_dim, None
 
     if crop_embedding_dim <= 0:
-        raise ValueError(
-            f"crop_embedding_dim must be a positive integer, got {crop_embedding_dim}"
-        )
+        raise ValueError(f"crop_embedding_dim must be a positive integer, got {crop_embedding_dim}")
     if crop_embedding_dim > source_dim:
         raise ValueError(
             "crop_embedding_dim cannot exceed the source embedding dimension: "
@@ -429,8 +421,7 @@ def _validate_crop_num_embeddings(
         return None
     if crop_num_embeddings <= 0:
         raise ValueError(
-            "crop_num_embeddings must be a positive integer, "
-            f"got {crop_num_embeddings}"
+            f"crop_num_embeddings must be a positive integer, got {crop_num_embeddings}"
         )
     return int(crop_num_embeddings)
 
@@ -551,7 +542,10 @@ def _crop_sparse_weights(
             table_name = tensor_name.split(".embeddings.", 1)[1].rsplit(".weight", 1)[0]
             if crop_num_embeddings is not None:
                 expected_num_embeddings = source_table_num_embeddings.get(table_name)
-                if expected_num_embeddings is not None and tensor.shape[0] != expected_num_embeddings:
+                if (
+                    expected_num_embeddings is not None
+                    and tensor.shape[0] != expected_num_embeddings
+                ):
                     raise RuntimeError(
                         "Sparse embedding tensor row-count mismatch during crop: "
                         f"{tensor_name} has rows={tensor.shape[0]}, "
@@ -604,9 +598,7 @@ def _write_conversion_meta(
         "embedding_artifact": embedding_artifact,
         "source_embedding_dim": source_embedding_dim,
         "target_embedding_dim": (
-            int(crop_embedding_dim)
-            if crop_embedding_dim is not None
-            else int(source_embedding_dim)
+            int(crop_embedding_dim) if crop_embedding_dim is not None else int(source_embedding_dim)
         ),
         "hstu_embedding_table_dim": int(getattr(config, "hstu_embedding_table_dim")),
         "embedding_table_dims": table_dims,
@@ -770,12 +762,9 @@ def convert(
                     )
         elif crop_embedding_dim is not None or crop_num_embeddings is not None:
             raise RuntimeError(
-                "crop settings require a config source via --config-json "
-                "or --dataset."
+                "crop settings require a config source via --config-json or --dataset."
             )
-        logger.info(
-            "Sparse directory found but --dense-only specified, skipping embeddings"
-        )
+        logger.info("Sparse directory found but --dense-only specified, skipping embeddings")
     elif config_json or dataset:
         with tempfile.TemporaryDirectory(prefix="gr_convert_cfg_") as source_config_dir:
             materialized_source_config = _materialize_source_config(
@@ -800,18 +789,13 @@ def convert(
                     source_config=source_config,
                 )
     elif crop_embedding_dim is not None or crop_num_embeddings is not None:
-        raise RuntimeError(
-            "crop settings require a config source via --config-json "
-            "or --dataset."
-        )
+        raise RuntimeError("crop settings require a config source via --config-json or --dataset.")
 
     if target_config is None and source_config is not None:
         target_config = source_config
 
     if has_sparse_dir and dense_only:
-        logger.info(
-            "Sparse directory found but --dense-only specified, skipping embeddings"
-        )
+        logger.info("Sparse directory found but --dense-only specified, skipping embeddings")
 
     # Save
     dense_artifact: Optional[str] = None
@@ -880,7 +864,9 @@ def convert(
     dense_count = len(converted) - sparse_count
     logger.info(
         "Converted %d tensors (%d parameters) -> %s",
-        len(converted), total_params, out_file,
+        len(converted),
+        total_params,
+        out_file,
     )
     sparse_dtype_summary = (
         "per-table config"
@@ -888,9 +874,11 @@ def convert(
         else ("original tensor dtypes" if sparse_count else "n/a")
     )
     logger.info(
-        "  Dense: %d tensors (target dtype=%s), Sparse: %d tensors "
-        "(target dtype=%s)",
-        dense_count, torch_dtype, sparse_count, sparse_dtype_summary,
+        "  Dense: %d tensors (target dtype=%s), Sparse: %d tensors (target dtype=%s)",
+        dense_count,
+        torch_dtype,
+        sparse_count,
+        sparse_dtype_summary,
     )
     if crop_embedding_dim is not None:
         logger.info(
@@ -922,24 +910,30 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--input-path", required=True,
+        "--input-path",
+        required=True,
         help="Path to DLRM_v3 checkpoint directory (containing non_sparse.ckpt)",
     )
     parser.add_argument(
-        "--output-dir", required=True,
+        "--output-dir",
+        required=True,
         help="Output directory for converted HuggingFace model",
     )
     parser.add_argument(
-        "--config-json", default=None,
+        "--config-json",
+        default=None,
         help="Path to existing config.json to copy into output directory",
     )
     parser.add_argument(
-        "--dataset", default=None,
+        "--dataset",
+        default=None,
         choices=DATASET_CHOICES,
         help="Dataset name to auto-generate config.json",
     )
     parser.add_argument(
-        "--dense-only", action="store_true", default=False,
+        "--dense-only",
+        action="store_true",
+        default=False,
         help=(
             "Only convert dense weights (skip sparse embeddings). "
             "Matches upstream inference pattern where embeddings come "
@@ -947,11 +941,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--format", choices=["safetensors", "pt"], default="safetensors",
+        "--format",
+        choices=["safetensors", "pt"],
+        default="safetensors",
         help="Output weight format (default: safetensors)",
     )
     parser.add_argument(
-        "--dtype", choices=["bfloat16", "float16", "float32"],
+        "--dtype",
+        choices=["bfloat16", "float16", "float32"],
         default="bfloat16",
         help="Target dtype for all tensors (default: bfloat16)",
     )
@@ -984,7 +981,9 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--verbose", action="store_true", default=False,
+        "--verbose",
+        action="store_true",
+        default=False,
         help="Enable verbose logging",
     )
 

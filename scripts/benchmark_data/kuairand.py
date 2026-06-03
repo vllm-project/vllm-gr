@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Prepare upstream-aligned KuaiRand benchmark data for vllm-GR."""
 
@@ -101,8 +101,7 @@ class KuaiRandDataProcessor(DataProcessor):
 
             grouped_df["action_weights"] = grouped_df.apply(
                 lambda row: [
-                    int(sum(values))
-                    for values in zip(*[row[column] for column in event_columns])
+                    int(sum(values)) for values in zip(*[row[column] for column in event_columns])
                 ],
                 axis=1,
             )

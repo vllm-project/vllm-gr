@@ -1,6 +1,6 @@
-# Copyright (c) vllm-GR Authors.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Original dataset configs from Meta Platforms, Inc. (generative-recommenders)
-# Licensed under the Apache License, Version 2.0
 
 """
 Dataset-specific configuration factory functions.
@@ -37,10 +37,7 @@ _SYNTHETIC_DATASETS = {
 }
 
 SUPPORTED_DATASETS = sorted(
-    _MOVIELENS_DATASETS
-    | _STREAMING_DATASETS
-    | _KUAIRAND_DATASETS
-    | _SYNTHETIC_DATASETS
+    _MOVIELENS_DATASETS | _STREAMING_DATASETS | _KUAIRAND_DATASETS | _SYNTHETIC_DATASETS
 )
 
 
@@ -54,9 +51,7 @@ def _resolve_dataset_family(dataset: str) -> str:
         return "kuairand"
     if dataset in _SYNTHETIC_DATASETS:
         return "synthetic"
-    raise ValueError(
-        f"Unsupported dataset: {dataset!r}. Supported datasets: {SUPPORTED_DATASETS}"
-    )
+    raise ValueError(f"Unsupported dataset: {dataset!r}. Supported datasets: {SUPPORTED_DATASETS}")
 
 
 def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
@@ -109,19 +104,33 @@ def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
         overrides["uih_weight_feature_name"] = "item_weights"
         overrides["hstu_uih_feature_names"] = (
             [
-                "user_id", "sex", "age_group", "occupation", "zip_code",
-                "movie_id", "movie_rating", "action_timestamp",
-                "item_weights", "dummy_watch_time",
+                "user_id",
+                "sex",
+                "age_group",
+                "occupation",
+                "zip_code",
+                "movie_id",
+                "movie_rating",
+                "action_timestamp",
+                "item_weights",
+                "dummy_watch_time",
             ]
             if dataset == "movielens-1m"
             else [
-                "user_id", "movie_id", "movie_rating",
-                "action_timestamp", "item_weights", "dummy_watch_time",
+                "user_id",
+                "movie_id",
+                "movie_rating",
+                "action_timestamp",
+                "item_weights",
+                "dummy_watch_time",
             ]
         )
         overrides["hstu_candidate_feature_names"] = [
-            "item_movie_id", "item_movie_rating", "item_query_time",
-            "item_action_weights", "item_dummy_watchtime",
+            "item_movie_id",
+            "item_movie_rating",
+            "item_query_time",
+            "item_action_weights",
+            "item_dummy_watchtime",
         ]
         overrides["merge_uih_candidate_feature_mapping"] = [
             ["movie_id", "item_movie_id"],
@@ -144,21 +153,32 @@ def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
         overrides["candidates_watchtime_feature_name"] = "item_candidate_rating"
         overrides["candidates_querytime_feature_name"] = "item_query_time"
         overrides["user_embedding_feature_names"] = [
-            "item_id", "user_id", "item_category_id",
+            "item_id",
+            "user_id",
+            "item_category_id",
         ]
         overrides["item_embedding_feature_names"] = [
-            "item_candidate_id", "item_candidate_category_id",
+            "item_candidate_id",
+            "item_candidate_category_id",
         ]
         overrides["uih_post_id_feature_name"] = "item_id"
         overrides["uih_action_time_feature_name"] = "action_timestamp"
         overrides["uih_weight_feature_name"] = "item_weights"
         overrides["hstu_uih_feature_names"] = [
-            "user_id", "item_id", "item_rating", "action_timestamp",
-            "item_weights", "dummy_watch_time", "item_category_id",
+            "user_id",
+            "item_id",
+            "item_rating",
+            "action_timestamp",
+            "item_weights",
+            "dummy_watch_time",
+            "item_category_id",
         ]
         overrides["hstu_candidate_feature_names"] = [
-            "item_candidate_id", "item_candidate_rating", "item_query_time",
-            "item_action_weights", "item_dummy_watchtime",
+            "item_candidate_id",
+            "item_candidate_rating",
+            "item_query_time",
+            "item_action_weights",
+            "item_dummy_watchtime",
             "item_candidate_category_id",
         ]
         overrides["merge_uih_candidate_feature_mapping"] = [
@@ -176,31 +196,46 @@ def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
 
     elif dataset_family == "kuairand":
         overrides["contextual_feature_to_max_length"] = {
-            "user_id": 1, "user_active_degree": 1,
-            "follow_user_num_range": 1, "fans_user_num_range": 1,
-            "friend_user_num_range": 1, "register_days_range": 1,
+            "user_id": 1,
+            "user_active_degree": 1,
+            "follow_user_num_range": 1,
+            "fans_user_num_range": 1,
+            "friend_user_num_range": 1,
+            "register_days_range": 1,
         }
         overrides["candidates_weight_feature_name"] = "item_action_weight"
         overrides["candidates_watchtime_feature_name"] = "item_target_watchtime"
         overrides["candidates_querytime_feature_name"] = "item_query_time"
         overrides["user_embedding_feature_names"] = [
-            "video_id", "user_id", "user_active_degree",
-            "follow_user_num_range", "fans_user_num_range",
-            "friend_user_num_range", "register_days_range",
+            "video_id",
+            "user_id",
+            "user_active_degree",
+            "follow_user_num_range",
+            "fans_user_num_range",
+            "friend_user_num_range",
+            "register_days_range",
         ]
         overrides["item_embedding_feature_names"] = ["item_video_id"]
         overrides["uih_post_id_feature_name"] = "video_id"
         overrides["uih_action_time_feature_name"] = "action_timestamp"
         overrides["uih_weight_feature_name"] = "action_weight"
         overrides["hstu_uih_feature_names"] = [
-            "user_id", "user_active_degree", "follow_user_num_range",
-            "fans_user_num_range", "friend_user_num_range",
-            "register_days_range", "video_id", "action_timestamp",
-            "action_weight", "watch_time",
+            "user_id",
+            "user_active_degree",
+            "follow_user_num_range",
+            "fans_user_num_range",
+            "friend_user_num_range",
+            "register_days_range",
+            "video_id",
+            "action_timestamp",
+            "action_weight",
+            "watch_time",
         ]
         overrides["hstu_candidate_feature_names"] = [
-            "item_video_id", "item_action_weight",
-            "item_target_watchtime", "item_query_time",
+            "item_video_id",
+            "item_action_weight",
+            "item_target_watchtime",
+            "item_query_time",
         ]
         overrides["merge_uih_candidate_feature_mapping"] = [
             ["video_id", "item_video_id"],
@@ -210,8 +245,14 @@ def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
         ]
         overrides["action_weights"] = [1, 2, 4, 8, 16, 32, 64, 128]
         overrides["task_names"] = [
-            "is_click", "is_like", "is_follow", "is_comment",
-            "is_forward", "is_hate", "long_view", "is_profile_enter",
+            "is_click",
+            "is_like",
+            "is_follow",
+            "is_comment",
+            "is_forward",
+            "is_hate",
+            "long_view",
+            "is_profile_enter",
         ]
         overrides["task_types"] = [
             "binary_classification",
@@ -219,31 +260,47 @@ def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
 
     else:
         overrides["contextual_feature_to_max_length"] = {
-            "viewer_id": 1, "dummy_contexual": 1,
+            "viewer_id": 1,
+            "dummy_contexual": 1,
         }
         overrides["contextual_feature_to_min_uih_length"] = {
-            "viewer_id": 128, "dummy_contexual": 128,
+            "viewer_id": 128,
+            "dummy_contexual": 128,
         }
         overrides["candidates_weight_feature_name"] = "item_action_weight"
         overrides["candidates_watchtime_feature_name"] = "item_target_watchtime"
         overrides["candidates_querytime_feature_name"] = "item_query_time"
         overrides["user_embedding_feature_names"] = [
-            "uih_post_id", "uih_owner_id", "viewer_id", "dummy_contexual",
+            "uih_post_id",
+            "uih_owner_id",
+            "viewer_id",
+            "dummy_contexual",
         ]
         overrides["item_embedding_feature_names"] = [
-            "item_post_id", "item_owner_id",
+            "item_post_id",
+            "item_owner_id",
         ]
         overrides["uih_post_id_feature_name"] = "uih_post_id"
         overrides["uih_action_time_feature_name"] = "uih_action_time"
         overrides["hstu_uih_feature_names"] = [
-            "uih_post_id", "uih_action_time", "uih_weight",
-            "uih_owner_id", "uih_watchtime", "uih_surface_type",
-            "uih_video_length", "viewer_id", "dummy_contexual",
+            "uih_post_id",
+            "uih_action_time",
+            "uih_weight",
+            "uih_owner_id",
+            "uih_watchtime",
+            "uih_surface_type",
+            "uih_video_length",
+            "viewer_id",
+            "dummy_contexual",
         ]
         overrides["hstu_candidate_feature_names"] = [
-            "item_post_id", "item_owner_id", "item_surface_type",
-            "item_video_length", "item_action_weight",
-            "item_target_watchtime", "item_query_time",
+            "item_post_id",
+            "item_owner_id",
+            "item_surface_type",
+            "item_video_length",
+            "item_action_weight",
+            "item_target_watchtime",
+            "item_query_time",
         ]
         overrides["merge_uih_candidate_feature_mapping"] = [
             ["uih_post_id", "item_post_id"],
@@ -272,86 +329,151 @@ def get_embedding_table_overrides(dataset: str) -> List[Dict[str, Any]]:
     if dataset_family == "movielens":
         if dataset == "movielens-1m":
             return [
-                {"name": "movie_id", "embedding_dim": dim,
-                 "num_embeddings": HASH_SIZE,
-                 "feature_names": ["movie_id", "item_movie_id"]},
-                {"name": "user_id", "embedding_dim": dim,
-                 "num_embeddings": HASH_SIZE,
-                 "feature_names": ["user_id"]},
-                {"name": "sex", "embedding_dim": dim,
-                 "num_embeddings": HASH_SIZE,
-                 "feature_names": ["sex"]},
-                {"name": "age_group", "embedding_dim": dim,
-                 "num_embeddings": HASH_SIZE,
-                 "feature_names": ["age_group"]},
-                {"name": "occupation", "embedding_dim": dim,
-                 "num_embeddings": HASH_SIZE,
-                 "feature_names": ["occupation"]},
-                {"name": "zip_code", "embedding_dim": dim,
-                 "num_embeddings": HASH_SIZE,
-                 "feature_names": ["zip_code"]},
+                {
+                    "name": "movie_id",
+                    "embedding_dim": dim,
+                    "num_embeddings": HASH_SIZE,
+                    "feature_names": ["movie_id", "item_movie_id"],
+                },
+                {
+                    "name": "user_id",
+                    "embedding_dim": dim,
+                    "num_embeddings": HASH_SIZE,
+                    "feature_names": ["user_id"],
+                },
+                {
+                    "name": "sex",
+                    "embedding_dim": dim,
+                    "num_embeddings": HASH_SIZE,
+                    "feature_names": ["sex"],
+                },
+                {
+                    "name": "age_group",
+                    "embedding_dim": dim,
+                    "num_embeddings": HASH_SIZE,
+                    "feature_names": ["age_group"],
+                },
+                {
+                    "name": "occupation",
+                    "embedding_dim": dim,
+                    "num_embeddings": HASH_SIZE,
+                    "feature_names": ["occupation"],
+                },
+                {
+                    "name": "zip_code",
+                    "embedding_dim": dim,
+                    "num_embeddings": HASH_SIZE,
+                    "feature_names": ["zip_code"],
+                },
             ]
         else:
             return [
-                {"name": "movie_id", "embedding_dim": dim,
-                 "num_embeddings": HASH_SIZE_1B,
-                 "feature_names": ["movie_id", "item_movie_id"]},
-                {"name": "user_id", "embedding_dim": dim,
-                 "num_embeddings": 3_000_000,
-                 "feature_names": ["user_id"]},
+                {
+                    "name": "movie_id",
+                    "embedding_dim": dim,
+                    "num_embeddings": HASH_SIZE_1B,
+                    "feature_names": ["movie_id", "item_movie_id"],
+                },
+                {
+                    "name": "user_id",
+                    "embedding_dim": dim,
+                    "num_embeddings": 3_000_000,
+                    "feature_names": ["user_id"],
+                },
             ]
 
     elif dataset_family == "streaming":
         return [
-            {"name": "item_id", "embedding_dim": dim,
-             "num_embeddings": HASH_SIZE_1B,
-             "feature_names": ["item_id", "item_candidate_id"]},
-            {"name": "item_category_id", "embedding_dim": dim,
-             "num_embeddings": 128,
-             "weight_init_max": 1.0,
-             "weight_init_min": -1.0,
-             "feature_names": ["item_category_id", "item_candidate_category_id"]},
-            {"name": "user_id", "embedding_dim": dim,
-             "num_embeddings": HASH_SIZE,
-             "feature_names": ["user_id"]},
+            {
+                "name": "item_id",
+                "embedding_dim": dim,
+                "num_embeddings": HASH_SIZE_1B,
+                "feature_names": ["item_id", "item_candidate_id"],
+            },
+            {
+                "name": "item_category_id",
+                "embedding_dim": dim,
+                "num_embeddings": 128,
+                "weight_init_max": 1.0,
+                "weight_init_min": -1.0,
+                "feature_names": ["item_category_id", "item_candidate_category_id"],
+            },
+            {
+                "name": "user_id",
+                "embedding_dim": dim,
+                "num_embeddings": HASH_SIZE,
+                "feature_names": ["user_id"],
+            },
         ]
 
     elif dataset_family == "kuairand":
         return [
-            {"name": "video_id", "embedding_dim": dim,
-             "num_embeddings": HASH_SIZE,
-             "feature_names": ["video_id", "item_video_id"]},
-            {"name": "user_id", "embedding_dim": dim,
-             "num_embeddings": HASH_SIZE,
-             "feature_names": ["user_id"]},
-            {"name": "user_active_degree", "embedding_dim": dim,
-             "num_embeddings": 8,
-             "feature_names": ["user_active_degree"]},
-            {"name": "follow_user_num_range", "embedding_dim": dim,
-             "num_embeddings": 9,
-             "feature_names": ["follow_user_num_range"]},
-            {"name": "fans_user_num_range", "embedding_dim": dim,
-             "num_embeddings": 9,
-             "feature_names": ["fans_user_num_range"]},
-            {"name": "friend_user_num_range", "embedding_dim": dim,
-             "num_embeddings": 8,
-             "feature_names": ["friend_user_num_range"]},
-            {"name": "register_days_range", "embedding_dim": dim,
-             "num_embeddings": 8,
-             "feature_names": ["register_days_range"]},
+            {
+                "name": "video_id",
+                "embedding_dim": dim,
+                "num_embeddings": HASH_SIZE,
+                "feature_names": ["video_id", "item_video_id"],
+            },
+            {
+                "name": "user_id",
+                "embedding_dim": dim,
+                "num_embeddings": HASH_SIZE,
+                "feature_names": ["user_id"],
+            },
+            {
+                "name": "user_active_degree",
+                "embedding_dim": dim,
+                "num_embeddings": 8,
+                "feature_names": ["user_active_degree"],
+            },
+            {
+                "name": "follow_user_num_range",
+                "embedding_dim": dim,
+                "num_embeddings": 9,
+                "feature_names": ["follow_user_num_range"],
+            },
+            {
+                "name": "fans_user_num_range",
+                "embedding_dim": dim,
+                "num_embeddings": 9,
+                "feature_names": ["fans_user_num_range"],
+            },
+            {
+                "name": "friend_user_num_range",
+                "embedding_dim": dim,
+                "num_embeddings": 8,
+                "feature_names": ["friend_user_num_range"],
+            },
+            {
+                "name": "register_days_range",
+                "embedding_dim": dim,
+                "num_embeddings": 8,
+                "feature_names": ["register_days_range"],
+            },
         ]
 
     return [
-        {"name": "post_id", "embedding_dim": dim,
-         "num_embeddings": HASH_SIZE,
-         "feature_names": [
-             "uih_post_id", "item_post_id",
-             "uih_owner_id", "item_owner_id",
-         ]},
-        {"name": "viewer_id", "embedding_dim": dim,
-         "num_embeddings": HASH_SIZE,
-         "feature_names": ["viewer_id"]},
-        {"name": "dummy_contexual", "embedding_dim": dim,
-         "num_embeddings": HASH_SIZE,
-         "feature_names": ["dummy_contexual"]},
+        {
+            "name": "post_id",
+            "embedding_dim": dim,
+            "num_embeddings": HASH_SIZE,
+            "feature_names": [
+                "uih_post_id",
+                "item_post_id",
+                "uih_owner_id",
+                "item_owner_id",
+            ],
+        },
+        {
+            "name": "viewer_id",
+            "embedding_dim": dim,
+            "num_embeddings": HASH_SIZE,
+            "feature_names": ["viewer_id"],
+        },
+        {
+            "name": "dummy_contexual",
+            "embedding_dim": dim,
+            "num_embeddings": HASH_SIZE,
+            "feature_names": ["dummy_contexual"],
+        },
     ]

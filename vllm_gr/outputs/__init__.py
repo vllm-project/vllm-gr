@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Output data types for generative recommendation.
@@ -9,13 +9,13 @@ Re-exports all public types from submodules:
 - base.py: GRModelOutput, ScoringOutput, EmbeddingOutput, TextOutput
 """
 
-from vllm_gr.outputs.request import RecommendedItem, GRRequestOutput
 from vllm_gr.outputs.base import (
+    EmbeddingOutput,
     GRModelOutput,
     ScoringOutput,
-    EmbeddingOutput,
     TextOutput,
 )
+from vllm_gr.outputs.request import GRRequestOutput, RecommendedItem
 
 __all__ = [
     "RecommendedItem",

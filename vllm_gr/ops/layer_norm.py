@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,14 +23,14 @@ In this fork, both public entry points currently execute the PyTorch kernels
 only. The ``kernel`` argument is preserved for upstream API compatibility.
 """
 
-import torch
 from typing import List
 
-from vllm_gr.models.dlrm_v3.common import HammerKernel, HammerModule
+import torch
 
+from vllm_gr.models.dlrm_v3.common import HammerKernel, HammerModule
 from vllm_gr.ops.pytorch.pt_hstu_layer_norm import (
-    pytorch_swish_layer_norm,
     pytorch_layer_norm,
+    pytorch_swish_layer_norm,
 )
 
 

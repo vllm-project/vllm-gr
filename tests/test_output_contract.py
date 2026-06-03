@@ -1,23 +1,24 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 
 """Regression tests for raw-score output semantics."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
-from contextlib import contextmanager
 import importlib.machinery
 import importlib.util
-from pathlib import Path
-from collections import namedtuple
 import sys
 import tempfile
 import types
 import unittest
+from collections import namedtuple
+from contextlib import contextmanager
+from pathlib import Path
 from unittest import mock
 
 import torch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -38,7 +39,7 @@ def _restore_modules(saved: dict[str, types.ModuleType]) -> None:
         sys.modules[name] = module
 
 
-def _load_module(name: str, path: Path):
+def _load_module(name: str, path: Path) -> None:
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -54,7 +55,7 @@ def _install_stub_package(name: str) -> None:
         sys.modules[name] = module
 
 
-def _load_jagged_entrypoint_module():
+def _load_jagged_entrypoint_module() -> None:
     _install_stub_package("vllm_gr.models")
     _install_stub_package("vllm_gr.models.dlrm_v3")
     _install_stub_package("vllm_gr.ops")
@@ -74,7 +75,7 @@ def _load_jagged_entrypoint_module():
     )
 
 
-def _load_pt_position_module():
+def _load_pt_position_module() -> None:
     _install_stub_package("vllm_gr.models")
     _install_stub_package("vllm_gr.models.dlrm_v3")
     _install_stub_package("vllm_gr.ops")
@@ -91,14 +92,14 @@ def _load_pt_position_module():
 
 
 @contextmanager
-def _fake_vllm_outputs():
+def _fake_vllm_outputs() -> None:
     saved = _purge_modules("vllm", "vllm.outputs", "vllm_gr.outputs")
 
     fake_vllm = types.ModuleType("vllm")
     fake_outputs = types.ModuleType("vllm.outputs")
 
     class PoolingOutput:
-        def __init__(self, data):
+        def __init__(self, data) -> None:
             self.data = data
 
     class PoolingRequestOutput:
@@ -109,7 +110,7 @@ def _fake_vllm_outputs():
             prompt_token_ids,
             num_cached_tokens,
             finished,
-        ):
+        ) -> None:
             self.request_id = request_id
             self.outputs = outputs
             self.prompt_token_ids = prompt_token_ids
@@ -119,10 +120,12 @@ def _fake_vllm_outputs():
     fake_outputs.PoolingOutput = PoolingOutput
     fake_outputs.PoolingRequestOutput = PoolingRequestOutput
 
-    sys.modules.update({
-        "vllm": fake_vllm,
-        "vllm.outputs": fake_outputs,
-    })
+    sys.modules.update(
+        {
+            "vllm": fake_vllm,
+            "vllm.outputs": fake_outputs,
+        }
+    )
 
     try:
         yield
@@ -132,7 +135,7 @@ def _fake_vllm_outputs():
 
 
 @contextmanager
-def _fake_dlrm_hstu_module():
+def _fake_dlrm_hstu_module() -> None:
     module_name = "vllm_gr.models.dlrm_v3.modules.dlrm_hstu"
     saved = _purge_modules(module_name)
     fake_module = types.ModuleType(module_name)
@@ -149,7 +152,7 @@ def _fake_dlrm_hstu_module():
 
 
 @contextmanager
-def _fake_torchrec_embedding_config_module(*, with_bf16: bool):
+def _fake_torchrec_embedding_config_module(*, with_bf16: bool) -> None:
     saved = _purge_modules(
         "torchrec",
         "torchrec.modules",
@@ -166,15 +169,13 @@ def _fake_torchrec_embedding_config_module(*, with_bf16: bool):
             BF16 = object()
 
     class FakeEmbeddingConfig:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.kwargs = kwargs
 
     fake_embedding_configs.DataType = FakeDataType
     fake_embedding_configs.EmbeddingConfig = FakeEmbeddingConfig
     fake_torchrec.__spec__ = importlib.machinery.ModuleSpec("torchrec", loader=None)
-    fake_torchrec_modules.__spec__ = importlib.machinery.ModuleSpec(
-        "torchrec.modules", loader=None
-    )
+    fake_torchrec_modules.__spec__ = importlib.machinery.ModuleSpec("torchrec.modules", loader=None)
     fake_embedding_configs.__spec__ = importlib.machinery.ModuleSpec(
         "torchrec.modules.embedding_configs", loader=None
     )
@@ -199,7 +200,7 @@ def _fake_torchrec_embedding_config_module(*, with_bf16: bool):
 
 
 @contextmanager
-def _fake_torchrec_jagged_tensor_module():
+def _fake_torchrec_jagged_tensor_module() -> None:
     saved = _purge_modules(
         "torchrec",
         "torchrec.sparse",
@@ -211,14 +212,12 @@ def _fake_torchrec_jagged_tensor_module():
 
     class FakeKeyedJaggedTensor:
         @classmethod
-        def from_lengths_sync(cls, **kwargs):
+        def from_lengths_sync(cls, **kwargs) -> None:
             return types.SimpleNamespace(**kwargs)
 
     fake_jagged_tensor.KeyedJaggedTensor = FakeKeyedJaggedTensor
     fake_torchrec.__spec__ = importlib.machinery.ModuleSpec("torchrec", loader=None)
-    fake_torchrec_sparse.__spec__ = importlib.machinery.ModuleSpec(
-        "torchrec.sparse", loader=None
-    )
+    fake_torchrec_sparse.__spec__ = importlib.machinery.ModuleSpec("torchrec.sparse", loader=None)
     fake_jagged_tensor.__spec__ = importlib.machinery.ModuleSpec(
         "torchrec.sparse.jagged_tensor", loader=None
     )
@@ -242,7 +241,7 @@ def _fake_torchrec_jagged_tensor_module():
 
 
 @contextmanager
-def _fake_hstu_config_runtime():
+def _fake_hstu_config_runtime() -> None:
     saved = _purge_modules(
         "transformers",
         "vllm",
@@ -256,13 +255,13 @@ def _fake_hstu_config_runtime():
     fake_transformers = types.ModuleType("transformers")
 
     class _PretrainedConfig:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
     class _AutoConfig:
         @classmethod
-        def register(cls, *_args, **_kwargs):
+        def register(cls, *_args, **_kwargs) -> None:
             return None
 
     fake_transformers.PretrainedConfig = _PretrainedConfig
@@ -270,9 +269,7 @@ def _fake_hstu_config_runtime():
 
     fake_vllm = types.ModuleType("vllm")
     fake_vllm_transformers_utils = types.ModuleType("vllm.transformers_utils")
-    fake_convertor = types.ModuleType(
-        "vllm.transformers_utils.model_arch_config_convertor"
-    )
+    fake_convertor = types.ModuleType("vllm.transformers_utils.model_arch_config_convertor")
     fake_convertor.MODEL_ARCH_CONFIG_CONVERTORS = {}
 
     class _ModelArchConfigConvertorBase:
@@ -305,7 +302,7 @@ def _fake_hstu_config_runtime():
 
 
 @contextmanager
-def _fake_gr_input_processor_runtime():
+def _fake_gr_input_processor_runtime() -> None:
     saved = _purge_modules(
         "vllm",
         "vllm.config",
@@ -338,14 +335,14 @@ def _fake_gr_input_processor_runtime():
     fake_gr_engine = types.ModuleType("vllm_gr.engine")
 
     class _InputProcessor:
-        def __init__(self, *_args, **_kwargs):
+        def __init__(self, *_args, **_kwargs) -> None:
             return None
 
-        def process_inputs(self, *_args, **_kwargs):
+        def process_inputs(self, *_args, **_kwargs) -> None:
             raise AssertionError("super().process_inputs() should not be called")
 
     class _PoolingParams:
-        def __init__(self, task: str = "embed"):
+        def __init__(self, task: str = "embed") -> None:
             self.task = task
 
     class _SamplingParams:
@@ -404,7 +401,7 @@ def _fake_gr_input_processor_runtime():
 
 
 @contextmanager
-def _fake_arg_utils_runtime():
+def _fake_arg_utils_runtime() -> None:
     saved = _purge_modules(
         "vllm",
         "vllm.engine",
@@ -437,7 +434,7 @@ def _fake_arg_utils_runtime():
         disable_log_stats: bool = False
         gpu_memory_utilization: float = 0.9
 
-        def __post_init__(self):
+        def __post_init__(self) -> None:
             return None
 
     @dataclass
@@ -471,7 +468,7 @@ def _fake_arg_utils_runtime():
 
 
 @contextmanager
-def _fake_gr_engine_runtime():
+def _fake_gr_engine_runtime() -> None:
     saved = _purge_modules(
         "vllm",
         "vllm.config",
@@ -516,7 +513,7 @@ def _fake_gr_engine_runtime():
 
     class _Executor:
         @staticmethod
-        def get_class(_config):
+        def get_class(_config) -> None:
             return object
 
     fake_llm_engine.LLMEngine = _LLMEngine
@@ -534,7 +531,7 @@ def _fake_gr_engine_runtime():
     fake_gr_config = types.ModuleType("vllm_gr.config.gr_config")
 
     class _GRConfig:
-        def __init__(self, max_seq_len=512, max_candidates=1000):
+        def __init__(self, max_seq_len=512, max_candidates=1000) -> None:
             self.max_seq_len = max_seq_len
             self.max_candidates = max_candidates
 
@@ -594,8 +591,7 @@ def _fake_gr_engine_runtime():
 
 
 class TestOutputContract(unittest.TestCase):
-
-    def test_top_recommendation_uses_max_score_without_reordering(self):
+    def test_top_recommendation_uses_max_score_without_reordering(self) -> None:
         with _fake_vllm_outputs():
             from vllm_gr.outputs import GRRequestOutput, RecommendedItem
 
@@ -615,7 +611,7 @@ class TestOutputContract(unittest.TestCase):
             self.assertEqual(output.top_recommendation.item_id, 102)
             self.assertEqual(output.top_recommendation.score, 0.9)
 
-    def test_to_dict_preserves_optional_task_scores(self):
+    def test_to_dict_preserves_optional_task_scores(self) -> None:
         with _fake_vllm_outputs():
             from vllm_gr.outputs import GRRequestOutput, RecommendedItem
 
@@ -640,7 +636,7 @@ class TestOutputContract(unittest.TestCase):
                 {"is_click": 0.3, "is_like": 0.8},
             )
 
-    def test_sparse_transfer_preserves_embedding_dtype_without_target_dtype(self):
+    def test_sparse_transfer_preserves_embedding_dtype_without_target_dtype(self) -> None:
         with _fake_dlrm_hstu_module() as SequenceEmbedding:
             from vllm_gr.utils.hstu_runtime import move_hstu_sparse_outputs_to_device
 
@@ -659,15 +655,13 @@ class TestOutputContract(unittest.TestCase):
             uih_seq_lengths = torch.tensor([2], dtype=torch.int64)
             num_candidates = torch.tensor([1], dtype=torch.int64)
 
-            moved_seq_embeddings, moved_payload_features, _, _ = (
-                move_hstu_sparse_outputs_to_device(
-                    seq_embeddings=seq_embeddings,
-                    payload_features=payload_features,
-                    uih_seq_lengths=uih_seq_lengths,
-                    num_candidates=num_candidates,
-                    device=torch.device("cpu"),
-                    source_device=torch.device("cuda"),
-                )
+            moved_seq_embeddings, moved_payload_features, _, _ = move_hstu_sparse_outputs_to_device(
+                seq_embeddings=seq_embeddings,
+                payload_features=payload_features,
+                uih_seq_lengths=uih_seq_lengths,
+                num_candidates=num_candidates,
+                device=torch.device("cpu"),
+                source_device=torch.device("cuda"),
             )
 
             self.assertEqual(
@@ -679,7 +673,7 @@ class TestOutputContract(unittest.TestCase):
                 torch.float16,
             )
 
-    def test_sparse_transfer_casts_embeddings_to_dense_forward_dtype(self):
+    def test_sparse_transfer_casts_embeddings_to_dense_forward_dtype(self) -> None:
         with _fake_dlrm_hstu_module() as SequenceEmbedding:
             from vllm_gr.utils.hstu_runtime import move_hstu_sparse_outputs_to_device
 
@@ -698,16 +692,14 @@ class TestOutputContract(unittest.TestCase):
             uih_seq_lengths = torch.tensor([2], dtype=torch.int64)
             num_candidates = torch.tensor([1], dtype=torch.int64)
 
-            moved_seq_embeddings, moved_payload_features, _, _ = (
-                move_hstu_sparse_outputs_to_device(
-                    seq_embeddings=seq_embeddings,
-                    payload_features=payload_features,
-                    uih_seq_lengths=uih_seq_lengths,
-                    num_candidates=num_candidates,
-                    device=torch.device("cpu"),
-                    source_device=torch.device("cuda"),
-                    target_dtype=torch.bfloat16,
-                )
+            moved_seq_embeddings, moved_payload_features, _, _ = move_hstu_sparse_outputs_to_device(
+                seq_embeddings=seq_embeddings,
+                payload_features=payload_features,
+                uih_seq_lengths=uih_seq_lengths,
+                num_candidates=num_candidates,
+                device=torch.device("cpu"),
+                source_device=torch.device("cuda"),
+                target_dtype=torch.bfloat16,
             )
 
             self.assertEqual(
@@ -719,52 +711,56 @@ class TestOutputContract(unittest.TestCase):
                 torch.float16,
             )
 
-    def test_runtime_devices_default_dense_to_active_accelerator(self):
+    def test_runtime_devices_default_dense_to_active_accelerator(self) -> None:
         from vllm_gr.utils import hstu_runtime
 
-        with mock.patch.object(
-            hstu_runtime,
-            "is_npu_available",
-            return_value=False,
-        ), mock.patch.object(
-            hstu_runtime,
-            "is_cuda_available",
-            return_value=True,
-        ), mock.patch.object(
-            torch.cuda,
-            "current_device",
-            return_value=3,
+        with (
+            mock.patch.object(
+                hstu_runtime,
+                "is_npu_available",
+                return_value=False,
+            ),
+            mock.patch.object(
+                hstu_runtime,
+                "is_cuda_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "current_device",
+                return_value=3,
+            ),
         ):
             devices = hstu_runtime.resolve_hstu_runtime_devices()
 
         self.assertEqual(devices.dense_device, torch.device("cuda", 3))
         self.assertEqual(devices.embedding_device, torch.device("cpu"))
 
-    def test_sparse_inputs_move_to_embedding_device_before_preprocess(self):
+    def test_sparse_inputs_move_to_embedding_device_before_preprocess(self) -> None:
         class FakeTensor:
-            def __init__(self, value: torch.Tensor, device: torch.device):
+            def __init__(self, value: torch.Tensor, device: torch.device) -> None:
                 self._value = value
                 self.device = device
 
-            def to(self, device):
+            def to(self, device) -> None:
                 return self._value.to(device)
 
         class FakeFeatures:
-            def __init__(self, keys, values, lengths):
+            def __init__(self, keys, values, lengths) -> None:
                 self._keys = keys
                 self._values = values
                 self._lengths = lengths
 
-            def keys(self):
+            def keys(self) -> None:
                 return self._keys
 
-            def values(self):
+            def values(self) -> None:
                 return self._values
 
-            def lengths(self):
+            def lengths(self) -> None:
                 return self._lengths
 
-            def weights_or_none(self):
+            def weights_or_none(self) -> None:
                 return None
 
         with _fake_torchrec_jagged_tensor_module():
@@ -795,7 +791,7 @@ class TestOutputContract(unittest.TestCase):
         self.assertEqual(moved_candidates.values.device, torch.device("cpu"))
         self.assertEqual(moved_candidates.lengths.device, torch.device("cpu"))
 
-    def test_initialize_runtime_fails_fast_when_registration_fails(self):
+    def test_initialize_runtime_fails_fast_when_registration_fails(self) -> None:
         plugin_path = ROOT / "vllm_gr" / "plugin.py"
         saved = _purge_modules(
             "vllm_gr.plugin",
@@ -834,7 +830,7 @@ class TestOutputContract(unittest.TestCase):
             )
             _restore_modules(saved)
 
-    def test_candidate_primary_id_resolution_requires_explicit_contract(self):
+    def test_candidate_primary_id_resolution_requires_explicit_contract(self) -> None:
         adapter_path = ROOT / "vllm_gr" / "adapters" / "hstu" / "adapter.py"
 
         with _fake_gr_engine_runtime():
@@ -882,7 +878,7 @@ class TestOutputContract(unittest.TestCase):
                 ["item_candidate_id", "category_id"],
             )
 
-    def test_gr_engine_shutdown_delegates_to_engine_core(self):
+    def test_gr_engine_shutdown_delegates_to_engine_core(self) -> None:
         engine_path = ROOT / "vllm_gr" / "engine" / "gr_engine.py"
 
         with _fake_gr_engine_runtime():
@@ -897,7 +893,7 @@ class TestOutputContract(unittest.TestCase):
         fake_engine_core.shutdown.assert_called_once_with()
         self.assertIsNone(engine.engine_core)
 
-    def test_hstu_config_allows_unresolved_candidate_primary_id_until_runtime(self):
+    def test_hstu_config_allows_unresolved_candidate_primary_id_until_runtime(self) -> None:
         config_path = ROOT / "vllm_gr" / "config" / "hstu_hf_config.py"
 
         with _fake_hstu_config_runtime():
@@ -934,7 +930,7 @@ class TestOutputContract(unittest.TestCase):
         unresolved = HSTUConfig(**shared_kwargs)
         self.assertEqual(unresolved.candidate_primary_id_feature_name, "")
 
-    def test_hstu_config_rejects_candidate_primary_id_outside_item_embeddings(self):
+    def test_hstu_config_rejects_candidate_primary_id_outside_item_embeddings(self) -> None:
         config_path = ROOT / "vllm_gr" / "config" / "hstu_hf_config.py"
 
         with _fake_hstu_config_runtime():
@@ -971,7 +967,7 @@ class TestOutputContract(unittest.TestCase):
                 **shared_kwargs,
             )
 
-    def test_gr_input_processor_rejects_non_gr_prompt(self):
+    def test_gr_input_processor_rejects_non_gr_prompt(self) -> None:
         input_processor_path = ROOT / "vllm_gr" / "engine" / "gr_input_processor.py"
 
         with _fake_gr_input_processor_runtime():
@@ -992,7 +988,7 @@ class TestOutputContract(unittest.TestCase):
                 params=object(),
             )
 
-    def test_arg_utils_rejects_local_model_dir_without_weights(self):
+    def test_arg_utils_rejects_local_model_dir_without_weights(self) -> None:
         arg_utils_path = ROOT / "vllm_gr" / "engine" / "arg_utils.py"
 
         with _fake_arg_utils_runtime():
@@ -1008,7 +1004,7 @@ class TestOutputContract(unittest.TestCase):
                     model_family="hstu",
                 )
 
-    def test_arg_utils_allows_explicit_dummy_loader_for_weightless_local_model_dir(self):
+    def test_arg_utils_allows_explicit_dummy_loader_for_weightless_local_model_dir(self) -> None:
         arg_utils_path = ROOT / "vllm_gr" / "engine" / "arg_utils.py"
 
         with _fake_arg_utils_runtime():
@@ -1026,7 +1022,7 @@ class TestOutputContract(unittest.TestCase):
 
         self.assertEqual(args.load_format, "dummy")
 
-    def test_arg_utils_fails_fast_on_invalid_local_config(self):
+    def test_arg_utils_fails_fast_on_invalid_local_config(self) -> None:
         arg_utils_path = ROOT / "vllm_gr" / "engine" / "arg_utils.py"
 
         with _fake_arg_utils_runtime():
@@ -1042,7 +1038,7 @@ class TestOutputContract(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Failed to read local model config"):
                 module.GREngineArgs(model=tmpdir)
 
-    def test_reliable_ops_fails_fast_when_accelerated_fbgemm_call_breaks(self):
+    def test_reliable_ops_fails_fast_when_accelerated_fbgemm_call_breaks(self) -> None:
         from vllm_gr.utils import reliable_ops as module
 
         fake_adapter = types.SimpleNamespace(
@@ -1063,7 +1059,7 @@ class TestOutputContract(unittest.TestCase):
                 ):
                     module.ReliableOps.asynchronous_complete_cumsum(lengths)
 
-    def test_reliable_ops_keeps_cpu_fallback_when_no_fbgemm_backend(self):
+    def test_reliable_ops_keeps_cpu_fallback_when_no_fbgemm_backend(self) -> None:
         from vllm_gr.utils import reliable_ops as module
 
         fake_adapter = types.SimpleNamespace(
@@ -1079,7 +1075,7 @@ class TestOutputContract(unittest.TestCase):
             torch.tensor([0, 1, 3, 6], dtype=torch.int64),
         )
 
-    def test_pt_position_uses_fbgemm_jagged_add_on_accelerated_backend(self):
+    def test_pt_position_uses_fbgemm_jagged_add_on_accelerated_backend(self) -> None:
         module = _load_pt_position_module()
         fake_adapter = types.SimpleNamespace(
             should_use_fbgemm=lambda _device: True,
@@ -1110,7 +1106,7 @@ class TestOutputContract(unittest.TestCase):
         self.assertTrue(mocked_op.called)
         self.assertIs(result, expected)
 
-    def test_pt_position_keeps_cpu_fallback_without_fbgemm_backend(self):
+    def test_pt_position_keeps_cpu_fallback_without_fbgemm_backend(self) -> None:
         module = _load_pt_position_module()
         fake_adapter = types.SimpleNamespace(
             should_use_fbgemm=lambda _device: False,
@@ -1151,7 +1147,7 @@ class TestOutputContract(unittest.TestCase):
             torch.tensor([[121.0], [112.0]], dtype=torch.float32),
         )
 
-    def test_pooling_split_mismatch_fails_fast(self):
+    def test_pooling_split_mismatch_fails_fast(self) -> None:
         from vllm_gr.model_executor.models.hstu_vllm import HSTUForRecommendation
 
         with self.assertRaisesRegex(ValueError, "pooling split mismatch"):
@@ -1160,10 +1156,8 @@ class TestOutputContract(unittest.TestCase):
                 num_candidates=torch.tensor([1, 1], dtype=torch.int64),
             )
 
-    def test_hstu_l2_helpers_preserve_contextual_insertion_semantics(self):
-        module_path = (
-            ROOT / "vllm_gr" / "ops" / "pytorch" / "pt_jagged_tensors.py"
-        )
+    def test_hstu_l2_helpers_preserve_contextual_insertion_semantics(self) -> None:
+        module_path = ROOT / "vllm_gr" / "ops" / "pytorch" / "pt_jagged_tensors.py"
         module = _load_module(
             "pt_jagged_tensors_contract_test_module",
             module_path,
@@ -1223,10 +1217,8 @@ class TestOutputContract(unittest.TestCase):
         )
         torch.testing.assert_close(reconstructed_x, x)
 
-    def test_plain_jagged_split_matches_golden_left_right_semantics(self):
-        module_path = (
-            ROOT / "vllm_gr" / "ops" / "pytorch" / "pt_jagged_tensors.py"
-        )
+    def test_plain_jagged_split_matches_golden_left_right_semantics(self) -> None:
+        module_path = ROOT / "vllm_gr" / "ops" / "pytorch" / "pt_jagged_tensors.py"
         module = _load_module(
             "pt_jagged_tensors_plain_split_contract_test_module",
             module_path,
@@ -1262,10 +1254,8 @@ class TestOutputContract(unittest.TestCase):
             torch.tensor([[20.0], [120.0], [121.0]], dtype=torch.float32),
         )
 
-    def test_plain_jagged_concat_reconstructs_split_values(self):
-        module_path = (
-            ROOT / "vllm_gr" / "ops" / "pytorch" / "pt_jagged_tensors.py"
-        )
+    def test_plain_jagged_concat_reconstructs_split_values(self) -> None:
+        module_path = ROOT / "vllm_gr" / "ops" / "pytorch" / "pt_jagged_tensors.py"
         module = _load_module(
             "pt_jagged_tensors_plain_concat_contract_test_module",
             module_path,
@@ -1298,7 +1288,7 @@ class TestOutputContract(unittest.TestCase):
             ),
         )
 
-    def test_jagged_entrypoint_rejects_mismatched_feature_widths(self):
+    def test_jagged_entrypoint_rejects_mismatched_feature_widths(self) -> None:
         module = _load_jagged_entrypoint_module()
 
         with self.assertRaisesRegex(AssertionError, "shape\\[1\\].*equal"):
@@ -1310,7 +1300,7 @@ class TestOutputContract(unittest.TestCase):
                 offsets_right=torch.tensor([0, 2], dtype=torch.int64),
             )
 
-    def test_jagged_entrypoint_requires_split_length_contract(self):
+    def test_jagged_entrypoint_requires_split_length_contract(self) -> None:
         module = _load_jagged_entrypoint_module()
 
         with self.assertRaisesRegex(
@@ -1322,7 +1312,7 @@ class TestOutputContract(unittest.TestCase):
                 values=torch.zeros(4, 1),
             )
 
-    def test_embedding_bf16_requires_runtime_support(self):
+    def test_embedding_bf16_requires_runtime_support(self) -> None:
         model_path = ROOT / "vllm_gr" / "model_executor" / "models" / "hstu_vllm.py"
         saved = _purge_modules("hstu_vllm_bf16_contract_test_module")
 

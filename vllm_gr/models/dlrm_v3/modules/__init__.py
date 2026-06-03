@@ -1,6 +1,6 @@
-# Copyright (c) vllm-GR Authors.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Original code from Meta Platforms, Inc. (generative-recommenders)
-# Licensed under the Apache License, Version 2.0
 
 """Core DLRM_v3 module exports."""
 

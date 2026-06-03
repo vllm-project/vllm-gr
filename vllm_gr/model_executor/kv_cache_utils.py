@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Utility helpers for reading and writing paged KV cache tensors."""
 
@@ -116,13 +116,11 @@ def read_from_paged_cache(
     if packed_per_req:
         packed = torch.cat(packed_per_req, dim=0)
     else:
-        packed = runtime_kv_cache.new_empty(
-            (0, num_kv_heads, head_size + head_size_v)
-        )
+        packed = runtime_kv_cache.new_empty((0, num_kv_heads, head_size + head_size_v))
 
     return (
-        packed[..., : head_size],
-        packed[..., head_size :],
+        packed[..., :head_size],
+        packed[..., head_size:],
         int(seq_lens.max().item()) if seq_lens.numel() > 0 else 0,
         _complete_cumsum(seq_lens.to(device=packed.device, dtype=torch.int64)),
     )
@@ -134,4 +132,3 @@ __all__ = [
     "read_from_paged_cache",
     "write_to_paged_cache",
 ]
-

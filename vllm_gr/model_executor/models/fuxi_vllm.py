@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """FuXi model entry for vLLM ModelRegistry."""
 
@@ -47,13 +47,10 @@ class FuXiForRecommendation(nn.Module):
 
         self.config = config
         self.enable_kv_cache = bool(getattr(self.config, "enable_kv_cache", False))
-        self.kv_cache_dtype = (
-            getattr(self.config, "kv_cache_dtype", None)
-            or getattr(self.config, "torch_dtype", torch.bfloat16)
+        self.kv_cache_dtype = getattr(self.config, "kv_cache_dtype", None) or getattr(
+            self.config, "torch_dtype", torch.bfloat16
         )
-        dense_device_override = (
-            torch.device(device) if device is not None else None
-        )
+        dense_device_override = torch.device(device) if device is not None else None
         runtime_devices = resolve_hstu_runtime_devices(
             explicit_dense_device=dense_device_override,
         )
@@ -166,15 +163,15 @@ class FuXiForRecommendation(nn.Module):
                 ):
                     metadata.num_targets = runtime_num_targets
 
-                total_delta_tokens = int(
-                    metadata.num_targets.to(dtype=torch.int64).sum().item()
-                )
+                _total_delta_tokens = int(metadata.num_targets.to(dtype=torch.int64).sum().item())
                 expected_total_tokens = int(
                     (
                         metadata.history_lengths.to(dtype=torch.int64)
                         + int(getattr(metadata, "contextual_seq_len", 0))
                         + metadata.num_targets.to(dtype=torch.int64)
-                    ).sum().item()
+                    )
+                    .sum()
+                    .item()
                 )
                 slot_mapping = getattr(
                     getattr(metadata, "common_attn_metadata", None),
@@ -187,7 +184,7 @@ class FuXiForRecommendation(nn.Module):
                     None,
                 )
                 actual_token_slots = int(slot_mapping.numel()) if slot_mapping is not None else 0
-                actual_computed_tokens = (
+                _actual_computed_tokens = (
                     int(num_computed_tokens.to(dtype=torch.int64).sum().item())
                     if num_computed_tokens is not None
                     else 0
@@ -227,10 +224,7 @@ class FuXiForRecommendation(nn.Module):
         if candidate_lengths is not None:
             candidate_lengths = candidate_lengths.to(dense_device)
         if past_payloads:
-            past_payloads = {
-                key: value.to(dense_device)
-                for key, value in past_payloads.items()
-            }
+            past_payloads = {key: value.to(dense_device) for key, value in past_payloads.items()}
 
         hstu_attn_metadata = self._get_hstu_attention_metadata(
             uih_seq_lengths=past_lengths,

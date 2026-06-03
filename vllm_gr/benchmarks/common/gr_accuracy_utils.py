@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Shared helpers for GR accuracy benchmark records and metrics."""
 
@@ -75,14 +75,11 @@ def extract_predictions_by_task(
     scores = torch.as_tensor(all_scores, dtype=torch.float32).detach().cpu()
     if scores.ndim == 1:
         if len(task_names) != 1:
-            raise ValueError(
-                f"Received 1D scores for multi-task request: tasks={task_names}"
-            )
+            raise ValueError(f"Received 1D scores for multi-task request: tasks={task_names}")
         values = scores.tolist()
         if len(values) != num_candidates:
             raise ValueError(
-                f"Candidate count mismatch: scores={len(values)}, "
-                f"expected={num_candidates}"
+                f"Candidate count mismatch: scores={len(values)}, expected={num_candidates}"
             )
         return {task_names[0]: [float(value) for value in values]}
 
@@ -186,6 +183,7 @@ def _group_auc(
         weight_total += group_weight
     return weighted_sum / weight_total if weight_total > 0 else 0.0
 
+
 def compute_metrics(
     grouped_predictions_by_task: dict[str, list[list[float]]],
     grouped_labels_by_task: dict[str, list[list[float]]],
@@ -249,11 +247,9 @@ def validate_accuracy_record(record: dict[str, Any]) -> None:
             )
         if len(labels) != num_candidates:
             raise ValueError(
-                f"Label length mismatch for task={task_name}: "
-                f"{len(labels)} vs {num_candidates}"
+                f"Label length mismatch for task={task_name}: {len(labels)} vs {num_candidates}"
             )
         if len(weights) != num_candidates:
             raise ValueError(
-                f"Weight length mismatch for task={task_name}: "
-                f"{len(weights)} vs {num_candidates}"
+                f"Weight length mismatch for task={task_name}: {len(weights)} vs {num_candidates}"
             )

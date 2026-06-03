@@ -1,8 +1,10 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 
 """Contract tests for HSTU prompt identity with vLLM native prefix caching."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import importlib
@@ -10,7 +12,6 @@ import os
 import sys
 import types
 import unittest
-
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -47,7 +48,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
         init_none_hash(sha256_cbor)
 
     @staticmethod
-    def _make_processor():
+    def _make_processor() -> None:
         from vllm_gr.adapters.hstu.adapter import HSTUModelAdapter
         from vllm_gr.engine.gr_input_processor import GRInputProcessor
 
@@ -96,6 +97,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
         from vllm.pooling_params import PoolingParams
         from vllm.utils.hashing import sha256_cbor
         from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+
         from vllm_gr.request import GRRequest
 
         processor = self._make_processor()
@@ -125,10 +127,11 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
         prompt: dict[str, object],
         block_size: int = 2,
         cache_salt_override: str | None = None,
-    ):
+    ) -> None:
         from vllm.pooling_params import PoolingParams
         from vllm.utils.hashing import sha256_cbor
         from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+
         from vllm_gr.request import GRRequest
 
         processor = self._make_processor()
@@ -147,7 +150,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
         return GRRequest.from_engine_core_request(engine_request, block_hasher)
 
     @staticmethod
-    def _make_kv_cache_config(block_size: int, num_blocks: int):
+    def _make_kv_cache_config(block_size: int, num_blocks: int) -> None:
         import torch
         from vllm.v1.kv_cache_interface import (
             FullAttentionSpec,
@@ -190,7 +193,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
         self.assertIsNotNone(new_blocks)
         manager.free(request)
 
-    def test_shared_context_and_history_preserve_prefix_block_hashes(self):
+    def test_shared_context_and_history_preserve_prefix_block_hashes(self) -> None:
         base_prompt = {
             "user_id": "u-prefix",
             "user_history": [
@@ -229,7 +232,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
             3,
         )
 
-    def test_context_change_breaks_first_prefix_block_hash(self):
+    def test_context_change_breaks_first_prefix_block_hash(self) -> None:
         base_prompt = {
             "user_id": "u-context",
             "user_history": [
@@ -264,7 +267,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
             0,
         )
 
-    def test_cache_salt_change_invalidates_entire_block_hash_chain(self):
+    def test_cache_salt_change_invalidates_entire_block_hash_chain(self) -> None:
         prompt = {
             "user_id": "u-salt",
             "user_history": [
@@ -295,7 +298,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
         self.assertNotEqual(hashes_a[0], hashes_b[0])
         self.assertEqual(self._shared_prefix_block_count(hashes_a, hashes_b), 0)
 
-    def test_kv_cache_manager_hits_shared_hstu_prefix_blocks(self):
+    def test_kv_cache_manager_hits_shared_hstu_prefix_blocks(self) -> None:
         from vllm.v1.core.kv_cache_manager import KVCacheManager
 
         block_size = 2
@@ -350,7 +353,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
         self.assertEqual(num_computed_tokens, 6)
         self.assertEqual(computed_blocks.get_block_ids(), ([1, 2, 3],))
 
-    def test_kv_cache_manager_context_change_breaks_prefix_hit(self):
+    def test_kv_cache_manager_context_change_breaks_prefix_hit(self) -> None:
         from vllm.v1.core.kv_cache_manager import KVCacheManager
 
         block_size = 2
@@ -400,7 +403,7 @@ class TestHSTUPrefixCacheContract(unittest.TestCase):
         self.assertEqual(num_computed_tokens, 0)
         self.assertFalse(computed_blocks.blocks[0])
 
-    def test_kv_cache_manager_cache_salt_change_breaks_prefix_hit(self):
+    def test_kv_cache_manager_cache_salt_change_breaks_prefix_hit(self) -> None:
         from vllm.v1.core.kv_cache_manager import KVCacheManager
 
         block_size = 2

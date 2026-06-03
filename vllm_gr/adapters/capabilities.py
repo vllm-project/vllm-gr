@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Capability protocols for GR model adapters.
@@ -19,7 +19,7 @@ dispatch.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, TYPE_CHECKING, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from vllm_gr.inputs.base import GRParsedInput
@@ -53,7 +53,9 @@ class GRScoringModel(Protocol):
 
     is_scoring_model: bool
 
-    def build_model_kwargs(self, batch_features: list[tuple[str, dict[str, Any]]], device: Any) -> dict[str, Any]: ...
+    def build_model_kwargs(
+        self, batch_features: list[tuple[str, dict[str, Any]]], device: Any
+    ) -> dict[str, Any]: ...
 
 
 @runtime_checkable
@@ -68,4 +70,6 @@ class GREmbeddingModel(Protocol):
 
     is_embedding_model: bool
 
-    def build_model_kwargs(self, batch_features: list[tuple[str, dict[str, Any]]], device: Any) -> dict[str, Any]: ...
+    def build_model_kwargs(
+        self, batch_features: list[tuple[str, dict[str, Any]]], device: Any
+    ) -> dict[str, Any]: ...

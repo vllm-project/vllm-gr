@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 HSTUModelAdapter — concrete adapter for HSTU-based recommendation models.
@@ -11,14 +11,17 @@ capability protocols.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+if TYPE_CHECKING:
+    from vllm_gr.inputs.base import GRParsedInput
+
 from vllm_gr.adapters.base import GRModelAdapter
 from vllm_gr.adapters.capabilities import (
-    GRPrefixCacheSupport,
     GRPoolingModel,
+    GRPrefixCacheSupport,
     GRScoringModel,
 )
 from vllm_gr.adapters.hstu.feature_extractor import (
@@ -49,6 +52,7 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
         super().__init__(vllm_config, gr_config)
         # Resolve payload type via registry (lazily imported, avoids circular import).
         from vllm_gr.adapters.registry import get_payload_type
+
         self.payload_type = get_payload_type("hstu")
 
         self._resolve_feature_config()
@@ -58,10 +62,12 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
         hf = self._hf_config
         cfg = self._gr_config
 
-        configured_context_feature_names = list(dict.fromkeys(
-            list(getattr(hf, "contextual_feature_to_max_length", {}).keys())
-            + list(getattr(hf, "contextual_feature_to_min_uih_length", {}).keys())
-        ))
+        configured_context_feature_names = list(
+            dict.fromkeys(
+                list(getattr(hf, "contextual_feature_to_max_length", {}).keys())
+                + list(getattr(hf, "contextual_feature_to_min_uih_length", {}).keys())
+            )
+        )
         self.context_feature_names = configured_context_feature_names
         raw_uih_feature_names = list(
             getattr(hf, "hstu_uih_feature_names", None)
@@ -72,8 +78,7 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
         # but prompts carry them separately under prompt["context"] rather than
         # duplicating them into each user_history record.
         self.uih_feature_names = [
-            key for key in raw_uih_feature_names
-            if key not in self.context_feature_names
+            key for key in raw_uih_feature_names if key not in self.context_feature_names
         ]
         self.candidate_feature_names = list(
             getattr(hf, "hstu_candidate_feature_names", None)
@@ -81,13 +86,9 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
             or []
         )
         self.full_uih_feature_names = list(
-            dict.fromkeys(
-                self.context_feature_names + self.uih_feature_names
-            )
+            dict.fromkeys(self.context_feature_names + self.uih_feature_names)
         )
-        self.primary_id_feature_name = (
-            getattr(hf, "uih_post_id_feature_name", None) or "item_id"
-        )
+        self.primary_id_feature_name = getattr(hf, "uih_post_id_feature_name", None) or "item_id"
         self.candidate_primary_id_key = self._resolve_candidate_primary_id_key()
         self.task_names = list(getattr(hf, "task_names", None) or [])
         self.primary_task = self.task_names[0] if self.task_names else ""
@@ -106,14 +107,14 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
         )
 
     @staticmethod
-    def _resolve_candidate_primary_id_key_from_config(hf_config, candidate_feature_names: list[str]) -> str:
+    def _resolve_candidate_primary_id_key_from_config(
+        hf_config, candidate_feature_names: list[str]
+    ) -> str:
         explicit = str(getattr(hf_config, "candidate_primary_id_feature_name", "") or "")
         if explicit:
             return explicit
 
-        merge_mapping = list(
-            getattr(hf_config, "merge_uih_candidate_feature_mapping", []) or []
-        )
+        merge_mapping = list(getattr(hf_config, "merge_uih_candidate_feature_mapping", []) or [])
         primary_uih_id_key = getattr(hf_config, "uih_post_id_feature_name", "")
         for uih_key, candidate_key in merge_mapping:
             if uih_key == primary_uih_id_key:
@@ -141,22 +142,27 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
         user_id = str(prompt.get("user_id", ""))
         user_history = prompt.get("user_history", [])
         candidates = prompt.get("candidates", [])
-        recent_history = user_history[-self.max_seq_len:]
+        recent_history = user_history[-self.max_seq_len :]
 
         uih_keys, uih_values_per_key, uih_lengths_per_key = extract_uih_features(
-            recent_history, self.uih_feature_names,
+            recent_history,
+            self.uih_feature_names,
         )
         cand_keys, cand_values_per_key, cand_lengths_per_key = extract_candidate_features(
-            candidates, self.candidate_feature_names,
+            candidates,
+            self.candidate_feature_names,
         )
 
         context = prompt.get("context") or {}
         ctx_keys, ctx_values_per_key = extract_context_features(
-            context, feature_names=self.context_feature_names,
+            context,
+            feature_names=self.context_feature_names,
         )
 
         uih_keys, cand_keys, ctx_keys, schema_fingerprint = compute_schema_fingerprint(
-            uih_keys=uih_keys, cand_keys=cand_keys, ctx_keys=ctx_keys,
+            uih_keys=uih_keys,
+            cand_keys=cand_keys,
+            ctx_keys=ctx_keys,
         )
         validate_parsed_features(
             uih_keys=uih_keys,
@@ -195,9 +201,7 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
         from vllm_gr.adapters.hstu.payload import HSTUFeaturesPayload
 
         rf = parsed.raw_features
-        original_candidates = [
-            dict(c) for c in parsed.original_prompt.get("candidates", [])
-        ]
+        original_candidates = [dict(c) for c in parsed.original_prompt.get("candidates", [])]
 
         return HSTUFeaturesPayload(
             uih_keys=rf["uih_keys"],
@@ -219,9 +223,14 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
         cand_keys = list(payload.cand_keys)
         ctx_keys = list(payload.ctx_keys)
         (
-            uih_keys, cand_keys, ctx_keys, schema_fingerprint,
+            uih_keys,
+            cand_keys,
+            ctx_keys,
+            schema_fingerprint,
         ) = compute_schema_fingerprint(
-            uih_keys=uih_keys, cand_keys=cand_keys, ctx_keys=ctx_keys,
+            uih_keys=uih_keys,
+            cand_keys=cand_keys,
+            ctx_keys=ctx_keys,
         )
         validate_parsed_features(
             uih_keys=uih_keys,
@@ -234,13 +243,10 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
             ctx_values_per_key=list(payload.ctx_values_per_key),
         )
 
-        full_uih_keys = list(
-            getattr(payload, "full_uih_keys", []) or (uih_keys + ctx_keys)
-        )
+        full_uih_keys = list(getattr(payload, "full_uih_keys", []) or (uih_keys + ctx_keys))
         combined_uih_keys = uih_keys + ctx_keys
-        if (
-            len(full_uih_keys) != len(combined_uih_keys)
-            or set(full_uih_keys) != set(combined_uih_keys)
+        if len(full_uih_keys) != len(combined_uih_keys) or set(full_uih_keys) != set(
+            combined_uih_keys
         ):
             raise ValueError(
                 "GR payload full_uih_keys do not match decoded UIH/context keys: "
@@ -250,24 +256,23 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
         return {
             "uih_keys": uih_keys,
             "uih_values_per_key": [
-                torch.tensor(values, dtype=torch.int64)
-                for values in payload.uih_values_per_key
+                torch.tensor(values, dtype=torch.int64) for values in payload.uih_values_per_key
             ],
             "uih_lengths_per_key": torch.tensor(
-                payload.uih_lengths_per_key, dtype=torch.int64,
+                payload.uih_lengths_per_key,
+                dtype=torch.int64,
             ),
             "cand_keys": cand_keys,
             "cand_values_per_key": [
-                torch.tensor(values, dtype=torch.int64)
-                for values in payload.cand_values_per_key
+                torch.tensor(values, dtype=torch.int64) for values in payload.cand_values_per_key
             ],
             "cand_lengths_per_key": torch.tensor(
-                payload.cand_lengths_per_key, dtype=torch.int64,
+                payload.cand_lengths_per_key,
+                dtype=torch.int64,
             ),
             "ctx_keys": ctx_keys,
             "ctx_values_per_key": [
-                torch.tensor(values, dtype=torch.int64)
-                for values in payload.ctx_values_per_key
+                torch.tensor(values, dtype=torch.int64) for values in payload.ctx_values_per_key
             ],
             "full_uih_keys": full_uih_keys,
             "schema_fingerprint": schema_fingerprint,
@@ -319,10 +324,7 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
             else:
                 primary_idx = 0
             primary_scores = scores[primary_idx]
-            all_task_scores = {
-                name: scores[i].tolist()
-                for i, name in enumerate(task_names)
-            }
+            all_task_scores = {name: scores[i].tolist() for i, name in enumerate(task_names)}
         else:
             primary_scores = scores[0]
 
@@ -338,12 +340,14 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
             item_task_scores = None
             if all_task_scores is not None:
                 item_task_scores = {t: all_task_scores[t][idx] for t in all_task_scores}
-            recommendations.append(RecommendedItem(
-                item_id=candidate.get(primary_id_key, idx),
-                score=float(primary_scores[idx]),
-                features=candidate,
-                task_scores=item_task_scores,
-            ))
+            recommendations.append(
+                RecommendedItem(
+                    item_id=candidate.get(primary_id_key, idx),
+                    score=float(primary_scores[idx]),
+                    features=candidate,
+                    task_scores=item_task_scores,
+                )
+            )
 
         return GRRequestOutput(
             request_id=request_id,
@@ -384,9 +388,7 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
             else:
                 history_lengths.append(0)
 
-        contextual_seq_len = int(
-            sum(getattr(hf, "contextual_feature_to_max_length", {}).values())
-        )
+        contextual_seq_len = int(sum(getattr(hf, "contextual_feature_to_max_length", {}).values()))
         device = features[0].get("uih_lengths_per_key", torch.tensor([])).device
         return (
             torch.tensor(num_targets, dtype=torch.int32, device=device),
@@ -451,6 +453,6 @@ class HSTUModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel, GRPrefixC
 
 
 # ── Layer-2 registration (heavy: torch/torchrec now loaded) ──────
-from vllm_gr.adapters.registry import register_adapter_class
+from vllm_gr.adapters.registry import register_adapter_class  # noqa: E402
 
 register_adapter_class("hstu", HSTUModelAdapter)

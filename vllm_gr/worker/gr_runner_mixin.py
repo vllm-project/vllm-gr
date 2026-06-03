@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Shared GR-specific model runner logic.
 
@@ -9,15 +9,15 @@ spec fallback, attention builder preparation) remains here as it is tied to
 the HSTU model's execution lifecycle.
 """
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from vllm_gr.logger import init_logger
-
-from vllm_gr.engine.gr_features_codec import decode_gr_features_payload
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import ModelRunnerOutput
+
+from vllm_gr.engine.gr_features_codec import decode_gr_features_payload
+from vllm_gr.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -274,19 +274,12 @@ class GRFeatureRunnerMixin:
 
     def _build_gr_model_kwargs(self) -> dict[str, Any]:
         batch_req_ids = list(self.input_batch.req_ids)
-        failed_req_ids = [
-            req_id for req_id in batch_req_ids
-            if req_id in self._gr_feature_errors
-        ]
+        failed_req_ids = [req_id for req_id in batch_req_ids if req_id in self._gr_feature_errors]
         if failed_req_ids:
             error_text = ", ".join(
-                f"{req_id}: {self._gr_feature_errors[req_id]}"
-                for req_id in failed_req_ids
+                f"{req_id}: {self._gr_feature_errors[req_id]}" for req_id in failed_req_ids
             )
-            raise ValueError(
-                "GR feature decode failed for scheduled requests: "
-                f"{error_text}"
-            )
+            raise ValueError(f"GR feature decode failed for scheduled requests: {error_text}")
 
         if not self._gr_features_cache:
             return {}
@@ -300,8 +293,7 @@ class GRFeatureRunnerMixin:
             return {}
         if len(gr_reqs) != len(batch_req_ids):
             missing_req_ids = [
-                req_id for req_id in batch_req_ids
-                if req_id not in self._gr_features_cache
+                req_id for req_id in batch_req_ids if req_id not in self._gr_features_cache
             ]
             raise ValueError(
                 "Incomplete GR feature batch: missing decoded features for "
@@ -353,11 +345,7 @@ class GRFeatureRunnerMixin:
         seq_lens_cpu = self.seq_lens.cpu[:num_reqs]
 
         pool_device = next(
-            (
-                tensor.device
-                for tensor in per_req_hidden_states
-                if isinstance(tensor, torch.Tensor)
-            ),
+            (tensor.device for tensor in per_req_hidden_states if isinstance(tensor, torch.Tensor)),
             torch.device("cpu"),
         )
         pooling_metadata = self.input_batch.get_pooling_metadata()
@@ -394,19 +382,15 @@ class GRFeatureRunnerMixin:
 
         if len(raw_outputs) != num_reqs:
             raise ValueError(
-                "GR pooling output count mismatch: "
-                f"num_reqs={num_reqs}, outputs={len(raw_outputs)}"
+                f"GR pooling output count mismatch: num_reqs={num_reqs}, outputs={len(raw_outputs)}"
             )
 
         raw_outputs = [
-            None
-            if tensor is None
-            else tensor.to("cpu", non_blocking=True)
+            None if tensor is None else tensor.to("cpu", non_blocking=True)
             for tensor in raw_outputs
         ]
         model_runner_output.pooler_output = [
-            output if include else None
-            for output, include in zip(raw_outputs, finished_mask)
+            output if include else None for output, include in zip(raw_outputs, finished_mask)
         ]
 
         sync_device = getattr(self, "_sync_device", None)
@@ -458,10 +442,7 @@ class GRFeatureRunnerMixin:
             if actual != expected or actual_full_uih_keys != expected_full_uih_keys:
                 mismatch_desc = f"{req_id}={actual}"
                 if actual_full_uih_keys != expected_full_uih_keys:
-                    mismatch_desc += (
-                        " full_uih_keys="
-                        f"{actual_full_uih_keys!r}"
-                    )
+                    mismatch_desc += f" full_uih_keys={actual_full_uih_keys!r}"
                 mismatches.append(mismatch_desc)
 
         if mismatches:

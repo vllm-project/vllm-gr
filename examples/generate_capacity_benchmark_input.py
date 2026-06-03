@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Generate high-diversity benchmark JSON for capacity scenario.
 
 This script creates a benchmark input file with:
@@ -119,13 +121,15 @@ def generate_user_history_records(count: int) -> list[dict]:
         action_timestamp = 1700000001 + i * 31
         item_weights = [1, 2, 4, 8, 16, 32][i % 6]
         dummy_watch_time = 20 + i
-        records.append({
-            "movie_id": movie_id,
-            "movie_rating": movie_rating,
-            "action_timestamp": action_timestamp,
-            "item_weights": item_weights,
-            "dummy_watch_time": dummy_watch_time,
-        })
+        records.append(
+            {
+                "movie_id": movie_id,
+                "movie_rating": movie_rating,
+                "action_timestamp": action_timestamp,
+                "item_weights": item_weights,
+                "dummy_watch_time": dummy_watch_time,
+            }
+        )
     return records
 
 
@@ -138,13 +142,15 @@ def generate_candidates_records(count: int) -> list[dict]:
         item_query_time = 1700002000 + i * 100
         item_action_weights = [1, 2, 4, 8, 16][i % 5]
         item_dummy_watchtime = 19 + i * 3
-        records.append({
-            "item_movie_id": item_movie_id,
-            "item_movie_rating": item_movie_rating,
-            "item_query_time": item_query_time,
-            "item_action_weights": item_action_weights,
-            "item_dummy_watchtime": item_dummy_watchtime,
-        })
+        records.append(
+            {
+                "item_movie_id": item_movie_id,
+                "item_movie_rating": item_movie_rating,
+                "item_query_time": item_query_time,
+                "item_action_weights": item_action_weights,
+                "item_dummy_watchtime": item_dummy_watchtime,
+            }
+        )
     return records
 
 
@@ -174,11 +180,13 @@ def main():
 
     user_history_count = args.user_history_count
     candidates_count = args.candidates_count
-    output_path = args.output or os.path.join(SCRIPT_DIR, "prefix_cache_benchmark.capacity_input.json")
-    
+    output_path = args.output or os.path.join(
+        SCRIPT_DIR, "prefix_cache_benchmark.capacity_input.json"
+    )
+
     user_history = generate_user_history_records(user_history_count)
     candidates = generate_candidates_records(candidates_count)
-    
+
     benchmark_data = {
         "meta": {
             "dataset": "movielens-1m",
@@ -205,10 +213,10 @@ def main():
             },
         ],
     }
-    
+
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(benchmark_data, f, indent=2, ensure_ascii=False)
-    
+
     print(f"Generated: {output_path}")
     print(f"  - user_history records: {user_history_count}")
     print(f"  - candidates records: {candidates_count}")

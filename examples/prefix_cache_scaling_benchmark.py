@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Prefix-cache benchmark with scaling and cache-pressure scenarios.
 
@@ -200,11 +200,10 @@ from typing import Any
 
 from runtime_utils import add_repo_root_to_path, add_runtime_args, describe_runtime
 
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 add_repo_root_to_path(__file__)
 
-from vllm_gr.utils.npu_adapter import release_accelerator_memory
+from vllm_gr.utils.npu_adapter import release_accelerator_memory  # noqa: E402
 
 DATASET_NAME = "movielens-1m"
 DEFAULT_INPUT_JSON = os.path.join(
@@ -220,8 +219,7 @@ DEFAULT_SCENARIO = "scaling"
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark fixed-ratio prefix reuse as prompt length scales, "
-            "with and without Yuanrong."
+            "Benchmark fixed-ratio prefix reuse as prompt length scales, with and without Yuanrong."
         ),
     )
     add_runtime_args(parser, include_model=True)
@@ -245,8 +243,7 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help=(
-            "Number of measurement requests per sequence length in scaling "
-            "scenario (default: 20)."
+            "Number of measurement requests per sequence length in scaling scenario (default: 20)."
         ),
     )
     parser.add_argument(
@@ -300,8 +297,7 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=64,
         help=(
-            "Number of unique warm requests per sequence length in capacity "
-            "scenario (default: 64)."
+            "Number of unique warm requests per sequence length in capacity scenario (default: 64)."
         ),
     )
     parser.add_argument(
@@ -309,8 +305,7 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help=(
-            "Number of oldest warm requests to exactly revisit in capacity "
-            "scenario (default: 16)."
+            "Number of oldest warm requests to exactly revisit in capacity scenario (default: 16)."
         ),
     )
     parser.add_argument(
@@ -477,8 +472,12 @@ def _diff_counters(after: dict[str, int], before: dict[str, int]) -> dict[str, i
     return {
         key: int(after.get(key, 0) - before.get(key, 0))
         for key in (
-            "requests", "queries", "hits",
-            "connector_requests", "connector_queries", "connector_hits",
+            "requests",
+            "queries",
+            "hits",
+            "connector_requests",
+            "connector_queries",
+            "connector_hits",
         )
     }
 
@@ -567,9 +566,7 @@ def _build_llm(*, args: argparse.Namespace, mode: str):
 
     sequence_lengths = _parse_sequence_lengths(args.sequence_lengths)
     max_uih_len = args.max_uih_len or max(sequence_lengths)
-    kv_transfer_config = (
-        _build_kv_transfer_config(args) if mode == "yuanrong" else None
-    )
+    kv_transfer_config = _build_kv_transfer_config(args) if mode == "yuanrong" else None
 
     llm_kwargs: dict[str, Any] = {
         "model": args.model,
@@ -691,9 +688,7 @@ def _build_benchmark_slice(
     target_prompt_len = nominal_seq_len
     history_len = target_prompt_len - prompt_layout["overhead"]
     if history_len <= 0:
-        raise RuntimeError(
-            f"Target prompt length {target_prompt_len} is too small for this schema"
-        )
+        raise RuntimeError(f"Target prompt length {target_prompt_len} is too small for this schema")
 
     max_cacheable_prefix_tokens = _estimate_cacheable_prefix_tokens(
         target_prompt_len,
@@ -846,18 +841,14 @@ def _build_capacity_benchmark_slice(
     if revisit_rounds <= 0:
         raise ValueError("--revisit-rounds must be > 0")
     if probe_oldest_requests > warm_unique_requests:
-        raise ValueError(
-            "--probe-oldest-requests must be <= --warm-unique-requests"
-        )
+        raise ValueError("--probe-oldest-requests must be <= --warm-unique-requests")
 
     block_size = _get_runtime_cache_block_size(llm)
     prompt_layout = _derive_prompt_layout(llm, template_case)
     target_prompt_len = nominal_seq_len
     history_len = target_prompt_len - prompt_layout["overhead"]
     if history_len <= 0:
-        raise RuntimeError(
-            f"Target prompt length {target_prompt_len} is too small for this schema"
-        )
+        raise RuntimeError(f"Target prompt length {target_prompt_len} is too small for this schema")
 
     max_cacheable_prefix_tokens = _estimate_cacheable_prefix_tokens(
         target_prompt_len,
@@ -881,8 +872,7 @@ def _build_capacity_benchmark_slice(
         for probe_idx, source_case in enumerate(probe_source_cases, start=1):
             revisited_case = copy.deepcopy(source_case)
             revisited_case["case_id"] = (
-                f"probe_capacity_{nominal_seq_len}_r{round_idx + 1:02d}_"
-                f"{probe_idx:03d}"
+                f"probe_capacity_{nominal_seq_len}_r{round_idx + 1:02d}_{probe_idx:03d}"
             )
             revisited_case["user_id"] = source_case["user_id"]
             measurement_cases.append(revisited_case)
@@ -942,7 +932,11 @@ def _run_measurement_cases(
     warm_delta = _diff_counters(after_warm, before_warm)
     warm_hbm_hits = warm_delta["hits"]
     warm_connector_hits = warm_delta["connector_hits"]
-    warm_queries = warm_delta["connector_queries"] if warm_delta["connector_queries"] > 0 else warm_delta["queries"]
+    warm_queries = (
+        warm_delta["connector_queries"]
+        if warm_delta["connector_queries"] > 0
+        else warm_delta["queries"]
+    )
 
     before_all = _snapshot_prefix_cache_counters(llm)
     start_all = time.perf_counter()
@@ -977,14 +971,16 @@ def _run_measurement_cases(
     delta_all = _diff_counters(after_all, before_all)
     probe_hbm_hits = delta_all["hits"]
     probe_connector_hits = delta_all["connector_hits"]
-    probe_queries = delta_all["connector_queries"] if delta_all["connector_queries"] > 0 else delta_all["queries"]
+    probe_queries = (
+        delta_all["connector_queries"]
+        if delta_all["connector_queries"] > 0
+        else delta_all["queries"]
+    )
     total_hbm_hits = warm_hbm_hits + probe_hbm_hits
     total_connector_hits = warm_connector_hits + probe_connector_hits
     total_hits = total_hbm_hits + total_connector_hits
     total_queries = warm_queries + probe_queries
-    throughput_seq_s = (
-        float(len(measurement_cases)) / elapsed_s if elapsed_s > 0 else 0.0
-    )
+    throughput_seq_s = float(len(measurement_cases)) / elapsed_s if elapsed_s > 0 else 0.0
     avg_latency_ms = (
         sum(row["latency_ms"] for row in per_case_rows) / len(per_case_rows)
         if per_case_rows
@@ -1012,14 +1008,10 @@ def _run_measurement_cases(
         print(
             "    [{index:02d}] case_id={case_id} latency_ms={latency_ms:.3f} "
             "hbm={hbm_hit_rate:.4%} yuanrong={connector_hit_rate:.4%} "
-            "total={cache_hit_rate:.4%}".format(
-                **row
-            )
+            "total={cache_hit_rate:.4%}".format(**row)
         )
     if len(per_case_rows) > max(show_case_limit, 0):
-        print(
-            f"    ... ({len(per_case_rows) - max(show_case_limit, 0)} more cases)"
-        )
+        print(f"    ... ({len(per_case_rows) - max(show_case_limit, 0)} more cases)")
 
     return {
         "reset_ok": True,
@@ -1057,9 +1049,7 @@ def _run_capacity_measurement_cases(
     for warm_idx, warm_case in enumerate(warm_cases, start=1):
         output = llm.recommend(prompts=[_prompt_from_case(warm_case)], use_tqdm=False)[0]
         if not getattr(output, "finished", True):
-            raise RuntimeError(
-                f"Warm request {warm_case['case_id']} did not finish successfully"
-            )
+            raise RuntimeError(f"Warm request {warm_case['case_id']} did not finish successfully")
         if warm_idx <= max(show_case_limit, 0):
             print(
                 "    [{index:02d}] case_id={case_id} prompt_len={prompt_len}".format(
@@ -1069,14 +1059,16 @@ def _run_capacity_measurement_cases(
                 )
             )
     if len(warm_cases) > max(show_case_limit, 0):
-        print(
-            f"    ... ({len(warm_cases) - max(show_case_limit, 0)} more warm cases)"
-        )
+        print(f"    ... ({len(warm_cases) - max(show_case_limit, 0)} more warm cases)")
     after_warm = _snapshot_prefix_cache_counters(llm)
     warm_delta = _diff_counters(after_warm, before_warm)
     warm_hbm_hits = warm_delta["hits"]
     warm_connector_hits = warm_delta["connector_hits"]
-    warm_queries = warm_delta["connector_queries"] if warm_delta["connector_queries"] > 0 else warm_delta["queries"]
+    warm_queries = (
+        warm_delta["connector_queries"]
+        if warm_delta["connector_queries"] > 0
+        else warm_delta["queries"]
+    )
 
     before_all = _snapshot_prefix_cache_counters(llm)
     start_all = time.perf_counter()
@@ -1110,14 +1102,16 @@ def _run_capacity_measurement_cases(
     delta_all = _diff_counters(after_all, before_all)
     probe_hbm_hits = delta_all["hits"]
     probe_connector_hits = delta_all["connector_hits"]
-    probe_queries = delta_all["connector_queries"] if delta_all["connector_queries"] > 0 else delta_all["queries"]
+    probe_queries = (
+        delta_all["connector_queries"]
+        if delta_all["connector_queries"] > 0
+        else delta_all["queries"]
+    )
     total_hbm_hits = warm_hbm_hits + probe_hbm_hits
     total_connector_hits = warm_connector_hits + probe_connector_hits
     total_hits = total_hbm_hits + total_connector_hits
     total_queries = warm_queries + probe_queries
-    throughput_seq_s = (
-        float(len(measurement_cases)) / elapsed_s if elapsed_s > 0 else 0.0
-    )
+    throughput_seq_s = float(len(measurement_cases)) / elapsed_s if elapsed_s > 0 else 0.0
     avg_latency_ms = (
         sum(row["latency_ms"] for row in per_case_rows) / len(per_case_rows)
         if per_case_rows
@@ -1141,14 +1135,10 @@ def _run_capacity_measurement_cases(
         print(
             "    [{index:02d}] case_id={case_id} latency_ms={latency_ms:.3f} "
             "hbm={hbm_hit_rate:.4%} yuanrong={connector_hit_rate:.4%} "
-            "total={cache_hit_rate:.4%}".format(
-                **row
-            )
+            "total={cache_hit_rate:.4%}".format(**row)
         )
     if len(per_case_rows) > max(show_case_limit, 0):
-        print(
-            f"    ... ({len(per_case_rows) - max(show_case_limit, 0)} more probe cases)"
-        )
+        print(f"    ... ({len(per_case_rows) - max(show_case_limit, 0)} more probe cases)")
 
     return {
         "reset_ok": True,
@@ -1384,9 +1374,7 @@ def _run_single_slice(
             "requested_hit_tokens={requested_prefix_hit_tokens} "
             "shared_prefix_tokens={shared_prefix_tokens} "
             "requested_hit_rate={requested_prefix_hit_rate:.4%} "
-            "effective_hit_rate={expected_prefix_hit_rate:.4%}".format(
-                **benchmark_slice
-            )
+            "effective_hit_rate={expected_prefix_hit_rate:.4%}".format(**benchmark_slice)
         )
         if args.scenario == "capacity":
             measurement = _run_capacity_measurement_cases(
@@ -1413,19 +1401,11 @@ def _run_single_slice(
                 "context_len": benchmark_slice["context_len"],
                 "candidate_len": benchmark_slice["candidate_len"],
                 "shared_history_len": benchmark_slice.get("shared_history_len"),
-                "requested_prefix_hit_tokens": benchmark_slice[
-                    "requested_prefix_hit_tokens"
-                ],
+                "requested_prefix_hit_tokens": benchmark_slice["requested_prefix_hit_tokens"],
                 "shared_prefix_tokens": benchmark_slice["shared_prefix_tokens"],
-                "requested_prefix_hit_rate": benchmark_slice[
-                    "requested_prefix_hit_rate"
-                ],
-                "max_cacheable_prefix_tokens": benchmark_slice[
-                    "max_cacheable_prefix_tokens"
-                ],
-                "expected_prefix_hit_rate": benchmark_slice[
-                    "expected_prefix_hit_rate"
-                ],
+                "requested_prefix_hit_rate": benchmark_slice["requested_prefix_hit_rate"],
+                "max_cacheable_prefix_tokens": benchmark_slice["max_cacheable_prefix_tokens"],
+                "expected_prefix_hit_rate": benchmark_slice["expected_prefix_hit_rate"],
                 "warm_unique_requests": benchmark_slice.get("warm_unique_requests"),
                 "probe_oldest_requests": benchmark_slice.get("probe_oldest_requests"),
                 "revisit_rounds": benchmark_slice.get("revisit_rounds"),
@@ -1573,9 +1553,7 @@ def main() -> int:
                     "effective_hit_rate={expected_prefix_hit_rate:.4%} "
                     "hbm_hit_rate={hbm_hit_rate:.4%} connector_hit_rate={connector_hit_rate:.4%} "
                     "cache_hit_rate={cache_hit_rate:.4%} "
-                    "throughput_seq_s={throughput_seq_s:.4f}".format(
-                        **result
-                    )
+                    "throughput_seq_s={throughput_seq_s:.4f}".format(**result)
                 )
 
     if args.output_json:

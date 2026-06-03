@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HSTU prompt identity helpers for vLLM native prefix caching.
 
 This module lives near the input pipeline on purpose: it builds
@@ -12,7 +14,6 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
-
 
 _PROMPT_IDENTITY_VERSION = "hstu-prefix-v1"
 # vLLM runtime paths materialize prompt token ids into int32-backed
@@ -40,10 +41,7 @@ def _values_by_key(
     keys: Sequence[str],
     values_per_key: Sequence[Sequence[int]],
 ) -> dict[str, list[int]]:
-    return {
-        str(key): [int(value) for value in values]
-        for key, values in zip(keys, values_per_key)
-    }
+    return {str(key): [int(value) for value in values] for key, values in zip(keys, values_per_key)}
 
 
 def _segment_tokens_from_feature_rows(
@@ -137,9 +135,7 @@ def build_hstu_prompt_token_ids(
     contextual_feature_to_min_uih_length: Mapping[str, int] | None = None,
 ) -> list[int]:
     contextual_feature_to_max_length = contextual_feature_to_max_length or {}
-    contextual_feature_to_min_uih_length = (
-        contextual_feature_to_min_uih_length or {}
-    )
+    contextual_feature_to_min_uih_length = contextual_feature_to_min_uih_length or {}
 
     context_tokens = _build_contextual_tokens(
         ctx_keys=ctx_keys,

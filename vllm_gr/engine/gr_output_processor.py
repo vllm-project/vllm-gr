@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GROutputProcessor — extends vLLM's OutputProcessor for recommendation output.
@@ -13,12 +13,11 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreRequest, FinishReason
+from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.engine.output_processor import (
-    OutputProcessor as VLLMOutputProcessor,
     RequestOutputCollector,
     RequestState,
 )
@@ -68,9 +67,11 @@ class GRRequestState(RequestState):
                 tokenizer = None
             output_kind = sampling_params.output_kind
             logprobs_processor = LogprobsProcessor.from_new_request(
-                tokenizer=tokenizer, request=request)
+                tokenizer=tokenizer, request=request
+            )
             detokenizer = IncrementalDetokenizer.from_new_request(
-                tokenizer=tokenizer, request=request)
+                tokenizer=tokenizer, request=request
+            )
             max_tokens_param = sampling_params.max_tokens
             top_p = sampling_params.top_p
             n = sampling_params.n
@@ -125,8 +126,13 @@ class GRRequestState(RequestState):
             return self._make_gr_output(pooling_output, finish_reason)
 
         return super().make_request_output(
-            new_token_ids, pooling_output, finish_reason,
-            stop_reason, kv_transfer_params, routed_experts)
+            new_token_ids,
+            pooling_output,
+            finish_reason,
+            stop_reason,
+            kv_transfer_params,
+            routed_experts,
+        )
 
     def _make_gr_output(
         self,

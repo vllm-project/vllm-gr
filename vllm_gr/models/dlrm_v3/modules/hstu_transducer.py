@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """HSTU Transducer module."""
 
@@ -12,12 +13,14 @@ from torch.profiler import record_function
 from vllm_gr.logger import init_logger
 from vllm_gr.models.dlrm_v3.common import HammerModule
 from vllm_gr.models.dlrm_v3.modules.positional_encoder import HSTUPositionalEncoder
-from vllm_gr.models.dlrm_v3.modules.postprocessors import L2NormPostprocessor, OutputPostprocessor
+from vllm_gr.models.dlrm_v3.modules.postprocessors import (
+    L2NormPostprocessor,
+    OutputPostprocessor,
+)
 from vllm_gr.models.dlrm_v3.modules.preprocessors import InputPreprocessor
 from vllm_gr.models.dlrm_v3.modules.stu import STU
 from vllm_gr.ops.jagged_tensors import concat_2D_jagged, split_2D_jagged
 from vllm_gr.utils import ReliableOps
-
 
 logger = init_logger(__name__)
 
@@ -40,10 +43,10 @@ def default_seq_payload(
 class HSTUTransducer(HammerModule):
     """
     HSTU Transducer - the main sequence encoder for DLRM_v3.
-    
+
     Combines preprocessing, positional encoding, STU layers, and postprocessing.
     """
-    
+
     def __init__(
         self,
         stu_module: STU,
@@ -55,13 +58,11 @@ class HSTUTransducer(HammerModule):
         listwise: bool = False,
     ) -> None:
         super().__init__()
-        
+
         self._stu_module = stu_module
         self._input_preprocessor: InputPreprocessor = input_preprocessor
         self._output_postprocessor: OutputPostprocessor = (
-            output_postprocessor
-            if output_postprocessor is not None
-            else L2NormPostprocessor()
+            output_postprocessor if output_postprocessor is not None else L2NormPostprocessor()
         )
 
         self._positional_encoder: Optional[HSTUPositionalEncoder] = positional_encoder
@@ -86,8 +87,7 @@ class HSTUTransducer(HammerModule):
         hstu_attn_metadata: Optional[Any],
     ) -> bool:
         return bool(
-            hstu_attn_metadata is not None
-            and getattr(hstu_attn_metadata, "cache_layers", None)
+            hstu_attn_metadata is not None and getattr(hstu_attn_metadata, "cache_layers", None)
         )
 
     def _cached_path_has_consistent_inputs(
@@ -161,9 +161,14 @@ class HSTUTransducer(HammerModule):
         num_targets: torch.Tensor,
         seq_payloads: Dict[str, torch.Tensor],
     ) -> Tuple[
-        int, int, int,
-        torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor,
+        int,
+        int,
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
         Dict[str, torch.Tensor],
     ]:
         seq_payloads = default_seq_payload(seq_payloads)
@@ -325,10 +330,10 @@ class HSTUTransducer(HammerModule):
                     seq_timestamps=seq_timestamps,
                     seq_payloads=seq_payloads,
                 )
-            
+
             uih_offsets = complete_cumsum(seq_lengths - num_targets)
             candidates_offsets = complete_cumsum(num_targets)
-            
+
             _, candidate_embeddings = split_2D_jagged(
                 values=seq_embeddings,
                 max_seq_len=max_seq_len,
@@ -338,13 +343,13 @@ class HSTUTransducer(HammerModule):
                 offsets_right=candidates_offsets,
                 kernel=self.hammer_kernel(),
             )
-            
+
             interleave_targets: bool = self._input_preprocessor.interleave_targets()
             if interleave_targets:
                 candidate_embeddings = candidate_embeddings.view(
                     -1, 2, candidate_embeddings.size(-1)
                 )[:, 0, :]
-            
+
             if not self._return_full_embeddings:
                 _, candidate_timestamps = split_2D_jagged(
                     values=seq_timestamps.unsqueeze(-1),
@@ -358,7 +363,7 @@ class HSTUTransducer(HammerModule):
                 candidate_timestamps = candidate_timestamps.squeeze(-1)
                 if interleave_targets:
                     candidate_timestamps = candidate_timestamps.view(-1, 2)[:, 0]
-                
+
                 candidate_embeddings = self._output_postprocessor(
                     seq_embeddings=candidate_embeddings,
                     seq_timestamps=candidate_timestamps,
@@ -385,7 +390,7 @@ class HSTUTransducer(HammerModule):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass of HSTU Transducer.
-        
+
         Returns:
             (candidate_embeddings, full_embeddings or None)
         """
@@ -412,8 +417,7 @@ class HSTUTransducer(HammerModule):
         )
 
         use_vllm_kv_cache = (
-            self._can_use_vllm_kv_cache(hstu_attn_metadata)
-            and torch.any(num_targets > 0).item()
+            self._can_use_vllm_kv_cache(hstu_attn_metadata) and torch.any(num_targets > 0).item()
         )
         if use_vllm_kv_cache:
             use_vllm_kv_cache = self._cached_path_has_consistent_inputs(
@@ -445,8 +449,7 @@ class HSTUTransducer(HammerModule):
                 ):
                     raise
                 logger.warning(
-                    "Fallback to full HSTU forward because cached path failed "
-                    "on %s with %s",
+                    "Fallback to full HSTU forward because cached path failed on %s with %s",
                     seq_embeddings.device,
                     exc,
                 )

@@ -1,13 +1,13 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GRRequest — extends vLLM's Request to carry GR features through the
 EngineCore → Scheduler → ModelRunner pipeline.
 """
 
-from typing import Any, Optional
 from collections.abc import Callable
+from typing import Any, Optional
 
 from vllm.v1.request import Request
 

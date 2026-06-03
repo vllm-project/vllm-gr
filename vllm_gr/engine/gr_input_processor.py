@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GRInputProcessor — extends vLLM's InputProcessor to handle GRPrompt.
@@ -9,13 +9,11 @@ prefix-cache building to a ``GRModelAdapter`` instance, making the
 processor model-family-agnostic.
 """
 
-from typing import Any
-from collections.abc import Mapping
-import time
 import logging
+import time
+from collections.abc import Mapping
+from typing import Any
 
-from vllm.v1.engine.input_processor import InputProcessor
-from vllm.v1.engine import EngineCoreRequest
 from vllm.config import VllmConfig
 from vllm.inputs import PromptType
 from vllm.lora.request import LoRARequest
@@ -23,10 +21,12 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_gr.adapters.capabilities import GRPrefixCacheSupport
-from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
 from vllm_gr.engine import GREngineCoreRequest
+from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
 
 logger = logging.getLogger("vllm_gr.input_processor")
 
@@ -64,8 +64,7 @@ class GRInputProcessor(InputProcessor):
     ) -> EngineCoreRequest:
         if not is_gr_prompt(prompt):
             raise TypeError(
-                "GRInputProcessor only supports GRPrompt inputs; "
-                f"got {type(prompt).__name__}"
+                f"GRInputProcessor only supports GRPrompt inputs; got {type(prompt).__name__}"
             )
 
         return self._process_gr_prompt(

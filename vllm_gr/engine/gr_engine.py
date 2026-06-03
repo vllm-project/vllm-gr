@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GRLLMEngine — extends vLLM's LLMEngine for recommendation inference.
@@ -13,10 +13,10 @@ import gc
 import logging
 
 from vllm.config import VllmConfig
+from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.executor import Executor
-from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.metrics.loggers import StatLoggerFactory
 
 from vllm_gr.config.gr_config import GRConfig

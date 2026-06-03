@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """
 HSTU Attention Operator Entry Point
@@ -12,6 +13,7 @@ unified dual-path dispatch scaffold for NPU fused kernels.
 from typing import Optional
 
 import torch
+
 from vllm_gr.logger import init_logger
 from vllm_gr.models.dlrm_v3.common import HammerKernel
 from vllm_gr.ops.npu import can_run_hstu_jagged, run_hstu_jagged

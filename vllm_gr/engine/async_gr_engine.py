@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -108,8 +108,7 @@ class GRAsyncLLM(AsyncLLM):
     ) -> AsyncGenerator[GRRequestOutput, None]:
         if not is_gr_prompt(prompt):
             raise TypeError(
-                "GRAsyncLLM.encode expects GRPrompt input; "
-                f"got {type(prompt).__name__}"
+                f"GRAsyncLLM.encode expects GRPrompt input; got {type(prompt).__name__}"
             )
         if pooling_params.task != "embed":
             raise ValueError(

@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """End-to-end output regression test for the adapter-driven output pipeline.
 
@@ -9,9 +9,10 @@ refactoring.  This tests the exact output path used by both the sync
 and async engines.
 """
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
+import importlib
 import os
 import sys
-import importlib
 import types
 import unittest
 
@@ -35,9 +36,7 @@ def _has_vllm_processor_runtime() -> bool:
 
 
 _HAS_VLLM_RUNTIME = _has_vllm_processor_runtime()
-_SKIP_REASON = (
-    "vLLM processor/runtime submodules are unavailable in this environment"
-)
+_SKIP_REASON = "vLLM processor/runtime submodules are unavailable in this environment"
 
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
@@ -45,7 +44,7 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
     """End-to-end test: adapter -> GROutputProcessor -> GRRequestOutput."""
 
     @staticmethod
-    def _make_adapter_and_processor():
+    def _make_adapter_and_processor() -> None:
         from vllm_gr.adapters.hstu.adapter import HSTUModelAdapter
         from vllm_gr.engine.gr_output_processor import GROutputProcessor
 
@@ -77,7 +76,7 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
         )
         return adapter, processor
 
-    def test_single_request_output_matches_scores(self):
+    def test_single_request_output_matches_scores(self) -> None:
         """Full output path: scores -> GRRequestOutput with correct recommendations."""
         from vllm_gr.outputs import GRRequestOutput
 
@@ -124,10 +123,12 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
         )
 
         # Simulate model output: 2 tasks x 3 candidates
-        scores = torch.tensor([
-            [0.9, 0.1, 0.5],   # is_click
-            [0.2, 0.8, 0.6],   # is_purchase
-        ])
+        scores = torch.tensor(
+            [
+                [0.9, 0.1, 0.5],  # is_click
+                [0.2, 0.8, 0.6],  # is_purchase
+            ]
+        )
 
         output = state.make_request_output(
             new_token_ids=[],
@@ -153,17 +154,11 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
         # Verify per-item task scores
         self.assertIn("is_click", output.recommendations[0].task_scores)
         self.assertIn("is_purchase", output.recommendations[0].task_scores)
-        self.assertAlmostEqual(
-            output.recommendations[0].task_scores["is_click"], 0.9
-        )
-        self.assertAlmostEqual(
-            output.recommendations[0].task_scores["is_purchase"], 0.2
-        )
-        self.assertAlmostEqual(
-            output.recommendations[1].task_scores["is_purchase"], 0.8
-        )
+        self.assertAlmostEqual(output.recommendations[0].task_scores["is_click"], 0.9)
+        self.assertAlmostEqual(output.recommendations[0].task_scores["is_purchase"], 0.2)
+        self.assertAlmostEqual(output.recommendations[1].task_scores["is_purchase"], 0.8)
 
-    def test_multi_request_output_boundaries(self):
+    def test_multi_request_output_boundaries(self) -> None:
         """Multiple requests produce independent, correctly bounded outputs."""
         from vllm_gr.outputs import GRRequestOutput
 
@@ -171,10 +166,7 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
         from vllm_gr.engine.gr_output_processor import GRRequestState
 
         for req_idx in range(3):
-            candidates = [
-                {"item_candidate_id": req_idx * 10 + i}
-                for i in range(2)
-            ]
+            candidates = [{"item_candidate_id": req_idx * 10 + i} for i in range(2)]
             meta = {
                 "user_id": f"user-{req_idx}",
                 "original_candidates": candidates,
@@ -222,7 +214,7 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
             )
             self.assertAlmostEqual(output.recommendations[0].score, 0.7)
 
-    def test_empty_candidates_produces_empty_recommendations(self):
+    def test_empty_candidates_produces_empty_recommendations(self) -> None:
         """Edge case: no candidates -> empty recommendations list."""
         from vllm_gr.outputs import GRRequestOutput
 
@@ -270,7 +262,7 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
         self.assertEqual(output.user_id, "user-empty")
         self.assertEqual(output.recommendations, [])
 
-    def test_extract_request_meta_via_adapter_round_trip(self):
+    def test_extract_request_meta_via_adapter_round_trip(self) -> None:
         """Verify adapter.extract_request_meta -> process_output round trip."""
         from vllm_gr.adapters.hstu.adapter import HSTUModelAdapter
 

@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Request-level output types for generative recommendation.
@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from vllm.outputs import PoolingOutput, PoolingRequestOutput
 
 
@@ -53,8 +52,7 @@ class GRRequestOutput(PoolingRequestOutput):
         prompt_token_ids: list[int] | None = None,
         num_cached_tokens: int = 0,
     ):
-        outputs = PoolingOutput(data=all_scores if all_scores is not None
-                                else torch.tensor([]))
+        outputs = PoolingOutput(data=all_scores if all_scores is not None else torch.tensor([]))
         super().__init__(
             request_id=request_id,
             outputs=outputs,

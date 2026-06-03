@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -30,8 +30,7 @@ def _maybe_launch_beam_search_serve() -> bool:
         return False
 
     logger.info(
-        "vllm detected --gr flag in serve command. "
-        "Launching vllm-gr specialized serving path."
+        "vllm detected --gr flag in serve command. Launching vllm-gr specialized serving path."
     )
 
     # Check for LMCache connector in args
@@ -39,10 +38,12 @@ def _maybe_launch_beam_search_serve() -> bool:
         if arg.startswith("--kv-transfer-config"):
             if "LMCacheConnectorV1" in arg:
                 import os
+
                 os.environ["VLLM_GR_LMCACHE_PATCH"] = "1"
             if arg == "--kv-transfer-config" and idx + 1 < len(sys.argv):
                 if "LMCacheConnectorV1" in sys.argv[idx + 1]:
                     import os
+
                     os.environ["VLLM_GR_LMCACHE_PATCH"] = "1"
 
     # Beam search patches are already applied through the unified
@@ -53,9 +54,10 @@ def _maybe_launch_beam_search_serve() -> bool:
 
 
 def main() -> None:
-    import vllm_gr.entrypoints.cli.serve as gr_serve
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    import vllm_gr.entrypoints.cli.serve as gr_serve
 
     # Handle --gr flag for beam search serving mode
     _maybe_launch_beam_search_serve()

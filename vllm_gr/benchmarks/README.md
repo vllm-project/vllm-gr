@@ -16,13 +16,13 @@
 ## 范围
 
 - 支持数据集：
-  - `movielens-1m`
-  - `movielens-20m`
-  - `kuairand-1k`
+    - `movielens-1m`
+    - `movielens-20m`
+    - `kuairand-1k`
 - 支持指标：
-  - `NE`
-  - `Accuracy`
-  - `GAUC`
+    - `NE`
+    - `Accuracy`
+    - `GAUC`
 
 benchmark 直接复用 `GRLLM` 和 `GRPrompt`。
 
@@ -44,20 +44,20 @@ vllm_gr/benchmarks/
 当前 benchmark 的指标口径对齐 upstream `generative_recommenders/dlrm_v3/inference/accuracy.py` 与 `MetricsLogger`。`models/hstu/gr_accuracy.py` 的汇总 JSON 使用小写字段名 `accuracy`、`ne`、`gauc`，其中：
 
 - `accuracy`
-  - 二分类准确率。
-  - 先把预测分数按 `0.5` 阈值转成 `0/1`，再与标签比较。
-  - 当前实现按 `weights_by_task` 做加权平均，越大越好。
+    - 二分类准确率。
+    - 先把预测分数按 `0.5` 阈值转成 `0/1`，再与标签比较。
+    - 当前实现按 `weights_by_task` 做加权平均，越大越好。
 - `ne`
-  - Normalized Entropy，归一化熵。
-  - 本质是加权二元交叉熵，再除以标签分布自身的熵。
-  - 越小越好。`1.0` 接近“只学到总体正样本率”的基线，`< 1.0` 通常表示优于该基线。
+    - Normalized Entropy，归一化熵。
+    - 本质是加权二元交叉熵，再除以标签分布自身的熵。
+    - 越小越好。`1.0` 接近“只学到总体正样本率”的基线，`< 1.0` 通常表示优于该基线。
 - `gauc`
-  - 这里直接沿用 upstream 的 `GAUC` 语义，对应 group AUC，而不是简单的全局 ROC-AUC。
-  - `accuracy` 关心“按 `0.5` 阈值判对没有”，`gauc` 关心“正样本整体有没有排在负样本前面”，因此它是排序型指标，不依赖 `0.5` 阈值做最终分类。
-  - 计算口径是先在单条请求的 candidate 集合内计算组内 AUC，再在请求级做加权聚合。
-  - 指标计算阶段按标签值划分正负样本：`label >= 0.5` 视为正样本，`label < 0.5` 视为负样本。由于当前 benchmark 标签实际是 `0.0` / `1.0`，可直接理解为 `1.0` 为正、`0.0` 为负。
-  - 如果一条请求里有 `3` 个正样本、`2` 个负样本，则 `GAUC` 会形成 `3 x 2 = 6` 对正负样本比较；若存在权重，每一对的贡献按 `pos_weight * neg_weight` 计入。
-  - 只有同时包含正负样本的请求才会对该指标有贡献；全正或全负请求会被跳过。越大越好。
+    - 这里直接沿用 upstream 的 `GAUC` 语义，对应 group AUC，而不是简单的全局 ROC-AUC。
+    - `accuracy` 关心“按 `0.5` 阈值判对没有”，`gauc` 关心“正样本整体有没有排在负样本前面”，因此它是排序型指标，不依赖 `0.5` 阈值做最终分类。
+    - 计算口径是先在单条请求的 candidate 集合内计算组内 AUC，再在请求级做加权聚合。
+    - 指标计算阶段按标签值划分正负样本：`label >= 0.5` 视为正样本，`label < 0.5` 视为负样本。由于当前 benchmark 标签实际是 `0.0` / `1.0`，可直接理解为 `1.0` 为正、`0.0` 为负。
+    - 如果一条请求里有 `3` 个正样本、`2` 个负样本，则 `GAUC` 会形成 `3 x 2 = 6` 对正负样本比较；若存在权重，每一对的贡献按 `pos_weight * neg_weight` 计入。
+    - 只有同时包含正负样本的请求才会对该指标有贡献；全正或全负请求会被跳过。越大越好。
 
 ## 数据准备
 
@@ -76,7 +76,6 @@ python -m scripts.benchmark_data.movielens --dataset movielens-1m
 ```bash
 python -m scripts.benchmark_data.movielens --dataset movielens-1m --insecure
 ```
-
 
 但是由于内置下载通常较慢，推荐手动下载归档文件，并放到 `tmp/` 下对应文件名的位置；只要文件已经存在，脚本会跳过下载，直接解压和预处理。
 
@@ -123,30 +122,30 @@ MovieLens 的公开数据预处理与 upstream `generative-recommenders` 的 Mov
 - `ml-20m` 读取 `ratings.csv`
 - 先按 `unix_timestamp` 升序排序，再按 `user_id` 分组
 - 分组后输出：
-  - `sequence_item_ids`
-  - `sequence_ratings`
-  - `sequence_timestamps`
+    - `sequence_item_ids`
+    - `sequence_ratings`
+    - `sequence_timestamps`
 - `ml-1m` 额外包含：
-  - `sex`
-  - `age_group`
-  - `occupation`
-  - `zip_code`
+    - `sex`
+    - `age_group`
+    - `occupation`
+    - `zip_code`
 
 KuaiRand 的公开数据预处理与 upstream `generative-recommenders` 的 KuaiRand 路径一致：
 
 - `kuairand-1k` 读取两段公开 log CSV
 - 按 `user_id` 聚合：
-  - `video_id`
-  - `time_ms`
-  - `action_weights`
-  - `play_time_ms`
-  - `duration_ms`
+    - `video_id`
+    - `time_ms`
+    - `action_weights`
+    - `play_time_ms`
+    - `duration_ms`
 - 合并用户侧特征：
-  - `user_active_degree`
-  - `follow_user_num_range`
-  - `fans_user_num_range`
-  - `friend_user_num_range`
-  - `register_days_range`
+    - `user_active_degree`
+    - `follow_user_num_range`
+    - `fans_user_num_range`
+    - `friend_user_num_range`
+    - `register_days_range`
 
 ## 请求构造
 
@@ -158,8 +157,8 @@ MovieLens 的请求构造：
 - 序列长度 `<= candidate_count` 的样本会被跳过
 - `item_query_time` 取 history 时间戳最大值
 - `rating` 标签按原始 rating 阈值生成：
-  - `raw_rating >= 3.5 => 1.0`
-  - `raw_rating < 3.5 => 0.0`
+    - `raw_rating >= 3.5 => 1.0`
+    - `raw_rating < 3.5 => 0.0`
 
 KuaiRand 的请求构造：
 
@@ -168,14 +167,14 @@ KuaiRand 的请求构造：
 - 序列长度 `<= candidate_count` 的样本会被跳过
 - `item_query_time` 取 history 时间戳最大值
 - `labels_by_task` 从 candidate `action_weights` bitset 恢复 8 个任务：
-  - `is_click`
-  - `is_like`
-  - `is_follow`
-  - `is_comment`
-  - `is_forward`
-  - `is_hate`
-  - `long_view`
-  - `is_profile_enter`
+    - `is_click`
+    - `is_like`
+    - `is_follow`
+    - `is_comment`
+    - `is_forward`
+    - `is_hate`
+    - `long_view`
+    - `is_profile_enter`
 
 ## 运行 Benchmark
 

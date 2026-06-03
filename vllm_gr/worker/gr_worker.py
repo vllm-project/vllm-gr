@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GRWorker — extends GPUWorker to use GRModelRunner.
@@ -15,9 +15,10 @@ vLLM modules loaded after the initial plugin execution.
 
 import gc
 
-from vllm_gr.logger import init_logger
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
+
 from vllm_gr.config.gr_config import GRConfig
+from vllm_gr.logger import init_logger
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 
 logger = init_logger(__name__)
@@ -32,11 +33,12 @@ class GRWorker(GPUWorker):
         # Defense-in-depth: re-apply patches to cover any vLLM modules
         # loaded after the plugin's initial patch in load_general_plugins().
         from vllm_gr.patch import re_apply_patches
+
         re_apply_patches()
 
         from vllm_gr.worker.gr_model_runner import GRModelRunner
 
-        gr_config = getattr(self.vllm_config, 'gr_config', None) or GRConfig()
+        gr_config = getattr(self.vllm_config, "gr_config", None) or GRConfig()
         self.model_runner = GRModelRunner(self.vllm_config, self.device, gr_config=gr_config)
 
         logger.info("GRWorker: using GRModelRunner on device %s", self.device)

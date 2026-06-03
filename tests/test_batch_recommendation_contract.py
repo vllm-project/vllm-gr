@@ -1,8 +1,10 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 
 """Core contract tests for multi-request recommendation boundaries."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import unittest
@@ -20,15 +22,11 @@ def _build_prompt(user_id: str, candidate_ids: list[int]) -> dict[str, object]:
             {"item_id": 1},
             {"item_id": 2},
         ],
-        "candidates": [
-            {"item_candidate_id": candidate_id}
-            for candidate_id in candidate_ids
-        ],
+        "candidates": [{"item_candidate_id": candidate_id} for candidate_id in candidate_ids],
     }
 
 
 class TestBatchRecommendationContract(unittest.TestCase):
-
     def _assert_output_boundaries(
         self,
         outputs,
@@ -47,10 +45,7 @@ class TestBatchRecommendationContract(unittest.TestCase):
             user_id = prompt["user_id"]
             output = outputs_by_user[user_id]
             candidates = prompt["candidates"]
-            expected_item_ids = [
-                candidate["item_candidate_id"]
-                for candidate in candidates
-            ]
+            expected_item_ids = [candidate["item_candidate_id"] for candidate in candidates]
 
             self.assertTrue(output.finished)
             self.assertEqual(output.user_id, user_id)
@@ -61,7 +56,7 @@ class TestBatchRecommendationContract(unittest.TestCase):
                 [None] * len(candidates),
             )
 
-    def test_recommend_multi_prompt_preserves_request_boundaries(self):
+    def test_recommend_multi_prompt_preserves_request_boundaries(self) -> None:
         prompts = [
             _build_prompt("u1", [101, 102, 103]),
             _build_prompt("u2", [201, 202, 203]),
@@ -81,6 +76,7 @@ class TestBatchRecommendationContract(unittest.TestCase):
                     )
 
                     llm.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

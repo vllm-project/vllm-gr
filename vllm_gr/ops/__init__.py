@@ -1,6 +1,6 @@
-# Copyright (c) vllm-GR Authors.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Original code from Meta Platforms, Inc. (generative-recommenders)
-# Licensed under the Apache License, Version 2.0
 
 """
 HSTU Model Operators Package
@@ -9,10 +9,10 @@ Contains attention, compute, jagged tensor operations, and normalization operato
 Currently provides PyTorch implementations, extensible to Triton/CUDA optimized versions.
 """
 
-from vllm_gr.ops.hstu_attention import hstu_mha, delta_hstu_mha
+from vllm_gr.ops.hstu_attention import delta_hstu_mha, hstu_mha
 from vllm_gr.ops.hstu_compute import (
-    hstu_compute_uqvk,
     hstu_compute_output,
+    hstu_compute_uqvk,
     hstu_preprocess_and_attention,
 )
 from vllm_gr.ops.jagged_tensors import concat_2D_jagged, split_2D_jagged

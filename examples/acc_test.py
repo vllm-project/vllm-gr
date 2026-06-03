@@ -1,6 +1,6 @@
-﻿#!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Run vllm-GR on benchmark input JSON and optionally compare with GT JSON.
@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -163,9 +164,7 @@ def _extract_scores_from_output(
         )
 
     if len(out) != expected_num_candidates:
-        raise ValueError(
-            f"Score count mismatch: got {len(out)} expected {expected_num_candidates}"
-        )
+        raise ValueError(f"Score count mismatch: got {len(out)} expected {expected_num_candidates}")
     return [float(x) for x in out]
 
 
@@ -224,8 +223,7 @@ def _mean_relative_error(
             raise ValueError(f"case={case_id} missing scores list")
         if len(pred_scores) != len(gt_scores):
             raise ValueError(
-                f"case={case_id} score length mismatch: "
-                f"pred={len(pred_scores)} gt={len(gt_scores)}"
+                f"case={case_id} score length mismatch: pred={len(pred_scores)} gt={len(gt_scores)}"
             )
 
         for pred_row, gt_row in zip(pred_scores, gt_scores):
@@ -243,9 +241,7 @@ def _mean_relative_error(
             gt_score = float(gt_row.get("score"))
             rel = abs(pred_score - gt_score) / max(abs(gt_score), eps)
             if not math.isfinite(rel):
-                raise ValueError(
-                    f"case={case_id} encountered non-finite relative error: {rel}"
-                )
+                raise ValueError(f"case={case_id} encountered non-finite relative error: {rel}")
             total += rel
             count += 1
 
@@ -327,4 +323,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-        main()
+    main()

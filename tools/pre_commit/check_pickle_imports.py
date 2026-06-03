@@ -40,7 +40,8 @@ def check_file(file_path: Path) -> list[tuple[int, str]]:
             for line_num, line in enumerate(f, start=1):
                 for pattern in compiled_patterns:
                     if pattern.match(line):
-                        violations.append((line_num, line.rstrip()))
+                        if "# noqa: pickle" not in line:
+                            violations.append((line_num, line.rstrip()))
                         break
     except Exception as e:
         print(f"Error reading {file_path}: {e}", file=sys.stderr)

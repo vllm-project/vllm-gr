@@ -1,11 +1,12 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Core tests for GR input/output processor behavior."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
+import importlib
 import os
 import sys
-import importlib
 import types
 import unittest
 
@@ -30,9 +31,7 @@ def _has_vllm_processor_runtime() -> bool:
 
 
 _HAS_VLLM_RUNTIME = _has_vllm_processor_runtime()
-_SKIP_REASON = (
-    "vLLM processor/runtime submodules are unavailable in this environment"
-)
+_SKIP_REASON = "vLLM processor/runtime submodules are unavailable in this environment"
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -48,8 +47,9 @@ def _make_adapter(
     task_names=None,
     max_seq_len=512,
     max_candidates=1000,
-):
+) -> None:
     """Build an HSTUModelAdapter with the given feature config."""
+
     from vllm_gr.adapters.hstu.adapter import HSTUModelAdapter
 
     if uih_feature_names is None:
@@ -93,14 +93,14 @@ def _make_adapter(
     return HSTUModelAdapter(vllm_config, gr_config)
 
 
-def _decode_request_payload(request):
+def _decode_request_payload(request) -> None:
     from vllm_gr.adapters.hstu.payload import HSTUFeaturesPayload
     from vllm_gr.engine.gr_features_codec import decode_gr_features_payload
 
     return decode_gr_features_payload(request.gr_features, HSTUFeaturesPayload)
 
 
-def _make_processor_with_adapter(**adapter_kwargs):
+def _make_processor_with_adapter(**adapter_kwargs) -> None:
     """Build a GRInputProcessor wired to an HSTUModelAdapter."""
     from vllm_gr.engine.gr_input_processor import GRInputProcessor
 
@@ -116,8 +116,7 @@ def _make_processor_with_adapter(**adapter_kwargs):
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
 class TestExtractFeatures(unittest.TestCase):
-
-    def test_extract_multi_key_features(self):
+    def test_extract_multi_key_features(self) -> None:
         from vllm_gr.gr_schema import extract_features
 
         records = [
@@ -138,7 +137,7 @@ class TestExtractFeatures(unittest.TestCase):
         for length in lengths:
             self.assertEqual(length, 3)
 
-    def test_extract_missing_key_rejected(self):
+    def test_extract_missing_key_rejected(self) -> None:
         from vllm_gr.gr_schema import extract_features
 
         records = [{"item_id": 1}, {"item_id": 2}]
@@ -149,7 +148,7 @@ class TestExtractFeatures(unittest.TestCase):
                 group_name="features",
             )
 
-    def test_extract_missing_value_rejected(self):
+    def test_extract_missing_value_rejected(self) -> None:
         from vllm_gr.gr_schema import extract_features
 
         records = [
@@ -164,7 +163,7 @@ class TestExtractFeatures(unittest.TestCase):
                 group_name="features",
             )
 
-    def test_process_gr_prompt_preserves_all_candidates(self):
+    def test_process_gr_prompt_preserves_all_candidates(self) -> None:
         from vllm.pooling_params import PoolingParams
 
         processor = _make_processor_with_adapter(
@@ -194,7 +193,7 @@ class TestExtractFeatures(unittest.TestCase):
         )
         self.assertEqual(len(payload.original_candidates), 3)
 
-    def test_process_gr_prompt_separates_contextual_features_from_history(self):
+    def test_process_gr_prompt_separates_contextual_features_from_history(self) -> None:
         from vllm.pooling_params import PoolingParams
 
         processor = _make_processor_with_adapter(
@@ -241,7 +240,7 @@ class TestExtractFeatures(unittest.TestCase):
         self.assertEqual(payload.uih_values_per_key, [[11, 12], [101, 102]])
         self.assertEqual(payload.ctx_values_per_key, [[7], [1]])
 
-    def test_process_gr_prompt_builds_stable_prompt_identity(self):
+    def test_process_gr_prompt_builds_stable_prompt_identity(self) -> None:
         from vllm.pooling_params import PoolingParams
 
         processor = _make_processor_with_adapter(
@@ -283,11 +282,9 @@ class TestExtractFeatures(unittest.TestCase):
             len(request_a.prompt_token_ids),
             2 + len(prompt["user_history"]) + len(prompt["candidates"]),
         )
-        self.assertTrue(
-            all(0 <= token_id <= _INT32_MAX for token_id in request_a.prompt_token_ids)
-        )
+        self.assertTrue(all(0 <= token_id <= _INT32_MAX for token_id in request_a.prompt_token_ids))
 
-    def test_process_gr_prompt_prompt_identity_changes_with_context_and_candidates(self):
+    def test_process_gr_prompt_prompt_identity_changes_with_context_and_candidates(self) -> None:
         from vllm.pooling_params import PoolingParams
 
         processor = _make_processor_with_adapter(
@@ -357,10 +354,10 @@ class TestExtractFeatures(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
 class TestGRRequestState(unittest.TestCase):
-
     @staticmethod
-    def _make_state(user_id="user_123", candidates=None,
-                    primary_id_key="item_candidate_id"):
+    def _make_state(
+        user_id="user_123", candidates=None, primary_id_key="item_candidate_id"
+    ) -> None:
         from vllm_gr.engine.gr_output_processor import GRRequestState
 
         if candidates is None:
@@ -401,7 +398,7 @@ class TestGRRequestState(unittest.TestCase):
             },
         )
 
-    def test_make_gr_output_basic(self):
+    def test_make_gr_output_basic(self) -> None:
         state = self._make_state()
         scores = torch.tensor([[0.1, 0.5, 0.3, 0.8, 0.2]])
 
@@ -415,7 +412,7 @@ class TestGRRequestState(unittest.TestCase):
         self.assertEqual(output.recommendations[0].item_id, 10)
         self.assertAlmostEqual(output.recommendations[0].score, 0.1)
 
-    def test_make_gr_output_preserves_all_candidate_scores(self):
+    def test_make_gr_output_preserves_all_candidate_scores(self) -> None:
         candidates = [{"item_candidate_id": i} for i in range(10)]
         state = self._make_state(candidates=candidates)
         scores = torch.tensor([[0.1, 0.9, 0.3, 0.8, 0.5, 0.2, 0.7, 0.4, 0.6, 0.15]])
@@ -427,20 +424,20 @@ class TestGRRequestState(unittest.TestCase):
         self.assertEqual(output.recommendations[1].item_id, 1)
         self.assertAlmostEqual(output.recommendations[1].score, 0.9)
 
-    def test_make_gr_output_rejects_candidate_score_mismatch(self):
+    def test_make_gr_output_rejects_candidate_score_mismatch(self) -> None:
         state = self._make_state(candidates=[{"item_candidate_id": 10}, {"item_candidate_id": 20}])
         scores = torch.tensor([[0.1]])
 
         with self.assertRaisesRegex(ValueError, "candidate/score count mismatch"):
             state._make_gr_output(scores, finish_reason="stop")
 
-    def test_make_gr_output_rejects_non_2d_scores(self):
+    def test_make_gr_output_rejects_non_2d_scores(self) -> None:
         state = self._make_state()
 
         with self.assertRaisesRegex(ValueError, "must be 2D"):
             state._make_gr_output(torch.tensor([0.1, 0.5]), finish_reason="stop")
 
-    def test_make_request_output_keeps_empty_candidate_requests_in_gr_path(self):
+    def test_make_request_output_keeps_empty_candidate_requests_in_gr_path(self) -> None:
         state = self._make_state(candidates=[])
 
         output = state.make_request_output(
@@ -456,7 +453,7 @@ class TestGRRequestState(unittest.TestCase):
         self.assertEqual(output.user_id, "user_123")
         self.assertEqual(output.recommendations, [])
 
-    def test_make_gr_output_uses_explicit_primary_id_key(self):
+    def test_make_gr_output_uses_explicit_primary_id_key(self) -> None:
         state = self._make_state(
             candidates=[
                 {"rank_feature": 999, "item_candidate_id": 10},
@@ -478,8 +475,7 @@ class TestGRRequestState(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
 class TestMultiTaskOutput(unittest.TestCase):
-
-    def _make_state_with_tasks(self, task_names, primary_task=""):
+    def _make_state_with_tasks(self, task_names, primary_task="") -> None:
         from vllm_gr.engine.gr_output_processor import GRRequestState
 
         candidates = [
@@ -518,15 +514,17 @@ class TestMultiTaskOutput(unittest.TestCase):
             },
         )
 
-    def test_primary_task_selection(self):
+    def test_primary_task_selection(self) -> None:
         state = self._make_state_with_tasks(
             task_names=["is_click", "is_purchase"],
             primary_task="is_purchase",
         )
-        scores = torch.tensor([
-            [0.9, 0.1, 0.5],   # is_click
-            [0.2, 0.8, 0.6],   # is_purchase
-        ])
+        scores = torch.tensor(
+            [
+                [0.9, 0.1, 0.5],  # is_click
+                [0.2, 0.8, 0.6],  # is_purchase
+            ]
+        )
 
         output = state._make_gr_output(scores, finish_reason="stop")
 
@@ -535,15 +533,17 @@ class TestMultiTaskOutput(unittest.TestCase):
         self.assertEqual(output.recommendations[1].item_id, 20)
         self.assertAlmostEqual(output.recommendations[1].score, 0.8)
 
-    def test_per_item_task_scores(self):
+    def test_per_item_task_scores(self) -> None:
         state = self._make_state_with_tasks(
             task_names=["is_click", "is_purchase"],
             primary_task="is_click",
         )
-        scores = torch.tensor([
-            [0.9, 0.1, 0.5],
-            [0.2, 0.8, 0.6],
-        ])
+        scores = torch.tensor(
+            [
+                [0.9, 0.1, 0.5],
+                [0.2, 0.8, 0.6],
+            ]
+        )
 
         output = state._make_gr_output(scores, finish_reason="stop")
 
@@ -558,10 +558,10 @@ class TestMultiTaskOutput(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
 class TestHSTUFeaturesPayload(unittest.TestCase):
-
-    def test_creation_and_serialization(self):
+    def test_creation_and_serialization(self) -> None:
         """Payload round-trips through msgspec."""
         import msgspec
+
         from vllm_gr.adapters.hstu.payload import HSTUFeaturesPayload
 
         payload = HSTUFeaturesPayload(

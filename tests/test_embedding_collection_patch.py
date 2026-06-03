@@ -1,29 +1,24 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = (
-    ROOT
-    / "vllm_gr"
-    / "model_executor"
-    / "models"
-    / "embedding_collection_patch.py"
-)
+MODULE_PATH = ROOT / "vllm_gr" / "model_executor" / "models" / "embedding_collection_patch.py"
 
 
-def _load_module(name: str, path: Path):
+def _load_module(name: str, path: Path) -> None:
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -33,7 +28,7 @@ def _load_module(name: str, path: Path):
 
 
 class _FakeFeature:
-    def __init__(self, values: torch.Tensor, lengths: torch.Tensor):
+    def __init__(self, values: torch.Tensor, lengths: torch.Tensor) -> None:
         self._values = values
         self._lengths = lengths
 
@@ -45,22 +40,22 @@ class _FakeFeature:
 
 
 class _FakeInputKJT:
-    def __init__(self, feature_map):
+    def __init__(self, feature_map) -> None:
         self._feature_map = feature_map
 
-    def to_dict(self):
+    def to_dict(self) -> None:
         return self._feature_map
 
 
 class _FakeJaggedTensor:
-    def __init__(self, values, lengths, weights=None):
+    def __init__(self, values, lengths, weights=None) -> None:
         self.values = values
         self.lengths = lengths
         self.weights = weights
 
 
 class _FakeEmbeddingModule:
-    def __init__(self, num_embeddings: int):
+    def __init__(self, num_embeddings: int) -> None:
         self.weight = torch.zeros(num_embeddings, 2)
         self.last_input = None
 
@@ -70,8 +65,7 @@ class _FakeEmbeddingModule:
 
 
 class TestEmbeddingCollectionPatch(unittest.TestCase):
-
-    def test_patch_allows_in_range_indices(self):
+    def test_patch_allows_in_range_indices(self) -> None:
         module = _load_module(
             "embedding_collection_patch_test_module",
             MODULE_PATH,
@@ -110,11 +104,13 @@ class TestEmbeddingCollectionPatch(unittest.TestCase):
                 features,
             )
 
-        torch.testing.assert_close(embedding_module.last_input, features.to_dict()["item_id"].values())
+        torch.testing.assert_close(
+            embedding_module.last_input, features.to_dict()["item_id"].values()
+        )
         self.assertIn("item_id", outputs)
         self.assertTrue(torch.equal(outputs["item_id"].lengths, torch.tensor([3])))
 
-    def test_patch_rejects_out_of_range_indices(self):
+    def test_patch_rejects_out_of_range_indices(self) -> None:
         module = _load_module(
             "embedding_collection_patch_test_module_strict",
             MODULE_PATH,

@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 HSTU Model for vLLM-GR.
@@ -20,14 +20,18 @@ Runtime topology:
 - Forward pass: preprocess(embedding device) -> transfer -> main_forward(dense device)
 """
 
-from functools import partial
 import importlib
 import inspect
 import types
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from functools import partial
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from torchrec.modules.embedding_configs import EmbeddingConfig
+
 from vllm_gr.logger import init_logger
 
 try:
@@ -90,6 +94,7 @@ class HSTUPooler(nn.Module):
 
     def get_pooling_updates(self, task: str) -> Any:
         from vllm.model_executor.layers.pooler.common import PoolingParamsUpdate
+
         return PoolingParamsUpdate()
 
     def forward(
@@ -140,14 +145,11 @@ class HSTUForRecommendation(nn.Module):
 
         self.config = config
         self.enable_kv_cache = bool(getattr(self.config, "enable_kv_cache", False))
-        self.kv_cache_dtype = (
-            getattr(self.config, "kv_cache_dtype", None)
-            or getattr(self.config, "torch_dtype", torch.bfloat16)
+        self.kv_cache_dtype = getattr(self.config, "kv_cache_dtype", None) or getattr(
+            self.config, "torch_dtype", torch.bfloat16
         )
         self._hstu_kv_cache_layers = nn.ModuleList()
-        dense_device_override = (
-            torch.device(device) if device is not None else None
-        )
+        dense_device_override = torch.device(device) if device is not None else None
         self._set_runtime_devices(
             dense_device_override=dense_device_override,
         )
@@ -201,7 +203,7 @@ class HSTUForRecommendation(nn.Module):
 
     def _build_embedding_configs(self) -> Dict[str, "EmbeddingConfig"]:
         """Convert HSTUConfig.embedding_tables (list of dicts) to TorchRec EmbeddingConfig dict."""
-        from torchrec.modules.embedding_configs import EmbeddingConfig, DataType
+        from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
 
         def _resolve_data_type(raw_value: Any) -> DataType:
             if isinstance(raw_value, DataType):
@@ -243,9 +245,7 @@ class HSTUForRecommendation(nn.Module):
                 "num_embeddings": table_cfg["num_embeddings"],
                 "embedding_dim": table_cfg["embedding_dim"],
                 "name": name,
-                "data_type": _resolve_data_type(
-                    table_cfg.get("data_type", default_data_type)
-                ),
+                "data_type": _resolve_data_type(table_cfg.get("data_type", default_data_type)),
                 "feature_names": table_cfg.get("feature_names", [name]),
             }
 
@@ -327,23 +327,22 @@ class HSTUForRecommendation(nn.Module):
                     and int(runtime_num_targets.to(dtype=torch.int64).sum().item()) > 0
                 ):
                     metadata.num_targets = runtime_num_targets
-                if (
-                    int(getattr(metadata, "contextual_seq_len", 0)) == 0
-                    and getattr(self.config, "contextual_feature_to_max_length", None)
+                if int(getattr(metadata, "contextual_seq_len", 0)) == 0 and getattr(
+                    self.config, "contextual_feature_to_max_length", None
                 ):
                     metadata.contextual_seq_len = int(
                         sum(self.config.contextual_feature_to_max_length.values())
                     )
 
-                total_delta_tokens = int(
-                    metadata.num_targets.to(dtype=torch.int64).sum().item()
-                )
+                total_delta_tokens = int(metadata.num_targets.to(dtype=torch.int64).sum().item())
                 expected_total_tokens = int(
                     (
                         metadata.history_lengths.to(dtype=torch.int64)
                         + int(getattr(metadata, "contextual_seq_len", 0))
                         + metadata.num_targets.to(dtype=torch.int64)
-                    ).sum().item()
+                    )
+                    .sum()
+                    .item()
                 )
                 slot_mapping = getattr(
                     getattr(metadata, "common_attn_metadata", None),
@@ -362,10 +361,7 @@ class HSTUForRecommendation(nn.Module):
                     else 0
                 )
                 if actual_token_slots < expected_total_tokens:
-                    if (
-                        actual_computed_tokens == 0
-                        and actual_token_slots == total_delta_tokens
-                    ):
+                    if actual_computed_tokens == 0 and actual_token_slots == total_delta_tokens:
                         logger.debug_once(
                             "Skip native HSTU KV cache for this cold-start step "
                             "because scheduler-visible token slots only cover "
@@ -376,10 +372,7 @@ class HSTUForRecommendation(nn.Module):
                             total_delta_tokens,
                             expected_total_tokens,
                         )
-                    elif (
-                        actual_token_slots + actual_computed_tokens
-                        >= expected_total_tokens
-                    ):
+                    elif actual_token_slots + actual_computed_tokens >= expected_total_tokens:
                         logger.debug_once(
                             "Skip native HSTU KV cache for this step because "
                             "scheduler-visible token slots only cover the new "
@@ -414,9 +407,7 @@ class HSTUForRecommendation(nn.Module):
         )
 
         layer_prefix = (
-            f"{self.prefix}.hstu_kv_cache_layers"
-            if self.prefix
-            else "hstu_kv_cache_layers"
+            f"{self.prefix}.hstu_kv_cache_layers" if self.prefix else "hstu_kv_cache_layers"
         )
         self._hstu_kv_cache_layers = nn.ModuleList(
             [
@@ -440,7 +431,8 @@ class HSTUForRecommendation(nn.Module):
     def _create_hstu_model(self) -> None:
         """Create the underlying DlrmHSTU model with EmbeddingCollection."""
         from vllm_gr.models.dlrm_v3.modules.dlrm_hstu import (
-            DlrmHSTU, DlrmHSTUConfig,
+            DlrmHSTU,
+            DlrmHSTUConfig,
         )
         from vllm_gr.models.dlrm_v3.modules.multitask_module import (
             TaskConfig,
@@ -492,7 +484,9 @@ class HSTUForRecommendation(nn.Module):
             action_embedding_init_std=getattr(self.config, "action_embedding_init_std", 0.1),
             causal_multitask_weights=getattr(self.config, "causal_multitask_weights", 0.2),
             enable_postprocessor=getattr(self.config, "enable_postprocessor", True),
-            use_layer_norm_postprocessor=getattr(self.config, "use_layer_norm_postprocessor", False),
+            use_layer_norm_postprocessor=getattr(
+                self.config, "use_layer_norm_postprocessor", False
+            ),
             enable_kv_cache=getattr(self.config, "enable_kv_cache", False),
         )
 
@@ -569,7 +563,8 @@ class HSTUForRecommendation(nn.Module):
         if uih_features is None or candidates_features is None:
             total_tokens = input_ids.numel() if input_ids is not None else 1
             return torch.zeros(
-                total_tokens, self.config.hstu_transducer_embedding_dim,
+                total_tokens,
+                self.config.hstu_transducer_embedding_dim,
                 device=dense_device,
             )
 
@@ -621,7 +616,8 @@ class HSTUForRecommendation(nn.Module):
         return self._split_pooling_predictions(predictions, num_candidates)
 
     def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]],
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
     ) -> Set[str]:
         """Load model weights with sparse/dense device separation.
 
@@ -671,8 +667,7 @@ class HSTUForRecommendation(nn.Module):
         loaded |= loader.load_weights(iter(param_weights))
 
         logger.info(
-            "Loaded %d weights: %d sparse (%s), %d dense (%s), "
-            "%d buffers",
+            "Loaded %d weights: %d sparse (%s), %d dense (%s), %d buffers",
             len(loaded),
             sparse_count,
             getattr(self.hstu, "_embedding_device", torch.device("cpu")).type,

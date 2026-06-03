@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """vLLM general plugin entry point for vllm-GR.
 
@@ -15,8 +15,8 @@ It is responsible only for:
 - registering GR model architectures with vLLM
 """
 
-from importlib import import_module
 import logging
+from importlib import import_module
 
 logger = logging.getLogger("vllm_gr.plugin")
 
@@ -127,8 +127,7 @@ def initialize_runtime() -> dict[str, int | bool]:
     }
     if not config_registered:
         raise RuntimeError(
-            "vllm-GR runtime initialization failed: "
-            "HSTU config registration did not succeed"
+            "vllm-GR runtime initialization failed: HSTU config registration did not succeed"
         )
     if not models_registered:
         raise RuntimeError(
@@ -136,8 +135,7 @@ def initialize_runtime() -> dict[str, int | bool]:
             "GR model architecture registration did not succeed"
         )
     logger.debug(
-        "vllm-GR runtime initialized: patches=%d, config_registered=%s, "
-        "models_registered=%s",
+        "vllm-GR runtime initialized: patches=%d, config_registered=%s, models_registered=%s",
         patch_count,
         config_registered,
         models_registered,

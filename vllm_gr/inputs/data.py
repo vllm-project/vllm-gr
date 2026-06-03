@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Core data types for generative recommendation.
@@ -11,7 +11,7 @@ the GR pipeline by setting a registered ``model_type``.
 """
 
 import importlib
-from typing import Any, Union, List, Dict
+from typing import Any, Dict, List, Union
 
 # Pydantic v2 requires typing_extensions.TypedDict on Python < 3.12.
 # Keep using typing_extensions to stay compatible with the supported

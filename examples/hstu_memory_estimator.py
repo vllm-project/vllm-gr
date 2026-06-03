@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Estimate HSTU model memory requirements without launching a vLLM engine.
 
@@ -125,11 +125,10 @@ from typing import Any
 
 from runtime_utils import add_repo_root_to_path
 
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 add_repo_root_to_path(__file__)
 
-from vllm_gr.config.hstu_config import get_hstu_contextual_seq_len
+from vllm_gr.config.hstu_config import get_hstu_contextual_seq_len  # noqa: E402
 
 DEFAULT_SEQUENCE_LENGTHS = "1024,2048,4096,8192"
 DEFAULT_BLOCK_SIZE = 128
@@ -381,7 +380,7 @@ def _build_fit_checks(
     if device_memory_gib is None:
         return []
 
-    device_total_bytes = int(device_memory_gib * (1024 ** 3))
+    device_total_bytes = int(device_memory_gib * (1024**3))
     engine_budget_bytes = int(device_total_bytes * gpu_memory_utilization)
     rows: list[dict[str, Any]] = []
     for sequence_row in sequence_rows:
@@ -408,9 +407,7 @@ def main() -> int:
 
     max_candidates = _resolve_inference_candidates(config, args.max_candidates)
     kv_cache_dtype = str(
-        args.kv_cache_dtype
-        or config.get("kv_cache_dtype")
-        or config.get("torch_dtype", "bfloat16")
+        args.kv_cache_dtype or config.get("kv_cache_dtype") or config.get("torch_dtype", "bfloat16")
     )
     weight_files = _find_weight_files(model_dir)
     weight_file_bytes = _sum_weight_file_bytes(weight_files)
@@ -514,10 +511,10 @@ def main() -> int:
 
     if fit_rows:
         print("\n[Rough Fit Check]")
-        engine_budget_bytes = int(args.device_memory_gib * (1024 ** 3) * args.gpu_memory_utilization)
+        engine_budget_bytes = int(args.device_memory_gib * (1024**3) * args.gpu_memory_utilization)
         print(
             "  device_memory={device_memory} gpu_memory_utilization={util:.2f} engine_budget={budget}".format(
-                device_memory=_format_bytes(int(args.device_memory_gib * (1024 ** 3))),
+                device_memory=_format_bytes(int(args.device_memory_gib * (1024**3))),
                 util=args.gpu_memory_utilization,
                 budget=_format_bytes(engine_budget_bytes),
             )

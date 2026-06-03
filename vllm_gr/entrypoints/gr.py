@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GRLLM — user-facing entry point for generative recommendation inference.
@@ -9,23 +9,22 @@ GRPrompt inputs. Internally creates a GRLLMEngine (which has GR-specific
 processors) and drives the engine loop to collect GRRequestOutput results.
 """
 
-from typing import Optional, Union, Sequence, List
 import gc
 import time
+from typing import List, Optional, Sequence, Union
 
 from tqdm.auto import tqdm
-
 from vllm.entrypoints.llm import LLM
-from vllm_gr.logger import init_logger
+from vllm.pooling_params import PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
-from vllm.pooling_params import PoolingParams
 
-from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
 from vllm_gr.config.gr_config import GRConfig
-from vllm_gr.outputs import GRRequestOutput
 from vllm_gr.engine.arg_utils import GREngineArgs
 from vllm_gr.engine.gr_engine import GRLLMEngine
+from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
+from vllm_gr.logger import init_logger
+from vllm_gr.outputs import GRRequestOutput
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 
 logger = init_logger(__name__)
@@ -89,9 +88,11 @@ class GRLLM(LLM):
         self.io_processor = None
 
         logger.info(
-            "GRLLM initialized: model=%s, model_family=%s, max_seq_len=%d, "
-            "max_candidates=%d",
-            model, model_family, self.max_seq_len, self.max_candidates,
+            "GRLLM initialized: model=%s, model_family=%s, max_seq_len=%d, max_candidates=%d",
+            model,
+            model_family,
+            self.max_seq_len,
+            self.max_candidates,
         )
 
     def recommend(
@@ -132,7 +133,8 @@ class GRLLM(LLM):
         elapsed = time.time() - start_time
         logger.debug(
             "Recommendation completed in %.3fs for %d prompts",
-            elapsed, len(prompts),
+            elapsed,
+            len(prompts),
         )
         return outputs
 
@@ -164,15 +166,10 @@ class GRLLM(LLM):
             pbar.close()
 
         missing_request_ids = [
-            request_id
-            for request_id in request_ids
-            if request_id not in outputs_by_request_id
+            request_id for request_id in request_ids if request_id not in outputs_by_request_id
         ]
         if missing_request_ids:
-            raise RuntimeError(
-                "Missing GRRequestOutput for request ids: "
-                f"{missing_request_ids!r}"
-            )
+            raise RuntimeError(f"Missing GRRequestOutput for request ids: {missing_request_ids!r}")
 
         return [outputs_by_request_id[request_id] for request_id in request_ids]
 
@@ -184,7 +181,7 @@ class GRLLM(LLM):
         """Process prompts in fixed-size batches for large-scale inference."""
         all_outputs = []
         for i in range(0, len(prompts), batch_size):
-            batch = prompts[i:i + batch_size]
+            batch = prompts[i : i + batch_size]
             outputs = self.recommend(batch, use_tqdm=False)
             all_outputs.extend(outputs)
         return all_outputs
@@ -196,7 +193,7 @@ class GRLLM(LLM):
         return self.llm_engine.get_prefix_cache_counters()
 
     def shutdown(self) -> None:
-        if hasattr(self, 'llm_engine') and self.llm_engine is not None:
+        if hasattr(self, "llm_engine") and self.llm_engine is not None:
             self.llm_engine.shutdown()
             self.llm_engine = None
         self.default_sampling_params = None

@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Schema validation helpers for GR payloads.
 
@@ -34,11 +34,7 @@ def build_schema_fingerprint(
     cand_keys: list[str],
     ctx_keys: list[str],
 ) -> str:
-    return (
-        f"uih:{','.join(uih_keys)}|"
-        f"cand:{','.join(cand_keys)}|"
-        f"ctx:{','.join(ctx_keys)}"
-    )
+    return f"uih:{','.join(uih_keys)}|cand:{','.join(cand_keys)}|ctx:{','.join(ctx_keys)}"
 
 
 def validate_feature_group(
@@ -65,9 +61,7 @@ def validate_feature_group(
     if values_per_key:
         expected_size = len(values_per_key[0])
         mismatched_keys = [
-            key
-            for key, values in zip(keys, values_per_key)
-            if len(values) != expected_size
+            key for key, values in zip(keys, values_per_key) if len(values) != expected_size
         ]
         if mismatched_keys:
             raise ValueError(
@@ -89,8 +83,7 @@ def validate_context_group(
     for key, values in zip(ctx_keys, ctx_values_per_key):
         if len(values) != 1:
             raise ValueError(
-                f"context feature {key!r} must contain exactly one value, "
-                f"got {len(values)}"
+                f"context feature {key!r} must contain exactly one value, got {len(values)}"
             )
 
 
@@ -111,15 +104,13 @@ def extract_context_features(
         unexpected_keys = sorted(set(context.keys()) - set(ctx_keys))
         if unexpected_keys:
             raise ValueError(
-                "context contains unexpected keys for configured schema: "
-                f"{unexpected_keys!r}"
+                f"context contains unexpected keys for configured schema: {unexpected_keys!r}"
             )
     try:
         ctx_values_per_key = [[int(context[k])] for k in ctx_keys]
     except (ValueError, TypeError) as exc:
         raise ValueError(
-            "Context values must be convertible to int. "
-            f"Got context={context!r}: {exc}"
+            f"Context values must be convertible to int. Got context={context!r}: {exc}"
         ) from exc
     return ctx_keys, ctx_values_per_key
 
@@ -134,9 +125,7 @@ def extract_features(
     if not feature_names:
         if not records:
             return [], [], []
-        raise ValueError(
-            f"{group_name} feature_names must be configured when records are present"
-        )
+        raise ValueError(f"{group_name} feature_names must be configured when records are present")
 
     if not records:
         return (
@@ -148,9 +137,7 @@ def extract_features(
     missing_features: list[str] = []
     for key in feature_names:
         missing_record_indexes = [
-            str(idx)
-            for idx, record in enumerate(records)
-            if key not in record
+            str(idx) for idx, record in enumerate(records) if key not in record
         ]
         if missing_record_indexes:
             missing_features.append(

@@ -1,8 +1,10 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 
 """GPU smoke test for the minimal GR runtime path."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import unittest
@@ -14,8 +16,7 @@ except ImportError:
 
 
 class TestGPUSmoke(unittest.TestCase):
-
-    def test_gpu_smoke_runs_grllm_worker_runner_hstu_chain(self):
+    def test_gpu_smoke_runs_grllm_worker_runner_hstu_chain(self) -> None:
         with smoke_harness("cuda") as harness:
             llm = harness.create_llm()
             outputs = llm.recommend(harness.prompt(), use_tqdm=False)

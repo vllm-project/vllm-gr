@@ -11,6 +11,8 @@ To run this directory intentionally, pass `allow_missing_weights=True` so vLLM
 uses the dummy/random weight loader.
 
 Use cases:
+
+- Validating the FuXi inference pipeline without trained weights
 - Validating the FuXi inference pipeline without trained weights
 - Development and debugging
 - CI / smoke testing

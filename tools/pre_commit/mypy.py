@@ -125,9 +125,7 @@ def main():
     for file_group, changed_files in file_groups.items():
         follow_imports = None if ci and file_group == "" else "skip"
         if changed_files:
-            returncode |= mypy(
-                changed_files, python_version, follow_imports, file_group
-            )
+            returncode |= mypy(changed_files, python_version, follow_imports, file_group)
     return returncode
 
 

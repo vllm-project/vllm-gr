@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """Output postprocessors for HSTU model"""
 
@@ -116,17 +117,13 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
 
         timestamps = timestamps.unsqueeze(-1)
         period_units = _unsqueeze_if_needed(period_units, combined_embeddings)
-        units_per_period = _unsqueeze_if_needed(
-            units_per_period, combined_embeddings
-        ).float()
+        units_per_period = _unsqueeze_if_needed(units_per_period, combined_embeddings).float()
         _units_elapsed_type: torch.dtype = combined_embeddings.dtype
         _units_since_epoch = torch.div(
             timestamps.float(), period_units.float(), rounding_mode="floor"
         )
         _units_elapsed = (
-            (torch.remainder(_units_since_epoch, units_per_period) / units_per_period)
-            * 2
-            * 3.14
+            (torch.remainder(_units_since_epoch, units_per_period) / units_per_period) * 2 * 3.14
         )
         _units_elapsed = torch.view_as_real(
             torch.polar(
@@ -150,4 +147,3 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
             )
         )
         return self._layer_norm(user_embeddings)
-

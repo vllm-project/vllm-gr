@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Batch inference example for vllm-GR."""
 
@@ -15,13 +15,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 add_repo_root_to_path(__file__)
 
 if TYPE_CHECKING:
-    from vllm_gr import GRPrompt, GRRequestOutput
+    from vllm_gr import GRPrompt
 
 # Demo model path - relative to examples directory
 DEMO_MODEL_PATH = os.path.join(SCRIPT_DIR, "demo-model")
 
 
-def generate_sample_prompts(num_users: int, seq_length: int, num_candidates: int) -> List["GRPrompt"]:
+def generate_sample_prompts(
+    num_users: int, seq_length: int, num_candidates: int
+) -> List["GRPrompt"]:
     """Generate sample GRPrompt requests for testing.
 
     Uses the default demo-model feature names:
@@ -64,9 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-users", type=int, default=10, help="Number of users to generate.")
     parser.add_argument("--seq-length", type=int, default=20, help="History length per user.")
     parser.add_argument("--num-candidates", type=int, default=30, help="Candidates per user.")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size for recommend_batch().")
-    parser.add_argument("--max-seq-len", type=int, default=64, help="Maximum user history sequence length.")
-    parser.add_argument("--max-candidates", type=int, default=50, help="Maximum number of candidate items.")
+    parser.add_argument(
+        "--batch-size", type=int, default=4, help="Batch size for recommend_batch()."
+    )
+    parser.add_argument(
+        "--max-seq-len", type=int, default=64, help="Maximum user history sequence length."
+    )
+    parser.add_argument(
+        "--max-candidates", type=int, default=50, help="Maximum number of candidate items."
+    )
     return parser
 
 
@@ -74,25 +82,25 @@ def main():
     """Run batch recommendation inference."""
     args = build_parser().parse_args()
     from vllm_gr import GRLLM, GRRequestOutput
-    
+
     print("=" * 60)
     print(" vllm-GR Batch Inference Example")
     print("=" * 60)
-    
+
     # 1. Initialize GRLLM
-    # 
+    #
     # Model Loading Modes:
     # - Production: GRLLM(model="path/to/pretrained_model")
     #   -> Loads config.json and weights from the directory
-    # 
+    #
     # - Demo mode: GRLLM(model="path/to/demo-model", allow_missing_weights=True)
     #   -> Loads config.json for architecture parameters
     #   -> Uses randomly initialized weights (explicit opt-in only)
     #   -> Useful for validating the complete inference pipeline
-    
-    print(f"\n[Model Path]")
+
+    print("\n[Model Path]")
     print(f"   Using model: {args.model}")
-    
+
     llm = GRLLM(
         model=args.model,
         max_seq_len=args.max_seq_len,
@@ -100,29 +108,29 @@ def main():
         allow_missing_weights=True,
     )
     active_device = describe_runtime(expected_device=args.expect_device)
-    
-    print(f"\n[GRLLM Initialized]")
+
+    print("\n[GRLLM Initialized]")
     print(f"   Engine: {llm.engine_class.__name__}")
     print(f"   Device path: {active_device}")
     print("   Model: HSTU with randomly initialized weights (explicit demo mode)")
-    
+
     # 2. Test parameters
     num_users = args.num_users
     seq_length = args.seq_length
     num_candidates = args.num_candidates
-    
-    print(f"\n[Batch Test Parameters]")
+
+    print("\n[Batch Test Parameters]")
     print(f"   Number of users: {num_users}")
     print(f"   Sequence length: {seq_length}")
     print(f"   Candidates per user: {num_candidates}")
-    
+
     # 3. Generate GRPrompt requests
     prompts = generate_sample_prompts(num_users, seq_length, num_candidates)
     print(f"\n[Generated {len(prompts)} GRPrompt requests]")
-    
+
     # 4. Method 1: Use recommend() with all prompts at once
-    print(f"\n[Method 1: recommend() with all prompts]")
-    print(f"   Running HSTU model inference...")
+    print("\n[Method 1: recommend() with all prompts]")
+    print("   Running HSTU model inference...")
     start_time = time.time()
     outputs: List[GRRequestOutput] = llm.recommend(
         prompts=prompts,
@@ -131,7 +139,7 @@ def main():
     method1_time = (time.time() - start_time) * 1000
     print(f"   Time: {method1_time:.2f}ms")
     print(f"   Outputs: {len(outputs)}")
-    
+
     # 5. Method 2: Use recommend_batch() for large batches
     print(f"\n[Method 2: recommend_batch() with batch_size={args.batch_size}]")
     start_time = time.time()
@@ -142,14 +150,14 @@ def main():
     method2_time = (time.time() - start_time) * 1000
     print(f"   Time: {method2_time:.2f}ms")
     print(f"   Outputs: {len(outputs_batch)}")
-    
+
     # 6. Display results for all users
-    print(f"\n[Results By User]")
-    print(f"   (Note: Scores are from explicitly enabled random-init demo mode)")
+    print("\n[Results By User]")
+    print("   (Note: Scores are from explicitly enabled random-init demo mode)")
     for i, output in enumerate(outputs):
         print(f"\n   User {i}: {output.user_id}")
         print(f"     Request ID: {output.request_id}")
-        print(f"     Candidate scores:")
+        print("     Candidate scores:")
         for item in output.recommendations:
             display_line = f"item_{item.item_id} score={item.score:.3f}"
             if item.task_scores:
@@ -159,30 +167,34 @@ def main():
                 )
                 display_line = f"{display_line}  {task_suffix}"
             print(f"       {display_line}")
-    
+
     # 7. Summary statistics
-    print(f"\n[Performance Summary]")
-    print(f"   Method 1 (recommend):       {method1_time:.2f}ms total, {method1_time/num_users:.2f}ms/request")
-    print(f"   Method 2 (recommend_batch): {method2_time:.2f}ms total, {method2_time/num_users:.2f}ms/request")
+    print("\n[Performance Summary]")
+    print(
+        f"   Method 1 (recommend):       {method1_time:.2f}ms total, {method1_time / num_users:.2f}ms/request"
+    )
+    print(
+        f"   Method 2 (recommend_batch): {method2_time:.2f}ms total, {method2_time / num_users:.2f}ms/request"
+    )
     print(f"   Throughput: {num_users / (method1_time / 1000):.2f} requests/sec")
-    
+
     # 8. Verify output structure
-    print(f"\n[Output Structure Verification]")
+    print("\n[Output Structure Verification]")
     sample = outputs[0]
     print(f"   Type: {type(sample).__name__}")
-    print(f"   Attributes: request_id, user_id, recommendations, finished, metrics")
+    print("   Attributes: request_id, user_id, recommendations, finished, metrics")
     print(f"   Recommendation type: {type(sample.recommendations[0]).__name__}")
-    print(f"   Item attributes: item_id, score, features, task_scores")
+    print("   Item attributes: item_id, score, features, task_scores")
 
     # 9. Serialization example
-    print(f"\n[Serialization Example]")
+    print("\n[Serialization Example]")
     output_dict = outputs[0].to_dict()
     print(f"   Keys: {list(output_dict.keys())}")
     print(f"   First recommendation: {output_dict['recommendations'][0]}")
-    
+
     # 10. Cleanup
     llm.shutdown()
-    
+
     print("\n" + "=" * 60)
     print(" Batch example completed successfully!")
     print(f" Full HSTU model forward pass was executed on {active_device}.")

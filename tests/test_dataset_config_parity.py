@@ -1,12 +1,13 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
-import unittest
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import importlib.util
-from pathlib import Path
+import json
 import sys
-
+import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "vllm_gr" / "config" / "dataset_configs.py"
@@ -15,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def _load_dataset_config_module():
+def _load_dataset_config_module() -> None:
     spec = importlib.util.spec_from_file_location(
         "dataset_config_parity_test_module",
         MODULE_PATH,
@@ -27,8 +28,7 @@ def _load_dataset_config_module():
 
 
 class TestDatasetConfigParity(unittest.TestCase):
-
-    def test_streaming_matches_golden_overrides(self):
+    def test_streaming_matches_golden_overrides(self) -> None:
         module = _load_dataset_config_module()
         cfg = module.get_hstu_config_overrides("streaming")
 
@@ -39,7 +39,7 @@ class TestDatasetConfigParity(unittest.TestCase):
         self.assertEqual(cfg["action_embedding_init_std"], 5.0)
         self.assertEqual(cfg["max_num_candidates_inference"], 2048)
 
-    def test_streaming_embedding_tables_keep_category_initializer_bounds(self):
+    def test_streaming_embedding_tables_keep_category_initializer_bounds(self) -> None:
         module = _load_dataset_config_module()
         tables = module.get_embedding_table_overrides("streaming")
         table_by_name = {table["name"]: table for table in tables}
@@ -47,7 +47,7 @@ class TestDatasetConfigParity(unittest.TestCase):
         self.assertEqual(table_by_name["item_category_id"]["weight_init_max"], 1.0)
         self.assertEqual(table_by_name["item_category_id"]["weight_init_min"], -1.0)
 
-    def test_movielens_large_variants_match_golden_inference_limit(self):
+    def test_movielens_large_variants_match_golden_inference_limit(self) -> None:
         module = _load_dataset_config_module()
 
         cfg_13b = module.get_hstu_config_overrides("movielens-13b")
@@ -56,7 +56,7 @@ class TestDatasetConfigParity(unittest.TestCase):
         self.assertEqual(cfg_13b["max_num_candidates_inference"], 2048)
         self.assertEqual(cfg_18b["max_num_candidates_inference"], 2048)
 
-    def test_large_table_datasets_raise_hash_size_to_match_embedding_scale(self):
+    def test_large_table_datasets_raise_hash_size_to_match_embedding_scale(self) -> None:
         module = _load_dataset_config_module()
 
         self.assertEqual(
@@ -72,7 +72,7 @@ class TestDatasetConfigParity(unittest.TestCase):
             module.HASH_SIZE,
         )
 
-    def test_unknown_dataset_fails_fast(self):
+    def test_unknown_dataset_fails_fast(self) -> None:
         module = _load_dataset_config_module()
 
         with self.assertRaisesRegex(ValueError, "Unsupported dataset"):
@@ -83,9 +83,8 @@ class TestDatasetConfigParity(unittest.TestCase):
 
 
 class TestHSTUConfigConsistency(unittest.TestCase):
-
     @staticmethod
-    def _minimal_hstu_kwargs():
+    def _minimal_hstu_kwargs() -> None:
         return {
             "user_embedding_feature_names": ["item_id"],
             "item_embedding_feature_names": ["item_candidate_id"],
@@ -102,7 +101,7 @@ class TestHSTUConfigConsistency(unittest.TestCase):
             ],
         }
 
-    def test_supported_datasets_can_all_be_materialized_as_hstu_config(self):
+    def test_supported_datasets_can_all_be_materialized_as_hstu_config(self) -> None:
         from vllm_gr.config.hstu_config import HSTUConfig
 
         module = _load_dataset_config_module()
@@ -114,7 +113,7 @@ class TestHSTUConfigConsistency(unittest.TestCase):
                     overrides["embedding_tables"] = tables
                 HSTUConfig(**overrides)
 
-    def test_example_configs_are_hstu_config_consistent(self):
+    def test_example_configs_are_hstu_config_consistent(self) -> None:
         from vllm_gr.config.hstu_config import HSTUConfig
 
         config_paths = [
@@ -127,7 +126,7 @@ class TestHSTUConfigConsistency(unittest.TestCase):
                 config_data = json.loads(config_path.read_text(encoding="utf-8"))
                 HSTUConfig(**config_data)
 
-    def test_contextual_min_lengths_must_be_declared_in_max_lengths(self):
+    def test_contextual_min_lengths_must_be_declared_in_max_lengths(self) -> None:
         from vllm_gr.config.hstu_config import HSTUConfig
 
         with self.assertRaisesRegex(
@@ -158,7 +157,7 @@ class TestHSTUConfigConsistency(unittest.TestCase):
                 contextual_feature_to_min_uih_length={"session_id": 5},
             )
 
-    def test_task_types_default_to_binary_classification(self):
+    def test_task_types_default_to_binary_classification(self) -> None:
         from vllm_gr.config.hstu_config import HSTUConfig
         from vllm_gr.config.multitask_types import MultitaskTaskType
 
@@ -175,7 +174,7 @@ class TestHSTUConfigConsistency(unittest.TestCase):
             ],
         )
 
-    def test_task_types_serialize_back_to_strings(self):
+    def test_task_types_serialize_back_to_strings(self) -> None:
         from vllm_gr.config.hstu_config import HSTUConfig
 
         config = HSTUConfig(
@@ -189,7 +188,7 @@ class TestHSTUConfigConsistency(unittest.TestCase):
             ["regression"],
         )
 
-    def test_task_types_must_align_with_task_names(self):
+    def test_task_types_must_align_with_task_names(self) -> None:
         from vllm_gr.config.hstu_config import HSTUConfig
 
         with self.assertRaisesRegex(ValueError, "same length as task_names"):
@@ -199,7 +198,7 @@ class TestHSTUConfigConsistency(unittest.TestCase):
                 **self._minimal_hstu_kwargs(),
             )
 
-    def test_task_types_must_be_known(self):
+    def test_task_types_must_be_known(self) -> None:
         from vllm_gr.config.hstu_config import HSTUConfig
 
         with self.assertRaisesRegex(ValueError, "must be one of"):

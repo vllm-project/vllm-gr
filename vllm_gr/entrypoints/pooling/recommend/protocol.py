@@ -1,12 +1,11 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
 import time
 
 from pydantic import Field
-
 from vllm.entrypoints.openai.protocol import OpenAIBaseModel
 from vllm.pooling_params import PoolingParams
 from vllm.utils import random_uuid

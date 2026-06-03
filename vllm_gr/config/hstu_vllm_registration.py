@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """vLLM/HuggingFace registration helpers for HSTU config integration."""
 
@@ -42,9 +42,7 @@ class HSTUModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return 0
 
     def derive_max_model_len_and_key(self) -> tuple:
-        return float(get_hstu_max_model_len(self.hf_text_config)), (
-            "hstu_full_visible_seq_len"
-        )
+        return float(get_hstu_max_model_len(self.hf_text_config)), ("hstu_full_visible_seq_len")
 
 
 _HSTU_CONFIG_REGISTERED = False

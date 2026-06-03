@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Shared helpers for cross-platform example scripts."""
 
@@ -54,6 +54,7 @@ def normalize_expected_device(device: Optional[str]) -> Optional[str]:
     if normalized == "gpu":
         return "cuda"
     return normalized
+
 
 def describe_runtime(expected_device: Optional[str] = None) -> str:
     """Print the active vLLM runtime backend and verify it when requested."""

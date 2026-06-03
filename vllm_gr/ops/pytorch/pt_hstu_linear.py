@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """PyTorch implementation of HSTU linear operations"""
 
@@ -25,7 +26,7 @@ def pytorch_norm_mul_dropout(
 ) -> torch.Tensor:
     """
     Apply normalization, gating, and optional concatenation.
-    
+
     This matches the original generative-recommenders implementation.
     """
     dtype = x.dtype
@@ -84,9 +85,9 @@ def pytorch_hstu_compute_output(
 ) -> torch.Tensor:
     """
     Compute HSTU output with layer normalization and dropout.
-    
+
     This matches the original generative-recommenders implementation exactly.
-    
+
     Args:
         attn: Attention output (L, H*D)
         u: Gate values (L, H*D)
@@ -103,7 +104,7 @@ def pytorch_hstu_compute_output(
         num_heads: Number of attention heads
         linear_dim: Linear dimension (hidden_dim)
         silu_u: Apply SiLU activation to u
-    
+
     Returns:
         Output tensor (L, E)
     """
@@ -126,4 +127,3 @@ def pytorch_hstu_compute_output(
     # Use torch.addmm for: x + y @ output_weight
     # output_weight shape: (y_dim, embedding_dim)
     return torch.addmm(x, y, output_weight.to(x.dtype)).to(dtype)
-

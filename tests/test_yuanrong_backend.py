@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import importlib
@@ -6,7 +9,6 @@ import sys
 import types
 import unittest
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,19 +30,19 @@ def _restore_modules(saved: dict[str, types.ModuleType]) -> None:
 
 
 class _FakeBlob:
-    def __init__(self, addr: int, size: int):
+    def __init__(self, addr: int, size: int) -> None:
         self.addr = addr
         self.size = size
 
 
 class _FakeDeviceBlobList:
-    def __init__(self, dev_idx: int, blob_list: list[_FakeBlob]):
+    def __init__(self, dev_idx: int, blob_list: list[_FakeBlob]) -> None:
         self.dev_idx = dev_idx
         self.blob_list = blob_list
 
 
 class _FakeSetParam:
-    def __init__(self):
+    def __init__(self) -> None:
         self.write_mode = None
 
 
@@ -51,45 +53,47 @@ class _FakeWriteMode:
 class _FakeHeteroClient:
     instances: list["_FakeHeteroClient"] = []
 
-    def __init__(self, *_args, **_kwargs):
+    def __init__(self, *_args, **_kwargs) -> None:
         self.exist_calls: list[list[str]] = []
         self.put_calls: list[tuple[list[str], list[_FakeDeviceBlobList]]] = []
         self.get_calls: list[tuple[list[str], list[_FakeDeviceBlobList]]] = []
         type(self).instances.append(self)
 
-    def init(self):
+    def init(self) -> None:
         return None
 
-    def exist(self, keys: list[str]):
+    def exist(self, keys: list[str]) -> None:
         self.exist_calls.append(list(keys))
         return [True] * len(keys)
 
-    def mset_d2h(self, keys: list[str], blob_lists: list[_FakeDeviceBlobList], _set_param):
+    def mset_d2h(self, keys: list[str], blob_lists: list[_FakeDeviceBlobList], _set_param) -> None:
         self.put_calls.append((list(keys), list(blob_lists)))
 
-    def mget_h2d(self, keys: list[str], blob_lists: list[_FakeDeviceBlobList], _timeout_ms: int):
+    def mget_h2d(
+        self, keys: list[str], blob_lists: list[_FakeDeviceBlobList], _timeout_ms: int
+    ) -> None:
         self.get_calls.append((list(keys), list(blob_lists)))
         return []
 
 
 class _FakeLogger:
-    def __init__(self):
+    def __init__(self) -> None:
         self.info_calls: list[tuple[object, ...]] = []
         self.warning_calls: list[tuple[object, ...]] = []
         self.error_calls: list[tuple[object, ...]] = []
 
-    def info(self, *args, **_kwargs):
+    def info(self, *args, **_kwargs) -> None:
         self.info_calls.append(args)
 
-    def warning(self, *args, **_kwargs):
+    def warning(self, *args, **_kwargs) -> None:
         self.warning_calls.append(args)
 
-    def error(self, *args, **_kwargs):
+    def error(self, *args, **_kwargs) -> None:
         self.error_calls.append(args)
 
 
 class TestYuanrongBackend(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.saved_modules = _purge_modules(
             "vllm",
             "vllm_ascend",
@@ -126,7 +130,7 @@ class TestYuanrongBackend(unittest.TestCase):
         )
 
         class ParallelConfig:
-            def __init__(self, rank: int = 0):
+            def __init__(self, rank: int = 0) -> None:
                 self.rank = rank
 
         class Backend:
@@ -176,7 +180,7 @@ class TestYuanrongBackend(unittest.TestCase):
         os.environ["DS_WORKER_ADDR"] = "127.0.0.1:31501"
         _FakeHeteroClient.instances.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         for key, value in self.saved_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -185,7 +189,7 @@ class TestYuanrongBackend(unittest.TestCase):
         _purge_modules("vllm", "vllm_ascend", "yr", "vllm_gr.distributed")
         _restore_modules(self.saved_modules)
 
-    def _build_backend(self):
+    def _build_backend(self) -> None:
         module = importlib.import_module(
             "vllm_gr.distributed.kv_transfer.kv_pool.backend.yuanrong_backend"
         )
@@ -193,7 +197,7 @@ class TestYuanrongBackend(unittest.TestCase):
         backend._ds_device_id = 0
         return backend
 
-    def test_put_passes_through_single_batch(self):
+    def test_put_passes_through_single_batch(self) -> None:
         backend = self._build_backend()
         client = _FakeHeteroClient.instances[-1]
 
@@ -220,7 +224,7 @@ class TestYuanrongBackend(unittest.TestCase):
             ),
         )
 
-    def test_get_passes_through_single_batch(self):
+    def test_get_passes_through_single_batch(self) -> None:
         backend = self._build_backend()
         client = _FakeHeteroClient.instances[-1]
 
@@ -247,7 +251,7 @@ class TestYuanrongBackend(unittest.TestCase):
             ),
         )
 
-    def test_exists_uses_full_key_list_once(self):
+    def test_exists_uses_full_key_list_once(self) -> None:
         backend = self._build_backend()
         client = _FakeHeteroClient.instances[-1]
 

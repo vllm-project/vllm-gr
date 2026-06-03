@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Minimal /recommend client using requests."""
 
@@ -8,7 +8,6 @@ import json
 import pathlib
 
 import requests
-
 
 api_url = "http://127.0.0.1:8000/recommend"
 request_file = pathlib.Path(__file__).resolve().with_name("recommend_request.json")
@@ -31,7 +30,5 @@ print(
 
 for idx, item in enumerate(data.get("recommendations", []), start=1):
     print(
-        f"{idx}. item_id={item.get('item_id')} "
-        f"score={item.get('score')} "
-        f"index={item.get('index')}"
+        f"{idx}. item_id={item.get('item_id')} score={item.get('score')} index={item.get('index')}"
     )

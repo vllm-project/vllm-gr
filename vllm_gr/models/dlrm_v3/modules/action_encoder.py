@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +19,7 @@
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
 from vllm_gr.models.dlrm_v3.common import HammerModule
 from vllm_gr.ops.jagged_tensors import concat_2D_jagged
 
@@ -28,9 +31,7 @@ class ActionEncoder(HammerModule):
         action_feature_name: str,
         action_weights: List[int],
         watchtime_feature_name: str = "",
-        watchtime_to_action_thresholds_and_weights: Optional[
-            List[Tuple[int, int]]
-        ] = None,
+        watchtime_to_action_thresholds_and_weights: Optional[List[Tuple[int, int]]] = None,
         embedding_init_std: float = 0.1,
     ) -> None:
         super().__init__()
@@ -44,8 +45,7 @@ class ActionEncoder(HammerModule):
         self.register_buffer(
             "_combined_action_weights",
             torch.tensor(
-                action_weights
-                + [x[1] for x in self._watchtime_to_action_thresholds_and_weights]
+                action_weights + [x[1] for x in self._watchtime_to_action_thresholds_and_weights]
             ),
         )
         self._num_action_types: int = len(action_weights) + len(
@@ -84,9 +84,7 @@ class ActionEncoder(HammerModule):
                     seq_actions, (watchtimes >= threshold).to(torch.int64) * weight
                 )
         exploded_actions = (
-            torch.bitwise_and(
-                seq_actions.unsqueeze(-1), self._combined_action_weights.unsqueeze(0)
-            )
+            torch.bitwise_and(seq_actions.unsqueeze(-1), self._combined_action_weights.unsqueeze(0))
             > 0
         )
         action_embeddings = (

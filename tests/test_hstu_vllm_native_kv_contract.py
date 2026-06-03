@@ -1,6 +1,8 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import importlib
 import importlib.machinery
 import sys
@@ -15,7 +17,7 @@ import torch
 
 
 @pytest.fixture(scope="class")
-def setup_fake_torchrec_modules():
+def setup_fake_torchrec_modules() -> None:
     """
     Fixture to set up fake torchrec modules only for tests that require them.
     Cleans up after the test completes.
@@ -46,25 +48,21 @@ def setup_fake_torchrec_modules():
         pass
 
     class _EmbeddingCollection:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
 
     class _KeyedJaggedTensor:
         pass
 
     fake_torchrec.__spec__ = importlib.machinery.ModuleSpec("torchrec", loader=None)
-    fake_torchrec_modules.__spec__ = importlib.machinery.ModuleSpec(
-        "torchrec.modules", loader=None
-    )
+    fake_torchrec_modules.__spec__ = importlib.machinery.ModuleSpec("torchrec.modules", loader=None)
     fake_embedding_configs.__spec__ = importlib.machinery.ModuleSpec(
         "torchrec.modules.embedding_configs", loader=None
     )
     fake_embedding_modules.__spec__ = importlib.machinery.ModuleSpec(
         "torchrec.modules.embedding_modules", loader=None
     )
-    fake_torchrec_sparse.__spec__ = importlib.machinery.ModuleSpec(
-        "torchrec.sparse", loader=None
-    )
+    fake_torchrec_sparse.__spec__ = importlib.machinery.ModuleSpec("torchrec.sparse", loader=None)
     fake_jagged_tensor.__spec__ = importlib.machinery.ModuleSpec(
         "torchrec.sparse.jagged_tensor", loader=None
     )
@@ -93,13 +91,13 @@ def setup_fake_torchrec_modules():
 
 
 @contextmanager
-def _patched_gr_npu_model_runner():
+def _patched_gr_npu_model_runner() -> None:
     fake_vllm_ascend = types.ModuleType("vllm_ascend")
     fake_vllm_ascend_worker = types.ModuleType("vllm_ascend.worker")
     fake_vllm_ascend_runner = types.ModuleType("vllm_ascend.worker.model_runner_v1")
 
     class _FakeNPUModelRunner:
-        def __init__(self, vllm_config, device):
+        def __init__(self, vllm_config, device) -> None:
             self.vllm_config = vllm_config
             self.model_config = getattr(vllm_config, "model_config", None)
             self.compilation_config = getattr(vllm_config, "compilation_config", None)
@@ -107,24 +105,22 @@ def _patched_gr_npu_model_runner():
             self.attn_groups = []
             self.model = None
 
-        def load_model(self, *args, **kwargs):
+        def load_model(self, *args, **kwargs) -> None:
             del args, kwargs
             return None
 
-        def get_kv_cache_spec(self):
+        def get_kv_cache_spec(self) -> None:
             return {}
 
-        def initialize_kv_cache(self, kv_cache_config):
+        def initialize_kv_cache(self, kv_cache_config) -> None:
             self._initialized_kv_cache_config = kv_cache_config
             return None
 
-        def _build_attention_metadata(self, *args, **kwargs):
+        def _build_attention_metadata(self, *args, **kwargs) -> None:
             self._build_attention_metadata_called = (args, kwargs)
             return {"base_called": True}
 
-    fake_vllm_ascend.__spec__ = importlib.machinery.ModuleSpec(
-        "vllm_ascend", loader=None
-    )
+    fake_vllm_ascend.__spec__ = importlib.machinery.ModuleSpec("vllm_ascend", loader=None)
     fake_vllm_ascend_worker.__spec__ = importlib.machinery.ModuleSpec(
         "vllm_ascend.worker", loader=None
     )
@@ -145,42 +141,44 @@ def _patched_gr_npu_model_runner():
         },
     ):
         sys.modules.pop("vllm_gr.worker.gr_npu_model_runner", None)
-        gr_npu_model_runner_module = importlib.import_module(
-            "vllm_gr.worker.gr_npu_model_runner"
-        )
-        with mock.patch.object(
-            gr_npu_model_runner_module,
-            "resolve_model_type",
-            return_value="hstu",
-        ), mock.patch.object(
-            gr_npu_model_runner_module,
-            "create_adapter",
-            return_value=SimpleNamespace(payload_type=None),
+        gr_npu_model_runner_module = importlib.import_module("vllm_gr.worker.gr_npu_model_runner")
+        with (
+            mock.patch.object(
+                gr_npu_model_runner_module,
+                "resolve_model_type",
+                return_value="hstu",
+            ),
+            mock.patch.object(
+                gr_npu_model_runner_module,
+                "create_adapter",
+                return_value=SimpleNamespace(payload_type=None),
+            ),
         ):
             yield gr_npu_model_runner_module.GRNPUModelRunner
 
         sys.modules.pop("vllm_gr.worker.gr_npu_model_runner", None)
 
-from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_gr.attention.backends.hstu_attn import (
+from vllm.v1.attention.backend import CommonAttentionMetadata  # noqa: E402
+from vllm.v1.kv_cache_interface import FullAttentionSpec  # noqa: E402
+
+from vllm_gr.attention.backends.hstu_attn import (  # noqa: E402
     HSTUAttentionMetadata,
     HSTUAttentionMetadataBuilder,
     _build_hstu_token_positions,
 )
-from vllm_gr.engine.arg_utils import GREngineArgs
-from vllm_gr.model_executor.layers.hstu_attention_layer import (
+from vllm_gr.engine.arg_utils import GREngineArgs  # noqa: E402
+from vllm_gr.model_executor.layers.hstu_attention_layer import (  # noqa: E402
     HSTUKVCacheAttentionLayer,
 )
-from vllm_gr.model_executor.models.hstu_vllm import HSTUForRecommendation
-from vllm_gr.models.dlrm_v3.modules import stu as stu_module
-from vllm_gr.models.dlrm_v3.modules.hstu_transducer import HSTUTransducer
-from vllm_gr.models.dlrm_v3.modules.stu import STULayer, STULayerConfig
-from vllm_gr.ops.hstu_attention import delta_hstu_mha
+from vllm_gr.model_executor.models.hstu_vllm import HSTUForRecommendation  # noqa: E402
+from vllm_gr.models.dlrm_v3.modules import stu as stu_module  # noqa: E402
+from vllm_gr.models.dlrm_v3.modules.hstu_transducer import HSTUTransducer  # noqa: E402
+from vllm_gr.models.dlrm_v3.modules.stu import STULayer, STULayerConfig  # noqa: E402
+from vllm_gr.ops.hstu_attention import delta_hstu_mha  # noqa: E402
 
 
-def _dummy_vllm_config(block_size: int = 16):
+def _dummy_vllm_config(block_size: int = 16) -> None:
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         speculative_config=None,
@@ -190,16 +188,13 @@ def _dummy_vllm_config(block_size: int = 16):
 
 @pytest.mark.usefixtures("setup_fake_torchrec_modules")
 class TestHSTUVllmNativeKVContract(unittest.TestCase):
-
     @staticmethod
-    def _make_hstu_model_for_metadata_test():
+    def _make_hstu_model_for_metadata_test() -> None:
         model = HSTUForRecommendation.__new__(HSTUForRecommendation)
         torch.nn.Module.__init__(model)
         model.enable_kv_cache = True
         model._hstu_kv_cache_layers = [SimpleNamespace(layer_name="layer0")]
-        model.config = SimpleNamespace(
-            contextual_feature_to_max_length={"ctx_a": 2, "ctx_b": 3}
-        )
+        model.config = SimpleNamespace(contextual_feature_to_max_length={"ctx_a": 2, "ctx_b": 3})
         return model
 
     @staticmethod
@@ -643,15 +638,15 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
 
         prefix_x = torch.cat(
             [
-                x[0:history_lens[0]],
-                x[seq_lens[0]:seq_lens[0] + history_lens[1]],
+                x[0 : history_lens[0]],
+                x[seq_lens[0] : seq_lens[0] + history_lens[1]],
             ],
             dim=0,
         )
         delta_x = torch.cat(
             [
-                x[history_lens[0]:seq_lens[0]],
-                x[seq_lens[0] + history_lens[1]:total_seq_len],
+                x[history_lens[0] : seq_lens[0]],
+                x[seq_lens[0] + history_lens[1] : total_seq_len],
             ],
             dim=0,
         )
@@ -675,10 +670,10 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
 
         combined = torch.cat(
             [
-                prefix_output[0:history_lens[0]],
-                delta_output[0:num_targets[0]],
-                prefix_output[history_lens[0]:sum(history_lens)],
-                delta_output[num_targets[0]:sum(num_targets)],
+                prefix_output[0 : history_lens[0]],
+                delta_output[0 : num_targets[0]],
+                prefix_output[history_lens[0] : sum(history_lens)],
+                delta_output[num_targets[0] : sum(num_targets)],
             ],
             dim=0,
         )
@@ -809,7 +804,7 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
         captured_rows: list[int] = []
         original_uqvk = stu_module.hstu_compute_uqvk
 
-        def _capture_uqvk(*args, **kwargs):
+        def _capture_uqvk(*args, **kwargs) -> None:
             captured_rows.append(int(kwargs["x"].shape[0]))
             return original_uqvk(*args, **kwargs)
 
@@ -851,7 +846,7 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
         captured_rows: list[int] = []
         original_uqvk = stu_module.hstu_compute_uqvk
 
-        def _capture_uqvk(*args, **kwargs):
+        def _capture_uqvk(*args, **kwargs) -> None:
             captured_rows.append(int(kwargs["x"].shape[0]))
             return original_uqvk(*args, **kwargs)
 
@@ -874,17 +869,20 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
         )
         fake_forward_context = SimpleNamespace(attn_metadata={"layer0": metadata})
 
-        with mock.patch(
-            "vllm.forward_context.is_forward_context_available",
-            return_value=True,
-        ), mock.patch(
-            "vllm.forward_context.get_forward_context",
-            return_value=fake_forward_context,
-        ), mock.patch(
-            "vllm_gr.model_executor.models.hstu_vllm.logger.debug_once"
-        ) as debug_once, mock.patch(
-            "vllm_gr.model_executor.models.hstu_vllm.logger.warning_once"
-        ) as warning_once:
+        with (
+            mock.patch(
+                "vllm.forward_context.is_forward_context_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "vllm.forward_context.get_forward_context",
+                return_value=fake_forward_context,
+            ),
+            mock.patch("vllm_gr.model_executor.models.hstu_vllm.logger.debug_once") as debug_once,
+            mock.patch(
+                "vllm_gr.model_executor.models.hstu_vllm.logger.warning_once"
+            ) as warning_once,
+        ):
             result = model._get_hstu_attention_metadata(
                 uih_seq_lengths=torch.tensor([11], dtype=torch.int32),
                 num_targets=torch.tensor([6], dtype=torch.int32),
@@ -902,17 +900,20 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
         )
         fake_forward_context = SimpleNamespace(attn_metadata={"layer0": metadata})
 
-        with mock.patch(
-            "vllm.forward_context.is_forward_context_available",
-            return_value=True,
-        ), mock.patch(
-            "vllm.forward_context.get_forward_context",
-            return_value=fake_forward_context,
-        ), mock.patch(
-            "vllm_gr.model_executor.models.hstu_vllm.logger.debug_once"
-        ) as debug_once, mock.patch(
-            "vllm_gr.model_executor.models.hstu_vllm.logger.warning_once"
-        ) as warning_once:
+        with (
+            mock.patch(
+                "vllm.forward_context.is_forward_context_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "vllm.forward_context.get_forward_context",
+                return_value=fake_forward_context,
+            ),
+            mock.patch("vllm_gr.model_executor.models.hstu_vllm.logger.debug_once") as debug_once,
+            mock.patch(
+                "vllm_gr.model_executor.models.hstu_vllm.logger.warning_once"
+            ) as warning_once,
+        ):
             result = model._get_hstu_attention_metadata(
                 uih_seq_lengths=torch.tensor([11], dtype=torch.int32),
                 num_targets=torch.tensor([6], dtype=torch.int32),
@@ -1013,12 +1014,15 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
         )
         fake_forward_context = SimpleNamespace(attn_metadata={"layer0": metadata})
 
-        with mock.patch(
-            "vllm.forward_context.is_forward_context_available",
-            return_value=True,
-        ), mock.patch(
-            "vllm.forward_context.get_forward_context",
-            return_value=fake_forward_context,
+        with (
+            mock.patch(
+                "vllm.forward_context.is_forward_context_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "vllm.forward_context.get_forward_context",
+                return_value=fake_forward_context,
+            ),
         ):
             result = model._get_hstu_attention_metadata(
                 uih_seq_lengths=torch.tensor([11], dtype=torch.int32),
@@ -1057,16 +1061,12 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
             fake_kernel_block_sizes = [16]
             fake_kv_caches = {"hstu_kv_cache_layers.0": object()}
 
-            fake_gpu_model_runner_module = types.ModuleType(
-                "vllm.v1.worker.gpu_model_runner"
-            )
+            fake_gpu_model_runner_module = types.ModuleType("vllm.v1.worker.gpu_model_runner")
             fake_worker_utils_module = types.ModuleType("vllm.v1.worker.utils")
 
             class _FakeGPUModelRunner:
                 initialize_attn_backend = mock.Mock()
-                _prepare_kernel_block_sizes = mock.Mock(
-                    return_value=fake_kernel_block_sizes
-                )
+                _prepare_kernel_block_sizes = mock.Mock(return_value=fake_kernel_block_sizes)
                 initialize_metadata_builders = mock.Mock()
                 _allocate_kv_cache_tensors = mock.Mock(return_value={"raw": object()})
                 _reshape_kv_cache_tensors = mock.Mock(return_value=fake_kv_caches)

@@ -8,8 +8,8 @@
 - 可以访问本仓库目录
 - `demo` 分支使用 `examples/configs/movielens-1m`，该目录当前只包含 `config.json`，不包含真实权重
 - `load_weight` 分支使用你本地的已转换模型目录，该目录需要包含：
-  - `config.json`
-  - `model.safetensors` 或等价权重文件
+    - `config.json`
+    - `model.safetensors` 或等价权重文件
 
 ## 2. Demo 分支
 

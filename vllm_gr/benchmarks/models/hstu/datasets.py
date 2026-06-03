@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """HSTU dataset adapters for GR accuracy benchmarks."""
 
@@ -42,6 +42,7 @@ KUAIRAND_TASK_NAMES = [
     "long_view",
     "is_profile_enter",
 ]
+
 
 def _parse_sequence(value: str | int | float | Sequence[Any]) -> list[Any]:
     if isinstance(value, (list, tuple)):
@@ -113,9 +114,7 @@ class MovieLensBenchmarkDataset(BenchmarkDataset):
         candidate_count: int = 5,
     ) -> None:
         overrides = get_hstu_config_overrides(dataset_name)
-        self.contextual_feature_to_max_length = dict(
-            overrides["contextual_feature_to_max_length"]
-        )
+        self.contextual_feature_to_max_length = dict(overrides["contextual_feature_to_max_length"])
         self.action_weights = list(overrides["action_weights"])
         self.max_uih_len = DEFAULT_MAX_UIH_LEN
         self._candidate_count = int(candidate_count)
@@ -165,9 +164,7 @@ class MovieLensBenchmarkDataset(BenchmarkDataset):
         timestamps_uih = _maybe_truncate_seq(timestamps_uih, self.max_uih_len)
 
         user_history: list[dict[str, int]] = []
-        for movie_id, rating, timestamp in zip(
-            history_ids, history_ratings, timestamps_uih
-        ):
+        for movie_id, rating, timestamp in zip(history_ids, history_ratings, timestamps_uih):
             rating_float = float(rating)
             rating_int = int(rating_float)
             user_history.append(
@@ -233,9 +230,7 @@ class KuaiRandBenchmarkDataset(BenchmarkDataset):
         candidate_count: int = 5,
     ) -> None:
         overrides = get_hstu_config_overrides(dataset_name)
-        self.contextual_feature_to_max_length = dict(
-            overrides["contextual_feature_to_max_length"]
-        )
+        self.contextual_feature_to_max_length = dict(overrides["contextual_feature_to_max_length"])
         self.action_weights = list(overrides["action_weights"])
         self.max_uih_len = DEFAULT_MAX_UIH_LEN
         self._candidate_count = int(candidate_count)
@@ -287,13 +282,9 @@ class KuaiRandBenchmarkDataset(BenchmarkDataset):
         )
 
         history_ids = _maybe_truncate_seq(history_ids, self.max_uih_len)
-        history_action_weights = _maybe_truncate_seq(
-            history_action_weights, self.max_uih_len
-        )
+        history_action_weights = _maybe_truncate_seq(history_action_weights, self.max_uih_len)
         history_timestamps = _maybe_truncate_seq(history_timestamps, self.max_uih_len)
-        history_watch_times = _maybe_truncate_seq(
-            history_watch_times, self.max_uih_len
-        )
+        history_watch_times = _maybe_truncate_seq(history_watch_times, self.max_uih_len)
 
         video_hash_size = self.hash_sizes["video_id"]
         context: dict[str, int] = {}
@@ -302,9 +293,7 @@ class KuaiRandBenchmarkDataset(BenchmarkDataset):
                 continue
             value = int(row[key])
             hash_size = self.hash_sizes.get(key)
-            context[key] = (
-                _hash_feature(value, hash_size) if hash_size is not None else value
-            )
+            context[key] = _hash_feature(value, hash_size) if hash_size is not None else value
 
         user_history: list[dict[str, int]] = []
         for video_id, timestamp, action_weight, watch_time in zip(
@@ -341,13 +330,9 @@ class KuaiRandBenchmarkDataset(BenchmarkDataset):
                 }
             )
             for task_name, bit in zip(KUAIRAND_TASK_NAMES, self.action_weights):
-                labels_by_task[task_name].append(
-                    float(bool(encoded_action_weight & int(bit)))
-                )
+                labels_by_task[task_name].append(float(bool(encoded_action_weight & int(bit))))
 
-        weights_by_task = {
-            task_name: [1.0] * len(candidates) for task_name in KUAIRAND_TASK_NAMES
-        }
+        weights_by_task = {task_name: [1.0] * len(candidates) for task_name in KUAIRAND_TASK_NAMES}
 
         return BenchmarkSampleRequest(
             prompt={

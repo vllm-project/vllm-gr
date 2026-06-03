@@ -39,18 +39,13 @@ def lock_gpu(gpu_id: int, mem_to_alloc_mb: int):
             raise Exception("No EGL devices found")
 
         devices = (ctypes.c_void_p * num_devices.value)()
-        if (
-            eglQueryDevicesEXT(num_devices.value, devices, ctypes.byref(num_devices))
-            == 0
-        ):
+        if eglQueryDevicesEXT(num_devices.value, devices, ctypes.byref(num_devices)) == 0:
             raise Exception("eglQueryDevicesEXT failed")
 
         if gpu_id >= num_devices.value:
             raise Exception(f"GPU ID {gpu_id} >= {num_devices.value} EGL devices")
 
-        display = eglGetPlatformDisplayEXT(
-            0x313F, devices[gpu_id], None
-        )  # EGL_PLATFORM_DEVICE_EXT
+        display = eglGetPlatformDisplayEXT(0x313F, devices[gpu_id], None)  # EGL_PLATFORM_DEVICE_EXT
         if not display:
             raise Exception("eglGetPlatformDisplayEXT failed")
 
@@ -84,9 +79,7 @@ def lock_gpu(gpu_id: int, mem_to_alloc_mb: int):
         if not ctx:
             raise Exception("eglCreateContext failed")
 
-        pbuffer_attribs = (ctypes.c_int * 5)(
-            0x3057, 1, 0x3056, 1, 0x3038
-        )  # WIDTH, HEIGHT
+        pbuffer_attribs = (ctypes.c_int * 5)(0x3057, 1, 0x3056, 1, 0x3038)  # WIDTH, HEIGHT
         surface = egl.eglCreatePbufferSurface(display, config, pbuffer_attribs)
         if not surface:
             raise Exception("eglCreatePbufferSurface failed")
@@ -119,8 +112,6 @@ def lock_gpu(gpu_id: int, mem_to_alloc_mb: int):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Lock a GPU by allocating some VRAM.")
     parser.add_argument("gpu_id", type=int, help="ID of the GPU to lock.")
-    parser.add_argument(
-        "--mem", type=int, default=4, help="Amount of memory in MB to allocate."
-    )
+    parser.add_argument("--mem", type=int, default=4, help="Amount of memory in MB to allocate.")
     args = parser.parse_args()
     lock_gpu(args.gpu_id, args.mem)

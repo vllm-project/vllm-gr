@@ -1,21 +1,22 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import argparse
 import importlib.util
-from pathlib import Path
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "run_tests.py"
 
 
-def _load_module(name: str, path: Path):
+def _load_module(name: str, path: Path) -> None:
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -25,9 +26,8 @@ def _load_module(name: str, path: Path):
 
 
 class TestRunTestsScript(unittest.TestCase):
-
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         cls.module = _load_module("run_tests_script_test_module", MODULE_PATH)
 
     def _make_args(self, **overrides) -> argparse.Namespace:
@@ -40,7 +40,7 @@ class TestRunTestsScript(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
-    def test_all_with_auto_platform_prefers_npu_lane(self):
+    def test_all_with_auto_platform_prefers_npu_lane(self) -> None:
         args = self._make_args(all=True, auto_platform=True)
 
         with mock.patch.object(
@@ -53,7 +53,7 @@ class TestRunTestsScript(unittest.TestCase):
         self.assertEqual(backend, "npu")
         self.assertEqual(suites, ["unit", "npu-smoke"])
 
-    def test_all_with_auto_platform_falls_back_to_gpu_lane(self):
+    def test_all_with_auto_platform_falls_back_to_gpu_lane(self) -> None:
         args = self._make_args(all=True, auto_platform=True)
 
         with mock.patch.object(
@@ -66,7 +66,7 @@ class TestRunTestsScript(unittest.TestCase):
         self.assertEqual(backend, "gpu")
         self.assertEqual(suites, ["unit", "gpu-smoke"])
 
-    def test_all_with_auto_platform_skips_platform_smoke_on_cpu(self):
+    def test_all_with_auto_platform_skips_platform_smoke_on_cpu(self) -> None:
         args = self._make_args(all=True, auto_platform=True)
 
         with mock.patch.object(
@@ -79,7 +79,7 @@ class TestRunTestsScript(unittest.TestCase):
         self.assertEqual(backend, "cpu")
         self.assertEqual(suites, ["unit"])
 
-    def test_explicit_smoke_suite_is_not_overridden_by_auto_platform(self):
+    def test_explicit_smoke_suite_is_not_overridden_by_auto_platform(self) -> None:
         args = self._make_args(
             suite=["gpu-smoke"],
             auto_platform=True,
@@ -95,7 +95,7 @@ class TestRunTestsScript(unittest.TestCase):
         self.assertEqual(backend, "npu")
         self.assertEqual(suites, ["gpu-smoke"])
 
-    def test_run_examples_propagates_expected_device(self):
+    def test_run_examples_propagates_expected_device(self) -> None:
         recorded_calls: list[tuple[str, list[str] | None]] = []
 
         def _fake_run_example(

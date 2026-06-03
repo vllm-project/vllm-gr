@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GRModelAdapter — base class for model-specific recommendation adapters.
@@ -20,10 +20,11 @@ override what they need.
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
     from vllm_gr.config.gr_config import GRConfig
     from vllm_gr.inputs.base import GRParsedInput
 
@@ -66,7 +67,9 @@ class GRModelAdapter:
         """Decode a serialized payload into per-feature tensors/metadata."""
         raise NotImplementedError
 
-    def build_model_kwargs(self, batch_features: list[tuple[str, dict[str, Any]]], device) -> dict[str, Any]:
+    def build_model_kwargs(
+        self, batch_features: list[tuple[str, dict[str, Any]]], device
+    ) -> dict[str, Any]:
         """Build model-specific kwargs for the forward pass.
 
         ``batch_features`` is a list of ``(req_id, decoded_features)`` pairs

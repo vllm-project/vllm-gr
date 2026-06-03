@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 HSTU KJT (KeyedJaggedTensor) builder.
@@ -91,9 +91,7 @@ def build_hstu_model_kwargs(
     uih_keys: list[str] = features_0["uih_keys"]
     cand_keys: list[str] = features_0["cand_keys"]
     ctx_keys: list[str] = features_0["ctx_keys"]
-    full_uih_keys: list[str] = features_0.get(
-        "full_uih_keys", uih_keys + ctx_keys
-    )
+    full_uih_keys: list[str] = features_0.get("full_uih_keys", uih_keys + ctx_keys)
 
     num_uih_keys = len(uih_keys)
     num_cand_keys = len(cand_keys)
@@ -146,10 +144,7 @@ def build_hstu_model_kwargs(
             all_uih_lengths.extend([1] * batch_size)
             continue
 
-        raise ValueError(
-            "Full UIH schema contains unknown key not present in GR payload: "
-            f"{key!r}"
-        )
+        raise ValueError(f"Full UIH schema contains unknown key not present in GR payload: {key!r}")
 
     uih_values = _concat_1d_int_tensors(all_uih_value_parts, device=device)
     uih_kjt = _build_kjt(
@@ -159,8 +154,10 @@ def build_hstu_model_kwargs(
     )
 
     cand_values = _concat_1d_int_tensors(
-        [_concat_1d_int_tensors(values_per_key, device=device)
-         for values_per_key in cand_values_by_key],
+        [
+            _concat_1d_int_tensors(values_per_key, device=device)
+            for values_per_key in cand_values_by_key
+        ],
         device=device,
     )
     cand_lengths = torch.tensor(

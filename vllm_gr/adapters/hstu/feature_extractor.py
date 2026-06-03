@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 HSTU feature extraction logic.
@@ -16,8 +16,10 @@ from typing import Any
 
 from vllm_gr.gr_schema import (
     attach_schema_fingerprint,
-    extract_context_features as _extract_context_features,
-    extract_features as _extract_features,
+)
+from vllm_gr.gr_schema import extract_context_features as _extract_context_features
+from vllm_gr.gr_schema import extract_features as _extract_features
+from vllm_gr.gr_schema import (
     validate_context_group,
     validate_feature_group,
 )

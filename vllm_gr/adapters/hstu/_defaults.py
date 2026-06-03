@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 HSTU family defaults for engine args.
@@ -10,8 +10,8 @@ No torch / vLLM heavy imports required.
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -48,7 +48,8 @@ def apply_hstu_defaults(engine_args: "GRCommonEngineArgsMixin") -> None:
     _ensure_hstu_model_max_length_override(engine_args, required_max_model_len)
 
     worker_cls = get_worker_cls_path(
-        "hstu", is_npu=engine_args._is_ascend_platform(),
+        "hstu",
+        is_npu=engine_args._is_ascend_platform(),
     )
     if worker_cls is not None:
         engine_args.worker_cls = worker_cls
@@ -65,7 +66,11 @@ def apply_hstu_defaults(engine_args: "GRCommonEngineArgsMixin") -> None:
             engine_args.tensor_parallel_size,
         )
 
-    if engine_args.model and os.path.isdir(engine_args.model) and not engine_args._has_model_weights():
+    if (
+        engine_args.model
+        and os.path.isdir(engine_args.model)
+        and not engine_args._has_model_weights()
+    ):
         if engine_args.allow_missing_weights or engine_args.load_format == "dummy":
             engine_args.load_format = "dummy"
             logger.info(

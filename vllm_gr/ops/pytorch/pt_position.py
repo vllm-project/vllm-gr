@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
 
 """PyTorch reference implementation of timestamp positional embeddings."""
 
@@ -106,12 +107,12 @@ def pytorch_add_timestamp_positional_embeddings(
         max=num_time_buckets,
     )
 
-    position_embeddings = torch.index_select(
-        pos_embeddings, 0, pos_inds.reshape(-1)
-    ).view(batch_size, max_seq_len, -1)
-    time_embeddings = torch.index_select(
-        ts_embeddings, 0, ts.reshape(-1)
-    ).view(batch_size, max_seq_len, -1)
+    position_embeddings = torch.index_select(pos_embeddings, 0, pos_inds.reshape(-1)).view(
+        batch_size, max_seq_len, -1
+    )
+    time_embeddings = torch.index_select(ts_embeddings, 0, ts.reshape(-1)).view(
+        batch_size, max_seq_len, -1
+    )
     dense_add = (time_embeddings + position_embeddings).to(seq_embeddings.dtype)
 
     adapter = get_device_adapter()

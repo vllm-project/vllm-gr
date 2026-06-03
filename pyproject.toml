@@ -8,7 +8,7 @@ version = "0.3.0"
 description = "vLLM-based Generative Recommender Inference Engine"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 authors = [
     {name = "vllm-GR Authors"},
 ]
@@ -18,8 +18,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -28,19 +26,26 @@ classifiers = [
 
 # Shared dependencies only. Platform runtimes are selected via extras.
 dependencies = [
+    "vllm==0.14.*",
     "msgspec",
     "pandas>=3.0.0",
     "requests>=2.32.0",
     "scikit-learn>=1.8.0",
-    "pyarrow>=23.0.0",
+    "pyarrow==23.0.0",
     "tqdm>=4.66.0",
 ]
 
 [project.optional-dependencies]
 # Development dependencies
 dev = [
-    "pytest>=8.0.0",
-    "pytest-cov>=6.0.0",
+    "pytest",
+    "pytest-asyncio",
+    "tblib",
+    "pytest-cov",
+    "black",
+    "ruff",
+    "mypy",
+    "psutil"
 ]
 # LMCache integration
 lmcache = [
@@ -141,8 +146,20 @@ addopts = "-v"
 
 [tool.black]
 line-length = 100
-target-version = ['py310', 'py311', 'py312']
+target-version = ['py311', 'py312', 'py313']
 
-[tool.isort]
-profile = "black"
-line_length = 100
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+strict = true
+
+[tool.typos.default.extend-identifiers]
+CANN = "CANN"
+cann = "cann"
+fx_arange = "fx_arange"
+
+[tool.typos.default.extend-words]
+contexual = "contexual"
+interm = "interm"

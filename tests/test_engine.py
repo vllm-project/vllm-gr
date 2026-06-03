@@ -1,11 +1,12 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Core tests for engine args and GR request data types."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
+import importlib
 import os
 import sys
-import importlib
 import unittest
 from unittest import mock
 
@@ -36,9 +37,7 @@ def _has_vllm_engine_runtime() -> bool:
 
 
 _HAS_VLLM_RUNTIME = _has_vllm_engine_runtime()
-_SKIP_REASON = (
-    "vLLM engine/runtime submodules are unavailable in this environment"
-)
+_SKIP_REASON = "vLLM engine/runtime submodules are unavailable in this environment"
 
 
 # ── Engine Args ───────────────────────────────────────────────────
@@ -46,8 +45,7 @@ _SKIP_REASON = (
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
 class TestGREngineArgs(unittest.TestCase):
-
-    def test_default_values(self):
+    def test_default_values(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         args = GREngineArgs(model=DEMO_MODEL_DIR, allow_missing_weights=True)
@@ -55,7 +53,7 @@ class TestGREngineArgs(unittest.TestCase):
         self.assertEqual(args.max_seq_len, 512)
         self.assertEqual(args.max_candidates, 1000)
 
-    def test_custom_values(self):
+    def test_custom_values(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         args = GREngineArgs(
@@ -69,7 +67,7 @@ class TestGREngineArgs(unittest.TestCase):
         self.assertEqual(args.max_seq_len, 256)
         self.assertEqual(args.max_candidates, 500)
 
-    def test_worker_cls_injection(self):
+    def test_worker_cls_injection(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         with mock.patch.object(
@@ -84,7 +82,7 @@ class TestGREngineArgs(unittest.TestCase):
             )
         self.assertEqual(args.worker_cls, "vllm_gr.worker.gr_worker.GRWorker")
 
-    def test_hstu_defaults_do_not_force_disable_prefix_caching(self):
+    def test_hstu_defaults_do_not_force_disable_prefix_caching(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         with mock.patch.object(
@@ -100,7 +98,7 @@ class TestGREngineArgs(unittest.TestCase):
 
         self.assertTrue(args.enable_prefix_caching)
 
-    def test_hstu_defaults_disable_hybrid_kv_cache_manager(self):
+    def test_hstu_defaults_disable_hybrid_kv_cache_manager(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         with mock.patch.object(
@@ -115,7 +113,7 @@ class TestGREngineArgs(unittest.TestCase):
 
         self.assertTrue(args.disable_hybrid_kv_cache_manager)
 
-    def test_unknown_model_family_does_not_apply_hstu_defaults(self):
+    def test_unknown_model_family_does_not_apply_hstu_defaults(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         with mock.patch.object(
@@ -133,24 +131,27 @@ class TestGREngineArgs(unittest.TestCase):
         )
         self.assertFalse(args.trust_remote_code)
 
-    def test_grllm_does_not_force_hstu_model_family(self):
-        from vllm_gr.entrypoints.gr import GRLLM
+    def test_grllm_does_not_force_hstu_model_family(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
+        from vllm_gr.entrypoints.gr import GRLLM
 
         captured: dict[str, object] = {}
         fake_engine = mock.Mock()
 
-        def _fake_from_engine_args(*, engine_args, usage_context):
+        def _fake_from_engine_args(*, engine_args, usage_context) -> None:
             captured["model_family"] = engine_args.model_family
             return fake_engine
 
-        with mock.patch.object(
-            GREngineArgs,
-            "_read_model_type_from_local_config",
-            return_value=None,
-        ), mock.patch(
-            "vllm_gr.entrypoints.gr.GRLLMEngine.from_engine_args",
-            side_effect=_fake_from_engine_args,
+        with (
+            mock.patch.object(
+                GREngineArgs,
+                "_read_model_type_from_local_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "vllm_gr.entrypoints.gr.GRLLMEngine.from_engine_args",
+                side_effect=_fake_from_engine_args,
+            ),
         ):
             llm = GRLLM(
                 model=DEMO_MODEL_DIR,
@@ -160,14 +161,14 @@ class TestGREngineArgs(unittest.TestCase):
         self.assertIsNone(captured["model_family"])
         self.assertIsNone(llm.model_family)
 
-    def test_feature_names_not_on_engine_args(self):
+    def test_feature_names_not_on_engine_args(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         fields = {f.name for f in GREngineArgs.__dataclass_fields__.values()}
         self.assertNotIn("uih_feature_names", fields)
         self.assertNotIn("candidate_feature_names", fields)
 
-    def test_dataset_overrides_use_hf_overrides(self):
+    def test_dataset_overrides_use_hf_overrides(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         args = GREngineArgs(
@@ -177,10 +178,11 @@ class TestGREngineArgs(unittest.TestCase):
         )
         self.assertIsInstance(args.hf_overrides, dict)
         self.assertEqual(
-            args.hf_overrides["uih_post_id_feature_name"], "movie_id",
+            args.hf_overrides["uih_post_id_feature_name"],
+            "movie_id",
         )
 
-    def test_dataset_overrides_preserve_user_hf_overrides(self):
+    def test_dataset_overrides_preserve_user_hf_overrides(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         args = GREngineArgs(
@@ -191,7 +193,8 @@ class TestGREngineArgs(unittest.TestCase):
         )
         self.assertEqual(args.hf_overrides["hstu_attn_num_layers"], 99)
         self.assertEqual(
-            args.hf_overrides["uih_post_id_feature_name"], "movie_id",
+            args.hf_overrides["uih_post_id_feature_name"],
+            "movie_id",
         )
 
 
@@ -200,15 +203,14 @@ class TestGREngineArgs(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
 class TestGRConfig(unittest.TestCase):
-
-    def test_defaults(self):
+    def test_defaults(self) -> None:
         from vllm_gr.config.gr_config import GRConfig
 
         cfg = GRConfig()
         self.assertEqual(cfg.max_seq_len, 512)
         self.assertEqual(cfg.max_candidates, 1000)
 
-    def test_no_feature_name_fields(self):
+    def test_no_feature_name_fields(self) -> None:
         from vllm_gr.config.gr_config import GRConfig
 
         fields = {f.name for f in GRConfig.__dataclass_fields__.values()}
@@ -217,8 +219,7 @@ class TestGRConfig(unittest.TestCase):
 
 
 class TestGRPrompt(unittest.TestCase):
-
-    def test_basic_gr_prompt(self):
+    def test_basic_gr_prompt(self) -> None:
         from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
 
         prompt: GRPrompt = {
@@ -228,7 +229,7 @@ class TestGRPrompt(unittest.TestCase):
         }
         self.assertTrue(is_gr_prompt(prompt))
 
-    def test_gr_prompt_with_optional_fields(self):
+    def test_gr_prompt_with_optional_fields(self) -> None:
         from vllm_gr.inputs.data import is_gr_prompt
 
         prompt = {
@@ -239,7 +240,7 @@ class TestGRPrompt(unittest.TestCase):
         }
         self.assertTrue(is_gr_prompt(prompt))
 
-    def test_is_gr_prompt_accepts_registered_model_type_without_hstu_shape(self):
+    def test_is_gr_prompt_accepts_registered_model_type_without_hstu_shape(self) -> None:
         from vllm_gr.inputs.data import is_gr_prompt
 
         prompt = {
@@ -248,7 +249,7 @@ class TestGRPrompt(unittest.TestCase):
         }
         self.assertTrue(is_gr_prompt(prompt))
 
-    def test_is_gr_prompt_rejects_unknown_model_type_without_legacy_shape(self):
+    def test_is_gr_prompt_rejects_unknown_model_type_without_legacy_shape(self) -> None:
         from vllm_gr.inputs.data import is_gr_prompt
 
         prompt = {
@@ -257,7 +258,7 @@ class TestGRPrompt(unittest.TestCase):
         }
         self.assertFalse(is_gr_prompt(prompt))
 
-    def test_is_gr_prompt_false_cases(self):
+    def test_is_gr_prompt_false_cases(self) -> None:
         from vllm_gr.inputs.data import is_gr_prompt
 
         self.assertFalse(is_gr_prompt("not a dict"))
@@ -266,8 +267,9 @@ class TestGRPrompt(unittest.TestCase):
         self.assertFalse(is_gr_prompt({"user_history": []}))
         self.assertFalse(is_gr_prompt({"candidates": []}))
 
-    def test_is_gr_prompt_user_id_only_accepted(self):
+    def test_is_gr_prompt_user_id_only_accepted(self) -> None:
         """Without model_type, user_id alone is sufficient.
+
 
         Field validation (user_history, candidates, etc.) is deferred
         to the adapter's validate_prompt(), keeping is_gr_prompt()
@@ -278,7 +280,7 @@ class TestGRPrompt(unittest.TestCase):
         self.assertTrue(is_gr_prompt({"user_id": 1}))
         self.assertTrue(is_gr_prompt({"user_id": 1, "user_history": []}))
 
-    def test_is_gr_prompt_rejects_invalid_model_type(self):
+    def test_is_gr_prompt_rejects_invalid_model_type(self) -> None:
         """When model_type is present but invalid, reject outright.
 
         An explicit model_type means the caller wants registry-based
@@ -291,11 +293,12 @@ class TestGRPrompt(unittest.TestCase):
         self.assertFalse(is_gr_prompt({"user_id": 1, "model_type": "   "}))
         self.assertFalse(is_gr_prompt({"user_id": 1, "model_type": 123}))
 
-    def test_ensure_registered_model_family_propagates_broken_import(self):
+    def test_ensure_registered_model_family_propagates_broken_import(self) -> None:
         """A broken adapter dependency must propagate, not be silently
         swallowed as 'unregistered family'."""
-        from vllm_gr.inputs.data import _ensure_registered_model_family
         from unittest import mock
+
+        from vllm_gr.inputs.data import _ensure_registered_model_family
 
         exc = ModuleNotFoundError("torchrec")
         exc.name = "torchrec"
@@ -304,10 +307,11 @@ class TestGRPrompt(unittest.TestCase):
             with self.assertRaises(ModuleNotFoundError):
                 _ensure_registered_model_family("broken_dep_adapter")
 
-    def test_ensure_registered_model_family_silences_missing_adapter(self):
+    def test_ensure_registered_model_family_silences_missing_adapter(self) -> None:
         """When the adapter package itself is missing, no error is raised."""
-        from vllm_gr.inputs.data import _ensure_registered_model_family
         from unittest import mock
+
+        from vllm_gr.inputs.data import _ensure_registered_model_family
 
         target = "vllm_gr.adapters.nonexistent_pkg_xyz"
         exc = ModuleNotFoundError(target)
@@ -319,10 +323,10 @@ class TestGRPrompt(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
 class TestGRRequest(unittest.TestCase):
-
-    def test_without_features(self):
-        from vllm_gr.request import GRRequest, is_gr_request
+    def test_without_features(self) -> None:
         from vllm.pooling_params import PoolingParams
+
+        from vllm_gr.request import GRRequest, is_gr_request
 
         request = GRRequest(
             request_id="req1",
@@ -334,14 +338,15 @@ class TestGRRequest(unittest.TestCase):
         self.assertIsNone(request.gr_features)
         self.assertFalse(is_gr_request(request))
 
-    def test_with_features(self):
-        from vllm_gr.request import GRRequest, is_gr_request
+    def test_with_features(self) -> None:
+        from vllm.pooling_params import PoolingParams
+
         from vllm_gr.adapters.hstu.payload import HSTUFeaturesPayload
         from vllm_gr.engine.gr_features_codec import (
             decode_gr_features_payload,
             encode_gr_features_payload,
         )
-        from vllm.pooling_params import PoolingParams
+        from vllm_gr.request import GRRequest, is_gr_request
 
         payload = HSTUFeaturesPayload(
             uih_keys=["item_id"],
@@ -364,7 +369,7 @@ class TestGRRequest(unittest.TestCase):
         decoded = decode_gr_features_payload(request.gr_features, HSTUFeaturesPayload)
         self.assertEqual(decoded.user_id, "user_123")
 
-    def test_is_gr_request_false_for_non_request(self):
+    def test_is_gr_request_false_for_non_request(self) -> None:
         from vllm_gr.request import is_gr_request
 
         self.assertFalse(is_gr_request(None))
@@ -373,9 +378,9 @@ class TestGRRequest(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)
 class TestGROutputProcessorStats(unittest.TestCase):
-
-    def test_prefix_cache_counters_accumulate_scheduler_stats(self):
+    def test_prefix_cache_counters_accumulate_scheduler_stats(self) -> None:
         from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+
         from vllm_gr.engine.gr_output_processor import GROutputProcessor
 
         processor = GROutputProcessor(

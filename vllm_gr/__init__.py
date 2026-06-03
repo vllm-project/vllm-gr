@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Public API package for vllm-GR.
 
@@ -14,9 +14,9 @@ Runtime initialization is performed explicitly by
 point ``vllm_gr.plugin:register``.
 """
 
+import warnings
 from importlib import import_module
 from typing import Any
-import warnings
 
 __version__ = "0.3.0"
 

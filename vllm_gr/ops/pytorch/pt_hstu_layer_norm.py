@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
-# Licensed under the Apache License, Version 2.0
+
+from typing import List
 
 import torch
-from typing import List
+
 
 def pytorch_swish_layer_norm(
     input: torch.Tensor,

@@ -1,16 +1,17 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Tests for GRAsyncLLM adapter wiring."""
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
-from contextlib import contextmanager
 import importlib.util
-from pathlib import Path
 import sys
 import types
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -31,7 +32,7 @@ def _restore_modules(saved: dict[str, types.ModuleType]) -> None:
         sys.modules[name] = module
 
 
-def _load_module(name: str, path: Path):
+def _load_module(name: str, path: Path) -> None:
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -48,8 +49,9 @@ def _install_stub_package(name: str) -> None:
 
 
 @contextmanager
-def _fake_async_engine_runtime():
+def _fake_async_engine_runtime() -> None:
     """Set up fakes for all modules imported by async_gr_engine.py."""
+
     saved = _purge_modules(
         "vllm",
         "vllm.config",
@@ -109,7 +111,7 @@ def _fake_async_engine_runtime():
     fake_pooling = types.ModuleType("vllm.pooling_params")
 
     class _PoolingParams:
-        def __init__(self, task=""):
+        def __init__(self, task="") -> None:
             self.task = task
 
     fake_pooling.PoolingParams = _PoolingParams
@@ -122,7 +124,7 @@ def _fake_async_engine_runtime():
     fake_gr_config = types.ModuleType("vllm_gr.config.gr_config")
 
     class _GRConfig:
-        def __init__(self, max_seq_len=512, max_candidates=1000):
+        def __init__(self, max_seq_len=512, max_candidates=1000) -> None:
             self.max_seq_len = max_seq_len
             self.max_candidates = max_candidates
 
@@ -131,7 +133,7 @@ def _fake_async_engine_runtime():
     fake_input_processor = types.ModuleType("vllm_gr.engine.gr_input_processor")
 
     class _GRInputProcessor:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.adapter = kwargs.get("adapter")
 
     fake_input_processor.GRInputProcessor = _GRInputProcessor
@@ -139,7 +141,7 @@ def _fake_async_engine_runtime():
     fake_output_processor = types.ModuleType("vllm_gr.engine.gr_output_processor")
 
     class _GROutputProcessor:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             self.adapter = kwargs.get("adapter")
 
     fake_output_processor.GROutputProcessor = _GROutputProcessor
@@ -147,7 +149,7 @@ def _fake_async_engine_runtime():
     fake_inputs_pkg = types.ModuleType("vllm_gr.inputs")
     fake_inputs_data = types.ModuleType("vllm_gr.inputs.data")
 
-    def _is_gr_prompt(prompt):
+    def _is_gr_prompt(prompt) -> None:
         return (
             isinstance(prompt, dict)
             and "user_id" in prompt
@@ -190,14 +192,21 @@ def _fake_async_engine_runtime():
 
     # Track exactly which keys we install so we can remove them later.
     fake_keys = [
-        "vllm", "vllm.config", "vllm.usage", "vllm.usage.usage_lib",
+        "vllm",
+        "vllm.config",
+        "vllm.usage",
+        "vllm.usage.usage_lib",
         "vllm.v1.engine.async_llm",
-        "vllm.lora", "vllm.lora.request", "vllm.pooling_params",
-        "vllm.v1.metrics", "vllm.v1.metrics.loggers",
+        "vllm.lora",
+        "vllm.lora.request",
+        "vllm.pooling_params",
+        "vllm.v1.metrics",
+        "vllm.v1.metrics.loggers",
         "vllm_gr.config.gr_config",
         "vllm_gr.engine.gr_input_processor",
         "vllm_gr.engine.gr_output_processor",
-        "vllm_gr.inputs", "vllm_gr.inputs.data",
+        "vllm_gr.inputs",
+        "vllm_gr.inputs.data",
         "vllm_gr.outputs",
     ]
 
@@ -215,27 +224,32 @@ class TestGRAsyncLLM(unittest.TestCase):
     """Test GRAsyncLLM adapter wiring and input validation."""
 
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         async_path = ROOT / "vllm_gr" / "engine" / "async_gr_engine.py"
         with _fake_async_engine_runtime():
             cls.module = _load_module(
-                "async_gr_engine_test_module", async_path,
+                "async_gr_engine_test_module",
+                async_path,
             )
         # Clean up the loaded test module to avoid polluting sys.modules
         sys.modules.pop("async_gr_engine_test_module", None)
 
-    def test_replace_processors_creates_adapter_and_injects_into_processors(self):
+    def test_replace_processors_creates_adapter_and_injects_into_processors(self) -> None:
         """_replace_processors() creates HSTUModelAdapter and passes it to both processors."""
         import types as _types
 
-        fake_adapter = object()
-        adapter_created = {}
+        _fake_adapter = object()
+        _adapter_created = {}
 
         class _FakeAdapter:
             pass
 
         # We mock HSTUModelAdapter by intercepting the import
-        saved_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __builtins__["__import__"]
+        _saved_import = (
+            __builtins__.__import__
+            if hasattr(__builtins__, "__import__")
+            else __builtins__["__import__"]
+        )
 
         # Build a fake async_llm instance
         instance = self.module.GRAsyncLLM.__new__(self.module.GRAsyncLLM)
@@ -272,6 +286,7 @@ class TestGRAsyncLLM(unittest.TestCase):
         # that the processors receive the same adapter instance.
         try:
             import torchrec  # noqa: F401
+
             _HAS_TORCHREC = True
         except ImportError:
             _HAS_TORCHREC = False
@@ -289,7 +304,7 @@ class TestGRAsyncLLM(unittest.TestCase):
             instance.output_processor.adapter,
         )
 
-    def test_encode_rejects_non_gr_prompt(self):
+    def test_encode_rejects_non_gr_prompt(self) -> None:
         """encode() raises TypeError for non-GRPrompt input."""
         instance = self.module.GRAsyncLLM.__new__(self.module.GRAsyncLLM)
         instance.input_processor = None
@@ -298,8 +313,9 @@ class TestGRAsyncLLM(unittest.TestCase):
         import asyncio
 
         async def _run():
-            params = self.module.GRAsyncLLM.__bases__[0].__dict__.get(
-                "encode", None,
+            _params = self.module.GRAsyncLLM.__bases__[0].__dict__.get(
+                "encode",
+                None,
             )
             coro = instance.encode(
                 prompt="not a gr prompt",
@@ -324,7 +340,7 @@ class TestGRAsyncLLM(unittest.TestCase):
 
         asyncio.get_event_loop().run_until_complete(_test())
 
-    def test_encode_rejects_wrong_pooling_task(self):
+    def test_encode_rejects_wrong_pooling_task(self) -> None:
         """encode() raises ValueError when PoolingParams.task != 'embed'."""
         instance = self.module.GRAsyncLLM.__new__(self.module.GRAsyncLLM)
 

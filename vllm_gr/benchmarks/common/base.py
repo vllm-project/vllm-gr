@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Common benchmark types and dataset abstractions."""
 
@@ -44,9 +44,7 @@ class BenchmarkDataset(ABC):
 
         self.dataset_name = dataset_name
         self.input_csv = str(csv_path)
-        self.random_seed = (
-            random_seed if random_seed is not None else self.DEFAULT_SEED
-        )
+        self.random_seed = random_seed if random_seed is not None else self.DEFAULT_SEED
         self.disable_shuffle = disable_shuffle
         self.rows: list[dict[str, object]] = []
 
@@ -105,9 +103,7 @@ class BenchmarkDataset(ABC):
     ) -> list[BenchmarkSampleRequest]:
         query_ids = self.get_query_ids(num_requests)
         if not query_ids:
-            raise ValueError(
-                "No valid benchmark queries available for the selected dataset."
-            )
+            raise ValueError("No valid benchmark queries available for the selected dataset.")
 
         requests = [
             self.build_sample_request(self.get_row(query_id), request_id=str(query_id))

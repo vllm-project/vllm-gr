@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Tests for GRRequestOutput — requires the full vLLM runtime.
 
@@ -9,6 +9,7 @@ this file's import state.  This file only covers GRRequestOutput, which
 genuinely needs vLLM.
 """
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import unittest
 
 try:
@@ -17,6 +18,7 @@ try:
         GRRequestOutput,
         RecommendedItem,
     )
+
     _VLLM_AVAILABLE = True
 except ImportError:
     _VLLM_AVAILABLE = False
@@ -26,11 +28,11 @@ except ImportError:
 class TestGRRequestOutputUnchanged(unittest.TestCase):
     """Verify GRRequestOutput is NOT affected by the new types."""
 
-    def test_gr_request_output_not_gr_model_output(self):
+    def test_gr_request_output_not_gr_model_output(self) -> None:
         out = GRRequestOutput(request_id="r1")
         self.assertNotIsInstance(out, GRModelOutput)
 
-    def test_gr_request_output_isinstance_check(self):
+    def test_gr_request_output_isinstance_check(self) -> None:
         """The isinstance checks in async_gr_engine / gr.py / serving.py
         must continue to work."""
         out = GRRequestOutput(

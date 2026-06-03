@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 Model wrappers and registry for vllm-GR.
@@ -12,11 +12,11 @@ This module provides:
 
 from vllm_gr.model_executor.models.hstu_vllm import HSTUForRecommendation
 from vllm_gr.model_executor.models.registry import (
-    register_gr_model_architectures,
-    register_gr_models_to_vllm,
-    is_registered,
     get_gr_architectures,
     is_gr_model,
+    is_registered,
+    register_gr_model_architectures,
+    register_gr_models_to_vllm,
 )
 
 __all__ = [

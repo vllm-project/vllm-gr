@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Pure HSTU configuration definitions and validation helpers."""
 
@@ -25,13 +25,9 @@ def _validate_feature_name_list(
 
     for key in feature_names:
         if not isinstance(key, str) or not key:
-            raise ValueError(
-                f"{group_name} contains an invalid key: {key!r}"
-            )
+            raise ValueError(f"{group_name} contains an invalid key: {key!r}")
         if key in seen:
-            raise ValueError(
-                f"{group_name} contains duplicate key: {key!r}"
-            )
+            raise ValueError(f"{group_name} contains duplicate key: {key!r}")
         validated.append(key)
         seen.add(key)
 
@@ -51,9 +47,7 @@ def _validate_feature_length_mapping(
     for key in validated_keys:
         value = feature_lengths[key]
         if not isinstance(value, int) or value <= 0:
-            raise ValueError(
-                f"{group_name}[{key!r}] must be a positive integer, got {value!r}"
-            )
+            raise ValueError(f"{group_name}[{key!r}] must be a positive integer, got {value!r}")
         validated[key] = value
     return validated
 
@@ -67,8 +61,7 @@ def _validate_merge_mapping(
     for pair in merge_mapping:
         if not isinstance(pair, list) or len(pair) != 2:
             raise ValueError(
-                "merge_uih_candidate_feature_mapping entries must be "
-                "two-element lists"
+                "merge_uih_candidate_feature_mapping entries must be two-element lists"
             )
         validated.append(_validate_feature_name_list("merge_mapping_pair", pair))
 
@@ -86,19 +79,13 @@ def _validate_embedding_tables(
     seen_names: set[str] = set()
     for index, table in enumerate(embedding_tables):
         if not isinstance(table, dict):
-            raise ValueError(
-                f"embedding_tables[{index}] must be a dict, got {type(table)!r}"
-            )
+            raise ValueError(f"embedding_tables[{index}] must be a dict, got {type(table)!r}")
 
         name = table.get("name")
         if not isinstance(name, str) or not name:
-            raise ValueError(
-                f"embedding_tables[{index}]['name'] must be a non-empty string"
-            )
+            raise ValueError(f"embedding_tables[{index}]['name'] must be a non-empty string")
         if name in seen_names:
-            raise ValueError(
-                f"embedding_tables contains duplicate table name: {name!r}"
-            )
+            raise ValueError(f"embedding_tables contains duplicate table name: {name!r}")
         seen_names.add(name)
 
         num_embeddings = table.get("num_embeddings")
@@ -136,9 +123,7 @@ def _validate_feature_membership(
     group_name: str,
 ) -> None:
     if feature_name and feature_name not in declared_features:
-        raise ValueError(
-            f"{feature_name!r} must be declared in {group_name}"
-        )
+        raise ValueError(f"{feature_name!r} must be declared in {group_name}")
 
 
 def _validate_embedding_feature_coverage(
@@ -149,15 +134,12 @@ def _validate_embedding_feature_coverage(
         return
 
     covered_feature_names = {
-        feature_name
-        for table in embedding_tables
-        for feature_name in table["feature_names"]
+        feature_name for table in embedding_tables for feature_name in table["feature_names"]
     }
     missing = sorted(set(expected_feature_names) - covered_feature_names)
     if missing:
         raise ValueError(
-            "embedding_tables must cover every declared embedding feature; "
-            f"missing {missing!r}"
+            f"embedding_tables must cover every declared embedding feature; missing {missing!r}"
         )
 
 
@@ -196,12 +178,8 @@ def _resolve_candidate_primary_id_feature_name(
     require_resolution: bool,
 ) -> str:
     explicit = str(getattr(config, "candidate_primary_id_feature_name", "") or "")
-    merge_mapping = list(
-        getattr(config, "merge_uih_candidate_feature_mapping", []) or []
-    )
-    primary_uih_feature_name = str(
-        getattr(config, "uih_post_id_feature_name", "") or ""
-    )
+    merge_mapping = list(getattr(config, "merge_uih_candidate_feature_mapping", []) or [])
+    primary_uih_feature_name = str(getattr(config, "uih_post_id_feature_name", "") or "")
 
     derived_candidates = [
         candidate_feature_name
@@ -212,9 +190,7 @@ def _resolve_candidate_primary_id_feature_name(
     if derived_candidates:
         first_candidate = derived_candidates[0]
         conflicting_candidates = [
-            candidate
-            for candidate in derived_candidates[1:]
-            if candidate != first_candidate
+            candidate for candidate in derived_candidates[1:] if candidate != first_candidate
         ]
         if conflicting_candidates:
             raise ValueError(
@@ -318,8 +294,7 @@ def _validate_hstu_config_consistency(config: "HSTUConfig") -> None:
         )
 
     missing_item_features = sorted(
-        set(config.item_embedding_feature_names)
-        - set(config.hstu_candidate_feature_names)
+        set(config.item_embedding_feature_names) - set(config.hstu_candidate_feature_names)
     )
     if missing_item_features:
         raise ValueError(
@@ -327,9 +302,7 @@ def _validate_hstu_config_consistency(config: "HSTUConfig") -> None:
             f"hstu_candidate_feature_names; missing {missing_item_features!r}"
         )
 
-    for uih_feature_name, candidate_feature_name in (
-        config.merge_uih_candidate_feature_mapping
-    ):
+    for uih_feature_name, candidate_feature_name in config.merge_uih_candidate_feature_mapping:
         _validate_feature_membership(
             uih_feature_name,
             config.hstu_uih_feature_names,
@@ -367,9 +340,7 @@ def _validate_hstu_config_consistency(config: "HSTUConfig") -> None:
     )
 
     if config.embedding_tables:
-        largest_table_size = max(
-            table["num_embeddings"] for table in config.embedding_tables
-        )
+        largest_table_size = max(table["num_embeddings"] for table in config.embedding_tables)
         if config.hash_size < largest_table_size:
             raise ValueError(
                 "hash_size must be greater than or equal to every embedding table "
@@ -377,11 +348,9 @@ def _validate_hstu_config_consistency(config: "HSTUConfig") -> None:
                 f"largest_table_size={largest_table_size}"
             )
 
-    resolved_candidate_primary_id_feature_name = (
-        _resolve_candidate_primary_id_feature_name(
-            config,
-            require_resolution=False,
-        )
+    resolved_candidate_primary_id_feature_name = _resolve_candidate_primary_id_feature_name(
+        config,
+        require_resolution=False,
     )
     if resolved_candidate_primary_id_feature_name:
         _validate_feature_membership(
@@ -403,11 +372,14 @@ def _read_hstu_config_value(
 
 def get_hstu_contextual_seq_len(config: Any) -> int:
     """Return the fixed contextual-prefix token count for one request."""
-    contextual_mapping = _read_hstu_config_value(
-        config,
-        "contextual_feature_to_max_length",
-        {},
-    ) or {}
+    contextual_mapping = (
+        _read_hstu_config_value(
+            config,
+            "contextual_feature_to_max_length",
+            {},
+        )
+        or {}
+    )
     return int(sum(int(length) for length in contextual_mapping.values()))
 
 
@@ -570,9 +542,7 @@ class HSTUConfig(PretrainedConfig):
         self.enable_kv_cache = bool(enable_kv_cache)
 
         if not isinstance(hash_size, int) or hash_size <= 0:
-            raise ValueError(
-                f"hash_size must be a positive integer, got {hash_size!r}"
-            )
+            raise ValueError(f"hash_size must be a positive integer, got {hash_size!r}")
         self.hash_size = hash_size
         self.task_names = task_names or ["is_click"]
         self.task_types: List[MultitaskTaskType] = _validate_and_resolve_task_types(
@@ -595,24 +565,17 @@ class HSTUConfig(PretrainedConfig):
                 ]
             )
         if not is_inference:
-            raise ValueError(
-                "HSTUConfig only supports is_inference=True in this vllm-GR."
-            )
+            raise ValueError("HSTUConfig only supports is_inference=True in this vllm-GR.")
 
         _validate_hstu_config_consistency(self)
-        self.candidate_primary_id_feature_name = (
-            _resolve_candidate_primary_id_feature_name(
-                self,
-                require_resolution=False,
-            )
+        self.candidate_primary_id_feature_name = _resolve_candidate_primary_id_feature_name(
+            self,
+            require_resolution=False,
         )
 
     def to_dict(self) -> Dict[str, Any]:
         config_dict = super().to_dict()
-        config_dict["task_types"] = [
-            task_type.name.lower()
-            for task_type in self.task_types
-        ]
+        config_dict["task_types"] = [task_type.name.lower() for task_type in self.task_types]
         return config_dict
 
 

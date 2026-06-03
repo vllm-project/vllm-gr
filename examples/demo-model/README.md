@@ -13,6 +13,7 @@ dummy/random weight loading explicitly (for example,
 strict fail-fast mode while preserving a clear demo path.
 
 Use cases:
+
 - Validating the inference pipeline without trained weights
 - Development and debugging
 - CI / smoke testing
@@ -21,7 +22,7 @@ For verifying real trained weights, use `load_converted_model.py` instead.
 
 ## Directory Structure
 
-```
+```text
 demo-model/
 ├── config.json    # Model architecture + feature configuration
 └── README.md
@@ -62,7 +63,7 @@ The config follows the `HSTUConfig` schema (a HuggingFace `PretrainedConfig`
 subclass). Key sections:
 
 | Section | Fields |
-|---------|--------|
+| --------- | -------- |
 | Architecture | `hstu_num_heads`, `hstu_attn_num_layers`, `hstu_transducer_embedding_dim`, ... |
 | Features | `hstu_uih_feature_names`, `hstu_candidate_feature_names`, `merge_uih_candidate_feature_mapping` |
 | Embeddings | `embedding_tables` (list of name / dim / num_embeddings / feature_names) |

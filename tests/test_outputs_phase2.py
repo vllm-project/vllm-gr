@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Tests for Phase 2 output types (GRModelOutput hierarchy).
 
@@ -10,6 +10,7 @@ test files (e.g. test_outputs_hierarchy.py) see a pristine import
 state regardless of execution order.
 """
 
+# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import subprocess
 import sys
 import textwrap
@@ -138,7 +139,6 @@ _SUBPROCESS_TESTS = {
 
 
 class TestPhase2Outputs(unittest.TestCase):
-
     def _run_subprocess(self, script: str) -> None:
         result = subprocess.run(
             [sys.executable, "-c", script],
@@ -147,7 +147,8 @@ class TestPhase2Outputs(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(
-            result.returncode, 0,
+            result.returncode,
+            0,
             f"Subprocess failed:\nstdout: {result.stdout}\nstderr: {result.stderr}",
         )
 

@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Shared runtime helpers for HSTU execution."""
 
@@ -191,8 +191,7 @@ def move_hstu_sparse_outputs_to_device(
         for key, value in seq_embeddings.items()
     }
     moved_payload_features = {
-        key: value.to(transfer_plan.target_device)
-        for key, value in payload_features.items()
+        key: value.to(transfer_plan.target_device) for key, value in payload_features.items()
     }
 
     return (
@@ -227,11 +226,7 @@ def _move_keyed_jagged_tensor_to_device(features: Any, device: torch.device) -> 
     target_device = torch.device(device)
     values = features.values()
     lengths = features.lengths()
-    weights = (
-        features.weights_or_none()
-        if hasattr(features, "weights_or_none")
-        else None
-    )
+    weights = features.weights_or_none() if hasattr(features, "weights_or_none") else None
 
     current_device = values.device
     if current_device == target_device and lengths.device == target_device:

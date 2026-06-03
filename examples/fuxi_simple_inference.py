@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Simple FuXi-alpha inference example for vllm-GR."""
 
 import argparse
-import os
 
 # Enable verbose logging
 import logging
-logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
+import os
 
-from runtime_utils import add_repo_root_to_path, add_runtime_args, describe_runtime
+logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
+
+from runtime_utils import (  # noqa: E402
+    add_repo_root_to_path,
+    add_runtime_args,
+    describe_runtime,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 add_repo_root_to_path(__file__)
@@ -25,8 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run a simple FuXi-alpha recommendation example",
     )
     add_runtime_args(parser, default_model=FUXI_DEMO_MODEL_PATH)
-    parser.add_argument("--max-seq-len", type=int, default=64, help="Maximum user history sequence length.")
-    parser.add_argument("--max-candidates", type=int, default=50, help="Maximum number of candidate items.")
+    parser.add_argument(
+        "--max-seq-len", type=int, default=64, help="Maximum user history sequence length."
+    )
+    parser.add_argument(
+        "--max-candidates", type=int, default=50, help="Maximum number of candidate items."
+    )
     return parser
 
 
@@ -39,7 +48,7 @@ def main():
     print(" vllm-GR FuXi-alpha Simple Inference Example")
     print("=" * 60)
 
-    print(f"\n[Model Path]")
+    print("\n[Model Path]")
     print(f"   Using model: {args.model}")
 
     with GRLLM(
@@ -50,7 +59,7 @@ def main():
     ) as llm:
         active_device = describe_runtime(expected_device=args.expect_device)
 
-        print(f"\n[Configuration]")
+        print("\n[Configuration]")
         print(f"   Max sequence length: {llm.max_seq_len}")
         print(f"   Max candidates: {llm.max_candidates}")
         print(f"   Engine: {llm.engine_class.__name__}")
@@ -78,13 +87,13 @@ def main():
             ],
         }
 
-        print(f"\n[Request Details]")
+        print("\n[Request Details]")
         print(f"   User: {prompt['user_id']}")
         print(f"   History length: {len(prompt['user_history'])}")
         print(f"   Candidates: {len(prompt['candidates'])}")
 
         # GRLLM.recommend() -> GRLLMEngine -> EngineCore -> FuXiForRecommendation
-        print(f"\n[Running FuXi-alpha model inference...]")
+        print("\n[Running FuXi-alpha model inference...]")
         outputs = llm.recommend(
             prompts=[prompt],
             use_tqdm=False,
@@ -92,14 +101,14 @@ def main():
 
         output = outputs[0]
 
-        print(f"\n[Recommendation Results]")
+        print("\n[Recommendation Results]")
         print(f"   Request ID: {output.request_id}")
         print(f"   User ID: {output.user_id}")
         print(f"   Finished: {output.finished}")
         print(f"   Returned scores for all candidates: {len(output.recommendations)}")
-        print(f"   (Note: Scores are from explicitly enabled random-init demo mode)")
+        print("   (Note: Scores are from explicitly enabled random-init demo mode)")
 
-        print(f"\n   Candidate score list:")
+        print("\n   Candidate score list:")
         for item in output.recommendations:
             display_line = f"item_{item.item_id:<10} score={item.score:.4f}"
             if item.task_scores:
@@ -110,7 +119,7 @@ def main():
                 display_line = f"{display_line}  {task_suffix}"
             print(f"   {display_line}")
 
-        print(f"\n[Output Summary]")
+        print("\n[Output Summary]")
         print(f"   First 5 item IDs: {output.item_ids[:5]}")
         print(f"   First 5 scores: {[f'{s:.3f}' for s in output.scores[:5]]}")
         print(f"   Best-scoring candidate (derived client-side): {output.top_recommendation}")

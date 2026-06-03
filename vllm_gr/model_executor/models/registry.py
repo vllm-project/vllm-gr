@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 GR Model Registry.
@@ -28,9 +28,8 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 try:
-    from vllm.model_executor.models.registry import (
-        ModelRegistry as VLLMModelRegistry,
-    )
+    from vllm.model_executor.models.registry import ModelRegistry as VLLMModelRegistry
+
     _HAS_VLLM_REGISTRY = True
 except ImportError:
     _HAS_VLLM_REGISTRY = False
@@ -63,6 +62,7 @@ _GR_MODEL_ARCHITECTURES_REGISTERED = False
 # Public API
 # ============================================================================
 
+
 def register_gr_model_architectures() -> bool:
     """
     Register GR model architectures into vLLM's global ModelRegistry.
@@ -88,8 +88,7 @@ def register_gr_model_architectures() -> bool:
         for arch, (mod_name, cls_name) in _GR_MODEL_ARCHITECTURES.items():
             if arch not in supported_archs:
                 VLLMModelRegistry.register_model(
-                    arch,
-                    f"vllm_gr.model_executor.models.{mod_name}:{cls_name}"
+                    arch, f"vllm_gr.model_executor.models.{mod_name}:{cls_name}"
                 )
                 logger.debug(f"Registered {arch} with vLLM ModelRegistry")
 

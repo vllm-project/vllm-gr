@@ -1,5 +1,5 @@
-# Copyright (c) vllm-GR Authors.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """FuXi-alpha RAB-off inference model.
 
@@ -169,8 +169,7 @@ class FuXiBlockJagged(torch.nn.Module):
                 torch.empty(
                     (
                         embedding_dim,
-                        linear_hidden_dim * num_heads * 2
-                        + attention_dim * num_heads * 2,
+                        linear_hidden_dim * num_heads * 2 + attention_dim * num_heads * 2,
                     )
                 ).normal_(mean=0, std=0.02),
             )
@@ -291,7 +290,6 @@ class FuXiBlockJagged(torch.nn.Module):
 
 
 class FuXiJagged(torch.nn.Module):
-
     def __init__(
         self,
         modules: List[FuXiBlockJagged],
@@ -299,9 +297,7 @@ class FuXiJagged(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        self._attention_layers: torch.nn.ModuleList = torch.nn.ModuleList(
-            modules=modules
-        )
+        self._attention_layers: torch.nn.ModuleList = torch.nn.ModuleList(modules=modules)
         self._autocast_dtype: Optional[torch.dtype] = autocast_dtype
 
     def jagged_forward(
@@ -354,9 +350,7 @@ class FuXiJagged(torch.nn.Module):
 
 
 def build_input_features_preprocessor(cfg: Any) -> InputFeaturesPreprocessorModule:
-    positional_max_len = int(
-        getattr(cfg, "positional_embedding_max_len", None) or cfg.max_seq_len
-    )
+    positional_max_len = int(getattr(cfg, "positional_embedding_max_len", None) or cfg.max_seq_len)
     dropout_rate = float(getattr(cfg, "linear_dropout_rate", 0.0))
     preprocessor_type = getattr(cfg, "input_preprocessor_type", "posi")
     if cfg.use_rating_embedding or preprocessor_type in {"posir", "rated"}:
@@ -375,9 +369,7 @@ def build_input_features_preprocessor(cfg: Any) -> InputFeaturesPreprocessorModu
 
 
 def build_output_postprocessor(cfg: Any) -> OutputPostprocessorModule:
-    emb_dim = cfg.item_embedding_dim + (
-        cfg.rating_embedding_dim if cfg.use_rating_embedding else 0
-    )
+    emb_dim = cfg.item_embedding_dim + (cfg.rating_embedding_dim if cfg.use_rating_embedding else 0)
     postprocessor_type = getattr(cfg, "output_postprocessor_type", "l2")
     if postprocessor_type == "l2":
         return L2NormEmbeddingPostprocessor(embedding_dim=emb_dim)
@@ -402,12 +394,8 @@ class FuXiAlphaInferenceModel(nn.Module):
         self._dqk: int = hf_config.dqk
         self._dv: int = hf_config.dv
         self._linear_activation: str = getattr(hf_config, "linear_activation", "silu")
-        self._linear_dropout_rate: float = float(
-            getattr(hf_config, "linear_dropout_rate", 0.0)
-        )
-        self._attn_dropout_rate: float = float(
-            getattr(hf_config, "attn_dropout_rate", 0.0)
-        )
+        self._linear_dropout_rate: float = float(getattr(hf_config, "linear_dropout_rate", 0.0))
+        self._attn_dropout_rate: float = float(getattr(hf_config, "attn_dropout_rate", 0.0))
         max_output_len = int(getattr(hf_config, "max_output_len", 0))
 
         self._embedding_module = nn.Module()
@@ -420,11 +408,7 @@ class FuXiAlphaInferenceModel(nn.Module):
         self._input_features_preproc = build_input_features_preprocessor(hf_config)
         self._output_postproc = build_output_postprocessor(hf_config)
 
-        block_prefix = (
-            f"{prefix}._fuxi._attention_layers"
-            if prefix
-            else "_fuxi._attention_layers"
-        )
+        block_prefix = f"{prefix}._fuxi._attention_layers" if prefix else "_fuxi._attention_layers"
         self._fuxi = FuXiJagged(
             modules=[
                 FuXiBlockJagged(
@@ -509,9 +493,7 @@ class FuXiAlphaInferenceModel(nn.Module):
             x=user_embeddings,
             x_offsets=x_offsets,
             all_timestamps=(
-                past_payloads[TIMESTAMPS_KEY]
-                if TIMESTAMPS_KEY in past_payloads
-                else None
+                past_payloads[TIMESTAMPS_KEY] if TIMESTAMPS_KEY in past_payloads else None
             ),
             invalid_attn_mask=1.0 - attn_mask.to(float_dtype),
             hstu_attn_metadata=hstu_attn_metadata,

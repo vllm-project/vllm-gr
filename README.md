@@ -1,6 +1,6 @@
 # vllm-GR
 
-**vLLM-based Generative Recommender Inference Engine**
+vLLM-based Generative Recommender Inference Engine
 
 当前仓库聚焦于基于 vLLM 的生成式推荐推理，包含 HSTU 离线推理主链路、示例脚本、测试套件，以及 GPU / NPU 运行时适配代码。
 
@@ -29,32 +29,32 @@
 - 机器上需要有可用的 NVIDIA GPU
 - 基础环境需要能正常使用 CUDA 驱动 / runtime
 - 本仓的 GPU 安装步骤会通过 `.[gpu]` 或 `requirements-gpu.txt` 安装：
-  - `torch==2.9.1`
-  - `numpy==2.2.6`
-  - `vllm==0.14.1`
-  - `torchrec==1.4.0`
-  - `fbgemm-gpu==1.4.0`
-  - `opencv-python-headless`
-  - `safetensors` 可选但强烈建议安装
+    - `torch==2.9.1`
+    - `numpy==2.2.6`
+    - `vllm==0.14.1`
+    - `torchrec==1.4.0`
+    - `fbgemm-gpu==1.4.0`
+    - `opencv-python-headless`
+    - `safetensors` 可选但强烈建议安装
 
 ### 3. NPU 前置依赖
 
 - 机器上需要有可用的 NPU 设备
 - NPU 基础环境必须提前准备好：
-  - `torch`
-  - `torch-npu`
-  - NPU 对应 runtime
-  - 如需真实 NPU backend 链路，需提前准备对应平台插件，例如 `vllm_ascend`
+    - `torch`
+    - `torch-npu`
+    - NPU 对应 runtime
+    - 如需真实 NPU backend 链路，需提前准备对应平台插件，例如 `vllm_ascend`
 - 本仓的 NPU 安装步骤只安装仓内依赖，不会安装：
-  - `torch == 2.9.0`
-  - `torch-npu == 2.9.0`
-  - `numpy == 2.2.6`
-  - `vllm_ascend == 0.14.0rc1`
+    - `torch == 2.9.0`
+    - `torch-npu == 2.9.0`
+    - `numpy == 2.2.6`
+    - `vllm_ascend == 0.14.0rc1`
 - 本仓的 NPU 安装步骤会安装：
-  - `vllm==0.14.1`
-  - `fbgemm-gpu-cpu==1.4.0`
-  - `opencv-python-headless`
-  - `safetensors` 可选但强烈建议安装
+    - `vllm==0.14.1`
+    - `fbgemm-gpu-cpu==1.4.0`
+    - `opencv-python-headless`
+    - `safetensors` 可选但强烈建议安装
 
 ## 推荐安装顺序
 
@@ -199,7 +199,9 @@ dscli start -w \
   --etcd_address "${ETCD_IP}:2379" \
   --shared_memory_size_mb 20480
 ```
+
 停止 worker：
+
 ```bash
 dscli stop --worker_address "${WORKER_IP}:31501"
 ```
@@ -236,7 +238,8 @@ python examples/yuanrong_backend_example.py \
   --max-cases 2 \
   --lookup-rpc-port 1
 ```
-更多帮助，参见：https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/index.html
+
+更多帮助，参见：<https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/index.html>
 
 ## 推荐执行顺序
 
@@ -260,9 +263,9 @@ python scripts/run_tests.py --all --auto-platform
 
 - `--all` 会跑 `unit + platform lane + examples`
 - `--auto-platform` 会自动解析当前可用后端：
-  - NPU 环境优先跑 `platform-npu`
-  - GPU 环境优先跑 `platform-gpu`
-  - CPU 环境会跳过平台 smoke，只跑 `unit + examples`
+    - NPU 环境优先跑 `platform-npu`
+    - GPU 环境优先跑 `platform-gpu`
+    - CPU 环境会跳过平台 smoke，只跑 `unit + examples`
 - examples 会自动带 `--expect-device` 做后端一致性检查
 
 如果只想跑默认 unit：
