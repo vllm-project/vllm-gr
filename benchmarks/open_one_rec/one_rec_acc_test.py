@@ -190,9 +190,9 @@ def main():
     # 1. Load Configuration
     if args.gr:
         logger.info("Detected --gr flag, enabling vllm-gr mode for accuracy test.")
-        from vllm_gr.patch import re_apply_patches
+        from vllm_gr.entrypoints.beam_search_patch import patch_offline_beam_search
 
-        re_apply_patches()
+        patch_offline_beam_search()
 
     if args.task_type not in TASK_REGISTRY:
         print(f"Task {args.task_type} not found in configuration.")
