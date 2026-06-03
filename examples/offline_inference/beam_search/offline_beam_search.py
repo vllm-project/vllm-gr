@@ -47,11 +47,6 @@ def beam_search_example(model, beam_width: int, compare: str):
                         f"Generated text {index}:{i} : {generated_text[len(long_recommendation_texts[index]) :]}"
                     )
 
-    # Apply vllm-gr patches
-    from vllm_gr.patch import re_apply_patches
-
-    re_apply_patches()
-
     # Send beam search request to vllm-gr
     start = time.perf_counter()
     outputs = llm.beam_search(prompts, params)
