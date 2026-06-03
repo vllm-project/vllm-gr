@@ -1,16 +1,40 @@
 # Copyright (c) vllm-GR Authors.
 # Licensed under the Apache License, Version 2.0
 
+import importlib
 import importlib.machinery
-from types import SimpleNamespace
 import sys
 import types
 import unittest
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
-if "torchrec" not in sys.modules:
+
+@pytest.fixture(scope="class")
+def setup_fake_torchrec_modules():
+    """
+    Fixture to set up fake torchrec modules only for tests that require them.
+    Cleans up after the test completes.
+    """
+    # Store original modules if they exist
+    original_modules = {}
+    modules_to_set = {
+        "torchrec",
+        "torchrec.modules",
+        "torchrec.modules.embedding_configs",
+        "torchrec.modules.embedding_modules",
+        "torchrec.sparse",
+        "torchrec.sparse.jagged_tensor",
+    }
+    for module_name in modules_to_set:
+        if module_name in sys.modules:
+            original_modules[module_name] = sys.modules[module_name]
+
+    # Set up fake modules
     fake_torchrec = types.ModuleType("torchrec")
     fake_torchrec_modules = types.ModuleType("torchrec.modules")
     fake_embedding_configs = types.ModuleType("torchrec.modules.embedding_configs")
@@ -58,7 +82,18 @@ if "torchrec" not in sys.modules:
         }
     )
 
-if "vllm_ascend.worker.model_runner_v1" not in sys.modules:
+    yield
+
+    # Clean up: remove fake modules
+    for module_name in modules_to_set:
+        if module_name in original_modules:
+            sys.modules[module_name] = original_modules[module_name]
+        else:
+            sys.modules.pop(module_name, None)
+
+
+@contextmanager
+def _patched_gr_npu_model_runner():
     fake_vllm_ascend = types.ModuleType("vllm_ascend")
     fake_vllm_ascend_worker = types.ModuleType("vllm_ascend.worker")
     fake_vllm_ascend_runner = types.ModuleType("vllm_ascend.worker.model_runner_v1")
@@ -67,6 +102,7 @@ if "vllm_ascend.worker.model_runner_v1" not in sys.modules:
         def __init__(self, vllm_config, device):
             self.vllm_config = vllm_config
             self.model_config = getattr(vllm_config, "model_config", None)
+            self.compilation_config = getattr(vllm_config, "compilation_config", None)
             self.device = device
             self.attn_groups = []
             self.model = None
@@ -86,33 +122,62 @@ if "vllm_ascend.worker.model_runner_v1" not in sys.modules:
             self._build_attention_metadata_called = (args, kwargs)
             return {"base_called": True}
 
+    fake_vllm_ascend.__spec__ = importlib.machinery.ModuleSpec(
+        "vllm_ascend", loader=None
+    )
+    fake_vllm_ascend_worker.__spec__ = importlib.machinery.ModuleSpec(
+        "vllm_ascend.worker", loader=None
+    )
+    fake_vllm_ascend_runner.__spec__ = importlib.machinery.ModuleSpec(
+        "vllm_ascend.worker.model_runner_v1", loader=None
+    )
+    fake_vllm_ascend.register_connector = lambda *args, **kwargs: None
+    fake_vllm_ascend.register_model_loader = lambda *args, **kwargs: None
+    fake_vllm_ascend.register_service_profiling = lambda *args, **kwargs: None
     fake_vllm_ascend_runner.NPUModelRunner = _FakeNPUModelRunner
-    sys.modules.update(
+
+    with mock.patch.dict(
+        sys.modules,
         {
             "vllm_ascend": fake_vllm_ascend,
             "vllm_ascend.worker": fake_vllm_ascend_worker,
             "vllm_ascend.worker.model_runner_v1": fake_vllm_ascend_runner,
-        }
-    )
+        },
+    ):
+        sys.modules.pop("vllm_gr.worker.gr_npu_model_runner", None)
+        gr_npu_model_runner_module = importlib.import_module(
+            "vllm_gr.worker.gr_npu_model_runner"
+        )
+        with mock.patch.object(
+            gr_npu_model_runner_module,
+            "resolve_model_type",
+            return_value="hstu",
+        ), mock.patch.object(
+            gr_npu_model_runner_module,
+            "create_adapter",
+            return_value=SimpleNamespace(payload_type=None),
+        ):
+            yield gr_npu_model_runner_module.GRNPUModelRunner
+
+        sys.modules.pop("vllm_gr.worker.gr_npu_model_runner", None)
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_gr.engine.arg_utils import GREngineArgs
-from vllm_gr.models.dlrm_v3.modules import stu as stu_module
-from vllm_gr.models.dlrm_v3.modules.hstu_transducer import HSTUTransducer
-from vllm_gr.models.dlrm_v3.modules.stu import STULayer, STULayerConfig
 from vllm_gr.attention.backends.hstu_attn import (
     HSTUAttentionMetadata,
     HSTUAttentionMetadataBuilder,
     _build_hstu_token_positions,
 )
+from vllm_gr.engine.arg_utils import GREngineArgs
 from vllm_gr.model_executor.layers.hstu_attention_layer import (
     HSTUKVCacheAttentionLayer,
 )
 from vllm_gr.model_executor.models.hstu_vllm import HSTUForRecommendation
+from vllm_gr.models.dlrm_v3.modules import stu as stu_module
+from vllm_gr.models.dlrm_v3.modules.hstu_transducer import HSTUTransducer
+from vllm_gr.models.dlrm_v3.modules.stu import STULayer, STULayerConfig
 from vllm_gr.ops.hstu_attention import delta_hstu_mha
-from vllm_gr.worker.gr_npu_model_runner import GRNPUModelRunner
 
 
 def _dummy_vllm_config(block_size: int = 16):
@@ -123,6 +188,7 @@ def _dummy_vllm_config(block_size: int = 16):
     )
 
 
+@pytest.mark.usefixtures("setup_fake_torchrec_modules")
 class TestHSTUVllmNativeKVContract(unittest.TestCase):
 
     @staticmethod
@@ -878,10 +944,11 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
             compilation_config=SimpleNamespace(static_forward_context={}),
         )
 
-        runner = GRNPUModelRunner(vllm_config, torch.device("cpu"))
-        runner.model = SimpleNamespace(_hstu_kv_cache_layers=[layer])
+        with _patched_gr_npu_model_runner() as gr_npu_model_runner_cls:
+            runner = gr_npu_model_runner_cls(vllm_config, torch.device("cpu"))
+            runner.model = SimpleNamespace(_hstu_kv_cache_layers=[layer])
 
-        kv_cache_spec = runner.get_kv_cache_spec()
+            kv_cache_spec = runner.get_kv_cache_spec()
 
         self.assertEqual(kv_cache_spec, {"hstu_kv_cache_layers.0": spec})
         self.assertIs(
@@ -976,44 +1043,45 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
             ),
             compilation_config=SimpleNamespace(static_forward_context={}),
         )
-        runner = GRNPUModelRunner(vllm_config, torch.device("cpu"))
-        runner.model = SimpleNamespace(_hstu_kv_cache_layers=[object()])
-        runner.attn_groups = []
-        runner.cross_layers_kv_cache = None
-        runner.cross_layers_attn_backend = None
-        runner.may_add_encoder_only_layers_to_kv_cache_config = mock.Mock()
-        runner.maybe_add_kv_sharing_layers_to_kv_cache_groups = mock.Mock()
-        runner.may_reinitialize_input_batch = mock.Mock()
+        with _patched_gr_npu_model_runner() as gr_npu_model_runner_cls:
+            runner = gr_npu_model_runner_cls(vllm_config, torch.device("cpu"))
+            runner.model = SimpleNamespace(_hstu_kv_cache_layers=[object()])
+            runner.attn_groups = []
+            runner.cross_layers_kv_cache = None
+            runner.cross_layers_attn_backend = None
+            runner.may_add_encoder_only_layers_to_kv_cache_config = mock.Mock()
+            runner.maybe_add_kv_sharing_layers_to_kv_cache_groups = mock.Mock()
+            runner.may_reinitialize_input_batch = mock.Mock()
 
-        kv_cache_config = SimpleNamespace()
-        fake_kernel_block_sizes = [16]
-        fake_kv_caches = {"hstu_kv_cache_layers.0": object()}
+            kv_cache_config = SimpleNamespace()
+            fake_kernel_block_sizes = [16]
+            fake_kv_caches = {"hstu_kv_cache_layers.0": object()}
 
-        fake_gpu_model_runner_module = types.ModuleType(
-            "vllm.v1.worker.gpu_model_runner"
-        )
-        fake_worker_utils_module = types.ModuleType("vllm.v1.worker.utils")
-
-        class _FakeGPUModelRunner:
-            initialize_attn_backend = mock.Mock()
-            _prepare_kernel_block_sizes = mock.Mock(
-                return_value=fake_kernel_block_sizes
+            fake_gpu_model_runner_module = types.ModuleType(
+                "vllm.v1.worker.gpu_model_runner"
             )
-            initialize_metadata_builders = mock.Mock()
-            _allocate_kv_cache_tensors = mock.Mock(return_value={"raw": object()})
-            _reshape_kv_cache_tensors = mock.Mock(return_value=fake_kv_caches)
+            fake_worker_utils_module = types.ModuleType("vllm.v1.worker.utils")
 
-        fake_gpu_model_runner_module.GPUModelRunner = _FakeGPUModelRunner
-        fake_worker_utils_module.bind_kv_cache = mock.Mock()
+            class _FakeGPUModelRunner:
+                initialize_attn_backend = mock.Mock()
+                _prepare_kernel_block_sizes = mock.Mock(
+                    return_value=fake_kernel_block_sizes
+                )
+                initialize_metadata_builders = mock.Mock()
+                _allocate_kv_cache_tensors = mock.Mock(return_value={"raw": object()})
+                _reshape_kv_cache_tensors = mock.Mock(return_value=fake_kv_caches)
 
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "vllm.v1.worker.gpu_model_runner": fake_gpu_model_runner_module,
-                "vllm.v1.worker.utils": fake_worker_utils_module,
-            },
-        ):
-            runner.initialize_kv_cache(kv_cache_config)
+            fake_gpu_model_runner_module.GPUModelRunner = _FakeGPUModelRunner
+            fake_worker_utils_module.bind_kv_cache = mock.Mock()
+
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "vllm.v1.worker.gpu_model_runner": fake_gpu_model_runner_module,
+                    "vllm.v1.worker.utils": fake_worker_utils_module,
+                },
+            ):
+                runner.initialize_kv_cache(kv_cache_config)
 
         runner.may_add_encoder_only_layers_to_kv_cache_config.assert_called_once()
         runner.maybe_add_kv_sharing_layers_to_kv_cache_groups.assert_called_once()
