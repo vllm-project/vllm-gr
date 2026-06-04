@@ -149,7 +149,7 @@ class TestGREngineArgs(unittest.TestCase):
                 return_value=None,
             ),
             mock.patch(
-                "vllm_gr.entrypoints.gr.GRLLMEngine.from_engine_args",
+                "vllm_gr.entrypoints.gr.create_sync_engine_from_engine_args",
                 side_effect=_fake_from_engine_args,
             ),
         ):

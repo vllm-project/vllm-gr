@@ -18,8 +18,9 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.system_utils import decorate_logs
 
 from vllm_gr.config.gr_config import GRConfig
+from vllm_gr.config.model_taxonomy import ModelCategory, is_gr_category
 from vllm_gr.engine.arg_utils import GRAsyncEngineArgs
-from vllm_gr.engine.async_gr_engine import GRAsyncLLM
+from vllm_gr.engine.engine_factory import create_async_llm_from_engine_args
 from vllm_gr.entrypoints.pooling import register_gr_pooling_api_routers
 from vllm_gr.entrypoints.pooling.recommend.serving import GRServingRecommendation
 from vllm_gr.logger import init_logger
@@ -38,12 +39,17 @@ def _apply_client_process_config(
 
 def _log_disabled_recommend_api(
     model_family: str | None,
+    model_category: str | None,
     supported_tasks: Any,
 ) -> None:
     supported_task_names = sorted(str(task) for task in supported_tasks)
     supported_tasks_text = ", ".join(supported_task_names) or "<none>"
 
     reasons: list[str] = []
+    if not is_gr_category(model_category):
+        reasons.append(
+            f"model_category={model_category!r} is not GR recommendation mode."
+        )
     if model_family is None:
         reasons.append(
             "model_family could not be resolved to 'hstu'; when serving from a "
@@ -98,7 +104,6 @@ async def build_async_gr_engine_client_from_engine_args(
     disable_frontend_multiprocessing: bool = False,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
-    vllm_config = engine_args.create_engine_config(usage_context=usage_context)
     gr_config = GRConfig(
         max_seq_len=engine_args.max_seq_len,
         max_candidates=engine_args.max_candidates,
@@ -113,17 +118,17 @@ async def build_async_gr_engine_client_from_engine_args(
     if disable_frontend_multiprocessing:
         logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing.")
 
-    async_llm: GRAsyncLLM | None = None
+    async_llm = None
 
     client_config = dict(client_config) if client_config else {}
     client_count = client_config.pop("client_count", 1)
     client_index = client_config.pop("client_index", 0)
 
     try:
-        async_llm = GRAsyncLLM.from_vllm_config(
-            vllm_config=vllm_config,
-            gr_config=gr_config,
+        async_llm = create_async_llm_from_engine_args(
+            engine_args,
             usage_context=usage_context,
+            gr_config=gr_config,
             enable_log_requests=engine_args.enable_log_requests,
             aggregate_engine_logging=engine_args.aggregate_engine_logging,
             disable_log_stats=engine_args.disable_log_stats,
@@ -150,6 +155,7 @@ async def init_gr_app_state(
     state: State,
     args: Namespace,
     model_family: str | None,
+    model_category: str | None,
 ) -> None:
     await openai_api_server.init_app_state(engine_client, state, args)
 
@@ -160,7 +166,12 @@ async def init_gr_app_state(
     if embedding_handler is not None:
         request_logger = embedding_handler.request_logger
 
-    if "embed" in supported_tasks and model_family == "hstu":
+    mount_recommend = (
+        is_gr_category(model_category)
+        and model_family == "hstu"
+        and "embed" in supported_tasks
+    )
+    if mount_recommend:
         state.gr_serving_recommendation = GRServingRecommendation(
             engine_client=engine_client,
             models=state.openai_serving_models,
@@ -171,6 +182,7 @@ async def init_gr_app_state(
         state.gr_serving_recommendation = None
         _log_disabled_recommend_api(
             model_family=model_family,
+            model_category=model_category,
             supported_tasks=supported_tasks,
         )
 
@@ -211,6 +223,7 @@ async def run_server_worker(
             app.state,
             args,
             model_family=engine_args.model_family,
+            model_category=engine_args.model_category,
         )
 
         logger.info(

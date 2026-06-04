@@ -73,6 +73,9 @@ class GRCommonEngineArgsMixin:
     # fast unless the caller clearly requests dummy loading.
     allow_missing_weights: bool = False
 
+    # Resolved by ``_apply_model_family_defaults``: "gr" or "llm".
+    model_category: Optional[str] = None
+
     def __post_init__(self):
         """Post-init processing to ensure proper configuration."""
         super().__post_init__()
@@ -178,15 +181,26 @@ class GRCommonEngineArgsMixin:
         return None
 
     def _apply_model_family_defaults(self) -> None:
-        """Apply runtime defaults for known GR model families via registry."""
+        """Resolve model category and apply family-specific engine defaults."""
+        from vllm_gr.adapters.pangu_llm._defaults import apply_pangu_llm_defaults
         from vllm_gr.adapters.registry import apply_family_defaults
+        from vllm_gr.config.model_taxonomy import ModelCategory, classify_model
+
+        self.model_category = classify_model(
+            model_family=self.model_family,
+            local_config=self._read_local_config_dict(),
+            hf_overrides=(
+                self.hf_overrides if isinstance(self.hf_overrides, dict) else None
+            ),
+        ).value
+
+        if self.model_category == ModelCategory.LLM.value:
+            apply_pangu_llm_defaults(self)
+            return
 
         if self.model_family is not None:
-            # Ensure the family is registered (Layer 1, pure Python).
-            # The adapter packages register themselves on import.
             self._ensure_family_registered(self.model_family)
-
-        apply_family_defaults(self.model_family, self)
+            apply_family_defaults(self.model_family, self)
 
     @staticmethod
     def _ensure_family_registered(model_family: str) -> None:
@@ -254,14 +268,23 @@ class GRCommonEngineArgsMixin:
         Dataset overrides have already been merged into ``hf_overrides`` during
         ``__post_init__``.
         """
+        from vllm_gr.config.model_taxonomy import ModelCategory, is_gr_category
+        from vllm_gr.engine.engine_factory import attach_model_category_to_vllm_config
         from vllm_gr.plugin import initialize_runtime
 
-        initialize_runtime()
-        logger.info("Creating engine config for model: %s", self.model)
-        return super().create_engine_config(
+        strict_gr = is_gr_category(getattr(self, "model_category", None))
+        initialize_runtime(strict_gr=strict_gr)
+        logger.info(
+            "Creating engine config for model: %s (category=%s)",
+            self.model,
+            getattr(self, "model_category", None),
+        )
+        vllm_config = super().create_engine_config(
             usage_context=usage_context,
             headless=headless,
         )
+        attach_model_category_to_vllm_config(vllm_config, self)
+        return vllm_config
 
 
 @dataclass
@@ -279,6 +302,7 @@ class GREngineArgs(GRCommonEngineArgsMixin, EngineArgs):
     force_hammer_npu: Optional[bool] = None
     dataset: Optional[str] = None
     model_family: Optional[str] = None
+    model_category: Optional[str] = None
     allow_missing_weights: bool = False
 
     @classmethod
@@ -306,6 +330,7 @@ class GRAsyncEngineArgs(GRCommonEngineArgsMixin, AsyncEngineArgs):
     force_hammer_npu: Optional[bool] = None
     dataset: Optional[str] = None
     model_family: Optional[str] = None
+    model_category: Optional[str] = None
     allow_missing_weights: bool = False
 
     @classmethod

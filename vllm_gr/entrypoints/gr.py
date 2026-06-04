@@ -11,7 +11,10 @@ processors) and drives the engine loop to collect GRRequestOutput results.
 
 import gc
 import time
-from typing import List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, List, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    from vllm_gr.engine.gr_engine import GRLLMEngine
 
 from tqdm.auto import tqdm
 from vllm.entrypoints.llm import LLM
@@ -21,10 +24,11 @@ from vllm.utils.counter import Counter
 
 from vllm_gr.config.gr_config import GRConfig
 from vllm_gr.engine.arg_utils import GREngineArgs
-from vllm_gr.engine.gr_engine import GRLLMEngine
 from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
 from vllm_gr.logger import init_logger
 from vllm_gr.outputs import GRRequestOutput
+from vllm_gr.config.model_taxonomy import is_llm_category
+from vllm_gr.engine.engine_factory import create_sync_engine_from_engine_args
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 
 logger = init_logger(__name__)
@@ -71,7 +75,15 @@ class GRLLM(LLM):
             **kwargs,
         )
 
-        self.llm_engine = GRLLMEngine.from_engine_args(
+        if is_llm_category(engine_args.model_category):
+            raise ValueError(
+                "GRLLM only supports generative recommendation models (HSTU/FuXi). "
+                f"Detected model_category={engine_args.model_category!r} for "
+                f"model={model!r}. For causal LM models such as Pangu Embedded 1B, "
+                "use: vllm-gr serve <model_path> --model-family llm"
+            )
+
+        self.llm_engine = create_sync_engine_from_engine_args(
             engine_args=engine_args,
             usage_context=UsageContext.LLM_CLASS,
         )
@@ -79,6 +91,7 @@ class GRLLM(LLM):
 
         self.model = model
         self.model_family = engine_args.model_family
+        self.model_category = engine_args.model_category
         self.max_seq_len = resolved_gr_config.max_seq_len
         self.max_candidates = resolved_gr_config.max_candidates
         self.gr_config = resolved_gr_config
@@ -186,7 +199,7 @@ class GRLLM(LLM):
             all_outputs.extend(outputs)
         return all_outputs
 
-    def get_engine(self) -> GRLLMEngine:
+    def get_engine(self) -> "GRLLMEngine":
         return self.llm_engine
 
     def get_prefix_cache_counters(self) -> dict[str, int]:

@@ -53,7 +53,10 @@ class GRServeSubcommand(CLISubcommand):
             "--model-family",
             type=str,
             default=None,
-            help="GR model family identifier. Use 'hstu' for HSTU models.",
+            help=(
+                "Model family: 'hstu'/'fuxi' for GR recommendation, "
+                "'llm'/'pangu' for causal LM passthrough (e.g. Pangu Embedded 1B)."
+            ),
         )
         serve_parser.add_argument(
             "--dataset",

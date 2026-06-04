@@ -20,6 +20,14 @@ class GRNPUModelRunner(GRFeatureRunnerMixin, NPUModelRunner):
     """NPU model runner that injects GR features into HSTU inputs."""
 
     def __init__(self, vllm_config, device, gr_config=None):
+        from vllm_gr.config.model_taxonomy import is_llm_category
+
+        if is_llm_category(getattr(vllm_config, "model_category", None)):
+            raise RuntimeError(
+                "GRNPUModelRunner must not be used for LLM passthrough models. "
+                "Use the default vllm-ascend NPU worker (do not set GR worker_cls)."
+            )
+
         gr_config = gr_config or GRConfig()
         model_type = resolve_model_type(vllm_config)
         adapter = create_adapter(model_type, vllm_config, gr_config)
