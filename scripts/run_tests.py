@@ -44,6 +44,7 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
             "test_checkpoint_conversion_contract.py",
             "test_output_contract.py",
             "test_positional_encoder_parity.py",
+            "test_dlrm_hstu_embedding_padding.py",
             "test_run_tests_script.py",
             "test_hstu_attention_contract.py",
             "test_hstu_vllm_native_kv_contract.py",
