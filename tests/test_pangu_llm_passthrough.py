@@ -3,11 +3,15 @@
 
 """Unit tests for Pangu / LLM passthrough engine-arg defaults and guards."""
 
+import importlib
+import importlib.machinery
 import importlib.util
 import os
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -36,6 +40,44 @@ _HAS_VLLM = _has_vllm_engine_runtime()
 _HAS_FACTORY_DEPS = _HAS_VLLM and _has_transformers()
 _SKIP = "vLLM engine/runtime submodules are unavailable in this environment"
 _SKIP_FACTORY = "transformers/vLLM required for engine_factory import tests"
+
+
+@contextmanager
+def _stubbed_gr_npu_model_runner_import():
+    """Import GRNPUModelRunner without vllm-ascend (avoids numba/numpy pin issues)."""
+    fake_vllm_ascend = types.ModuleType("vllm_ascend")
+    fake_vllm_ascend_worker = types.ModuleType("vllm_ascend.worker")
+    fake_vllm_ascend_runner = types.ModuleType("vllm_ascend.worker.model_runner_v1")
+
+    class _FakeNPUModelRunner:
+        def __init__(self, vllm_config, device, **kwargs) -> None:
+            del kwargs
+            self.vllm_config = vllm_config
+            self.device = device
+
+    fake_vllm_ascend.__spec__ = importlib.machinery.ModuleSpec(
+        "vllm_ascend", loader=None
+    )
+    fake_vllm_ascend_worker.__spec__ = importlib.machinery.ModuleSpec(
+        "vllm_ascend.worker", loader=None
+    )
+    fake_vllm_ascend_runner.__spec__ = importlib.machinery.ModuleSpec(
+        "vllm_ascend.worker.model_runner_v1", loader=None
+    )
+    fake_vllm_ascend_runner.NPUModelRunner = _FakeNPUModelRunner
+
+    patched_modules = {
+        "vllm_ascend": fake_vllm_ascend,
+        "vllm_ascend.worker": fake_vllm_ascend_worker,
+        "vllm_ascend.worker.model_runner_v1": fake_vllm_ascend_runner,
+    }
+    with mock.patch.dict(sys.modules, patched_modules):
+        sys.modules.pop("vllm_gr.worker.gr_npu_model_runner", None)
+        module = importlib.import_module("vllm_gr.worker.gr_npu_model_runner")
+        try:
+            yield module.GRNPUModelRunner
+        finally:
+            sys.modules.pop("vllm_gr.worker.gr_npu_model_runner", None)
 
 
 class TestPanguLlmDefaults(unittest.TestCase):
@@ -171,12 +213,12 @@ class TestGrllmRejectsLlmCategory(unittest.TestCase):
 class TestGrNpuRunnerGuard(unittest.TestCase):
 
     def test_gr_npu_runner_rejects_llm_category(self):
-        from vllm_gr.worker.gr_npu_model_runner import GRNPUModelRunner
-
         vllm_config = mock.Mock()
         vllm_config.model_category = "llm"
-        with self.assertRaises(RuntimeError):
-            GRNPUModelRunner(vllm_config, "npu:0")
+        with _stubbed_gr_npu_model_runner_import() as GRNPUModelRunner:
+            with self.assertRaises(RuntimeError) as ctx:
+                GRNPUModelRunner(vllm_config, "npu:0")
+        self.assertIn("GRNPUModelRunner must not", str(ctx.exception))
 
 
 def _load_engine_factory_module():
