@@ -365,13 +365,13 @@ class TestGRRunnerCore(unittest.TestCase):
             cand_keys=["item_post_id"],
             cand_values_per_key=[[50, 60]],
             cand_lengths_per_key=[2],
-            ctx_keys=["viewer_id", "dummy_contexual"],
+            ctx_keys=["viewer_id", "dummy_contextual"],
             ctx_values_per_key=[[7], [1]],
             full_uih_keys=[
                 "viewer_id",
                 "uih_post_id",
                 "uih_owner_id",
-                "dummy_contexual",
+                "dummy_contextual",
             ],
         )
 
@@ -381,7 +381,7 @@ class TestGRRunnerCore(unittest.TestCase):
 
         self.assertEqual(
             model_kwargs["uih_features"].keys(),
-            ["viewer_id", "uih_post_id", "uih_owner_id", "dummy_contexual"],
+            ["viewer_id", "uih_post_id", "uih_owner_id", "dummy_contextual"],
         )
         torch.testing.assert_close(
             model_kwargs["uih_features"].values(),

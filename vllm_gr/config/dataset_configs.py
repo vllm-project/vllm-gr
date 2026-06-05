@@ -261,11 +261,11 @@ def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
     else:
         overrides["contextual_feature_to_max_length"] = {
             "viewer_id": 1,
-            "dummy_contexual": 1,
+            "dummy_contextual": 1,
         }
         overrides["contextual_feature_to_min_uih_length"] = {
             "viewer_id": 128,
-            "dummy_contexual": 128,
+            "dummy_contextual": 128,
         }
         overrides["candidates_weight_feature_name"] = "item_action_weight"
         overrides["candidates_watchtime_feature_name"] = "item_target_watchtime"
@@ -274,7 +274,7 @@ def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
             "uih_post_id",
             "uih_owner_id",
             "viewer_id",
-            "dummy_contexual",
+            "dummy_contextual",
         ]
         overrides["item_embedding_feature_names"] = [
             "item_post_id",
@@ -291,7 +291,7 @@ def get_hstu_config_overrides(dataset: str) -> Dict[str, Any]:
             "uih_surface_type",
             "uih_video_length",
             "viewer_id",
-            "dummy_contexual",
+            "dummy_contextual",
         ]
         overrides["hstu_candidate_feature_names"] = [
             "item_post_id",
@@ -471,9 +471,9 @@ def get_embedding_table_overrides(dataset: str) -> List[Dict[str, Any]]:
             "feature_names": ["viewer_id"],
         },
         {
-            "name": "dummy_contexual",
+            "name": "dummy_contextual",
             "embedding_dim": dim,
             "num_embeddings": HASH_SIZE,
-            "feature_names": ["dummy_contexual"],
+            "feature_names": ["dummy_contextual"],
         },
     ]

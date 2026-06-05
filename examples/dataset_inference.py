@@ -464,7 +464,7 @@ def build_synthetic_prompts() -> Dict[str, Any]:
     Candidates:    item_post_id, item_owner_id, item_surface_type,
                    item_video_length, item_action_weight,
                    item_target_watchtime, item_query_time
-    Context:       viewer_id, dummy_contexual
+    Context:       viewer_id, dummy_contextual
     Task:          vvp100
     """
     prompts: List["GRPrompt"] = [
@@ -546,7 +546,7 @@ def build_synthetic_prompts() -> Dict[str, Any]:
                     "item_query_time": 4000,
                 },
             ],
-            "context": {"viewer_id": 42, "dummy_contexual": 1},
+            "context": {"viewer_id": 42, "dummy_contextual": 1},
         },
     ]
     return {

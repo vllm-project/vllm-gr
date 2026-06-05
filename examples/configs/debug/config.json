@@ -18,10 +18,10 @@
   "hstu_transducer_embedding_dim": 64,
 
   "contextual_feature_to_max_length": {
-    "viewer_id": 1, "dummy_contexual": 1
+    "viewer_id": 1, "dummy_contextual": 1
   },
   "contextual_feature_to_min_uih_length": {
-    "viewer_id": 128, "dummy_contexual": 128
+    "viewer_id": 128, "dummy_contextual": 128
   },
 
   "candidates_weight_feature_name": "item_action_weight",
@@ -29,7 +29,7 @@
   "candidates_querytime_feature_name": "item_query_time",
 
   "user_embedding_feature_names": [
-    "uih_post_id", "uih_owner_id", "viewer_id", "dummy_contexual"
+    "uih_post_id", "uih_owner_id", "viewer_id", "dummy_contextual"
   ],
   "item_embedding_feature_names": ["item_post_id", "item_owner_id"],
   "uih_post_id_feature_name": "uih_post_id",
@@ -39,7 +39,7 @@
   "hstu_uih_feature_names": [
     "uih_post_id", "uih_action_time", "uih_weight",
     "uih_owner_id", "uih_watchtime", "uih_surface_type",
-    "uih_video_length", "viewer_id", "dummy_contexual"
+    "uih_video_length", "viewer_id", "dummy_contextual"
   ],
   "hstu_candidate_feature_names": [
     "item_post_id", "item_owner_id",
@@ -80,11 +80,11 @@
       "feature_names": ["viewer_id"]
     },
     {
-      "name": "dummy_contexual",
+      "name": "dummy_contextual",
       "embedding_dim": 64,
       "data_type": "fp16",
       "num_embeddings": 10000,
-      "feature_names": ["dummy_contexual"]
+      "feature_names": ["dummy_contextual"]
     }
   ]
 }

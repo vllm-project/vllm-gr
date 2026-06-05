@@ -254,7 +254,7 @@ class GRFeatureRunnerMixin:
             input_ids,
             inputs_embeds,
             positions,
-            interm_tensors,
+            intermediate,
             model_kwargs,
             ec_connector_output,
         ) = result
@@ -267,7 +267,7 @@ class GRFeatureRunnerMixin:
             input_ids,
             inputs_embeds,
             positions,
-            interm_tensors,
+            intermediate,
             model_kwargs,
             ec_connector_output,
         )

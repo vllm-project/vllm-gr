@@ -1,0 +1,5 @@
+# Common dependencies
+-r common.txt
+
+torchrec==1.4.0
+fbgemm-gpu==1.4.0

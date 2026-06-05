@@ -159,7 +159,3 @@ strict = true
 CANN = "CANN"
 cann = "cann"
 fx_arange = "fx_arange"
-
-[tool.typos.default.extend-words]
-contexual = "contexual"
-interm = "interm"

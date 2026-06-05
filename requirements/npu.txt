@@ -1,0 +1,4 @@
+# Common dependencies
+-r common.txt
+
+fbgemm-gpu-cpu==1.4.0

@@ -1,9 +1,0 @@
-# vllm-GR Shared Requirements
-#
-# Shared dependencies only.
-# Platform runtimes live in requirements-gpu.txt / requirements-npu.txt.
-
-msgspec
-pandas>=2.0.0
-requests>=2.32.0
-tqdm>=4.66.0

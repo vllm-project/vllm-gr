@@ -1,0 +1,23 @@
+# vllm-GR Shared Requirements
+#
+# Shared dependencies only.
+# Platform runtimes live in requirements-gpu.txt / requirements-npu.txt.
+
+vllm==0.14.1
+msgspec
+pandas>=3.0.0
+requests>=2.32.0
+scikit-learn>=1.8.0
+pyarrow==23.0.0
+tqdm>=4.66.0
+opencv-python-headless>=4.13.0
+numpy==2.2.6
+safetensors>=0.4.5
+pytest
+pytest-asyncio
+tblib
+pytest-cov
+black
+ruff
+mypy
+psutil

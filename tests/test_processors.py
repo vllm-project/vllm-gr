@@ -199,8 +199,8 @@ class TestExtractFeatures(unittest.TestCase):
         processor = _make_processor_with_adapter(
             uih_feature_names=["uih_post_id", "uih_owner_id"],
             candidate_feature_names=["item_post_id"],
-            context_feature_to_max_length={"viewer_id": 2, "dummy_contexual": 2},
-            context_feature_to_min_uih_length={"viewer_id": 2, "dummy_contexual": 2},
+            context_feature_to_max_length={"viewer_id": 2, "dummy_contextual": 2},
+            context_feature_to_min_uih_length={"viewer_id": 2, "dummy_contextual": 2},
             merge_uih_candidate_feature_mapping=[
                 ["uih_post_id", "item_post_id"],
             ],
@@ -218,7 +218,7 @@ class TestExtractFeatures(unittest.TestCase):
                 "candidates": [{"item_post_id": 21}],
                 "context": {
                     "viewer_id": 7,
-                    "dummy_contexual": 1,
+                    "dummy_contextual": 1,
                 },
             },
             params=PoolingParams(task="embed"),
@@ -231,11 +231,11 @@ class TestExtractFeatures(unittest.TestCase):
         )
         self.assertEqual(
             payload.ctx_keys,
-            ["viewer_id", "dummy_contexual"],
+            ["viewer_id", "dummy_contextual"],
         )
         self.assertEqual(
             payload.full_uih_keys,
-            ["viewer_id", "dummy_contexual", "uih_post_id", "uih_owner_id"],
+            ["viewer_id", "dummy_contextual", "uih_post_id", "uih_owner_id"],
         )
         self.assertEqual(payload.uih_values_per_key, [[11, 12], [101, 102]])
         self.assertEqual(payload.ctx_values_per_key, [[7], [1]])
