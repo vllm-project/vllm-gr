@@ -183,6 +183,95 @@ def _handle_beam_fork(self, fork_req) -> None:
 
 
 # ---------------------------------------------------------------------------
+# EngineCoreProc.process_output_sockets replacement
+# ---------------------------------------------------------------------------
+
+
+def process_output_sockets(
+    self,
+    output_paths,
+    coord_output_path,
+    engine_index,
+):
+    """Replacement for EngineCoreProc.process_output_sockets that fixes a
+    ZMQ zero-copy race condition (issue #91).
+
+    The original upstream implementation reuses a bytearray pool and sends
+    frames with ``copy=False``, relying on ``MessageTracker.done`` to know
+    when a buffer is safe to recycle.  Under high concurrency the tracker
+    can report completion before ZMQ's I/O thread has fully released the
+    memory, leading to garbled msgpack frames.
+
+    Fix: allocate a fresh buffer each iteration so no buffer is ever shared
+    with a prior in-flight send.  Zero-copy (``copy=False``) is preserved —
+    the ZMQ Frame holds a Python reference to the buffer, preventing GC
+    until transmission completes.  Tracker allocation is skipped for the
+    common single-frame case (no tensor backing buffers) since there is
+    nothing to track.
+    """
+    from contextlib import ExitStack
+
+    import zmq
+    from vllm.utils.network_utils import make_zmq_socket
+    from vllm.v1.engine.core import EngineCoreProc
+    from vllm.v1.serial_utils import MsgpackEncoder
+
+    encoder = MsgpackEncoder()
+    # Keep references to outputs until ZMQ is finished with their tensor
+    # backing buffers (buffers[1:] are zero-copy views into tensor memory).
+    # Only used when len(buffers) > 1 (tensor/numpy data in outputs),
+    # which does not occur for beam-search outputs (token IDs / scalars).
+    pending: list[tuple[zmq.MessageTracker, object]] = []
+
+    with ExitStack() as stack, zmq.Context() as ctx:
+        sockets = [
+            stack.enter_context(make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000))
+            for output_path in output_paths
+        ]
+        coord_socket = (
+            stack.enter_context(
+                make_zmq_socket(ctx, coord_output_path, zmq.PUSH, bind=False, linger=4000)
+            )
+            if coord_output_path is not None
+            else None
+        )
+
+        while True:
+            output = self.output_queue.get()
+            if output == EngineCoreProc.ENGINE_CORE_DEAD:
+                for socket in sockets:
+                    socket.send(output)
+                break
+            assert not isinstance(output, bytes)
+            client_index, outputs = output
+            outputs.engine_index = engine_index
+
+            if client_index == -1:
+                assert coord_socket is not None
+                coord_socket.send_multipart(encoder.encode(outputs))
+                continue
+
+            # Release outputs whose tensor backing buffers have been sent.
+            pending = [p for p in pending if not p[0].done]
+
+            buffer = bytearray()
+            buffers = encoder.encode_into(outputs, buffer)
+
+            if len(buffers) > 1:
+                # Tensor backing buffers present — need tracking to
+                # prevent GC of outputs while ZMQ reads tensor memory.
+                tracker = sockets[client_index].send_multipart(buffers, copy=False, track=True)
+                if not tracker.done:
+                    pending.append((tracker, outputs))
+            else:
+                # Common path: single msgpack frame, no tensors.
+                # copy=False with a unique buffer is safe — the ZMQ
+                # Frame prevents the buffer from being freed until
+                # transmission completes.  No tracker needed.
+                sockets[client_index].send(buffers[0], copy=False)
+
+
+# ---------------------------------------------------------------------------
 # EngineCoreProc.process_input_sockets replacement
 # ---------------------------------------------------------------------------
 

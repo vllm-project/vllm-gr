@@ -217,6 +217,7 @@ def apply_engine_core_child_patches(vllm_config=None):
         _cache_beam_request,
         _handle_beam_fork,
         process_input_sockets,
+        process_output_sockets,
     )
     from vllm_gr.v1.engine.types import BeamForkRequest
 
@@ -236,8 +237,9 @@ def apply_engine_core_child_patches(vllm_config=None):
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_fork = _handle_beam_fork
 
-    # Replace EngineCoreProc.process_input_sockets
+    # Replace EngineCoreProc.process_input_sockets and process_output_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
+    EngineCoreProc.process_output_sockets = process_output_sockets
 
     # Apply scheduler patches in the child process
     apply_scheduler_patch()
