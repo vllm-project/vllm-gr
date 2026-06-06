@@ -10,7 +10,9 @@ from typing import Any, Dict, List
 import requests
 
 try:
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
+
+    from vllm_gr.entrypoints.gr import GRLLM
 except ImportError:
     print("Error: vLLM is not installed. Please install it to run this benchmark.")
     sys.exit(1)
@@ -190,9 +192,6 @@ def main():
     # 1. Load Configuration
     if args.gr:
         logger.info("Detected --gr flag, enabling vllm-gr mode for accuracy test.")
-        from vllm_gr.entrypoints.beam_search_patch import patch_offline_beam_search
-
-        patch_offline_beam_search()
 
     if args.task_type not in TASK_REGISTRY:
         print(f"Task {args.task_type} not found in configuration.")
@@ -226,7 +225,7 @@ def main():
     else:
         logger.info(f"\nInitializing vLLM with model: {args.model}")
         try:
-            llm = LLM(
+            llm = GRLLM(
                 model=args.model,
                 trust_remote_code=True,
                 max_logprobs=gen_config.get("num_beams", 1) * 2,

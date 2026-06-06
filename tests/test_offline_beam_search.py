@@ -9,7 +9,8 @@ from typing import Any, Dict
 import psutil
 import pytest
 import torch
-from vllm import LLM
+
+from vllm_gr.entrypoints.gr import GRLLM
 
 try:
     from vllm_gr.sampling_params import BeamSearchParams
@@ -54,7 +55,7 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     # to improve performance. Reflect that here when use_patch is True.
     max_logprobs = beam_width if use_patch else 2 * beam_width
 
-    llm = LLM(
+    llm = GRLLM(
         model=model_name,
         trust_remote_code=True,
         max_logprobs=max_logprobs,

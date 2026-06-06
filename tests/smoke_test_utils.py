@@ -61,7 +61,7 @@ class SmokeHarness:
 
     def create_llm(self, **kwargs) -> None:
         module = importlib.import_module("vllm_gr.entrypoints.gr")
-        kwargs.setdefault("model_family", "hstu")
+        kwargs.setdefault("model_type", "hstu")
         return module.GRLLM(model="test-model", **kwargs)
 
     def prompt(self) -> dict[str, object]:

@@ -378,15 +378,6 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         logger.debug("vllm_gr: Skipping patch_OpenAIServingModels_init: %s", exc)
 
     try:
-        from vllm_gr.entrypoints.beam_search_patch import patch_offline_beam_search
-
-        patch_offline_beam_search()
-        patch_count += 1
-        logger.debug("vllm_gr: Applied patch_offline_beam_search")
-    except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_offline_beam_search: %s", exc)
-
-    try:
         from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
         patch_batch_and_fork()

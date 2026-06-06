@@ -131,36 +131,6 @@ class TestGREngineArgs(unittest.TestCase):
         )
         self.assertFalse(args.trust_remote_code)
 
-    def test_grllm_does_not_force_hstu_model_family(self) -> None:
-        from vllm_gr.engine.arg_utils import GREngineArgs
-        from vllm_gr.entrypoints.gr import GRLLM
-
-        captured: dict[str, object] = {}
-        fake_engine = mock.Mock()
-
-        def _fake_from_engine_args(*, engine_args, usage_context) -> None:
-            captured["model_family"] = engine_args.model_family
-            return fake_engine
-
-        with (
-            mock.patch.object(
-                GREngineArgs,
-                "_read_model_type_from_local_config",
-                return_value=None,
-            ),
-            mock.patch(
-                "vllm_gr.entrypoints.gr.GRLLMEngine.from_engine_args",
-                side_effect=_fake_from_engine_args,
-            ),
-        ):
-            llm = GRLLM(
-                model=DEMO_MODEL_DIR,
-                allow_missing_weights=True,
-            )
-
-        self.assertIsNone(captured["model_family"])
-        self.assertIsNone(llm.model_family)
-
     def test_feature_names_not_on_engine_args(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 

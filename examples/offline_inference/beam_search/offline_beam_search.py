@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
+import gc
 import time
 
 from vllm.entrypoints.llm import LLM
+
+from vllm_gr.entrypoints.gr import GRLLM
 
 try:
     from vllm_gr.sampling_params import BeamSearchParams
@@ -17,13 +20,6 @@ def beam_search_example(model, beam_width: int, compare: str):
     prompts = [
         {"prompt": long_recommendation_texts[0]},
     ]
-    # Initialize LLM
-    llm = LLM(
-        model=model,
-        max_logprobs=beam_width * 2,
-        max_num_seqs=512 * 5,
-        max_num_batched_tokens=4096 * 5,
-    )
 
     params = BeamSearchParams(beam_width=beam_width, max_tokens=5)
     if hasattr(BeamSearchParams, "begin_token"):
@@ -32,35 +28,50 @@ def beam_search_example(model, beam_width: int, compare: str):
 
     if compare != "none":
         # Send beam search request to Vanilla vLLM
+        llm = LLM(
+            model=model,
+            max_logprobs=beam_width * 2,
+            max_num_seqs=512 * 5,
+            max_num_batched_tokens=4096 * 5,
+        )
         start = time.perf_counter()
-        outputs = llm.beam_search(prompts, params)
+        llm_outputs = llm.beam_search(prompts, params)
         end = time.perf_counter()
+        llm_time = end - start
         if compare in ["latency", "both"]:
-            print(f"Vanilla vLLM with BW={beam_width} took {end - start:.6f} seconds")
+            print(f"Vanilla vLLM with BW={beam_width} took {llm_time:.6f} seconds")
 
-        if compare in ["output", "both"]:
-            # Print results
-            for index, output in enumerate(outputs):
-                for i in range(len(output.sequences)):
-                    generated_text = output.sequences[i].text
-                    print(
-                        f"Generated text {index}:{i} : {generated_text[len(long_recommendation_texts[index]) :]}"
-                    )
+        del llm
+        gc.collect()
 
+    # Initialize GRLLM
+    grllm = GRLLM(
+        model=model,
+        max_logprobs=beam_width * 2,
+        max_num_seqs=512 * 5,
+        max_num_batched_tokens=4096 * 5,
+    )
     # Send beam search request to vllm-gr
     start = time.perf_counter()
-    outputs = llm.beam_search(prompts, params)
+    outputs = grllm.beam_search(prompts, params)
     end = time.perf_counter()
-    print(f"vLLM-gr with BW={beam_width} took {(end - start):.6f} seconds")
-
     if compare in ["output", "both"]:
         # Print results
+        for index, output in enumerate(llm_outputs):
+            for i in range(len(output.sequences)):
+                generated_text = output.sequences[i].text
+                print(
+                    f"Vanilla vLLM Generated text {index}:{i} : {generated_text[len(long_recommendation_texts[index]) :]}"
+                )
         for index, output in enumerate(outputs):
             for i in range(len(output.sequences)):
                 generated_text = output.sequences[i].text
                 print(
-                    f"Generated text {index}:{i} : {generated_text[len(long_recommendation_texts[index]) :]}"
+                    f"vLLMi-gr Generated text {index}:{i} : {generated_text[len(long_recommendation_texts[index]) :]}"
                 )
+    if compare in ["latency", "both"]:
+        print(f"Vanilla vLLM with BW={beam_width} took {llm_time:.6f} seconds")
+    print(f"vLLM-gr with BW={beam_width} took {(end - start):.6f} seconds")
 
 
 def main():
