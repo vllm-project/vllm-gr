@@ -26,5 +26,15 @@ def patch_batch_and_fork():
     apply_batch_fork_patches()
     # Save the original so the wrapper can delegate without recursion
     # even if run_patch() is called again in a spawned child process.
-    run_engine_core._original_run_engine_core = EngineCoreProc.run_engine_core
+    current_run_engine_core = EngineCoreProc.run_engine_core
+    if current_run_engine_core is run_engine_core:
+        return
+    original_run_engine_core = getattr(
+        run_engine_core,
+        "_original_run_engine_core",
+        current_run_engine_core,
+    )
+    if original_run_engine_core is run_engine_core:
+        original_run_engine_core = current_run_engine_core
+    run_engine_core._original_run_engine_core = original_run_engine_core
     EngineCoreProc.run_engine_core = run_engine_core

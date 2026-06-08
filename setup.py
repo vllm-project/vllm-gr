@@ -1,82 +1,163 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Setup script for vLLM-gr with hardware-dependent installation.
+Setup script for vllm-gr with hardware-dependent installation.
 
 This setup.py implements platform-aware dependency routing so users can run
-`python setup.py install` and automatically receive the correct platform-specific
-dependencies (CUDA/NPU) without requiring extras like `[gpu]`.
+`pip install vllm-gr` and automatically receive the correct platform-specific
+dependencies (CUDA/NPU/CPU) without requiring extras like `[gpu]`.
 """
 
+import logging
 import os
+import sys
+import warnings
 from pathlib import Path
 
 from setuptools import setup
+from setuptools_scm import get_version
+
+logger = logging.getLogger("vllm_gr.setup")
+
+_VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
+
+# Module-level cache so that detect_target_device() is evaluated exactly once
+# per setup.py invocation, avoiding duplicate log output and potential
+# inconsistency if env vars change between calls.
+_cached_device: str | None = None
+
+
+def warn_deprecated_extra_install() -> None:
+    """Warn when installing via deprecated [gpu] or [npu] extras."""
+    argv = " ".join(sys.argv).lower()
+    for extra in ("[gpu]", "[npu]", ".[gpu", ".[npu"):
+        if extra in argv:
+            warnings.warn(
+                f"Installing vllm-gr via the deprecated extra {extra!r} is "
+                "supported for one transition release only. "
+                "Use `pip install -e .` instead — platform dependencies are "
+                "auto-selected by setup.py.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return
 
 
 def detect_target_device() -> str:
     """
-    Detect the target device for installation following RFC priority rules.
+    Detect the target device for installation.
 
     Priority order:
     1. VLLM_GR_TARGET_DEVICE environment variable (highest priority)
-    2. Torch backend detection (cuda, npu)
-    3. GPU fallback (default)
+    2. READTHEDOCS=1 -> cpu
+    3. Torch backend detection (cuda, npu)
+    4. No torch -> default cuda (consistent with vllm-omni)
+    5. Torch present but no GPU/NPU backend -> cpu
 
-    Returns:
-        str: Device name ('cuda', 'npu')
+    The result is cached after the first call.
     """
-    # Priority 1: Explicit override via environment variable
+    global _cached_device
+    if _cached_device is not None:
+        return _cached_device
+
     target_device = os.environ.get("VLLM_GR_TARGET_DEVICE")
     if target_device:
-        valid_devices = ["cuda", "npu"]
-        if target_device.lower() in valid_devices:
-            print(f"Using target device from VLLM_GR_TARGET_DEVICE: {target_device.lower()}")
-            return target_device.lower()
+        if target_device.lower() in _VALID_DEVICES:
+            logger.info("Using target device from VLLM_GR_TARGET_DEVICE: %s", target_device.lower())
+            _cached_device = target_device.lower()
+            return _cached_device
+        logger.warning(
+            "Invalid VLLM_GR_TARGET_DEVICE '%s', falling back to auto-detection",
+            target_device,
+        )
+
+    if os.environ.get("READTHEDOCS"):
+        logger.info("Detected READTHEDOCS=1; using cpu requirements for docs build")
+        _cached_device = "cpu"
+        return _cached_device
+
+    try:
+        import torch
+
+        if torch.version.cuda is not None:
+            logger.info("Detected CUDA backend from torch")
+            _cached_device = "cuda"
+            return _cached_device
+
+        if hasattr(torch, "npu"):
+            try:
+                if torch.npu.is_available():
+                    logger.info("Detected NPU backend from torch")
+                    _cached_device = "npu"
+                    return _cached_device
+            except Exception:
+                pass
+
+        logger.info("No GPU/NPU backend detected in torch, defaulting to CPU")
+        _cached_device = "cpu"
+        return _cached_device
+
+    except ImportError:
+        logger.info("PyTorch not found, defaulting to CUDA installation")
+        _cached_device = "cuda"
+        return _cached_device
+
+
+def get_vllm_gr_version() -> str:
+    """
+    Get the vllm-gr version with optional device-specific suffix.
+
+    Version format examples:
+        - 0.3.0 (cuda, no suffix)
+        - 0.3.0+npu
+        - 0.3.0+cpu
+
+    Environment variables:
+        VLLM_GR_VERSION_OVERRIDE: Override version completely
+        VLLM_GR_TARGET_DEVICE: Override device detection
+    """
+    if env_version := os.getenv("VLLM_GR_VERSION_OVERRIDE"):
+        logger.info("Overriding version with %s from VLLM_GR_VERSION_OVERRIDE", env_version)
+        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
+        version = get_version(write_to="vllm_gr/_version.py")
+    else:
+        try:
+            version = get_version()
+        except Exception as exc:
+            logger.warning("Failed to get version from git, using fallback: %s", exc)
+            version = "0.0.0.dev0"
+
+        device = detect_target_device()
+
+        if device == "cuda":
+            pass
+        elif device in ("npu", "cpu"):
+            sep = "+" if "+" not in version else "."
+            version += f"{sep}{device}"
         else:
-            print(
-                f"Warning: Invalid VLLM_GR_TARGET_DEVICE '{target_device}', falling back to auto-detection"
-            )
+            raise RuntimeError(f"Unknown target device: {device}")
 
-    # Priority 2: backend detection
-    import shutil
-
-    if shutil.which("npu-smi") is not None:
-        print("Detected NPU backend from torch")
-        return "npu"
-
-    print("Using default CUDA backend")
-    return "cuda"
+    os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = version
+    get_version(write_to="vllm_gr/_version.py")
+    logger.info("Generated version: %s", version)
+    return version
 
 
 def load_requirements(file_path: Path) -> list[str]:
-    """
-    Load requirements from a file, supporting -r directive for recursive loading.
-
-    Args:
-        file_path: Path to the requirements file
-
-    Returns:
-        List of requirement strings
-    """
-    requirements = []
+    """Load requirements from a file, supporting -r directive for recursive loading."""
+    requirements: list[str] = []
 
     if not file_path.exists():
-        print(f"Warning: Requirements file not found: {file_path}")
+        logger.warning("Requirements file not found: %s", file_path)
         return requirements
 
     with open(file_path) as f:
         for line in f:
             line = line.strip()
-
-            # Skip empty lines and comments
             if not line or line.startswith("#"):
                 continue
-
-            # Handle -r directive for recursive loading
             if line.startswith("-r "):
-                nested_file = line[3:].strip()
-                nested_path = file_path.parent / nested_file
+                nested_path = file_path.parent / line[3:].strip()
                 requirements.extend(load_requirements(nested_path))
             else:
                 requirements.append(line)
@@ -85,30 +166,27 @@ def load_requirements(file_path: Path) -> list[str]:
 
 
 def get_install_requires() -> list[str]:
-    """
-    Get the list of dependencies based on detected platform.
+    """Get dependencies based on detected platform."""
+    warn_deprecated_extra_install()
 
-    Returns:
-        List of requirement strings for the detected platform
-    """
     device = detect_target_device()
     requirements_dir = Path(__file__).parent / "requirements"
     requirements_file = requirements_dir / f"{device}.txt"
 
-    print(f"Loading requirements from: {requirements_file}")
+    logger.info("Loading requirements from: %s", requirements_file)
     requirements = load_requirements(requirements_file)
 
     if not requirements:
-        print(f"Warning: No requirements loaded for device '{device}'")
+        logger.warning("No requirements loaded for device '%s'", device)
     else:
-        print(f"Loaded {len(requirements)} requirements for {device}")
+        logger.info("Loaded %d requirements for %s", len(requirements), device)
 
     return requirements
 
 
 if __name__ == "__main__":
-    # Get platform-specific dependencies
-    install_requires = get_install_requires()
-
-    # Setup configuration
-    setup(version="0.3.0", install_requires=install_requires)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    setup(
+        version=get_vllm_gr_version(),
+        install_requires=get_install_requires(),
+    )

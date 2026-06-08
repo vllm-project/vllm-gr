@@ -1,16 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "pybind11", "numpy"]
+requires = [
+    "setuptools>=77.0.3,<81.0.0",
+    "wheel",
+    "setuptools-scm>=8.0",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-gr"
-version = "0.3.0"
+dynamic = ["version", "dependencies"]
 description = "vLLM-based Generative Recommender Inference Engine"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11,<3.14"
 authors = [
-    {name = "vllm-GR Authors"},
+    {name = "vllm-gr Authors"},
 ]
 keywords = ["machine-learning", "recommender-systems", "inference", "vllm", "hstu", "dlrm"]
 classifiers = [
@@ -24,106 +28,35 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# Shared dependencies only. Platform runtimes are selected via extras.
-dependencies = [
-    "vllm==0.14.*",
-    "msgspec",
-    "pandas>=3.0.0",
-    "requests>=2.32.0",
-    "scikit-learn>=1.8.0",
-    "pyarrow==23.0.0",
-    "tqdm>=4.66.0",
-]
+# Platform runtimes are selected automatically via setup.py + requirements/.
+# See docs/install_simplification_plan.md for the installation model.
 
 [project.optional-dependencies]
-# Development dependencies
 dev = [
-    "pytest",
-    "pytest-asyncio",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
     "tblib",
-    "pytest-cov",
     "black",
     "ruff",
     "mypy",
-    "psutil"
+    "psutil",
 ]
-# LMCache integration
-lmcache = [
-    "lmcache==0.4.1",
-]
-# SafeTensors for model loading
-safetensors = [
-    "safetensors>=0.4.5",
-]
-# GPU runtime for the current GR mainline
+# DEPRECATED: use `pip install -e .` — platform deps come from setup.py
+# Kept for one transition release so legacy `.[gpu]` installs still receive
+# the GPU-only GR dependencies even if setup.py metadata routing is bypassed.
 gpu = [
-    "torch==2.9.1",
-    "numpy==2.2.6",
-    "opencv-python-headless>=4.13.0",
-    "vllm==0.14.1",
     "torchrec==1.4.0",
     "fbgemm-gpu==1.4.0",
 ]
-# NPU runtime for the GR repo itself.
-npu = [
-    "opencv-python-headless>=4.13.0",
-    "vllm==0.14.1",
-    "fbgemm-gpu-cpu==1.4.0",
-]
-# Serving (future extension)
-serving = [
-    "fastapi[standard]>=0.115.0",
-    "uvicorn>=0.35.0",
-    "pydantic>=2.12.0",
-]
-# Full GPU installation
-all-gpu = [
-    "torch==2.9.1",
-    "numpy==2.2.6",
-    "opencv-python-headless>=4.13.0",
-    "vllm==0.14.1",
-    "torchrec==1.4.0",
-    "fbgemm-gpu==1.4.0",
-    "pytest>=8.0.0",
-    "pytest-cov>=6.0.0",
-    "safetensors>=0.4.5",
-    "fastapi[standard]>=0.115.0",
-    "uvicorn>=0.35.0",
-    "pydantic>=2.12.0",
-]
-# Full NPU installation
-all-npu = [
-    "opencv-python-headless>=4.13.0",
-    "vllm==0.14.1",
-    "fbgemm-gpu-cpu==1.4.0",
-    "pytest>=8.0.0",
-    "pytest-cov>=6.0.0",
-    "safetensors>=0.4.5",
-    "fastapi[standard]>=0.115.0",
-    "uvicorn>=0.35.0",
-    "pydantic>=2.12.0",
-]
-# Backward-compatible alias. Prefer all-gpu / all-npu in new docs.
-all = [
-    "torch==2.9.1",
-    "numpy==2.2.6",
-    "opencv-python-headless>=4.13.0",
-    "vllm==0.14.1",
-    "torchrec==1.4.0",
-    "fbgemm-gpu==1.4.0",
-    "pytest>=8.0.0",
-    "pytest-cov>=6.0.0",
-    "safetensors>=0.4.5",
-    "fastapi[standard]>=0.115.0",
-    "uvicorn>=0.35.0",
-    "pydantic>=2.12.0",
-]
+# DEPRECATED: use `pip install -e .` — platform deps come from setup.py
+npu = []
 
 [project.urls]
-Homepage = "https://github.com/your-org/vllm-GR"
-Documentation = "https://github.com/your-org/vllm-GR#readme"
-Repository = "https://github.com/your-org/vllm-GR.git"
-Issues = "https://github.com/your-org/vllm-GR/issues"
+Homepage = "https://github.com/JiusiServe/vllm-gr"
+Documentation = "https://github.com/JiusiServe/vllm-gr#readme"
+Repository = "https://github.com/JiusiServe/vllm-gr.git"
+Issues = "https://github.com/JiusiServe/vllm-gr/issues"
 
 [project.entry-points."vllm.general_plugins"]
 vllm_gr = "vllm_gr.plugin:register"
@@ -136,7 +69,9 @@ where = ["."]
 include = ["vllm_gr*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.json"]
+"vllm_gr" = ["_version.py", "*.json"]
+
+[tool.setuptools_scm]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

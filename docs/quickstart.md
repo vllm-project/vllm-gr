@@ -31,23 +31,33 @@ pip --version
 #pip 25.0.1 from /your-path/vllm-gr/.venv/lib/python3.12/site-packages/pip (python 3.12)
 ```
 
-3. **Installation**
+3. **Install vLLM (base environment)**
 
-For standard installation, run
+vllm-gr does not install vllm. Prepare the GPU base environment first:
+
+```bash
+uv pip install vllm==0.14.1 --torch-backend=auto
+```
+
+4. **Install vllm-gr**
+
+For standard installation:
 
 ```bash
 pip install -e .
 ```
 
-Alternatively, for developer mode, run
+For developer mode (includes pytest, ruff, etc.):
 
 ```bash
-pip install -e .[dev]
+pip install -e ".[dev]"
 ```
+
+Platform dependencies (torchrec, fbgemm-gpu) are selected automatically by `setup.py`. LMCache is not installed by default for now. See [getting_started/installation/](getting_started/installation/README.md).
 
 > **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
 
-4. **Verify installation**
+5. **Verify installation**
 
 ```bash
 python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"

@@ -51,6 +51,7 @@ jobs:
       - name: Build Wheel
         env:
           UV_SYSTEM_PYTHON: 1
+          VLLM_GR_TARGET_DEVICE: cpu
         run: |
           bash scripts/build_wheel.sh --python python
 

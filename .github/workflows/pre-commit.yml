@@ -42,7 +42,7 @@ jobs:
         with:
           path: .venv
           base: /data/actions/cache
-          key: venv-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          key: venv-${{ runner.os }}-vllm0.14.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
 
       - name: Create virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -60,15 +60,21 @@ jobs:
           echo "Error: The PR has ${{ github.event.pull_request.commits }} commits. Please squash them into a single commit."
           exit 1
 
+      - name: Install base environment (vllm)
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          uv pip install vllm==0.14.1
+
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
-          # Install all dependencies and the package concurrently (fast)
-          uv pip install .[dev]
+          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+          uv pip install -e ".[dev]"
 
-      - name: Install vllm-gr
+      - name: Install vllm-gr (editable refresh)
         run: |
-          uv pip install --reinstall --no-deps .
+          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+          uv pip install -e ".[dev]"
 
       - uses: pre-commit/action@v3.0.1
         with:
@@ -110,3 +116,7 @@ jobs:
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
         run: |
           ./tests/system/run_benchmark_and_verify.sh
+
+      - name: Run HSTU auto tests
+        run: |
+          python scripts/run_tests.py --all --auto-platform

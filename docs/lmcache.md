@@ -50,9 +50,13 @@ LMCache typically operates through a **Controller-Worker** model. The workers (i
 
 ### Install lmcache
 
- ```bash
+LMCache is included automatically on the CUDA install path (`requirements/cuda.txt`). If you installed with `VLLM_GR_TARGET_DEVICE=cpu` or need to reinstall:
+
+```bash
 pip install lmcache==0.4.1
- ```
+# or
+pip install "vllm-gr[lmcache]"
+```
 
 ### Run standalone vllm-gr with lmcache
 

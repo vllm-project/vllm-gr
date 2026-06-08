@@ -228,3 +228,10 @@ tmp/
 # Profiling
 *.prof
 *.lprof
+
+# setuptools-scm generated version file
+vllm_gr/_version.py
+
+# AI coding assistants
+.claude/
+.codex/

@@ -18,9 +18,7 @@ git clone https://github.com/JiusiServe/vllm-gr.git
 cd vllm-gr
 ```
 
-2. **Create environment**
-
-### install CANN
+2. **Create environment and install CANN**
 
 - Follow miniconda installation procedure on [conda installation](https://www.anaconda.com/docs/getting-started/miniconda/install/linux-install) if not yet installed.
 - For details about CANN installation on various platforms, please refer to [CANN installation](https://ascend.github.io/docs/sources/ascend/quick_install.html)
@@ -36,27 +34,37 @@ conda install -c https://repo.huaweicloud.com/ascend/repos/conda ascend::cann-nn
 source ${CONDA_PREFIX}/Ascend/nnal/atb/set_env.sh
 ```
 
-3. **Install vllm-gr**
+3. **Install vllm-ascend (base environment)**
 
-For standard installation, run
-
-```bash
-pip install .
-```
-
-Alternatively, for developer mode, run
-
-```bash
-pip install -e .[dev]
-```
-
-4. **Install vllm-ascend**
+vllm-gr does **not** install vllm-ascend. Install the Ascend platform stack first:
 
 ```bash
 pip install vllm-ascend==0.14.0rc1
 ```
 
-5. **Verify installation**
+See the [vllm-ascend v0.14.0rc1 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.14.0rc1).
+
+4. **Install GR-specific manual dependencies**
+
+```bash
+pip install /path/to/torchrec-1.4.0-npu.whl
+pip install fbgemm-gpu==1.4.0+cpu \
+  --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+5. **Install vllm-gr**
+
+```bash
+VLLM_GR_TARGET_DEVICE=npu pip install -e . --no-build-isolation
+```
+
+For developer mode:
+
+```bash
+VLLM_GR_TARGET_DEVICE=npu pip install -e ".[dev]" --no-build-isolation
+```
+
+6. **Verify installation**
 
 ```bash
 python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
@@ -64,4 +72,6 @@ python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
 
 ## Quick Start
 
-Refer to [quickstart](quickstart.md#quick-start) for deployment
+Refer to [quickstart](quickstart.md#quick-start) for deployment.
+
+See [getting_started/installation/npu/npu.inc.md](getting_started/installation/npu/npu.inc.md) for the full NPU installation guide.

@@ -91,9 +91,10 @@ class TestGREngineArgs(unittest.TestCase):
             return_value=False,
         ):
             args = GREngineArgs(
-                model="test-model",
+                model=DEMO_MODEL_DIR,
                 model_family="hstu",
                 enable_prefix_caching=True,
+                allow_missing_weights=True,
             )
 
         self.assertTrue(args.enable_prefix_caching)
@@ -107,8 +108,9 @@ class TestGREngineArgs(unittest.TestCase):
             return_value=True,
         ):
             args = GREngineArgs(
-                model="test-model",
+                model=DEMO_MODEL_DIR,
                 model_family="hstu",
+                allow_missing_weights=True,
             )
 
         self.assertTrue(args.disable_hybrid_kv_cache_manager)

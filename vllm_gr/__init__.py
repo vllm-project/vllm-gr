@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Public API package for vllm-GR.
+"""Public API package for vllm-gr.
 
 Top-level ``import vllm_gr`` is intentionally lightweight:
 
@@ -18,7 +18,7 @@ import warnings
 from importlib import import_module
 from typing import Any
 
-__version__ = "0.3.0"
+from vllm_gr.version import __version__
 
 _PUBLIC_EXPORTS: dict[str, tuple[str, str, bool]] = {
     "GRPrompt": ("vllm_gr.inputs.data", "GRPrompt", False),

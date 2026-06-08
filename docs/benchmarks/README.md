@@ -162,13 +162,21 @@ You can refer also to [`Quickstart`](../quickstart.md) menu.
   cd vllm-gr
   ```
 
-2. **Installation**
+2. **Install vLLM (base environment)**
+
+  ```bash
+  uv pip install vllm==0.14.1 --torch-backend=auto
+  ```
+
+3. **Install vllm-gr**
 
   ```bash
   pip install -e .
+  # or for development:
+  pip install -e ".[dev]"
   ```
 
-3. **Verify installation**
+4. **Verify installation**
 
   ```bash
   python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"

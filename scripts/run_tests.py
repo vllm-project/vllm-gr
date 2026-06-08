@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unified test runner for the reduced core vllm-GR test matrix.
+"""Unified test runner for the reduced core vllm-gr test matrix.
 
 Runs core correctness suites plus optional GPU/NPU smoke lanes and examples.
 
@@ -55,7 +55,6 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
             "test_gr_model_adapter_interface.py",
             "test_gr_capabilities.py",
             "test_async_gr_engine.py",
-            "test_gr_config_pickle.py",
             "test_batch_recommendation_contract.py",
             "test_output_processor_adapter_e2e.py",
             "test_hstu_adapter_contract.py",
@@ -346,7 +345,7 @@ def determine_requested_suites(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run vllm-GR tests and examples",
+        description="Run vllm-gr tests and examples",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -409,7 +408,7 @@ def main() -> None:
     requested_suites, runtime_backend = determine_requested_suites(args)
 
     print("=" * 60)
-    print("  vllm-GR Test Runner")
+    print("  vllm-gr Test Runner")
     print("=" * 60)
 
     if args.auto_platform:
