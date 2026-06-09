@@ -3,67 +3,65 @@
 # This script is meant to be sourced.
 # It provides utilities to allocate and manage local NPU resources.
 
+chip_num() {
+    # Run the npu-smi command and extract the chip count
+    local output=$(npu-smi info -t board -i 0)
+    local chip_count=$(echo "$output" | grep "Chip Count" | awk -F': *' '{print $2}' | tr -cd '0-9')
+    # Return the chip count
+    echo "$chip_count"
+}
+
+npu_count() {
+   local output=$(npu-smi info -l)
+   local count=$(echo "$output" | grep "Total Count" | awk -F': *' '{print$2}' | tr -cd '0-9')
+   echo "$count"
+}
+
+NPU_COUNT=$(npu_count)
+CHIP_NUM=$(chip_num)
+
 function is_available_npu() {
-    local i=$1
-    local mem_npu=$2
+    local npu_id=$1
+    local threshold=$2
 
-    # npu-smi doesn't have a nice query format like nvidia-smi, so we parse the text output.
-    local smi_output
-    smi_output=$(npu-smi info 2>/dev/null) || return 1
+    # Calculate card_id and chip_id
+    local nchip=${CHIP_NUM}
 
-    # Check 1: No running processes. This is a very strong signal of availability.
-    if ! echo "$smi_output" | grep -q "No running processes found in NPU $i"; then
-        return 1
-    fi
+    local card_id=$(( npu_id / nchip ))
+    local chip_id=$(( npu_id % nchip ))
 
-    # Extract the two-line block for the NPU
-    # The grep pattern looks for a line starting with "| " followed by the NPU id and a space.
-    local npu_block
-    npu_block=$(echo "$smi_output" | grep -A 1 "^| ${i} ")
+    # Get memory usage data
+    local usage_data=$(npu-smi info -t usages -i $card_id -c $chip_id)
 
-    if [ -z "$npu_block" ]; then
-        return 1
-    fi
+    # Extract HBM Capacity and Usage Rate
+    local hbm_capacity=$(echo "$usage_data" | grep -i "HBM Capacity" | awk -F': *' '{print $2}' | tr -cd '0-9')
+    local usage_rate=$(echo "$usage_data" | grep -i "HBM Usage Rate" | awk -F': *' '{print $2}' | tr -cd '0-9')
 
-    # Parse health from the first line
-    local health
-    health=$(echo "$npu_block" | head -n 1 | awk -F'|' '{print $3}' | tr -d ' ')
+    # Calculate used memory percentage
+    local used_memory_percent=$((hbm_capacity * usage_rate / 100))
 
-    # Parse AICore and HBM usage from the second line
-    local stats_line
-    stats_line=$(echo "$npu_block" | tail -n 1 | awk -F'|' '{print $4}')
-    local aicore
-    aicore=$(echo "$stats_line" | awk '{print $1}')
-    local mem_used
-    mem_used=$(echo "$stats_line" | awk '{print $2}')
-
-    if [ -z "$health" ] || [ -z "$aicore" ] || [ -z "$mem_used" ]; then
-        return 1
-    fi
-
-    # CRITERIA CHECK:
-    # - Is health OK?
-    # - Is AICore utilization 0?
-    # - Is HBM memory used < mem_npu limit?
-    if [ "$health" = "OK" ] && [ "$aicore" -eq 0 ] && [ "$mem_used" -lt "$mem_npu" ]; then
+    # Check against threshold
+    if (( used_memory_percent <= threshold )); then
         return 0
+    else
+        return 1
     fi
-    return 1
 }
 
 function get_npu() {
-    local mem_npu=${1:-16}
+    local mem_npu=${1:-3000}
     local timeout_secs=${2:-0} # 0 means wait indefinitely
 
-    local npu_count
-    npu_count=$(npu-smi info 2>/dev/null | grep "^| [0-9]" | awk '{print $2}' | sort -u | wc -l)
-    if [ -z "$npu_count" ] || [ "$npu_count" -eq 0 ]; then echo "No NPUs available"; return 1; fi
+    local ncount
+    ncount=${NPU_COUNT}
+    nchip=${CHIP_NUM}
+    total=$(( ncount * nchip ))
 
     local start_time=$(date +%s)
 
     while true; do
         # Loop through each NPU index
-        for (( i=0; i<npu_count; i++ ))
+        for (( i=0; i<total; i++ ))
         do
             if is_available_npu "$i" "$mem_npu"; then
                 echo $i
@@ -87,10 +85,9 @@ function get_npus() {
     local mem_npu=${2:-16}
     local timeout_secs=${3:-0} # 0 means wait indefinitely
 
-    local npu_count
-    npu_count=$(npu-smi info 2>/dev/null | grep -c "^| [0-9]" || true)
-    if [ -z "$npu_count" ] || [ "$npu_count" -eq 0 ]; then return 1; fi
-
+    local ncount=${NPU_COUNT}
+    local nchip=${CHIP_NUM}
+    local total=$(( ncount * nchip ))
     local start_time=$(date +%s)
 
     while true; do
@@ -98,7 +95,7 @@ function get_npus() {
         local found=0
 
         # Loop through each NPU index
-        for (( i=0; i<npu_count; i++ ))
+        for (( i=0; i<total; i++ ))
         do
             if is_available_npu "$i" "$mem_npu"; then
                 if [ -z "$idle_npus" ]; then

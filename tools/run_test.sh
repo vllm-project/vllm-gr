@@ -4,7 +4,13 @@ set -euo pipefail
 ./tests/development/test_resource.sh
 # test pre-commit
 source "./tools/resource.sh"
-idle_gpu=$(get_gpu 18)
+if [ "${npu_state:-}" == "true" ]; then
+    mem_th=3000
+else
+    mem_th=18
+fi
+
+idle_gpu=$(get_gpu $mem_th)
 rc=$?
 if [ $rc -ne 0 ] || [ -z "$idle_gpu" ]; then
     echo "No GPUs found that are 0% utilized, using < 16MiB memory, and error-free. (exit code: $rc)"

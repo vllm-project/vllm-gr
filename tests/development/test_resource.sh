@@ -3,7 +3,10 @@
 # Integration test for resource.sh
 # This script verifies GPU allocation and locking mechanisms.
 set -euo pipefail
-
+mem_th=18
+if command -v npu-smi &> /dev/null; then
+  mem_th=3000
+fi
 # Check for required system dependencies
 if command -v nvidia-smi &> /dev/null; then
     GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader | tail -n 1 || echo 0)
@@ -24,7 +27,7 @@ echo "Running tests for resource.sh..."
 # 1. Test get_gpu
 echo -n "Testing get_gpu... "
 set +e
-GPU_ID=$(get_gpu 100 15)
+GPU_ID=$(get_gpu $mem_th 15)
 rc=$?
 set -e
 
@@ -66,7 +69,7 @@ if [ "$GPU_COUNT" -lt 2 ]; then
 fi
 
 set +e
-GPU_IDS=$(get_gpus 2 100 15)
+GPU_IDS=$(get_gpus 2 $mem_th 15)
 rc=$?
 set -e
 

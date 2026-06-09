@@ -8,7 +8,7 @@ fi
 
 # Configuration
 UPSTREAM_REF="upstream/main"
-EXPORT_BRANCH="export-branch-$(date +%Y%m%d-%H%M%S)"
+EXPORT_BRANCH="export-branch"
 PATCH_FILE=$(mktemp /tmp/changes.patch.XXXXXX)
 ADDED_FILES_LIST=$(mktemp /tmp/added_files.txt.XXXXXX)
 EXCLUDE_DIR="trc"
@@ -35,7 +35,7 @@ git diff --name-only --diff-filter=A "$UPSTREAM_REF" HEAD -- . ":!$EXCLUDE_DIR" 
 
 # 3. Create an export branch based on upstream/main
 echo "3. Creating export branch $EXPORT_BRANCH..."
-git checkout -b "$EXPORT_BRANCH" "$UPSTREAM_REF"
+git checkout -B "$EXPORT_BRANCH" "$UPSTREAM_REF"
 
 # 4. Apply the diff created in stage 1
 echo "4. Applying diff..."

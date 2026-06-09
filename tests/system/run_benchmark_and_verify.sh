@@ -9,6 +9,23 @@ pass_32_th=0.2
 recall_32_th=0.04
 elapsed_time_ol=70
 
+device="gpu"
+#if exist npu-smi tune some threshold
+if command -v npu-smi &> /dev/null; then
+   device="npu"
+   board_id=$(python -c "import acl;print(acl.get_soc_name())" 2>/dev/null || echo "unknown")
+   echo "identify $board_id"
+   case $board_id in
+    "Ascend910_9362" )
+      p99_ttft_th=1000
+      elapsed_time_ol=92
+       ;;
+    * )
+    echo "using default thresholds for $board_id" ;;
+  esac
+fi
+
+
 validate_metric() {
     local metric_name="$1"
     local metric_value="$2"
@@ -25,16 +42,38 @@ validate_metric() {
     fi
 
     if awk -v val="$metric_value" -v th="$threshold" "$awk_script"; then
-        echo "SUCCESS: ${metric_name} (${metric_value}) is ${condition_text} ${threshold}."
+        echo "SUCCESS on ${device}: ${metric_name} (${metric_value}) is ${condition_text} ${threshold}."
     else
-        echo "FAILURE: ${metric_name} (${metric_value}) is not ${condition_text} ${threshold}."
+        echo "FAILURE on ${device}: ${metric_name} (${metric_value}) is not ${condition_text} ${threshold}."
         exit 1
     fi
 }
 
+# Function to extract numeric value based on string key from multi-line input
+extract_numeric_value() {
+    local input_lines="$1"
+    local string_key="$2"
+
+    # Use grep to find the line containing the string key
+    local matched_line=$(echo "$input_lines" | grep -m 1 "$string_key")
+
+    if [[ -n "$matched_line" ]]; then
+        # Use regex to extract the numeric value from the matched line
+        local value=$(echo "$matched_line" | grep -oP "$string_key.*:\s*\K[0-9.]+")
+        if [[ -z "$value" ]]; then
+            echo "Error: Key $string_key not found, or formatting did not match" >&2
+            return  1
+        else
+            echo "$value"
+        fi
+    else
+      echo "key $string_key not found" >&2
+      return 1
+    fi
+}
 echo "offline test"
 
-output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+output=$( python -m benchmarks.open_one_rec.one_rec_acc_test \
 --gr \
 --model OpenOneRec/OneRec-1.7B \
 --dataset-path "$DATASET_PATH" \
@@ -43,25 +82,21 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
 --use-beam-search \
 --task-type video \
 --catalog-path "$CATALOG_PATH" \
---n 128)
+--n 128 )
+
 
 echo "$output"
 
-pass_1=$(echo "$output" | grep -E '^[[:space:]]*"pass@1":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
-pass_32=$(echo "$output" | grep -E '^[[:space:]]*"pass@32":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
-recall_32=$(echo "$output" | grep -E '^[[:space:]]*"recall@32":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
-elaped_time=$(echo "$output" | grep -E '^[[:space:]]*"elapsed_time":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
+pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
+pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
+recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
+elapsed_time=$(extract_numeric_value "$output" "elapsed_time") || exit 1
 
-
-if [ -z "$pass_1" ] || [ -z "$pass_32" ] || [ -z "$recall_32" ] || [ -z "$elaped_time" ]; then
-    echo "Error: Could not extract accuracy metrics from the output."
-    exit 1
-fi
 
 echo "Parsed pass@1: $pass_1"
 echo "Parsed pass@32: $pass_32"
 echo "Parsed recall@32: $recall_32"
-echo "Parsed elapsed_time: $elaped_time"
+echo "Parsed elapsed_time: $elapsed_time"
 
 
 # Validate pass@1
@@ -74,7 +109,7 @@ validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
 validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
 
 # Validate elapsed_time
-validate_metric "elapsed_time" "$elaped_time" "$elapsed_time_ol" "le"
+validate_metric "elapsed_time" "$elapsed_time" "$elapsed_time_ol" "le"
 
 
 # online tests
@@ -139,29 +174,23 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   --request-rate 0.5 \
   --n 128)
 
-
-
 echo "$output"
 
 # Extract P99 TTFT
-p99_ttft=$(echo "$output" | grep "P99 TTFT (ms):" | awk '{print $4}')
-p99_tpot=$(echo "$output" | grep "P99 TPOT (ms):" | awk '{print $4}')
 
-if [ -z "$p99_ttft" ]; then
-    echo "Error: Could not extract 'P99 TTFT (ms)' from the output."
+
+failed=$(extract_numeric_value "$output" "Failed requests")
+if [[ "$failed" -ne 0 ]]; then
+    echo "FAILURE: There were $failed failed requests."
     exit 1
 fi
 
-echo "Parsed P99 TTFT: ${p99_ttft} ms"
+p99_ttft=$(extract_numeric_value "$output" "P99 TTFT") || exit 1
+p99_tpot=$(extract_numeric_value "$output" "P99 TPOT") || exit 1
 
+echo "Parsed P99 TTFT: ${p99_ttft}"
 # Validate P99 ttft (Using awk to safely evaluate floating point comparison)
 validate_metric "P99 TTFT" "$p99_ttft" "$p99_ttft_th" "le"
-
-if [ -z "$p99_tpot" ]; then
-    echo "Error: Could not extract 'P99 TPOT (ms)' from the output."
-    exit 1
-fi
-
 echo "Parsed P99 TPOT: ${p99_tpot} ms"
 
 # Validate P99 tpot (Using awk to safely evaluate floating point comparison)
@@ -180,14 +209,9 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
 --n 128)
 
 echo "$output"
-pass_1=$(echo "$output" | grep -E '^[[:space:]]*"pass@1":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
-pass_32=$(echo "$output" | grep -E '^[[:space:]]*"pass@32":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
-recall_32=$(echo "$output" | grep -E '^[[:space:]]*"recall@32":' | tail -1 | awk -F':' '{print $2}' | tr -d ' ,')
-
-if [ -z "$pass_1" ] || [ -z "$pass_32" ] || [ -z "$recall_32" ]; then
-    echo "Error: Could not extract accuracy metrics from the output."
-    exit 1
-fi
+pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
+pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
+recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
 
 echo "Parsed pass@1: $pass_1"
 echo "Parsed pass@32: $pass_32"
