@@ -128,6 +128,43 @@ def register_adapter_class(
     _ADAPTER_CLASSES[model_type] = cls
 
 
+def is_adapter_registered(model_type: str) -> bool:
+    """Check if an adapter is registered or can be loaded for *model_type*.
+
+    Returns True if the adapter is already in the registry or can be
+    dynamically imported without errors. Returns False if the adapter
+    module doesn't exist or fails to import.
+
+    This is useful for checking adapter availability before attempting
+    to create an adapter, avoiding exception handling in the caller.
+    """
+    if model_type is None:
+        return False
+
+    # Check if already registered
+    if model_type in _ADAPTER_CLASSES:
+        return True
+
+    # Try to load it dynamically
+    target_module = f"vllm_gr.adapters.{model_type}.adapter"
+    adapter_package = f"vllm_gr.adapters.{model_type}"
+    try:
+        importlib.import_module(target_module)
+        return model_type in _ADAPTER_CLASSES
+    except ModuleNotFoundError as exc:
+        # Return False if the adapter package or module doesn't exist
+        # exc.name could be either 'vllm_gr.adapters.qwen3' or 'vllm_gr.adapters.qwen3.adapter'
+        if exc.name in (target_module, adapter_package):
+            return False
+        # Re-raise if it's a different import error (missing dependency)
+        raise
+    except Exception:
+        # Adapter module exists but failed to import (e.g., due to
+        # unregistered config classes, missing dependencies, etc.)
+        # Return False so caller can fall back gracefully
+        return False
+
+
 def get_adapter_class(model_type: str) -> type["GRModelAdapter"]:
     """Return the adapter class for *model_type*.
 

@@ -11,7 +11,7 @@ refer to [quickstart.md](../../../docs/quickstart.md) for installation
 - Run server (beam search patches are auto-loaded via plugin)
 
 ```bash
-vllm serve OpenOneRec/OneRec-1.7B \
+vllm-gr serve OpenOneRec/OneRec-1.7B \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \

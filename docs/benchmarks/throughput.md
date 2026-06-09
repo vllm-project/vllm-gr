@@ -38,7 +38,7 @@ Run the server and client separately for a production‑style setup.
 
 ```bash
 
-  vllm serve OpenOneRec/OneRec-1.7B \
+  vllm-gr serve OpenOneRec/OneRec-1.7B \
   --max-logprobs 1024 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --max-num-seqs 1024 \

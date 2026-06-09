@@ -136,12 +136,32 @@ class GRLLMEngine(LLMEngine):
         Looks up the adapter class from the registry and injects it into both
         input and output processors so they delegate model-specific logic
         correctly.
+
+        Only replaces processors if model_type is detected and a GR adapter
+        is registered for it. Falls back to standard vLLM processors otherwise.
         """
-        from vllm_gr.adapters.registry import create_adapter, resolve_model_type
+        from vllm_gr.adapters.registry import (
+            create_adapter,
+            is_adapter_registered,
+            resolve_model_type,
+        )
 
         model_type = resolve_model_type(self.vllm_config)
-        adapter = create_adapter(model_type, self.vllm_config, self.gr_config)
 
+        # If no model_type detected, keep standard vLLM processors
+        if model_type is None:
+            logger.info("No GR model_type detected; using standard vLLM processors")
+            return
+
+        # Check if adapter is registered; fall back to standard processors if not
+        if not is_adapter_registered(model_type):
+            logger.info(
+                "No GR adapter registered for model_type=%s; using standard vLLM processors",
+                model_type,
+            )
+            return
+
+        adapter = create_adapter(model_type, self.vllm_config, self.gr_config)
         logger.info("Created adapter for model_type=%s: %s", model_type, type(adapter).__name__)
 
         self.input_processor = GRInputProcessor(

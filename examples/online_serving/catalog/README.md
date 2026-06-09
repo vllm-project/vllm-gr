@@ -38,7 +38,7 @@ python benchmarks/open_one_rec/tools/convert_catalog.py \
 - Add the catalog attribute to server invocation
 
 ```bash
- vllm serve OpenOneRec/OneRec-1.7B \
+ vllm-gr serve OpenOneRec/OneRec-1.7B \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \

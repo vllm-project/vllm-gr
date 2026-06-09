@@ -27,10 +27,37 @@ class GRAsyncLLM(AsyncLLM):
     gr_config: GRConfig
 
     def _replace_processors(self) -> None:
-        from vllm_gr.adapters.registry import create_adapter, resolve_model_type
+        """Replace default processors with GR-specific versions.
+
+        Only replaces processors if model_type is detected and a GR adapter
+        is registered for it. Falls back to standard vLLM processors otherwise.
+        """
+        import logging
+
+        from vllm_gr.adapters.registry import (
+            create_adapter,
+            is_adapter_registered,
+            resolve_model_type,
+        )
 
         model_type = resolve_model_type(self.vllm_config)
+
+        # If no model_type detected, keep standard vLLM processors
+        if model_type is None:
+            return
+
+        # Check if adapter is registered; fall back to standard processors if not
+        if not is_adapter_registered(model_type):
+            logging.getLogger("vllm_gr.engine").info(
+                "No GR adapter registered for model_type=%s; using standard vLLM processors",
+                model_type,
+            )
+            return
+
         adapter = create_adapter(model_type, self.vllm_config, self.gr_config)
+        logging.getLogger("vllm_gr.engine").info(
+            "Created adapter for model_type=%s: %s", model_type, type(adapter).__name__
+        )
 
         self.input_processor = GRInputProcessor(
             vllm_config=self.vllm_config,

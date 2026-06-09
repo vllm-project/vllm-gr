@@ -71,7 +71,7 @@ max_local_cpu_size: 120" > lmcache_standalone.yaml
 
 ```bash
 LMCACHE_CONFIG_FILE=lmcache_standalone.yaml \
-vllm serve \
+vllm-gr serve \
     OpenOneRec/OneRec-1.7B \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
@@ -157,7 +157,7 @@ CUDA_VISIBLE_DEVICES=0 \
 TMPDIR=/tmp \
 LMCACHE_LOG_LEVEL=WARNING \
 LMCACHE_CONFIG_FILE=lmcache_controller_vllm_1.yaml \
-vllm serve OpenOneRec/OneRec-1.7B \
+vllm-gr serve OpenOneRec/OneRec-1.7B \
     --port 10501 \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
@@ -174,7 +174,7 @@ CUDA_VISIBLE_DEVICES=1 \
 TMPDIR=/tmp \
 LMCACHE_LOG_LEVEL=WARNING \
 LMCACHE_CONFIG_FILE=lmcache_controller_vllm_2.yaml \
-vllm serve OpenOneRec/OneRec-1.7B \
+vllm-gr serve OpenOneRec/OneRec-1.7B \
     --port 10502 \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \

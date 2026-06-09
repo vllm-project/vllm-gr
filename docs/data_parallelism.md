@@ -1,10 +1,10 @@
 # Scaling vLLM with Nginx Load Balancing
 
-This guide provides instructions for scaling `vllm-gr` throughput using Data Parallelism (DP) by running multiple independent `vllm serve` instances behind an Nginx load balancer.
+This guide provides instructions for scaling `vllm-gr` throughput using Data Parallelism (DP) by running multiple independent `vllm-gr serve` instances behind an Nginx load balancer.
 
 ## Overview
 
-In standard `vllm serve` configurations, a single Python process manages the API server, tokenization, and request scheduling. For high-throughput workloads (like **Beam Search**), the CPU-bound ApiServer front-end vllm process often becomes a bottleneck, preventing linear scaling across multiple GPUs.
+In standard `vllm-gr serve` configurations, a single Python process manages the API server, tokenization, and request scheduling. For high-throughput workloads (like **Beam Search**), the CPU-bound ApiServer front-end vllm process often becomes a bottleneck, preventing linear scaling across multiple GPUs.
 
 By deploying $N$ independent vLLM processes, we distribute the CPU load across multiple Python interpreters (bypassing the GIL).
 
@@ -18,7 +18,7 @@ Assign each vLLM instance to a specific GPU using `CUDA_VISIBLE_DEVICES`. Ensure
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-vllm serve \
+vllm-gr serve \
     --port 9001 \
     --trust-remote-code \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
@@ -34,7 +34,7 @@ vllm serve \
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
-vllm serve \
+vllm-gr serve \
     --port 9002 \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
@@ -115,7 +115,7 @@ sudo nginx -c /path/to/file/nginx_vllm.conf -g "daemon off;"
 
 ## 4. Client Integration
 
-Update your client or benchmark to point to the load balancer port (`8000`) instead of the 'vllm serve' individual engine ports. For example:
+Update your client or benchmark to point to the load balancer port (`8000`) instead of the 'vllm-gr serve' individual engine ports. For example:
 
 ```bash
 python -m benchmarks.open_one_rec.one_rec_main bench serve --endpoint /v1/chat/completions --backend openai-chat --model OpenOneRec/OneRec-1.7B --dataset-name onerec --dataset-path ./data --task-type video --num-prompts 200 --use-beam-search --profile --n 128 --port 8000
@@ -126,7 +126,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve --endpoint /v1/chat/c
 The script does the following:
 
 1. Gets an optional argument (default: 2) of number of GPUs to use (N)
-2. Launches N `vllm serve` processes (in parallel) and wait for all to be ready.
+2. Launches N `vllm-gr serve` processes (in parallel) and wait for all to be ready.
     Each vllm process uses one GPU.
     Each vllm process's output is directed to log file under temp directory nginx_dp_run
 3. Launches a single Nginx load balnacer on port 8000.
@@ -217,7 +217,7 @@ for ((id=0; id<N; id++)); do
 
     # Launch using standard environment
     CUDA_VISIBLE_DEVICES=$current_gpu \
-    vllm serve \
+    vllm-gr serve \
         --port $run_port \
         --trust-remote-code \
         --default-chat-template-kwargs '{"enable_thinking": false}' \

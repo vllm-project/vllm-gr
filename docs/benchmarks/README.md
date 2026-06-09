@@ -86,7 +86,7 @@ For production-like testing with separate server and client:
 
 ```bash
 # On Terminal 1: Start vLLM API server
-vllm serve OpenOneRec/OneRec-1.7B \
+vllm-gr serve OpenOneRec/OneRec-1.7B \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \
@@ -496,7 +496,7 @@ extra_body parameters ignored
 
 ```bash
 # Start server
-vllm serve OpenOneRec/OneRec-1.7B --gpu-memory-utilization 0.9
+vllm-gr serve OpenOneRec/OneRec-1.7B --gpu-memory-utilization 0.9
 
 # Use endpoint
 --endpoint http://localhost:8000/v1

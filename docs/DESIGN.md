@@ -157,7 +157,7 @@ The plugin integrates with vLLM's v1 engine through:
     - `vllm-gr bench`: Benchmark HSTU model performance
     - `vllm-gr run-batch`: Execute batch inference tasks
     - `vllm-gr recommend`: Generate recommendations via CLI
-    - Follows vLLM's CLI pattern (`vllm serve`, `vllm bench`, etc.)
+    - Follows vLLM's CLI pattern (`vllm-gr serve`, `vllm-gr bench`, etc.)
 
 - **`api_server.py`**: Online serving API server
     - OpenAI-compatible API server for recommendation models
@@ -544,8 +544,8 @@ hstu = "vllm_gr.model_executor.hstu_model_executor:HSTUModelExecutor"
 # Start API server for online serving
 vllm-gr serve hstu-model --port 8100 --host 0.0.0.0
 
-# Or use vllm serve with plugin
-vllm serve hstu-model --port 8100 --plugins vllm-gr
+# Or use vllm-gr serve with plugin
+vllm-gr serve hstu-model --port 8100 --plugins vllm-gr
 ```
 
 **Offline Serving** (Python Interface):

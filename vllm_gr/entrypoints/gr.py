@@ -79,19 +79,35 @@ class GRLLM(LLM):
         # Detect model_type from explicit parameter or config file
         resolved_model_type = model_type
         if resolved_model_type is None:
-            import json
             import os
 
-            config_path = os.path.join(model, "config.json")
-            if os.path.exists(config_path):
-                try:
-                    with open(config_path) as f:
+            from vllm_gr.adapters.registry import is_adapter_registered
+
+            # Try to load config - handles both local paths and HuggingFace model names
+            try:
+                # First check if it's a local path
+                config_path = os.path.join(model, "config.json")
+                if os.path.isfile(config_path):
+                    import json
+
+                    with open(config_path, encoding="utf-8") as f:
                         config = json.load(f)
                         resolved_model_type = config.get("model_type")
-                        if isinstance(resolved_model_type, str):
-                            resolved_model_type = resolved_model_type.strip().lower() or None
-                except Exception:
-                    pass  # Failed to detect, will use backward compatibility
+                else:
+                    # Not a local path, try loading from HuggingFace
+                    from transformers import AutoConfig
+
+                    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+                    resolved_model_type = getattr(config, "model_type", None)
+
+                if isinstance(resolved_model_type, str):
+                    resolved_model_type = resolved_model_type.strip().lower() or None
+            except Exception:
+                pass  # Failed to detect, will use backward compatibility
+
+            # If there is no adapter registered for the detected model_type, fall back to backward compatibility mode
+            if resolved_model_type is not None and not is_adapter_registered(resolved_model_type):
+                resolved_model_type = None
 
         # Backward compatibility: if no model_type is detected, delegate
         # entirely to the standard vLLM LLM initialisation.

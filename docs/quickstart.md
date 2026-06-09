@@ -61,10 +61,10 @@ To run vllm-gr in a server--client configuration, use two terminals
 
 ### On the first terminal: Run the server
 
-Use vllm serve (beam search patches are automatically loaded via plugin)
+Use vllm-gr serve (beam search patches are automatically loaded via plugin)
 
 ```bash
-vllm serve OpenOneRec/OneRec-1.7B \
+vllm-gr serve OpenOneRec/OneRec-1.7B \
   --trust-remote-code \
   --max-logprobs 1024 \
   --max-num-seqs 1024 \
@@ -101,8 +101,8 @@ Or use the [benchmark](benchmarks/README.md) to run a more complete benchmark te
 
 ### Data Parallelism
 
-To run `vllm serve` with data parallelism, please see [data_parallelism.md](data_parallelism.md)
+To run `vllm-gr serve` with data parallelism, please see [data_parallelism.md](data_parallelism.md)
 
 ### LMCache
 
-To run `vllm serve` with LMCache, please see [lmcache.md](lmcache.md)
+To run `vllm-gr serve` with LMCache, please see [lmcache.md](lmcache.md)

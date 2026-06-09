@@ -83,7 +83,7 @@ validate_metric "elapsed_time" "$elaped_time" "$elapsed_time_ol" "le"
 # Ensure we clean up the background server process if the script exits early
 trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; sleep 2; pkill -P "$SERVER_PID" 2>/dev/null || true; fi' EXIT
 
-vllm serve \
+vllm-gr serve \
     --port $run_port \
     --seed 123 \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
