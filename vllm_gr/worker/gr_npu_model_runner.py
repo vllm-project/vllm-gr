@@ -11,7 +11,11 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
-from vllm_gr.adapters.registry import create_adapter, resolve_model_type
+from vllm_gr.adapters.registry import (
+    create_adapter,
+    get_model_type_from_config,
+    is_adapter_registered,
+)
 from vllm_gr.config.gr_config import GRConfig
 from vllm_gr.worker.gr_runner_mixin import GRFeatureRunnerMixin
 
@@ -21,7 +25,11 @@ class GRNPUModelRunner(GRFeatureRunnerMixin, NPUModelRunner):
 
     def __init__(self, vllm_config, device, gr_config=None):
         gr_config = gr_config or GRConfig()
-        model_type = resolve_model_type(vllm_config)
+        model_type = get_model_type_from_config(vllm_config)
+        if not is_adapter_registered(model_type):
+            raise ValueError(
+                f"GRNPUModelRunner requires a registered adapter, got model_type={model_type!r}"
+            )
         adapter = create_adapter(model_type, vllm_config, gr_config)
         super().__init__(
             vllm_config=vllm_config,
@@ -34,8 +42,10 @@ class GRNPUModelRunner(GRFeatureRunnerMixin, NPUModelRunner):
         if model is None or not getattr(model, "_hstu_kv_cache_layers", None):
             return False
 
-        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
-        return bool(hf_config is not None and getattr(hf_config, "model_type", None) == "hstu")
+        from vllm_gr.adapters.registry import is_adapter_registered
+
+        model_type = get_model_type_from_config(self.vllm_config)
+        return is_adapter_registered(model_type)
 
     def load_model(self, *args, **kwargs):
         result = super().load_model(*args, **kwargs)

@@ -294,6 +294,16 @@ class TestGRAsyncLLM(unittest.TestCase):
         if not _HAS_TORCHREC:
             self.skipTest("torchrec not available for full adapter wiring test")
 
+        # Ensure the HSTU family is registered so is_adapter_registered() can find it.
+        from vllm_gr.adapters.registry import get_registered_families, register_family
+
+        if "hstu" not in get_registered_families():
+            register_family(
+                model_type="hstu",
+                gpu_worker="vllm_gr.worker.gr_worker.GRWorker",
+                npu_worker="vllm_gr.worker.gr_npu_worker.GRNPUWorker",
+            )
+
         instance._replace_processors()
 
         # Both processors must have the same adapter instance

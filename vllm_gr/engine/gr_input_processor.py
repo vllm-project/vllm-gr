@@ -26,7 +26,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_gr.adapters.capabilities import GRPrefixCacheSupport
 from vllm_gr.engine import GREngineCoreRequest
-from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
+from vllm_gr.inputs.data import GRPrompt
 
 logger = logging.getLogger("vllm_gr.input_processor")
 
@@ -62,10 +62,23 @@ class GRInputProcessor(InputProcessor):
         priority: int = 0,
         data_parallel_rank: int | None = None,
     ) -> EngineCoreRequest:
-        if not is_gr_prompt(prompt):
-            raise TypeError(
-                f"GRInputProcessor only supports GRPrompt inputs; got {type(prompt).__name__}"
+        # No adapter → standard vLLM path
+        if self._adapter is None:
+            return super().process_inputs(
+                request_id=request_id,
+                prompt=prompt,
+                params=params,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
             )
+
+        # Adapter exists + PoolingParams → GR path
+        if not isinstance(params, PoolingParams):
+            raise TypeError(f"Expected PoolingParams for GR request, got {type(params).__name__}")
 
         return self._process_gr_prompt(
             request_id=request_id,

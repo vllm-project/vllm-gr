@@ -17,7 +17,7 @@ from vllm.v1.metrics.loggers import StatLoggerFactory
 from vllm_gr.config.gr_config import GRConfig
 from vllm_gr.engine.gr_input_processor import GRInputProcessor
 from vllm_gr.engine.gr_output_processor import GROutputProcessor
-from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
+from vllm_gr.inputs.data import GRPrompt
 from vllm_gr.outputs import GRRequestOutput
 
 
@@ -29,27 +29,22 @@ class GRAsyncLLM(AsyncLLM):
     def _replace_processors(self) -> None:
         """Replace default processors with GR-specific versions.
 
-        Only replaces processors if model_type is detected and a GR adapter
-        is registered for it. Falls back to standard vLLM processors otherwise.
+        Only replaces processors when an adapter is registered for the model.
+        Falls back to standard vLLM processors otherwise.
         """
         import logging
 
         from vllm_gr.adapters.registry import (
             create_adapter,
+            get_model_type_from_config,
             is_adapter_registered,
-            resolve_model_type,
         )
 
-        model_type = resolve_model_type(self.vllm_config)
+        model_type = get_model_type_from_config(self.vllm_config)
 
-        # If no model_type detected, keep standard vLLM processors
-        if model_type is None:
-            return
-
-        # Check if adapter is registered; fall back to standard processors if not
         if not is_adapter_registered(model_type):
             logging.getLogger("vllm_gr.engine").info(
-                "No GR adapter registered for model_type=%s; using standard vLLM processors",
+                "No adapter registered for model_type=%r; using standard vLLM processors",
                 model_type,
             )
             return
@@ -133,10 +128,8 @@ class GRAsyncLLM(AsyncLLM):
         truncate_prompt_tokens: int | None = None,
         tokenization_kwargs: dict | None = None,
     ) -> AsyncGenerator[GRRequestOutput, None]:
-        if not is_gr_prompt(prompt):
-            raise TypeError(
-                f"GRAsyncLLM.encode expects GRPrompt input; got {type(prompt).__name__}"
-            )
+        if not isinstance(prompt, dict):
+            raise TypeError(f"GRAsyncLLM.encode expects dict input; got {type(prompt).__name__}")
         if pooling_params.task != "embed":
             raise ValueError(
                 "GRAsyncLLM.encode requires PoolingParams(task='embed'); "

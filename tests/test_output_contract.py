@@ -976,12 +976,14 @@ class TestOutputContract(unittest.TestCase):
                 input_processor_path,
             )
 
+        # With adapter present, non-PoolingParams/non-SamplingParams raises TypeError
         processor = module.GRInputProcessor(
             vllm_config=None,
             tokenizer=None,
+            adapter=object(),
         )
 
-        with self.assertRaisesRegex(TypeError, "only supports GRPrompt"):
+        with self.assertRaisesRegex(TypeError, "Expected PoolingParams for GR request"):
             processor.process_inputs(
                 request_id="req-1",
                 prompt="not-a-gr-prompt",
@@ -1001,7 +1003,7 @@ class TestOutputContract(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "No model weight files found"):
                 module.GREngineArgs(
                     model=tmpdir,
-                    model_family="hstu",
+                    hf_overrides={"model_type": "hstu"},
                 )
 
     def test_arg_utils_allows_explicit_dummy_loader_for_weightless_local_model_dir(self) -> None:
@@ -1016,7 +1018,7 @@ class TestOutputContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             args = module.GREngineArgs(
                 model=tmpdir,
-                model_family="hstu",
+                hf_overrides={"model_type": "hstu"},
                 allow_missing_weights=True,
             )
 

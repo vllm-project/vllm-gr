@@ -15,13 +15,13 @@ from vllm_gr.adapters.registry import (
     ensure_adapter_class_registered,
     get_adapter_class,
     get_family_info,
+    get_model_type_from_config,
     get_payload_type,
     get_registered_families,
     get_worker_cls_path,
     is_adapter_registered,
     register_adapter_class,
     register_family,
-    resolve_model_type,
 )
 
 __all__ = [
@@ -32,11 +32,11 @@ __all__ = [
     "ensure_adapter_class_registered",
     "get_adapter_class",
     "get_family_info",
+    "get_model_type_from_config",
     "get_payload_type",
     "get_registered_families",
     "get_worker_cls_path",
     "is_adapter_registered",
     "register_adapter_class",
     "register_family",
-    "resolve_model_type",
 ]

@@ -77,7 +77,7 @@ class TestGREngineArgs(unittest.TestCase):
         ):
             args = GREngineArgs(
                 model=DEMO_MODEL_DIR,
-                model_family="hstu",
+                hf_overrides={"model_type": "hstu"},
                 allow_missing_weights=True,
             )
         self.assertEqual(args.worker_cls, "vllm_gr.worker.gr_worker.GRWorker")
@@ -92,7 +92,7 @@ class TestGREngineArgs(unittest.TestCase):
         ):
             args = GREngineArgs(
                 model=DEMO_MODEL_DIR,
-                model_family="hstu",
+                hf_overrides={"model_type": "hstu"},
                 enable_prefix_caching=True,
                 allow_missing_weights=True,
             )
@@ -109,13 +109,13 @@ class TestGREngineArgs(unittest.TestCase):
         ):
             args = GREngineArgs(
                 model=DEMO_MODEL_DIR,
-                model_family="hstu",
                 allow_missing_weights=True,
+                hf_overrides={"model_type": "hstu"},
             )
 
         self.assertTrue(args.disable_hybrid_kv_cache_manager)
 
-    def test_unknown_model_family_does_not_apply_hstu_defaults(self) -> None:
+    def test_no_model_type_does_not_apply_hstu_defaults(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         with mock.patch.object(
@@ -265,32 +265,32 @@ class TestGRPrompt(unittest.TestCase):
         self.assertFalse(is_gr_prompt({"user_id": 1, "model_type": "   "}))
         self.assertFalse(is_gr_prompt({"user_id": 1, "model_type": 123}))
 
-    def test_ensure_registered_model_family_propagates_broken_import(self) -> None:
+    def test_ensure_registered_model_type_propagates_broken_import(self) -> None:
         """A broken adapter dependency must propagate, not be silently
         swallowed as 'unregistered family'."""
         from unittest import mock
 
-        from vllm_gr.inputs.data import _ensure_registered_model_family
+        from vllm_gr.inputs.data import _ensure_registered_model_type
 
         exc = ModuleNotFoundError("torchrec")
         exc.name = "torchrec"
         with mock.patch("importlib.import_module", side_effect=exc):
             # torchrec is NOT the target module, so this should re-raise
             with self.assertRaises(ModuleNotFoundError):
-                _ensure_registered_model_family("broken_dep_adapter")
+                _ensure_registered_model_type("broken_dep_adapter")
 
-    def test_ensure_registered_model_family_silences_missing_adapter(self) -> None:
+    def test_ensure_registered_model_type_silences_missing_adapter(self) -> None:
         """When the adapter package itself is missing, no error is raised."""
         from unittest import mock
 
-        from vllm_gr.inputs.data import _ensure_registered_model_family
+        from vllm_gr.inputs.data import _ensure_registered_model_type
 
         target = "vllm_gr.adapters.nonexistent_pkg_xyz"
         exc = ModuleNotFoundError(target)
         exc.name = target
         with mock.patch("importlib.import_module", side_effect=exc):
             # Should NOT raise — the adapter package simply doesn't exist
-            _ensure_registered_model_family("nonexistent_pkg_xyz")
+            _ensure_registered_model_type("nonexistent_pkg_xyz")
 
 
 @unittest.skipUnless(_HAS_VLLM_RUNTIME, _SKIP_REASON)

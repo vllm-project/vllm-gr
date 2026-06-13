@@ -137,26 +137,20 @@ class GRLLMEngine(LLMEngine):
         input and output processors so they delegate model-specific logic
         correctly.
 
-        Only replaces processors if model_type is detected and a GR adapter
-        is registered for it. Falls back to standard vLLM processors otherwise.
+        Only replaces processors when an adapter is registered for the model.
+        Falls back to standard vLLM processors otherwise.
         """
         from vllm_gr.adapters.registry import (
             create_adapter,
+            get_model_type_from_config,
             is_adapter_registered,
-            resolve_model_type,
         )
 
-        model_type = resolve_model_type(self.vllm_config)
+        model_type = get_model_type_from_config(self.vllm_config)
 
-        # If no model_type detected, keep standard vLLM processors
-        if model_type is None:
-            logger.info("No GR model_type detected; using standard vLLM processors")
-            return
-
-        # Check if adapter is registered; fall back to standard processors if not
         if not is_adapter_registered(model_type):
             logger.info(
-                "No GR adapter registered for model_type=%s; using standard vLLM processors",
+                "No adapter registered for model_type=%r; using standard vLLM processors",
                 model_type,
             )
             return

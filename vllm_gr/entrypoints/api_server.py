@@ -37,29 +37,26 @@ def _apply_client_process_config(
 
 
 def _log_disabled_recommend_api(
-    model_family: str | None,
+    has_adapter: bool,
+    model_type: str | None,
     supported_tasks: Any,
 ) -> None:
     supported_task_names = sorted(str(task) for task in supported_tasks)
     supported_tasks_text = ", ".join(supported_task_names) or "<none>"
 
     reasons: list[str] = []
-    if model_family is None:
+    if not has_adapter:
         reasons.append(
-            "model_family could not be resolved to 'hstu'; when serving from a "
-            "local model path, Recommend API requires config.json to declare "
-            '"model_type": "hstu" or the server to be started with '
-            "--model-family hstu."
+            "No adapter registered for model_type=%r. "
+            "Recommend API requires a model with a registered adapter." % (model_type,)
         )
-    elif model_family != "hstu":
-        reasons.append("Recommend API is mounted only for model_family='hstu'.")
-
     if "embed" not in supported_tasks:
         reasons.append("The model does not advertise the required 'embed' task.")
 
     logger.warning(
-        "Recommend API disabled: model_family=%r, supported_tasks=%s. %s",
-        model_family,
+        "Recommend API disabled: model_type=%r, has_adapter=%s, supported_tasks=%s. %s",
+        model_type,
+        has_adapter,
         supported_tasks_text,
         " ".join(reasons),
     )
@@ -149,7 +146,6 @@ async def init_gr_app_state(
     engine_client: EngineClient,
     state: State,
     args: Namespace,
-    model_family: str | None,
 ) -> None:
     await openai_api_server.init_app_state(engine_client, state, args)
 
@@ -160,7 +156,15 @@ async def init_gr_app_state(
     if embedding_handler is not None:
         request_logger = embedding_handler.request_logger
 
-    if "embed" in supported_tasks and model_family == "hstu":
+    from vllm_gr.adapters.registry import (
+        get_model_type_from_config,
+        is_adapter_registered,
+    )
+
+    model_type = get_model_type_from_config(engine_client.vllm_config)
+    has_adapter = is_adapter_registered(model_type)
+
+    if "embed" in supported_tasks and has_adapter:
         state.gr_serving_recommendation = GRServingRecommendation(
             engine_client=engine_client,
             models=state.openai_serving_models,
@@ -170,7 +174,8 @@ async def init_gr_app_state(
     else:
         state.gr_serving_recommendation = None
         _log_disabled_recommend_api(
-            model_family=model_family,
+            has_adapter=has_adapter,
+            model_type=model_type,
             supported_tasks=supported_tasks,
         )
 
@@ -210,7 +215,6 @@ async def run_server_worker(
             engine_client,
             app.state,
             args,
-            model_family=engine_args.model_family,
         )
 
         logger.info(

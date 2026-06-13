@@ -50,12 +50,6 @@ class GRServeSubcommand(CLISubcommand):
 
         serve_parser = make_arg_parser(serve_parser)
         serve_parser.add_argument(
-            "--model-family",
-            type=str,
-            default=None,
-            help="GR model family identifier. Use 'hstu' for HSTU models.",
-        )
-        serve_parser.add_argument(
             "--dataset",
             type=str,
             default=None,

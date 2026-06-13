@@ -62,10 +62,11 @@ class GRCommonEngineArgsMixin:
     # GR-specific: Dataset identifier (drives config overrides)
     dataset: Optional[str] = None
 
-    # GR-specific: explicit model family for backend/runtime defaults.
-    # Keep this separate from HuggingFace's ``model_type`` so future GR
-    # model families can coexist without assuming unknown models are HSTU.
-    model_family: Optional[str] = None
+    # GR-specific: model type. When passed in by the caller (e.g. GRLLM
+    # forwards its resolved value), acts as an explicit override. Otherwise
+    # resolved from hf_overrides / config.json / HuggingFace AutoConfig in
+    # __post_init__. None after resolution = standard LLM path.
+    model_type: Optional[str] = None
 
     # GR-specific: explicit opt-in for demo/example flows that intentionally
     # provide only config.json and rely on randomly initialized weights.
@@ -80,23 +81,28 @@ class GRCommonEngineArgsMixin:
         # Merge dataset overrides into hf_overrides (in-memory, never disk)
         self._apply_dataset_overrides()
 
-        self.model_family = self._resolve_model_family()
-        self._apply_model_family_defaults()
+        self.model_type = self._resolve_model_type()
+
+        from vllm_gr.adapters.registry import is_adapter_registered
+
+        if is_adapter_registered(self.model_type):
+            self._ensure_family_registered(self.model_type)
+            self._apply_type_defaults()
 
     def _is_ascend_platform(self) -> bool:
         """Return True when the active vLLM platform is Ascend/NPU."""
         return current_platform.device_type == "npu"
 
-    def _select_worker_cls_for_model_family(
+    def _select_worker_cls_for_model_type(
         self,
-        model_family: Optional[str],
+        model_type: Optional[str],
     ) -> Optional[str]:
-        """Choose a worker only when the model family defines one."""
+        """Choose a worker only when the model type defines one."""
         from vllm_gr.adapters.registry import get_worker_cls_path
 
-        if model_family is None:
+        if model_type is None:
             return None
-        return get_worker_cls_path(model_family, is_npu=self._is_ascend_platform())
+        return get_worker_cls_path(model_type, is_npu=self._is_ascend_platform())
 
     def _has_model_weights(self) -> bool:
         """Check if the model path contains HuggingFace-style weight files."""
@@ -119,7 +125,7 @@ class GRCommonEngineArgsMixin:
         return False
 
     @staticmethod
-    def _normalize_model_family(value: Optional[str]) -> Optional[str]:
+    def _normalize_model_type(value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         normalized = value.strip().lower()
@@ -129,7 +135,7 @@ class GRCommonEngineArgsMixin:
         if isinstance(self.hf_overrides, dict):
             model_type = self.hf_overrides.get("model_type")
             if isinstance(model_type, str):
-                return self._normalize_model_family(model_type)
+                return self._normalize_model_type(model_type)
         return None
 
     def _read_model_type_from_local_config(self) -> Optional[str]:
@@ -138,7 +144,7 @@ class GRCommonEngineArgsMixin:
             return None
         model_type = config.get("model_type")
         if isinstance(model_type, str):
-            return self._normalize_model_family(model_type)
+            return self._normalize_model_type(model_type)
         return None
 
     def _read_local_config_dict(self) -> Optional[Dict[str, Any]]:
@@ -157,11 +163,39 @@ class GRCommonEngineArgsMixin:
                 f"Failed to read local model config at {config_path}: {exc}"
             ) from exc
 
-    def _resolve_model_family(self) -> Optional[str]:
-        """Resolve the GR model family without assuming unknown == HSTU."""
-        explicit = self._normalize_model_family(self.model_family)
-        if explicit is not None:
-            return explicit
+    def _read_model_type_from_huggingface(self) -> Optional[str]:
+        """Read ``model_type`` from a HuggingFace ``AutoConfig``.
+
+        Only triggers when ``self.model`` is not a local directory, avoiding
+        a double-read of local configs already handled by
+        :meth:`_read_model_type_from_local_config`.
+        """
+        if not self.model or os.path.isdir(self.model):
+            return None
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+            model_type = getattr(config, "model_type", None)
+            if isinstance(model_type, str):
+                return self._normalize_model_type(model_type)
+        except Exception as exc:
+            logger.debug("Skipping HuggingFace AutoConfig for '%s': %s", self.model, exc)
+        return None
+
+    def _resolve_model_type(self) -> Optional[str]:
+        """Extract ``model_type`` from available config sources.
+
+        Priority: explicit ``model_type`` field → ``hf_overrides`` → local
+        ``config.json`` → HuggingFace ``AutoConfig``.  Pure extraction — no
+        registry lookup.  Returns ``None`` when nothing is detected.
+
+        To override, pass ``model_type`` directly or use
+        ``--hf-overrides '{"model_type": "xxx"}'``.
+        """
+        explicit_model_type = self._normalize_model_type(self.model_type)
+        if explicit_model_type is not None:
+            return explicit_model_type
 
         override_model_type = self._read_model_type_from_hf_overrides()
         if override_model_type is not None:
@@ -171,45 +205,40 @@ class GRCommonEngineArgsMixin:
         if config_model_type is not None:
             return config_model_type
 
-        if not self.model:
-            # The in-repo no-path flow is still the current HSTU bootstrap path.
-            return "hstu"
+        hf_model_type = self._read_model_type_from_huggingface()
+        if hf_model_type is not None:
+            return hf_model_type
 
         return None
 
-    def _apply_model_family_defaults(self) -> None:
-        """Apply runtime defaults for known GR model families via registry."""
+    def _apply_type_defaults(self) -> None:
+        """Apply runtime defaults for known GR model types via registry."""
         from vllm_gr.adapters.registry import apply_family_defaults
 
-        if self.model_family is not None:
-            # Ensure the family is registered (Layer 1, pure Python).
-            # The adapter packages register themselves on import.
-            self._ensure_family_registered(self.model_family)
-
-        apply_family_defaults(self.model_family, self)
+        apply_family_defaults(self.model_type, self)
 
     @staticmethod
-    def _ensure_family_registered(model_family: str) -> None:
-        """Trigger Layer 1 registration for the given family if not already done.
+    def _ensure_family_registered(model_type: str) -> None:
+        """Trigger Layer 1 registration for the given model type if not already done.
 
-        Uses dynamic discovery: imports ``vllm_gr.adapters.<model_family>``
+        Uses dynamic discovery: imports ``vllm_gr.adapters.<model_type>``
         which triggers ``register_family()`` in that package's ``__init__.py``.
-        No hardcoded family list — new models only need to create the adapter
+        No hardcoded model type list — new models only need to create the adapter
         package directory with a ``register_family()`` call.
         """
         from vllm_gr.adapters.registry import get_registered_families
 
-        if model_family in get_registered_families():
+        if model_type in get_registered_families():
             return
 
         import importlib
 
-        target = f"vllm_gr.adapters.{model_family}"
+        target = f"vllm_gr.adapters.{model_type}"
         try:
             importlib.import_module(target)
         except ModuleNotFoundError as exc:
             if exc.name == target:
-                pass  # adapter package not installed — family stays unregistered
+                pass  # adapter package not installed — type stays unregistered
             else:
                 raise
 
@@ -278,7 +307,7 @@ class GREngineArgs(GRCommonEngineArgsMixin, EngineArgs):
     enable_npu_fused_prefill: Optional[bool] = None
     force_hammer_npu: Optional[bool] = None
     dataset: Optional[str] = None
-    model_family: Optional[str] = None
+    model_type: Optional[str] = None
     allow_missing_weights: bool = False
 
     @classmethod
@@ -305,7 +334,7 @@ class GRAsyncEngineArgs(GRCommonEngineArgsMixin, AsyncEngineArgs):
     enable_npu_fused_prefill: Optional[bool] = None
     force_hammer_npu: Optional[bool] = None
     dataset: Optional[str] = None
-    model_family: Optional[str] = None
+    model_type: Optional[str] = None
     allow_missing_weights: bool = False
 
     @classmethod

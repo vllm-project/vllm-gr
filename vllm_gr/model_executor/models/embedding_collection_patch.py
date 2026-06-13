@@ -51,7 +51,7 @@ def ec_patched_forward_wo_embedding_copy(
 ) -> Dict[str, Any]:
     """Mirror golden sparse inference lookup behavior for EmbeddingCollection.
 
-    This patch keeps the inference path close to the upstream `model_family`
+    This patch keeps the inference path close to the upstream
     implementation while failing fast on invalid ids for the inference-only
     adapter.
     """

@@ -230,26 +230,16 @@ def ensure_adapter_class_registered(model_type: str) -> None:
 # ── Internal helpers ─────────────────────────────────────────────
 
 
-def resolve_model_type(vllm_config: Any) -> str:
-    """Resolve the GR model type from a vllm_config.
+def get_model_type_from_config(vllm_config: Any) -> str | None:
+    """Extract ``hf_config.model_type`` from ``vllm_config``.
 
-    Checks ``hf_config.model_type`` first, then falls back to
-    ``gr_config.model_family``, then to ``"hstu"`` as a last resort.
+    Pure data access — no registry lookup or filtering.  Pair with
+    :func:`is_adapter_registered` for validation.
     """
-    model_type = getattr(
+    return getattr(
         getattr(getattr(vllm_config, "model_config", None), "hf_config", None),
         "model_type",
         None,
-    )
-    if model_type:
-        return model_type
-    return (
-        getattr(
-            getattr(vllm_config, "gr_config", None),
-            "model_family",
-            None,
-        )
-        or "hstu"
     )
 
 

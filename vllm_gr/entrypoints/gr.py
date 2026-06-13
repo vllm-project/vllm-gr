@@ -76,16 +76,13 @@ class GRLLM(LLM):
             "dataset": kwargs.pop("dataset", None),
         }
 
-        # Detect model_type from explicit parameter or config file
+        # Extract model_type from explicit parameter or config file
         resolved_model_type = model_type
         if resolved_model_type is None:
             import os
 
-            from vllm_gr.adapters.registry import is_adapter_registered
-
             # Try to load config - handles both local paths and HuggingFace model names
             try:
-                # First check if it's a local path
                 config_path = os.path.join(model, "config.json")
                 if os.path.isfile(config_path):
                     import json
@@ -94,7 +91,6 @@ class GRLLM(LLM):
                         config = json.load(f)
                         resolved_model_type = config.get("model_type")
                 else:
-                    # Not a local path, try loading from HuggingFace
                     from transformers import AutoConfig
 
                     config = AutoConfig.from_pretrained(model, trust_remote_code=True)
@@ -105,9 +101,11 @@ class GRLLM(LLM):
             except Exception:
                 pass  # Failed to detect, will use backward compatibility
 
-            # If there is no adapter registered for the detected model_type, fall back to backward compatibility mode
-            if resolved_model_type is not None and not is_adapter_registered(resolved_model_type):
-                resolved_model_type = None
+        # Validate: only keep model_type if an adapter is registered for it
+        from vllm_gr.adapters.registry import is_adapter_registered
+
+        if not is_adapter_registered(resolved_model_type):
+            resolved_model_type = None
 
         # Backward compatibility: if no model_type is detected, delegate
         # entirely to the standard vLLM LLM initialisation.
@@ -134,9 +132,10 @@ class GRLLM(LLM):
         for policy_name, policy_value in hstu_runtime_policy.items():
             if policy_value is not None and hasattr(resolved_gr_config, policy_name):
                 setattr(resolved_gr_config, policy_name, policy_value)
+
         engine_args = GREngineArgs(
             model=model,
-            model_family=resolved_model_type,
+            model_type=resolved_model_type,
             max_seq_len=resolved_gr_config.max_seq_len,
             max_candidates=resolved_gr_config.max_candidates,
             enable_npu_fused_prefill=getattr(resolved_gr_config, "enable_npu_fused_prefill", None),
@@ -155,7 +154,7 @@ class GRLLM(LLM):
         self.engine_class = type(self.llm_engine)
 
         self.model = model
-        self.model_family = engine_args.model_family
+        self.model_type = engine_args.model_type
         self.max_seq_len = resolved_gr_config.max_seq_len
         self.max_candidates = resolved_gr_config.max_candidates
         self.gr_config = resolved_gr_config
@@ -173,9 +172,9 @@ class GRLLM(LLM):
             self.catalog.load(catalog_path)
 
         logger.info(
-            "GRLLM initialized: model=%s, model_family=%s, max_seq_len=%d, max_candidates=%d",
+            "GRLLM initialized: model=%s, model_type=%s, max_seq_len=%d, max_candidates=%d",
             model,
-            self.model_family,
+            self.model_type,
             self.max_seq_len,
             self.max_candidates,
         )

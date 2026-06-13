@@ -145,8 +145,13 @@ def _patched_gr_npu_model_runner() -> None:
         with (
             mock.patch.object(
                 gr_npu_model_runner_module,
-                "resolve_model_type",
+                "get_model_type_from_config",
                 return_value="hstu",
+            ),
+            mock.patch.object(
+                gr_npu_model_runner_module,
+                "is_adapter_registered",
+                return_value=True,
             ),
             mock.patch.object(
                 gr_npu_model_runner_module,
@@ -296,13 +301,14 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
             max_seq_len=128,
             max_candidates=256,
             hf_overrides={
+                "model_type": "hstu",
                 "contextual_feature_to_max_length": {
                     "user_id": 1,
                     "sex": 1,
                     "age_group": 1,
                     "occupation": 1,
                     "zip_code": 1,
-                }
+                },
             },
             allow_missing_weights=True,
         )

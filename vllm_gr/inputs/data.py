@@ -87,7 +87,7 @@ def is_gr_prompt(prompt: Any) -> bool:
         normalized_model_type = model_type.strip().lower()
         if not normalized_model_type:
             return False
-        _ensure_registered_model_family(normalized_model_type)
+        _ensure_registered_model_type(normalized_model_type)
         from vllm_gr.adapters.registry import get_registered_families
 
         return normalized_model_type in get_registered_families()
@@ -97,16 +97,16 @@ def is_gr_prompt(prompt: Any) -> bool:
     return True
 
 
-def _ensure_registered_model_family(model_type: str) -> None:
+def _ensure_registered_model_type(model_type: str) -> None:
     """Best-effort Layer-1 registration for prompt-type dispatch.
 
-    Importing ``vllm_gr.adapters.<model_type>`` triggers the family
+    Importing ``vllm_gr.adapters.<model_type>`` triggers the adapter
     package's ``register_family()`` call when such a package exists.
 
     Only suppresses ``ModuleNotFoundError`` when the missing module is
     the adapter package itself.  A broken transitive dependency (e.g.
     torchrec) propagates so the caller sees a real error, not a silent
-    "unregistered family" failure.
+    "unregistered model type" failure.
     """
     from vllm_gr.adapters.registry import get_registered_families
 
