@@ -1,107 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Monkey-patches for EngineCore / EngineCoreProc to support
-ADD_BATCH and BEAM_FORK."""
+ADD_BATCH and MEGA_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
-import os
+from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
 
 logger = init_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# Helper: Pre-compute shared prefix groups for attention beam routing
-# ---------------------------------------------------------------------------
-
-
-def _get_lcp(a: list, b: list, hint: int = 0) -> int:
-    """Find longest common prefix between two hash lists using binary search."""
-    m = min(len(a), len(b))
-    if m == 0:
-        return 0
-
-    start = 0
-    end = m - 1
-
-    if hint > 0:
-        h = min(hint, m)
-        if a[h - 1] == b[h - 1]:
-            if h == m or a[h] != b[h]:
-                return h
-            start = h
-        else:
-            end = h - 2
-
-    if start <= end and a[end] == b[end]:
-        return end + 1
-
-    ans = start
-    low, high = start, end
-    while low <= high:
-        mid = (low + high) // 2
-        if a[mid] == b[mid]:
-            ans = mid + 1
-            low = mid + 1
-        else:
-            high = mid - 1
-    return ans
-
-
-def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: int) -> list:
-    """Group requests by beam priority and find the common prefix depth.
-    This function groups all requests of the same beam priority into a single group,
-    calculating the longest common prefix (LCP) shared by all requests in the group.
-    """
-    if not req_ids:
-        return []
-
-    # The min_group_th defines the minimum number of common blocks required
-    # to justify the overhead of a shared prefix group.
-    # 256 tokens (approx 16 blocks of size 16) is a heuristic for
-    # when the compute savings outweigh the kernel launch overhead.
-    min_group_th = 256 // block_size
-
-    # Group requests by beam group id (priority)
-    beam_groups: dict[int, list[str]] = {}
-    for req_id in req_ids:
-        if req_id not in requests:
-            continue
-        g = requests[req_id].priority
-        if g not in beam_groups:
-            beam_groups[g] = []
-        beam_groups[g].append(req_id)
-
-    all_groups = []
-    for g, group_req_ids in beam_groups.items():
-        n = len(group_req_ids)
-        if n == 0:
-            continue
-        if n == 1:
-            all_groups.append((0, [group_req_ids[0]]))
-            continue
-
-        # Calculate minimum Longest Common Prefix (LCP) across all adjacent requests in the group
-        min_lcp = float("inf")
-        last_lcp = 0
-        for i in range(n - 1):
-            req1 = requests[group_req_ids[i]]
-            req2 = requests[group_req_ids[i + 1]]
-
-            common_len = _get_lcp(req1.block_hashes, req2.block_hashes, hint=last_lcp)
-
-            min_lcp = common_len if common_len < min_lcp else min_lcp
-            last_lcp = common_len
-
-            if min_lcp < min_group_th:
-                min_lcp = 0
-                break
-        all_groups.append((min_lcp, group_req_ids))
-
-    return all_groups
-
 
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
@@ -188,56 +99,39 @@ def _add_enum_member(name: str, value: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _is_lmcache_patch_enabled(vllm_config=None) -> bool:
-    if vllm_config is not None:
-        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-        if kv_transfer_config is not None:
-            if getattr(kv_transfer_config, "kv_connector", None) == "LMCacheConnectorV1":
-                return True
-
-    return os.getenv("VLLM_GR_LMCACHE_PATCH", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-    )
-
-
-def apply_engine_core_child_patches(vllm_config=None):
+def apply_engine_core_child_patches():
     """Apply all patches inside the EngineCore child process.
 
     This must be called at the start of run_engine_core (the child process
     entry point) because multiprocessing 'spawn' starts a fresh Python
     interpreter that does not inherit monkey patches from the parent.
     """
-    import vllm.v1.engine as engine_mod
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
-        _handle_beam_fork,
+        _handle_mega_request_step_update,
         process_input_sockets,
     )
-    from vllm_gr.v1.engine.types import BeamForkRequest
 
-    # Inject types into vllm.v1.engine module
-    engine_mod.BeamForkRequest = BeamForkRequest
-
-    # Add new enum members: ADD_BATCH, BEAM_FORK
+    # Add new enum members: ADD_BATCH, MEGA_REQUEST_STEP_UPDATE
     _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_FORK", b"\x06")
+    _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
 
     # Wrap EngineCore.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
 
-    # Bind _cache_beam_request and _handle_beam_fork on both classes
+    # Bind _cache_beam_request and _handle_mega_request_step_update on both classes
     EngineCore._cache_beam_request = _cache_beam_request
-    EngineCore._handle_beam_fork = _handle_beam_fork
-    EngineCoreProc._cache_beam_request = _cache_beam_request
-    EngineCoreProc._handle_beam_fork = _handle_beam_fork
+    EngineCore._handle_mega_request_step_update = _handle_mega_request_step_update
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
+
+    from vllm.sampling_params import SamplingParams
+
+    # Force the greedy verification check to be a no-op to allow n > 1 under greedy beam search parameters
+    SamplingParams._verify_greedy_sampling = lambda self: None
 
     # Apply scheduler patches in the child process
     apply_scheduler_patch()
@@ -245,20 +139,7 @@ def apply_engine_core_child_patches(vllm_config=None):
     # Apply worker patches (e.g., GPUModelRunner)
     apply_worker_patches()
 
-    # Apply LMCache patches
-    if _is_lmcache_patch_enabled(vllm_config):
-        try:
-            from vllm_gr.patch import patch_lmcache_adapter
-
-            patch_lmcache_adapter()
-            logger.debug("vllm_gr lmcache child patch applied in EngineCore process.")
-        except Exception as exc:
-            logger.warning(
-                "Unable to apply vllm_gr lmcache child patch in EngineCore: %s",
-                exc,
-            )
-
-    logger.debug("Engine-core patches (ADD_BATCH, BEAM_FORK) applied in child process.")
+    logger.debug("Engine-core patches applied in child process.")
 
 
 # Re-entry guard to detect recursive calls
@@ -339,141 +220,584 @@ def run_engine_core(*args, **kwargs):
     # Set re-entry guard and apply patches
     _run_engine_core_active = True
     try:
-        apply_engine_core_child_patches(kwargs.get("vllm_config"))
+        apply_engine_core_child_patches()
         original_run(*args, **kwargs)
     finally:
         _run_engine_core_active = False
 
 
 def apply_scheduler_patch():
-    """Monkey-patch Scheduler.schedule with the cache computed blocks version."""
+    """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from functools import wraps
 
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    if getattr(Scheduler, "_patched_for_cache_computed_blocks", False):
+    if getattr(Scheduler, "_patched_for_mega_requests", False):
         return
 
     _original_schedule = Scheduler.schedule
 
     @wraps(_original_schedule)
     def patched_schedule(self):
-        # Cache for get_computed_blocks to optimize beam search
-        computed_blocks_cache = {}
-        last_key = None
-        last_res = None
-        block_size = self.cache_config.block_size
         _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
+        block_size = self.cache_config.block_size
 
-        def get_cache_computed_blocks(req):
-            # In some cases, the first beam must recompute all blocks if they were previously cleared.
-            # However, later beams can skip this work because the first beam has already performed it.
-            # By applying a threshold, we ensure that only heavily reused blocks—those with many cache hits—are stored in the cache.
-            cache_th = 256
+        # TODO: Add support for cache > prefix
+        def patch_get_computed_blocks(req):
+            bn, tn = _original_get_computed_blocks(req)
+            if req and getattr(req, "is_mega_decode", False):
+                pl = getattr(req, "prefix_len", 0) // block_size * block_size
+                if tn > pl:
+                    sliced_blocks = tuple(group[: pl // block_size] for group in bn.blocks)
+                    return self.kv_cache_manager.create_kv_cache_blocks(sliced_blocks), pl
+            return bn, tn
 
-            def is_cache_worthy(r):
-                return r[1] > cache_th
-
-            nonlocal last_key, last_res
-            # get_computed_blocks only accounts for hashes up to the final complete block.
-            # Additionally, when every token is retrieved from the cache, the last token still
-            # needs to be recomputed to produce the logits
-            max_num_blocks = max(0, (req.num_tokens - 1) // block_size)
-            hash_idx = min(max_num_blocks - 1, len(req.block_hashes) - 1)
-            last_hash = req.block_hashes[hash_idx] if hash_idx >= 0 else None
-            if last_hash is None:
-                last_hash = req.request_id
-            key = (req.num_tokens, req.skip_reading_prefix_cache, last_hash)
-
-            served_from_sw_cache = True
-            if key == last_key and last_res is not None and is_cache_worthy(last_res):
-                res = last_res
-            elif key in computed_blocks_cache:
-                res = computed_blocks_cache[key]
-                last_key = key
-                last_res = res
-            else:
-                res = _original_get_computed_blocks(req)
-                served_from_sw_cache = False
-                if is_cache_worthy(res):
-                    computed_blocks_cache[key] = res
-                    last_key = key
-                    last_res = res
-
-            if served_from_sw_cache and self.kv_cache_manager.log_stats:
-                if self.kv_cache_manager.prefix_cache_stats is not None:
-                    self.kv_cache_manager.prefix_cache_stats.record(
-                        num_tokens=req.num_tokens,
-                        num_hits=res[1],
-                        preempted=req.num_preemptions > 0,
-                    )
-            return res
-
-        # Temporarily mock the get_computed_blocks method for this schedule pass
-        self.kv_cache_manager.get_computed_blocks = get_cache_computed_blocks
+        self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
         try:
             output = _original_schedule(self)
+
+            # Propagate mega request attributes from Request objects to SchedulerOutput
+            mega_data = {}
+            if hasattr(output, "num_scheduled_tokens"):
+                for req_id in output.num_scheduled_tokens.keys():
+                    req = self.requests.get(req_id)
+                    if req and getattr(req, "is_mega_decode", False):
+                        mega_data[req_id] = {
+                            "is_mega_decode": True,
+                            "mega_beam_width": getattr(req, "mega_beam_width", 1),
+                            "mega_decode_steps": getattr(req, "mega_decode_steps", 0),
+                            "prefix_len": getattr(req, "prefix_len", 0),
+                            "cache_len": req.num_computed_tokens
+                            - output.num_scheduled_tokens[req_id],
+                        }
+            output.mega_data = mega_data
+            return output
         finally:
-            # Restore the original methods immediately after
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
 
-        req_ids = list(output.num_scheduled_tokens.keys())
-        if req_ids:
-            output.beam_prefix_groups = _compute_beam_prefix_groups(
-                req_ids, self.requests, self.cache_config.block_size
-            )
-        return output
-
     Scheduler.schedule = patched_schedule
-    setattr(Scheduler, "_patched_for_cache_computed_blocks", True)
-    logger.debug("Scheduler.schedule patched for cache computed blocks.")
+    Scheduler._patched_for_mega_requests = True
+    logger.debug("Scheduler.schedule patched for mega-requests propagation.")
+
+
+# ============================================================================
+# TENSOR AND BUFFER GEOMETRY EXTRACTION HELPERS
+# ============================================================================
+
+
+def _get_positions_buffers(
+    runner: Any,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Safely extracts underlying hardware and host indexing position tensors."""
+    gpu_positions = None
+    cpu_positions = None
+    if hasattr(runner, "positions") and runner.positions is not None:
+        gpu_positions = getattr(runner.positions, "gpu", None)
+        cpu_positions = getattr(runner.positions, "cpu", None)
+    return gpu_positions, cpu_positions
+
+
+def _compute_beam_bounds(
+    b: int,
+    prefix_len: int,
+    cache_len: int,
+    decode_steps: int,
+    chunk_budget: int,
+    delta: int,
+) -> Tuple[int, int]:
+    """Calculates active lookahead allocations and historical trace lengths."""
+    past_suffix_b = max(0, min(decode_steps, delta - b * decode_steps))
+    if prefix_len >= cache_len:
+        remaining_prefix = prefix_len - cache_len
+        if b == 0:
+            return min(chunk_budget, remaining_prefix + decode_steps), past_suffix_b
+        return min(chunk_budget, decode_steps), past_suffix_b
+
+    remaining_suffix_b = decode_steps - past_suffix_b
+    return min(chunk_budget, remaining_suffix_b), past_suffix_b
+
+
+def _overwrite_position_ids(
+    st: int,
+    b_uncached: int,
+    curr_offset: int,
+    gpu_pos: Optional[torch.Tensor],
+    cpu_pos: Optional[torch.Tensor],
+) -> None:
+    """Overwrites positional indexing structures in place on targets."""
+    if gpu_pos is not None:
+        gpu_pos[curr_offset : curr_offset + b_uncached] = torch.arange(
+            st, st + b_uncached, dtype=gpu_pos.dtype, device=gpu_pos.device
+        )
+    if cpu_pos is not None:
+        cpu_pos[curr_offset : curr_offset + b_uncached] = torch.arange(
+            st, st + b_uncached, dtype=cpu_pos.dtype, device=torch.device("cpu")
+        )
+
+
+def _process_mega_decode_request(
+    mdata: Dict[str, Any],
+    seq_len: int,
+    token_offset: int,
+    gpu_pos: Optional[torch.Tensor],
+    cpu_pos: Optional[torch.Tensor],
+    new_logits_indices: List[int],
+) -> Tuple[int, int, int]:
+    """Traces allocation arrays and mutates position buffers for a speculative request."""
+    prefix_len = mdata["prefix_len"]
+    beam_width = mdata["mega_beam_width"]
+    decode_steps = mdata["mega_decode_steps"]
+    cache_len = mdata["cache_len"]
+
+    chunk_budget = seq_len
+    delta = max(0, cache_len - prefix_len)
+    curr_offset = token_offset
+    valid_rows_for_req = 0
+    logits_row_cnt = 0
+    for b in range(beam_width):
+        if chunk_budget <= 0:
+            break
+
+        b_uncached, past_suffix_b = _compute_beam_bounds(
+            b, prefix_len, cache_len, decode_steps, chunk_budget, delta
+        )
+
+        if b_uncached > 0:
+            st = (
+                cache_len
+                if (prefix_len >= cache_len and b == 0)
+                else (prefix_len if prefix_len >= cache_len else prefix_len + past_suffix_b)
+            )
+            _overwrite_position_ids(st, b_uncached, curr_offset, gpu_pos, cpu_pos)
+
+            if past_suffix_b + b_uncached >= decode_steps:
+                new_logits_indices.append(curr_offset + b_uncached - 1)
+                logits_row_cnt += 1
+
+            valid_rows_for_req += 1
+            curr_offset += b_uncached
+            chunk_budget -= b_uncached
+
+    return valid_rows_for_req, logits_row_cnt, curr_offset
+
+
+# ============================================================================
+# CORE WORKER PIPELINE WELDER LOGIC
+# ============================================================================
+
+
+def _remux_logprobs_tensors(
+    request_row_configs: List[Tuple[Any, int, int]],
+    max_chained_dim: int,
+    target_K: int,
+    orig_lps: torch.Tensor,
+    orig_lp_ids: Optional[torch.Tensor],
+    orig_ranks: Optional[torch.Tensor],
+    st_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Merges and aligns sampler tensor slices sequentially across runtime waves."""
+    if max_chained_dim == 0 or orig_lps.numel() == 0:
+        return st_ids, orig_lps, orig_lp_ids, orig_ranks
+
+    new_st_ids, new_lps, new_lp_ids, new_ranks = [], [], [], []
+    gpu_row_cursor = 0
+
+    for req_id, _, W_logits in request_row_configs:
+        # --------------------------------------------------------------------
+        # CASE A: INTERMEDIATE CHUNKED PREFILL (No output rows generated)
+        # --------------------------------------------------------------------
+        if W_logits == 0:
+            dummy_st = torch.tensor([[-1]], dtype=st_ids.dtype, device=st_ids.device)
+            new_st_ids.append(dummy_st)
+
+            new_lps.append(
+                torch.full(
+                    (1, max_chained_dim),
+                    float("-inf"),
+                    dtype=orig_lps.dtype,
+                    device=orig_lps.device,
+                )
+            )
+            if orig_lp_ids is not None:
+                new_lp_ids.append(
+                    torch.zeros(
+                        (1, max_chained_dim),
+                        dtype=orig_lp_ids.dtype,
+                        device=orig_lp_ids.device,
+                    )
+                )
+            if orig_ranks is not None:
+                new_ranks.append(
+                    torch.zeros(
+                        (1, max_chained_dim),
+                        dtype=orig_ranks.dtype,
+                        device=orig_ranks.device,
+                    )
+                )
+            continue
+
+        # --------------------------------------------------------------------
+        # CASE B: ACTIVE SAMPLING PATH (Captures the full multi-beam footprint)
+        # --------------------------------------------------------------------
+        # Retain leader token track identity
+        new_st_ids.append(st_ids[gpu_row_cursor : gpu_row_cursor + 1, :])
+
+        req_lps = orig_lps[gpu_row_cursor : gpu_row_cursor + W_logits, :target_K].reshape(
+            1, W_logits * target_K
+        )
+        if W_logits * target_K < max_chained_dim:
+            req_lps = torch.nn.functional.pad(
+                req_lps,
+                (0, max_chained_dim - (W_logits * target_K)),
+                value=float("-inf"),
+            )
+        new_lps.append(req_lps)
+
+        if orig_lp_ids is not None:
+            req_lp_ids = orig_lp_ids[gpu_row_cursor : gpu_row_cursor + W_logits, :target_K].reshape(
+                1, W_logits * target_K
+            )
+            if W_logits * target_K < max_chained_dim:
+                req_lp_ids = torch.nn.functional.pad(
+                    req_lp_ids, (0, max_chained_dim - (W_logits * target_K)), value=0
+                )
+            new_lp_ids.append(req_lp_ids)
+
+        if orig_ranks is not None:
+            req_ranks = orig_ranks[gpu_row_cursor : gpu_row_cursor + W_logits].reshape(1, W_logits)
+            if W_logits < max_chained_dim:
+                req_ranks = torch.nn.functional.pad(
+                    req_ranks, (0, max_chained_dim - W_logits), value=0
+                )
+            new_ranks.append(req_ranks)
+
+        # Advance the pointer cursor past the complete multi-beam block size
+        gpu_row_cursor += W_logits
+
+    return (
+        torch.cat(new_st_ids, dim=0),
+        torch.cat(new_lps, dim=0),
+        torch.cat(new_lp_ids, dim=0) if orig_lp_ids is not None else None,
+        torch.cat(new_ranks, dim=0) if orig_ranks is not None else None,
+    )
+
+
+# ============================================================================
+# INLINE COMPILATION PROXIES FOR HIGH-PERFORMANCE INTERCEPTION
+# ============================================================================
+
+
+class MegaReqIdsProxy(list):
+    def __init__(self, original_list, req_id_map):
+        super().__init__(original_list)
+        self.req_id_map = req_id_map
+
+    def __getitem__(self, index):
+        return (
+            self.req_id_map[index]
+            if index < len(self.req_id_map)
+            else (self.req_id_map[-1] if self.req_id_map else None)
+        )
+
+    def copy(self):
+        return list(self.req_id_map)
+
+
+class Mock1DArray:
+    def __init__(self, original, batch_idx_map):
+        self.original = original
+        self.batch_idx_map = batch_idx_map
+
+    def __getitem__(self, idx):
+        return (
+            self.original[self.batch_idx_map[idx]]
+            if idx < len(self.batch_idx_map)
+            else self.original[0]
+        )
+
+    def __setitem__(self, idx, value):
+        if idx < len(self.batch_idx_map):
+            self.original[self.batch_idx_map[idx]] = value
+
+
+class Mock2DArray:
+    def __init__(self, original, batch_idx_map):
+        self.original = original
+        self.batch_idx_map = batch_idx_map
+
+    def __setitem__(self, key, value):
+        idx, slc = key
+        if idx < len(self.batch_idx_map):
+            self.original[self.batch_idx_map[idx], slc] = value
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+    def __getitem__(self, key):
+        idx, slc = key
+        actual_idx = self.batch_idx_map[idx] if idx < len(self.batch_idx_map) else 0
+        return self.original[actual_idx, slc]
+
+
+class InputBatchProxy:
+    def __init__(self, obj, req_map, idx_map, logits_map):
+        object.__setattr__(self, "_obj", obj)
+        object.__setattr__(self, "_req_id_map", req_map)
+        object.__setattr__(self, "_batch_idx_map", idx_map)
+        object.__setattr__(self, "_logit_idx_map", logits_map)
+
+    def __getattr__(self, name):
+        obj = object.__getattribute__(self, "_obj")
+        idx_map = object.__getattribute__(self, "_batch_idx_map")
+        logits_map = object.__getattribute__(self, "_logit_idx_map")
+        req_map = object.__getattribute__(self, "_req_id_map")
+
+        if name == "sampling_metadata":
+            s_meta = getattr(obj, "sampling_metadata", None)
+            if s_meta is None or logits_map is None:
+                return s_meta
+
+            orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
+            for attr in [
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "frequency_penalties",
+                "presence_penalties",
+                "repetition_penalties",
+            ]:
+                val = getattr(s_meta, attr, None)
+                if isinstance(val, torch.Tensor) and val.numel() > 0:
+                    if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
+                        object.__setattr__(s_meta, attr, val[logits_map])
+            return s_meta
+
+        elif name == "req_ids":
+            return MegaReqIdsProxy(obj.req_ids, req_map)
+        elif name == "num_tokens_no_spec":
+            return Mock1DArray(obj.num_tokens_no_spec, idx_map)
+        elif name == "token_ids_cpu":
+            return Mock2DArray(obj.token_ids_cpu, idx_map)
+        elif name == "is_token_ids":
+            return (
+                Mock2DArray(obj.is_token_ids, idx_map)
+                if hasattr(obj, "is_token_ids")
+                else Mock2DArray(obj.token_ids_cpu, idx_map)
+            )
+        return getattr(obj, name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_obj"), name, value)
+
+
+# ============================================================================
+# MONKEY PATCH APPLICATOR REGISTRY
+# ============================================================================
 
 
 def apply_worker_patches():
-    """Monkey-patch GPUModelRunner to inject beam_prefix_groups into the attention builder."""
+    """Applies runtime overrides onto GPUModelRunner execution entries."""
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-        from vllm_gr.v1.attention.backends.beam_attn import BEAM_PREFIX_GROUPS_VAR
+        from vllm_gr.v1.attention.backends.beam_attn import MEGA_DATA_VAR
     except ImportError:
+        logger.warning("Failed to import GPUModelRunner segments, skipping patches.")
         return
 
-    if getattr(GPUModelRunner, "_patched_for_beam_groups", False):
+    if getattr(GPUModelRunner, "_patched_for_mega_beam_pos_ids", False):
         return
 
     _original_execute_model = GPUModelRunner.execute_model
-    _original_build_attention_metadata = GPUModelRunner._build_attention_metadata
+    _original_prepare_inputs = GPUModelRunner._prepare_inputs
+    _original_bookkeeping_sync = GPUModelRunner._bookkeeping_sync
 
-    def patched_execute_model(self, scheduler_output, intermediate_tensors=None):
-        beam_groups = getattr(scheduler_output, "beam_prefix_groups", None)
-        self._current_beam_prefix_groups_str = beam_groups
+    @wraps(_original_execute_model)
+    def patched_execute_model(self, scheduler_output, *args, **kwargs):
+        self._current_mega_data = getattr(scheduler_output, "mega_data", {})
+        mega_info = {"mega_data": self._current_mega_data, "req_ids": []}
+        token = MEGA_DATA_VAR.set(mega_info)
+        self._current_mega_info = mega_info
+        try:
+            return _original_execute_model(self, scheduler_output, *args, **kwargs)
+        finally:
+            self._current_mega_data = {}
+            self._current_mega_info = None
+            MEGA_DATA_VAR.reset(token)
+
+    @wraps(_original_prepare_inputs)
+    def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        logits_indices, spec_decode_metadata = _original_prepare_inputs(
+            self, scheduler_output, num_scheduled_tokens
+        )
+
+        if getattr(self, "_current_mega_info", None) is not None:
+            self._current_mega_info["req_ids"] = self.input_batch.req_ids
+
+        mega_data = getattr(scheduler_output, "mega_data", {})
+        if not mega_data:
+            return logits_indices, spec_decode_metadata
+
+        self.input_batch.logprob_token_ids = {}
+        new_logits_indices = []
+        orig_req_ids = self.input_batch.req_ids
+
+        token_offset = 0
+        row_to_req_id, row_to_batch_idx, logits_to_batch_idx, request_row_configs = (
+            [],
+            [],
+            [],
+            [],
+        )
+        input_row_idx = 0
+
+        gpu_positions, cpu_positions = _get_positions_buffers(self)
+
+        for batch_idx, req_id in enumerate(orig_req_ids):
+            seq_len = (
+                num_scheduled_tokens[batch_idx] if batch_idx < len(num_scheduled_tokens) else 0
+            )
+            if req_id is None:
+                row_to_req_id.append(None)
+                row_to_batch_idx.append(batch_idx)
+                input_row_idx += 1
+                token_offset += seq_len
+                continue
+
+            mdata = mega_data.get(req_id)
+            if mdata and mdata.get("is_mega_decode", False):
+                W, W_logits, next_offset = _process_mega_decode_request(
+                    mdata,
+                    seq_len,
+                    token_offset,
+                    gpu_positions,
+                    cpu_positions,
+                    new_logits_indices,
+                )
+                row_to_req_id.extend([req_id] * W)
+                row_to_batch_idx.extend([batch_idx] * W)
+                logits_to_batch_idx.extend([batch_idx] * W_logits)
+
+                request_row_configs.append((req_id, input_row_idx, W_logits))
+                input_row_idx += W
+            else:
+                num_computed_tokens = self.input_batch.num_computed_tokens_cpu[batch_idx]
+                num_prompt_tokens = self.input_batch.num_prompt_tokens[batch_idx]
+
+                is_last_chunk_prefill = bool(
+                    num_computed_tokens < num_prompt_tokens
+                    and num_computed_tokens + seq_len >= num_prompt_tokens
+                )
+                W_logits_count = 0
+                W = 1
+                if is_last_chunk_prefill:
+                    new_logits_indices.append(token_offset + seq_len - 1)
+                    W_logits_count = 1
+                    logits_to_batch_idx.extend([batch_idx] * W)
+                row_to_req_id.extend([req_id] * W)
+                row_to_batch_idx.extend([batch_idx] * W)
+
+                request_row_configs.append((req_id, input_row_idx, W_logits_count))
+                input_row_idx += W
+
+            token_offset += seq_len
+
+        self.input_batch = InputBatchProxy(
+            self.input_batch, row_to_req_id, row_to_batch_idx, logits_to_batch_idx
+        )
+        scheduler_output._gr_request_row_configs = request_row_configs
+
+        return torch.tensor(
+            new_logits_indices, dtype=torch.int32, device=self.device
+        ), spec_decode_metadata
+
+    @wraps(_original_bookkeeping_sync)
+    def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
+        mega_data = getattr(scheduler_output, "mega_data", {})
+        if not mega_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
+            res = _original_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
+            sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+            if sampler_output is not None:
+                st_ids = sampler_output.sampled_token_ids
+                lp_tensors = sampler_output.logprobs_tensors
+            return res
+
+        request_row_configs = scheduler_output._gr_request_row_configs
+        orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
 
         try:
-            return _original_execute_model(self, scheduler_output, intermediate_tensors)
+            res = _original_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
         finally:
-            self._current_beam_prefix_groups_str = None
+            self.input_batch = orig_input_batch
 
-    def patched_build_attention_metadata(self, *args, **kwargs):
-        beam_groups_str = getattr(self, "_current_beam_prefix_groups_str", None)
-        if beam_groups_str is not None:
-            req_id_to_idx = {
-                r_id: i for i, r_id in enumerate(self.input_batch.req_ids) if r_id is not None
-            }
-            translated_groups = []
-            for depth, group_req_ids in beam_groups_str:
-                indices = [req_id_to_idx[r] for r in group_req_ids if r in req_id_to_idx]
-                if indices:
-                    translated_groups.append((depth, indices))
+        (
+            num_nans_in_logits,
+            logprobs_lists,
+            valid_sampled_token_ids,
+            prompt_logprobs_dict,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            invalid_req_indices,
+        ) = res
 
-            token = BEAM_PREFIX_GROUPS_VAR.set(translated_groups)
-            try:
-                return _original_build_attention_metadata(self, *args, **kwargs)
-            finally:
-                BEAM_PREFIX_GROUPS_VAR.reset(token)
-        else:
-            return _original_build_attention_metadata(self, *args, **kwargs)
+        collapsed_req_ids_copy = [r[0] for r in request_row_configs if r[0] is not None]
+        collapsed_req_id_to_index = {
+            req_id: idx for idx, req_id in enumerate(collapsed_req_ids_copy)
+        }
+        num_logical_requests = len(collapsed_req_ids_copy)
+
+        sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+        if sampler_output is not None:
+            st_ids = sampler_output.sampled_token_ids
+            lp_tensors = sampler_output.logprobs_tensors
+            if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
+                orig_lps = lp_tensors.logprobs
+                orig_lp_ids = lp_tensors.logprob_token_ids
+                orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
+                actual_K = orig_lps.shape[1]
+                max_chained_dim = max(W * actual_K for _, _, W in request_row_configs)
+
+                final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
+                    request_row_configs,
+                    max_chained_dim,
+                    actual_K,
+                    orig_lps,
+                    orig_lp_ids,
+                    orig_ranks,
+                    st_ids,
+                )
+
+                # Safely resizes the original tensor wrapper and copies the elements in place
+                st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
+                lp_tensors.logprobs.resize_(final_lps.shape).copy_(final_lps)
+
+                if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
+                    lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
+                if orig_ranks is not None and final_ranks is not None:
+                    clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
+                    lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
+                        clean_ranks_slice
+                    )
+
+                if getattr(orig_input_batch, "prev_sampled_token_ids", None) is not None:
+                    orig_input_batch.prev_sampled_token_ids.resize_(final_st_ids.shape).copy_(
+                        final_st_ids
+                    )
+
+        return (
+            num_nans_in_logits,
+            [[] for _ in range(num_logical_requests)] if logprobs_lists is not None else None,
+            [[] for _ in range(num_logical_requests)],
+            prompt_logprobs_dict,
+            collapsed_req_ids_copy,
+            collapsed_req_id_to_index,
+            invalid_req_indices,
+        )
 
     GPUModelRunner.execute_model = patched_execute_model
-    GPUModelRunner._build_attention_metadata = patched_build_attention_metadata
-    GPUModelRunner._patched_for_beam_groups = True
-    logger.debug("GPUModelRunner patched for beam groups via ContextVar.")
+    GPUModelRunner._prepare_inputs = patched_prepare_inputs
+    GPUModelRunner._bookkeeping_sync = patched_bookkeeping_sync
+    GPUModelRunner._patched_for_mega_beam_pos_ids = True
+    logger.debug("GPUModelRunner hooks patched successfully.")
+    print("==============================We are Here===========================")

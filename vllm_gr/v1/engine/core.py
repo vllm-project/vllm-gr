@@ -28,73 +28,51 @@ logger = init_logger(__name__)
 def _cache_beam_request(self, request) -> None:
     """Cache Request state for later beam forking.
 
-    Stores ``(request, block_hashes_snapshot)`` — the Request object itself
-    (immutable fields read via attribute access) plus a snapshot of its
-    ``block_hashes`` (the only scheduler-mutated list we need).
-
     Thread-safe: uses beam_cache_lock to prevent data races.
     """
     with self.beam_cache_lock:
-        self.beam_cache[request.request_id] = (
-            request,
-            list(request.block_hashes),
-        )
+        self.beam_cache[request.request_id] = {
+            "all_token_ids": list(request._all_token_ids),
+            "block_hashes": list(request.block_hashes),
+            "eos_token_id": request.eos_token_id,
+            "lora_request": request.lora_request,
+            "cache_salt": request.cache_salt,
+            "mm_features": request.mm_features,
+            "prompt_embeds": request.prompt_embeds,
+            "num_prompt_tokens": request.num_prompt_tokens,
+        }
 
 
-# Fields that differ per child in a BEAM_FORK batch.  Must be kept in sync
-# with vllm.v1.request.Request — if upstream adds new mutable per-request
-# state, add the corresponding key here to avoid silent sharing.
-_PER_CHILD_FIELDS = frozenset(
-    {
-        "request_id",
-        "prompt_token_ids",
-        "num_prompt_tokens",
-        "_all_token_ids",
-        "_output_token_ids",
-        "output_token_ids",
-        "all_token_ids",
-        "events",
-        "spec_token_ids",
-        "block_hashes",
-        "get_hash_new_full_blocks",
-    }
-)
-
-
-def _handle_beam_fork(self, fork_req) -> None:
-    """Create child Requests from cached parent state.
-
-    Uses a template-clone optimisation: the first child is built with the
-    normal ``Request()`` constructor, then a lean shared-fields dict is
-    snapshotted (excluding per-child fields).  Subsequent children are
-    created via ``object.__new__(Request)`` + shared dict copy + per-child
-    field insertion, avoiding both the full constructor cost and the
-    copy-then-overwrite overhead of a full ``__dict__.copy()``.
-
-    Thread-safe: uses beam_cache_lock to prevent data races.
-    """
-    # Deferred imports to avoid circular dependency (engine ↔ request).
+def _handle_mega_request_step_update(self, update) -> None:
+    """Apply a grouped step update using only the prefill cache entry."""
     from vllm.v1.request import Request
-    from vllm.v1.utils import ConstantList
 
-    shared_fields: dict[str, Any] | None = None
-    # All children share the same arrival_time — acceptable because every
-    # child in a BEAM_FORK batch originates from the same prompt at the
-    # same logical point in time.
-    now = time.time()
-    has_block_hasher = self.request_block_hasher is not None
+    session_id = update.session_id
+    B = update.beam_width
 
-    for parent_id, child_id, token_id in zip(
-        fork_req.parent_ids, fork_req.child_ids, fork_req.token_ids
-    ):
+    # Clear the session completely upon generation termination / cleanup message
+    if B == 0:
         with self.beam_cache_lock:
-            cached = self.beam_cache.get(parent_id)
+            self.beam_cache.pop(session_id, None)
 
-        if cached is None:
-            logger.error("BEAM_FORK: parent %s not in cache", parent_id)
+        # We MUST abort the running mega-request session_id itself!
+        self.aborts_queue.put_nowait(session_id)
+        if update.pruned_ids:
+            for abort_id in update.pruned_ids:
+                self.aborts_queue.put_nowait(abort_id)
+        return
+
+    # Validate parallel arrays
+    if (
+        len(update.beam_tokens) != B
+        or len(update.parent_beam_ids) != B
+        or len(update.child_beam_ids) != B
+    ):
+        logger.error("MEGA_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
+        for child_id in update.child_beam_ids:
             self.output_queue.put_nowait(
                 (
-                    fork_req.client_index,
+                    update.client_index,
                     EngineCoreOutputs(
                         engine_index=self.engine_index,
                         finished_requests={child_id},
@@ -108,78 +86,89 @@ def _handle_beam_fork(self, fork_req) -> None:
                     ),
                 )
             )
-            continue
+        return
 
-        cached_req, cached_block_hashes = cached
-        child_token_ids = cached_req.prompt_token_ids + [token_id]
-
-        if shared_fields is None:
-            # First valid child — use normal constructor
-            req = Request(
-                request_id=child_id,
-                prompt_token_ids=child_token_ids,
-                sampling_params=fork_req.sampling_params,
-                pooling_params=None,
-                eos_token_id=(
-                    fork_req.eos_token_id
-                    if fork_req.eos_token_id is not None
-                    else cached_req.eos_token_id
-                ),
-                client_index=fork_req.client_index,
-                arrival_time=now,
-                lora_request=(fork_req.lora_request or cached_req.lora_request),
-                cache_salt=fork_req.cache_salt or cached_req.cache_salt,
-                priority=fork_req.priority,
-                trace_headers=fork_req.trace_headers,
-                prompt_embeds=cached_req.prompt_embeds,
-                mm_features=cached_req.mm_features,
-                block_hasher=None,
-            )
-            # Snapshot shared fields BEFORE enqueuing (scheduler may mutate).
-            #
-            # SHALLOW COPY — mutable objects (sampling_params, prompt_embeds,
-            # mm_features, etc.) are shared by reference across all children.
-            # This is safe because all children in a BEAM_FORK originate from
-            # the same prompt and the scheduler does not mutate these objects
-            # in-place.  If that invariant ever changes, the values below must
-            # be deep-copied.
-            shared_fields = {k: v for k, v in req.__dict__.items() if k not in _PER_CHILD_FIELDS}
-        else:
-            # Children 2..N — lean clone from shared dict.
-            # We use object.__new__ + __dict__ assignment instead of the full
-            # Request() constructor for performance (avoids re-validating
-            # identical fields).  Request is an upstream vLLM class that uses
-            # __dict__ (not __slots__), so this is safe.
-            req = object.__new__(Request)
-            child_dict = shared_fields.copy()
-            all_token_ids = list(child_token_ids)
-            output_token_ids: list[int] = []
-            child_dict["request_id"] = child_id
-            child_dict["prompt_token_ids"] = child_token_ids
-            child_dict["num_prompt_tokens"] = len(child_token_ids)
-            child_dict["_all_token_ids"] = all_token_ids
-            child_dict["_output_token_ids"] = output_token_ids
-            child_dict["output_token_ids"] = ConstantList(output_token_ids)
-            child_dict["all_token_ids"] = ConstantList(all_token_ids)
-            child_dict["events"] = []
-            child_dict["spec_token_ids"] = []
-            req.__dict__ = child_dict
-
-        # Clone parent's block hashes and incrementally compute new ones
-        req.block_hashes = list(cached_block_hashes)
-        if has_block_hasher:
-            req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
-            req.block_hashes.extend(req.get_hash_new_full_blocks())
-        else:
-            req.get_hash_new_full_blocks = None
-
-        self._cache_beam_request(req)
-        self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, fork_req.current_wave)))
-
-    # Clean up parents + aborted beams from cache
+    # Fetch the shared prefill cache entry
     with self.beam_cache_lock:
-        for pid in set(fork_req.parent_ids) | set(fork_req.abort_ids):
-            self.beam_cache.pop(pid, None)
+        session_cached = self.beam_cache.get(session_id)
+
+    if session_cached is None and update.beam_width > 0:
+        logger.error("MEGA_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
+        for child_id in update.child_beam_ids:
+            self.output_queue.put_nowait(
+                (
+                    update.client_index,
+                    EngineCoreOutputs(
+                        engine_index=self.engine_index,
+                        finished_requests={child_id},
+                        outputs=[
+                            EngineCoreOutput(
+                                request_id=child_id,
+                                new_token_ids=[],
+                                finish_reason=FinishReason.ERROR,
+                            )
+                        ],
+                    ),
+                )
+            )
+        return
+
+    arrival = time.time()
+    inputs_to_push = []
+
+    prefill_tokens = session_cached["all_token_ids"]
+    prefill_block_hashes = list(session_cached["block_hashes"])
+    lora_request = session_cached["lora_request"]
+    cache_salt = session_cached["cache_salt"]
+    mm_features = session_cached["mm_features"]
+    prompt_embeds = session_cached["prompt_embeds"]
+    eos = session_cached["eos_token_id"]
+
+    # Pack the shared prefill and all beam suffixes into a single contiguous Mega Request
+    mega_token_ids = list(prefill_tokens)
+    decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
+    for gen_tokens in update.beam_tokens:
+        mega_token_ids.extend(gen_tokens)
+
+    req = Request(
+        request_id=session_id,  # Single request ID representing all beams
+        prompt_token_ids=mega_token_ids,
+        sampling_params=update.sampling_params,
+        pooling_params=None,
+        eos_token_id=(update.eos_token_id if update.eos_token_id is not None else eos),
+        client_index=update.client_index,
+        arrival_time=arrival,
+        lora_request=(update.lora_request or lora_request),
+        cache_salt=update.cache_salt or cache_salt,
+        priority=update.priority,
+        trace_headers=update.trace_headers,
+        prompt_embeds=prompt_embeds,
+        mm_features=mm_features,
+        block_hasher=None,
+    )
+
+    # Start with the prefill block hashes; block_hasher extends it incrementally
+    req.block_hashes = prefill_block_hashes
+    if self.request_block_hasher is not None:
+        req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
+        req.block_hashes.extend(req.get_hash_new_full_blocks())
+
+    # Metadata Enrichment
+    req.is_mega_beam = True
+    req.mega_beam_width = B
+    req.is_mega_decode = True  # Flag indicating it's the decode stage
+    req.mega_decode_steps = decode_steps
+    req.prefix_len = update.prefix_len
+
+    inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
+
+    # Non-blocking concurrent queue pushes
+    for item in inputs_to_push:
+        self.input_queue.put_nowait(item)
+
+    if update.pruned_ids:
+        for abort_id in update.pruned_ids:
+            self.aborts_queue.put_nowait(abort_id)
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +184,7 @@ def process_input_sockets(
     ready_event,
 ):
     """Replacement for EngineCoreProc.process_input_sockets with
-    ADD_BATCH and BEAM_FORK decoders."""
+    ADD_BATCH and MEGA_REQUEST_STEP_UPDATE decoders."""
     from contextlib import ExitStack
 
     import zmq
@@ -203,12 +192,12 @@ def process_input_sockets(
     from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
     from vllm.v1.serial_utils import MsgpackDecoder
 
-    from vllm_gr.v1.engine.types import BeamForkRequest
+    from vllm_gr.v1.engine.types import MegaRequestStepUpdate
 
     # Msgpack serialization decoding.
     add_request_decoder = MsgpackDecoder(EngineCoreRequest)
     add_batch_decoder = MsgpackDecoder(list[EngineCoreRequest])
-    beam_fork_decoder = MsgpackDecoder(BeamForkRequest)
+    mega_request_decoder = MsgpackDecoder(MegaRequestStepUpdate)
     generic_decoder = MsgpackDecoder()
 
     with ExitStack() as stack, zmq.Context() as ctx:
@@ -271,9 +260,9 @@ def process_input_sockets(
                         self.input_queue.put_nowait((EngineCoreRequestType.ADD, request))
                     continue
 
-                elif request_type == EngineCoreRequestType.BEAM_FORK:
-                    fork_req: BeamForkRequest = beam_fork_decoder.decode(data_frames)
-                    self._handle_beam_fork(fork_req)
+                elif request_type == EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE:
+                    mega_update: MegaRequestStepUpdate = mega_request_decoder.decode(data_frames)
+                    self._handle_mega_request_step_update(mega_update)
                     continue
 
                 else:

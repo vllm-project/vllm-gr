@@ -185,7 +185,7 @@ def main():
         "--catalog-path", type=str, default=None, help="Path to item validation (catalog) json file"
     )
     parser.add_argument(
-        "--concurrency-limit", type=int, default=None, help="maximum prompts to run concurrently"
+        "--max-concurrency", type=int, default=None, help="maximum prompts to run concurrently"
     )
     args = parser.parse_args()
 
@@ -281,7 +281,7 @@ def main():
         prompts_dict = [{"prompt": prompt} for prompt in prompts]
         gen_start = time.perf_counter()
         raw_offline_outputs = llm.beam_search(
-            prompts_dict, params, concurrency_limit=args.concurrency_limit
+            prompts_dict, params, concurrency_limit=args.max_concurrency
         )
         assert len(raw_offline_outputs) == len(prompts)
         gen_end = time.perf_counter()

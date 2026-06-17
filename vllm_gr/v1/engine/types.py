@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared types for vllm_gr engine patches.
 
-Defines BeamForkRequest.
+Defines MegaRequestStepUpdate
 """
 
 from __future__ import annotations
@@ -14,26 +14,25 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
 
 # ---------------------------------------------------------------------------
-# BeamForkRequest — lightweight beam fork (ADD_BATCH + BEAM_FORK path)
+# MegaRequestStepUpdate — Improved Beam handling by a single Mega request
 # ---------------------------------------------------------------------------
 
 
-class BeamForkRequest(
+class MegaRequestStepUpdate(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,
 ):  # type: ignore[call-arg]
-    """Lightweight beam search fork: clone parent state + append 1 token.
+    """Single logical message for all branches of a decode step."""
 
-    Parallel arrays: parent_ids[i] -> child_ids[i] with token_ids[i] appended.
-    A parent can appear multiple times (one beam forking into multiple children).
-    """
-
-    parent_ids: list[str]
-    child_ids: list[str]
-    token_ids: list[int]
-    abort_ids: list[str]
+    session_id: str
+    parent_beam_ids: list[str]
+    child_beam_ids: list[str]
+    beam_tokens: list[list[int]]
+    pruned_ids: list[str]
+    prefix_len: int
+    beam_width: int
     sampling_params: SamplingParams
     eos_token_id: int | None = None
     client_index: int = 0
