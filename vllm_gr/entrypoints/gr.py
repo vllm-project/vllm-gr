@@ -515,9 +515,30 @@ class GRLLM(LLM):
                         instance_prefill_id[j] = ec_req.request_id
                         instance_prev_beam_internal_ids[j] = [ec_req.request_id]
 
-                # Run Engine Step
-                step_outputs = llm_engine.step()
-                outputs_map = {out.request_id: out for out in step_outputs}
+                # Run Engine Step until we get outputs for all active instances
+                active_indices = [
+                    j for j, instance in enumerate(instances_batch) if len(instance.beams) > 0
+                ]
+                step_outputs_accumulated = []
+                while active_indices:
+                    step_outputs = llm_engine.step()
+                    step_outputs_accumulated.extend(step_outputs)
+
+                    outputs_map = {out.request_id: out for out in step_outputs}
+                    new_active_indices = []
+                    for j in active_indices:
+                        session_id = instance_prefill_id.get(j)
+                        search_id = (
+                            f"offline-beam-{prompt_start + j}-0" if token == 0 else session_id
+                        )
+                        if search_id in outputs_map:
+                            # Received output for this instance
+                            pass
+                        else:
+                            new_active_indices.append(j)
+                    active_indices = new_active_indices
+
+                outputs_map = {out.request_id: out for out in step_outputs_accumulated}
 
                 # Step 4: Process outputs for each instance
                 for j, instance in enumerate(instances_batch):

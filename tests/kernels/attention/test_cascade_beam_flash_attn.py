@@ -345,6 +345,8 @@ def run_cascade_beam_attention(
         builder.use_full_cuda_graph = False
         builder.max_cudagraph_size = None
         builder.max_num_splits = 0
+        builder.num_heads_q = inputs.query.shape[1]
+        builder.num_heads_kv = inputs.num_kv_heads
 
         attn_metadata = builder.build(
             common_prefix_len=inputs.shared_tokens_len,

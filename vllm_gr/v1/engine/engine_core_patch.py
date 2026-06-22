@@ -800,4 +800,3 @@ def apply_worker_patches():
     GPUModelRunner._bookkeeping_sync = patched_bookkeeping_sync
     GPUModelRunner._patched_for_mega_beam_pos_ids = True
     logger.debug("GPUModelRunner hooks patched successfully.")
-    print("==============================We are Here===========================")

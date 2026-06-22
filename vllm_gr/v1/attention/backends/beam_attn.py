@@ -853,12 +853,10 @@ class BeamAttentionImpl(AttentionImpl):
     ):
         if attn_metadata.std_indices is not None:
             std_query = query[attn_metadata.std_indices]
-            std_out = torch.empty_like(std_query)
-            flash_attn_varlen_func(
+            std_out = flash_attn_varlen_func(
                 q=std_query,
                 k=key_cache,
                 v=value_cache,
-                out=std_out,
                 cu_seqlens_q=attn_metadata.std_cu_seqlens_q,
                 max_seqlen_q=attn_metadata.std_max_q_len,
                 seqused_k=attn_metadata.std_seq_lens,
@@ -906,12 +904,10 @@ class BeamAttentionImpl(AttentionImpl):
                     attn_metadata.mega_suffix_total_tokens,
                     attn_metadata.block_size,
                 )
-                mega_suffix_out = torch.empty_like(mega_query)
                 mega_suffix_out, mega_suffix_lse = flash_attn_varlen_func(
                     q=mega_query,
                     k=contig_k,
                     v=contig_v,
-                    out=mega_suffix_out,
                     cu_seqlens_q=attn_metadata.mega_suffix_cu_seqlens_q,
                     cu_seqlens_k=attn_metadata.mega_suffix_cu_seqlens_k,
                     seqused_k=None,
@@ -932,6 +928,7 @@ class BeamAttentionImpl(AttentionImpl):
                     attn_metadata.mega_suffix_max_q_len == 1
                     and attn_metadata.mega_suffix_max_seq_len == 1
                     and group_size > 1
+                    and not vllm_flash_attn_version == 3
                 ):
                     mega_suffix_lse = (
                         mega_suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
@@ -940,7 +937,7 @@ class BeamAttentionImpl(AttentionImpl):
                         .view(attn_metadata.num_heads, -1)
                     )
 
-                mega_out = torch.empty_like(mega_query)
+                mega_out = torch.empty_like(mega_suffix_out)
                 merge_attn_states(
                     mega_out, mega_prefix_out, mega_prefix_lse, mega_suffix_out, mega_suffix_lse
                 )
