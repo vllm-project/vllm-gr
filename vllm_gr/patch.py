@@ -31,6 +31,7 @@ Safety features:
 import importlib
 import logging
 import math
+import os
 import sys
 import threading
 import types
@@ -312,6 +313,149 @@ def _apply_yuanrong_npu_patch(force: bool = False) -> int:
 
 _KV_MERGE_PATCHES_APPLIED = False
 _GR_BEAM_PATCHES_APPLIED = False
+_ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
+_ASCEND_ORIGINAL_CACHED_GET_ATTN = None
+
+_VLLM_GR_BEAM_ATTN_ENV = "VLLM_GR_BEAM_ATTN"
+
+
+def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
+    """Preserve CUSTOM attention backend on Ascend NPU.
+
+    The vllm-ascend platform plugin resets any user-specified attention backend
+    (other than FLASH_ATTN) to None in its ``check_and_update_config()``.  This
+    prevents BeamAttentionBackend — registered under
+    ``AttentionBackendEnum.CUSTOM`` — from being selected.
+
+    Patching the platform's classmethods does not reliably take effect (the
+    Ascend platform's MRO / descriptor resolution can bypass them).  Instead
+    this patch operates at the **selector** level: it replaces
+    ``_cached_get_attn_backend`` in ``vllm.v1.attention.selector`` so that
+    ``BeamAttentionBackend`` is returned directly — bypassing both the
+    platform's ``get_attn_backend_cls`` and ``resolve_obj_by_qualname``.
+
+    Cross-process signalling uses the ``VLLM_GR_BEAM_ATTN`` env-var:
+
+    * **Main process** — detected from ``sys.argv`` (``--attention-backend
+      CUSTOM``) and set *before* the Ascend platform can reset the config.
+    * **Child processes** — inherited via the environment, so the selector
+      patch activates even though the serialised config has ``backend=None``.
+    """
+    global _ASCEND_ATTN_BACKEND_PATCH_APPLIED
+    global _ASCEND_ORIGINAL_CACHED_GET_ATTN
+
+    if _ASCEND_ATTN_BACKEND_PATCH_APPLIED and not force:
+        return 0
+
+    if not _is_npu_platform():
+        return 0
+
+    try:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    except ImportError:
+        return 0
+
+    # Ensure BeamAttentionBackend is registered under CUSTOM.
+    try:
+        import vllm_gr.v1.attention.backends.beam_attn  # noqa: F401
+    except Exception as exc:
+        logger.debug(
+            "vllm_gr: Could not import beam_attn for CUSTOM registration: %s",
+            exc,
+        )
+        return 0
+
+    if not AttentionBackendEnum.CUSTOM.is_overridden():
+        logger.debug(
+            "vllm_gr: BeamAttentionBackend not registered under CUSTOM, "
+            "skipping Ascend selector patch"
+        )
+        _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
+        return 0
+
+    patch_count = 0
+
+    # --- Signal: set env-var when user requested CUSTOM -----------------
+    if os.environ.get(_VLLM_GR_BEAM_ATTN_ENV) != "1":
+        for i, arg in enumerate(sys.argv):
+            if (
+                arg == "--attention-backend"
+                and i + 1 < len(sys.argv)
+                and sys.argv[i + 1].upper() == "CUSTOM"
+            ):
+                os.environ[_VLLM_GR_BEAM_ATTN_ENV] = "1"
+                logger.info(
+                    "vllm_gr: Detected --attention-backend CUSTOM, "
+                    "set %s=1",
+                    _VLLM_GR_BEAM_ATTN_ENV,
+                )
+                break
+            if arg.startswith("--attention-backend=") and (
+                arg.split("=", 1)[1].upper() == "CUSTOM"
+            ):
+                os.environ[_VLLM_GR_BEAM_ATTN_ENV] = "1"
+                logger.info(
+                    "vllm_gr: Detected --attention-backend=CUSTOM, "
+                    "set %s=1",
+                    _VLLM_GR_BEAM_ATTN_ENV,
+                )
+                break
+
+    if os.environ.get(_VLLM_GR_BEAM_ATTN_ENV) != "1":
+        logger.debug(
+            "vllm_gr: %s not set, skipping Ascend selector patch",
+            _VLLM_GR_BEAM_ATTN_ENV,
+        )
+        _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
+        return 0
+
+    # --- Patch selector._cached_get_attn_backend -----------------------
+    try:
+        import vllm.v1.attention.selector as selector_mod
+    except ImportError:
+        logger.debug(
+            "vllm_gr: Could not import vllm.v1.attention.selector, "
+            "skipping Ascend selector patch"
+        )
+        return 0
+
+    # Save the original on first call to avoid double-wrapping on re-apply.
+    if _ASCEND_ORIGINAL_CACHED_GET_ATTN is None:
+        _ASCEND_ORIGINAL_CACHED_GET_ATTN = selector_mod._cached_get_attn_backend
+
+    original_cached_fn = _ASCEND_ORIGINAL_CACHED_GET_ATTN
+
+    def _patched_cached_get_attn_backend(backend, attn_selector_config):
+        """Return BeamAttentionBackend when VLLM_GR_BEAM_ATTN is set."""
+        if os.environ.get(_VLLM_GR_BEAM_ATTN_ENV) == "1":
+            from vllm_gr.v1.attention.backends.beam_attn import (
+                BeamAttentionBackend,
+            )
+
+            # Replicate the KV cache layout adjustment from the original
+            # selector so that backends requiring a specific layout still
+            # get it applied.
+            required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
+            if required_layout is not None:
+                from vllm.v1.attention.backends.utils import (
+                    set_kv_cache_layout,
+                )
+
+                set_kv_cache_layout(required_layout)
+
+            return BeamAttentionBackend
+        return original_cached_fn(backend, attn_selector_config)
+
+    selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
+    patch_count += 1
+
+    _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
+    logger.info(
+        "vllm_gr: Applied %d Ascend attention selector patch(es) "
+        "for CUSTOM backend",
+        patch_count,
+    )
+    return patch_count
 
 
 def _apply_gr_beam_patches(force: bool = False) -> int:
@@ -709,8 +853,9 @@ def _apply_patches(force: bool = False) -> int:
     core_count = _apply_gr_core_patches(force=force)
     yuanrong_count = _apply_yuanrong_npu_patch(force=force)
     kv_merge_count = _apply_kv_merge_patch(force=force)
+    ascend_attn_count = _apply_ascend_attention_backend_patch(force=force)
     beam_count = _apply_gr_beam_patches(force=force)
-    return core_count + yuanrong_count + kv_merge_count + beam_count
+    return core_count + yuanrong_count + kv_merge_count + ascend_attn_count + beam_count
 
 
 def verify_patches() -> list[str]:

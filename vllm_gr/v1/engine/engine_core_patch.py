@@ -99,6 +99,8 @@ def _add_enum_member(name: str, value: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+
 def apply_engine_core_child_patches():
     """Apply all patches inside the EngineCore child process.
 
@@ -113,6 +115,9 @@ def apply_engine_core_child_patches():
         _handle_mega_request_step_update,
         process_input_sockets,
     )
+
+
+    logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
     # Add new enum members: ADD_BATCH, MEGA_REQUEST_STEP_UPDATE
     _add_enum_member("ADD_BATCH", b"\x05")
