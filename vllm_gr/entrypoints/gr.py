@@ -9,7 +9,6 @@ GRPrompt inputs. Internally creates a GRLLMEngine (which has GR-specific
 processors) and drives the engine loop to collect GRRequestOutput results.
 """
 
-import gc
 import time
 from typing import TYPE_CHECKING, List, Optional, Sequence, Union
 
@@ -21,17 +20,18 @@ from vllm.utils.counter import Counter
 
 from vllm_gr.config.gr_config import GRConfig
 from vllm_gr.engine.arg_utils import GREngineArgs
-from vllm_gr.engine.gr_engine import GRLLMEngine
+from vllm_gr.engine.engine_factory import create_sync_engine
 from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
 from vllm_gr.logger import init_logger
 from vllm_gr.outputs import GRRequestOutput
-from vllm_gr.utils.npu_adapter import release_accelerator_memory
 
 if TYPE_CHECKING:
     from vllm.beam_search import BeamSearchOutput
     from vllm.inputs import TextPrompt, TokensPrompt
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
+
+    from vllm_gr.engine.gr_engine import GRLLMEngine
 
 logger = init_logger(__name__)
 
@@ -65,6 +65,8 @@ class GRLLM(LLM):
         model_type: Optional[str] = None,
         **kwargs,
     ):
+        self._shutdown_complete = False
+
         hstu_runtime_policy = {
             "enable_npu_fused_prefill": kwargs.pop("enable_npu_fused_prefill", None),
             "force_hammer_npu": kwargs.pop("force_hammer_npu", None),
@@ -75,7 +77,6 @@ class GRLLM(LLM):
             "allow_missing_weights": kwargs.pop("allow_missing_weights", False),
             "dataset": kwargs.pop("dataset", None),
         }
-
         # Extract model_type from explicit parameter or config file
         resolved_model_type = model_type
         if resolved_model_type is None:
@@ -101,7 +102,7 @@ class GRLLM(LLM):
             except Exception:
                 pass  # Failed to detect, will use backward compatibility
 
-        # Validate: only keep model_type if an adapter is registered for it
+        # Validate: only keep model_type when a GR adapter is registered for it
         from vllm_gr.adapters.registry import is_adapter_registered
 
         if not is_adapter_registered(resolved_model_type):
@@ -147,7 +148,7 @@ class GRLLM(LLM):
             **kwargs,
         )
 
-        self.llm_engine = GRLLMEngine.from_engine_args(
+        self.llm_engine = create_sync_engine(
             engine_args=engine_args,
             usage_context=UsageContext.LLM_CLASS,
         )
@@ -270,7 +271,7 @@ class GRLLM(LLM):
             all_outputs.extend(outputs)
         return all_outputs
 
-    def get_engine(self) -> GRLLMEngine:
+    def get_engine(self) -> "GRLLMEngine":
         return self.llm_engine
 
     def get_prefix_cache_counters(self) -> dict[str, int]:
@@ -592,11 +593,24 @@ class GRLLM(LLM):
         return outputs
 
     def shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+
+        import gc
+
+        from vllm_gr.utils.engine_lifecycle import shutdown_sync_engine
+        from vllm_gr.utils.npu_adapter import release_accelerator_memory
+
         if hasattr(self, "llm_engine") and self.llm_engine is not None:
-            self.llm_engine.shutdown()
+            shutdown_sync_engine(self.llm_engine)
             self.llm_engine = None
-        self.default_sampling_params = None
-        self.io_processor = None
+
+        if hasattr(self, "default_sampling_params"):
+            self.default_sampling_params = None
+        if hasattr(self, "io_processor"):
+            self.io_processor = None
+
         gc.collect()
         release_accelerator_memory()
         logger.info("GRLLM shutdown complete")

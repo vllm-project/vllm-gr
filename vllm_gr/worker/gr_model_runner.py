@@ -18,12 +18,14 @@ class GRModelRunner(GRFeatureRunnerMixin, GPUModelRunner):
     """GPU model runner that injects GR features into HSTU inputs."""
 
     def __init__(self, vllm_config, device, gr_config=None):
-        gr_config = gr_config or GRConfig()
         model_type = get_model_type_from_config(vllm_config)
         if not is_adapter_registered(model_type):
-            raise ValueError(
-                f"GRModelRunner requires a registered adapter, got model_type={model_type!r}"
+            raise RuntimeError(
+                "GRModelRunner must not be used for LLM passthrough models. "
+                "Use the default vLLM GPU worker (do not set GR worker_cls)."
             )
+
+        gr_config = gr_config or GRConfig()
         adapter = create_adapter(model_type, vllm_config, gr_config)
         super().__init__(
             vllm_config=vllm_config,

@@ -283,10 +283,15 @@ class GRCommonEngineArgsMixin:
         Dataset overrides have already been merged into ``hf_overrides`` during
         ``__post_init__``.
         """
+        from vllm_gr.adapters.registry import is_adapter_registered
         from vllm_gr.plugin import initialize_runtime
 
-        initialize_runtime()
-        logger.info("Creating engine config for model: %s", self.model)
+        initialize_runtime(strict_gr=is_adapter_registered(self.model_type))
+        logger.info(
+            "Creating engine config for model: %s (model_type=%s)",
+            self.model,
+            self.model_type,
+        )
         return super().create_engine_config(
             usage_context=usage_context,
             headless=headless,

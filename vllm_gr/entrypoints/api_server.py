@@ -19,7 +19,7 @@ from vllm.utils.system_utils import decorate_logs
 
 from vllm_gr.config.gr_config import GRConfig
 from vllm_gr.engine.arg_utils import GRAsyncEngineArgs
-from vllm_gr.engine.async_gr_engine import GRAsyncLLM
+from vllm_gr.engine.engine_factory import create_async_llm
 from vllm_gr.entrypoints.pooling import register_gr_pooling_api_routers
 from vllm_gr.entrypoints.pooling.recommend.serving import GRServingRecommendation
 from vllm_gr.logger import init_logger
@@ -95,7 +95,6 @@ async def build_async_gr_engine_client_from_engine_args(
     disable_frontend_multiprocessing: bool = False,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
-    vllm_config = engine_args.create_engine_config(usage_context=usage_context)
     gr_config = GRConfig(
         max_seq_len=engine_args.max_seq_len,
         max_candidates=engine_args.max_candidates,
@@ -110,17 +109,17 @@ async def build_async_gr_engine_client_from_engine_args(
     if disable_frontend_multiprocessing:
         logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing.")
 
-    async_llm: GRAsyncLLM | None = None
+    async_llm = None
 
     client_config = dict(client_config) if client_config else {}
     client_count = client_config.pop("client_count", 1)
     client_index = client_config.pop("client_index", 0)
 
     try:
-        async_llm = GRAsyncLLM.from_vllm_config(
-            vllm_config=vllm_config,
-            gr_config=gr_config,
+        async_llm = create_async_llm(
+            engine_args=engine_args,
             usage_context=usage_context,
+            gr_config=gr_config,
             enable_log_requests=engine_args.enable_log_requests,
             aggregate_engine_logging=engine_args.aggregate_engine_logging,
             disable_log_stats=engine_args.disable_log_stats,
