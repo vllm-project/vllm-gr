@@ -726,6 +726,7 @@ def apply_worker_patches():
             if sampler_output is not None:
                 st_ids = sampler_output.sampled_token_ids
                 lp_tensors = sampler_output.logprobs_tensors
+                # print(f"lp_tensors 1: {lp_tensors}", flush=True)
             return res
 
         request_row_configs = scheduler_output._gr_request_row_configs
@@ -756,6 +757,7 @@ def apply_worker_patches():
         if sampler_output is not None:
             st_ids = sampler_output.sampled_token_ids
             lp_tensors = sampler_output.logprobs_tensors
+            # print(f"lp_tensors 2: {lp_tensors}", flush=True)
             if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
                 orig_lps = lp_tensors.logprobs
                 orig_lp_ids = lp_tensors.logprob_token_ids

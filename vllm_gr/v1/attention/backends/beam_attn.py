@@ -65,6 +65,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     merge_attn_states_pytorch,
     merge_tnd_attention_outputs,
+    extract_suffix_kv_pytorch
 )
 
 logger = init_logger(__name__)
@@ -148,6 +149,7 @@ class BeamAttentionMetadata:
     # Mega Requests shared context arrays
     mega_prefix_indices: torch.Tensor | None = None
     mega_prefix_cu_seqlens_q: torch.Tensor | None = None
+    mega_prefix_cu_seqlens_kv: torch.Tensor | None = None
     mega_prefix_seq_lens: torch.Tensor | None = None
     mega_prefix_max_q_len: int = 0
     mega_prefix_max_seq_len: int = 0
@@ -165,6 +167,9 @@ class BeamAttentionMetadata:
     scheduler_metadata: dict | None = None
     prefix_scheduler_metadata: dict | None = None
     max_num_splits: int = 0
+    block_size: int = 16
+    num_heads: int = 0
+    num_kv_heads: int = 0
 
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
@@ -453,6 +458,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 .cumsum(dim=0)
                 .to(torch.int32)
             )
+
             mega_prefix_max_q_len = max(mega_prefix_q_lens) if mega_prefix_q_lens else 0
             mega_prefix_block_table = torch.stack(mega_prefix_block_tables).contiguous()
 
@@ -635,6 +641,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_total_tokens=mega_suffix_total_tokens,
             mega_suffix_slot_mapping_out=mega_suffix_slot_mapping_out,
             max_num_splits=max_num_splits,
+            block_size=self.block_size,
+            num_heads=self.num_heads_q,
+            num_kv_heads=self.num_heads_kv
         )
         return meta
 
@@ -1109,14 +1118,22 @@ class BeamAttentionImpl(AttentionImpl):
                 "[beam_attn NPU] std query shape=%s, key_cache shape=%s",
                 std_query.shape, key_cache.shape
             )
-            std_out = _sdpa_attention(
-                std_query, key_cache, value_cache,
-                attn_metadata.std_cu_seqlens_q,
-                attn_metadata.std_seq_lens,
-                attn_metadata.std_max_q_len,
-                attn_metadata.std_max_seq_len,
-                attn_metadata.causal,
+            # print("key_cache:       key_cache_squeezed: ", key_cache.shape, key_cache.view(*key_cache.shape[:-2], -1).shape)
+            std_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                std_query, key_cache.view(*key_cache.shape[:-2], -1), value_cache.view(*value_cache.shape[:-2], -1),
+                num_query_heads=attn_metadata.num_heads,
+                num_key_value_heads=attn_metadata.num_kv_heads,
+                actual_seq_qlen=attn_metadata.std_cu_seqlens_q,
+                actual_seq_kvlen=attn_metadata.std_seq_lens,
+                softmax_scale=scale,
+                block_table=attn_metadata.std_block_table,
+                block_size=attn_metadata.block_size,
+                sparse_mode=0,
+                inner_precise=0,
+                input_layout="TND",
+                return_softmax_lse=False,
             )
+
             logger.debug("[beam_attn NPU] std_out shape=%s", std_out.shape)
             output[attn_metadata.std_indices] = std_out
 
@@ -1127,14 +1144,23 @@ class BeamAttentionImpl(AttentionImpl):
                 "[beam_attn NPU] mega_query shape=%s, key_cache shape=%s",
                 mega_query.shape, key_cache.shape
             )
-            mega_prefix_out = _sdpa_attention_prefix(
+
+            
+            mega_prefix_out, mega_prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
                 mega_query, key_cache, value_cache,
-                attn_metadata.mega_prefix_cu_seqlens_q,
-                attn_metadata.mega_prefix_seq_lens,
-                attn_metadata.mega_prefix_max_q_len,
-                attn_metadata.mega_prefix_max_seq_len,
-                attn_metadata.mega_prefix_block_table,
+                num_query_heads=attn_metadata.num_heads,
+                num_key_value_heads=attn_metadata.num_kv_heads,
+                actual_seq_qlen=attn_metadata.mega_prefix_cu_seqlens_q,
+                actual_seq_kvlen=attn_metadata.mega_prefix_cu_seqlens_kv,
+                softmax_scale=scale,
+                block_table=attn_metadata.mega_prefix_block_table,
+                block_size=attn_metadata.block_size,
+                sparse_mode=0,
+                inner_precise=0,
+                input_layout="TND",
+                return_softmax_lse=True,
             )
+
             logger.debug(
                 "[beam_attn NPU] mega_prefix_out shape=%s, range [%.6f, %.6f], mega_suffix_total=%d",
                 mega_prefix_out.shape, float(mega_prefix_out.min()), float(mega_prefix_out.max()),
@@ -1148,44 +1174,39 @@ class BeamAttentionImpl(AttentionImpl):
                     slot_mapping[:20].tolist(),
                     attn_metadata.mega_suffix_slot_mapping_out[:20].tolist(),
                 )
-                contig_k, contig_v = extract_suffix_kv(
+                contig_k, contig_v = extract_suffix_kv_pytorch(
                     key_cache,
                     value_cache,
                     slot_mapping,
-                    attn_metadata.mega_suffix_slot_mapping_out,
-                    attn_metadata.mega_suffix_total_tokens,
+                    attn_metadata.mega_suffix_slot_mapping_out
                 )
                 logger.debug(
                     "[beam_attn NPU] contig_k shape=%s, contig_v shape=%s",
                     contig_k.shape, contig_v.shape
                 )
-                mega_suffix_out = _sdpa_attention(
+                
+                mega_suffix_out, mega_suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
                     mega_query, contig_k, contig_v,
-                    attn_metadata.mega_suffix_cu_seqlens_q,
-                    None,
-                    attn_metadata.mega_suffix_max_q_len,
-                    attn_metadata.mega_suffix_max_seq_len,
-                    causal=True,
+                    num_query_heads=attn_metadata.num_heads,
+                    num_key_value_heads=attn_metadata.num_kv_heads,
+                    actual_seq_qlen=attn_metadata.mega_suffix_cu_seqlens_q,
+                    actual_seq_kvlen=attn_metadata.mega_suffix_cu_seqlens_k,
+                    softmax_scale=scale,
+                    block_table=None,  # Using contiguous format, not paged
+                    block_size=None,
+                    sparse_mode=0,  # Standard attention
+                    inner_precise=0,  # FP32 internal precision
+                    nput_layout="TND",
+                    return_softmax_lse=True
                 )
+
                 logger.debug(
                     "[beam_attn NPU] mega_suffix_out shape=%s, range [%.6f, %.6f]",
                     mega_suffix_out.shape, float(mega_suffix_out.min()), float(mega_suffix_out.max())
                 )
-                # Use merge_attn_states_pytorch for NPU
                 mega_out = torch.empty_like(mega_query)
-                mega_out_view = mega_out.view(-1, num_heads, head_dim)
-                prefix_view = mega_prefix_out.view(-1, num_heads, head_dim)
-                suffix_view = mega_suffix_out.view(-1, num_heads, head_dim)
-                # Build dummy LSE tensors: [total_q, num_heads, 1] -> [num_heads, total_q] for merge_attn_states_pytorch
-                mega_prefix_lse = torch.zeros(mega_prefix_out.shape[0], num_heads, 1, dtype=mega_prefix_out.dtype, device=mega_prefix_out.device)
-                mega_suffix_lse = torch.zeros(mega_suffix_out.shape[0], num_heads, 1, dtype=mega_suffix_out.dtype, device=mega_suffix_out.device)
-                merge_attn_states_pytorch(
-                    mega_out_view,
-                    prefix_view,
-                    mega_prefix_lse.squeeze(-1).t(),  # [num_heads, total_q]
-                    suffix_view,
-                    mega_suffix_lse.squeeze(-1).t(),  # [num_heads, total_q]
-                )
+                mega_out = merge_attn_states_pytorch(mega_out, mega_prefix_out, mega_prefix_lse, mega_suffix_out, mega_suffix_lse) 
+     
                 logger.debug(
                     "[beam_attn NPU] merged mega_out range [%.6f, %.6f]",
                     float(mega_out.min()), float(mega_out.max())
