@@ -1,5 +1,2 @@
 -r common.txt
-torchrec==1.4.0
-fbgemm-gpu==1.4.0
-# LMCache is temporarily not installed by default on the CUDA path.
 # Keep LMCache out of the default install for now.

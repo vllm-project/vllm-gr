@@ -53,7 +53,7 @@ For developer mode (includes pytest, ruff, etc.):
 pip install -e ".[dev]"
 ```
 
-Platform dependencies (torchrec, fbgemm-gpu) are selected automatically by `setup.py`. LMCache is not installed by default for now. See [getting_started/installation/](getting_started/installation/README.md).
+Platform dependencies come from the shared `requirements/common.txt`; there are no CUDA-only extras. See [getting_started/installation/](getting_started/installation/README.md).
 
 > **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
 

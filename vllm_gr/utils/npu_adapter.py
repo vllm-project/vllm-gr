@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import os
-import sysconfig
 from typing import Optional
 
 import torch
@@ -14,8 +12,6 @@ import torch
 from vllm_gr.logger import init_logger
 
 logger = init_logger(__name__)
-
-_MXREC_OPS_LOADED = False
 
 
 class DeviceType:
@@ -49,55 +45,6 @@ def is_npu_available() -> bool:
         return False
 
 
-def load_mxrec_ops() -> bool:
-    """Load RecSDK mxrec custom ops using the same total library as RecSDK tests."""
-    global _MXREC_OPS_LOADED
-    if _MXREC_OPS_LOADED:
-        return True
-    if not is_npu_available():
-        logger.warning("mxrec ops not loaded: NPU not available")
-        return False
-
-    try:
-        torch.npu.config.allow_internal_format = False
-    except AttributeError:
-        logger.warning(
-            "mxrec ops preload skipped: torch.npu.config.allow_internal_format unavailable"
-        )
-
-    candidate_paths = []
-    env_path = os.getenv("LIB_FBGEMM_NPU_API_SO_PATH")
-    if env_path:
-        candidate_paths.append(env_path)
-    purelib = sysconfig.get_path("purelib")
-    if purelib:
-        candidate_paths.append(os.path.join(purelib, "libfbgemm_npu_api.so"))
-
-    seen_paths: set[str] = set()
-    for lib_path in candidate_paths:
-        if not lib_path or lib_path in seen_paths:
-            continue
-        seen_paths.add(lib_path)
-        if not os.path.exists(lib_path):
-            continue
-        try:
-            torch.ops.load_library(lib_path)
-            torch.ops.mxrec.hstu_jagged
-            _MXREC_OPS_LOADED = True
-            logger.warning("mxrec ops loaded from %s", lib_path)
-            return True
-        except (RuntimeError, AttributeError, OSError) as e:
-            logger.warning("failed to load mxrec ops from %s: %s", lib_path, e)
-
-    logger.warning("mxrec ops not loaded: no usable libfbgemm_npu_api.so found")
-    return False
-
-
-def preload_mxrec_ops_for_hstu() -> bool:
-    """Explicit early preload hook for HSTU entrypoints."""
-    return load_mxrec_ops()
-
-
 def is_cuda_available() -> bool:
     """Return whether CUDA is available."""
     try:
@@ -115,45 +62,15 @@ def get_default_device() -> torch.device:
     return torch.device(DeviceType.CPU)
 
 
-def check_torchrec_available() -> bool:
-    """Return whether the torchrec or torchrec-npu runtime is available."""
-    try:
-        import torchrec  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
-def check_recsdk_available() -> bool:
-    """Backward-compatible alias for the torchrec runtime availability check."""
-    return check_torchrec_available()
-
-
-def check_fbgemm_available() -> bool:
-    """Return whether the required fbgemm custom ops are available."""
-    try:
-        torch.ops.fbgemm.asynchronous_complete_cumsum
-        torch.ops.fbgemm.jagged_to_padded_dense
-        torch.ops.fbgemm.dense_to_jagged
-        return True
-    except (RuntimeError, AttributeError):
-        return False
-
-
 class DeviceAdapter:
-    """Small facade around backend detection and optional operator stacks."""
+    """Small facade around backend detection."""
 
     def __init__(self) -> None:
         self._device_backend = self._detect_device_backend()
-        self._torchrec_available = check_torchrec_available()
-        self._fbgemm_available = check_fbgemm_available()
 
         logger.debug(
-            "DeviceAdapter backend=%s torchrec=%s fbgemm=%s",
+            "DeviceAdapter backend=%s",
             self._device_backend,
-            self._torchrec_available,
-            self._fbgemm_available,
         )
 
     def _detect_device_backend(self) -> str:
@@ -180,26 +97,15 @@ class DeviceAdapter:
         return self._device_backend == DeviceType.CPU
 
     def should_use_torchrec(self, device: Optional[torch.device] = None) -> bool:
-        """Return whether a torchrec-backed NPU environment is available."""
-        target = self.device_backend if device is None else get_device_backend(device)
-        return target == DeviceType.NPU and self._torchrec_available
+        """Deprecated; vllm-GR no longer uses torchrec."""
+        return False
 
     def should_use_recsdk(self, device: Optional[torch.device] = None) -> bool:
-        """Backward-compatible alias for the torchrec-backed NPU check."""
-        return self.should_use_torchrec(device)
+        """Deprecated alias kept for backward compatibility."""
+        return False
 
     def should_use_fbgemm(self, device: Optional[torch.device] = None) -> bool:
-        """Return whether fbgemm-backed execution is usable for a device."""
-        target = self.device_backend if device is None else get_device_backend(device)
-        if not self._fbgemm_available:
-            return False
-
-        if target == DeviceType.CUDA:
-            return True
-
-        if target == DeviceType.NPU:
-            return self._torchrec_available
-
+        """Deprecated; vllm-GR no longer uses fbgemm custom ops."""
         return False
 
 

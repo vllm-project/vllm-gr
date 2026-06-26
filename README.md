@@ -6,7 +6,7 @@
 
 vLLM-based Generative Recommender Inference Engine
 
-This repository focuses on vLLM-based generative recommendation inference, including the HSTU offline inference pipeline, example scripts, test suites, and GPU / NPU runtime adaptation code.
+This repository focuses on vLLM-based generative recommendation inference, including the OneRec beam-search / catalog-constrained generation pipeline, the Pangu LLM passthrough path, example scripts, test suites, and GPU / NPU runtime adaptation code.
 
 ## Current Scope
 
@@ -14,10 +14,10 @@ The current implementation targets inference scenarios and does not aim for full
 
 ## Repository Contents
 
-- `vllm_gr/` — GRLLM, I/O protocols, workers, runtime utils, ops
-- `examples/` — demo inference, dataset inference, weight loading, benchmark tools
-- `scripts/` — unified test runner and checkpoint conversion scripts
-- `tests/` — unit, contract, platform smoke, and runtime guard tests
+- `vllm_gr/` — GRLLM (offline beam search), beam-search/catalog patches, NPU runtime utils, ops
+- `examples/` — OneRec beam-search and Pangu LLM passthrough offline examples
+- `scripts/` — unified test runner
+- `tests/` — unit, contract, and Pangu system tests
 - `requirements/` — platform dependency lists (auto-selected by `setup.py` as `cuda` / `npu` / `cpu`)
 
 ## Installation
@@ -52,7 +52,7 @@ cd vllm-gr
 uv pip install -e .
 ```
 
-`setup.py` detects the CUDA backend and automatically loads `requirements/cuda.txt` (includes torchrec and fbgemm-gpu). LMCache is not installed by default for now.
+`setup.py` detects the CUDA backend and automatically loads `requirements/cuda.txt` (shares the common dependencies; no CUDA-only extras). LMCache is not installed by default for now.
 
 #### Step 3 (optional): Developer tools
 
@@ -64,7 +64,7 @@ uv pip install -e ".[dev]"
 
 ```bash
 python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
-python -c "import vllm, msgspec, safetensors, torchrec; print('gpu python deps ok')"
+python -c "import vllm, msgspec, safetensors; print('gpu python deps ok')"
 ```
 
 ### NPU Installation
@@ -75,10 +75,11 @@ Follow the [vllm-ascend installation guide](https://docs.vllm.ai/projects/ascend
 
 #### Step 1.5: GR-specific dependencies (manual install)
 
+The NPU runtime no longer requires torchrec or fbgemm-gpu; jagged-tensor
+ops run through the native PyTorch fallback path.
+
 ```bash
-pip install /path/to/torchrec-1.4.0-npu.whl
-pip install fbgemm-gpu==1.4.0+cpu \
-  --extra-index-url https://download.pytorch.org/whl/cpu
+# No additional GR-specific wheels required on NPU.
 ```
 
 #### Step 2: Install vllm-gr
@@ -227,32 +228,19 @@ python scripts/run_tests.py --list-suites
 
 ### 2. Unified self-validation
 
-Recommended command:
+Recommended command (this is what the PR gate runs):
 
 ```bash
-python scripts/run_tests.py --all --auto-platform
+python scripts/run_tests.py --all
 ```
 
-Notes:
+`--all` expands to the `unit` suite only. `pangu1b-st` is intended for
+nightly / manual runs (it requires the Pangu 1B checkpoint and a GPU/NPU).
 
-- `--all` runs `unit + platform lane + examples`
-- `--auto-platform` automatically resolves the currently available backend:
-    - NPU environment → runs `platform-npu`
-    - GPU environment → runs `platform-gpu`
-    - CPU environment → skips platform smoke tests, runs `unit + examples` only
-- Examples automatically pass `--expect-device` for backend consistency checks
-
-To run only the default unit suite:
+To run only the default unit suite explicitly:
 
 ```bash
 python scripts/run_tests.py
-```
-
-To explicitly specify a platform smoke test:
-
-```bash
-python scripts/run_tests.py --suite gpu-smoke
-python scripts/run_tests.py --suite npu-smoke
 ```
 
 ## How to Add New Test Cases to CI
@@ -264,8 +252,8 @@ The CI pipeline works as follows:
 ```text
 PR /retest
   -> CI clones the MR code
-  -> python scripts/run_tests.py --suite unit gpu-smoke
-  -> Only executes test files explicitly listed in SUITE_DEFINITIONS
+  -> python scripts/run_tests.py --all
+  -> Only executes test files explicitly listed in SUITE_DEFINITIONS["unit"]
 ```
 
 This means:
@@ -279,7 +267,7 @@ This means:
 If your new test case belongs in the default gate, follow these 4 steps:
 
 1. Add the new test file under `tests/`
-2. Add the filename to the appropriate suite in `SUITE_DEFINITIONS` in `scripts/run_tests.py`
+2. Add the filename to the `unit` suite in `SUITE_DEFINITIONS` in `scripts/run_tests.py`
 3. Run the unified test runner locally to verify
 4. Push to the MR branch and comment `/retest` on the PR
 
@@ -288,21 +276,20 @@ If your new test case belongs in the default gate, follow these 4 steps:
 The current default gate is equivalent to:
 
 ```bash
-python scripts/run_tests.py --suite unit gpu-smoke
+python scripts/run_tests.py --suite unit
 ```
 
 Where:
 
 - `unit` is for pure logic, protocol, contract, and dependency-light tests
-- `gpu-smoke` is for GPU smoke tests that need to run as standalone scripts
-- If your test is an NPU smoke test, do not put it in `unit`. Use `npu-smoke` or create a new suite instead
+  (beam search, catalog, patch helpers, Pangu passthrough)
 
 ### Example 1: Add a new contract test to the default CI
 
 Suppose you added:
 
 ```text
-tests/test_batch_recommendation_contract.py
+tests/test_my_new_contract.py
 ```
 
 If you want it included in the default `/retest`, the simplest way is to add it to the `unit` suite:
@@ -313,20 +300,18 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
         "label": "Core Unit Tests",
         "runner": "pytest",
         "files": [
-            "test_engine.py",
-            "test_gr_schema_contract.py",
-            "test_processors.py",
-            "test_embedding_collection_patch.py",
-            "test_gr_runner_core.py",
-            "test_dataset_config_parity.py",
-            "test_checkpoint_conversion_contract.py",
-            "test_output_contract.py",
-            "test_positional_encoder_parity.py",
-            "test_run_tests_script.py",
-            "test_hstu_attention_contract.py",
-            "test_batch_recommendation_contract.py",
+            "test_yuanrong_monkey_patch.py",
+            "test_yuanrong_backend.py",
+            "test_split_qkv_rmsnorm_rope_patch.py",
+            "test_batch_and_fork_unit.py",
+            "test_dp_beam_search_unit.py",
+            "test_catalog.py",
+            "test_task_specific_catalog_program.py",
+            "test_pangu_llm_passthrough.py",
+            "test_my_new_contract.py",
         ],
     },
+    # ...
 }
 ```
 
@@ -339,14 +324,14 @@ python scripts/run_tests.py --suite unit
 To quickly verify just the new file:
 
 ```bash
-python -m pytest tests/test_batch_recommendation_contract.py -q
+python -m pytest tests/test_my_new_contract.py -q
 ```
 
 Once confirmed passing:
 
 ```bash
-git add tests/test_batch_recommendation_contract.py scripts/run_tests.py
-git commit -m "Add batch recommendation contract test to unit suite"
+git add tests/test_my_new_contract.py scripts/run_tests.py
+git commit -m "Add my new contract test to unit suite"
 git push
 ```
 
@@ -358,23 +343,16 @@ Then comment on the corresponding PR:
 
 ### Example 2: Create a new standalone suite
 
-If your test does not fit in the default `unit` suite, you can define a separate suite:
+If your test does not fit in the default `unit` suite (e.g. it needs special hardware or a model download), you can define a separate suite alongside `unit` and `pangu1b-st`:
 
 ```python
 SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
-    "unit": {
-        "label": "Core Unit Tests",
+    # ... existing suites ...
+    "my-suite": {
+        "label": "My Specialized Tests",
         "runner": "pytest",
         "files": [
-            "test_engine.py",
-            "test_gr_schema_contract.py",
-        ],
-    },
-    "batch-contract": {
-        "label": "Batch Recommendation Contract Tests",
-        "runner": "pytest",
-        "files": [
-            "test_batch_recommendation_contract.py",
+            "test_my_specialized.py",
         ],
     },
 }
@@ -383,21 +361,21 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
 Verify locally:
 
 ```bash
-python scripts/run_tests.py --suite batch-contract
+python scripts/run_tests.py --suite my-suite
 ```
 
 Note:
 
 - After doing this, the suite can be run locally
-- However, if CI still runs `python scripts/run_tests.py --suite unit gpu-smoke` by default, `/retest` will not automatically run `batch-contract`
-- It will only enter the default gate when the CI test command is updated to include this suite, or when you merge it into the default `unit` suite
+- However, since the PR gate runs `--all` (which expands to `unit` only), `/retest` will not automatically run `my-suite`
+- It will only enter the default gate when you either merge its files into `unit`, or update the CI `--all` expansion
 
 ### When CI Infrastructure Changes Are Not Needed
 
 The following scenarios typically require no changes to webhooks, queues, workers, or container scripts:
 
 - You are only adding a new `tests/test_xxx.py`
-- And adding it to an existing suite (`unit` / `gpu-smoke` / `npu-smoke`)
+- And adding it to an existing suite (`unit` or `pangu1b-st`)
 - And still using `python scripts/run_tests.py` as the unified test runner
 
 In other words, most "add a new test case and make `/retest` run it" scenarios only require changes within the repository itself:
@@ -407,12 +385,10 @@ In other words, most "add a new test case and make `/retest` run it" scenarios o
 
 ### Pre-Commit Checklist
 
-It is recommended to run at least one of the following:
+It is recommended to run at least the unit suite:
 
 ```bash
 python scripts/run_tests.py --suite unit
-python scripts/run_tests.py --suite gpu-smoke
-python scripts/run_tests.py --all --auto-platform
 ```
 
 Minimum checks:
@@ -425,110 +401,47 @@ Minimum checks:
 
 ### 3. Run demo examples
 
-GPU:
+The OneRec offline beam-search example lives under `examples/offline_inference/beam_search/`,
+and the Pangu 1B LLM passthrough example lives under `examples/offline_inference/pangu1b/`.
+See the per-example README files for hardware-specific instructions.
 
-```bash
-python examples/simple_inference.py --expect-device gpu
-python examples/dataset_inference.py --expect-device gpu debug
-```
+### 4. Run OneRec benchmark / accuracy tools
 
-NPU:
-
-```bash
-python examples/simple_inference.py --expect-device npu
-python examples/dataset_inference.py --expect-device npu debug
-```
-
-CPU:
-
-```bash
-python examples/simple_inference.py --expect-device cpu
-python examples/dataset_inference.py --expect-device cpu debug
-```
-
-Once the `debug` dataset passes, continue with:
-
-```bash
-python examples/dataset_inference.py movielens-1m
-python examples/dataset_inference.py kuairand-1k
-python examples/dataset_inference.py streaming
-```
-
-### 4. Convert and load real weights
-
-First, convert the training checkpoint:
-
-```bash
-python scripts/convert_gr_checkpoint.py \
-  --input-path /path/to/training_checkpoint \
-  --output-dir /path/to/converted_model \
-  --dataset movielens-1m
-```
-
-Then load the converted model:
-
-```bash
-python examples/load_converted_model.py \
-  --model /path/to/converted_model \
-  --expect-device gpu
-```
-
-For NPU environments, replace `--expect-device gpu` with `npu`.
-
-Note:
-
-- `examples/demo-model/` contains only `config.json` with no real weights; it is only used for the demo/random-init path
-- `scripts/convert_gr_checkpoint.py` depends on `torchrec` capabilities and is best run in a GPU environment or an environment with `torchrec` already available
-- A minimal NPU dependency environment may not support running the checkpoint conversion script directly
-
-### 5. Run benchmark / accuracy tools
-
-```bash
-python examples/acc_test.py \
-  --model /path/to/converted_model \
-  --input-json /path/to/input.json \
-  --output-json /tmp/gr_pred.json
-```
-
-If ground truth results are available:
-
-```bash
-python examples/analyze_acc_error.py \
-  --pred-json /tmp/gr_pred.json \
-  --gt-json /path/to/gt.json \
-  --input-json /path/to/input.json
-```
+The OneRec benchmark suite is under `benchmarks/open_one_rec/` and provides
+its own dataset loaders, evaluators and catalog tooling. See
+`docs/benchmarks/` for details.
 
 ## Python API Example
 
+`GRLLM` is a thin subclass of vLLM's `LLM` that adds optional catalog-constrained
+beam search. After removing the GR adapter / recommend runtime it always goes
+through the standard vLLM LLM path, so any HuggingFace checkpoint (OneRec,
+Pangu, …) is supported:
+
 ```python
-from vllm_gr import GRLLM, GRPrompt
+from vllm_gr import GRLLM
+from vllm.sampling_params import BeamSearchParams
 
 llm = GRLLM(
-    model="examples/demo-model",
-    max_seq_len=64,
-    max_candidates=50,
-    allow_missing_weights=True,
+    model="OpenOneRec/OneRec-1.7B",
+    trust_remote_code=True,
+    catalog_path="/path/to/catalog.json",  # optional catalog constraint
 )
 
-prompt: GRPrompt = {
-    "user_id": "user_001",
-    "user_history": [
-        {"item_id": 1001, "timestamp": 1609459200},
-        {"item_id": 1002, "timestamp": 1609545600},
-    ],
-    "candidates": [
-        {"item_candidate_id": 2001, "query_time": 1610000000},
-        {"item_candidate_id": 2002, "query_time": 1610000000},
-    ],
-}
-
-outputs = llm.recommend([prompt], use_tqdm=False)
-print(outputs[0].item_ids)
+params = BeamSearchParams(
+    beam_width=512,
+    max_tokens=5,
+    temperature=0.0,
+    ignore_eos=False,
+)
+outputs = llm.beam_search([{"prompt": "..."}], params)
+print(outputs[0].sequences[0].text)
 llm.shutdown()
 ```
 
-The feature names in `user_history` / `candidates` within `GRPrompt` must match the model configuration. For dataset-specific usage patterns, see `examples/` and `vllm_gr/inputs/data.py`.
+For online serving, use the `vllm-gr serve` subcommand or the vLLM OpenAI API
+server (the beam-search / catalog patches are applied automatically via the
+vLLM general plugin).
 
 ## Uninstall
 

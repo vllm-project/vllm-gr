@@ -46,11 +46,9 @@ See the [vllm-ascend v0.14.0rc1 installation reference](https://github.com/vllm-
 
 4. **Install GR-specific manual dependencies**
 
-```bash
-pip install /path/to/torchrec-1.4.0-npu.whl
-pip install fbgemm-gpu==1.4.0+cpu \
-  --extra-index-url https://download.pytorch.org/whl/cpu
-```
+NPU runtime no longer requires torchrec or fbgemm-gpu; jagged-tensor ops run
+through the native PyTorch fallback path. No additional GR-specific wheels
+are required on NPU.
 
 5. **Install vllm-gr**
 

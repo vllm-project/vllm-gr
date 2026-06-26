@@ -38,17 +38,17 @@ def _load_setup_module() -> ModuleType:
         (
             "cpu",
             {"msgspec", "safetensors>=0.4.5"},
-            {"torchrec==1.4.0", "fbgemm-gpu==1.4.0", "vllm"},
+            {"vllm"},
         ),
         (
             "cuda",
-            {"torchrec==1.4.0", "fbgemm-gpu==1.4.0"},
+            {"msgspec", "safetensors>=0.4.5"},
             {"vllm"},
         ),
         (
             "npu",
             {"msgspec", "safetensors>=0.4.5"},
-            {"torchrec==1.4.0", "fbgemm-gpu==1.4.0", "vllm"},
+            {"vllm"},
         ),
     ],
 )

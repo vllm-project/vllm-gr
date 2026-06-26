@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Sync engine shutdown helpers for GR and vLLM LLM passthrough paths."""
+"""Sync engine shutdown helpers for the vLLM LLM passthrough path."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ logger = init_logger(__name__)
 
 
 def shutdown_sync_engine(engine: Any) -> None:
-    """Shut down a sync engine from either GRLLMEngine or vLLM LLMEngine."""
+    """Shut down a sync engine (vLLM LLMEngine)."""
     if engine is None:
         return
 
@@ -32,17 +32,4 @@ def shutdown_sync_engine(engine: Any) -> None:
     logger.warning(
         "Engine %s has no shutdown method; resources may not be released",
         type(engine).__name__,
-    )
-
-
-def shutdown_grllm(llm: Any) -> None:
-    """Delegate shutdown to ``llm.shutdown()`` when available."""
-    shutdown = getattr(llm, "shutdown", None)
-    if callable(shutdown):
-        shutdown()
-        return
-
-    logger.warning(
-        "Object %s has no shutdown method; cannot release resources",
-        type(llm).__name__,
     )

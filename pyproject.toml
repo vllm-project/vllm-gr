@@ -16,7 +16,7 @@ requires-python = ">=3.11,<3.14"
 authors = [
     {name = "vllm-gr Authors"},
 ]
-keywords = ["machine-learning", "recommender-systems", "inference", "vllm", "hstu", "dlrm"]
+keywords = ["machine-learning", "recommender-systems", "inference", "vllm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -46,8 +46,6 @@ dev = [
 # Kept for one transition release so legacy `.[gpu]` installs still receive
 # the GPU-only GR dependencies even if setup.py metadata routing is bypassed.
 gpu = [
-    "torchrec==1.4.0",
-    "fbgemm-gpu==1.4.0",
 ]
 # DEPRECATED: use `pip install -e .` — platform deps come from setup.py
 npu = []

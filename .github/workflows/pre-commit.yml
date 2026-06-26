@@ -117,6 +117,13 @@ jobs:
         run: |
           ./tests/system/run_benchmark_and_verify.sh
 
-      - name: Run HSTU auto tests
+      - name: Run unit test suite
         run: |
-          python scripts/run_tests.py --all --auto-platform
+          python scripts/run_tests.py --all
+
+      - name: Attempt Pangu 1B system tests (non-blocking)
+        # ST needs PANGU1B_MODEL_PATH + GPU; skips gracefully when absent.
+        # continue-on-error keeps it informational — never blocks the PR gate.
+        continue-on-error: true
+        run: |
+          python scripts/run_tests.py --suite pangu1b-st

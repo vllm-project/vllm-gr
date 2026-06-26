@@ -1,32 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Original code from Meta Platforms, Inc. (generative-recommenders)
 
+"""vllm-gr operator packages.
+
+After the HSTU / DLRM-v3 / FuXi runtime was removed, the paged-KV attention
+ops and jagged-tensor helpers that served it are gone. The only remaining
+operator package is :mod:`vllm_gr.ops.npu`, which hosts the NPU (Ascend)
+custom-op patches applied by ``vllm_gr.plugin`` / ``vllm_gr.patch``.
 """
-HSTU Model Operators Package
 
-Contains attention, compute, jagged tensor operations, and normalization operators.
-Currently provides PyTorch implementations, extensible to Triton/CUDA optimized versions.
-"""
-
-from vllm_gr.ops.hstu_attention import delta_hstu_mha, hstu_mha
-from vllm_gr.ops.hstu_compute import (
-    hstu_compute_output,
-    hstu_compute_uqvk,
-    hstu_preprocess_and_attention,
+from vllm_gr.ops.npu.split_qkv_rmsnorm_rope import (
+    apply_split_qkv_rmsnorm_rope_patch,
 )
-from vllm_gr.ops.jagged_tensors import concat_2D_jagged, split_2D_jagged
-from vllm_gr.ops.layer_norm import LayerNorm, SwishLayerNorm, layer_norm
 
 __all__ = [
-    "hstu_mha",
-    "delta_hstu_mha",
-    "hstu_compute_uqvk",
-    "hstu_compute_output",
-    "hstu_preprocess_and_attention",
-    "concat_2D_jagged",
-    "split_2D_jagged",
-    "LayerNorm",
-    "SwishLayerNorm",
-    "layer_norm",
+    "apply_split_qkv_rmsnorm_rope_patch",
 ]

@@ -218,6 +218,9 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
         self.assertTrue(content.strip(), f"empty completion: {body}")
 
     def test_recommend_api_disabled_for_llm_mode(self) -> None:
+        # After removing the GR adapter / recommend runtime, the /recommend
+        # router is no longer registered; requests must fail (404) instead of
+        # being routed to a recommendation handler.
         payload = {
             "model": SERVED_MODEL_NAME,
             "prompt": {
@@ -231,11 +234,7 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
             json=payload,
             timeout=30,
         )
-        body = response.json()
-        self.assertIn("error", body)
-        error_message = body["error"].get("message", "")
-        self.assertIn("Recommend API", error_message)
-        self.assertEqual(body["error"].get("code"), 400)
+        self.assertEqual(response.status_code, 404)
 
     def test_gsm8k_mini_online_accuracy(self) -> None:
         spec = importlib.util.spec_from_file_location(

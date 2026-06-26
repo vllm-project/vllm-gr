@@ -1,40 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Backend-aware operator wrappers with conservative fallbacks."""
+"""Pure-PyTorch jagged-tensor operator wrappers.
+
+These helpers used to dispatch to torch.ops.fbgemm when available; the fbgemm
+dependency has been removed and all paths now execute through native PyTorch
+implementations.
+"""
 
 import logging
 
 import torch
 
-from vllm_gr.utils.npu_adapter import get_device_adapter
-
 logger = logging.getLogger(__name__)
 
 
 class ReliableOps:
-    """Run optional custom ops when available and fall back to PyTorch.
-
-    Backend selection is delegated to DeviceAdapter so CUDA and torchrec-backed
-    NPU can share the same torch.ops.fbgemm dispatch path.
-    """
+    """Jagged-tensor operators implemented on top of native PyTorch."""
 
     @staticmethod
     def asynchronous_complete_cumsum(lengths: torch.Tensor) -> torch.Tensor:
-        adapter = get_device_adapter()
-        device = lengths.device
-
-        if adapter.should_use_fbgemm(device):
-            return ReliableOps._call_fbgemm_or_raise(
-                op_name="asynchronous_complete_cumsum",
-                device=device,
-                fn=lambda: torch.ops.fbgemm.asynchronous_complete_cumsum(lengths),
-            )
-
         cumsum = torch.zeros(
             lengths.size(0) + 1,
             dtype=lengths.dtype,
-            device=device,
+            device=lengths.device,
         )
         torch.cumsum(lengths, dim=0, out=cumsum[1:])
         return cumsum
@@ -46,21 +35,7 @@ class ReliableOps:
         max_lengths: list[int],
         padding_value: float,
     ) -> torch.Tensor:
-        adapter = get_device_adapter()
         device = values.device
-
-        if adapter.should_use_fbgemm(device):
-            return ReliableOps._call_fbgemm_or_raise(
-                op_name="jagged_to_padded_dense",
-                device=device,
-                fn=lambda: torch.ops.fbgemm.jagged_to_padded_dense(
-                    values=values,
-                    offsets=offsets,
-                    max_lengths=max_lengths,
-                    padding_value=padding_value,
-                ),
-            )
-
         fallback_offsets = ReliableOps._resolve_single_offsets(
             op_name="jagged_to_padded_dense",
             offsets=offsets,
@@ -82,19 +57,7 @@ class ReliableOps:
         dense: torch.Tensor,
         x_offsets: list[torch.Tensor],
     ) -> torch.Tensor:
-        adapter = get_device_adapter()
         device = dense.device
-
-        if adapter.should_use_fbgemm(device):
-            return ReliableOps._call_fbgemm_or_raise(
-                op_name="dense_to_jagged",
-                device=device,
-                fn=lambda: torch.ops.fbgemm.dense_to_jagged(
-                    dense=dense,
-                    x_offsets=x_offsets,
-                )[0],
-            )
-
         fallback_offsets = ReliableOps._resolve_single_offsets(
             op_name="dense_to_jagged",
             offsets=x_offsets,
@@ -110,22 +73,6 @@ class ReliableOps:
         )
 
     @staticmethod
-    def _call_fbgemm_or_raise(
-        op_name: str,
-        device: torch.device,
-        fn,
-    ):
-        try:
-            return fn()
-        except (RuntimeError, AttributeError) as exc:
-            raise RuntimeError(
-                "torch.ops.fbgemm."
-                f"{op_name} failed on accelerated device {torch.device(device)}. "
-                "CUDA/NPU paths require a working fbgemm backend and do not "
-                "fall back to the PyTorch reference implementation."
-            ) from exc
-
-    @staticmethod
     def _resolve_single_offsets(
         op_name: str,
         offsets: list[torch.Tensor],
@@ -136,8 +83,8 @@ class ReliableOps:
 
         if len(offsets) != 1:
             raise NotImplementedError(
-                f"{op_name} fallback only supports a single offsets tensor; "
-                "multi-offset dispatch requires torch.ops.fbgemm."
+                f"{op_name} only supports a single offsets tensor; "
+                "multi-offset dispatch is not implemented in the PyTorch path."
             )
 
         return offsets[0]
@@ -188,7 +135,7 @@ class ReliableOps:
         if results:
             return torch.cat(results, dim=0)
 
-        logger.debug("dense_to_jagged fallback received an empty batch")
+        logger.debug("dense_to_jagged received an empty batch")
         return torch.empty(
             0,
             *dense.shape[2:],

@@ -13,7 +13,12 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_gr.entrypoints.api_server import run_server
 
-DESCRIPTION = """Launch a local OpenAI-compatible API server for vllm-GR /recommend serving."""
+DESCRIPTION = """Launch a local OpenAI-compatible API server for vllm-gr.
+
+This wraps vLLM's standard OpenAI API server; the vllm-gr beam-search and
+catalog-constrained generation patches are loaded automatically via the vLLM
+general plugin. Useful for serving OneRec-style checkpoints.
+"""
 
 
 class GRServeSubcommand(CLISubcommand):
@@ -26,12 +31,6 @@ class GRServeSubcommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        if args.headless:
-            raise ValueError("vllm-gr serve does not support --headless")
-
-        if getattr(args, "api_server_count", 1) != 1:
-            raise ValueError("vllm-gr serve currently supports api_server_count=1 only")
-
         uvloop.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
@@ -43,36 +42,12 @@ class GRServeSubcommand(CLISubcommand):
     ) -> FlexibleArgumentParser:
         serve_parser = subparsers.add_parser(
             self.name,
-            help="Launch a local OpenAI-compatible API server for vllm-GR.",
+            help="Launch a local OpenAI-compatible API server for vllm-gr.",
             description=DESCRIPTION,
             usage="vllm-gr serve [model_tag] [options]",
         )
 
         serve_parser = make_arg_parser(serve_parser)
-        serve_parser.add_argument(
-            "--dataset",
-            type=str,
-            default=None,
-            help="Optional dataset name used to apply in-memory config overrides.",
-        )
-        serve_parser.add_argument(
-            "--max-seq-len",
-            type=int,
-            default=512,
-            help="Maximum user history sequence length.",
-        )
-        serve_parser.add_argument(
-            "--max-candidates",
-            type=int,
-            default=1000,
-            help="Maximum number of candidate items.",
-        )
-        serve_parser.add_argument(
-            "--allow-missing-weights",
-            action=argparse.BooleanOptionalAction,
-            default=False,
-            help="Allow local model dirs without checkpoint weights (dummy loader).",
-        )
 
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
         return serve_parser
