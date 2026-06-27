@@ -1229,8 +1229,12 @@ class BeamAttentionImpl(AttentionImpl):
                     "[beam_attn NPU] mega_suffix_out shape=%s, range [%.6f, %.6f]",
                     mega_suffix_out.shape, float(mega_suffix_out.min()), float(mega_suffix_out.max())
                 )
-                mega_out = torch.empty_like(mega_query)
-                mega_out = merge_attn_states_pytorch(mega_out, mega_prefix_out, mega_prefix_lse, mega_suffix_out, mega_suffix_lse)
+                # NPU FIA returns LSE in TND layout [T, N, 1], so use the TND
+                # merge (merge_attn_states_pytorch expects the flash 2-D
+                # [num_heads, total_q] convention used on the GPU path).
+                mega_out, _ = merge_tnd_attention_outputs(
+                    mega_prefix_out, mega_prefix_lse, mega_suffix_out, mega_suffix_lse
+                )
 
                 logger.debug(
                     "[beam_attn NPU] merged mega_out range [%.6f, %.6f]",
