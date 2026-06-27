@@ -582,6 +582,11 @@ class InputBatchProxy:
             return MegaReqIdsProxy(obj.req_ids, req_map)
         elif name == "num_tokens_no_spec":
             return Mock1DArray(obj.num_tokens_no_spec, idx_map)
+        elif name == "num_tokens":
+            # NPU's _bookkeeping_sync writeback loop also updates num_tokens
+            # (the GPU path does not). Map it to the logical batch slot like
+            # num_tokens_no_spec. Inert when never accessed (e.g. GPU).
+            return Mock1DArray(obj.num_tokens, idx_map)
         elif name == "token_ids_cpu":
             return Mock2DArray(obj.token_ids_cpu, idx_map)
         elif name == "is_token_ids":
@@ -601,14 +606,372 @@ class InputBatchProxy:
 # ============================================================================
 
 
+def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[int]:
+    """Expand a packed mega-decode batch into per-beam rows.
+
+    Device-neutral. Overwrites per-beam RoPE position ids (Job B), builds the
+    per-beam ``logits_indices`` list, installs an ``InputBatchProxy`` on
+    ``runner.input_batch`` and stashes ``scheduler_output._gr_request_row_configs``
+    (Job C). Job A (populating ``mega_info["req_ids"]``) is left to the caller
+    because its ordering relative to the original ``_prepare_inputs`` differs
+    between GPU and NPU.
+
+    Assumes ``scheduler_output.mega_data`` is non-empty (caller checks).
+
+    Returns:
+        The new per-beam logits-index list (caller converts to a tensor).
+    """
+    mega_data = getattr(scheduler_output, "mega_data", {})
+
+    runner.input_batch.logprob_token_ids = {}
+    new_logits_indices: List[int] = []
+    orig_req_ids = runner.input_batch.req_ids
+
+    token_offset = 0
+    row_to_req_id, row_to_batch_idx, logits_to_batch_idx, request_row_configs = ([], [], [], [])
+    input_row_idx = 0
+
+    gpu_positions, cpu_positions = _get_positions_buffers(runner)
+
+    for batch_idx, req_id in enumerate(orig_req_ids):
+        seq_len = num_scheduled_tokens[batch_idx] if batch_idx < len(num_scheduled_tokens) else 0
+        if req_id is None:
+            row_to_req_id.append(None)
+            row_to_batch_idx.append(batch_idx)
+            input_row_idx += 1
+            token_offset += seq_len
+            continue
+
+        mdata = mega_data.get(req_id)
+        if mdata and mdata.get("is_mega_decode", False):
+            W, W_logits, next_offset = _process_mega_decode_request(
+                mdata,
+                seq_len,
+                token_offset,
+                gpu_positions,
+                cpu_positions,
+                new_logits_indices,
+            )
+            row_to_req_id.extend([req_id] * W)
+            row_to_batch_idx.extend([batch_idx] * W)
+            logits_to_batch_idx.extend([batch_idx] * W_logits)
+
+            request_row_configs.append((req_id, input_row_idx, W_logits))
+            input_row_idx += W
+        else:
+            num_computed_tokens = runner.input_batch.num_computed_tokens_cpu[batch_idx]
+            num_prompt_tokens = runner.input_batch.num_prompt_tokens[batch_idx]
+
+            is_last_chunk_prefill = bool(
+                num_computed_tokens < num_prompt_tokens
+                and num_computed_tokens + seq_len >= num_prompt_tokens
+            )
+            W_logits_count = 0
+            W = 1
+            if is_last_chunk_prefill:
+                new_logits_indices.append(token_offset + seq_len - 1)
+                W_logits_count = 1
+                logits_to_batch_idx.extend([batch_idx] * W)
+            row_to_req_id.extend([req_id] * W)
+            row_to_batch_idx.extend([batch_idx] * W)
+
+            request_row_configs.append((req_id, input_row_idx, W_logits_count))
+            input_row_idx += W
+
+        token_offset += seq_len
+
+    runner.input_batch = InputBatchProxy(
+        runner.input_batch, row_to_req_id, row_to_batch_idx, logits_to_batch_idx
+    )
+    scheduler_output._gr_request_row_configs = request_row_configs
+
+    return new_logits_indices
+
+
+def _mega_collapse_bookkeeping(
+    orig_input_batch, request_row_configs, sampler_output
+) -> Tuple[List[Any], Dict[Any, int], int]:
+    """Collapse per-beam sampler output back onto logical (session) requests.
+
+    Device-neutral. Remuxes the sampler logprobs tensors in place so that each
+    logical request owns one flattened ``W * K`` row, and resizes the sampler
+    output tensors accordingly.
+
+    Returns:
+        ``(collapsed_req_ids, collapsed_req_id_to_index, num_logical_requests)``.
+    """
+    collapsed_req_ids_copy = [r[0] for r in request_row_configs if r[0] is not None]
+    collapsed_req_id_to_index = {
+        req_id: idx for idx, req_id in enumerate(collapsed_req_ids_copy)
+    }
+    num_logical_requests = len(collapsed_req_ids_copy)
+
+    if sampler_output is not None:
+        st_ids = sampler_output.sampled_token_ids
+        lp_tensors = sampler_output.logprobs_tensors
+        if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
+            orig_lps = lp_tensors.logprobs
+            orig_lp_ids = lp_tensors.logprob_token_ids
+            orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
+            actual_K = orig_lps.shape[1]
+            max_chained_dim = max(W * actual_K for _, _, W in request_row_configs)
+
+            final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
+                request_row_configs,
+                max_chained_dim,
+                actual_K,
+                orig_lps,
+                orig_lp_ids,
+                orig_ranks,
+                st_ids,
+            )
+
+            # Safely resizes the original tensor wrapper and copies the elements in place
+            st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
+            lp_tensors.logprobs.resize_(final_lps.shape).copy_(final_lps)
+
+            if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
+                lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
+            if orig_ranks is not None and final_ranks is not None:
+                clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
+                lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
+                    clean_ranks_slice
+                )
+
+            if getattr(orig_input_batch, "prev_sampled_token_ids", None) is not None:
+                orig_input_batch.prev_sampled_token_ids.resize_(final_st_ids.shape).copy_(
+                    final_st_ids
+                )
+
+    return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
+
+
+# ---------------------------------------------------------------------------
+# Factory functions (module-level so each captures its own original via
+# closure argument, avoiding late-binding bugs when patching multiple runners).
+# ---------------------------------------------------------------------------
+
+
+def make_patched_execute_model(_orig_execute_model):
+    """Wrap execute_model to publish mega-request context for the run.
+
+    Shared by GPU and NPU runners.
+    """
+    from vllm_gr.v1.attention.backends.beam_attn import MEGA_DATA_VAR
+
+    @wraps(_orig_execute_model)
+    def patched_execute_model(self, scheduler_output, *args, **kwargs):
+        self._current_mega_data = getattr(scheduler_output, "mega_data", {})
+        mega_info = {"mega_data": self._current_mega_data, "req_ids": []}
+        token = MEGA_DATA_VAR.set(mega_info)
+        self._current_mega_info = mega_info
+        try:
+            return _orig_execute_model(self, scheduler_output, *args, **kwargs)
+        finally:
+            self._current_mega_data = {}
+            self._current_mega_info = None
+            MEGA_DATA_VAR.reset(token)
+
+    return patched_execute_model
+
+
+def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
+    """GPU ``_prepare_inputs`` wrapper: ``(scheduler_output, num_scheduled_tokens)``
+    returning ``(logits_indices, spec_decode_metadata)``."""
+
+    @wraps(_orig_prepare_inputs)
+    def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        logits_indices, spec_decode_metadata = _orig_prepare_inputs(
+            self, scheduler_output, num_scheduled_tokens
+        )
+
+        # Job A: the GPU attention builder runs after _prepare_inputs returns, so
+        # populating req_ids here (post-orig) is in time.
+        if getattr(self, "_current_mega_info", None) is not None:
+            self._current_mega_info["req_ids"] = self.input_batch.req_ids
+
+        mega_data = getattr(scheduler_output, "mega_data", {})
+        if not mega_data:
+            return logits_indices, spec_decode_metadata
+
+        new_logits_indices = _mega_remap_inputs(self, scheduler_output, num_scheduled_tokens)
+        return (
+            torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device),
+            spec_decode_metadata,
+        )
+
+    return patched_prepare_inputs
+
+
+def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
+    """GPU ``_bookkeeping_sync`` wrapper: returns the 7-tuple including
+    ``num_nans_in_logits``."""
+
+    @wraps(_orig_bookkeeping_sync)
+    def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
+        mega_data = getattr(scheduler_output, "mega_data", {})
+        if not mega_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
+            return _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
+
+        request_row_configs = scheduler_output._gr_request_row_configs
+        orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
+
+        try:
+            res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
+        finally:
+            self.input_batch = orig_input_batch
+
+        (
+            num_nans_in_logits,
+            logprobs_lists,
+            valid_sampled_token_ids,
+            prompt_logprobs_dict,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            invalid_req_indices,
+        ) = res
+
+        sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(
+            orig_input_batch, request_row_configs, sampler_output
+        )
+
+        return (
+            num_nans_in_logits,
+            [[] for _ in range(n)] if logprobs_lists is not None else None,
+            [[] for _ in range(n)],
+            prompt_logprobs_dict,
+            collapsed_req_ids,
+            collapsed_idx,
+            invalid_req_indices,
+        )
+
+    return patched_bookkeeping_sync
+
+
+def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
+    """NPU ``_prepare_inputs`` wrapper.
+
+    Signature: ``(scheduler_output, intermediate_tensors=None)``.
+    Returns the NPU 7-tuple
+    ``(attn_metadata, num_scheduled_tokens, num_input_tokens,
+    num_tokens_across_dp, logits_indices, spec_decode_metadata,
+    max_num_scheduled_tokens)``.
+
+    Two NPU-specific differences vs the GPU wrapper:
+
+    - The NPU attention metadata builder runs *inside* the original
+      ``_prepare_inputs``, so Job A (publishing ``req_ids`` to the contextvar)
+      must happen *before* delegating, not after.
+    - ``_prepare_inputs`` is called from ``execute_model``, while sampling and
+      ``_bookkeeping_sync`` run in a separate ``sample_tokens`` call. If an
+      early return skips bookkeeping, a stale ``InputBatchProxy`` could survive
+      to the next step, so we defensively un-proxy at entry.
+
+    The per-beam RoPE position overwrite needs no extra device copy: NPU
+    ``self.positions`` is a ``CpuGpuBuffer`` and ``_overwrite_position_ids``
+    writes the ``.gpu`` (device) tensor in place, which ``_preprocess`` reads.
+    The physical ``slot_mapping`` is materialized from linear positions inside
+    the original before the overwrite, so it is unaffected.
+    """
+
+    @wraps(_orig_prepare_inputs)
+    def patched_prepare_inputs(self, scheduler_output, intermediate_tensors=None):
+        # Drop a stale proxy left over from a prior step (see docstring).
+        if isinstance(self.input_batch, InputBatchProxy):
+            self.input_batch = object.__getattribute__(self.input_batch, "_obj")
+
+        # Job A: publish req_ids BEFORE the original builds attention metadata.
+        if getattr(self, "_current_mega_info", None) is not None:
+            self._current_mega_info["req_ids"] = self.input_batch.req_ids
+
+        out = _orig_prepare_inputs(self, scheduler_output, intermediate_tensors)
+
+        mega_data = getattr(scheduler_output, "mega_data", {})
+        if not mega_data:
+            return out
+
+        (
+            attn_metadata,
+            num_scheduled_tokens,
+            num_input_tokens,
+            num_tokens_across_dp,
+            logits_indices,
+            spec_decode_metadata,
+            max_num_scheduled_tokens,
+        ) = out
+
+        new_logits_indices = _mega_remap_inputs(self, scheduler_output, num_scheduled_tokens)
+        logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
+
+        return (
+            attn_metadata,
+            num_scheduled_tokens,
+            num_input_tokens,
+            num_tokens_across_dp,
+            logits_indices,
+            spec_decode_metadata,
+            max_num_scheduled_tokens,
+        )
+
+    return patched_prepare_inputs
+
+
+def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
+    """NPU ``_bookkeeping_sync`` wrapper: returns the 6-tuple (no
+    ``num_nans_in_logits``).
+
+    NPU calls ``_bookkeeping_sync(scheduler_output, sampler_output, logits,
+    hidden_states, num_scheduled_tokens, spec_decode_metadata)`` positionally,
+    so ``sampler_output`` is ``args[0]``.
+    """
+
+    @wraps(_orig_bookkeeping_sync)
+    def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
+        mega_data = getattr(scheduler_output, "mega_data", {})
+        if not mega_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
+            return _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
+
+        request_row_configs = scheduler_output._gr_request_row_configs
+        orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
+
+        try:
+            res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
+        finally:
+            self.input_batch = orig_input_batch
+
+        (
+            logprobs_lists,
+            valid_sampled_token_ids,
+            prompt_logprobs_dict,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            invalid_req_indices,
+        ) = res
+
+        sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(
+            orig_input_batch, request_row_configs, sampler_output
+        )
+
+        return (
+            [[] for _ in range(n)] if logprobs_lists is not None else None,
+            [[] for _ in range(n)],
+            prompt_logprobs_dict,
+            collapsed_req_ids,
+            collapsed_idx,
+            invalid_req_indices,
+        )
+
+    return patched_bookkeeping_sync
+
+
 def apply_worker_patches():
     """Applies runtime overrides onto GPUModelRunner and NPUModelRunner execution entries."""
     from vllm_gr.utils.npu_adapter import is_npu_available
 
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-        from vllm_gr.v1.attention.backends.beam_attn import MEGA_DATA_VAR
     except ImportError:
         logger.warning("Failed to import GPUModelRunner segments, skipping GPU patches.")
         GPUModelRunner = None
@@ -630,9 +993,13 @@ def apply_worker_patches():
 
     # Track which runners have already been patched
     runners_to_patch = []
-    if GPUModelRunner is not None and not getattr(GPUModelRunner, "_patched_for_mega_beam_pos_ids", False):
+    if GPUModelRunner is not None and not getattr(
+        GPUModelRunner, "_patched_for_mega_beam_pos_ids", False
+    ):
         runners_to_patch.append(("GPUModelRunner", GPUModelRunner))
-    if NPUModelRunner is not None and not getattr(NPUModelRunner, "_patched_for_mega_beam_pos_ids", False):
+    if NPUModelRunner is not None and not getattr(
+        NPUModelRunner, "_patched_for_mega_beam_pos_ids", False
+    ):
         runners_to_patch.append(("NPUModelRunner", NPUModelRunner))
 
     if not runners_to_patch:
@@ -640,214 +1007,22 @@ def apply_worker_patches():
 
     # Apply patches to each runner
     for runner_name, runner_class in runners_to_patch:
-        _orig_execute_model = runner_class.execute_model
-        _orig_bookkeeping_sync = runner_class._bookkeeping_sync
+        runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
 
-        @wraps(_orig_execute_model)
-        def patched_execute_model(self, scheduler_output, *args, **kwargs):
-            print(f"PATCHED patched_execute_model called on {type(self).__name__}", flush=True)
-
-            self._current_mega_data = getattr(scheduler_output, "mega_data", {})
-            mega_info = {"mega_data": self._current_mega_data, "req_ids": []}
-            token = MEGA_DATA_VAR.set(mega_info)
-            self._current_mega_info = mega_info
-            try:
-                return _orig_execute_model(self, scheduler_output, *args, **kwargs)
-            finally:
-                self._current_mega_data = {}
-                self._current_mega_info = None
-                MEGA_DATA_VAR.reset(token)
-
-        runner_class.execute_model = patched_execute_model
-
-        # Only patch _prepare_inputs and _bookkeeping_sync for GPUModelRunner
-        # NPU has incompatible signatures and different internal flow - skipping for now
         if runner_name == "GPUModelRunner":
-            _orig_prepare_inputs = runner_class._prepare_inputs
-
-            @wraps(_orig_prepare_inputs)
-            def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
-
-                print(f"PATCHED patched_prepare_inputs called on {type(self).__name__}", flush=True)
-
-                logits_indices, spec_decode_metadata = _orig_prepare_inputs(
-                    self, scheduler_output, num_scheduled_tokens
-                )
-
-                if getattr(self, "_current_mega_info", None) is not None:
-                    self._current_mega_info["req_ids"] = self.input_batch.req_ids
-
-                mega_data = getattr(scheduler_output, "mega_data", {})
-                if not mega_data:
-                    return logits_indices, spec_decode_metadata
-
-                self.input_batch.logprob_token_ids = {}
-                new_logits_indices = []
-                orig_req_ids = self.input_batch.req_ids
-
-                token_offset = 0
-                row_to_req_id, row_to_batch_idx, logits_to_batch_idx, request_row_configs = (
-                    [],
-                    [],
-                    [],
-                    [],
-                )
-                input_row_idx = 0
-
-                gpu_positions, cpu_positions = _get_positions_buffers(self)
-
-                for batch_idx, req_id in enumerate(orig_req_ids):
-                    seq_len = (
-                        num_scheduled_tokens[batch_idx] if batch_idx < len(num_scheduled_tokens) else 0
-                    )
-                    if req_id is None:
-                        row_to_req_id.append(None)
-                        row_to_batch_idx.append(batch_idx)
-                        input_row_idx += 1
-                        token_offset += seq_len
-                        continue
-
-                    mdata = mega_data.get(req_id)
-                    if mdata and mdata.get("is_mega_decode", False):
-                        W, W_logits, next_offset = _process_mega_decode_request(
-                            mdata,
-                            seq_len,
-                            token_offset,
-                            gpu_positions,
-                            cpu_positions,
-                            new_logits_indices,
-                        )
-                        row_to_req_id.extend([req_id] * W)
-                        row_to_batch_idx.extend([batch_idx] * W)
-                        logits_to_batch_idx.extend([batch_idx] * W_logits)
-
-                        request_row_configs.append((req_id, input_row_idx, W_logits))
-                        input_row_idx += W
-                    else:
-                        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[batch_idx]
-                        num_prompt_tokens = self.input_batch.num_prompt_tokens[batch_idx]
-
-                        is_last_chunk_prefill = bool(
-                            num_computed_tokens < num_prompt_tokens
-                            and num_computed_tokens + seq_len >= num_prompt_tokens
-                        )
-                        W_logits_count = 0
-                        W = 1
-                        if is_last_chunk_prefill:
-                            new_logits_indices.append(token_offset + seq_len - 1)
-                            W_logits_count = 1
-                            logits_to_batch_idx.extend([batch_idx] * W)
-                        row_to_req_id.extend([req_id] * W)
-                        row_to_batch_idx.extend([batch_idx] * W)
-
-                        request_row_configs.append((req_id, input_row_idx, W_logits_count))
-                        input_row_idx += W
-
-                    token_offset += seq_len
-
-                self.input_batch = InputBatchProxy(
-                    self.input_batch, row_to_req_id, row_to_batch_idx, logits_to_batch_idx
-                )
-                scheduler_output._gr_request_row_configs = request_row_configs
-
-                return torch.tensor(
-                    new_logits_indices, dtype=torch.int32, device=self.device
-                ), spec_decode_metadata
-
-            @wraps(_orig_bookkeeping_sync)
-            def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-
-                print(f"PATCHED patched_bookkeeping_sync called on {type(self).__name__}", flush=True)
-
-                mega_data = getattr(scheduler_output, "mega_data", {})
-                if not mega_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
-                    res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
-                    sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
-                    if sampler_output is not None:
-                        st_ids = sampler_output.sampled_token_ids
-                        lp_tensors = sampler_output.logprobs_tensors
-                        print(f"lp_tensors 1: {lp_tensors}", flush=True)
-                    return res
-
-                request_row_configs = scheduler_output._gr_request_row_configs
-                orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
-
-                try:
-                    res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
-                finally:
-                    self.input_batch = orig_input_batch
-
-                (
-                    num_nans_in_logits,
-                    logprobs_lists,
-                    valid_sampled_token_ids,
-                    prompt_logprobs_dict,
-                    req_ids_output_copy,
-                    req_id_to_index_output_copy,
-                    invalid_req_indices,
-                ) = res
-
-                collapsed_req_ids_copy = [r[0] for r in request_row_configs if r[0] is not None]
-                collapsed_req_id_to_index = {
-                    req_id: idx for idx, req_id in enumerate(collapsed_req_ids_copy)
-                }
-                num_logical_requests = len(collapsed_req_ids_copy)
-
-                sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
-                if sampler_output is not None:
-                    st_ids = sampler_output.sampled_token_ids
-                    lp_tensors = sampler_output.logprobs_tensors
-                    print(f"lp_tensors 2: {lp_tensors}", flush=True)
-                    if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
-                        orig_lps = lp_tensors.logprobs
-                        orig_lp_ids = lp_tensors.logprob_token_ids
-                        orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
-                        actual_K = orig_lps.shape[1]
-                        max_chained_dim = max(W * actual_K for _, _, W in request_row_configs)
-
-                        final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
-                            request_row_configs,
-                            max_chained_dim,
-                            actual_K,
-                            orig_lps,
-                            orig_lp_ids,
-                            orig_ranks,
-                            st_ids,
-                        )
-
-                        # Safely resizes the original tensor wrapper and copies the elements in place
-                        st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
-                        lp_tensors.logprobs.resize_(final_lps.shape).copy_(final_lps)
-
-                        if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
-                            lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
-                        if orig_ranks is not None and final_ranks is not None:
-                            clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
-                            lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
-                                clean_ranks_slice
-                            )
-
-                        if getattr(orig_input_batch, "prev_sampled_token_ids", None) is not None:
-                            orig_input_batch.prev_sampled_token_ids.resize_(final_st_ids.shape).copy_(
-                                final_st_ids
-                            )
-
-                return (
-                    num_nans_in_logits,
-                    [[] for _ in range(num_logical_requests)] if logprobs_lists is not None else None,
-                    [[] for _ in range(num_logical_requests)],
-                    prompt_logprobs_dict,
-                    collapsed_req_ids_copy,
-                    collapsed_req_id_to_index,
-                    invalid_req_indices,
-                )
-
-            runner_class._prepare_inputs = patched_prepare_inputs
-            runner_class._bookkeeping_sync = patched_bookkeeping_sync
-
-        # For NPUModelRunner, only patch execute_model - skip _prepare_inputs and _bookkeeping_sync
-        # due to incompatible signatures and different internal flow that causes shape mismatches
+            runner_class._prepare_inputs = make_patched_prepare_inputs_gpu(
+                runner_class._prepare_inputs
+            )
+            runner_class._bookkeeping_sync = make_patched_bookkeeping_sync_gpu(
+                runner_class._bookkeeping_sync
+            )
+        elif runner_name == "NPUModelRunner":
+            runner_class._prepare_inputs = make_patched_prepare_inputs_npu(
+                runner_class._prepare_inputs
+            )
+            runner_class._bookkeeping_sync = make_patched_bookkeeping_sync_npu(
+                runner_class._bookkeeping_sync
+            )
 
         runner_class._patched_for_mega_beam_pos_ids = True
         logger.info(f"{runner_name} hooks patched successfully.")
-    print("==============================We are Here===========================")

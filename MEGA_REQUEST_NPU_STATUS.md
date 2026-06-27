@@ -145,22 +145,41 @@ if npu_available:
 | Method | GPUModelRunner | NPUModelRunner |
 |--------|---------------|----------------|
 | `execute_model` | ✅ Patched | ✅ Patched |
-| `_prepare_inputs` | ✅ Patched | ❌ Skipped (incompatible signature) |
-| `_bookkeeping_sync` | ✅ Patched | ❌ Skipped (incompatible signature) |
+| `_prepare_inputs` | ✅ Patched | ✅ Patched (NPU-specific wrapper, pending validation) |
+| `_bookkeeping_sync` | ✅ Patched | ✅ Patched (NPU-specific wrapper, pending validation) |
 
-### 4.3 Why `_prepare_inputs` and `_bookkeeping_sync` Are Skipped on NPU
+### 4.3 NPU-specific wrappers (implemented)
 
-The method signatures differ significantly:
+The GPU and NPU runner methods have different signatures, so each gets its own
+thin wrapper around shared, device-neutral helpers (`_mega_remap_inputs`,
+`_mega_collapse_bookkeeping`). The earlier `aclnnInplaceDiv ... 161002` error
+was a symptom of applying the GPU wrapper verbatim (its 2-tuple return / wrong
+positional binding produced bad `logits_indices`, so the sampler divided
+`logits` by a mis-shaped `temperature`) — **not** an inherent incompatibility.
 
 **GPU `_prepare_inputs`:** `(scheduler_output, num_scheduled_tokens) -> (logits_indices, spec_decode_metadata)`
 
-**NPU `_prepare_inputs`:** `(scheduler_output, intermediate_tensors=None) -> (attn_metadata, num_scheduled_tokens, num_input_tokens, num_tokens_across_dp, logits_indices, spec_decode_metadata, max_num_scheduled_tokens)` — 7 return values
+**NPU `_prepare_inputs`:** `(scheduler_output, intermediate_tensors=None) -> (attn_metadata, num_scheduled_tokens, num_input_tokens, num_tokens_across_dp, logits_indices, spec_decode_metadata, max_num_scheduled_tokens)` — 7 values
 
-**GPU `_bookkeeping_sync`:** Returns 7 values including `num_nans_in_logits`
+**GPU `_bookkeeping_sync`:** returns 7 values including `num_nans_in_logits`
 
-**NPU `_bookkeeping_sync`:** Returns 6 values (no `num_nans_in_logits`)
+**NPU `_bookkeeping_sync`:** returns 6 values (no `num_nans_in_logits`)
 
-Attempting to apply the same patches caused `RuntimeError: inplace_div_out_npu_no_check: ... aclnnInplaceDiv failed, error code is 161002` due to shape mismatches in the sampling metadata.
+Key NPU-specific handling (see `make_patched_prepare_inputs_npu` /
+`make_patched_bookkeeping_sync_npu` in `engine_core_patch.py`):
+
+- `req_ids` is published to `MEGA_DATA_VAR` **before** delegating, because the
+  NPU attention builder runs *inside* `_prepare_inputs` (the GPU builder runs
+  later).
+- `_prepare_inputs` (in `execute_model`) and `_bookkeeping_sync` (in the
+  separate `sample_tokens` call) straddle two method calls; a defensive
+  un-proxy at `_prepare_inputs` entry guards against a stale proxy if an early
+  return skips bookkeeping.
+- `InputBatchProxy` now also intercepts `num_tokens` (NPU's writeback loop
+  updates it; GPU's does not) — inert on GPU.
+- Per-beam RoPE positions are written to `self.positions.gpu` in place; no extra
+  `copy_to_gpu` is needed and the physical `slot_mapping` (materialized from
+  linear positions inside the original) is unaffected.
 
 ---
 
@@ -172,17 +191,19 @@ Attempting to apply the same patches caused `RuntimeError: inplace_div_out_npu_n
 - Standard attention via `npu_fused_infer_attention_score_v2`
 - Prefix/suffix KV extraction via pure PyTorch
 
-### ❌ Not Working on NPU
-- `_prepare_inputs` patches (incompatible signature)
-- `_bookkeeping_sync` patches (incompatible signature)
-- Mega request output processing (requires above patches)
+### 🧪 Implemented, pending NPU validation
+- `_prepare_inputs` / `_bookkeeping_sync` NPU wrappers (this change)
+- Mega request output processing end-to-end on NPU
 
-### ⚠️ Accuracy Issues
+### Validation TODO (run on server, async scheduling OFF first)
+- `beam_width=2`, single decode step → multi-step accuracy vs GPU / baselines
+  (`accuracy_flat_logprobs.txt`, `accuracy_b4_flat_logprobes.txt`).
+- Confirm `sampler_output.logprobs_tensors.resize_()` is legal on NPU
+  internal-format tensors; if not, switch the in-place remux to allocate+reassign.
+- Verify async-scheduling path (`AsyncGPUModelRunnerOutput`) sees the remuxed
+  tensor shapes.
 
-When running mega requests on NPU:
-- Server no longer crashes
-- But **accuracy is zero** because the mega request output processing is bypassed
-- Need NPU-specific implementations of `patched_prepare_inputs` and `patched_bookkeeping_sync`
+See `MEGA_REQUEST_NPU_PREPARE_BOOKKEEPING_PLAN.md` for the full design.
 
 ---
 
