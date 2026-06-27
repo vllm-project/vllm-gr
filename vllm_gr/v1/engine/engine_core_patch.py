@@ -14,6 +14,9 @@ from vllm.v1.engine import EngineCoreRequestType
 
 logger = init_logger(__name__)
 
+# One-shot diagnostic counter (temporary, for NPU mega bring-up).
+_GR_DIAG = {"n": 0}
+
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
 # ---------------------------------------------------------------------------
@@ -904,6 +907,26 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         new_logits_indices = _mega_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
 
+        if _GR_DIAG["n"] < 3:
+            try:
+                total = int(num_scheduled_tokens.sum())
+                pos = self.positions.gpu[:total].tolist()
+            except Exception as _e:  # noqa: BLE001
+                pos = f"<err {_e}>"
+            print(
+                "[GR DIAG prep] mega_data=%s | num_scheduled_tokens=%s | "
+                "new_logits_indices=%s | req_ids=%s | positions[:total]=%s"
+                % (
+                    dict(mega_data),
+                    num_scheduled_tokens.tolist()
+                    if hasattr(num_scheduled_tokens, "tolist") else num_scheduled_tokens,
+                    new_logits_indices,
+                    list(object.__getattribute__(self.input_batch, "_obj").req_ids),
+                    pos,
+                ),
+                flush=True,
+            )
+
         return (
             attn_metadata,
             num_scheduled_tokens,
@@ -950,9 +973,48 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
         ) = res
 
         sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+
+        if _GR_DIAG["n"] < 3:
+            try:
+                raw_st = sampler_output.sampled_token_ids
+                lp = sampler_output.logprobs_tensors
+                print(
+                    "[GR DIAG book] request_row_configs=%s | "
+                    "raw sampled_token_ids.shape=%s vals=%s | "
+                    "logprobs_tensors.logprobs.shape=%s | "
+                    "valid_sampled_token_ids=%s"
+                    % (
+                        request_row_configs,
+                        list(raw_st.shape) if raw_st is not None else None,
+                        raw_st.flatten().tolist()[:32] if raw_st is not None else None,
+                        list(lp.logprobs.shape) if lp is not None and lp.logprobs is not None else None,
+                        valid_sampled_token_ids,
+                    ),
+                    flush=True,
+                )
+            except Exception as _e:  # noqa: BLE001
+                print("[GR DIAG book] dump error: %s" % _e, flush=True)
+            _GR_DIAG["n"] += 1
+
         collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(
             orig_input_batch, request_row_configs, sampler_output
         )
+
+        if _GR_DIAG["n"] <= 3:
+            try:
+                rst = sampler_output.sampled_token_ids
+                print(
+                    "[GR DIAG book post-remux] collapsed_req_ids=%s | "
+                    "sampled_token_ids.shape=%s vals=%s"
+                    % (
+                        collapsed_req_ids,
+                        list(rst.shape) if rst is not None else None,
+                        rst.flatten().tolist()[:32] if rst is not None else None,
+                    ),
+                    flush=True,
+                )
+            except Exception as _e:  # noqa: BLE001
+                print("[GR DIAG book post] dump error: %s" % _e, flush=True)
 
         return (
             [[] for _ in range(n)] if logprobs_lists is not None else None,
