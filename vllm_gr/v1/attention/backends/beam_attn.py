@@ -1244,9 +1244,11 @@ class BeamAttentionImpl(AttentionImpl):
                     "[beam_attn NPU] merged_out range [%s, %s]",
                     float(mega_out.min()), float(mega_out.max())
                 )
-                output[attn_metadata.mega_prefix_indices] = mega_out
+                # The TND merge / FIA-with-LSE path produces fp32; cast back to
+                # the output dtype (e.g. bf16) before the in-place index_put.
+                output[attn_metadata.mega_prefix_indices] = mega_out.to(output.dtype)
             else:
-                output[attn_metadata.mega_prefix_indices] = mega_prefix_out
+                output[attn_metadata.mega_prefix_indices] = mega_prefix_out.to(output.dtype)
 
     def forward(
         self,
