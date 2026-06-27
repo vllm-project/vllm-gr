@@ -1152,6 +1152,23 @@ class BeamAttentionImpl(AttentionImpl):
                 mega_query.shape, key_cache.shape
             )
 
+            print(
+                "[beam_attn NPU DIAG] mega_query.shape=%s | "
+                "mega_prefix_cu_seqlens_q=%s | mega_prefix_seq_lens=%s | "
+                "mega_prefix_block_table.shape=%s | block_size=%s | "
+                "num_heads=%s num_kv_heads=%s"
+                % (
+                    list(mega_query.shape),
+                    attn_metadata.mega_prefix_cu_seqlens_q.tolist(),
+                    attn_metadata.mega_prefix_seq_lens.tolist(),
+                    list(attn_metadata.mega_prefix_block_table.shape),
+                    attn_metadata.block_size,
+                    attn_metadata.num_heads,
+                    attn_metadata.num_kv_heads,
+                ),
+                flush=True,
+            )
+
             mega_prefix_out, mega_prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
                 mega_query, key_cache, value_cache,
                 num_query_heads=attn_metadata.num_heads,
