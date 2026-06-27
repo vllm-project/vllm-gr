@@ -149,7 +149,6 @@ class BeamAttentionMetadata:
     # Mega Requests shared context arrays
     mega_prefix_indices: torch.Tensor | None = None
     mega_prefix_cu_seqlens_q: torch.Tensor | None = None
-    mega_prefix_cu_seqlens_kv: torch.Tensor | None = None
     mega_prefix_seq_lens: torch.Tensor | None = None
     mega_prefix_max_q_len: int = 0
     mega_prefix_max_seq_len: int = 0
@@ -1158,7 +1157,7 @@ class BeamAttentionImpl(AttentionImpl):
                 num_query_heads=attn_metadata.num_heads,
                 num_key_value_heads=attn_metadata.num_kv_heads,
                 actual_seq_qlen=attn_metadata.mega_prefix_cu_seqlens_q.tolist(),
-                actual_seq_kvlen=attn_metadata.mega_prefix_cu_seqlens_kv.tolist(),
+                actual_seq_kvlen=attn_metadata.mega_prefix_seq_lens.tolist(),
                 softmax_scale=scale,
                 block_table=attn_metadata.mega_prefix_block_table,
                 block_size=attn_metadata.block_size,
@@ -1203,7 +1202,7 @@ class BeamAttentionImpl(AttentionImpl):
                     block_size=None,
                     sparse_mode=0,  # Standard attention
                     inner_precise=0,  # FP32 internal precision
-                    nput_layout="TND",
+                    input_layout="TND",
                     return_softmax_lse=True
                 )
 
