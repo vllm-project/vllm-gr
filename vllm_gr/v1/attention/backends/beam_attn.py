@@ -1170,7 +1170,9 @@ class BeamAttentionImpl(AttentionImpl):
             )
 
             mega_prefix_out, mega_prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                mega_query, key_cache, value_cache,
+                mega_query,
+                key_cache.view(*key_cache.shape[:-2], -1),
+                value_cache.view(*value_cache.shape[:-2], -1),
                 num_query_heads=attn_metadata.num_heads,
                 num_key_value_heads=attn_metadata.num_kv_heads,
                 actual_seq_qlen=attn_metadata.mega_prefix_cu_seqlens_q.tolist(),
