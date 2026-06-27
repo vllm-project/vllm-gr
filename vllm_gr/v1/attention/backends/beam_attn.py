@@ -1207,6 +1207,23 @@ class BeamAttentionImpl(AttentionImpl):
                 return_softmax_lse=True,
             )
 
+            try:
+                _pblocks = attn_metadata.mega_prefix_block_table[0].long()
+                _blk_absmax = float(key_cache[_pblocks].abs().max())
+            except Exception as _e:  # noqa: BLE001
+                _blk_absmax = float("nan")
+            print(
+                "[beam_attn NPU DIAG2] prefix_out range [%.5f, %.5f] | "
+                "prefix_lse range [%.5f, %.5f] | key_cache.shape=%s | "
+                "prefix_blocks_absmax=%.5f"
+                % (
+                    float(mega_prefix_out.min()), float(mega_prefix_out.max()),
+                    float(mega_prefix_lse.min()), float(mega_prefix_lse.max()),
+                    list(key_cache.shape), _blk_absmax,
+                ),
+                flush=True,
+            )
+
             logger.debug(
                 "[beam_attn NPU] mega_prefix_out shape=%s, range [%.6f, %.6f], mega_suffix_total=%d",
                 mega_prefix_out.shape, float(mega_prefix_out.min()), float(mega_prefix_out.max()),
