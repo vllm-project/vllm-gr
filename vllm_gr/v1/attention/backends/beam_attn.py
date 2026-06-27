@@ -1218,7 +1218,7 @@ class BeamAttentionImpl(AttentionImpl):
                     actual_seq_kvlen=attn_metadata.mega_suffix_cu_seqlens_k.tolist(),
                     softmax_scale=scale,
                     block_table=None,  # Using contiguous format, not paged
-                    block_size=None,
+                    block_size=0,  # 0 = non-paged (schema requires int, not None)
                     sparse_mode=0,  # Standard attention
                     inner_precise=0,  # FP32 internal precision
                     input_layout="TND",
