@@ -1190,18 +1190,37 @@ class BeamAttentionImpl(AttentionImpl):
                 flush=True,
             )
 
+            # Paged FIA with return_softmax_lse=True returns zero output / inf LSE
+            # on this CANN version, so gather the (shared) prefix KV into a
+            # contiguous buffer and run the non-paged FIA, mirroring the suffix
+            # path which works. block_table rows are per prefix-group.
+            block_size = attn_metadata.block_size
+            prefix_block_table = attn_metadata.mega_prefix_block_table  # [G, max_blocks]
+            prefix_kv_lens = attn_metadata.mega_prefix_seq_lens         # [G]
+            contig_pk_list, contig_pv_list, prefix_kv_cu = [], [], [0]
+            for g in range(prefix_block_table.shape[0]):
+                clen = int(prefix_kv_lens[g])
+                pos = torch.arange(clen, device=key_cache.device)
+                blk = prefix_block_table[g].long()[pos // block_size]
+                off = pos % block_size
+                contig_pk_list.append(key_cache[blk, off])    # [clen, num_kv_heads, head_dim]
+                contig_pv_list.append(value_cache[blk, off])
+                prefix_kv_cu.append(prefix_kv_cu[-1] + clen)
+            prefix_k = torch.cat(contig_pk_list, dim=0)
+            prefix_v = torch.cat(contig_pv_list, dim=0)
+
             mega_prefix_out, mega_prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
                 mega_query,
-                key_cache.view(*key_cache.shape[:-2], -1),
-                value_cache.view(*value_cache.shape[:-2], -1),
+                prefix_k,
+                prefix_v,
                 num_query_heads=attn_metadata.num_heads,
                 num_key_value_heads=attn_metadata.num_kv_heads,
                 actual_seq_qlen=attn_metadata.mega_prefix_cu_seqlens_q.tolist(),
-                actual_seq_kvlen=attn_metadata.mega_prefix_seq_lens.tolist(),
+                actual_seq_kvlen=prefix_kv_cu,
                 softmax_scale=scale,
-                block_table=attn_metadata.mega_prefix_block_table,
-                block_size=attn_metadata.block_size,
-                sparse_mode=0,
+                block_table=None,  # contiguous, not paged
+                block_size=0,
+                sparse_mode=0,  # prefix attention is non-causal (full)
                 inner_precise=0,
                 input_layout="TND",
                 return_softmax_lse=True,
