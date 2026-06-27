@@ -661,6 +661,27 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 # ---------------------------------------------------------------------------
 # CORE EXECUTION REFACTOR
 # ---------------------------------------------------------------------------
+
+_NPU_CAUSAL_MASK_CACHE: dict = {}
+
+
+def _npu_causal_atten_mask(device: torch.device) -> torch.Tensor:
+    """Compressed causal mask for npu FIA ``sparse_mode=3`` (rightDownCausal).
+
+    Returns a ``[2048, 2048]`` upper-triangular bool tensor (``True`` = masked /
+    not attended), cached per device. This is the standard compressed mask the
+    op expands internally regardless of actual sequence length.
+    """
+    key = str(device)
+    mask = _NPU_CAUSAL_MASK_CACHE.get(key)
+    if mask is None:
+        mask = torch.triu(
+            torch.ones(2048, 2048, dtype=torch.bool, device=device), diagonal=1
+        )
+        _NPU_CAUSAL_MASK_CACHE[key] = mask
+    return mask
+
+
 class BeamAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
@@ -1217,9 +1238,12 @@ class BeamAttentionImpl(AttentionImpl):
                     actual_seq_qlen=attn_metadata.mega_suffix_cu_seqlens_q.tolist(),
                     actual_seq_kvlen=attn_metadata.mega_suffix_cu_seqlens_k.tolist(),
                     softmax_scale=scale,
+                    # Suffix attention is causal (GPU path uses causal=True);
+                    # sparse_mode=3 (rightDownCausal) + compressed mask.
+                    atten_mask=_npu_causal_atten_mask(mega_query.device),
                     block_table=None,  # Using contiguous format, not paged
                     block_size=0,  # 0 = non-paged (schema requires int, not None)
-                    sparse_mode=0,  # Standard attention
+                    sparse_mode=3,  # rightDownCausal
                     inner_precise=0,  # FP32 internal precision
                     input_layout="TND",
                     return_softmax_lse=True
