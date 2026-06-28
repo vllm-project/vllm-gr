@@ -168,6 +168,8 @@ class BeamAttentionMetadata:
     mega_suffix_max_seq_len: int = 0
     mega_suffix_total_tokens: int = 0
     mega_suffix_slot_mapping_out: torch.Tensor | None = None
+    mega_suffix_actual_seq_lengths_q: list | None = None
+    mega_suffix_actual_seq_lengths_kv: list | None = None
 
     scheduler_metadata: dict | None = None
     prefix_scheduler_metadata: dict | None = None
@@ -630,6 +632,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_prefix_actual_seq_lengths_q = np.cumsum(mega_prefix_q_lens).tolist()
             mega_prefix_actual_seq_lengths_kv = list(mega_prefix_seq_lens_list)
 
+        mega_suffix_actual_seq_lengths_q = None
+        mega_suffix_actual_seq_lengths_kv = None
+        if NPU_DEVICE and mega_suffix_q_lens:
+            mega_suffix_actual_seq_lengths_q = np.cumsum(mega_suffix_q_lens).tolist()
+            mega_suffix_actual_seq_lengths_kv = list(mega_suffix_seq_lens_list)
+
         if CUDA_DEVICE:
             torch.cuda.nvtx.range_pop()
         meta = BeamAttentionMetadata(
@@ -665,6 +673,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_max_seq_len=mega_suffix_max_seq_len,
             mega_suffix_total_tokens=mega_suffix_total_tokens,
             mega_suffix_slot_mapping_out=mega_suffix_slot_mapping_out,
+            mega_suffix_actual_seq_lengths_q=mega_suffix_actual_seq_lengths_q,
+            mega_suffix_actual_seq_lengths_kv=mega_suffix_actual_seq_lengths_kv,
             max_num_splits=max_num_splits,
             block_size=self.block_size,
             num_heads=self.num_heads_q,
@@ -1127,16 +1137,16 @@ class BeamAttentionImpl(AttentionImpl):
         )
         if attn_metadata.std_indices is not None:
             logger.debug(
-                "[beam_attn NPU] std cu_seqlens=%s, seq_lens=%s, block_table=%s",
-                attn_metadata.std_cu_seqlens_q.tolist() if attn_metadata.std_cu_seqlens_q is not None else None,
-                attn_metadata.std_seq_lens.tolist() if attn_metadata.std_seq_lens is not None else None,
+                "[beam_attn NPU] std actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, block_table=%s",
+                attn_metadata.std_actual_seq_lengths_q,
+                attn_metadata.std_actual_seq_lengths_kv,
                 attn_metadata.std_block_table.shape if attn_metadata.std_block_table is not None else None,
             )
         if attn_metadata.mega_prefix_indices is not None:
             logger.debug(
-                "[beam_attn NPU] mega cu_seqlens_q=%s, seq_lens=%s, block_table shape=%s",
-                attn_metadata.mega_prefix_cu_seqlens_q.tolist() if attn_metadata.mega_prefix_cu_seqlens_q is not None else None,
-                attn_metadata.mega_prefix_seq_lens.tolist() if attn_metadata.mega_prefix_seq_lens is not None else None,
+                "[beam_attn NPU] mega actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, block_table shape=%s",
+                attn_metadata.mega_prefix_actual_seq_lengths_q,
+                attn_metadata.mega_prefix_actual_seq_lengths_kv,
                 attn_metadata.mega_prefix_block_table.shape if attn_metadata.mega_prefix_block_table is not None else None,
             )
             logger.debug(
@@ -1145,9 +1155,9 @@ class BeamAttentionImpl(AttentionImpl):
                 if attn_metadata.mega_prefix_indices is not None else None,
             )
             logger.debug(
-                "[beam_attn NPU] mega_suffix cu_seqlens_q=%s, cu_seqlens_k=%s, total_tokens=%d",
-                attn_metadata.mega_suffix_cu_seqlens_q.tolist() if attn_metadata.mega_suffix_cu_seqlens_q is not None else None,
-                attn_metadata.mega_suffix_cu_seqlens_k.tolist() if attn_metadata.mega_suffix_cu_seqlens_k is not None else None,
+                "[beam_attn NPU] mega_suffix actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, total_tokens=%d",
+                attn_metadata.mega_suffix_actual_seq_lengths_q,
+                attn_metadata.mega_suffix_actual_seq_lengths_kv,
                 attn_metadata.mega_suffix_total_tokens,
             )
             logger.debug(
@@ -1244,22 +1254,21 @@ class BeamAttentionImpl(AttentionImpl):
                     contig_k.shape, contig_v.shape
                 )
 
-                mega_suffix_out, mega_suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                    mega_query, contig_k, contig_v,
-                    num_query_heads=attn_metadata.num_heads,
-                    num_key_value_heads=attn_metadata.num_kv_heads,
-                    actual_seq_qlen=attn_metadata.mega_suffix_cu_seqlens_q.tolist(),
-                    actual_seq_kvlen=attn_metadata.mega_suffix_cu_seqlens_k.tolist(),
-                    softmax_scale=scale,
-                    # Suffix attention is causal (GPU path uses causal=True);
-                    # sparse_mode=3 (rightDownCausal) + compressed mask.
+                mega_suffix_out, mega_suffix_lse = torch_npu.npu_fused_infer_attention_score(
+                    query=mega_query,
+                    key=contig_k,
+                    value=contig_v,
                     atten_mask=_npu_causal_atten_mask(mega_query.device),
-                    block_table=None,  # Using contiguous format, not paged
-                    block_size=0,  # 0 = non-paged (schema requires int, not None)
-                    sparse_mode=3,  # rightDownCausal
-                    inner_precise=0,  # FP32 internal precision
+                    block_table=None,
                     input_layout="TND",
-                    return_softmax_lse=True
+                    block_size=0,
+                    actual_seq_lengths=attn_metadata.mega_suffix_actual_seq_lengths_q,
+                    actual_seq_lengths_kv=attn_metadata.mega_suffix_actual_seq_lengths_kv,
+                    num_key_value_heads=attn_metadata.num_kv_heads,
+                    num_heads=attn_metadata.num_heads,
+                    scale=scale,
+                    softmax_lse_flag=True,
+                    sparse_mode=3,
                 )
 
                 logger.debug(
