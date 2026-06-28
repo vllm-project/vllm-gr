@@ -3,15 +3,13 @@
 
 
 from dataclasses import dataclass
+from typing import Any, cast
 
 import pytest
 import torch
 from vllm.utils.torch_utils import set_random_seed
 
 try:
-    from vllm_gr.v1.attention.backends.beam_attn import (
-        BeamAttentionImpl,
-    )
     from vllm_gr.v1.engine.engine_core_patch import _compute_beam_bounds
 except ImportError:
     pytest.skip(
@@ -40,25 +38,19 @@ CASES = [
     # Scenario: Standard Prefix Complete.
     # The shared prefix is fully cached, and beams independently decode their full suffixes.
     (8, 32, 8),
-    
     # Scenario: No Shared Prefix.
     # Completely independent parallel sequence generation where shared_tokens_len = 0.
     (8, 8, 8),
-    
     # Scenario: Large sequence general case with longer prefix.
     (4, 64, 4),
-    
     # Scenario: General small context generation.
     (4, 16, 4),
-    
     # Scenario: Chunked execution with strict budget (Partially Executed / Skipped beams).
     # Budget (1*16=16) runs out before all beams can process their 4-token suffixes.
     (1, 16, 4),
-    
     # Scenario: Pure single-token decoding (Typical autoregressive decoding phase).
     # Each beam processes exactly 1 token over a large context.
     (1, 128, 1),
-    
     # Scenario: Partial block-alignment anomaly.
     # Tests memory boundary safety when sequence lengths are prime/unaligned numbers.
     (4, 32, 7),
@@ -141,24 +133,26 @@ def prepare_inputs(
         current_block += blocks_per_req
 
     seq_lens_list = []
-    last_beam_suffix_start = shared_tokens_len + (beam_width - 1) * suffix_kv_len
     for i in range(num_reqs):
         seq_lens_list.append(mega_seq_len)
-            
+
     seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
 
     # Calculate slot_mapping using the full block table slice approach
     num_actual_tokens = num_seqs * q_seq_len
     slot_mapping = torch.zeros(num_actual_tokens, dtype=torch.long, device=device)
-    
+
     chunk_budget = beam_width * q_seq_len
     cache_len = (shared_tokens_len // block_size) * block_size
     remaining_prefix = shared_tokens_len - cache_len
     total_uncached_req = remaining_prefix + beam_width * suffix_kv_len
     write_len = min(total_uncached_req, chunk_budget)
-    
+
     for i in range(num_reqs):
-        physical_slots = (block_tables[i].to(torch.long).unsqueeze(-1) * block_size + torch.arange(block_size, device=device)).view(-1)
+        physical_slots = (
+            block_tables[i].to(torch.long).unsqueeze(-1) * block_size
+            + torch.arange(block_size, device=device)
+        ).view(-1)
         req_slots = physical_slots[cache_len : cache_len + write_len]
         q_start = i * chunk_budget
         slot_mapping[q_start : q_start + write_len] = req_slots
@@ -197,14 +191,14 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     for i in range(inputs.batch_size):
         # Retrieve the flat layout of the key and value cache for this specific request
         phys_blocks = inputs.block_tables[i].cpu().tolist()
-        k_seq = torch.cat([inputs.key_cache[b] for b in phys_blocks], dim=0)[:inputs.seq_lens[i]]
-        v_seq = torch.cat([inputs.value_cache[b] for b in phys_blocks], dim=0)[:inputs.seq_lens[i]]
+        k_seq = torch.cat([inputs.key_cache[b] for b in phys_blocks], dim=0)[: inputs.seq_lens[i]]
+        v_seq = torch.cat([inputs.value_cache[b] for b in phys_blocks], dim=0)[: inputs.seq_lens[i]]
 
         prefix_len = inputs.shared_tokens_len
         steps = inputs.suffix_kv_len
         w = inputs.beam_width
         q_len = inputs.q_seq_len * inputs.beam_width
-        
+
         b_cache_len = prefix_len // inputs.block_size * inputs.block_size
         chunk_budget = q_len
 
@@ -212,25 +206,25 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
             # Stop processing if we run out of token budget for this chunk
             if chunk_budget <= 0:
                 break
-                
+
             b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
                 b, prefix_len, b_cache_len, steps, chunk_budget
             )
-            
+
             # If there's no uncached tokens to compute for this beam, skip it
             if b_uncached <= 0:
                 continue
-                
+
             prefix_k = k_seq[:prefix_len]
             prefix_v = v_seq[:prefix_len]
             if b_cache_len <= prefix_len:
                 b_suffix_start = b_cache_len
             else:
                 b_suffix_start = prefix_len + b_physical * steps
-                
+
             suffix_k = k_seq[b_suffix_start : b_suffix_start + b_suffix_len]
             suffix_v = v_seq[b_suffix_start : b_suffix_start + b_suffix_len]
-                
+
             # Concatenate prefix and suffix to form the contiguous beam key and value tensor
             beam_k = torch.cat([prefix_k, suffix_k], dim=0)
             beam_v = torch.cat([prefix_v, suffix_v], dim=0)
@@ -239,7 +233,7 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
             dense_v.append(beam_v)
             seqlens_k.append(beam_k.shape[0])
             seqlens_q.append(b_uncached)
-            
+
             # Deduct the processed tokens from the chunk budget
             chunk_budget -= b_uncached
             b_cache_len += b_uncached
@@ -247,17 +241,25 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     k_tensor = torch.cat(dense_k, dim=0)
     v_tensor = torch.cat(dense_v, dim=0)
 
-    cu_seqlens_k = torch.tensor([0] + seqlens_k, dtype=torch.int32, device=inputs.query.device).cumsum(dim=0).to(torch.int32)
-    cu_seqlens_q = torch.tensor([0] + seqlens_q, dtype=torch.int32, device=inputs.query.device).cumsum(dim=0).to(torch.int32)
+    cu_seqlens_k = (
+        torch.tensor([0] + seqlens_k, dtype=torch.int32, device=inputs.query.device)
+        .cumsum(dim=0)
+        .to(torch.int32)
+    )
+    cu_seqlens_q = (
+        torch.tensor([0] + seqlens_q, dtype=torch.int32, device=inputs.query.device)
+        .cumsum(dim=0)
+        .to(torch.int32)
+    )
 
     output = torch.zeros_like(inputs.query)
 
     def run_kernel() -> None:
         flash_attn_varlen_func(
-            q=inputs.query[:cu_seqlens_q[-1]],
+            q=inputs.query[: cu_seqlens_q[-1]],
             k=k_tensor,
             v=v_tensor,
-            out=output[:cu_seqlens_q[-1]],
+            out=output[: cu_seqlens_q[-1]],
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max(seqlens_q),
@@ -274,21 +276,32 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     return output
 
 
-def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order: bool = False) -> torch.Tensor:
+def run_cascade_beam_attention(
+    inputs: BeamAttnInputs, shuffle_processing_order: bool = False
+) -> torch.Tensor:
     output = torch.zeros_like(inputs.query)
     device = inputs.query.device
 
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionMetadataBuilder, BeamAttentionImpl, MEGA_DATA_VAR
-    
+    from vllm_gr.v1.attention.backends.beam_attn import (
+        MEGA_DATA_VAR,
+        BeamAttentionImpl,
+        BeamAttentionMetadataBuilder,
+    )
+
     class MockCommonAttentionMetadata:
         def __init__(self, inputs: BeamAttnInputs):
             self.num_reqs = inputs.num_reqs
-            
-            # If shuffle_processing_order is True, we can simulate out-of-order execution 
+
+            # If shuffle_processing_order is True, we can simulate out-of-order execution
             # by reversing the query grouping lengths. But since we need them to match the
             # input shapes exactly, we just keep the sequential layout for queries.
-            
-            self.query_start_loc_cpu = torch.arange(0, (inputs.num_seqs + 1) * inputs.q_seq_len, inputs.beam_width * inputs.q_seq_len, dtype=torch.int32)
+
+            self.query_start_loc_cpu = torch.arange(
+                0,
+                (inputs.num_seqs + 1) * inputs.q_seq_len,
+                inputs.beam_width * inputs.q_seq_len,
+                dtype=torch.int32,
+            )
             self.query_start_loc = self.query_start_loc_cpu.to(device)
             self.seq_lens = inputs.seq_lens
             self.block_table_tensor = inputs.block_tables
@@ -299,21 +312,22 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
             self.slot_mapping = inputs.slot_mapping
 
     common_attn_metadata = MockCommonAttentionMetadata(inputs)
-    
-    mega_info = {
+
+    mega_info: dict[str, Any] = {
         "mega_data": {},
-        "req_ids": [f"req_{i}" for i in range(inputs.num_reqs)]
+        "req_ids": [f"req_{i}" for i in range(inputs.num_reqs)],
     }
-    
+
+    mega_data = cast(dict[str, Any], mega_info["mega_data"])
     for i in range(inputs.num_reqs):
-        mega_info["mega_data"][f"req_{i}"] = {
+        mega_data[f"req_{i}"] = {
             "is_mega_decode": True,
             "prefix_len": inputs.shared_tokens_len,
             "mega_beam_width": inputs.beam_width,
             "mega_decode_steps": inputs.suffix_kv_len,
             "cache_len": inputs.shared_tokens_len // inputs.block_size * inputs.block_size,
         }
-        
+
     token = MEGA_DATA_VAR.set(mega_info)
 
     try:
@@ -327,7 +341,7 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
         builder.max_num_splits = 0
         builder.num_heads_q = inputs.query.shape[1]
         builder.num_heads_kv = inputs.num_kv_heads
-        
+
         attn_metadata = builder.build(
             common_prefix_len=inputs.shared_tokens_len,
             common_attn_metadata=common_attn_metadata,
@@ -343,7 +357,7 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
         num_kv_heads=inputs.num_kv_heads,
         alibi_slopes=None,
         sliding_window=None,
-        kv_cache_dtype='auto',
+        kv_cache_dtype="auto",
         logits_soft_cap=inputs.soft_cap,
     )
 
@@ -368,16 +382,16 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
     return output
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("beam_width", [16, 32])
-@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("soft_cap", [None, 50])
-@pytest.mark.parametrize("fa_version", [2, 3])
-@torch.inference_mode()
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+@pytest.mark.parametrize("beam_width", [16, 32])  # type: ignore[misc]
+@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)  # type: ignore[misc]
+@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore[misc]
+@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore[misc]
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore[misc]
+@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore[misc]
+@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore[misc]
+@torch.inference_mode()  # type: ignore[misc]
 def test_beam_cascade(
     batch_size: int,
     beam_width: int,
@@ -434,17 +448,17 @@ def test_beam_cascade(
     torch.testing.assert_close(output, ref_output, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("beam_width", [16, 32, 128])
-@pytest.mark.parametrize("seq_lens_and_common_prefix", [(8, 2048, 8)])
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("soft_cap", [None, 50])
-@pytest.mark.parametrize("fa_version", [2, 3])
-@pytest.mark.parametrize("iter_num", [100])
-@torch.inference_mode()
+@pytest.mark.parametrize("batch_size", [8])  # type: ignore[misc]
+@pytest.mark.parametrize("beam_width", [16, 32, 128])  # type: ignore[misc]
+@pytest.mark.parametrize("seq_lens_and_common_prefix", [(8, 2048, 8)])  # type: ignore[misc]
+@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore[misc]
+@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore[misc]
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore[misc]
+@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore[misc]
+@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore[misc]
+@pytest.mark.parametrize("iter_num", [100])  # type: ignore[misc]
+@torch.inference_mode()  # type: ignore[misc]
 def test_beam_cascade_perf(
     batch_size: int,
     beam_width: int,
@@ -509,7 +523,9 @@ def test_beam_cascade_perf(
     torch.cuda.synchronize()
 
     elapsed_time_ms = start_event.elapsed_time(end_event) / iter_num
-    print(f"\nPerf: batch_size={batch_size}, beam_width={beam_width}, "
-          f"seq_lens={seq_lens_and_common_prefix}, num_heads={num_heads}, "
-          f"head_size={head_size}, dtype={dtype}, block_size={block_size}, "
-          f"avg_time={elapsed_time_ms:.3f} ms")
+    print(
+        f"\nPerf: batch_size={batch_size}, beam_width={beam_width}, "
+        f"seq_lens={seq_lens_and_common_prefix}, num_heads={num_heads}, "
+        f"head_size={head_size}, dtype={dtype}, block_size={block_size}, "
+        f"avg_time={elapsed_time_ms:.3f} ms"
+    )
