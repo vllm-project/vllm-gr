@@ -636,7 +636,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         mega_suffix_actual_seq_lengths_kv = None
         if NPU_DEVICE and mega_suffix_q_lens:
             mega_suffix_actual_seq_lengths_q = np.cumsum(mega_suffix_q_lens).tolist()
-            mega_suffix_actual_seq_lengths_kv = list(mega_suffix_seq_lens_list)
+            mega_suffix_actual_seq_lengths_kv = np.cumsum(mega_suffix_seq_lens_list).tolist()# list(mega_suffix_seq_lens_list)
 
         if CUDA_DEVICE:
             torch.cuda.nvtx.range_pop()
