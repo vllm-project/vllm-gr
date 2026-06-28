@@ -1147,6 +1147,10 @@ class BeamAttentionImpl(AttentionImpl):
 
             logger.debug(f"std_cu_seqlens_q.shape: {list(attn_metadata.std_cu_seqlens_q.shape)} | std_cu_seqlens_q.numel: {attn_metadata.std_cu_seqlens_q.numel()} | std_cu_seqlens_q.content: {attn_metadata.std_cu_seqlens_q.cpu().tolist()}")
 
+            # Standard requests need causal masking for (chunked) prefill; the
+            # GPU path passes causal=attn_metadata.causal. Single-token decode is
+            # unaffected either way, but multi-token prefill must be causal.
+            std_causal = bool(attn_metadata.causal)
             std_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                 std_query, key_cache.view(*key_cache.shape[:-2], -1), value_cache.view(*value_cache.shape[:-2], -1),
                 num_query_heads=attn_metadata.num_heads,
@@ -1154,9 +1158,10 @@ class BeamAttentionImpl(AttentionImpl):
                 actual_seq_qlen=attn_metadata.std_cu_seqlens_q.tolist(),
                 actual_seq_kvlen=attn_metadata.std_seq_lens.tolist(),
                 softmax_scale=scale,
+                atten_mask=_npu_causal_atten_mask(std_query.device) if std_causal else None,
                 block_table=attn_metadata.std_block_table,
                 block_size=attn_metadata.block_size,
-                sparse_mode=0,
+                sparse_mode=3 if std_causal else 0,
                 inner_precise=0,
                 input_layout="TND",
                 return_softmax_lse=False,
