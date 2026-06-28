@@ -63,7 +63,6 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
-    merge_attn_states_pytorch,
     merge_tnd_attention_outputs,
     extract_suffix_kv_pytorch
 )
@@ -664,9 +663,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
 _NPU_CAUSAL_MASK_CACHE: dict = {}
 
-# One-shot std-attention numerical-reference diagnostic (temporary).
-_STD_REF_DIAG = {"n": 0}
-
 
 def _npu_causal_atten_mask(device: torch.device) -> torch.Tensor:
     """Compressed causal mask for npu FIA ``sparse_mode=3`` (rightDownCausal).
@@ -1189,52 +1185,6 @@ class BeamAttentionImpl(AttentionImpl):
                 return_softmax_lse=False,
             )
 
-            logger.debug("[beam_attn NPU] std_out shape=%s", std_out.shape)
-
-            if _STD_REF_DIAG["n"] < 2:
-                _STD_REF_DIAG["n"] += 1
-                try:
-                    qs = attn_metadata.std_cu_seqlens_q.tolist()
-                    seqlens = attn_metadata.std_seq_lens.tolist()
-                    bt = attn_metadata.std_block_table
-                    Hq, Hkv = attn_metadata.num_heads, attn_metadata.num_kv_heads
-                    bsz = attn_metadata.block_size
-                    rep = Hq // Hkv
-                    ref = torch.zeros_like(std_query)
-                    for r in range(len(seqlens)):
-                        a, b = qs[r], qs[r + 1]
-                        lq = b - a
-                        skv = int(seqlens[r])
-                        if lq <= 0 or skv <= 0:
-                            continue
-                        pos = torch.arange(skv, device=key_cache.device)
-                        blk = bt[r].long()[pos // bsz]
-                        off = pos % bsz
-                        k = key_cache[blk, off].repeat_interleave(rep, dim=1).float()
-                        v = value_cache[blk, off].repeat_interleave(rep, dim=1).float()
-                        qr = std_query[a:b].float()
-                        sc = torch.einsum("qhd,khd->hqk", qr, k) * scale
-                        if std_causal:
-                            qpos = torch.arange(lq, device=key_cache.device) + (skv - lq)
-                            kpos = torch.arange(skv, device=key_cache.device)
-                            m = kpos[None, :] > qpos[:, None]
-                            sc = sc.masked_fill(m[None], float("-inf"))
-                        out_r = torch.einsum("hqk,khd->qhd", sc.softmax(dim=-1), v)
-                        ref[a:b] = out_r.to(std_query.dtype)
-                    diff = (ref.float() - std_out.float()).abs().max().item()
-                    print(
-                        "[STD REF DIFF] causal=%s num_reqs=%s seqlens=%s "
-                        "std_out_range=[%.4f,%.4f] ref_range=[%.4f,%.4f] max_abs_diff=%.5f"
-                        % (
-                            std_causal, len(seqlens), seqlens[:8],
-                            float(std_out.min()), float(std_out.max()),
-                            float(ref.min()), float(ref.max()), diff,
-                        ),
-                        flush=True,
-                    )
-                except Exception as _e:  # noqa: BLE001
-                    print("[STD REF DIFF] error: %s" % _e, flush=True)
-
             output[attn_metadata.std_indices] = std_out
 
         # Mega attention
@@ -1243,23 +1193,6 @@ class BeamAttentionImpl(AttentionImpl):
             logger.debug(
                 "[beam_attn NPU] mega_query shape=%s, key_cache shape=%s",
                 mega_query.shape, key_cache.shape
-            )
-
-            print(
-                "[beam_attn NPU DIAG] mega_query.shape=%s | "
-                "mega_prefix_cu_seqlens_q=%s | mega_prefix_seq_lens=%s | "
-                "mega_prefix_block_table.shape=%s | block_size=%s | "
-                "num_heads=%s num_kv_heads=%s"
-                % (
-                    list(mega_query.shape),
-                    attn_metadata.mega_prefix_cu_seqlens_q.tolist(),
-                    attn_metadata.mega_prefix_seq_lens.tolist(),
-                    list(attn_metadata.mega_prefix_block_table.shape),
-                    attn_metadata.block_size,
-                    attn_metadata.num_heads,
-                    attn_metadata.num_kv_heads,
-                ),
-                flush=True,
             )
 
             # Paged FIA with return_softmax_lse=True returns zero output / inf LSE
@@ -1296,23 +1229,6 @@ class BeamAttentionImpl(AttentionImpl):
                 inner_precise=0,
                 input_layout="TND",
                 return_softmax_lse=True,
-            )
-
-            try:
-                _pblocks = attn_metadata.mega_prefix_block_table[0].long()
-                _blk_absmax = float(key_cache[_pblocks].abs().max())
-            except Exception as _e:  # noqa: BLE001
-                _blk_absmax = float("nan")
-            print(
-                "[beam_attn NPU DIAG2] prefix_out range [%.5f, %.5f] | "
-                "prefix_lse range [%.5f, %.5f] | key_cache.shape=%s | "
-                "prefix_blocks_absmax=%.5f"
-                % (
-                    float(mega_prefix_out.min()), float(mega_prefix_out.max()),
-                    float(mega_prefix_lse.min()), float(mega_prefix_lse.max()),
-                    list(key_cache.shape), _blk_absmax,
-                ),
-                flush=True,
             )
 
             logger.debug(

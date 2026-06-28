@@ -42,20 +42,7 @@ def merge_tnd_attention_outputs(
         out1, out2: [T, N, D]  (Token, NumHead, HeadDim)
         lse1, lse2: [T, N, 1]  (output of _npu_normalize_lse)
     """
-    import logging as _logging
-    _logger = _logging.getLogger("vllm_gr.merge_tnd")
-    _logger.info(
-        "[merge_tnd] lse1 range [%.4f, %.4f], lse2 range [%.4f, %.4f]",
-        float(lse1.min()), float(lse1.max()),
-        float(lse2.min()), float(lse2.max()),
-    )
-    _logger.info(
-        "[merge_tnd] out1 range [%.4f, %.4f], out2 range [%.4f, %.4f]",
-        float(out1.min()), float(out1.max()),
-        float(out2.min()), float(out2.max()),
-    )
-
-    # LSE is already [T, N, 1] from _npu_normalize_lse, matching out1/out2 layout [T, N, D]
+    # LSE is [T, N, 1], matching out1/out2 layout [T, N, D]
 
     # 1. Extract max values for numerical stability
     max_lse = torch.maximum(lse1, lse2)  # [T, N, 1]
@@ -70,18 +57,6 @@ def merge_tnd_attention_outputs(
 
     # 4. Compute merged LSE
     normalized_lse = max_lse + torch.log(w_total)  # [T, N, 1]
-
-    _logger.info(
-        "[merge_tnd] w1=%.4f..%.4f, w2=%.4f..%.4f, w_total=%.4f..%.4f",
-        float(w1.min()), float(w1.max()),
-        float(w2.min()), float(w2.max()),
-        float(w_total.min()), float(w_total.max()),
-    )
-    _logger.info(
-        "[merge_tnd] normalized_out range [%.4f, %.4f], normalized_lse range [%.4f, %.4f]",
-        float(normalized_out.min()), float(normalized_out.max()),
-        float(normalized_lse.min()), float(normalized_lse.max()),
-    )
 
     return normalized_out, normalized_lse
 
