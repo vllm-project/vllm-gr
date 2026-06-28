@@ -144,6 +144,11 @@ class BeamAttentionMetadata:
     std_max_q_len: int = 0
     std_max_seq_len: int = 0
     std_block_table: torch.Tensor | None = None
+    # Pre-computed host lists for the NPU paged FIA (avoid device->host .tolist()
+    # syncs in the hot path). actual_seq_lengths_q is cumulative (no leading 0);
+    # actual_seq_lengths_kv is per-request KV length.
+    std_actual_seq_lengths_q: list | None = None
+    std_actual_seq_lengths_kv: list | None = None
 
     # Mega Requests shared context arrays
     mega_prefix_indices: torch.Tensor | None = None
@@ -551,6 +556,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         std_indices, std_q_lens = self._build_std_mappings(std_req_idxs, q_starts)
 
+        # Host lists for the NPU paged FIA, built from CPU/Python data so the hot
+        # path never calls .tolist() on a device tensor (which forces a sync).
+        # actual_seq_lengths_q: cumulative query lengths (no leading 0).
+        # actual_seq_lengths_kv: per-request KV (context) length.
+        std_actual_seq_lengths_q = None
+        std_actual_seq_lengths_kv = None
+        if NPU_DEVICE and std_q_lens:
+            std_actual_seq_lengths_q = np.cumsum(std_q_lens).tolist()
+            std_actual_seq_lengths_kv = common_attn_metadata.seq_lens_cpu[std_req_idxs].tolist()
+
         (
             mega_prefix_indices,
             mega_prefix_q_lens,
@@ -624,6 +639,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_max_q_len=std_max_q_len,
             std_max_seq_len=std_max_seq_len,
             std_block_table=std_block_table,
+            std_actual_seq_lengths_q=std_actual_seq_lengths_q,
+            std_actual_seq_lengths_kv=std_actual_seq_lengths_kv,
             mega_prefix_indices=mega_prefix_indices_tensor,
             mega_prefix_cu_seqlens_q=mega_prefix_cu_seqlens_q,
             mega_prefix_seq_lens=mega_prefix_seq_lens,
@@ -1137,55 +1154,36 @@ class BeamAttentionImpl(AttentionImpl):
         # Standard attention
         if attn_metadata.std_indices is not None:
             std_query = query[attn_metadata.std_indices]
-            logger.debug(
-                "[beam_attn NPU] std query shape=%s, key_cache shape=%s",
-                std_query.shape, key_cache.shape
-            )
-            logger.debug("key_cache: %s key_cache_squeezed: %s",
-                key_cache.shape, key_cache.view(*key_cache.shape[:-2], -1).shape)
-
-            logger.debug(f"std_cu_seqlens_q.shape: {list(attn_metadata.std_cu_seqlens_q.shape)} | std_cu_seqlens_q.numel: {attn_metadata.std_cu_seqlens_q.numel()} | std_cu_seqlens_q.content: {attn_metadata.std_cu_seqlens_q.cpu().tolist()}")
 
             # Standard requests need causal masking for (chunked) prefill; the
             # GPU path passes causal=attn_metadata.causal. Single-token decode is
             # unaffected either way, but multi-token prefill must be causal.
             std_causal = bool(attn_metadata.causal)
 
-            # Paged FIA (block_table) returns all-zero output on this CANN
-            # version, so gather the cached KV contiguously per request and run
-            # the non-paged FIA (same workaround as the mega prefix).
-            std_bsz = attn_metadata.block_size
-            std_seqlens = attn_metadata.std_seq_lens
-            std_bt = attn_metadata.std_block_table
-            std_ck_list, std_cv_list, std_kv_cu = [], [], [0]
-            for r in range(std_seqlens.shape[0]):
-                skv = int(std_seqlens[r])
-                spos = torch.arange(skv, device=key_cache.device)
-                sblk = std_bt[r].long()[spos // std_bsz]
-                soff = spos % std_bsz
-                std_ck_list.append(key_cache[sblk, soff])
-                std_cv_list.append(value_cache[sblk, soff])
-                std_kv_cu.append(std_kv_cu[-1] + skv)
-            std_k = torch.cat(std_ck_list, dim=0)
-            std_v = torch.cat(std_cv_list, dim=0)
-
-            std_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                std_query, std_k, std_v,
-                num_query_heads=attn_metadata.num_heads,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                actual_seq_qlen=attn_metadata.std_cu_seqlens_q.tolist(),
-                actual_seq_kvlen=std_kv_cu,
-                softmax_scale=scale,
+            # Paged attention via the v1 FIA op (npu_fused_infer_attention_score).
+            # NOTE: the v2 op returns zeros in paged mode on this CANN version;
+            # the v1 op pages correctly (it is vllm_ascend's main attention path).
+            # actual_seq_lengths_* are pre-built host lists (no device sync).
+            std_out, _ = torch_npu.npu_fused_infer_attention_score(
+                query=std_query,
+                key=key_cache.view(*key_cache.shape[:-2], -1),
+                value=value_cache.view(*value_cache.shape[:-2], -1),
                 atten_mask=_npu_causal_atten_mask(std_query.device) if std_causal else None,
-                block_table=None,
-                block_size=0,
-                sparse_mode=3 if std_causal else 0,
-                inner_precise=0,
+                block_table=attn_metadata.std_block_table,
                 input_layout="TND",
-                return_softmax_lse=False,
+                block_size=attn_metadata.block_size,
+                actual_seq_lengths=attn_metadata.std_actual_seq_lengths_q,
+                actual_seq_lengths_kv=attn_metadata.std_actual_seq_lengths_kv,
+                num_key_value_heads=attn_metadata.num_kv_heads,
+                num_heads=attn_metadata.num_heads,
+                scale=scale,
+                sparse_mode=3 if std_causal else 0,
             )
 
-            output[attn_metadata.std_indices] = std_out
+            # v1 op may return [T, num_heads*head_dim]; view back to [T, N, D].
+            output[attn_metadata.std_indices] = std_out.view(
+                -1, attn_metadata.num_heads, output.shape[-1]
+            )
 
         # Mega attention
         if attn_metadata.mega_prefix_indices is not None:
