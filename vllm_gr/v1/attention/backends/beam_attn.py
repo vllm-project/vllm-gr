@@ -1154,16 +1154,35 @@ class BeamAttentionImpl(AttentionImpl):
             # GPU path passes causal=attn_metadata.causal. Single-token decode is
             # unaffected either way, but multi-token prefill must be causal.
             std_causal = bool(attn_metadata.causal)
+
+            # Paged FIA (block_table) returns all-zero output on this CANN
+            # version, so gather the cached KV contiguously per request and run
+            # the non-paged FIA (same workaround as the mega prefix).
+            std_bsz = attn_metadata.block_size
+            std_seqlens = attn_metadata.std_seq_lens
+            std_bt = attn_metadata.std_block_table
+            std_ck_list, std_cv_list, std_kv_cu = [], [], [0]
+            for r in range(std_seqlens.shape[0]):
+                skv = int(std_seqlens[r])
+                spos = torch.arange(skv, device=key_cache.device)
+                sblk = std_bt[r].long()[spos // std_bsz]
+                soff = spos % std_bsz
+                std_ck_list.append(key_cache[sblk, soff])
+                std_cv_list.append(value_cache[sblk, soff])
+                std_kv_cu.append(std_kv_cu[-1] + skv)
+            std_k = torch.cat(std_ck_list, dim=0)
+            std_v = torch.cat(std_cv_list, dim=0)
+
             std_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                std_query, key_cache.view(*key_cache.shape[:-2], -1), value_cache.view(*value_cache.shape[:-2], -1),
+                std_query, std_k, std_v,
                 num_query_heads=attn_metadata.num_heads,
                 num_key_value_heads=attn_metadata.num_kv_heads,
                 actual_seq_qlen=attn_metadata.std_cu_seqlens_q.tolist(),
-                actual_seq_kvlen=attn_metadata.std_seq_lens.tolist(),
+                actual_seq_kvlen=std_kv_cu,
                 softmax_scale=scale,
                 atten_mask=_npu_causal_atten_mask(std_query.device) if std_causal else None,
-                block_table=attn_metadata.std_block_table,
-                block_size=attn_metadata.block_size,
+                block_table=None,
+                block_size=0,
                 sparse_mode=3 if std_causal else 0,
                 inner_precise=0,
                 input_layout="TND",
