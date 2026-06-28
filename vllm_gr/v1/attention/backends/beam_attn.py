@@ -1191,9 +1191,7 @@ class BeamAttentionImpl(AttentionImpl):
             )
 
             # v1 op may return [T, num_heads*head_dim]; view back to [T, N, D].
-            output[attn_metadata.std_indices] = std_out.view(
-                -1, attn_metadata.num_heads, output.shape[-1]
-            )
+            output[attn_metadata.std_indices] = std_out
 
         # Mega attention
         if attn_metadata.mega_prefix_indices is not None:
@@ -1218,13 +1216,9 @@ class BeamAttentionImpl(AttentionImpl):
                 num_key_value_heads=attn_metadata.num_kv_heads,
                 num_heads=attn_metadata.num_heads,
                 scale=scale,
+                softmax_lse_flag=True,
                 sparse_mode=0,  # prefix attention is non-causal (full)
             )
-
-            # v1 op may return flat layout [T, num_heads*head_dim] or [T, num_heads, 1] for LSE.
-            # View back to [T, N, D] / [T, N, 1] to match subsequent merge functions.
-            mega_prefix_out = mega_prefix_out.view(-1, attn_metadata.num_heads, output.shape[-1])
-            mega_prefix_lse = mega_prefix_lse.view(-1, attn_metadata.num_heads, 1)
 
             logger.debug(
                 "[beam_attn NPU] mega_prefix_out shape=%s, range [%.6f, %.6f], mega_suffix_total=%d",
