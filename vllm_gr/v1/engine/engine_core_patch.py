@@ -981,14 +981,29 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
                 print(
                     "[GR DIAG book] request_row_configs=%s | "
                     "raw sampled_token_ids.shape=%s vals=%s | "
-                    "logprobs_tensors.logprobs.shape=%s | "
-                    "valid_sampled_token_ids=%s"
+                    "logprobs.shape=%s vals=%s | "
+                    "logprob_token_ids vals=%s | use_async=%s | valid=%s"
                     % (
                         request_row_configs,
                         list(raw_st.shape) if raw_st is not None else None,
                         raw_st.flatten().tolist()[:32] if raw_st is not None else None,
                         list(lp.logprobs.shape) if lp is not None and lp.logprobs is not None else None,
+                        lp.logprobs.flatten().tolist()[:40] if lp is not None and lp.logprobs is not None else None,
+                        lp.logprob_token_ids.flatten().tolist()[:40]
+                        if lp is not None and lp.logprob_token_ids is not None else None,
+                        getattr(self, "use_async_scheduling", "?"),
                         valid_sampled_token_ids,
+                    ),
+                    flush=True,
+                )
+                print(
+                    "[GR DIAG book] invalid_req_indices=%s | num_discarded=%s | "
+                    "discard_idx=%s"
+                    % (
+                        invalid_req_indices,
+                        getattr(self, "num_discarded_requests", "?"),
+                        self.discard_request_indices.np[: getattr(self, "num_discarded_requests", 0)].tolist()
+                        if hasattr(self, "discard_request_indices") else "?",
                     ),
                     flush=True,
                 )
@@ -1003,13 +1018,19 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
         if _GR_DIAG["n"] <= 3:
             try:
                 rst = sampler_output.sampled_token_ids
+                lp = sampler_output.logprobs_tensors
                 print(
                     "[GR DIAG book post-remux] collapsed_req_ids=%s | "
-                    "sampled_token_ids.shape=%s vals=%s"
+                    "sampled_token_ids.shape=%s vals=%s | "
+                    "logprobs.shape=%s vals=%s | logprob_token_ids vals=%s"
                     % (
                         collapsed_req_ids,
                         list(rst.shape) if rst is not None else None,
                         rst.flatten().tolist()[:32] if rst is not None else None,
+                        list(lp.logprobs.shape) if lp is not None and lp.logprobs is not None else None,
+                        lp.logprobs.flatten().tolist()[:40] if lp is not None and lp.logprobs is not None else None,
+                        lp.logprob_token_ids.flatten().tolist()[:40]
+                        if lp is not None and lp.logprob_token_ids is not None else None,
                     ),
                     flush=True,
                 )
