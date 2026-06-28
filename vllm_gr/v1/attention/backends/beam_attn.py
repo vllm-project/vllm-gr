@@ -157,6 +157,8 @@ class BeamAttentionMetadata:
     mega_prefix_max_q_len: int = 0
     mega_prefix_max_seq_len: int = 0
     mega_prefix_block_table: torch.Tensor | None = None
+    mega_prefix_actual_seq_lengths_q: list | None = None
+    mega_prefix_actual_seq_lengths_kv: list | None = None
 
     # Mega Requests split-gather channels
     mega_suffix_cu_seqlens_q: torch.Tensor | None = None
@@ -622,6 +624,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             max_num_splits,
         )
 
+        mega_prefix_actual_seq_lengths_q = None
+        mega_prefix_actual_seq_lengths_kv = None
+        if NPU_DEVICE and mega_prefix_q_lens:
+            mega_prefix_actual_seq_lengths_q = np.cumsum(mega_prefix_q_lens).tolist()
+            mega_prefix_actual_seq_lengths_kv = list(mega_prefix_seq_lens_list)
+
         if CUDA_DEVICE:
             torch.cuda.nvtx.range_pop()
         meta = BeamAttentionMetadata(
@@ -647,6 +655,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_prefix_max_q_len=mega_prefix_max_q_len,
             mega_prefix_max_seq_len=mega_prefix_max_seq_len,
             mega_prefix_block_table=mega_prefix_block_table,
+            mega_prefix_actual_seq_lengths_q=mega_prefix_actual_seq_lengths_q,
+            mega_prefix_actual_seq_lengths_kv=mega_prefix_actual_seq_lengths_kv,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             mega_suffix_cu_seqlens_q=mega_suffix_cu_seqlens_q,
             mega_suffix_cu_seqlens_k=mega_suffix_cu_seqlens_k,
@@ -1193,41 +1203,28 @@ class BeamAttentionImpl(AttentionImpl):
                 mega_query.shape, key_cache.shape
             )
 
-            # Paged FIA with return_softmax_lse=True returns zero output / inf LSE
-            # on this CANN version, so gather the (shared) prefix KV into a
-            # contiguous buffer and run the non-paged FIA, mirroring the suffix
-            # path which works. block_table rows are per prefix-group.
-            block_size = attn_metadata.block_size
-            prefix_block_table = attn_metadata.mega_prefix_block_table  # [G, max_blocks]
-            prefix_kv_lens = attn_metadata.mega_prefix_seq_lens         # [G]
-            contig_pk_list, contig_pv_list, prefix_kv_cu = [], [], [0]
-            for g in range(prefix_block_table.shape[0]):
-                clen = int(prefix_kv_lens[g])
-                pos = torch.arange(clen, device=key_cache.device)
-                blk = prefix_block_table[g].long()[pos // block_size]
-                off = pos % block_size
-                contig_pk_list.append(key_cache[blk, off])    # [clen, num_kv_heads, head_dim]
-                contig_pv_list.append(value_cache[blk, off])
-                prefix_kv_cu.append(prefix_kv_cu[-1] + clen)
-            prefix_k = torch.cat(contig_pk_list, dim=0)
-            prefix_v = torch.cat(contig_pv_list, dim=0)
-
-            mega_prefix_out, mega_prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                mega_query,
-                prefix_k,
-                prefix_v,
-                num_query_heads=attn_metadata.num_heads,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                actual_seq_qlen=attn_metadata.mega_prefix_cu_seqlens_q.tolist(),
-                actual_seq_kvlen=prefix_kv_cu,
-                softmax_scale=scale,
-                block_table=None,  # contiguous, not paged
-                block_size=0,
-                sparse_mode=0,  # prefix attention is non-causal (full)
-                inner_precise=0,
+            # Paged prefix attention via the v1 FIA op (npu_fused_infer_attention_score)
+            # using the prefix block table directly (no copy needed).
+            mega_prefix_out, mega_prefix_lse = torch_npu.npu_fused_infer_attention_score(
+                query=mega_query,
+                key=key_cache.view(*key_cache.shape[:-2], -1),
+                value=value_cache.view(*value_cache.shape[:-2], -1),
+                atten_mask=None,
+                block_table=attn_metadata.mega_prefix_block_table,
                 input_layout="TND",
-                return_softmax_lse=True,
+                block_size=attn_metadata.block_size,
+                actual_seq_lengths=attn_metadata.mega_prefix_actual_seq_lengths_q,
+                actual_seq_lengths_kv=attn_metadata.mega_prefix_actual_seq_lengths_kv,
+                num_key_value_heads=attn_metadata.num_kv_heads,
+                num_heads=attn_metadata.num_heads,
+                scale=scale,
+                sparse_mode=0,  # prefix attention is non-causal (full)
             )
+
+            # v1 op may return flat layout [T, num_heads*head_dim] or [T, num_heads, 1] for LSE.
+            # View back to [T, N, D] / [T, N, 1] to match subsequent merge functions.
+            mega_prefix_out = mega_prefix_out.view(-1, attn_metadata.num_heads, output.shape[-1])
+            mega_prefix_lse = mega_prefix_lse.view(-1, attn_metadata.num_heads, 1)
 
             logger.debug(
                 "[beam_attn NPU] mega_prefix_out shape=%s, range [%.6f, %.6f], mega_suffix_total=%d",
