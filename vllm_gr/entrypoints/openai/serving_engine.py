@@ -23,6 +23,9 @@ from vllm_gr.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
 
+# One-shot client-side diagnostic counter (temporary, for NPU mega bring-up).
+_GR_CLIENT_DIAG = {"n": 0}
+
 _dp_rank_counter = 0
 _dp_rank_lock = asyncio.Lock()
 
@@ -477,6 +480,19 @@ async def beam_search(
                 total_logprobs = len(raw_token_ids)
 
                 stride_k = total_logprobs // len(fork_info)
+
+                if _GR_CLIENT_DIAG["n"] < 3:
+                    _GR_CLIENT_DIAG["n"] += 1
+                    print(
+                        "[GR CLIENT DIAG] len(fork_info)=%s | total_logprobs=%s | "
+                        "stride_k=%s | logprobs_num=%s | raw_token_ids=%s | "
+                        "raw_logprobs=%s"
+                        % (
+                            len(fork_info), total_logprobs, stride_k, logprobs_num,
+                            list(raw_token_ids)[:40], list(raw_logprobs)[:40],
+                        ),
+                        flush=True,
+                    )
 
                 # Each logical beam block (W=16) should extract its top choices natively
                 for b_idx in range(len(fork_info)):
