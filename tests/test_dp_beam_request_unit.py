@@ -19,14 +19,20 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import msgspec
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.entrypoints.openai.serving_engine import _mega_request_cleanup, _mega_request_step
-from vllm_gr.v1.engine.core_client import add_requests_async, mega_request_step_update_async
+from vllm_gr.entrypoints.openai.serving_engine import (
+    _mega_request_cleanup,
+    _mega_request_step,
+)
+from vllm_gr.v1.engine.core_client import (
+    add_requests_async,
+    mega_request_step_update_async,
+)
 from vllm_gr.v1.engine.core_client_patch import register_beam_output_fn
 from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
 from vllm_gr.v1.engine.types import MegaRequestStepUpdate
@@ -153,7 +159,10 @@ def _finished_queue() -> MagicMock:
 class TestAddRequestsAsyncDP:
     def test_dp_add_batch_chooses_engine_by_rank(self) -> None:
         mock_self = _make_dp_client_mock(num_engines=3)
-        reqs = [_make_request_mock("r0", data_parallel_rank=2), _make_request_mock("r1", data_parallel_rank=2)]
+        reqs = [
+            _make_request_mock("r0", data_parallel_rank=2),
+            _make_request_mock("r1", data_parallel_rank=2),
+        ]
         asyncio.run(add_requests_async(mock_self, reqs, force_batch=True))
 
         mock_self._send_input.assert_awaited_once()

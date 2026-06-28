@@ -26,11 +26,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequestType, FinishReason
+from vllm.v1.engine import (
+    EngineCoreRequestType,
+    FinishReason,
+)
 
-from vllm_gr.entrypoints.openai.serving_engine import _mega_request_cleanup, _mega_request_step
+from vllm_gr.entrypoints.openai.serving_engine import (
+    _mega_request_cleanup,
+    _mega_request_step,
+)
 from vllm_gr.v1.engine.core import _cache_beam_request, _handle_mega_request_step_update
-from vllm_gr.v1.engine.core_client import add_requests_async, mega_request_step_update_async
+from vllm_gr.v1.engine.core_client import (
+    add_requests_async,
+    mega_request_step_update_async,
+)
 from vllm_gr.v1.engine.core_client_patch import (
     _add_requests_batch_fn,
     apply_batch_fork_patches,
@@ -57,6 +66,7 @@ _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
 def _sub_patch_batch_fork_registers_enum() -> None:
     """Verify patch_batch_and_fork adds MEGA_REQUEST_STEP_UPDATE to the enum."""
     from vllm.v1.engine import EngineCoreRequestType as ERT
+
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
     patch_batch_and_fork()
@@ -69,6 +79,7 @@ def _sub_patch_batch_fork_registers_enum() -> None:
 def _sub_patch_batch_fork_wires_run_engine_core() -> None:
     """Verify patch_batch_and_fork wires EngineCoreProc.run_engine_core."""
     from vllm.v1.engine.core import EngineCoreProc
+
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
@@ -81,6 +92,7 @@ def _sub_patch_batch_fork_wires_run_engine_core() -> None:
 def _sub_patch_batch_fork_idempotent() -> None:
     """Calling patch_batch_and_fork twice must not double-wrap run_engine_core."""
     from vllm.v1.engine.core import EngineCoreProc
+
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
@@ -333,7 +345,6 @@ class TestTypesSerialization:
         assert decoded.beam_width == 0
 
 
-
 # ===========================================================================
 # Section 2 — Enum Patching
 # ===========================================================================
@@ -366,7 +377,10 @@ class TestEnumPatching:
         assert member.name == "MEGA_REQUEST_STEP_UPDATE"
         # Must be accessible via reverse value lookup
         assert EngineCoreRequestType(b"\x06") is member
-        assert sum(1 for n in EngineCoreRequestType._member_names_ if n == "MEGA_REQUEST_STEP_UPDATE") == 1
+        assert (
+            sum(1 for n in EngineCoreRequestType._member_names_ if n == "MEGA_REQUEST_STEP_UPDATE")
+            == 1
+        )
 
     def test_enum_lookup_by_value(self) -> None:
         _add_enum_member("ADD_BATCH", b"\x05")
@@ -612,9 +626,9 @@ class TestBeamCache:
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
         update = _make_beam_update(
             session_id="s0",
-            parent_beam_ids=["p0", "p1"],   # 2 parents
-            child_beam_ids=["c0", "c1"],     # 2 children
-            beam_tokens=[[50]],              # only 1 token list — mismatch!
+            parent_beam_ids=["p0", "p1"],  # 2 parents
+            child_beam_ids=["c0", "c1"],  # 2 children
+            beam_tokens=[[50]],  # only 1 token list — mismatch!
             beam_width=2,
         )
 
@@ -737,37 +751,44 @@ class TestBeamCache:
             return MockReq
 
         # Step 1: first decode step, both beams survive
-        MockReq1 = _run_step(_make_beam_update(
-            session_id="s0",
-            parent_beam_ids=["parent-0", "parent-1"],
-            child_beam_ids=["child-1a", "child-1b"],
-            beam_tokens=[[40], [50]],
-            beam_width=2,
-        ))
+        MockReq1 = _run_step(
+            _make_beam_update(
+                session_id="s0",
+                parent_beam_ids=["parent-0", "parent-1"],
+                child_beam_ids=["child-1a", "child-1b"],
+                beam_tokens=[[40], [50]],
+                beam_width=2,
+            )
+        )
         assert "s0" in eng.beam_cache, "Session must survive step 1"
         assert eng.input_queue.qsize() == 1
         _, kwargs1 = MockReq1.call_args
         assert kwargs1["prompt_token_ids"][:3] == session_tokens  # prefill reused
 
         # Step 2: second decode step, same session, same prefill
-        MockReq2 = _run_step(_make_beam_update(
-            session_id="s0",
-            parent_beam_ids=["child-1a", "child-1b"],
-            child_beam_ids=["child-2a", "child-2b"],
-            beam_tokens=[[40, 60], [50, 70]],
-            beam_width=2,
-        ))
+        MockReq2 = _run_step(
+            _make_beam_update(
+                session_id="s0",
+                parent_beam_ids=["child-1a", "child-1b"],
+                child_beam_ids=["child-2a", "child-2b"],
+                beam_tokens=[[40, 60], [50, 70]],
+                beam_width=2,
+            )
+        )
         assert "s0" in eng.beam_cache, "Session must survive step 2"
         assert eng.input_queue.qsize() == 2
         _, kwargs2 = MockReq2.call_args
         assert kwargs2["prompt_token_ids"][:3] == session_tokens  # same prefill reused
 
         # Step 3: teardown — session removed, all ids aborted
-        _handle_mega_request_step_update(eng, _make_beam_update(
-            session_id="s0",
-            beam_width=0,
-            pruned_ids=["child-2a", "child-2b"],
-        ))
+        _handle_mega_request_step_update(
+            eng,
+            _make_beam_update(
+                session_id="s0",
+                beam_width=0,
+                pruned_ids=["child-2a", "child-2b"],
+            ),
+        )
         assert "s0" not in eng.beam_cache
         aborted = set()
         while not eng.aborts_queue.empty():
@@ -836,14 +857,18 @@ class TestClientPatches:
         assert update.client_index == 7
         # Must still have dispatched to the engine
         mock_self._send_input.assert_awaited_once()
-        assert mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        assert (
+            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        )
 
     def test_beam_request_step_update_async_sends_correct_type(self) -> None:
         mock_self = _make_non_dp_client_mock()
         update = _make_beam_update()
         asyncio.run(mega_request_step_update_async(mock_self, update))
         mock_self._send_input.assert_awaited_once()
-        assert mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        assert (
+            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        )
         assert mock_self._send_input.call_args[0][1] is update
         mock_self._ensure_output_queue_task.assert_called_once()
 
@@ -965,7 +990,9 @@ class TestClientPatches:
         update = _make_beam_update()
         sync_mp_mega_request_step_update(mock_self, update)
         mock_self._send_input.assert_called_once()
-        assert mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        assert (
+            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        )
         assert mock_self._send_input.call_args[0][1] is update
 
     # ── InprocClient patches ─────────────────────────────────────────────
@@ -1011,7 +1038,7 @@ class TestClientPatches:
         good_preprocessed = (MagicMock(), "extra")
         mock_core.preprocess_add_request.side_effect = [
             RuntimeError("bad input"),  # first request fails
-            good_preprocessed,          # second request succeeds
+            good_preprocessed,  # second request succeeds
         ]
 
         mock_self = MagicMock()
@@ -1214,8 +1241,8 @@ class TestBeamSearchOrchestration:
 
         ec.register_beam_output.assert_called_once()
         reg_args, reg_kwargs = ec.register_beam_output.call_args
-        assert reg_args[0] == "sess-1"              # session_id
-        assert reg_args[1] == [10, 50]              # all_beams[0].tokens
+        assert reg_args[0] == "sess-1"  # session_id
+        assert reg_args[1] == [10, 50]  # all_beams[0].tokens
         assert reg_kwargs["data_parallel_rank"] is None
 
     def test_beam_request_step_returns_single_output_list(self) -> None:
