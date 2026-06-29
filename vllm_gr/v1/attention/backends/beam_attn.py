@@ -891,6 +891,7 @@ class BeamAttentionImpl(AttentionImpl):
                     attn_metadata.mega_suffix_max_q_len == 1
                     and attn_metadata.mega_suffix_max_seq_len == 1
                     and group_size > 1
+                    and not vllm_flash_attn_version == 3
                 ):
                     mega_suffix_lse = (
                         mega_suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
