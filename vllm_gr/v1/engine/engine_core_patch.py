@@ -290,9 +290,7 @@ def apply_scheduler_patch():
 # ============================================================================
 
 
-def _get_positions_buffers(
-    runner: Any,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Safely extracts underlying hardware and host indexing position tensors."""
     gpu_positions = None
     cpu_positions = None
@@ -304,22 +302,27 @@ def _get_positions_buffers(
 
 def _compute_beam_bounds(
     b: int,
-    prefix_len: int,
-    cache_len: int,
+    b_prefix_len: int,
+    b_cache_len: int,
     decode_steps: int,
     chunk_budget: int,
-    delta: int,
 ) -> Tuple[int, int]:
     """Calculates active lookahead allocations and historical trace lengths."""
-    past_suffix_b = max(0, min(decode_steps, delta - b * decode_steps))
-    if prefix_len >= cache_len:
-        remaining_prefix = prefix_len - cache_len
-        if b == 0:
-            return min(chunk_budget, remaining_prefix + decode_steps), past_suffix_b
-        return min(chunk_budget, decode_steps), past_suffix_b
+    delta = max(0, b_cache_len - b_prefix_len)
+    remaining_prefix = b_prefix_len - b_cache_len
+    b_physical = delta // decode_steps
+    b_uncached = 0
+    b_suffix_len = 0
 
-    remaining_suffix_b = decode_steps - past_suffix_b
-    return min(chunk_budget, remaining_suffix_b), past_suffix_b
+    b_past_suffix = max(0, min(decode_steps, delta - b_physical * decode_steps))
+    if remaining_prefix >= 0:
+        # Scenario A: Prefix Incomplete - compute remaining prefix + suffix of first beam
+        b_uncached = min(chunk_budget, remaining_prefix + decode_steps)
+    else:
+        # Scenario B: Compute only suffix of beams
+        b_uncached = min(chunk_budget, max(decode_steps - b_past_suffix, 0))
+    b_suffix_len = b_uncached + b_past_suffix
+    return b_uncached, b_suffix_len, b_past_suffix, b_physical
 
 
 def _overwrite_position_ids(
@@ -353,37 +356,37 @@ def _process_mega_decode_request(
     beam_width = mdata["mega_beam_width"]
     decode_steps = mdata["mega_decode_steps"]
     cache_len = mdata["cache_len"]
+    active_beam_ids = []  # Track structural beam locations
 
     chunk_budget = seq_len
-    delta = max(0, cache_len - prefix_len)
     curr_offset = token_offset
     valid_rows_for_req = 0
     logits_row_cnt = 0
+    b_cache_len = cache_len
     for b in range(beam_width):
         if chunk_budget <= 0:
             break
 
-        b_uncached, past_suffix_b = _compute_beam_bounds(
-            b, prefix_len, cache_len, decode_steps, chunk_budget, delta
+        b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+            b, prefix_len, b_cache_len, decode_steps, chunk_budget
         )
 
         if b_uncached > 0:
-            st = (
-                cache_len
-                if (prefix_len >= cache_len and b == 0)
-                else (prefix_len if prefix_len >= cache_len else prefix_len + past_suffix_b)
-            )
+            st = cache_len if (prefix_len >= b_cache_len) else (prefix_len + b_past_suffix)
             _overwrite_position_ids(st, b_uncached, curr_offset, gpu_pos, cpu_pos)
 
-            if past_suffix_b + b_uncached >= decode_steps:
+            if b_past_suffix + b_uncached >= decode_steps:
                 new_logits_indices.append(curr_offset + b_uncached - 1)
+                active_beam_ids.append(b_physical)
+
                 logits_row_cnt += 1
 
             valid_rows_for_req += 1
             curr_offset += b_uncached
             chunk_budget -= b_uncached
+            b_cache_len += b_uncached
 
-    return valid_rows_for_req, logits_row_cnt, curr_offset
+    return valid_rows_for_req, logits_row_cnt, curr_offset, active_beam_ids
 
 
 # ============================================================================
@@ -407,7 +410,7 @@ def _remux_logprobs_tensors(
     new_st_ids, new_lps, new_lp_ids, new_ranks = [], [], [], []
     gpu_row_cursor = 0
 
-    for req_id, _, W_logits in request_row_configs:
+    for req_id, _, W_logits, *_ in request_row_configs:
         # --------------------------------------------------------------------
         # CASE A: INTERMEDIATE CHUNKED PREFILL (No output rows generated)
         # --------------------------------------------------------------------
@@ -426,17 +429,13 @@ def _remux_logprobs_tensors(
             if orig_lp_ids is not None:
                 new_lp_ids.append(
                     torch.zeros(
-                        (1, max_chained_dim),
-                        dtype=orig_lp_ids.dtype,
-                        device=orig_lp_ids.device,
+                        (1, max_chained_dim), dtype=orig_lp_ids.dtype, device=orig_lp_ids.device
                     )
                 )
             if orig_ranks is not None:
                 new_ranks.append(
                     torch.zeros(
-                        (1, max_chained_dim),
-                        dtype=orig_ranks.dtype,
-                        device=orig_ranks.device,
+                        (1, max_chained_dim), dtype=orig_ranks.dtype, device=orig_ranks.device
                     )
                 )
             continue
@@ -452,9 +451,7 @@ def _remux_logprobs_tensors(
         )
         if W_logits * target_K < max_chained_dim:
             req_lps = torch.nn.functional.pad(
-                req_lps,
-                (0, max_chained_dim - (W_logits * target_K)),
-                value=float("-inf"),
+                req_lps, (0, max_chained_dim - (W_logits * target_K)), value=float("-inf")
             )
         new_lps.append(req_lps)
 
@@ -644,7 +641,7 @@ def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
 
         mdata = mega_data.get(req_id)
         if mdata and mdata.get("is_mega_decode", False):
-            W, W_logits, next_offset = _process_mega_decode_request(
+            W, W_logits, next_offset, active_beam_ids = _process_mega_decode_request(
                 mdata,
                 seq_len,
                 token_offset,
@@ -656,7 +653,7 @@ def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
             row_to_batch_idx.extend([batch_idx] * W)
             logits_to_batch_idx.extend([batch_idx] * W_logits)
 
-            request_row_configs.append((req_id, input_row_idx, W_logits))
+            request_row_configs.append((req_id, input_row_idx, W_logits, active_beam_ids))
             input_row_idx += W
         else:
             num_computed_tokens = runner.input_batch.num_computed_tokens_cpu[batch_idx]
@@ -675,7 +672,7 @@ def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
             row_to_req_id.extend([req_id] * W)
             row_to_batch_idx.extend([batch_idx] * W)
 
-            request_row_configs.append((req_id, input_row_idx, W_logits_count))
+            request_row_configs.append((req_id, input_row_idx, W_logits_count, []))
             input_row_idx += W
 
         token_offset += seq_len
@@ -688,8 +685,8 @@ def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
     return new_logits_indices
 
 
-def _mega_collapse_bookkeeping(
-    orig_input_batch, request_row_configs, sampler_output
+def _mega_collapse_bookkeeping(runner,
+    orig_input_batch, request_row_configs, mega_data, sampler_output
 ) -> Tuple[List[Any], Dict[Any, int], int]:
     """Collapse per-beam sampler output back onto logical (session) requests.
 
@@ -707,41 +704,138 @@ def _mega_collapse_bookkeeping(
     num_logical_requests = len(collapsed_req_ids_copy)
 
     if sampler_output is not None:
-        st_ids = sampler_output.sampled_token_ids
-        lp_tensors = sampler_output.logprobs_tensors
-        if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
-            orig_lps = lp_tensors.logprobs
-            orig_lp_ids = lp_tensors.logprob_token_ids
-            orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
-            actual_K = orig_lps.shape[1]
-            max_chained_dim = max(W * actual_K for _, _, W in request_row_configs)
+        if sampler_output is not None:
+            st_ids = sampler_output.sampled_token_ids
+            lp_tensors = sampler_output.logprobs_tensors
+            if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
+                orig_lps = lp_tensors.logprobs
+                orig_lp_ids = lp_tensors.logprob_token_ids
+                orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
+                actual_K = orig_lps.shape[1]
 
-            final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
-                request_row_configs,
-                max_chained_dim,
-                actual_K,
-                orig_lps,
-                orig_lp_ids,
-                orig_ranks,
-                st_ids,
-            )
+                max_chained_dim = 0
+                for req_id, _, W, *_ in request_row_configs:
+                    if req_id is not None and req_id in mega_data:
+                        m_width = mega_data[req_id].get("mega_beam_width", 1)
+                        needed_dim = m_width * actual_K
+                    else:
+                        needed_dim = W * actual_K
+                    if needed_dim > max_chained_dim:
+                        max_chained_dim = needed_dim
 
-            # Safely resizes the original tensor wrapper and copies the elements in place
-            st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
-            lp_tensors.logprobs.resize_(final_lps.shape).copy_(final_lps)
-
-            if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
-                lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
-            if orig_ranks is not None and final_ranks is not None:
-                clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
-                lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
-                    clean_ranks_slice
+                final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
+                    request_row_configs,
+                    max_chained_dim,
+                    actual_K,
+                    orig_lps,
+                    orig_lp_ids,
+                    orig_ranks,
+                    st_ids,
                 )
+                if not hasattr(runner, "_mega_logprobs_cache"):
+                    runner._mega_logprobs_cache = {}
 
-            if getattr(orig_input_batch, "prev_sampled_token_ids", None) is not None:
-                orig_input_batch.prev_sampled_token_ids.resize_(final_st_ids.shape).copy_(
-                    final_st_ids
-                )
+                req_id_to_config = {
+                    r[0]: (r[2], r[3]) for r in request_row_configs if r[0] is not None
+                }
+
+                for idx, req_id in enumerate(collapsed_req_ids_copy):
+                    mdata = mega_data.get(req_id)
+                    if mdata and mdata.get("is_mega_decode", False):
+                        W_logits, active_beams = req_id_to_config.get(req_id, (0, []))
+                        total_beam_width = mdata.get("mega_beam_width", 1)
+
+                        if W_logits > 0:
+                            # ---------------------------------------------------------------------
+                            # FAST-PATH: This chunk contains ALL beams directly (No Split occurred)
+                            # ---------------------------------------------------------------------
+                            if W_logits == total_beam_width:
+                                # Clean up stale entries left behind by older preempted/aborted steps
+                                if req_id in runner._mega_logprobs_cache:
+                                    del runner._mega_logprobs_cache[req_id]
+
+                                # Skip all caching loops! final_lps[idx] is already fully populated.
+                                continue
+
+                            # ---------------------------------------------------------------------
+                            # SLOW-PATH: Handled split chunked prefills across steps
+                            # ---------------------------------------------------------------------
+                            # Extract this chunk's output elements
+                            actual_lps = final_lps[idx, : W_logits * actual_K].view(
+                                W_logits, actual_K
+                            )
+                            actual_lp_ids = (
+                                final_lp_ids[idx, : W_logits * actual_K].view(W_logits, actual_K)
+                                if final_lp_ids is not None
+                                else None
+                            )
+                            actual_ranks = (
+                                final_ranks[idx, :W_logits] if final_ranks is not None else None
+                            )
+
+                            # Initialize pre-allocated tensor cache matrix structures only if needed
+                            if req_id not in runner._mega_logprobs_cache:
+                                runner._mega_logprobs_cache[req_id] = {
+                                    "lps": torch.full(
+                                        (total_beam_width, actual_K),
+                                        float("-inf"),
+                                        device=orig_lps.device,
+                                        dtype=orig_lps.dtype,
+                                    ),
+                                    "lp_ids": torch.zeros(
+                                        (total_beam_width, actual_K),
+                                        dtype=orig_lp_ids.tensor.dtype
+                                        if hasattr(orig_lp_ids, "tensor")
+                                        else orig_lps.dtype,
+                                        device=orig_lps.device,
+                                    )
+                                    if orig_lp_ids is not None
+                                    else None,
+                                    "ranks": torch.zeros(
+                                        total_beam_width, dtype=torch.long, device=orig_lps.device
+                                    )
+                                    if orig_ranks is not None
+                                    else None,
+                                    "completed_beams": set(),
+                                }
+
+                            cache_entry = runner._mega_logprobs_cache[req_id]
+
+                            # Scatter write chunk data lines directly to their physical beam slots
+                            for local_row_idx, physical_beam_id in enumerate(active_beams):
+                                if physical_beam_id not in cache_entry["completed_beams"]:
+                                    cache_entry["lps"][physical_beam_id] = actual_lps[local_row_idx]
+                                    if actual_lp_ids is not None:
+                                        cache_entry["lp_ids"][physical_beam_id] = actual_lp_ids[
+                                            local_row_idx
+                                        ]
+                                    if actual_ranks is not None:
+                                        cache_entry["ranks"][physical_beam_id] = actual_ranks[
+                                            local_row_idx
+                                        ]
+                                    cache_entry["completed_beams"].add(physical_beam_id)
+
+                            # Evict and overwrite target boundaries only when ALL unique structural slots are filled
+                            if len(cache_entry["completed_beams"]) >= total_beam_width:
+                                final_lps[idx].copy_(cache_entry["lps"].view(-1))
+                                if final_lp_ids is not None:
+                                    final_lp_ids[idx].copy_(cache_entry["lp_ids"].view(-1))
+                                if final_ranks is not None:
+                                    final_ranks[idx, :total_beam_width].copy_(cache_entry["ranks"])
+
+                                del runner._mega_logprobs_cache[req_id]
+
+                # Safely resizes the original tensor wrapper and copies the elements in place
+                st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
+                lp_tensors.logprobs.resize_(final_lps.shape).copy_(final_lps)
+
+                if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
+                    lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
+                if orig_ranks is not None and final_ranks is not None:
+                    clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
+                    lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
+                        clean_ranks_slice
+                    )
 
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
 
@@ -832,8 +926,8 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         ) = res
 
         sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
-        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(
-            orig_input_batch, request_row_configs, sampler_output
+        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(self, 
+            orig_input_batch, request_row_configs, mega_data, sampler_output
         )
 
         return (
@@ -949,10 +1043,15 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
             invalid_req_indices,
         ) = res
 
+        collapsed_req_ids_copy = [r[0] for r in request_row_configs if r[0] is not None]
+        collapsed_req_id_to_index = {
+            req_id: idx for idx, req_id in enumerate(collapsed_req_ids_copy)
+        }
+        num_logical_requests = len(collapsed_req_ids_copy)
+        
         sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
-
-        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(
-            orig_input_batch, request_row_configs, sampler_output
+        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(self,
+            orig_input_batch, request_row_configs, mega_data, sampler_output
         )
 
         return (

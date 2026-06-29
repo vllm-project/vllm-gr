@@ -3,11 +3,19 @@
 
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
 from vllm.utils.torch_utils import set_random_seed
+
+try:
+    from vllm_gr.v1.engine.engine_core_patch import _compute_beam_bounds
+except ImportError:
+    pytest.skip(
+        "beam_attn backend is not supported.",
+        allow_module_level=True,
+    )
 
 try:
     from vllm.vllm_flash_attn import (
@@ -25,6 +33,7 @@ NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16, 32]
 DTYPES = [torch.float16, torch.bfloat16]
+
 CASES = [
     # Scenario: Standard Prefix Complete.
     # The shared prefix is fully cached, and beams independently decode their full suffixes.
@@ -69,6 +78,7 @@ class BeamAttnInputs:
     fa_version: int
     shared_tokens_len: int
     suffix_kv_len: int
+    slot_mapping: torch.Tensor
 
 
 def prepare_inputs(
@@ -128,6 +138,25 @@ def prepare_inputs(
 
     seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
 
+    # Calculate slot_mapping using the full block table slice approach
+    num_actual_tokens = num_seqs * q_seq_len
+    slot_mapping = torch.zeros(num_actual_tokens, dtype=torch.long, device=device)
+
+    chunk_budget = beam_width * q_seq_len
+    cache_len = (shared_tokens_len // block_size) * block_size
+    remaining_prefix = shared_tokens_len - cache_len
+    total_uncached_req = remaining_prefix + beam_width * suffix_kv_len
+    write_len = min(total_uncached_req, chunk_budget)
+
+    for i in range(num_reqs):
+        physical_slots = (
+            block_tables[i].to(torch.long).unsqueeze(-1) * block_size
+            + torch.arange(block_size, device=device)
+        ).view(-1)
+        req_slots = physical_slots[cache_len : cache_len + write_len]
+        q_start = i * chunk_budget
+        slot_mapping[q_start : q_start + write_len] = req_slots
+
     logits_soft_cap = soft_cap if soft_cap is not None else 0
     return BeamAttnInputs(
         query=query,
@@ -149,6 +178,7 @@ def prepare_inputs(
         fa_version=fa_version,
         shared_tokens_len=shared_tokens_len,
         suffix_kv_len=suffix_kv_len,
+        slot_mapping=slot_mapping,
     )
 
 
@@ -169,65 +199,29 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
         w = inputs.beam_width
         q_len = inputs.q_seq_len * inputs.beam_width
 
-        cache_len = prefix_len // inputs.block_size * inputs.block_size
-
-        # chunk_budget enforces the maximum number of new query tokens allowed in this iteration.
+        b_cache_len = prefix_len // inputs.block_size * inputs.block_size
         chunk_budget = q_len
-        # delta represents how many suffix tokens have already been cached across all beams
-        delta = max(0, cache_len - prefix_len)
 
         for b in range(w):
             # Stop processing if we run out of token budget for this chunk
             if chunk_budget <= 0:
                 break
 
-            b_uncached = 0
-            b_cache_len = 0
-            b_suffix_start = 0
-            b_suffix_len = 0
-
-            if prefix_len >= cache_len:
-                # Scenario A: Prefix Incomplete
-                remaining_prefix = prefix_len - cache_len
-                if b == 0:
-                    # Leader Beam computes the remaining shared prefix on behalf of all beams,
-                    # plus its own unique suffix tokens if there is leftover chunk budget.
-                    b_uncached = min(chunk_budget, remaining_prefix + steps)
-                    b_cache_len = cache_len
-                    b_suffix_start = cache_len
-                    b_suffix_len = b_uncached
-                    leader_suffix_len = b_suffix_len
-                else:
-                    # Follower Beams (1 to W-1) cannot compute shared prefix tokens.
-                    # They must wait until the prefix is fully resolved. They are only allowed
-                    # to compute their unique suffixes if the prefix finishes within this chunk.
-                    # if remaining_prefix <= q_len:
-                    b_uncached = min(chunk_budget, steps)
-                    b_cache_len = cache_len
-                    b_suffix_start = prefix_len + b * steps
-                    b_suffix_len = leader_suffix_len
-            else:
-                # Scenario B: Prefix Complete
-                past_suffix_b = max(0, min(steps, delta - b * steps))
-                remaining_suffix_b = steps - past_suffix_b
-                b_uncached = min(chunk_budget, remaining_suffix_b)
-                if b_uncached > 0:
-                    # Attend to the full shared prefix safely located in the cache.
-                    b_cache_len = prefix_len
-                    # Causal self-attention starts exactly where this beam's unique suffix begins.
-                    b_suffix_start = prefix_len + b * steps
-                    # Total suffix length includes past cached tokens + newly computed ones.
-                    b_suffix_len = past_suffix_b + b_uncached
+            b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+                b, prefix_len, b_cache_len, steps, chunk_budget
+            )
 
             # If there's no uncached tokens to compute for this beam, skip it
             if b_uncached <= 0:
                 continue
 
-            # Extract the shared prefix slice
-            prefix_k = k_seq[:b_cache_len]
-            prefix_v = v_seq[:b_cache_len]
+            prefix_k = k_seq[:prefix_len]
+            prefix_v = v_seq[:prefix_len]
+            if b_cache_len <= prefix_len:
+                b_suffix_start = b_cache_len
+            else:
+                b_suffix_start = prefix_len + b_physical * steps
 
-            # Extract the unique suffix slice for the current beam
             suffix_k = k_seq[b_suffix_start : b_suffix_start + b_suffix_len]
             suffix_v = v_seq[b_suffix_start : b_suffix_start + b_suffix_len]
 
@@ -242,6 +236,7 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
 
             # Deduct the processed tokens from the chunk budget
             chunk_budget -= b_uncached
+            b_cache_len += b_uncached
 
     k_tensor = torch.cat(dense_k, dim=0)
     v_tensor = torch.cat(dense_v, dim=0)
@@ -313,20 +308,19 @@ def run_cascade_beam_attention(
             self.num_actual_tokens = inputs.num_seqs * inputs.q_seq_len
             self.max_query_len = inputs.q_seq_len * inputs.beam_width
             self.max_seq_len = inputs.max_seq_len
-            self.slot_mapping = torch.empty(0)
             self.causal = True
+            self.slot_mapping = inputs.slot_mapping
 
     common_attn_metadata = MockCommonAttentionMetadata(inputs)
+
     mega_info: dict[str, Any] = {
         "mega_data": {},
         "req_ids": [f"req_{i}" for i in range(inputs.num_reqs)],
     }
-    print(
-        f"inputs.shared_tokens_len {inputs.shared_tokens_len}, cache={inputs.shared_tokens_len // inputs.block_size * inputs.block_size}"
-    )
 
+    mega_data = cast(dict[str, Any], mega_info["mega_data"])
     for i in range(inputs.num_reqs):
-        mega_info["mega_data"][f"req_{i}"] = {
+        mega_data[f"req_{i}"] = {
             "is_mega_decode": True,
             "prefix_len": inputs.shared_tokens_len,
             "mega_beam_width": inputs.beam_width,
@@ -345,6 +339,8 @@ def run_cascade_beam_attention(
         builder.use_full_cuda_graph = False
         builder.max_cudagraph_size = None
         builder.max_num_splits = 0
+        builder.num_heads_q = inputs.query.shape[1]
+        builder.num_heads_kv = inputs.num_kv_heads
 
         attn_metadata = builder.build(
             common_prefix_len=inputs.shared_tokens_len,
@@ -386,16 +382,16 @@ def run_cascade_beam_attention(
     return output
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore
-@pytest.mark.parametrize("beam_width", [16, 32])  # type: ignore
-@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)  # type: ignore
-@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore
-@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore
-@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore
-@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore
-@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore
-@torch.inference_mode()  # type: ignore
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+@pytest.mark.parametrize("beam_width", [16, 32])  # type: ignore[misc]
+@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)  # type: ignore[misc]
+@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore[misc]
+@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore[misc]
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore[misc]
+@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore[misc]
+@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore[misc]
+@torch.inference_mode()  # type: ignore[misc]
 def test_beam_cascade(
     batch_size: int,
     beam_width: int,
@@ -449,20 +445,20 @@ def test_beam_cascade(
     # Run beam attention
     output = run_cascade_beam_attention(inputs)
     # Compare the results.
-    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output, ref_output, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [8])  # type: ignore
-@pytest.mark.parametrize("beam_width", [16, 32, 128])  # type: ignore
-@pytest.mark.parametrize("seq_lens_and_common_prefix", [(8, 2048, 8)])  # type: ignore
-@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore
-@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore
-@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore
-@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore
-@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore
-@pytest.mark.parametrize("iter_num", [100])  # type: ignore
-@torch.inference_mode()  # type: ignore
+@pytest.mark.parametrize("batch_size", [8])  # type: ignore[misc]
+@pytest.mark.parametrize("beam_width", [16, 32, 128])  # type: ignore[misc]
+@pytest.mark.parametrize("seq_lens_and_common_prefix", [(8, 2048, 8)])  # type: ignore[misc]
+@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore[misc]
+@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore[misc]
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore[misc]
+@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore[misc]
+@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore[misc]
+@pytest.mark.parametrize("iter_num", [100])  # type: ignore[misc]
+@torch.inference_mode()  # type: ignore[misc]
 def test_beam_cascade_perf(
     batch_size: int,
     beam_width: int,

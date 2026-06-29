@@ -1,7 +1,7 @@
 import torch
 
 
-def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping, slot_mapping_out):
+def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping_out):
     """
     Pure PyTorch equivalent of the paged_kv_to_contig_suffix_kernel.
     Replaces indirect pointer math with vectorized advanced indexing.
@@ -9,14 +9,9 @@ def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping, slot_mapping_out):
     Args:
         k_cache: Tensor of shape [num_blocks, block_size, num_heads, head_dim]
         v_cache: Tensor of shape [num_blocks, block_size, num_heads, head_dim]
-        slot_mapping: Global slot allocation tensor
         slot_mapping_out: Indices indicating which slots to extract
     """
-    # 1. Replicate the indirect lookup: src_idx -> slot_idx
-    # In Triton: src_idx = tl.load(SLOT_MAPPING_OUT_PTR + pid_tok)
-    #            slot_idx = tl.load(SLOT_MAPPING_PTR + src_idx)
-    resolved_slots = slot_mapping[slot_mapping_out.long()]
- 
+   
     # 2. Collapse paged blocks [num_blocks, block_size, heads, dim]
     # into a flat token space [total_physical_slots, heads, dim]
     num_heads, head_dim = k_cache.shape[2], k_cache.shape[3]
@@ -24,8 +19,8 @@ def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping, slot_mapping_out):
     v_flat = v_cache.view(-1, num_heads, head_dim)
  
     # 3. Vectorized gather: Selects all matching token rows across all heads/dimensions
-    out_k = k_flat[resolved_slots]
-    out_v = v_flat[resolved_slots]
+    out_k = k_flat[slot_mapping_out]
+    out_v = v_flat[slot_mapping_out]
  
     return out_k, out_v
 
@@ -53,7 +48,7 @@ def merge_tnd_attention_outputs(
     w_total = w1 + w2                # [T, N, 1]
 
     # 3. Compute weighted attention sum - shapes align: [T, N, D] * [T, N, 1] broadcasts
-    normalized_out = (w1 * out1 + w2 * out2) / w_total
+    normalized_out = ((w1 * out1 + w2 * out2) / w_total).to(dtype=out1.dtype)
 
     # 4. Compute merged LSE
     normalized_lse = max_lse + torch.log(w_total)  # [T, N, 1]

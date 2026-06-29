@@ -67,60 +67,126 @@ from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     extract_suffix_kv_pytorch
 )
 
+from vllm_gr.v1.engine.engine_core_patch import _compute_beam_bounds
+
 logger = init_logger(__name__)
 MEGA_DATA_VAR = contextvars.ContextVar("mega_data", default=None)
 
 
-# ---------------------------------------------------------------------------
-# Pure-Torch KV Gather (works on NPU and CUDA)
-# ---------------------------------------------------------------------------
+# @triton.jit
+# def paged_kv_to_contig_suffix_kernel(
+#     K_CACHE_PTR,
+#     V_CACHE_PTR,
+#     SLOT_MAPPING_OUT_PTR,
+#     OUT_K_PTR,
+#     OUT_V_PTR,
+#     stride_kb,
+#     stride_kt,
+#     stride_kh,
+#     stride_kd,
+#     stride_vb,
+#     stride_vt,
+#     stride_vh,
+#     stride_vd,
+#     stride_ok_tok,
+#     stride_ok_h,
+#     stride_ok_d,
+#     stride_ov_tok,
+#     stride_ov_h,
+#     stride_ov_d,
+#     head_dim,
+#     BLOCK_SIZE: tl.constexpr,  # vLLM cache page block size (e.g., 16)
+#     BLOCK_SIZE_D: tl.constexpr,  # Next power of 2 greater than or equal to head_dim
+# ):
+#     pid_tok = tl.program_id(0)
+#     pid_h = tl.program_id(1)
+
+#     # 1. Fetch indirect layout indices safely
+#     slot_idx = tl.load(SLOT_MAPPING_OUT_PTR + pid_tok)
+
+#     # 2. Decompose global slot into robust paged coordinate structures
+#     block_id = slot_idx // BLOCK_SIZE
+#     block_offset = slot_idx % BLOCK_SIZE
+
+#     # 3. Create masked vector tracking offsets for head_dim
+#     d_offsets = tl.arange(0, BLOCK_SIZE_D)
+#     d_mask = d_offsets < head_dim
+
+#     # 4. Correct 4D paged coordinate jumping math
+#     k_ptrs = (
+#         K_CACHE_PTR
+#         + block_id * stride_kb
+#         + block_offset * stride_kt
+#         + pid_h * stride_kh
+#         + d_offsets * stride_kd
+#     )
+
+#     v_ptrs = (
+#         V_CACHE_PTR
+#         + block_id * stride_vb
+#         + block_offset * stride_vt
+#         + pid_h * stride_vh
+#         + d_offsets * stride_vd
+#     )
+
+#     # Load vectors with mask protection
+#     k = tl.load(k_ptrs, mask=d_mask, other=0.0)
+#     v = tl.load(v_ptrs, mask=d_mask, other=0.0)
+
+#     # 5. Continuous out-packing target calculation
+#     ok_ptrs = OUT_K_PTR + pid_tok * stride_ok_tok + pid_h * stride_ok_h + d_offsets * stride_ok_d
+#     ov_ptrs = OUT_V_PTR + pid_tok * stride_ov_tok + pid_h * stride_ov_h + d_offsets * stride_ov_d
+
+#     tl.store(ok_ptrs, k, mask=d_mask)
+#     tl.store(ov_ptrs, v, mask=d_mask)
 
 
-def extract_suffix_kv(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    slot_mapping_out: torch.Tensor,
-    out_token_num: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Gather contiguous K/V suffix tiles from the paged KV cache using torch.index_select,
-    which works identically on NPU and CUDA.
-    Input shapes:
-        k_cache: [num_blocks, block_size, num_kv_heads, head_dim]  (paged layout)
-        slot_mapping: [total_input_tokens]  - maps token -> block+offset in k_cache
-        slot_mapping_out: [out_token_num]   - desired output ordering
-        out_token_num: number of tokens to extract
-    Returns:
-        contig_k, contig_v:  [out_token_num, num_kv_heads, head_dim]
-    """
-    num_kv_heads = k_cache.shape[2]
-    head_dim = k_cache.shape[3]
+# # ---------------------------------------------------------------------------
+# # Python Launcher
+# # ---------------------------------------------------------------------------
+# def extract_suffix_kv(k_cache, v_cache, slot_mapping_out, out_token_num, block_size=16):
+#     nheads = k_cache.shape[2]
+#     head_dim = k_cache.shape[3]
 
-    # slot_mapping_out[i] gives the flat slot index in the paged cache.
-    # Convert flat slot to (block_idx, offset) using divmod.
-    block_size = k_cache.shape[1]  # block dimension from the paged cache
-    block_indices = slot_mapping_out // block_size
-    intra_block_offsets = slot_mapping_out % block_size
+#     # Calculate next power of 2 for Triton compiler stability
+#     block_size_d = 1 << (head_dim - 1).bit_length()
 
-    # Gather from k_cache: need to index by [block, offset, head, dim]
-    # Flat index into k_cache: block * block_size * num_kv_heads * head_dim
-    flat_idx = (
-        block_indices * block_size * num_kv_heads * head_dim
-        + intra_block_offsets.unsqueeze(-1) * num_kv_heads * head_dim
-        + torch.arange(num_kv_heads, device=k_cache.device, dtype=torch.long).unsqueeze(0)
-        * head_dim
-    )
-    # shape: [out_token_num, num_kv_heads * head_dim]
-    flat_idx = flat_idx + torch.arange(head_dim, device=k_cache.device, dtype=torch.long)
-    flat_idx = flat_idx.view(-1)  # [out_token_num * num_kv_heads * head_dim]
+#     out_k = torch.empty(
+#         (total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype
+#     )
+#     out_v = torch.empty(
+#         (total_tokens, nheads, head_dim), device=v_cache.device, dtype=v_cache.dtype
+#     )
+#     # shape: [out_token_num, num_kv_heads * head_dim]
+#     flat_idx = flat_idx + torch.arange(head_dim, device=k_cache.device, dtype=torch.long)
+#     flat_idx = flat_idx.view(-1)  # [out_token_num * num_kv_heads * head_dim]
 
-    k_flat = k_cache.permute(1, 2, 3, 0).contiguous().view(-1)  # [block_size * num_kv_heads * head_dim * num_blocks]
-    k_gathered = k_flat[flat_idx].view(out_token_num, num_kv_heads, head_dim)
-    v_flat = v_cache.permute(1, 2, 3, 0).contiguous().view(-1)
-    v_gathered = v_flat[flat_idx].view(out_token_num, num_kv_heads, head_dim)
-
-    return k_gathered, v_gathered
+#     grid = (total_tokens, nheads)
+#     paged_kv_to_contig_suffix_kernel[grid](
+#         k_cache,
+#         v_cache,
+#         slot_mapping_out,
+#         out_k,
+#         out_v,
+#         k_cache.stride(0),
+#         k_cache.stride(1),
+#         k_cache.stride(2),
+#         k_cache.stride(3),
+#         v_cache.stride(0),
+#         v_cache.stride(1),
+#         v_cache.stride(2),
+#         v_cache.stride(3),
+#         out_k.stride(0),
+#         out_k.stride(1),
+#         out_k.stride(2),
+#         out_v.stride(0),
+#         out_v.stride(1),
+#         out_v.stride(2),
+#         head_dim=head_dim,
+#         BLOCK_SIZE=block_size,
+#         BLOCK_SIZE_D=block_size_d,
+#     )
+#     return out_k, out_v
 
 
 # ---------------------------------------------------------------------------
@@ -275,46 +341,78 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             num_splits=max_num_splits,
         )
 
-    def _segment_requests(self, num_reqs: int, req_ids: list, mega_data: dict):
-        std_req_idxs = []
+    def _segment_requests(self, num_reqs: int, req_ids: list, mega_data: dict, q_starts: list):
+        std_reqs = []
         mega_req_idxs = []
         mega_prefix_lens = []
         mega_beam_widths = []
         mega_decode_steps = []
         mega_cache_lens = []
+        mega_q_start_offsets = []
 
         for i in range(num_reqs):
             req_id = req_ids[i] if i < len(req_ids) else None
             mdata = mega_data.get(req_id, {}) if req_id else {}
             if mdata.get("is_mega_decode", False):
                 mega_req_idxs.append(i)
-                mega_prefix_lens.append(mdata["prefix_len"])
+                prefix_len = mdata["prefix_len"]
+                cache_len = mdata["cache_len"]
+                delta = prefix_len - cache_len
+                q_offset = 0
+
+                # if prefix was cached out - run standard attention till prefix size
+                if delta > 0 and delta > self.block_size:
+                    q_len = q_starts[i + 1] - q_starts[i]
+                    std_q_len = min(delta, q_len)
+                    std_kv_len = cache_len + std_q_len
+
+                    cache_len = cache_len + std_q_len
+                    mdata["cache_len"] = cache_len
+                    std_reqs.append((i, std_q_len, std_kv_len))
+                    q_offset = std_q_len
+
+                mega_prefix_lens.append(prefix_len)
                 mega_beam_widths.append(mdata["mega_beam_width"])
                 mega_decode_steps.append(mdata["mega_decode_steps"])
-                mega_cache_lens.append(mdata.get("cache_len", mdata["prefix_len"]))
+                mega_cache_lens.append(cache_len)
+                mega_q_start_offsets.append(q_offset)
             else:
-                std_req_idxs.append(i)
+                std_reqs.append((i, None, None))
 
         return (
-            std_req_idxs,
+            std_reqs,
             mega_req_idxs,
             mega_prefix_lens,
             mega_beam_widths,
             mega_decode_steps,
             mega_cache_lens,
+            mega_q_start_offsets,
         )
 
-    def _build_std_mappings(self, std_req_idxs: list, q_starts: list):
+    def _build_std_mappings(self, std_reqs: list, q_starts: list):
         std_indices = []
         std_q_lens = []
+        std_kv_lens = []
+        std_req_idxs = []
 
-        for i in std_req_idxs:
-            q_start = q_starts[i]
-            q_end = q_starts[i + 1]
-            std_indices.extend(range(q_start, q_end))
-            std_q_lens.append(q_end - q_start)
+        for req_idx, std_q_len, std_kv_len in std_reqs:
+            q_start = q_starts[req_idx]
+            q_end = q_starts[req_idx + 1]
 
-        return std_indices, std_q_lens
+            if std_q_len is None:
+                q_len = q_end - q_start
+            else:
+                q_len = std_q_len
+
+            if q_len == 0:
+                continue
+
+            std_indices.extend(range(q_start, q_start + q_len))
+            std_q_lens.append(q_len)
+            std_kv_lens.append(std_kv_len)
+            std_req_idxs.append(req_idx)
+
+        return std_indices, std_q_lens, std_kv_lens, std_req_idxs
 
     def _build_mega_mappings(
         self,
@@ -323,6 +421,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         mega_beam_widths,
         mega_decode_steps,
         mega_cache_lens,
+        mega_q_start_offsets,
         q_starts,
         common_attn_metadata,
     ):
@@ -340,13 +439,18 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
         out_slot = 0
-        for req_idx, prefix_len, w, steps, cache_len in zip(
-            mega_req_idxs, mega_prefix_lens, mega_beam_widths, mega_decode_steps, mega_cache_lens
+        for req_idx, prefix_len, w, steps, cache_len, q_offset in zip(
+            mega_req_idxs,
+            mega_prefix_lens,
+            mega_beam_widths,
+            mega_decode_steps,
+            mega_cache_lens,
+            mega_q_start_offsets,
         ):
-            q_start = q_starts[req_idx]
+            q_start = q_starts[req_idx] + q_offset
             q_end = q_starts[req_idx + 1]
             q_len = q_end - q_start
-            if w == 0 or steps == 0:
+            if w == 0 or steps == 0 or q_len <= 0:
                 continue
 
             q_curr = q_start
@@ -355,48 +459,32 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             chunk_budget = q_len
             prefix_groups = []
 
-            remaining_prefix = prefix_len - cache_len
-            assert remaining_prefix >= 0, f"prefix_len: {prefix_len}, cache_len: {cache_len}"
-
-            shared_mapping = np.arange(out_slot, out_slot + remaining_prefix)
-            out_slot += remaining_prefix
+            b_prefix_len = prefix_len
+            b_cache_len = cache_len
             for b in range(w):
                 if chunk_budget <= 0:
                     break
 
-                b_uncached = 0
-                b_cache_len = 0
-                b_suffix_len = 0
+                b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+                    b, prefix_len, b_cache_len, steps, chunk_budget
+                )
+                full_mapping = np.arange(out_slot, out_slot + b_suffix_len, dtype=np.int32)
 
-                # Scenario A: Prefix Incomplete
-                if b == 0:
-                    b_uncached = min(chunk_budget, remaining_prefix + steps)
-                else:
-                    b_uncached = min(chunk_budget, steps)
-
-                b_cache_len = cache_len
-                b_suffix_len = remaining_prefix + steps
-
-                if b_uncached <= 0:
-                    continue
-
+                # Add beams to same prefix group
                 if prefix_groups:
                     prefix_groups[-1][1] += b_uncached
                 else:
-                    prefix_groups.append([q_curr, b_uncached, b_cache_len])
+                    prefix_groups.append([q_curr, b_uncached, b_prefix_len])
 
-                full_mapping = np.empty(remaining_prefix + steps, dtype=np.int32)
-                full_mapping[:remaining_prefix] = shared_mapping
-                full_mapping[remaining_prefix:] = np.arange(out_slot, out_slot + steps)
                 mega_suffix_slot_mapping_out_list.extend(full_mapping)
-
                 mega_suffix_q_lens.append(b_uncached)
                 mega_suffix_seq_lens_list.append(b_suffix_len)
 
+                b_cache_len += b_uncached
                 offset += b_suffix_len
                 q_curr += b_uncached
                 chunk_budget -= b_uncached
-                out_slot += steps
+                out_slot += b_uncached
 
             for group_q_start, group_q_len, group_cache_len in prefix_groups:
                 mega_prefix_indices.extend(range(group_q_start, group_q_start + group_q_len))
@@ -415,7 +503,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         )
 
     def _create_std_tensors(
-        self, std_indices, std_q_lens, std_req_idxs, common_attn_metadata, device
+        self, std_indices, std_q_lens, std_kv_lens, std_req_idxs, common_attn_metadata, device
     ):
         if std_q_lens:
             std_indices_tensor = torch.tensor(std_indices, dtype=torch.long, device=device)
@@ -424,9 +512,15 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 .cumsum(dim=0)
                 .to(torch.int32)
             )
-            std_seq_lens = common_attn_metadata.seq_lens[std_req_idxs]
+
+            std_seq_lens_list = [
+                common_attn_metadata.seq_lens[req_idx].item() if kv_len is None else kv_len
+                for req_idx, kv_len in zip(std_req_idxs, std_kv_lens)
+            ]
+            std_seq_lens = torch.tensor(std_seq_lens_list, dtype=torch.int32, device=device)
+
             std_max_q_len = max(std_q_lens)
-            std_max_seq_len = common_attn_metadata.max_seq_len
+            std_max_seq_len = max(std_seq_lens_list)
             std_block_table = common_attn_metadata.block_table_tensor[std_req_idxs].contiguous()
             return (
                 std_indices_tensor,
@@ -440,6 +534,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
     def _create_mega_tensors(
         self,
+        common_attn_metadata,
         mega_prefix_indices,
         mega_prefix_q_lens,
         mega_prefix_seq_lens_list,
@@ -475,7 +570,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_max_seq_len = (
                 max(mega_suffix_seq_lens_list) if mega_suffix_seq_lens_list else 0
             )
-            mega_suffix_total_tokens = sum(mega_suffix_seq_lens_list)
 
             mega_suffix_cu_seqlens_q = (
                 torch.tensor([0] + mega_suffix_q_lens, dtype=torch.int32, device=device)
@@ -489,9 +583,17 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             )
             mega_suffix_max_q_len = max(mega_suffix_q_lens) if mega_suffix_q_lens else 0
 
-            mega_suffix_slot_mapping_out = torch.tensor(
-                mega_suffix_slot_mapping_out_list, dtype=torch.int32, device=device
-            )
+            if mega_suffix_slot_mapping_out_list:
+                mega_suffix_total_tokens = len(mega_suffix_slot_mapping_out_list)
+                global_chunk_token_indices = [
+                    mega_prefix_indices[idx] for idx in mega_suffix_slot_mapping_out_list
+                ]
+                mega_suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
+                    global_chunk_token_indices
+                ].to(dtype=torch.int32, device=device)
+            else:
+                mega_suffix_total_tokens = 0
+                mega_suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
 
             prefix_scheduler_metadata = self._get_schedule(
                 batch_size=len(mega_prefix_q_lens),
@@ -542,23 +644,27 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self._update_aot_schedule(fast_build)
         max_num_splits = self._get_max_num_splits(common_attn_metadata.num_actual_tokens)
         device = self.device
+        block_size = self.block_size
         num_reqs = common_attn_metadata.num_reqs
         mega_info = MEGA_DATA_VAR.get()
         mega_data = mega_info["mega_data"] if mega_info else {}
         req_ids = mega_info["req_ids"] if mega_info else []
 
+        q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
+
         (
-            std_req_idxs,
+            std_reqs,
             mega_req_idxs,
             mega_prefix_lens,
             mega_beam_widths,
             mega_decode_steps,
             mega_cache_lens,
-        ) = self._segment_requests(num_reqs, req_ids, mega_data)
+            mega_q_start_offsets,
+        ) = self._segment_requests(num_reqs, req_ids, mega_data, q_starts)
 
-        q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
-
-        std_indices, std_q_lens = self._build_std_mappings(std_req_idxs, q_starts)
+        std_indices, std_q_lens, std_kv_lens, std_req_idxs = self._build_std_mappings(
+            std_reqs, q_starts
+        )
 
         # Host lists for the NPU paged FIA, built from CPU/Python data so the hot
         # path never calls .tolist() on a device tensor (which forces a sync).
@@ -584,6 +690,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_beam_widths,
             mega_decode_steps,
             mega_cache_lens,
+            mega_q_start_offsets,
             q_starts,
             common_attn_metadata,
         )
@@ -596,7 +703,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_max_seq_len,
             std_block_table,
         ) = self._create_std_tensors(
-            std_indices, std_q_lens, std_req_idxs, common_attn_metadata, device
+            std_indices, std_q_lens, std_kv_lens, std_req_idxs, common_attn_metadata, device
         )
 
         (
@@ -615,6 +722,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_max_q_len,
             prefix_scheduler_metadata,
         ) = self._create_mega_tensors(
+            common_attn_metadata,
             mega_prefix_indices,
             mega_prefix_q_lens,
             mega_prefix_seq_lens_list,
@@ -676,9 +784,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_actual_seq_lengths_q=mega_suffix_actual_seq_lengths_q,
             mega_suffix_actual_seq_lengths_kv=mega_suffix_actual_seq_lengths_kv,
             max_num_splits=max_num_splits,
-            block_size=self.block_size,
+            block_size=block_size,
             num_heads=self.num_heads_q,
-            num_kv_heads=self.num_heads_kv
+            num_kv_heads=self.num_heads_kv,
         )
         return meta
 
@@ -947,243 +1055,11 @@ class BeamAttentionImpl(AttentionImpl):
         # ─── NPU path ───────────────────────────────────────────────────────────
         import torch.nn.functional as F
 
-        num_heads = output.shape[1]
-        head_dim = output.shape[2]
-        num_kv_heads = key_cache.shape[2]
-
-        # todo: remove unused methods
-        '''
-        def _sdpa_attention(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            cu_seqlens_q: torch.Tensor,
-            seqused_k: torch.Tensor | None,
-            max_seqlen_q: int,
-            max_seqlen_k: int,
-            causal: bool,
-        ) -> torch.Tensor:
-            """
-            Run attention via F.scaled_dot_product_attention on NPU.
-            q/k/v: [T, N, D] or [T, num_kv_heads, D] (already selected)
-            cu_seqlens_q: cumulative seqlens for q
-            seqused_k: per-batch k/v lengths
-            """
-            # Reshape TND -> [B, N, S, D]
-            q_list, k_list, v_list = [], [], []
-            q_cu = cu_seqlens_q.tolist()
-            for i in range(len(q_cu) - 1):
-                start, end = q_cu[i], q_cu[i + 1]
-                q_list.append(q[start:end])  # [S_q, N, D]
-            if seqused_k is not None:
-                k_seqlens = seqused_k.tolist()
-            else:
-                k_seqlens = [max_seqlen_k] * len(q_list)
-            # Gather k/v from paged cache
-            block_size = key_cache.shape[1]
-            for b in range(len(q_list)):
-                q_b = q_list[b]  # [S_q, N, D]
-                S_k = k_seqlens[b]
-                # Gather k/v for this batch
-                bt = attn_metadata.block_table[b] if attn_metadata.block_table is not None else None
-                k_b = torch.zeros(S_k, num_kv_heads, head_dim, dtype=q.dtype, device=q.device)
-                v_b = torch.zeros(S_k, num_kv_heads, head_dim, dtype=q.dtype, device=q.device)
-                token_idx = 0
-                if bt is not None:
-                    for block_idx in bt:
-                        for offset in range(block_size):
-                            if token_idx >= S_k:
-                                break
-                            k_b[token_idx] = key_cache[block_idx, offset]
-                            v_b[token_idx] = value_cache[block_idx, offset]
-                            token_idx += 1
-                else:
-                    for t in range(S_k):
-                        k_b[t] = key_cache[t // block_size, t % block_size]
-                        v_b[t] = value_cache[t // block_size, t % block_size]
-                k_list.append(k_b)
-                v_list.append(v_b)
-            # Pad to max lengths
-            max_q = max(x.shape[0] for x in q_list) if q_list else 0
-            max_k = max(x.shape[0] for x in k_list) if k_list else 0
-            q_padded = torch.zeros(len(q_list), num_heads, max_q, head_dim, dtype=q.dtype, device=q.device)
-            k_padded = torch.zeros(len(k_list), num_kv_heads, max_k, head_dim, dtype=q.dtype, device=q.device)
-            v_padded = torch.zeros(len(k_list), num_kv_heads, max_k, head_dim, dtype=q.dtype, device=q.device)
-            for b in range(len(q_list)):
-                # q/k/v are [S, N, D] but padded tensors are [B, N, S, D]
-                q_padded[b, :, :q_list[b].shape[0]] = q_list[b].transpose(0, 1)  # [S, N, D] -> [N, S, D]
-                k_padded[b, :, :k_list[b].shape[0]] = k_list[b].transpose(0, 1)  # [S, N_kv, D] -> [N_kv, S, D]
-                v_padded[b, :, :v_list[b].shape[0]] = v_list[b].transpose(0, 1)  # [S, N_kv, D] -> [N_kv, S, D]
-            # Expand q heads for GQA by repeating k/v heads to match q heads
-            if num_heads != num_kv_heads:
-                H_q = num_heads // num_kv_heads
-                # Repeat k/v heads H_q times so they match q heads: [B, N_kv, S, D] -> [B, N_q, S, D]
-                k_padded = k_padded.repeat_interleave(H_q, dim=1)
-                v_padded = v_padded.repeat_interleave(H_q, dim=1)
-                logger.debug(
-                    "[beam_attn NPU] _sdpa_attention GQA: H_q=%d, q_padded=%s, k_padded=%s, v_padded=%s",
-                    H_q, q_padded.shape, k_padded.shape, v_padded.shape
-                )
-            # For now, use the first S_q tokens for each batch
-            out = F.scaled_dot_product_attention(
-                q_padded, k_padded, v_padded, is_causal=causal
-            )
-            logger.debug(
-                "[beam_attn NPU] _sdpa_attention: out shape=%s (should be [B, N, S, D] or [B, N_kv, S, H_q*D] for GQA)",
-                out.shape
-            )
-            # Extract back
-            result = torch.zeros_like(q)
-            offset = 0
-            for b in range(len(q_list)):
-                sq = q_list[b].shape[0]
-                # SDPA output is [B, N, S, D]
-                # Reshape to [sq, num_heads, head_dim]
-                out_b = out[b, :, :sq].permute(1, 0, 2).reshape(sq, num_heads, head_dim)
-                end = offset + sq
-                result[offset:end] = out_b
-                offset = end
-            logger.debug("[beam_attn NPU] _sdpa_attention: result range [%s, %s]", float(result.min()), float(result.max()))
-            return result
-
-        def _sdpa_attention_prefix(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            cu_seqlens_q: torch.Tensor,
-            seq_lens_k: torch.Tensor,
-            max_seqlen_q: int,
-            max_seqlen_k: int,
-            block_table: torch.Tensor | None,
-        ) -> torch.Tensor:
-            """
-            Prefix attention for mega path on NPU.
-            k/v are already the full KV cache (from block_table indexing).
-            q: [T, N, D], k/v: [T, num_kv_heads, D]
-            """
-            block_size = key_cache.shape[1]
-            q_cu = cu_seqlens_q.tolist()
-            seq_lens_k_list = seq_lens_k.tolist() if seq_lens_k is not None else [max_seqlen_k] * len(q_cu)
-            # Gather full k/v for each batch item using block table
-            k_packed, v_packed = [], []
-            for b in range(len(q_cu) - 1):
-                seq_k = seq_lens_k_list[b]
-                k_b = torch.zeros(seq_k, num_kv_heads, head_dim, dtype=q.dtype, device=q.device)
-                v_b = torch.zeros(seq_k, num_kv_heads, head_dim, dtype=q.dtype, device=q.device)
-                bt = block_table[b] if block_table is not None else None
-                for t in range(seq_k):
-                    slot = t
-                    if bt is not None:
-                        block_idx = slot // block_size
-                        offset = slot % block_size
-                        slot = bt[block_idx].item() * block_size + offset
-                    b_idx, off = divmod(slot, block_size)
-                    k_b[t] = key_cache[b_idx, off]
-                    v_b[t] = value_cache[b_idx, off]
-                k_packed.append(k_b)
-                v_packed.append(v_b)
-            max_k = max(x.shape[0] for x in k_packed) if k_packed else 0
-            max_q = max(q_cu[i + 1] - q_cu[i] for i in range(len(q_cu) - 1)) if q_cu else 0
-            q_padded = torch.zeros(len(k_packed), num_heads, max_q, head_dim, dtype=q.dtype, device=q.device)
-            k_padded = torch.zeros(len(k_packed), num_kv_heads, max_k, head_dim, dtype=q.dtype, device=q.device)
-            v_padded = torch.zeros(len(k_packed), num_kv_heads, max_k, head_dim, dtype=q.dtype, device=q.device)
-            for b in range(len(k_packed)):
-                sq = q_cu[b + 1] - q_cu[b]
-                q_slice = q[q_cu[b]:q_cu[b + 1]].permute(1, 0, 2)  # [num_heads, sq, head_dim]
-                q_padded[b, :, :sq] = q_slice
-                k_padded[b, :, :k_packed[b].shape[0]] = k_packed[b]
-                v_padded[b, :, :v_packed[b].shape[0]] = v_packed[b]
-            if num_heads != num_kv_heads:
-                # For GQA: reshape from [B, N_q, S, D] -> [B, N_kv, H_q, S, D] -> [B, N_kv, S, H_q, D] -> [B, N_kv, S, H_q*D]
-                H_q = num_heads // num_kv_heads
-                q_padded = q_padded.view(len(k_packed), num_kv_heads, H_q, max_q, head_dim)
-                q_padded = q_padded.permute(0, 1, 3, 2, 4).reshape(len(k_packed), num_kv_heads, max_q, H_q * head_dim)
-                logger.debug(
-                    "[beam_attn NPU] GQA: H_q=%d, q_padded shape=%s, k_padded shape=%s",
-                    H_q, q_padded.shape, k_padded.shape
-                )
-            logger.debug("[beam_attn NPU] _sdpa_attention_prefix: q_padded=%s, k_padded=%s, out_before_reshape=%s",
-                q_padded.shape, k_padded.shape, out.shape if 'out' in dir() else 'N/A')
-            out = F.scaled_dot_product_attention(q_padded, k_padded, v_padded, is_causal=False)
-            logger.debug("[beam_attn NPU] _sdpa_attention_prefix: out shape=%s", out.shape)
-            result = torch.zeros_like(q)
-            offset = 0
-            for b in range(len(k_packed)):
-                sq = q_cu[b + 1] - q_cu[b]
-                if num_heads == num_kv_heads:
-                    out_b = out[b, :, :sq].permute(1, 0, 2).reshape(sq, num_heads, head_dim)
-                else:
-                    # GQA: out is [B, N_kv, S, H_q*D]
-                    # Reshape [N_kv, sq, H_q*D] -> [sq, N_kv, H_q, D] -> [sq, N_q, D]
-                    H_q = num_heads // num_kv_heads
-                    out_b = out[b, :, :sq]  # [N_kv, sq, H_q*D]
-                    out_b = out_b.permute(1, 0, 2)  # [sq, N_kv, H_q*D]
-                    out_b = out_b.reshape(sq, num_kv_heads, H_q, head_dim)  # [sq, N_kv, H_q, D]
-                    out_b = out_b.reshape(sq, num_heads, head_dim)  # [sq, N_q, D]
-                result[offset:offset + sq] = out_b
-                offset += sq
-            return result
-        '''
-
-
-        # DEBUG
-        logger.debug(
-            "[beam_attn NPU] std_indices=%s, mega_prefix_indices=%s, "
-            "mega_suffix_total=%s, num_heads=%d, num_kv_heads=%d, head_dim=%d, query shape=%s",
-            attn_metadata.std_indices.shape if attn_metadata.std_indices is not None else None,
-            attn_metadata.mega_prefix_indices.shape if attn_metadata.mega_prefix_indices is not None else None,
-            attn_metadata.mega_suffix_total_tokens,
-            num_heads, num_kv_heads, head_dim, query.shape,
-        )
-        if attn_metadata.std_indices is not None:
-            logger.debug(
-                "[beam_attn NPU] std actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, block_table=%s",
-                attn_metadata.std_actual_seq_lengths_q,
-                attn_metadata.std_actual_seq_lengths_kv,
-                attn_metadata.std_block_table.shape if attn_metadata.std_block_table is not None else None,
-            )
-        if attn_metadata.mega_prefix_indices is not None:
-            logger.debug(
-                "[beam_attn NPU] mega actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, block_table shape=%s",
-                attn_metadata.mega_prefix_actual_seq_lengths_q,
-                attn_metadata.mega_prefix_actual_seq_lengths_kv,
-                attn_metadata.mega_prefix_block_table.shape if attn_metadata.mega_prefix_block_table is not None else None,
-            )
-            logger.debug(
-                "[beam_attn NPU] mega_prefix_indices[:20]=%s",
-                attn_metadata.mega_prefix_indices[:20].tolist()
-                if attn_metadata.mega_prefix_indices is not None else None,
-            )
-            logger.debug(
-                "[beam_attn NPU] mega_suffix actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, total_tokens=%d",
-                attn_metadata.mega_suffix_actual_seq_lengths_q,
-                attn_metadata.mega_suffix_actual_seq_lengths_kv,
-                attn_metadata.mega_suffix_total_tokens,
-            )
-            logger.debug(
-                "[beam_attn NPU] mega_suffix_slot_mapping_out[:20]=%s",
-                attn_metadata.mega_suffix_slot_mapping_out[:20].tolist()
-                if attn_metadata.mega_suffix_slot_mapping_out is not None else None,
-            )
-            logger.debug(
-                "[beam_attn NPU] mega_prefix_block_table[:3, :8]=%s",
-                attn_metadata.mega_prefix_block_table[:3, :8].tolist()
-                if attn_metadata.mega_prefix_block_table is not None else None,
-            )
-
         # Standard attention
         if attn_metadata.std_indices is not None:
             std_query = query[attn_metadata.std_indices]
 
-            # Standard requests need causal masking for (chunked) prefill; the
-            # GPU path passes causal=attn_metadata.causal. Single-token decode is
-            # unaffected either way, but multi-token prefill must be causal.
             std_causal = bool(attn_metadata.causal)
-
-            # Paged attention via the v1 FIA op (npu_fused_infer_attention_score).
-            # NOTE: the v2 op returns zeros in paged mode on this CANN version;
-            # the v1 op pages correctly (it is vllm_ascend's main attention path).
-            # actual_seq_lengths_* are pre-built host lists (no device sync).
             std_out, _ = torch_npu.npu_fused_infer_attention_score(
                 query=std_query,
                 key=key_cache.view(*key_cache.shape[:-2], -1),
@@ -1197,22 +1073,13 @@ class BeamAttentionImpl(AttentionImpl):
                 num_key_value_heads=attn_metadata.num_kv_heads,
                 num_heads=attn_metadata.num_heads,
                 scale=scale,
-                sparse_mode=3 if std_causal else 0,
+                sparse_mode=3 if attn_metadata.causal else 0,
             )
-
-            # v1 op may return [T, num_heads*head_dim]; view back to [T, N, D].
             output[attn_metadata.std_indices] = std_out
 
         # Mega attention
         if attn_metadata.mega_prefix_indices is not None:
             mega_query = query[attn_metadata.mega_prefix_indices]
-            logger.debug(
-                "[beam_attn NPU] mega_query shape=%s, key_cache shape=%s",
-                mega_query.shape, key_cache.shape
-            )
-
-            # Paged prefix attention via the v1 FIA op (npu_fused_infer_attention_score)
-            # using the prefix block table directly (no copy needed).
             mega_prefix_out, mega_prefix_lse = torch_npu.npu_fused_infer_attention_score(
                 query=mega_query,
                 key=key_cache.view(*key_cache.shape[:-2], -1),
@@ -1229,31 +1096,12 @@ class BeamAttentionImpl(AttentionImpl):
                 softmax_lse_flag=True,
                 sparse_mode=0,  # prefix attention is non-causal (full)
             )
-
-            logger.debug(
-                "[beam_attn NPU] mega_prefix_out shape=%s, range [%.6f, %.6f], mega_suffix_total=%d",
-                mega_prefix_out.shape, float(mega_prefix_out.min()), float(mega_prefix_out.max()),
-                attn_metadata.mega_suffix_total_tokens
-            )
-
             if attn_metadata.mega_suffix_total_tokens > 0:
-                slot_mapping = attn_metadata.slot_mapping[attn_metadata.mega_prefix_indices]
-                logger.debug(
-                    "[beam_attn NPU] slot_mapping[:20]=%s, mega_suffix_slot_out[:20]=%s",
-                    slot_mapping[:20].tolist(),
-                    attn_metadata.mega_suffix_slot_mapping_out[:20].tolist(),
-                )
                 contig_k, contig_v = extract_suffix_kv_pytorch(
                     key_cache,
                     value_cache,
-                    slot_mapping,
                     attn_metadata.mega_suffix_slot_mapping_out
                 )
-                logger.debug(
-                    "[beam_attn NPU] contig_k shape=%s, contig_v shape=%s",
-                    contig_k.shape, contig_v.shape
-                )
-
                 mega_suffix_out, mega_suffix_lse = torch_npu.npu_fused_infer_attention_score(
                     query=mega_query,
                     key=contig_k,
@@ -1270,31 +1118,12 @@ class BeamAttentionImpl(AttentionImpl):
                     softmax_lse_flag=True,
                     sparse_mode=3,
                 )
-
-                logger.debug(
-                    "[beam_attn NPU] mega_suffix_out shape=%s, range [%.6f, %.6f]",
-                    mega_suffix_out.shape, float(mega_suffix_out.min()), float(mega_suffix_out.max())
-                )
-                # NPU FIA returns LSE in TND layout [T, N, 1], so use the TND
-                # merge (merge_attn_states_pytorch expects the flash 2-D
-                # [num_heads, total_q] convention used on the GPU path).
                 mega_out, _ = merge_tnd_attention_outputs(
                     mega_prefix_out, mega_prefix_lse, mega_suffix_out, mega_suffix_lse
                 )
-
-                logger.debug(
-                    "[beam_attn NPU] merged mega_out range [%.6f, %.6f]",
-                    float(mega_out.min()), float(mega_out.max())
-                )
-                logger.debug(
-                    "[beam_attn NPU] merged_out range [%s, %s]",
-                    float(mega_out.min()), float(mega_out.max())
-                )
-                # The TND merge / FIA-with-LSE path produces fp32; cast back to
-                # the output dtype (e.g. bf16) before the in-place index_put.
-                output[attn_metadata.mega_prefix_indices] = mega_out.to(output.dtype)
+                output[attn_metadata.mega_prefix_indices] = mega_out
             else:
-                output[attn_metadata.mega_prefix_indices] = mega_prefix_out.to(output.dtype)
+                output[attn_metadata.mega_prefix_indices] = mega_prefix_out
 
     def forward(
         self,
