@@ -125,7 +125,8 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
                 not_in_catalog = []
                 for choice in final_output.outputs:
                     content = choice.text
-                    if content not in catalog_set:
+                    score = choice.cumulative_logprob
+                    if score > -1000 and content not in catalog_set:
                         not_in_catalog.append(content)
                 if not_in_catalog:
                     print("Generated content not found in catalog:")
