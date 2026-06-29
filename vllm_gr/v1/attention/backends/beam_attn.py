@@ -832,46 +832,46 @@ class BeamAttentionImpl(AttentionImpl):
                     s_aux=s_aux,
                 )
 
-            if attn_metadata.mega_suffix_total_tokens > 0:
-                contig_k, contig_v = extract_suffix_kv(
-                    key_cache,
-                    value_cache,
-                    attn_metadata.mega_suffix_slot_mapping_out,
-                    attn_metadata.mega_suffix_total_tokens,
-                    attn_metadata.block_size,
-                )
-
-                mega_suffix_out, mega_suffix_lse = flash_attn_varlen_func(
-                    q=mega_query,
-                    k=contig_k,
-                    v=contig_v,
-                    cu_seqlens_q=attn_metadata.mega_suffix_cu_seqlens_q,
-                    cu_seqlens_k=attn_metadata.mega_suffix_cu_seqlens_k,
-                    seqused_k=None,
-                    max_seqlen_q=attn_metadata.mega_suffix_max_q_len,
-                    max_seqlen_k=attn_metadata.mega_suffix_max_seq_len,
-                    softmax_scale=scale,
-                    causal=True,
-                    alibi_slopes=alibi_slopes,
-                    window_size=sliding_window_size,
-                    block_table=None,
-                    softcap=logits_soft_cap,
-                    return_softmax_lse=True,
-                    fa_version=vllm_flash_attn_version,
-                )
-
-                group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
-                if (
-                    attn_metadata.mega_suffix_max_q_len == 1
-                    and attn_metadata.mega_suffix_max_seq_len == 1
-                    and group_size > 1
-                ):
-                    mega_suffix_lse = (
-                        mega_suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
-                        .transpose(1, 2)
-                        .contiguous()
-                        .view(attn_metadata.num_heads, -1)
+                if attn_metadata.mega_suffix_total_tokens > 0:
+                    contig_k, contig_v = extract_suffix_kv(
+                        key_cache,
+                        value_cache,
+                        attn_metadata.mega_suffix_slot_mapping_out,
+                        attn_metadata.mega_suffix_total_tokens,
+                        attn_metadata.block_size,
                     )
+
+                    mega_suffix_out, mega_suffix_lse = flash_attn_varlen_func(
+                        q=mega_query,
+                        k=contig_k,
+                        v=contig_v,
+                        cu_seqlens_q=attn_metadata.mega_suffix_cu_seqlens_q,
+                        cu_seqlens_k=attn_metadata.mega_suffix_cu_seqlens_k,
+                        seqused_k=None,
+                        max_seqlen_q=attn_metadata.mega_suffix_max_q_len,
+                        max_seqlen_k=attn_metadata.mega_suffix_max_seq_len,
+                        softmax_scale=scale,
+                        causal=True,
+                        alibi_slopes=alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=None,
+                        softcap=logits_soft_cap,
+                        return_softmax_lse=True,
+                        fa_version=vllm_flash_attn_version
+                    )
+                    group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
+                    if (
+                        attn_metadata.mega_suffix_max_q_len == 1
+                        and attn_metadata.mega_suffix_max_seq_len == 1
+                        and group_size > 1
+                        and not vllm_flash_attn_version == 3
+                    ):
+                        mega_suffix_lse = (
+                            mega_suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
+                            .transpose(1, 2)
+                            .contiguous()
+                            .view(attn_metadata.num_heads, -1)
+                        )
 
                     mega_out = torch.empty_like(mega_query)
                     merge_attn_states(
