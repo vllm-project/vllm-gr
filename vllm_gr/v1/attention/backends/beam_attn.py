@@ -790,12 +790,10 @@ class BeamAttentionImpl(AttentionImpl):
         if CUDA_DEVICE and not NPU_DEVICE:
             if attn_metadata.std_indices is not None:
                 std_query = query[attn_metadata.std_indices]
-                std_out = torch.empty_like(std_query)
-                flash_attn_varlen_func(
+                std_out = flash_attn_varlen_func(
                     q=std_query,
                     k=key_cache,
                     v=value_cache,
-                    out=std_out,
                     cu_seqlens_q=attn_metadata.std_cu_seqlens_q,
                     max_seqlen_q=attn_metadata.std_max_q_len,
                     seqused_k=attn_metadata.std_seq_lens,
