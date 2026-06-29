@@ -31,6 +31,10 @@ CUDA_DEVICE = is_cuda_available()
 
 if NPU_DEVICE:
     import torch_npu  # noqa: F401
+if CUDA_DEVICE:
+    from vllm_gr.v1.attention.backends.beam_attn_triton import (
+    extract_suffix_kv,
+)
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -73,120 +77,7 @@ logger = init_logger(__name__)
 MEGA_DATA_VAR = contextvars.ContextVar("mega_data", default=None)
 
 
-# @triton.jit
-# def paged_kv_to_contig_suffix_kernel(
-#     K_CACHE_PTR,
-#     V_CACHE_PTR,
-#     SLOT_MAPPING_OUT_PTR,
-#     OUT_K_PTR,
-#     OUT_V_PTR,
-#     stride_kb,
-#     stride_kt,
-#     stride_kh,
-#     stride_kd,
-#     stride_vb,
-#     stride_vt,
-#     stride_vh,
-#     stride_vd,
-#     stride_ok_tok,
-#     stride_ok_h,
-#     stride_ok_d,
-#     stride_ov_tok,
-#     stride_ov_h,
-#     stride_ov_d,
-#     head_dim,
-#     BLOCK_SIZE: tl.constexpr,  # vLLM cache page block size (e.g., 16)
-#     BLOCK_SIZE_D: tl.constexpr,  # Next power of 2 greater than or equal to head_dim
-# ):
-#     pid_tok = tl.program_id(0)
-#     pid_h = tl.program_id(1)
 
-#     # 1. Fetch indirect layout indices safely
-#     slot_idx = tl.load(SLOT_MAPPING_OUT_PTR + pid_tok)
-
-#     # 2. Decompose global slot into robust paged coordinate structures
-#     block_id = slot_idx // BLOCK_SIZE
-#     block_offset = slot_idx % BLOCK_SIZE
-
-#     # 3. Create masked vector tracking offsets for head_dim
-#     d_offsets = tl.arange(0, BLOCK_SIZE_D)
-#     d_mask = d_offsets < head_dim
-
-#     # 4. Correct 4D paged coordinate jumping math
-#     k_ptrs = (
-#         K_CACHE_PTR
-#         + block_id * stride_kb
-#         + block_offset * stride_kt
-#         + pid_h * stride_kh
-#         + d_offsets * stride_kd
-#     )
-
-#     v_ptrs = (
-#         V_CACHE_PTR
-#         + block_id * stride_vb
-#         + block_offset * stride_vt
-#         + pid_h * stride_vh
-#         + d_offsets * stride_vd
-#     )
-
-#     # Load vectors with mask protection
-#     k = tl.load(k_ptrs, mask=d_mask, other=0.0)
-#     v = tl.load(v_ptrs, mask=d_mask, other=0.0)
-
-#     # 5. Continuous out-packing target calculation
-#     ok_ptrs = OUT_K_PTR + pid_tok * stride_ok_tok + pid_h * stride_ok_h + d_offsets * stride_ok_d
-#     ov_ptrs = OUT_V_PTR + pid_tok * stride_ov_tok + pid_h * stride_ov_h + d_offsets * stride_ov_d
-
-#     tl.store(ok_ptrs, k, mask=d_mask)
-#     tl.store(ov_ptrs, v, mask=d_mask)
-
-
-# # ---------------------------------------------------------------------------
-# # Python Launcher
-# # ---------------------------------------------------------------------------
-# def extract_suffix_kv(k_cache, v_cache, slot_mapping_out, out_token_num, block_size=16):
-#     nheads = k_cache.shape[2]
-#     head_dim = k_cache.shape[3]
-
-#     # Calculate next power of 2 for Triton compiler stability
-#     block_size_d = 1 << (head_dim - 1).bit_length()
-
-#     out_k = torch.empty(
-#         (total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype
-#     )
-#     out_v = torch.empty(
-#         (total_tokens, nheads, head_dim), device=v_cache.device, dtype=v_cache.dtype
-#     )
-#     # shape: [out_token_num, num_kv_heads * head_dim]
-#     flat_idx = flat_idx + torch.arange(head_dim, device=k_cache.device, dtype=torch.long)
-#     flat_idx = flat_idx.view(-1)  # [out_token_num * num_kv_heads * head_dim]
-
-#     grid = (total_tokens, nheads)
-#     paged_kv_to_contig_suffix_kernel[grid](
-#         k_cache,
-#         v_cache,
-#         slot_mapping_out,
-#         out_k,
-#         out_v,
-#         k_cache.stride(0),
-#         k_cache.stride(1),
-#         k_cache.stride(2),
-#         k_cache.stride(3),
-#         v_cache.stride(0),
-#         v_cache.stride(1),
-#         v_cache.stride(2),
-#         v_cache.stride(3),
-#         out_k.stride(0),
-#         out_k.stride(1),
-#         out_k.stride(2),
-#         out_v.stride(0),
-#         out_v.stride(1),
-#         out_v.stride(2),
-#         head_dim=head_dim,
-#         BLOCK_SIZE=block_size,
-#         BLOCK_SIZE_D=block_size_d,
-#     )
-#     return out_k, out_v
 
 
 # ---------------------------------------------------------------------------
@@ -639,8 +530,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> BeamAttentionMetadata:
-        if CUDA_DEVICE:
-            torch.cuda.nvtx.range_push("BeamAttentionMetadataBuilder.build")
+        
         self._update_aot_schedule(fast_build)
         max_num_splits = self._get_max_num_splits(common_attn_metadata.num_actual_tokens)
         device = self.device
@@ -744,10 +634,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         mega_suffix_actual_seq_lengths_kv = None
         if NPU_DEVICE and mega_suffix_q_lens:
             mega_suffix_actual_seq_lengths_q = np.cumsum(mega_suffix_q_lens).tolist()
-            mega_suffix_actual_seq_lengths_kv = np.cumsum(mega_suffix_seq_lens_list).tolist()# list(mega_suffix_seq_lens_list)
+            mega_suffix_actual_seq_lengths_kv = np.cumsum(mega_suffix_seq_lens_list).tolist()
 
-        if CUDA_DEVICE:
-            torch.cuda.nvtx.range_pop()
         meta = BeamAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -885,73 +773,6 @@ class BeamAttentionImpl(AttentionImpl):
         self.use_cascade = True
 
     @staticmethod
-    def _npu_std_attention(
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        attn_metadata: BeamAttentionMetadata,
-        scale: float,
-        num_heads: int,
-    ) -> torch.Tensor:
-        """
-        NPU path for standard (non-mega) attention using npu_incre_flash_attention.
-        query: [total_tokens, num_heads, head_dim]
-        key_cache: [num_blocks, block_size, num_kv_heads, head_dim]  (paged)
-        value_cache: same layout
-        Returns: [total_tokens, num_heads, head_dim]
-        """
-        import torch.nn.functional as F
-
-        seq_lens = attn_metadata.std_seq_lens  # [batch_size]
-        max_seq_len_k = attn_metadata.std_max_seq_len
-        num_kv_heads = key_cache.shape[2]
-        head_dim = key_cache.shape[3]
-        num_q_per_kv = num_heads // num_kv_heads
-
-        # Rebuild q/k/v in BSH layout for npu_incre_flash_attention
-        # query in TND -> BSH: need to re-compute q from the original query tensor
-        # We don't have the original k/v packed, so we do a simpler approach:
-        # reshape directly using the token mapping
-        block_size = key_cache.shape[1]
-        block_table = attn_metadata.std_block_table  # [batch, max_blocks]
-
-        # For std attention with varlen, we can use SDPA as fallback
-        # Since key_cache is paged, we need to first gather it
-        total_q = query.shape[0]
-
-        # Reshape query from TND to BSH
-        q_bsh = query.permute(1, 0, 2).contiguous()  # [num_heads, total_tokens, head_dim] -> [num_heads, total_tokens, head_dim]
-        # Actually: [T, N, D] -> [N, T, D], then reshape to [B, S, N*D]
-        batch_size = seq_lens.shape[0]
-        # Reconstruct batch dimension from cu_seqlens
-        cu_seqlens = attn_metadata.std_cu_seqlens_q.tolist()
-        q_bsh_list = []
-        for i in range(len(cu_seqlens) - 1):
-            start, end = cu_seqlens[i], cu_seqlens[i + 1]
-            q_bsh_list.append(q_bsh[:, start:end, :])  # [N, seq_len, D]
-        max_q_len = max(cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1))
-        pad_q = torch.zeros(
-            batch_size, max_q_len, num_heads * head_dim,
-            dtype=q_bsh.dtype, device=q_bsh.device
-        )
-        for b, chunk in enumerate(q_bsh_list):
-            pad_q[b, :chunk.shape[1]] = chunk.view(num_heads, -1, head_dim).permute(1, 0, 2).reshape(max_q_len, num_heads * head_dim)[:, :chunk.shape[1] * head_dim]
-
-        # Gather k/v from paged cache
-        k_bsh = torch.zeros(batch_size, max_seq_len_k, num_kv_heads * head_dim, dtype=query.dtype, device=query.device)
-        v_bsh = torch.zeros(batch_size, max_seq_len_k, num_kv_heads * head_dim, dtype=query.dtype, device=query.device)
-
-        # Actually this is getting complex. Let's just use SDPA which handles paged attention natively
-        # Reshape query for SDPA: [T, N, D] -> [B, N, S, D]
-        q_for_sdpa_list = []
-        for i in range(len(cu_seqlens) - 1):
-            start, end = cu_seqlens[i], cu_seqlens[i + 1]
-            q_for_sdpa_list.append(query[start:end])
-        # SDPA needs [B, N, S, D] - but we don't have separate k/v in same shape
-        # Use simple approach: gather full k/v from cache
-        return torch.empty_like(query)
-
-    @staticmethod
     def cascade_attention(
         output: torch.Tensor,
         query: torch.Tensor,
@@ -991,7 +812,7 @@ class BeamAttentionImpl(AttentionImpl):
 
             if attn_metadata.mega_prefix_indices is not None:
                 mega_query = query[attn_metadata.mega_prefix_indices]
-                slot_mapping = attn_metadata.slot_mapping[attn_metadata.mega_prefix_indices]
+
                 mega_prefix_out, mega_prefix_lse = flash_attn_varlen_func(
                     q=mega_query,
                     k=key_cache,
@@ -1013,34 +834,45 @@ class BeamAttentionImpl(AttentionImpl):
                     s_aux=s_aux,
                 )
 
+            if attn_metadata.mega_suffix_total_tokens > 0:
                 contig_k, contig_v = extract_suffix_kv(
                     key_cache,
                     value_cache,
-                    slot_mapping,
                     attn_metadata.mega_suffix_slot_mapping_out,
                     attn_metadata.mega_suffix_total_tokens,
+                    attn_metadata.block_size,
                 )
 
-                if attn_metadata.mega_suffix_total_tokens > 0:
-                    mega_suffix_out = torch.empty_like(mega_query)
-                    mega_suffix_out, mega_suffix_lse = flash_attn_varlen_func(
-                        q=mega_query,
-                        k=contig_k,
-                        v=contig_v,
-                        out=mega_suffix_out,
-                        cu_seqlens_q=attn_metadata.mega_suffix_cu_seqlens_q,
-                        cu_seqlens_k=attn_metadata.mega_suffix_cu_seqlens_k,
-                        seqused_k=None,
-                        max_seqlen_q=attn_metadata.mega_suffix_max_q_len,
-                        max_seqlen_k=attn_metadata.mega_suffix_max_seq_len,
-                        softmax_scale=scale,
-                        causal=True,
-                        alibi_slopes=alibi_slopes,
-                        window_size=sliding_window_size,
-                        block_table=None,
-                        softcap=logits_soft_cap,
-                        return_softmax_lse=True,
-                        fa_version=vllm_flash_attn_version,
+                mega_suffix_out, mega_suffix_lse = flash_attn_varlen_func(
+                    q=mega_query,
+                    k=contig_k,
+                    v=contig_v,
+                    cu_seqlens_q=attn_metadata.mega_suffix_cu_seqlens_q,
+                    cu_seqlens_k=attn_metadata.mega_suffix_cu_seqlens_k,
+                    seqused_k=None,
+                    max_seqlen_q=attn_metadata.mega_suffix_max_q_len,
+                    max_seqlen_k=attn_metadata.mega_suffix_max_seq_len,
+                    softmax_scale=scale,
+                    causal=True,
+                    alibi_slopes=alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=None,
+                    softcap=logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=vllm_flash_attn_version,
+                )
+
+                group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
+                if (
+                    attn_metadata.mega_suffix_max_q_len == 1
+                    and attn_metadata.mega_suffix_max_seq_len == 1
+                    and group_size > 1
+                ):
+                    mega_suffix_lse = (
+                        mega_suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
+                        .transpose(1, 2)
+                        .contiguous()
+                        .view(attn_metadata.num_heads, -1)
                     )
 
                     mega_out = torch.empty_like(mega_query)
@@ -1053,18 +885,15 @@ class BeamAttentionImpl(AttentionImpl):
             return
 
         # ─── NPU path ───────────────────────────────────────────────────────────
-        import torch.nn.functional as F
 
         # Standard attention
         if attn_metadata.std_indices is not None:
             std_query = query[attn_metadata.std_indices]
-
-            std_causal = bool(attn_metadata.causal)
             std_out, _ = torch_npu.npu_fused_infer_attention_score(
                 query=std_query,
                 key=key_cache.view(*key_cache.shape[:-2], -1),
                 value=value_cache.view(*value_cache.shape[:-2], -1),
-                atten_mask=_npu_causal_atten_mask(std_query.device) if std_causal else None,
+                atten_mask=_npu_causal_atten_mask(std_query.device) if attn_metadata.causal else None,
                 block_table=attn_metadata.std_block_table,
                 input_layout="TND",
                 block_size=attn_metadata.block_size,
@@ -1084,7 +913,6 @@ class BeamAttentionImpl(AttentionImpl):
                 query=mega_query,
                 key=key_cache.view(*key_cache.shape[:-2], -1),
                 value=value_cache.view(*value_cache.shape[:-2], -1),
-                atten_mask=None,
                 block_table=attn_metadata.mega_prefix_block_table,
                 input_layout="TND",
                 block_size=attn_metadata.block_size,
@@ -1109,7 +937,6 @@ class BeamAttentionImpl(AttentionImpl):
                     atten_mask=_npu_causal_atten_mask(mega_query.device),
                     block_table=None,
                     input_layout="TND",
-                    block_size=0,
                     actual_seq_lengths=attn_metadata.mega_suffix_actual_seq_lengths_q,
                     actual_seq_lengths_kv=attn_metadata.mega_suffix_actual_seq_lengths_kv,
                     num_key_value_heads=attn_metadata.num_kv_heads,
