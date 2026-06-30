@@ -229,8 +229,6 @@ def main():
                 model=args.model,
                 trust_remote_code=True,
                 max_logprobs=gen_config.get("num_beams", 1) * 2,
-                # max_seq_len=16384,
-                # max_num_batched_tokens=16384,  # 1B tokens
                 catalog_path=args.catalog_path if args.catalog_path is not None else None,
                 attention_config={"backend": args.backend} if args.backend is not None else None,
                 gpu_memory_utilization=0.7,
