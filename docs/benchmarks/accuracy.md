@@ -23,6 +23,7 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
   --dataset-path ./data \
   --task-type video \
   --num-prompts 1000 \
+  --backend CUSTOM \
   --result-dir results/acc_test_results
 ```
 

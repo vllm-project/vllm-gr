@@ -12,7 +12,6 @@ import vllm
 import vllm.benchmarks.datasets
 import vllm.benchmarks.throughput
 from tqdm import tqdm
-from vllm import LLM
 from vllm.benchmarks.datasets import add_dataset_parser as original_add_parser
 from vllm.benchmarks.datasets import get_samples as original_get_samples
 from vllm.benchmarks.lib.endpoint_request_func import (
@@ -32,11 +31,17 @@ from vllm.benchmarks.throughput import validate_args as original_validate_args
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
+from vllm_gr.entrypoints.gr import GRLLM
 
 # ============================================================================
 # Constants
 # ============================================================================
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 DATASET_NAME = "onerec"
 DEFAULT_TASK_TYPES = "ad,product,label_cond,video,interactive,label_pred"
 
@@ -385,12 +390,13 @@ def _run_offline_beam_search_benchmark(args):
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    # Initialize LLM
-    logger.info(f"Initializing LLM with model: {args.model}")
-    llm = LLM(
+    # Initialize GRLLM
+    logger.info(f"Initializing GRLLM with model: {args.model}")
+    llm = GRLLM(
         model=args.model,
         trust_remote_code=True,
         max_logprobs=args.max_logprobs if hasattr(args, "max_logprobs") else 2048,
+        attention_config={"backend": "CUSTOM"},
         # Add other relevant vLLM arguments if available in args
         **(
             {"max_num_batched_tokens": getattr(args, "max_num_batched_tokens", None)}

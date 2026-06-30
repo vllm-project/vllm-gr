@@ -29,7 +29,7 @@ def _load_prompt_text() -> str:
 
 def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     model_name = "OpenOneRec/OneRec-1.7B"
-    beam_width = 512
+    beam_width = 128
     max_tokens = 5
 
     if use_patch:
@@ -59,6 +59,7 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
         model=model_name,
         trust_remote_code=True,
         max_logprobs=max_logprobs,
+        attention_config={"backend": "CUSTOM"},
     )
     final_output = None
     start = time.perf_counter()
