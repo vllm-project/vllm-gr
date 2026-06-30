@@ -233,7 +233,7 @@ def main():
                 # max_num_batched_tokens=16384,  # 1B tokens
                 catalog_path=args.catalog_path if args.catalog_path is not None else None,
                 attention_config={"backend": args.backend} if args.backend is not None else None,
-                gpu_memory_utilization=0.7
+                gpu_memory_utilization=0.7,
             )
         except Exception as e:
             logger.error(f"Failed to initialize vLLM: {e}")

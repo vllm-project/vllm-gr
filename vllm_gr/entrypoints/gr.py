@@ -166,7 +166,6 @@ class GRLLM(LLM):
         self.supported_tasks = ("recommendation",)
         self.io_processor = None
 
-
         logger.info(
             "GRLLM initialized: model=%s, model_type=%s, max_seq_len=%d, max_candidates=%d",
             model,
@@ -595,7 +594,9 @@ class GRLLM(LLM):
                             )
 
                             if has_catalog:
-                                valid_tokens_set = self.catalog.valid(current_beam.tokens[instance.prompt_len:])
+                                valid_tokens_set = self.catalog.valid(
+                                    current_beam.tokens[instance.prompt_len :]
+                                )
                                 logprobs_pos = [
                                     lp if token_id in valid_tokens_set else -float("inf")
                                     for token_id, lp in zip(token_ids_pos, logprobs_pos)
@@ -613,7 +614,9 @@ class GRLLM(LLM):
                             extract_and_dedup_flat_logprobs(flat, logprobs_num)
                         )
                         if has_catalog:
-                            valid_tokens_set = self.catalog.valid(instance.beams[0].tokens[instance.prompt_len:])
+                            valid_tokens_set = self.catalog.valid(
+                                instance.beams[0].tokens[instance.prompt_len :]
+                            )
                             logprobs_pos = [
                                 lp if token_id in valid_tokens_set else -float("inf")
                                 for token_id, lp in zip(token_ids_pos, logprobs_pos)
