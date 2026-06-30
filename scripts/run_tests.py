@@ -67,6 +67,16 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
             "test_reexport.py",
             # Phase 3 — adapter registry
             "test_registry.py",
+            # Pangu 1B LLM passthrough
+            "test_pangu_llm_passthrough.py",
+        ],
+    },
+    "pangu1b-st": {
+        "label": "Pangu 1B System Tests (offline + online)",
+        "runner": "pytest",
+        "files": [
+            "st/test_pangu1b_accuracy_st.py",
+            "st/test_pangu1b_online_st.py",
         ],
     },
     "gpu-smoke": {

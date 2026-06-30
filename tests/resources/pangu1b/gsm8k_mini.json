@@ -1,0 +1,42 @@
+[
+  {
+    "id": "gsm8k_mini_01",
+    "question": "What is 25 + 17?",
+    "answer": "42"
+  },
+  {
+    "id": "gsm8k_mini_02",
+    "question": "What is 144 divided by 12?",
+    "answer": "12"
+  },
+  {
+    "id": "gsm8k_mini_03",
+    "question": "A store sells 5 notebooks per day. How many notebooks are sold in 6 days?",
+    "answer": "30"
+  },
+  {
+    "id": "gsm8k_mini_04",
+    "question": "Tom has 18 apples and gives 7 to his friend. How many apples does Tom have left?",
+    "answer": "11"
+  },
+  {
+    "id": "gsm8k_mini_05",
+    "question": "A train travels 60 miles in 2 hours at constant speed. How many miles does it travel in 5 hours?",
+    "answer": "150"
+  },
+  {
+    "id": "gsm8k_mini_06",
+    "question": "There are 4 boxes with 9 oranges in each box. How many oranges are there in total?",
+    "answer": "36"
+  },
+  {
+    "id": "gsm8k_mini_07",
+    "question": "A book has 240 pages. Sarah read 75 pages. How many pages remain?",
+    "answer": "165"
+  },
+  {
+    "id": "gsm8k_mini_08",
+    "question": "A baker made 48 cookies and packed them equally into 6 bags. How many cookies are in each bag?",
+    "answer": "8"
+  }
+]

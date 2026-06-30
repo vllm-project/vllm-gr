@@ -5,20 +5,20 @@
 Monkey-patch mechanism for vllm-GR.
 
 Replaces vLLM's core types with GR-extended variants in all loaded modules:
-  - EngineCoreRequest → GREngineCoreRequest
-  - Request → GRRequest
-  - NewRequestData → GRNewRequestData
+  - EngineCoreRequest -> GREngineCoreRequest
+  - Request -> GRRequest
+  - NewRequestData -> GRNewRequestData
 
 Activation:
-  Primary — vLLM plugin system.  ``vllm_gr.plugin:register`` is registered
+  Primary - vLLM plugin system.  ``vllm_gr.plugin:register`` is registered
   under ``[project.entry-points."vllm.general_plugins"]`` in pyproject.toml.
   ``load_general_plugins()`` calls it in every process (main, EngineCore
   subprocess, Worker subprocess) *before* any MsgpackDecoder is created.
 
-  Explicit main-process init — ``vllm_gr.plugin.initialize_runtime()`` is
+  Explicit main-process init - ``vllm_gr.plugin.initialize_runtime()`` is
   called by ``GREngineArgs.create_engine_config()`` before engine creation.
 
-  Defense-in-depth — ``GRWorker.init_device()`` calls ``re_apply_patches()``
+  Defense-in-depth - ``GRWorker.init_device()`` calls ``re_apply_patches()``
   to cover modules loaded after the initial plugin execution.
 
 Safety features:
@@ -35,6 +35,8 @@ import sys
 import threading
 import types
 from typing import Any
+
+from vllm_gr.ops.npu.split_qkv_rmsnorm_rope import apply_split_qkv_rmsnorm_rope_patch
 
 logger = logging.getLogger("vllm_gr.patch")
 
@@ -708,9 +710,10 @@ def _apply_patches(force: bool = False) -> int:
     """Apply all runtime patches needed by vllm-GR."""
     core_count = _apply_gr_core_patches(force=force)
     yuanrong_count = _apply_yuanrong_npu_patch(force=force)
+    qkv_rmsnorm_rope_count = apply_split_qkv_rmsnorm_rope_patch(force=force)
     kv_merge_count = _apply_kv_merge_patch(force=force)
     beam_count = _apply_gr_beam_patches(force=force)
-    return core_count + yuanrong_count + kv_merge_count + beam_count
+    return core_count + yuanrong_count + qkv_rmsnorm_rope_count + kv_merge_count + beam_count
 
 
 def verify_patches() -> list[str]:
