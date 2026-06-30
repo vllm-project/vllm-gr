@@ -166,13 +166,6 @@ class GRLLM(LLM):
         self.supported_tasks = ("recommendation",)
         self.io_processor = None
 
-        # Initialize catalog support for beam search
-        self.catalog = None
-        if catalog_path is not None:
-            from vllm_gr.entrypoints.openai.serving_models import Catalog
-
-            self.catalog = Catalog(self.llm_engine.get_tokenizer())
-            self.catalog.load(catalog_path)
 
         logger.info(
             "GRLLM initialized: model=%s, model_type=%s, max_seq_len=%d, max_candidates=%d",
@@ -393,6 +386,7 @@ class GRLLM(LLM):
                         "Failed to clear mega_request cache for session %s: %s", session_id, e
                     )
 
+            has_catalog = getattr(self, "catalog", None) is not None
             instance_prefill_id = {}
             instance_prev_beam_internal_ids = {}
             instance_fork_info = {}
@@ -600,6 +594,13 @@ class GRLLM(LLM):
                                 )
                             )
 
+                            if has_catalog:
+                                valid_tokens_set = self.catalog.valid(current_beam.tokens[instance.prompt_len:])
+                                logprobs_pos = [
+                                    lp if token_id in valid_tokens_set else -float("inf")
+                                    for token_id, lp in zip(token_ids_pos, logprobs_pos)
+                                ]
+
                             beam_flat_cache.append(
                                 (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)
                             )
@@ -611,6 +612,12 @@ class GRLLM(LLM):
                         token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
                             extract_and_dedup_flat_logprobs(flat, logprobs_num)
                         )
+                        if has_catalog:
+                            valid_tokens_set = self.catalog.valid(instance.beams[0].tokens[instance.prompt_len:])
+                            logprobs_pos = [
+                                lp if token_id in valid_tokens_set else -float("inf")
+                                for token_id, lp in zip(token_ids_pos, logprobs_pos)
+                            ]
                         beam_flat_cache.append(
                             (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)
                         )
@@ -860,6 +867,16 @@ class GRLLM(LLM):
                         lora_request=lora_req_batch,
                     )
 
+                    # Validate generated tokens using catalog if available
+                    valid_tokens_sets = []
+                    has_catalog = getattr(self, "catalog", None) is not None
+                    if has_catalog:
+                        for instance in instances_batch:
+                            prompt_len = instance.prompt_len
+                            for beam in instance.beams:
+                                generated_tokens = beam.tokens[prompt_len:]
+                                valid_tokens_sets.append(self.catalog.valid(generated_tokens))
+
                     for (start, end), instance in zip(instance_start_and_end, instances_batch):
                         # Gather all logprobs and cumulative scores for this instance
                         all_beams_token_id = []
@@ -875,6 +892,12 @@ class GRLLM(LLM):
                                 token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
                                     extract_and_dedup_flat_logprobs(flat, logprobs_num)
                                 )
+                                if has_catalog:
+                                    valid_tokens_set = valid_tokens_sets[start + i]
+                                    logprobs_pos = [
+                                        lp if token_id in valid_tokens_set else -float("inf")
+                                        for token_id, lp in zip(token_ids_pos, logprobs_pos)
+                                    ]
                                 beam_flat_cache.append(
                                     (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)
                                 )
