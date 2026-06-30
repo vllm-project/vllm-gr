@@ -943,6 +943,7 @@ class BeamAttentionImpl(AttentionImpl):
                     softmax_lse_flag=True,
                     sparse_mode=3,
                 )
+
                 mega_out, _ = merge_tnd_attention_outputs(
                     mega_prefix_out, mega_prefix_lse, mega_suffix_out, mega_suffix_lse
                 )

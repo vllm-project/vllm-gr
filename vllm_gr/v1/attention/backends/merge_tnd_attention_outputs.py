@@ -1,5 +1,7 @@
-import torch
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import torch
 
 def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping_out):
     """
@@ -54,34 +56,3 @@ def merge_tnd_attention_outputs(
     normalized_lse = max_lse + torch.log(w_total)  # [T, N, 1]
 
     return normalized_out, normalized_lse
-
-
-
-def merge_attn_states_pytorch(out, prefix_out, prefix_lse, suffix_out, suffix_lse):
-    """
-    Pure PyTorch exact replacement for the custom merge_attn_states kernel.
-    Modifies the 'out' tensor in-place to match the C++ signature layout.
-
-    Signature Layout:
-        out: Pre-allocated target tensor [total_q, num_heads, head_dim]
-        prefix_out, suffix_out: Partial attention outputs [total_q, num_heads, head_dim]
-        prefix_lse, suffix_lse: Attention scales [num_heads, total_q]
-    """
-    # 1. Align the LSE tensors for clean 3D broadcasting
-    # [num_heads, total_q] -> [total_q, num_heads, 1]
-    lse_p = prefix_lse.t().unsqueeze(-1)
-    lse_s = suffix_lse.t().unsqueeze(-1)
-
-    # 2. Numerical Stability: Subtract element-wise maximum LSE
-    max_lse = torch.maximum(lse_p, lse_s)
-
-    # 3. Compute stabilized exponential weights
-    weight_p = torch.exp(lse_p - max_lse)
-    weight_s = torch.exp(lse_s - max_lse)
-    weight_sum = weight_p + weight_s
-
-    # 4. In-place write to the pre-allocated out tensor
-    # .copy_() writes directly to out's existing memory pointer
-    out.copy_((prefix_out * weight_p + suffix_out * weight_s) / weight_sum)
-
-    return out
