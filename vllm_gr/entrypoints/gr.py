@@ -634,8 +634,6 @@ class GRLLM(LLM):
 
                     all_beams_token_id = np.array(all_beams_token_id)
                     all_beams_logprob = np.array(all_beams_logprob)
-                    print("all_beams_token_id", all_beams_token_id)
-                    print("all_beams_logprob", all_beams_logprob)
 
                     if not ignore_eos:
                         eos_idx = np.where(all_beams_token_id == tokenizer.eos_token_id)[0]
@@ -924,8 +922,6 @@ class GRLLM(LLM):
                         # Convert to numpy for efficient processing
                         all_beams_token_id = np.array(all_beams_token_id)
                         all_beams_logprob = np.array(all_beams_logprob)
-                        print("all_beams_token_id", all_beams_token_id)
-                        print("all_beams_logprob", all_beams_logprob)
                         # Handle EOS tokens
                         if not ignore_eos:
                             eos_idx = np.where(all_beams_token_id == tokenizer.eos_token_id)[0]

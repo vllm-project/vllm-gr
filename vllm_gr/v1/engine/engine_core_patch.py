@@ -99,8 +99,6 @@ def _add_enum_member(name: str, value: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 
-
-
 def apply_engine_core_child_patches():
     """Apply all patches inside the EngineCore child process.
 
@@ -115,7 +113,6 @@ def apply_engine_core_child_patches():
         _handle_mega_request_step_update,
         process_input_sockets,
     )
-
 
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
@@ -685,8 +682,8 @@ def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
     return new_logits_indices
 
 
-def _mega_collapse_bookkeeping(runner,
-    orig_input_batch, request_row_configs, mega_data, sampler_output
+def _mega_collapse_bookkeeping(
+    runner, orig_input_batch, request_row_configs, mega_data, sampler_output
 ) -> Tuple[List[Any], Dict[Any, int], int]:
     """Collapse per-beam sampler output back onto logical (session) requests.
 
@@ -698,9 +695,7 @@ def _mega_collapse_bookkeeping(runner,
         ``(collapsed_req_ids, collapsed_req_id_to_index, num_logical_requests)``.
     """
     collapsed_req_ids_copy = [r[0] for r in request_row_configs if r[0] is not None]
-    collapsed_req_id_to_index = {
-        req_id: idx for idx, req_id in enumerate(collapsed_req_ids_copy)
-    }
+    collapsed_req_id_to_index = {req_id: idx for idx, req_id in enumerate(collapsed_req_ids_copy)}
     num_logical_requests = len(collapsed_req_ids_copy)
 
     if sampler_output is not None:
@@ -926,8 +921,8 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         ) = res
 
         sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
-        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(self, 
-            orig_input_batch, request_row_configs, mega_data, sampler_output
+        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(
+            self, orig_input_batch, request_row_configs, mega_data, sampler_output
         )
 
         return (
@@ -1043,15 +1038,9 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
             invalid_req_indices,
         ) = res
 
-        collapsed_req_ids_copy = [r[0] for r in request_row_configs if r[0] is not None]
-        collapsed_req_id_to_index = {
-            req_id: idx for idx, req_id in enumerate(collapsed_req_ids_copy)
-        }
-        num_logical_requests = len(collapsed_req_ids_copy)
-        
         sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
-        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(self,
-            orig_input_batch, request_row_configs, mega_data, sampler_output
+        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(
+            self, orig_input_batch, request_row_configs, mega_data, sampler_output
         )
 
         return (

@@ -387,8 +387,7 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
             ):
                 os.environ[_VLLM_GR_BEAM_ATTN_ENV] = "1"
                 logger.info(
-                    "vllm_gr: Detected --attention-backend CUSTOM, "
-                    "set %s=1",
+                    "vllm_gr: Detected --attention-backend CUSTOM, set %s=1",
                     _VLLM_GR_BEAM_ATTN_ENV,
                 )
                 break
@@ -397,8 +396,7 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
             ):
                 os.environ[_VLLM_GR_BEAM_ATTN_ENV] = "1"
                 logger.info(
-                    "vllm_gr: Detected --attention-backend=CUSTOM, "
-                    "set %s=1",
+                    "vllm_gr: Detected --attention-backend=CUSTOM, set %s=1",
                     _VLLM_GR_BEAM_ATTN_ENV,
                 )
                 break
@@ -416,8 +414,7 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
         import vllm.v1.attention.selector as selector_mod
     except ImportError:
         logger.debug(
-            "vllm_gr: Could not import vllm.v1.attention.selector, "
-            "skipping Ascend selector patch"
+            "vllm_gr: Could not import vllm.v1.attention.selector, skipping Ascend selector patch"
         )
         return 0
 
@@ -453,8 +450,7 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
 
     _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
     logger.info(
-        "vllm_gr: Applied %d Ascend attention selector patch(es) "
-        "for CUSTOM backend",
+        "vllm_gr: Applied %d Ascend attention selector patch(es) for CUSTOM backend",
         patch_count,
     )
     return patch_count
@@ -858,7 +854,14 @@ def _apply_patches(force: bool = False) -> int:
     kv_merge_count = _apply_kv_merge_patch(force=force)
     ascend_attn_count = _apply_ascend_attention_backend_patch(force=force)
     beam_count = _apply_gr_beam_patches(force=force)
-    return core_count + yuanrong_count + qkv_rmsnorm_rope_count + kv_merge_count + beam_count + ascend_attn_count
+    return (
+        core_count
+        + yuanrong_count
+        + qkv_rmsnorm_rope_count
+        + kv_merge_count
+        + beam_count
+        + ascend_attn_count
+    )
 
 
 def verify_patches() -> list[str]:

@@ -8,6 +8,11 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from vllm.config import VllmConfig
+from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -22,8 +27,22 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+from vllm.v1.attention.backends.utils import (
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+    get_kv_cache_layout,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_gr.utils.npu_adapter import is_npu_available, is_cuda_available
+from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
+from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
+    extract_suffix_kv_pytorch,
+    merge_tnd_attention_outputs,
+)
+from vllm_gr.v1.engine.engine_core_patch import _compute_beam_bounds
+
+logger = init_logger(__name__)
+MEGA_DATA_VAR = contextvars.ContextVar("mega_data", default=None)
 
 # Device flag – must be checked after torch is loaded.
 NPU_DEVICE = is_npu_available()
@@ -33,8 +52,9 @@ if NPU_DEVICE:
     import torch_npu  # noqa: F401
 if CUDA_DEVICE:
     from vllm_gr.v1.attention.backends.beam_attn_triton import (
-    extract_suffix_kv,
-)
+        extract_suffix_kv,
+    )
+
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -54,30 +74,6 @@ else:
     get_scheduler_metadata = _flash_attn_varlen_unavailable
     merge_attn_states = _flash_attn_varlen_unavailable
     flash_attn_supports_sinks = _flash_attn_varlen_unavailable
-
-from vllm.config import VllmConfig
-from vllm.config.cache import CacheDType
-from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
-from vllm.platforms.interface import DeviceCapability
-from vllm.v1.attention.backends.utils import (
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-    get_kv_cache_layout,
-)
-from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
-    merge_tnd_attention_outputs,
-    extract_suffix_kv_pytorch
-)
-
-from vllm_gr.v1.engine.engine_core_patch import _compute_beam_bounds
-
-logger = init_logger(__name__)
-MEGA_DATA_VAR = contextvars.ContextVar("mega_data", default=None)
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +526,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> BeamAttentionMetadata:
-        
         self._update_aot_schedule(fast_build)
         max_num_splits = self._get_max_num_splits(common_attn_metadata.num_actual_tokens)
         device = self.device
@@ -707,9 +702,7 @@ def _npu_causal_atten_mask(device: torch.device) -> torch.Tensor:
     key = str(device)
     mask = _NPU_CAUSAL_MASK_CACHE.get(key)
     if mask is None:
-        mask = torch.triu(
-            torch.ones(2048, 2048, dtype=torch.bool, device=device), diagonal=1
-        )
+        mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool, device=device), diagonal=1)
         _NPU_CAUSAL_MASK_CACHE[key] = mask
     return mask
 
@@ -759,7 +752,9 @@ class BeamAttentionImpl(AttentionImpl):
             if NPU_DEVICE:
                 raise NotImplementedError("BeamAttention does not support fp8 kv-cache on NPU.")
             if not flash_attn_supports_fp8():
-                raise NotImplementedError("BeamAttention does not support fp8 kv-cache on this device.")
+                raise NotImplementedError(
+                    "BeamAttention does not support fp8 kv-cache on this device."
+                )
 
         self.sinks = running_sinks
         if self.sinks is not None:
@@ -857,7 +852,7 @@ class BeamAttentionImpl(AttentionImpl):
                         block_table=None,
                         softcap=logits_soft_cap,
                         return_softmax_lse=True,
-                        fa_version=vllm_flash_attn_version
+                        fa_version=vllm_flash_attn_version,
                     )
                     group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
                     if (
@@ -891,7 +886,9 @@ class BeamAttentionImpl(AttentionImpl):
                 query=std_query,
                 key=key_cache.view(*key_cache.shape[:-2], -1),
                 value=value_cache.view(*value_cache.shape[:-2], -1),
-                atten_mask=_npu_causal_atten_mask(std_query.device) if attn_metadata.causal else None,
+                atten_mask=_npu_causal_atten_mask(std_query.device)
+                if attn_metadata.causal
+                else None,
                 block_table=attn_metadata.std_block_table,
                 input_layout="TND",
                 block_size=attn_metadata.block_size,
@@ -924,28 +921,10 @@ class BeamAttentionImpl(AttentionImpl):
             )
             if attn_metadata.mega_suffix_total_tokens > 0:
                 contig_k, contig_v = extract_suffix_kv_pytorch(
-                    key_cache,
-                    value_cache,
-                    attn_metadata.mega_suffix_slot_mapping_out
+                    key_cache, value_cache, attn_metadata.mega_suffix_slot_mapping_out
                 )
-                
-                # If query length is 1, no causal mask is needed.
-                # This avoids the NPU causal mask indexing bug where the query token
-                # is incorrectly masked from attending to suffix KV slots > 0.
                 suffix_sparse_mode = 3
                 suffix_atten_mask = _npu_causal_atten_mask(mega_query.device)
-                if attn_metadata.mega_suffix_actual_seq_lengths_q:
-                    is_suffix_q_len_one = True
-                    prev_len = 0
-                    for q_len in attn_metadata.mega_suffix_actual_seq_lengths_q:
-                        if q_len - prev_len != 1:
-                            is_suffix_q_len_one = False
-                            break
-                        prev_len = q_len
-                    if is_suffix_q_len_one:
-                        suffix_sparse_mode = 0
-                        suffix_atten_mask = None
-
                 mega_suffix_out, mega_suffix_lse = torch_npu.npu_fused_infer_attention_score(
                     query=mega_query,
                     key=contig_k,

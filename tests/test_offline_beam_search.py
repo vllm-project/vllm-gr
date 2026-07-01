@@ -60,6 +60,7 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
         trust_remote_code=True,
         max_logprobs=max_logprobs,
         attention_config={"backend": "CUSTOM"},
+        max_num_seqs=64,
     )
     final_output = None
     start = time.perf_counter()

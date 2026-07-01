@@ -75,7 +75,6 @@ Use vllm-gr serve (beam search patches are automatically loaded via plugin)
 
 ```bash
 vllm-gr serve OpenOneRec/OneRec-1.7B \
-  --trust-remote-code \
   --max-logprobs 1024 \
   --max-num-seqs 1024 \
   --max-num-batched-tokens 16384 \

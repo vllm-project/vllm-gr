@@ -1,26 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Beam-Consecutive triton helper."""
+
 import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def paged_kv_to_contig_suffix_kernel(
-    K_CACHE_PTR, V_CACHE_PTR,  
-    SLOT_MAPPING_OUT_PTR, 
-    OUT_K_PTR, OUT_V_PTR, 
-    stride_kb, stride_kt, stride_kh, stride_kd,
-    stride_vb, stride_vt, stride_vh, stride_vd,
-    stride_ok_tok, stride_ok_h, stride_ok_d,
-    stride_ov_tok, stride_ov_h, stride_ov_d,
-    head_dim, 
-    BLOCK_SIZE: tl.constexpr,      # vLLM cache page block size (e.g., 16)
-    BLOCK_SIZE_D: tl.constexpr     # Next power of 2 greater than or equal to head_dim
+    K_CACHE_PTR,
+    V_CACHE_PTR,
+    SLOT_MAPPING_OUT_PTR,
+    OUT_K_PTR,
+    OUT_V_PTR,
+    stride_kb,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vb,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ok_tok,
+    stride_ok_h,
+    stride_ok_d,
+    stride_ov_tok,
+    stride_ov_h,
+    stride_ov_d,
+    head_dim,
+    BLOCK_SIZE: tl.constexpr,  # vLLM cache page block size (e.g., 16)
+    BLOCK_SIZE_D: tl.constexpr,  # Next power of 2 greater than or equal to head_dim
 ):
     pid_tok = tl.program_id(0)
     pid_h = tl.program_id(1)
-    
+
     # 1. Fetch indirect layout indices safely
     slot_idx = tl.load(SLOT_MAPPING_OUT_PTR + pid_tok)
 
@@ -31,19 +45,23 @@ def paged_kv_to_contig_suffix_kernel(
     # 3. Create masked vector tracking offsets for head_dim
     d_offsets = tl.arange(0, BLOCK_SIZE_D)
     d_mask = d_offsets < head_dim
-    
+
     # 4. Correct 4D paged coordinate jumping math
-    k_ptrs = (K_CACHE_PTR + 
-              block_id * stride_kb + 
-              block_offset * stride_kt + 
-              pid_h * stride_kh + 
-              d_offsets * stride_kd)
-              
-    v_ptrs = (V_CACHE_PTR + 
-              block_id * stride_vb + 
-              block_offset * stride_vt + 
-              pid_h * stride_vh + 
-              d_offsets * stride_vd)
+    k_ptrs = (
+        K_CACHE_PTR
+        + block_id * stride_kb
+        + block_offset * stride_kt
+        + pid_h * stride_kh
+        + d_offsets * stride_kd
+    )
+
+    v_ptrs = (
+        V_CACHE_PTR
+        + block_id * stride_vb
+        + block_offset * stride_vt
+        + pid_h * stride_vh
+        + d_offsets * stride_vd
+    )
 
     # Load vectors with mask protection
     k = tl.load(k_ptrs, mask=d_mask, other=0.0)
@@ -52,35 +70,52 @@ def paged_kv_to_contig_suffix_kernel(
     # 5. Continuous out-packing target calculation
     ok_ptrs = OUT_K_PTR + pid_tok * stride_ok_tok + pid_h * stride_ok_h + d_offsets * stride_ok_d
     ov_ptrs = OUT_V_PTR + pid_tok * stride_ov_tok + pid_h * stride_ov_h + d_offsets * stride_ov_d
-    
+
     tl.store(ok_ptrs, k, mask=d_mask)
     tl.store(ov_ptrs, v, mask=d_mask)
+
 
 # ---------------------------------------------------------------------------
 # Python Launcher
 # ---------------------------------------------------------------------------
-def extract_suffix_kv(
-    k_cache, v_cache, slot_mapping_out, out_token_num, block_size=16
-):
+def extract_suffix_kv(k_cache, v_cache, slot_mapping_out, out_token_num, block_size=16):
     nheads = k_cache.shape[2]
     head_dim = k_cache.shape[3]
     total_tokens = out_token_num
-    
+
     # Calculate next power of 2 for Triton compiler stability
     block_size_d = 1 << (head_dim - 1).bit_length()
-    
-    out_k = torch.empty((total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype)
-    out_v = torch.empty((total_tokens, nheads, head_dim), device=v_cache.device, dtype=v_cache.dtype)
-    
-    grid = (total_tokens, nheads)    
+
+    out_k = torch.empty(
+        (total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype
+    )
+    out_v = torch.empty(
+        (total_tokens, nheads, head_dim), device=v_cache.device, dtype=v_cache.dtype
+    )
+
+    grid = (total_tokens, nheads)
     paged_kv_to_contig_suffix_kernel[grid](
-        k_cache, v_cache, slot_mapping_out, out_k, out_v,
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
-        out_k.stride(0), out_k.stride(1), out_k.stride(2),
-        out_v.stride(0), out_v.stride(1), out_v.stride(2),
+        k_cache,
+        v_cache,
+        slot_mapping_out,
+        out_k,
+        out_v,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        v_cache.stride(3),
+        out_k.stride(0),
+        out_k.stride(1),
+        out_k.stride(2),
+        out_v.stride(0),
+        out_v.stride(1),
+        out_v.stride(2),
         head_dim=head_dim,
         BLOCK_SIZE=block_size,
-        BLOCK_SIZE_D=block_size_d
+        BLOCK_SIZE_D=block_size_d,
     )
     return out_k, out_v
