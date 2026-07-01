@@ -928,23 +928,6 @@ class BeamAttentionImpl(AttentionImpl):
                     value_cache,
                     attn_metadata.mega_suffix_slot_mapping_out
                 )
-                
-                # If query length is 1, no causal mask is needed.
-                # This avoids the NPU causal mask indexing bug where the query token
-                # is incorrectly masked from attending to suffix KV slots > 0.
-                suffix_sparse_mode = 3
-                suffix_atten_mask = _npu_causal_atten_mask(mega_query.device)
-                if attn_metadata.mega_suffix_actual_seq_lengths_q:
-                    is_suffix_q_len_one = True
-                    prev_len = 0
-                    for q_len in attn_metadata.mega_suffix_actual_seq_lengths_q:
-                        if q_len - prev_len != 1:
-                            is_suffix_q_len_one = False
-                            break
-                        prev_len = q_len
-                    if is_suffix_q_len_one:
-                        suffix_sparse_mode = 0
-                        suffix_atten_mask = None
 
                 mega_suffix_out, mega_suffix_lse = torch_npu.npu_fused_infer_attention_score(
                     query=mega_query,
