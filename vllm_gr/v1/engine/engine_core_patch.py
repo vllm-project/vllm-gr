@@ -943,52 +943,66 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
 
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
+    """NPU ``_prepare_inputs`` wrapper.
+
+    Signature: ``(scheduler_output, intermediate_tensors=None)``.
+    Returns the NPU 7-tuple
+    ``(attn_metadata, num_scheduled_tokens, num_input_tokens,
+    num_tokens_across_dp, logits_indices, spec_decode_metadata,
+    max_num_scheduled_tokens)``.
+
+    Two NPU-specific differences vs the GPU wrapper:
+
+    - The NPU attention metadata builder runs *inside* the original
+      ``_prepare_inputs``, so Job A (publishing ``req_ids`` to the contextvar)
+      must happen *before* delegating, not after.
+    - ``_prepare_inputs`` is called from ``execute_model``, while sampling and
+      ``_bookkeeping_sync`` run in a separate ``sample_tokens`` call. If an
+      early return skips bookkeeping, a stale ``InputBatchProxy`` could survive
+      to the next step, so we defensively un-proxy at entry.
+
+    The per-beam RoPE position overwrite needs no extra device copy: NPU
+    ``self.positions`` is a ``CpuGpuBuffer`` and ``_overwrite_position_ids``
+    writes the ``.gpu`` (device) tensor in place, which ``_preprocess`` reads.
+    The physical ``slot_mapping`` is materialized from linear positions inside
+    the original before the overwrite, so it is unaffected.
+    """
+
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(self, scheduler_output, intermediate_tensors=None):
+        # Drop a stale proxy left over from a prior step (see docstring).
         if isinstance(self.input_batch, InputBatchProxy):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
 
-        beam_data = getattr(scheduler_output, "beam_data", {})
-        
-        # --- NPU FIX: Remap inputs BEFORE the original runs ---
-        if beam_data:
-            # Extract num_scheduled_tokens from scheduler_output upfront
-            # (In vLLM V1, this is typically a dict or list mapping batch entries to token counts)
-            num_scheduled_tokens = list(scheduler_output.num_scheduled_tokens.values())
-            
-            # This mutates position IDs and installs InputBatchProxy *before* the internal NPU builder runs
-            new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
-            forced_logits_tensor = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
-        else:
-            forced_logits_tensor = None
-
+        # Job A: publish req_ids BEFORE the original builds attention metadata.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        # Now, when the original runs, its internal attention builder reads from our proxy seamlessly
         out = _orig_prepare_inputs(self, scheduler_output, intermediate_tensors)
 
+        beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data:
             return out
 
-        # Unpack the original output tuple
         (
             attn_metadata,
             num_scheduled_tokens,
             num_input_tokens,
             num_tokens_across_dp,
-            logits_indices, # This is the original stale tensor
+            logits_indices,
             spec_decode_metadata,
             max_num_scheduled_tokens,
         ) = out
 
-        # Overwrite the stale logits_indices with our multi-beam expanded version
+        new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
+        logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
+
         return (
             attn_metadata,
             num_scheduled_tokens,
             num_input_tokens,
             num_tokens_across_dp,
-            forced_logits_tensor, # Pass the correct expanded tensor out
+            logits_indices,
             spec_decode_metadata,
             max_num_scheduled_tokens,
         )

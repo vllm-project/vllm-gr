@@ -966,7 +966,7 @@ class BeamAttentionImpl(AttentionImpl):
                 query=beam_query,
                 key=contig_k,
                 value=contig_v,
-                atten_mask=_npu_causal_atten_mask(query_prefix.device),
+                atten_mask=_npu_causal_atten_mask(beam_query.device),
                 block_table=None,
                 input_layout="TND",
                 actual_seq_lengths=attn_metadata.npu_suffix_actual_seq_lengths_q_host,
