@@ -966,7 +966,7 @@ class BeamAttentionImpl(AttentionImpl):
                 query=query_prefix,
                 key=contig_k,
                 value=contig_v,
-                atten_mask=suffix_atten_mask,
+                atten_mask=_npu_causal_atten_mask(query_prefix.device),
                 block_table=None,
                 input_layout="TND",
                 actual_seq_lengths=attn_metadata.npu_suffix_actual_seq_lengths_q_host,
@@ -975,7 +975,7 @@ class BeamAttentionImpl(AttentionImpl):
                 num_heads=attn_metadata.num_heads,
                 scale=scale,
                 softmax_lse_flag=True,
-                sparse_mode=suffix_sparse_mode,
+                sparse_mode=3,
             )
 
             out, _ = merge_tnd_attention_outputs(
