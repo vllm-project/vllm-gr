@@ -831,12 +831,12 @@ class BeamAttentionImpl(AttentionImpl):
 
             if attn_metadata.prefix_indices is not None:
                 if attn_metadata.std_indices is None:
-                    prefix_query = query[:attn_metadata.num_prefix_indices]
+                    beam_query = query[:attn_metadata.num_prefix_indices]
                 else:
-                    prefix_query = query[attn_metadata.prefix_indices]
+                    beam_query = query[attn_metadata.prefix_indices]
 
                 prefix_out, prefix_lse = flash_attn_varlen_func(
-                    q=prefix_query,
+                    q=beam_query,
                     k=key_cache,
                     v=value_cache,
                     cu_seqlens_q=attn_metadata.prefix_cu_seqlens_q,
@@ -866,7 +866,7 @@ class BeamAttentionImpl(AttentionImpl):
                 )
 
                 suffix_out, suffix_lse = flash_attn_varlen_func(
-                    q=prefix_query,
+                    q=beam_query,
                     k=contig_k,
                     v=contig_v,
                     cu_seqlens_q=attn_metadata.suffix_cu_seqlens_q,
@@ -897,7 +897,7 @@ class BeamAttentionImpl(AttentionImpl):
                         .view(attn_metadata.num_heads, -1)
                     )
 
-                out = torch.empty_like(prefix_query)
+                out = torch.empty_like(beam_query)
                 merge_attn_states(
                     out, prefix_out, prefix_lse, suffix_out, suffix_lse
                 )
@@ -938,11 +938,11 @@ class BeamAttentionImpl(AttentionImpl):
         # Prefix/Suffix attention
         if attn_metadata.prefix_indices is not None:
             if attn_metadata.std_indices is None:
-                prefix_query = query[:attn_metadata.num_prefix_indices]
+                beam_query = query[:attn_metadata.num_prefix_indices]
             else:
-                prefix_query = query[attn_metadata.prefix_indices]
+                beam_query = query[attn_metadata.prefix_indices]
             prefix_out, prefix_lse = torch_npu.npu_fused_infer_attention_score(
-                query=query_prefix,
+                query=beam_query,
                 key=key_cache.view(*key_cache.shape[:-2], -1),
                 value=value_cache.view(*value_cache.shape[:-2], -1),
                 block_table=attn_metadata.prefix_block_table,
@@ -963,7 +963,7 @@ class BeamAttentionImpl(AttentionImpl):
             )
 
             suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score(
-                query=query_prefix,
+                query=beam_query,
                 key=contig_k,
                 value=contig_v,
                 atten_mask=_npu_causal_atten_mask(query_prefix.device),
