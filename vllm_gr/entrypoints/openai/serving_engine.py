@@ -18,7 +18,7 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
-from vllm_gr.v1.engine.types import MegaRequestStepUpdate
+from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
@@ -86,7 +86,7 @@ async def _add_batch_step(
     return output, internal_ids
 
 
-async def _mega_request_step(
+async def _beam_request_step(
     engine_client,
     session_id: str,
     fork_info,
@@ -101,7 +101,7 @@ async def _mega_request_step(
     priority=0,
     data_parallel_rank: int | None = None,
 ):
-    """MEGA_REQUEST path: single logical message update for all active branches."""
+    """BEAM_REQUEST path: single logical message update for all active branches."""
     parent_beam_ids = []
     child_beam_ids = []
     beam_tokens = []
@@ -140,8 +140,8 @@ async def _mega_request_step(
     pruned_ids = [pid for pid in prev_beam_internal_ids if pid not in used_parents]
 
     # Dispatch the consolidated persistent update to the client
-    await engine_client.mega_request_step_update(
-        MegaRequestStepUpdate(
+    await engine_client.beam_request_step_update(
+        BeamRequestStepUpdate(
             session_id=session_id,
             parent_beam_ids=parent_beam_ids,
             child_beam_ids=child_beam_ids,
@@ -166,13 +166,13 @@ async def _mega_request_step(
     return [single_output], child_beam_ids
 
 
-async def _mega_request_cleanup(engine_client, session_id, final_ids, rank):
+async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
     """Signals the core engine to fully purge all remaining session cache allocations."""
     if not final_ids:
         return
     try:
-        await engine_client.mega_request_step_update(
-            MegaRequestStepUpdate(
+        await engine_client.beam_request_step_update(
+            BeamRequestStepUpdate(
                 session_id=session_id,
                 parent_beam_ids=[],
                 child_beam_ids=[],
@@ -185,7 +185,7 @@ async def _mega_request_cleanup(engine_client, session_id, final_ids, rank):
             )
         )
     except Exception as e:
-        logger.error("Failed to clear mega_request cache for session %s: %s", session_id, e)
+        logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
 
 
 def _extract_and_dedup_segment(
@@ -345,7 +345,7 @@ async def beam_search(
         )
 
     # Check once if the engine supports batch submission / beam fork.
-    use_mega_request = hasattr(self.engine_client, "mega_request_step_update")
+    use_beam_request = hasattr(self.engine_client, "beam_request_step_update")
 
     prev_beam_internal_ids: list[str] = []
     fork_info: list[tuple[int, int]] | None = None
@@ -390,8 +390,8 @@ async def beam_search(
         gen_start = time.perf_counter()
 
         # Execute Engine Step Pass
-        if use_mega_request and fork_info is not None:
-            output, prev_beam_internal_ids = await _mega_request_step(
+        if use_beam_request and fork_info is not None:
+            output, prev_beam_internal_ids = await _beam_request_step(
                 self.engine_client,
                 session_id=prefill_id,
                 fork_info=fork_info,
@@ -413,7 +413,7 @@ async def beam_search(
                 lora_req_batch,
                 request_id_batch,
                 beam_search_params,
-                use_mega_request,
+                use_beam_request,
                 trace_headers,
                 priority=priority,
                 data_parallel_rank=rank,
@@ -441,11 +441,11 @@ async def beam_search(
         # -------------------------------------------------------------------------
         # STRIDE-AWARE METADATA EXTRACTION FOR GENERATED BEAMS
         # -------------------------------------------------------------------------
-        if use_mega_request and fork_info is not None:
+        if use_beam_request and fork_info is not None:
             # Under the optimized mode, 'output' contains exactly 1 combined RequestOutput instance
-            mega_result = output[0]
-            if mega_result.outputs[0].finish_reason == "error":
-                await _mega_request_cleanup(
+            beam_result = output[0]
+            if beam_result.outputs[0].finish_reason == "error":
+                await _beam_request_cleanup(
                     self.engine_client, prefill_id, prev_beam_internal_ids, rank
                 )
                 yield RequestOutput(
@@ -467,7 +467,7 @@ async def beam_search(
                 )
                 return
 
-            flat = mega_result.outputs[0].logprobs
+            flat = beam_result.outputs[0].logprobs
             if flat is not None:
                 # Extract tracking attributes cleanly
                 raw_token_ids = flat.token_ids
@@ -606,13 +606,13 @@ async def beam_search(
             new_beams.append(new_beam)
 
         # Build fork_info for next iteration's BEAM_FORK.
-        if use_mega_request:
+        if use_beam_request:
             fork_info = [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
 
         all_beams = new_beams
 
-    if use_mega_request and prev_beam_internal_ids:
-        await _mega_request_cleanup(self.engine_client, prefill_id, prev_beam_internal_ids, rank)
+    if use_beam_request and prev_beam_internal_ids:
+        await _beam_request_cleanup(self.engine_client, prefill_id, prev_beam_internal_ids, rank)
 
     if sid_end_token_id is not None:
         for beam in all_beams:

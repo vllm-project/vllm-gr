@@ -4,7 +4,7 @@
 import msgspec
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.v1.engine.types import MegaRequestStepUpdate
+from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
@@ -52,12 +52,12 @@ async def add_requests_async(self, requests, force_batch=False):
 
 
 # ---------------------------------------------------------------------------
-# AsyncMPClient.mega_request_step_update_async  (MEGA_REQUEST_STEP_UPDATE path)
+# AsyncMPClient.beam_request_step_update_async  (BEAM_REQUEST_STEP_UPDATE path)
 # ---------------------------------------------------------------------------
 
 
-async def mega_request_step_update_async(self, update: MegaRequestStepUpdate) -> None:
-    """Send MEGA_REQUEST_STEP_UPDATE to EngineCore.
+async def beam_request_step_update_async(self, update: BeamRequestStepUpdate) -> None:
+    """Send BEAM_REQUEST_STEP_UPDATE to EngineCore.
 
     Transmits a single logical message for all branches of a decode step.
     """
@@ -74,7 +74,7 @@ async def mega_request_step_update_async(self, update: MegaRequestStepUpdate) ->
             for pruned_id in update.pruned_ids:
                 self.reqs_in_flight.pop(pruned_id, None)
 
-    to_await = self._send_input(EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE, update, engine)
+    to_await = self._send_input(EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, update, engine)
     if hasattr(self, "first_req_send_socket") and not self.engines_running:
         req_msg = msgspec.msgpack.encode(("FIRST_REQ", engine))
         await self.first_req_send_socket.send(req_msg)

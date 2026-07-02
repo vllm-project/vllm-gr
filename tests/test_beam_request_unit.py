@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the MegaRequest beam search protocol (no GPU required).
+"""Unit tests for the BeamRequest beam search protocol (no GPU required).
 
 Sections:
-  1  — MegaRequestStepUpdate serialization / msgpack round-trip
+  1  — BeamRequestStepUpdate serialization / msgpack round-trip
   2  — EngineCoreRequestType enum patching (_add_enum_member)
-  3  — EngineCore beam cache (_cache_beam_request / _handle_mega_request_step_update)
-  4  — Client-side patches (add_requests_async / mega_request_step_update_async /
+  3  — EngineCore beam cache (_cache_beam_request / _handle_beam_request_step_update)
+  4  — Client-side patches (add_requests_async / beam_request_step_update_async /
          apply_batch_fork_patches / sync + inproc variants)
-  5  — Beam search orchestration (_mega_request_step / _mega_request_cleanup /
-         use_mega_request flag detection)
+  5  — Beam search orchestration (_beam_request_step / _beam_request_cleanup /
+         use_beam_request flag detection)
   6  — Patch wiring (patch_batch_and_fork / EngineCoreProc.run_engine_core)
   7  — Integration / cross-process (enum no-collision, encode-decode)
 """
@@ -32,31 +32,31 @@ from vllm.v1.engine import (
 )
 
 from vllm_gr.entrypoints.openai.serving_engine import (
-    _mega_request_cleanup,
-    _mega_request_step,
+    _beam_request_cleanup,
+    _beam_request_step,
 )
-from vllm_gr.v1.engine.core import _cache_beam_request, _handle_mega_request_step_update
+from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_request_step_update
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
-    mega_request_step_update_async,
+    beam_request_step_update_async,
 )
 from vllm_gr.v1.engine.core_client_patch import (
     _add_requests_batch_fn,
     apply_batch_fork_patches,
     inproc_add_requests,
-    inproc_mega_request_step_update,
-    mega_request_step_update_fn,
+    inproc_beam_request_step_update,
+    beam_request_step_update_fn,
     prepare_request_fn,
     register_beam_output_fn,
     sync_mp_add_requests,
-    sync_mp_mega_request_step_update,
+    sync_mp_beam_request_step_update,
 )
 from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
-from vllm_gr.v1.engine.types import MegaRequestStepUpdate
+from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 # Ensure custom enum members exist in this process for all tests below.
 _add_enum_member("ADD_BATCH", b"\x05")
-_add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
+_add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
 
 # ---------------------------------------------------------------------------
 # Module-level picklable targets for subprocess tests (§6)
@@ -64,15 +64,15 @@ _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
 
 
 def _sub_patch_batch_fork_registers_enum() -> None:
-    """Verify patch_batch_and_fork adds MEGA_REQUEST_STEP_UPDATE to the enum."""
+    """Verify patch_batch_and_fork adds BEAM_REQUEST_STEP_UPDATE to the enum."""
     from vllm.v1.engine import EngineCoreRequestType as ERT
 
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
     patch_batch_and_fork()
     assert hasattr(ERT, "ADD_BATCH"), "ADD_BATCH missing after patch"
-    assert hasattr(ERT, "MEGA_REQUEST_STEP_UPDATE"), "MEGA_REQUEST_STEP_UPDATE missing after patch"
-    assert ERT.MEGA_REQUEST_STEP_UPDATE.value == b"\x06"
+    assert hasattr(ERT, "BEAM_REQUEST_STEP_UPDATE"), "BEAM_REQUEST_STEP_UPDATE missing after patch"
+    assert ERT.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
     assert ERT.ADD_BATCH.value == b"\x05"
 
 
@@ -179,8 +179,8 @@ def _make_beam_update(
     client_index: int = 0,
     current_wave: int = 0,
     data_parallel_rank: int | None = None,
-) -> MegaRequestStepUpdate:
-    return MegaRequestStepUpdate(
+) -> BeamRequestStepUpdate:
+    return BeamRequestStepUpdate(
         session_id=session_id,
         parent_beam_ids=parent_beam_ids if parent_beam_ids is not None else ["old-0"],
         child_beam_ids=child_beam_ids if child_beam_ids is not None else ["new-0"],
@@ -264,7 +264,7 @@ def _run_subprocess(target: Any) -> None:
 class TestTypesSerialization:
     def test_roundtrip_all_fields(self) -> None:
         sp = _sampling_params()
-        original = MegaRequestStepUpdate(
+        original = BeamRequestStepUpdate(
             session_id="sess-abc",
             parent_beam_ids=["p0", "p1"],
             child_beam_ids=["c0", "c1"],
@@ -279,7 +279,7 @@ class TestTypesSerialization:
             data_parallel_rank=1,
         )
         encoded = msgspec.msgpack.encode(original)
-        decoded = msgspec.msgpack.decode(encoded, type=MegaRequestStepUpdate)
+        decoded = msgspec.msgpack.decode(encoded, type=BeamRequestStepUpdate)
 
         assert decoded.session_id == "sess-abc"
         assert decoded.parent_beam_ids == ["p0", "p1"]
@@ -306,7 +306,7 @@ class TestTypesSerialization:
         # All eight optional fields are omitted from the constructor call.
         # After encode → decode they must arrive at their declared defaults,
         # not as None/0 noise or missing keys.
-        msg = MegaRequestStepUpdate(
+        msg = BeamRequestStepUpdate(
             session_id="s",
             parent_beam_ids=[],
             child_beam_ids=[],
@@ -316,7 +316,7 @@ class TestTypesSerialization:
             beam_width=0,
             sampling_params=SamplingParams(),
         )
-        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(msg), type=MegaRequestStepUpdate)
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(msg), type=BeamRequestStepUpdate)
 
         assert decoded.eos_token_id is None
         assert decoded.client_index == 0
@@ -336,7 +336,7 @@ class TestTypesSerialization:
             pruned_ids=["final-0"],
         )
         encoded = msgspec.msgpack.encode(update)
-        decoded = msgspec.msgpack.decode(encoded, type=MegaRequestStepUpdate)
+        decoded = msgspec.msgpack.decode(encoded, type=BeamRequestStepUpdate)
         assert decoded.session_id == update.session_id
         assert decoded.beam_tokens == []
         assert decoded.parent_beam_ids == []
@@ -371,22 +371,22 @@ class TestEnumPatching:
         assert EngineCoreRequestType(b"\x05") is EngineCoreRequestType.ADD_BATCH
 
     def test_beam_request_step_update_enum_value(self) -> None:
-        _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
-        member = EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+        member = EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
         assert member.value == b"\x06"
-        assert member.name == "MEGA_REQUEST_STEP_UPDATE"
+        assert member.name == "BEAM_REQUEST_STEP_UPDATE"
         # Must be accessible via reverse value lookup
         assert EngineCoreRequestType(b"\x06") is member
         assert (
-            sum(1 for n in EngineCoreRequestType._member_names_ if n == "MEGA_REQUEST_STEP_UPDATE")
+            sum(1 for n in EngineCoreRequestType._member_names_ if n == "BEAM_REQUEST_STEP_UPDATE")
             == 1
         )
 
     def test_enum_lookup_by_value(self) -> None:
         _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
         assert EngineCoreRequestType(b"\x05") is EngineCoreRequestType.ADD_BATCH
-        assert EngineCoreRequestType(b"\x06") is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        assert EngineCoreRequestType(b"\x06") is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
 
 
 # ===========================================================================
@@ -443,7 +443,7 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty()
         req_type, payload = eng.input_queue.get_nowait()
@@ -468,13 +468,13 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty(), "Request must be pushed to input_queue"
         _, kwargs = MockReq.call_args
         assert kwargs["prompt_token_ids"] == prefill + beam0 + beam1
         assert kwargs["request_id"] == "session-0"
-        assert mock_req.is_mega_beam is True
+        assert mock_req.is_beam is True
 
     def test_handle_decode_steps_from_beam_token_length(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
@@ -491,10 +491,10 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty()
-        assert mock_req.mega_decode_steps == 3
+        assert mock_req.beam_decode_steps == 3
 
     def test_handle_sets_meta_attributes(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
@@ -511,13 +511,13 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty()
-        assert mock_req.is_mega_beam is True
-        assert mock_req.mega_beam_width == 2
-        assert mock_req.is_mega_decode is True
-        assert mock_req.mega_decode_steps == 1  # each beam_tokens list has length 1
+        assert mock_req.is_beam is True
+        assert mock_req.beam_beam_width == 2
+        assert mock_req.is_beam_decode is True
+        assert mock_req.beam_decode_steps == 1  # each beam_tokens list has length 1
         assert mock_req.prefix_len == 5
 
     def test_handle_block_hashes_from_session(self) -> None:
@@ -531,7 +531,7 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty()
         assert mock_req.block_hashes == [0xAA, 0xBB]
@@ -549,7 +549,7 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty()
         assert mock_req.block_hashes == [0xAA, 0xCC]
@@ -565,7 +565,7 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty()
         # block_hashes should be exactly the prefill hashes, not extended
@@ -579,7 +579,7 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty()
         _, kwargs = MockReq.call_args
@@ -593,7 +593,7 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty()
         _, kwargs = MockReq.call_args
@@ -610,7 +610,7 @@ class TestBeamCache:
         )
 
         with patch("vllm.v1.request.Request"):
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
         assert eng.output_queue.qsize() == 2
@@ -632,7 +632,7 @@ class TestBeamCache:
             beam_width=2,
         )
 
-        _handle_mega_request_step_update(eng, update)
+        _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
         assert eng.output_queue.qsize() == 2
@@ -654,7 +654,7 @@ class TestBeamCache:
             beam_width=2,
         )
 
-        _handle_mega_request_step_update(eng, update)
+        _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
         assert eng.output_queue.qsize() == 2  # one error per child
@@ -676,7 +676,7 @@ class TestBeamCache:
             beam_width=3,  # claims 3 beams but arrays have 2
         )
 
-        _handle_mega_request_step_update(eng, update)
+        _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
         assert eng.output_queue.qsize() == 2  # one error per child
@@ -694,7 +694,7 @@ class TestBeamCache:
             beam_width=0,
             pruned_ids=[],
         )
-        _handle_mega_request_step_update(eng, update)
+        _handle_beam_request_step_update(eng, update)
         assert "s0" not in eng.beam_cache
         assert eng.input_queue.empty()
 
@@ -705,7 +705,7 @@ class TestBeamCache:
             beam_width=0,
             pruned_ids=["final-0", "final-1"],
         )
-        _handle_mega_request_step_update(eng, update)
+        _handle_beam_request_step_update(eng, update)
         assert eng.input_queue.empty()
         aborted = set()
         while not eng.aborts_queue.empty():
@@ -727,7 +727,7 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         assert not eng.input_queue.empty(), "Normal step must push request to input_queue"
         # Session must still be in cache (only B=0 removes it)
@@ -747,7 +747,7 @@ class TestBeamCache:
                 mock_req = MagicMock()
                 mock_req.block_hashes = []
                 MockReq.return_value = mock_req
-                _handle_mega_request_step_update(eng, update)
+                _handle_beam_request_step_update(eng, update)
             return MockReq
 
         # Step 1: first decode step, both beams survive
@@ -781,7 +781,7 @@ class TestBeamCache:
         assert kwargs2["prompt_token_ids"][:3] == session_tokens  # same prefill reused
 
         # Step 3: teardown — session removed, all ids aborted
-        _handle_mega_request_step_update(
+        _handle_beam_request_step_update(
             eng,
             _make_beam_update(
                 session_id="s0",
@@ -803,7 +803,7 @@ class TestBeamCache:
             mock_req = MagicMock()
             mock_req.block_hashes = []
             MockReq.return_value = mock_req
-            _handle_mega_request_step_update(eng, update)
+            _handle_beam_request_step_update(eng, update)
 
         _, payload = eng.input_queue.get_nowait()
         _req, wave = payload
@@ -853,21 +853,21 @@ class TestClientPatches:
     def test_beam_request_step_update_async_sets_client_index(self) -> None:
         mock_self = _make_non_dp_client_mock(client_index=7)
         update = _make_beam_update(client_index=0)
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
         assert update.client_index == 7
         # Must still have dispatched to the engine
         mock_self._send_input.assert_awaited_once()
         assert (
-            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
         )
 
     def test_beam_request_step_update_async_sends_correct_type(self) -> None:
         mock_self = _make_non_dp_client_mock()
         update = _make_beam_update()
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
         mock_self._send_input.assert_awaited_once()
         assert (
-            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
         )
         assert mock_self._send_input.call_args[0][1] is update
         mock_self._ensure_output_queue_task.assert_called_once()
@@ -876,13 +876,13 @@ class TestClientPatches:
         mock_self = _make_non_dp_client_mock()
         mock_self.current_wave = 3
         update = _make_beam_update(current_wave=0)
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
         assert update.current_wave == 3
 
     def test_beam_request_step_update_async_no_wave_if_missing(self) -> None:
         mock_self = _make_non_dp_client_mock()
         update = _make_beam_update(current_wave=42)
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
         # Without current_wave attribute, the update's value is left as-is
         assert update.current_wave == 42
 
@@ -947,12 +947,12 @@ class TestClientPatches:
 
     def test_beam_request_step_update_fn_delegates(self) -> None:
         mock_self = MagicMock()
-        mock_self.engine_core.mega_request_step_update_async = AsyncMock()
+        mock_self.engine_core.beam_request_step_update_async = AsyncMock()
         update = _make_beam_update()
 
-        asyncio.run(mega_request_step_update_fn(mock_self, update))
+        asyncio.run(beam_request_step_update_fn(mock_self, update))
 
-        mock_self.engine_core.mega_request_step_update_async.assert_awaited_once_with(update)
+        mock_self.engine_core.beam_request_step_update_async.assert_awaited_once_with(update)
 
     # ── SyncMPClient patches ─────────────────────────────────────────────
 
@@ -988,10 +988,10 @@ class TestClientPatches:
     def test_sync_mp_beam_request_step_update_sends_correct_type(self) -> None:
         mock_self = MagicMock()
         update = _make_beam_update()
-        sync_mp_mega_request_step_update(mock_self, update)
+        sync_mp_beam_request_step_update(mock_self, update)
         mock_self._send_input.assert_called_once()
         assert (
-            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+            mock_self._send_input.call_args[0][0] is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
         )
         assert mock_self._send_input.call_args[0][1] is update
 
@@ -1058,17 +1058,17 @@ class TestClientPatches:
     def test_inproc_beam_request_step_update_delegates(self) -> None:
         mock_self = MagicMock()
         update = _make_beam_update()
-        inproc_mega_request_step_update(mock_self, update)
-        mock_self.engine_core._handle_mega_request_step_update.assert_called_once_with(update)
+        inproc_beam_request_step_update(mock_self, update)
+        mock_self.engine_core._handle_beam_request_step_update.assert_called_once_with(update)
 
     # ── apply_batch_fork_patches ─────────────────────────────────────────
 
     def test_apply_batch_fork_patches_adds_enum_members(self) -> None:
         apply_batch_fork_patches()
         assert hasattr(EngineCoreRequestType, "ADD_BATCH")
-        assert hasattr(EngineCoreRequestType, "MEGA_REQUEST_STEP_UPDATE")
+        assert hasattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE")
         assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
-        assert EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE.value == b"\x06"
+        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
 
     def test_apply_batch_fork_patches_four_classes(self) -> None:
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -1077,15 +1077,15 @@ class TestClientPatches:
         apply_batch_fork_patches()
 
         assert AsyncMPClient.add_requests_async is add_requests_async
-        assert AsyncMPClient.mega_request_step_update_async is mega_request_step_update_async
+        assert AsyncMPClient.beam_request_step_update_async is beam_request_step_update_async
         assert AsyncLLM.prepare_request is prepare_request_fn
         assert AsyncLLM._add_requests_batch is _add_requests_batch_fn
         assert AsyncLLM.register_beam_output is register_beam_output_fn
-        assert AsyncLLM.mega_request_step_update is mega_request_step_update_fn
+        assert AsyncLLM.beam_request_step_update is beam_request_step_update_fn
         assert SyncMPClient.add_requests is sync_mp_add_requests
-        assert SyncMPClient.mega_request_step_update is sync_mp_mega_request_step_update
+        assert SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
         assert InprocClient.add_requests is inproc_add_requests
-        assert InprocClient.mega_request_step_update is inproc_mega_request_step_update
+        assert InprocClient.beam_request_step_update is inproc_beam_request_step_update
 
 
 # ===========================================================================
@@ -1095,17 +1095,17 @@ class TestClientPatches:
 
 class TestBeamSearchOrchestration:
     def test_use_beam_request_true_when_client_has_method(self) -> None:
-        ec = MagicMock(spec=["mega_request_step_update"])
-        assert hasattr(ec, "mega_request_step_update")
+        ec = MagicMock(spec=["beam_request_step_update"])
+        assert hasattr(ec, "beam_request_step_update")
 
     def test_use_beam_request_false_when_method_absent(self) -> None:
         ec = MagicMock(spec=[])
-        assert not hasattr(ec, "mega_request_step_update")
+        assert not hasattr(ec, "beam_request_step_update")
 
     def test_beam_request_step_builds_correct_update(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [
             SimpleNamespace(tokens=[10, 20, 50]),
@@ -1114,7 +1114,7 @@ class TestBeamSearchOrchestration:
         fork_info = [(0, 50), (1, 60)]
 
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="sess-0",
                 fork_info=fork_info,
@@ -1131,9 +1131,9 @@ class TestBeamSearchOrchestration:
             )
         )
 
-        ec.mega_request_step_update.assert_awaited_once()
-        update: MegaRequestStepUpdate = ec.mega_request_step_update.call_args[0][0]
-        assert isinstance(update, MegaRequestStepUpdate)
+        ec.beam_request_step_update.assert_awaited_once()
+        update: BeamRequestStepUpdate = ec.beam_request_step_update.call_args[0][0]
+        assert isinstance(update, BeamRequestStepUpdate)
         assert update.session_id == "sess-0"
         assert update.beam_width == 2
         assert update.prefix_len == 2
@@ -1149,11 +1149,11 @@ class TestBeamSearchOrchestration:
     def test_beam_request_step_beam_tokens_are_delta_from_prefix(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [SimpleNamespace(tokens=[1, 2, 3, 50, 51])]
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="s",
                 fork_info=[(0, 50)],
@@ -1170,7 +1170,7 @@ class TestBeamSearchOrchestration:
             )
         )
 
-        update = ec.mega_request_step_update.call_args[0][0]
+        update = ec.beam_request_step_update.call_args[0][0]
         assert update.session_id == "s"
         assert update.beam_width == 1
         assert update.prefix_len == 3
@@ -1182,7 +1182,7 @@ class TestBeamSearchOrchestration:
     def test_beam_request_step_pruned_ids_are_unused_parents(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         # Both new beams expand from parent 0 → parent 1 is pruned
         all_beams = [
@@ -1190,7 +1190,7 @@ class TestBeamSearchOrchestration:
             SimpleNamespace(tokens=[10, 60]),
         ]
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="s",
                 fork_info=[(0, 50), (0, 60)],
@@ -1207,7 +1207,7 @@ class TestBeamSearchOrchestration:
             )
         )
 
-        update = ec.mega_request_step_update.call_args[0][0]
+        update = ec.beam_request_step_update.call_args[0][0]
         assert update.session_id == "s"
         assert update.beam_width == 2
         assert update.parent_beam_ids == ["parent-0", "parent-0"]
@@ -1218,11 +1218,11 @@ class TestBeamSearchOrchestration:
     def test_beam_request_step_calls_register_beam_output(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [SimpleNamespace(tokens=[10, 50])]
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="sess-1",
                 fork_info=[(0, 50)],
@@ -1248,11 +1248,11 @@ class TestBeamSearchOrchestration:
     def test_beam_request_step_returns_single_output_list(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [SimpleNamespace(tokens=[10, 50])]
         output, child_ids = asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="s",
                 fork_info=[(0, 50)],
@@ -1276,14 +1276,14 @@ class TestBeamSearchOrchestration:
     def test_beam_request_step_returns_correct_child_ids(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [
             SimpleNamespace(tokens=[10, 50]),
             SimpleNamespace(tokens=[10, 60]),
         ]
         _, child_ids = asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="s",
                 fork_info=[(0, 50), (1, 60)],
@@ -1305,11 +1305,11 @@ class TestBeamSearchOrchestration:
     def test_beam_request_step_passes_data_parallel_rank(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [SimpleNamespace(tokens=[10, 50])]
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="s",
                 fork_info=[(0, 50)],
@@ -1326,7 +1326,7 @@ class TestBeamSearchOrchestration:
             )
         )
 
-        update = ec.mega_request_step_update.call_args[0][0]
+        update = ec.beam_request_step_update.call_args[0][0]
         assert update.session_id == "s"
         assert update.beam_width == 1
         assert update.data_parallel_rank == 2
@@ -1335,11 +1335,11 @@ class TestBeamSearchOrchestration:
         assert reg_kwargs["data_parallel_rank"] == 2
 
     def test_single_protocol_message_per_decode_step(self) -> None:
-        """Key MegaRequest optimization: all beams in a decode step are sent
+        """Key BeamRequest optimization: all beams in a decode step are sent
         as exactly one protocol message, not one per beam."""
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [
             SimpleNamespace(tokens=[10, 50]),
@@ -1347,7 +1347,7 @@ class TestBeamSearchOrchestration:
             SimpleNamespace(tokens=[10, 70]),
         ]
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="s",
                 fork_info=[(0, 50), (1, 60), (2, 70)],
@@ -1365,8 +1365,8 @@ class TestBeamSearchOrchestration:
         )
 
         # All 3 beams packed into exactly one protocol message
-        ec.mega_request_step_update.assert_awaited_once()
-        update = ec.mega_request_step_update.call_args[0][0]
+        ec.beam_request_step_update.assert_awaited_once()
+        update = ec.beam_request_step_update.call_args[0][0]
         assert update.session_id == "s"
         assert update.beam_width == 3
         assert update.parent_beam_ids == ["p0", "p1", "p2"]
@@ -1376,13 +1376,13 @@ class TestBeamSearchOrchestration:
 
     def test_beam_request_cleanup_sends_b0(self) -> None:
         ec = MagicMock()
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
-        asyncio.run(_mega_request_cleanup(ec, "sess-0", ["old-0", "old-1"], rank=None))
+        asyncio.run(_beam_request_cleanup(ec, "sess-0", ["old-0", "old-1"], rank=None))
 
-        ec.mega_request_step_update.assert_awaited_once()
-        update: MegaRequestStepUpdate = ec.mega_request_step_update.call_args[0][0]
-        assert isinstance(update, MegaRequestStepUpdate)
+        ec.beam_request_step_update.assert_awaited_once()
+        update: BeamRequestStepUpdate = ec.beam_request_step_update.call_args[0][0]
+        assert isinstance(update, BeamRequestStepUpdate)
         assert update.session_id == "sess-0"
         assert update.beam_width == 0
         assert update.pruned_ids == ["old-0", "old-1"]
@@ -1394,12 +1394,12 @@ class TestBeamSearchOrchestration:
 
     def test_beam_request_cleanup_passes_rank(self) -> None:
         ec = MagicMock()
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
-        asyncio.run(_mega_request_cleanup(ec, "sess-r", ["final-x"], rank=3))
+        asyncio.run(_beam_request_cleanup(ec, "sess-r", ["final-x"], rank=3))
 
-        ec.mega_request_step_update.assert_awaited_once()
-        update = ec.mega_request_step_update.call_args[0][0]
+        ec.beam_request_step_update.assert_awaited_once()
+        update = ec.beam_request_step_update.call_args[0][0]
         assert update.session_id == "sess-r"
         assert update.beam_width == 0
         assert update.pruned_ids == ["final-x"]
@@ -1411,17 +1411,17 @@ class TestBeamSearchOrchestration:
 
     def test_beam_request_cleanup_noop_when_empty_final_ids(self) -> None:
         ec = MagicMock()
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
-        asyncio.run(_mega_request_cleanup(ec, "s", [], rank=None))
+        asyncio.run(_beam_request_cleanup(ec, "s", [], rank=None))
 
-        ec.mega_request_step_update.assert_not_awaited()
+        ec.beam_request_step_update.assert_not_awaited()
 
     def test_beam_request_cleanup_swallows_exception(self) -> None:
         ec = MagicMock()
-        ec.mega_request_step_update = AsyncMock(side_effect=RuntimeError("net error"))
+        ec.beam_request_step_update = AsyncMock(side_effect=RuntimeError("net error"))
         # Should not raise
-        asyncio.run(_mega_request_cleanup(ec, "s", ["x"], rank=None))
+        asyncio.run(_beam_request_cleanup(ec, "s", ["x"], rank=None))
 
 
 # ===========================================================================
@@ -1448,14 +1448,14 @@ class TestPatchWiring:
 class TestIntegrationCrossProcess:
     def test_enum_values_no_collision(self) -> None:
         _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
 
         assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
-        assert EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE.value == b"\x06"
+        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
 
         # Our two values must not collide with any upstream member
         for name in EngineCoreRequestType._member_names_:
-            if name in ("ADD_BATCH", "MEGA_REQUEST_STEP_UPDATE"):
+            if name in ("ADD_BATCH", "BEAM_REQUEST_STEP_UPDATE"):
                 continue
             member = getattr(EngineCoreRequestType, name)
             assert member.value not in (b"\x05", b"\x06"), (
@@ -1466,7 +1466,7 @@ class TestIntegrationCrossProcess:
         from vllm.v1.serial_utils import MsgpackDecoder
 
         sp = _sampling_params()
-        original = MegaRequestStepUpdate(
+        original = BeamRequestStepUpdate(
             session_id="session-xyz",
             parent_beam_ids=["p0", "p1"],
             child_beam_ids=["c0", "c1"],
@@ -1479,7 +1479,7 @@ class TestIntegrationCrossProcess:
             data_parallel_rank=1,
         )
         data = msgspec.msgpack.encode(original)
-        decoder = MsgpackDecoder(MegaRequestStepUpdate)
+        decoder = MsgpackDecoder(BeamRequestStepUpdate)
         decoded = decoder.decode(data)
 
         assert decoded.session_id == "session-xyz"
@@ -1493,8 +1493,8 @@ class TestIntegrationCrossProcess:
         assert decoded.data_parallel_rank == 1
 
     def test_beam_request_step_update_wire_byte_is_x06(self) -> None:
-        _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
-        assert EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE.value == b"\x06"
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
 
     def test_add_batch_wire_byte_is_x05(self) -> None:
         _add_enum_member("ADD_BATCH", b"\x05")

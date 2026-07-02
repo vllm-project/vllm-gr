@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Monkey-patches for EngineCore / EngineCoreProc to support
-ADD_BATCH and MEGA_REQUEST_STEP_UPDATE."""
+ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
@@ -112,23 +112,23 @@ def apply_engine_core_child_patches():
 
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
-        _handle_mega_request_step_update,
+        _handle_beam_request_step_update,
         process_input_sockets,
     )
 
 
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
-    # Add new enum members: ADD_BATCH, MEGA_REQUEST_STEP_UPDATE
+    # Add new enum members: ADD_BATCH, BEAM_REQUEST_STEP_UPDATE
     _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
 
     # Wrap EngineCore.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
 
-    # Bind _cache_beam_request and _handle_mega_request_step_update on both classes
+    # Bind _cache_beam_request and _handle_beam_request_step_update on both classes
     EngineCore._cache_beam_request = _cache_beam_request
-    EngineCore._handle_mega_request_step_update = _handle_mega_request_step_update
+    EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
@@ -237,7 +237,7 @@ def apply_scheduler_patch():
 
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    if getattr(Scheduler, "_patched_for_mega_requests", False):
+    if getattr(Scheduler, "_patched_for_beam_requests", False):
         return
 
     _original_schedule = Scheduler.schedule
@@ -250,7 +250,7 @@ def apply_scheduler_patch():
         # TODO: Add support for cache > prefix
         def patch_get_computed_blocks(req):
             bn, tn = _original_get_computed_blocks(req)
-            if req and getattr(req, "is_mega_decode", False):
+            if req and getattr(req, "is_beam_decode", False):
                 pl = getattr(req, "prefix_len", 0) // block_size * block_size
                 if tn > pl:
                     sliced_blocks = tuple(group[: pl // block_size] for group in bn.blocks)
@@ -261,28 +261,28 @@ def apply_scheduler_patch():
         try:
             output = _original_schedule(self)
 
-            # Propagate mega request attributes from Request objects to SchedulerOutput
-            mega_data = {}
+            # Propagate beam request attributes from Request objects to SchedulerOutput
+            beam_data = {}
             if hasattr(output, "num_scheduled_tokens"):
                 for req_id in output.num_scheduled_tokens.keys():
                     req = self.requests.get(req_id)
-                    if req and getattr(req, "is_mega_decode", False):
-                        mega_data[req_id] = {
-                            "is_mega_decode": True,
-                            "mega_beam_width": getattr(req, "mega_beam_width", 1),
-                            "mega_decode_steps": getattr(req, "mega_decode_steps", 0),
+                    if req and getattr(req, "is_beam_decode", False):
+                        beam_data[req_id] = {
+                            "is_beam_decode": True,
+                            "beam_beam_width": getattr(req, "beam_beam_width", 1),
+                            "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
                             "prefix_len": getattr(req, "prefix_len", 0),
                             "cache_len": req.num_computed_tokens
                             - output.num_scheduled_tokens[req_id],
                         }
-            output.mega_data = mega_data
+            output.beam_data = beam_data
             return output
         finally:
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
 
     Scheduler.schedule = patched_schedule
-    Scheduler._patched_for_mega_requests = True
-    logger.debug("Scheduler.schedule patched for mega-requests propagation.")
+    Scheduler._patched_for_beam_requests = True
+    logger.debug("Scheduler.schedule patched for beam-requests propagation.")
 
 
 # ============================================================================
@@ -343,7 +343,7 @@ def _overwrite_position_ids(
         )
 
 
-def _process_mega_decode_request(
+def _process_beam_decode_request(
     mdata: Dict[str, Any],
     seq_len: int,
     token_offset: int,
@@ -353,8 +353,8 @@ def _process_mega_decode_request(
 ) -> Tuple[int, int, int]:
     """Traces allocation arrays and mutates position buffers for a speculative request."""
     prefix_len = mdata["prefix_len"]
-    beam_width = mdata["mega_beam_width"]
-    decode_steps = mdata["mega_decode_steps"]
+    beam_width = mdata["beam_beam_width"]
+    decode_steps = mdata["beam_decode_steps"]
     cache_len = mdata["cache_len"]
     active_beam_ids = []  # Track structural beam locations
 
@@ -489,7 +489,7 @@ def _remux_logprobs_tensors(
 # ============================================================================
 
 
-class MegaReqIdsProxy(list):
+class BeamReqIdsProxy(list):
     def __init__(self, original_list, req_id_map):
         super().__init__(original_list)
         self.req_id_map = req_id_map
@@ -576,7 +576,7 @@ class InputBatchProxy:
             return s_meta
 
         elif name == "req_ids":
-            return MegaReqIdsProxy(obj.req_ids, req_map)
+            return BeamReqIdsProxy(obj.req_ids, req_map)
         elif name == "num_tokens_no_spec":
             return Mock1DArray(obj.num_tokens_no_spec, idx_map)
         elif name == "num_tokens":
@@ -603,22 +603,22 @@ class InputBatchProxy:
 # ============================================================================
 
 
-def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[int]:
-    """Expand a packed mega-decode batch into per-beam rows.
+def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[int]:
+    """Expand a packed beam-decode batch into per-beam rows.
 
     Device-neutral. Overwrites per-beam RoPE position ids (Job B), builds the
     per-beam ``logits_indices`` list, installs an ``InputBatchProxy`` on
     ``runner.input_batch`` and stashes ``scheduler_output._gr_request_row_configs``
-    (Job C). Job A (populating ``mega_info["req_ids"]``) is left to the caller
+    (Job C). Job A (populating ``beam_info["req_ids"]``) is left to the caller
     because its ordering relative to the original ``_prepare_inputs`` differs
     between GPU and NPU.
 
-    Assumes ``scheduler_output.mega_data`` is non-empty (caller checks).
+    Assumes ``scheduler_output.beam_data`` is non-empty (caller checks).
 
     Returns:
         The new per-beam logits-index list (caller converts to a tensor).
     """
-    mega_data = getattr(scheduler_output, "mega_data", {})
+    beam_data = getattr(scheduler_output, "beam_data", {})
 
     runner.input_batch.logprob_token_ids = {}
     new_logits_indices: List[int] = []
@@ -639,9 +639,9 @@ def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
             token_offset += seq_len
             continue
 
-        mdata = mega_data.get(req_id)
-        if mdata and mdata.get("is_mega_decode", False):
-            W, W_logits, next_offset, active_beam_ids = _process_mega_decode_request(
+        mdata = beam_data.get(req_id)
+        if mdata and mdata.get("is_beam_decode", False):
+            W, W_logits, next_offset, active_beam_ids = _process_beam_decode_request(
                 mdata,
                 seq_len,
                 token_offset,
@@ -685,8 +685,8 @@ def _mega_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
     return new_logits_indices
 
 
-def _mega_collapse_bookkeeping(runner,
-    orig_input_batch, request_row_configs, mega_data, sampler_output
+def _beam_collapse_bookkeeping(runner,
+    orig_input_batch, request_row_configs, beam_data, sampler_output
 ) -> Tuple[List[Any], Dict[Any, int], int]:
     """Collapse per-beam sampler output back onto logical (session) requests.
 
@@ -715,8 +715,8 @@ def _mega_collapse_bookkeeping(runner,
 
                 max_chained_dim = 0
                 for req_id, _, W, *_ in request_row_configs:
-                    if req_id is not None and req_id in mega_data:
-                        m_width = mega_data[req_id].get("mega_beam_width", 1)
+                    if req_id is not None and req_id in beam_data:
+                        m_width = beam_data[req_id].get("beam_beam_width", 1)
                         needed_dim = m_width * actual_K
                     else:
                         needed_dim = W * actual_K
@@ -732,18 +732,18 @@ def _mega_collapse_bookkeeping(runner,
                     orig_ranks,
                     st_ids,
                 )
-                if not hasattr(runner, "_mega_logprobs_cache"):
-                    runner._mega_logprobs_cache = {}
+                if not hasattr(runner, "_beam_logprobs_cache"):
+                    runner._beam_logprobs_cache = {}
 
                 req_id_to_config = {
                     r[0]: (r[2], r[3]) for r in request_row_configs if r[0] is not None
                 }
 
                 for idx, req_id in enumerate(collapsed_req_ids_copy):
-                    mdata = mega_data.get(req_id)
-                    if mdata and mdata.get("is_mega_decode", False):
+                    mdata = beam_data.get(req_id)
+                    if mdata and mdata.get("is_beam_decode", False):
                         W_logits, active_beams = req_id_to_config.get(req_id, (0, []))
-                        total_beam_width = mdata.get("mega_beam_width", 1)
+                        total_beam_width = mdata.get("beam_beam_width", 1)
 
                         if W_logits > 0:
                             # ---------------------------------------------------------------------
@@ -751,8 +751,8 @@ def _mega_collapse_bookkeeping(runner,
                             # ---------------------------------------------------------------------
                             if W_logits == total_beam_width:
                                 # Clean up stale entries left behind by older preempted/aborted steps
-                                if req_id in runner._mega_logprobs_cache:
-                                    del runner._mega_logprobs_cache[req_id]
+                                if req_id in runner._beam_logprobs_cache:
+                                    del runner._beam_logprobs_cache[req_id]
 
                                 # Skip all caching loops! final_lps[idx] is already fully populated.
                                 continue
@@ -774,8 +774,8 @@ def _mega_collapse_bookkeeping(runner,
                             )
 
                             # Initialize pre-allocated tensor cache matrix structures only if needed
-                            if req_id not in runner._mega_logprobs_cache:
-                                runner._mega_logprobs_cache[req_id] = {
+                            if req_id not in runner._beam_logprobs_cache:
+                                runner._beam_logprobs_cache[req_id] = {
                                     "lps": torch.full(
                                         (total_beam_width, actual_K),
                                         float("-inf"),
@@ -799,7 +799,7 @@ def _mega_collapse_bookkeeping(runner,
                                     "completed_beams": set(),
                                 }
 
-                            cache_entry = runner._mega_logprobs_cache[req_id]
+                            cache_entry = runner._beam_logprobs_cache[req_id]
 
                             # Scatter write chunk data lines directly to their physical beam slots
                             for local_row_idx, physical_beam_id in enumerate(active_beams):
@@ -823,7 +823,7 @@ def _mega_collapse_bookkeeping(runner,
                                 if final_ranks is not None:
                                     final_ranks[idx, :total_beam_width].copy_(cache_entry["ranks"])
 
-                                del runner._mega_logprobs_cache[req_id]
+                                del runner._beam_logprobs_cache[req_id]
 
                 # Safely resizes the original tensor wrapper and copies the elements in place
                 st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
@@ -847,24 +847,24 @@ def _mega_collapse_bookkeeping(runner,
 
 
 def make_patched_execute_model(_orig_execute_model):
-    """Wrap execute_model to publish mega-request context for the run.
+    """Wrap execute_model to publish beam-request context for the run.
 
     Shared by GPU and NPU runners.
     """
-    from vllm_gr.v1.attention.backends.beam_attn import MEGA_DATA_VAR
+    from vllm_gr.v1.attention.backends.beam_attn import BEAM_DATA_VAR
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
-        self._current_mega_data = getattr(scheduler_output, "mega_data", {})
-        mega_info = {"mega_data": self._current_mega_data, "req_ids": []}
-        token = MEGA_DATA_VAR.set(mega_info)
-        self._current_mega_info = mega_info
+        self._current_beam_data = getattr(scheduler_output, "beam_data", {})
+        beam_info = {"beam_data": self._current_beam_data, "req_ids": []}
+        token = BEAM_DATA_VAR.set(beam_info)
+        self._current_beam_info = beam_info
         try:
             return _orig_execute_model(self, scheduler_output, *args, **kwargs)
         finally:
-            self._current_mega_data = {}
-            self._current_mega_info = None
-            MEGA_DATA_VAR.reset(token)
+            self._current_beam_data = {}
+            self._current_beam_info = None
+            BEAM_DATA_VAR.reset(token)
 
     return patched_execute_model
 
@@ -881,14 +881,14 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
         # Job A: the GPU attention builder runs after _prepare_inputs returns, so
         # populating req_ids here (post-orig) is in time.
-        if getattr(self, "_current_mega_info", None) is not None:
-            self._current_mega_info["req_ids"] = self.input_batch.req_ids
+        if getattr(self, "_current_beam_info", None) is not None:
+            self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        mega_data = getattr(scheduler_output, "mega_data", {})
-        if not mega_data:
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        if not beam_data:
             return logits_indices, spec_decode_metadata
 
-        new_logits_indices = _mega_remap_inputs(self, scheduler_output, num_scheduled_tokens)
+        new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         return (
             torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device),
             spec_decode_metadata,
@@ -903,8 +903,8 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-        mega_data = getattr(scheduler_output, "mega_data", {})
-        if not mega_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
             return _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
 
         request_row_configs = scheduler_output._gr_request_row_configs
@@ -926,8 +926,8 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         ) = res
 
         sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
-        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(self, 
-            orig_input_batch, request_row_configs, mega_data, sampler_output
+        collapsed_req_ids, collapsed_idx, n = _beam_collapse_bookkeeping(self, 
+            orig_input_batch, request_row_configs, beam_data, sampler_output
         )
 
         return (
@@ -976,13 +976,13 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
 
         # Job A: publish req_ids BEFORE the original builds attention metadata.
-        if getattr(self, "_current_mega_info", None) is not None:
-            self._current_mega_info["req_ids"] = self.input_batch.req_ids
+        if getattr(self, "_current_beam_info", None) is not None:
+            self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
         out = _orig_prepare_inputs(self, scheduler_output, intermediate_tensors)
 
-        mega_data = getattr(scheduler_output, "mega_data", {})
-        if not mega_data:
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        if not beam_data:
             return out
 
         (
@@ -995,7 +995,7 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
             max_num_scheduled_tokens,
         ) = out
 
-        new_logits_indices = _mega_remap_inputs(self, scheduler_output, num_scheduled_tokens)
+        new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
 
         return (
@@ -1022,8 +1022,8 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-        mega_data = getattr(scheduler_output, "mega_data", {})
-        if not mega_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
             return _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
 
         request_row_configs = scheduler_output._gr_request_row_configs
@@ -1044,8 +1044,8 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
         ) = res
 
         sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
-        collapsed_req_ids, collapsed_idx, n = _mega_collapse_bookkeeping(self,
-            orig_input_batch, request_row_configs, mega_data, sampler_output
+        collapsed_req_ids, collapsed_idx, n = _beam_collapse_bookkeeping(self,
+            orig_input_batch, request_row_configs, beam_data, sampler_output
         )
 
         return (
@@ -1088,11 +1088,11 @@ def apply_worker_patches():
     # Track which runners have already been patched
     runners_to_patch = []
     if GPUModelRunner is not None and not getattr(
-        GPUModelRunner, "_patched_for_mega_beam_pos_ids", False
+        GPUModelRunner, "_patched_for_beam_beam_pos_ids", False
     ):
         runners_to_patch.append(("GPUModelRunner", GPUModelRunner))
     if NPUModelRunner is not None and not getattr(
-        NPUModelRunner, "_patched_for_mega_beam_pos_ids", False
+        NPUModelRunner, "_patched_for_beam_beam_pos_ids", False
     ):
         runners_to_patch.append(("NPUModelRunner", NPUModelRunner))
 
@@ -1118,5 +1118,5 @@ def apply_worker_patches():
                 runner_class._bookkeeping_sync
             )
 
-        runner_class._patched_for_mega_beam_pos_ids = True
+        runner_class._patched_for_beam_beam_pos_ids = True
         logger.info(f"{runner_name} hooks patched successfully.")

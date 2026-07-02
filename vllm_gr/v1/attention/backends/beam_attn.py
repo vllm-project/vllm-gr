@@ -74,7 +74,7 @@ from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
 from vllm_gr.v1.engine.engine_core_patch import _compute_beam_bounds
 
 logger = init_logger(__name__)
-MEGA_DATA_VAR = contextvars.ContextVar("mega_data", default=None)
+BEAM_DATA_VAR = contextvars.ContextVar("beam_data", default=None)
 
 
 
@@ -232,20 +232,20 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             num_splits=max_num_splits,
         )
 
-    def _segment_requests(self, num_reqs: int, req_ids: list, mega_data: dict, q_starts: list):
+    def _segment_requests(self, num_reqs: int, req_ids: list, beam_data: dict, q_starts: list):
         std_reqs = []
-        mega_req_idxs = []
-        mega_prefix_lens = []
-        mega_beam_widths = []
-        mega_decode_steps = []
-        mega_cache_lens = []
-        mega_q_start_offsets = []
+        beam_req_idxs = []
+        beam_prefix_lens = []
+        beam_beam_widths = []
+        beam_decode_steps = []
+        beam_cache_lens = []
+        beam_q_start_offsets = []
 
         for i in range(num_reqs):
             req_id = req_ids[i] if i < len(req_ids) else None
-            mdata = mega_data.get(req_id, {}) if req_id else {}
-            if mdata.get("is_mega_decode", False):
-                mega_req_idxs.append(i)
+            mdata = beam_data.get(req_id, {}) if req_id else {}
+            if mdata.get("is_beam_decode", False):
+                beam_req_idxs.append(i)
                 prefix_len = mdata["prefix_len"]
                 cache_len = mdata["cache_len"]
                 delta = prefix_len - cache_len
@@ -262,22 +262,22 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     std_reqs.append((i, std_q_len, std_kv_len))
                     q_offset = std_q_len
 
-                mega_prefix_lens.append(prefix_len)
-                mega_beam_widths.append(mdata["mega_beam_width"])
-                mega_decode_steps.append(mdata["mega_decode_steps"])
-                mega_cache_lens.append(cache_len)
-                mega_q_start_offsets.append(q_offset)
+                beam_prefix_lens.append(prefix_len)
+                beam_beam_widths.append(mdata["beam_beam_width"])
+                beam_decode_steps.append(mdata["beam_decode_steps"])
+                beam_cache_lens.append(cache_len)
+                beam_q_start_offsets.append(q_offset)
             else:
                 std_reqs.append((i, None, None))
 
         return (
             std_reqs,
-            mega_req_idxs,
-            mega_prefix_lens,
-            mega_beam_widths,
-            mega_decode_steps,
-            mega_cache_lens,
-            mega_q_start_offsets,
+            beam_req_idxs,
+            beam_prefix_lens,
+            beam_beam_widths,
+            beam_decode_steps,
+            beam_cache_lens,
+            beam_q_start_offsets,
         )
 
     def _build_std_mappings(self, std_reqs: list, q_starts: list, seq_lens_cpu_list: list[int]):
@@ -313,38 +313,38 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         return std_indices, std_q_lens, std_kv_lens, std_req_idxs, npu_std_actual_seq_lengths_q_host, npu_std_actual_seq_lengths_kv_host
 
-    def _build_mega_mappings(
+    def _build_beam_mappings(
         self,
-        mega_req_idxs,
-        mega_prefix_lens,
-        mega_beam_widths,
-        mega_decode_steps,
-        mega_cache_lens,
-        mega_q_start_offsets,
+        beam_req_idxs,
+        beam_prefix_lens,
+        beam_beam_widths,
+        beam_decode_steps,
+        beam_cache_lens,
+        beam_q_start_offsets,
         q_starts,
         common_attn_metadata,
     ):
-        mega_prefix_indices = []
-        mega_prefix_q_lens = []
-        mega_prefix_seq_lens_list = []
+        beam_prefix_indices = []
+        beam_prefix_q_lens = []
+        beam_prefix_seq_lens_list = []
 
-        mega_suffix_q_lens = []
-        mega_suffix_seq_lens_list = []
-        mega_prefix_block_tables = []
-        mega_suffix_slot_mapping_out_list = []
+        beam_suffix_q_lens = []
+        beam_suffix_seq_lens_list = []
+        beam_prefix_block_tables = []
+        beam_suffix_slot_mapping_out_list = []
 
         offset = 0
-        max_prefix_len = max(mega_prefix_lens) if mega_prefix_lens else 0
+        max_prefix_len = max(beam_prefix_lens) if beam_prefix_lens else 0
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
         out_slot = 0
         for req_idx, prefix_len, w, steps, cache_len, q_offset in zip(
-            mega_req_idxs,
-            mega_prefix_lens,
-            mega_beam_widths,
-            mega_decode_steps,
-            mega_cache_lens,
-            mega_q_start_offsets,
+            beam_req_idxs,
+            beam_prefix_lens,
+            beam_beam_widths,
+            beam_decode_steps,
+            beam_cache_lens,
+            beam_q_start_offsets,
         ):
             q_start = q_starts[req_idx] + q_offset
             q_end = q_starts[req_idx + 1]
@@ -375,9 +375,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 else:
                     prefix_groups.append([q_curr, b_uncached, b_prefix_len])
 
-                mega_suffix_slot_mapping_out_list.extend(full_mapping)
-                mega_suffix_q_lens.append(b_uncached)
-                mega_suffix_seq_lens_list.append(b_suffix_len)
+                beam_suffix_slot_mapping_out_list.extend(full_mapping)
+                beam_suffix_q_lens.append(b_uncached)
+                beam_suffix_seq_lens_list.append(b_suffix_len)
 
                 b_cache_len += b_uncached
                 offset += b_suffix_len
@@ -386,31 +386,31 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 out_slot += b_uncached
 
             for group_q_start, group_q_len, group_cache_len in prefix_groups:
-                mega_prefix_indices.extend(range(group_q_start, group_q_start + group_q_len))
-                mega_prefix_q_lens.append(group_q_len)
-                mega_prefix_seq_lens_list.append(group_cache_len)
-                mega_prefix_block_tables.append(bt[:max_prefix_blocks_count])
+                beam_prefix_indices.extend(range(group_q_start, group_q_start + group_q_len))
+                beam_prefix_q_lens.append(group_q_len)
+                beam_prefix_seq_lens_list.append(group_cache_len)
+                beam_prefix_block_tables.append(bt[:max_prefix_blocks_count])
 
         npu_prefix_actual_seq_lengths_q_host = None
         npu_prefix_actual_seq_lengths_kv_host = None
-        if NPU_DEVICE and mega_prefix_q_lens:
-            npu_prefix_actual_seq_lengths_q_host = np.cumsum(mega_prefix_q_lens).tolist()
-            npu_prefix_actual_seq_lengths_kv_host = list(mega_prefix_seq_lens_list)
+        if NPU_DEVICE and beam_prefix_q_lens:
+            npu_prefix_actual_seq_lengths_q_host = np.cumsum(beam_prefix_q_lens).tolist()
+            npu_prefix_actual_seq_lengths_kv_host = list(beam_prefix_seq_lens_list)
 
         npu_suffix_actual_seq_lengths_q_host = None
         npu_suffix_actual_seq_lengths_kv_host = None
-        if NPU_DEVICE and mega_suffix_q_lens:
-            npu_suffix_actual_seq_lengths_q_host = np.cumsum(mega_suffix_q_lens).tolist()
-            npu_suffix_actual_seq_lengths_kv_host = np.cumsum(mega_suffix_seq_lens_list).tolist()
+        if NPU_DEVICE and beam_suffix_q_lens:
+            npu_suffix_actual_seq_lengths_q_host = np.cumsum(beam_suffix_q_lens).tolist()
+            npu_suffix_actual_seq_lengths_kv_host = np.cumsum(beam_suffix_seq_lens_list).tolist()
 
         return (
-            mega_prefix_indices,
-            mega_prefix_q_lens,
-            mega_prefix_seq_lens_list,
-            mega_suffix_q_lens,
-            mega_suffix_seq_lens_list,
-            mega_prefix_block_tables,
-            mega_suffix_slot_mapping_out_list,
+            beam_prefix_indices,
+            beam_prefix_q_lens,
+            beam_prefix_seq_lens_list,
+            beam_suffix_q_lens,
+            beam_suffix_seq_lens_list,
+            beam_prefix_block_tables,
+            beam_suffix_slot_mapping_out_list,
             npu_prefix_actual_seq_lengths_q_host,
             npu_prefix_actual_seq_lengths_kv_host,
             npu_suffix_actual_seq_lengths_q_host,
@@ -447,7 +447,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             )
         return None, None, None, 0, 0, None
 
-    def _create_mega_tensors(
+    def _create_beam_tensors(
         self,
         common_attn_metadata,
         prefix_indices,
@@ -560,22 +560,22 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         device = self.device
         block_size = self.block_size
         num_reqs = common_attn_metadata.num_reqs
-        mega_info = MEGA_DATA_VAR.get()
-        mega_data = mega_info["mega_data"] if mega_info else {}
-        req_ids = mega_info["req_ids"] if mega_info else []
+        beam_info = BEAM_DATA_VAR.get()
+        beam_data = beam_info["beam_data"] if beam_info else {}
+        req_ids = beam_info["req_ids"] if beam_info else []
 
         q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
         seq_lens_cpu_list = common_attn_metadata.seq_lens.cpu().tolist()
 
         (
             std_reqs,
-            mega_req_idxs,
-            mega_prefix_lens,
-            mega_beam_widths,
-            mega_decode_steps,
-            mega_cache_lens,
-            mega_q_start_offsets,
-        ) = self._segment_requests(num_reqs, req_ids, mega_data, q_starts)
+            beam_req_idxs,
+            beam_prefix_lens,
+            beam_beam_widths,
+            beam_decode_steps,
+            beam_cache_lens,
+            beam_q_start_offsets,
+        ) = self._segment_requests(num_reqs, req_ids, beam_data, q_starts)
 
         (
             std_indices,
@@ -598,13 +598,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             npu_prefix_actual_seq_lengths_kv_host,
             npu_suffix_actual_seq_lengths_q_host,
             npu_suffix_actual_seq_lengths_kv_host,
-        ) = self._build_mega_mappings(
-            mega_req_idxs,
-            mega_prefix_lens,
-            mega_beam_widths,
-            mega_decode_steps,
-            mega_cache_lens,
-            mega_q_start_offsets,
+        ) = self._build_beam_mappings(
+            beam_req_idxs,
+            beam_prefix_lens,
+            beam_beam_widths,
+            beam_decode_steps,
+            beam_cache_lens,
+            beam_q_start_offsets,
             q_starts,
             common_attn_metadata,
         )
@@ -635,7 +635,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_k,
             suffix_max_q_len,
             prefix_scheduler_metadata,
-        ) = self._create_mega_tensors(
+        ) = self._create_beam_tensors(
             common_attn_metadata,
             prefix_indices,
             prefix_q_lens,
