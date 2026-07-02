@@ -704,138 +704,137 @@ def _beam_collapse_bookkeeping(runner,
     num_logical_requests = len(collapsed_req_ids_copy)
 
     if sampler_output is not None:
-        if sampler_output is not None:
-            st_ids = sampler_output.sampled_token_ids
-            lp_tensors = sampler_output.logprobs_tensors
-            if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
-                orig_lps = lp_tensors.logprobs
-                orig_lp_ids = lp_tensors.logprob_token_ids
-                orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
-                actual_K = orig_lps.shape[1]
+        st_ids = sampler_output.sampled_token_ids
+        lp_tensors = sampler_output.logprobs_tensors
+        if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
+            orig_lps = lp_tensors.logprobs
+            orig_lp_ids = lp_tensors.logprob_token_ids
+            orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
+            actual_K = orig_lps.shape[1]
 
-                max_chained_dim = 0
-                for req_id, _, W, *_ in request_row_configs:
-                    if req_id is not None and req_id in beam_data:
-                        m_width = beam_data[req_id].get("beam_beam_width", 1)
-                        needed_dim = m_width * actual_K
-                    else:
-                        needed_dim = W * actual_K
-                    if needed_dim > max_chained_dim:
-                        max_chained_dim = needed_dim
+            max_chained_dim = 0
+            for req_id, _, W, *_ in request_row_configs:
+                if req_id is not None and req_id in beam_data:
+                    m_width = beam_data[req_id].get("beam_beam_width", 1)
+                    needed_dim = m_width * actual_K
+                else:
+                    needed_dim = W * actual_K
+                if needed_dim > max_chained_dim:
+                    max_chained_dim = needed_dim
 
-                final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
-                    request_row_configs,
-                    max_chained_dim,
-                    actual_K,
-                    orig_lps,
-                    orig_lp_ids,
-                    orig_ranks,
-                    st_ids,
-                )
-                if not hasattr(runner, "_beam_logprobs_cache"):
-                    runner._beam_logprobs_cache = {}
+            final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
+                request_row_configs,
+                max_chained_dim,
+                actual_K,
+                orig_lps,
+                orig_lp_ids,
+                orig_ranks,
+                st_ids,
+            )
+            if not hasattr(runner, "_beam_logprobs_cache"):
+                runner._beam_logprobs_cache = {}
 
-                req_id_to_config = {
-                    r[0]: (r[2], r[3]) for r in request_row_configs if r[0] is not None
-                }
+            req_id_to_config = {
+                r[0]: (r[2], r[3]) for r in request_row_configs if r[0] is not None
+            }
 
-                for idx, req_id in enumerate(collapsed_req_ids_copy):
-                    mdata = beam_data.get(req_id)
-                    if mdata and mdata.get("is_beam_decode", False):
-                        W_logits, active_beams = req_id_to_config.get(req_id, (0, []))
-                        total_beam_width = mdata.get("beam_beam_width", 1)
+            for idx, req_id in enumerate(collapsed_req_ids_copy):
+                mdata = beam_data.get(req_id)
+                if mdata and mdata.get("is_beam_decode", False):
+                    W_logits, active_beams = req_id_to_config.get(req_id, (0, []))
+                    total_beam_width = mdata.get("beam_beam_width", 1)
 
-                        if W_logits > 0:
-                            # ---------------------------------------------------------------------
-                            # FAST-PATH: This chunk contains ALL beams directly (No Split occurred)
-                            # ---------------------------------------------------------------------
-                            if W_logits == total_beam_width:
-                                # Clean up stale entries left behind by older preempted/aborted steps
-                                if req_id in runner._beam_logprobs_cache:
-                                    del runner._beam_logprobs_cache[req_id]
-
-                                # Skip all caching loops! final_lps[idx] is already fully populated.
-                                continue
-
-                            # ---------------------------------------------------------------------
-                            # SLOW-PATH: Handled split chunked prefills across steps
-                            # ---------------------------------------------------------------------
-                            # Extract this chunk's output elements
-                            actual_lps = final_lps[idx, : W_logits * actual_K].view(
-                                W_logits, actual_K
-                            )
-                            actual_lp_ids = (
-                                final_lp_ids[idx, : W_logits * actual_K].view(W_logits, actual_K)
-                                if final_lp_ids is not None
-                                else None
-                            )
-                            actual_ranks = (
-                                final_ranks[idx, :W_logits] if final_ranks is not None else None
-                            )
-
-                            # Initialize pre-allocated tensor cache matrix structures only if needed
-                            if req_id not in runner._beam_logprobs_cache:
-                                runner._beam_logprobs_cache[req_id] = {
-                                    "lps": torch.full(
-                                        (total_beam_width, actual_K),
-                                        float("-inf"),
-                                        device=orig_lps.device,
-                                        dtype=orig_lps.dtype,
-                                    ),
-                                    "lp_ids": torch.zeros(
-                                        (total_beam_width, actual_K),
-                                        dtype=orig_lp_ids.tensor.dtype
-                                        if hasattr(orig_lp_ids, "tensor")
-                                        else orig_lps.dtype,
-                                        device=orig_lps.device,
-                                    )
-                                    if orig_lp_ids is not None
-                                    else None,
-                                    "ranks": torch.zeros(
-                                        total_beam_width, dtype=torch.long, device=orig_lps.device
-                                    )
-                                    if orig_ranks is not None
-                                    else None,
-                                    "completed_beams": set(),
-                                }
-
-                            cache_entry = runner._beam_logprobs_cache[req_id]
-
-                            # Scatter write chunk data lines directly to their physical beam slots
-                            for local_row_idx, physical_beam_id in enumerate(active_beams):
-                                if physical_beam_id not in cache_entry["completed_beams"]:
-                                    cache_entry["lps"][physical_beam_id] = actual_lps[local_row_idx]
-                                    if actual_lp_ids is not None:
-                                        cache_entry["lp_ids"][physical_beam_id] = actual_lp_ids[
-                                            local_row_idx
-                                        ]
-                                    if actual_ranks is not None:
-                                        cache_entry["ranks"][physical_beam_id] = actual_ranks[
-                                            local_row_idx
-                                        ]
-                                    cache_entry["completed_beams"].add(physical_beam_id)
-
-                            # Evict and overwrite target boundaries only when ALL unique structural slots are filled
-                            if len(cache_entry["completed_beams"]) >= total_beam_width:
-                                final_lps[idx].copy_(cache_entry["lps"].view(-1))
-                                if final_lp_ids is not None:
-                                    final_lp_ids[idx].copy_(cache_entry["lp_ids"].view(-1))
-                                if final_ranks is not None:
-                                    final_ranks[idx, :total_beam_width].copy_(cache_entry["ranks"])
-
+                    if W_logits > 0:
+                        # ---------------------------------------------------------------------
+                        # FAST-PATH: This chunk contains ALL beams directly (No Split occurred)
+                        # ---------------------------------------------------------------------
+                        if W_logits == total_beam_width:
+                            # Clean up stale entries left behind by older preempted/aborted steps
+                            if req_id in runner._beam_logprobs_cache:
                                 del runner._beam_logprobs_cache[req_id]
 
-                # Safely resizes the original tensor wrapper and copies the elements in place
-                st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
-                lp_tensors.logprobs.resize_(final_lps.shape).copy_(final_lps)
+                            # Skip all caching loops! final_lps[idx] is already fully populated.
+                            continue
 
-                if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
-                    lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
-                if orig_ranks is not None and final_ranks is not None:
-                    clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
-                    lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
-                        clean_ranks_slice
-                    )
+                        # ---------------------------------------------------------------------
+                        # SLOW-PATH: Handled split chunked prefills across steps
+                        # ---------------------------------------------------------------------
+                        # Extract this chunk's output elements
+                        actual_lps = final_lps[idx, : W_logits * actual_K].view(
+                            W_logits, actual_K
+                        )
+                        actual_lp_ids = (
+                            final_lp_ids[idx, : W_logits * actual_K].view(W_logits, actual_K)
+                            if final_lp_ids is not None
+                            else None
+                        )
+                        actual_ranks = (
+                            final_ranks[idx, :W_logits] if final_ranks is not None else None
+                        )
+
+                        # Initialize pre-allocated tensor cache matrix structures only if needed
+                        if req_id not in runner._beam_logprobs_cache:
+                            runner._beam_logprobs_cache[req_id] = {
+                                "lps": torch.full(
+                                    (total_beam_width, actual_K),
+                                    float("-inf"),
+                                    device=orig_lps.device,
+                                    dtype=orig_lps.dtype,
+                                ),
+                                "lp_ids": torch.zeros(
+                                    (total_beam_width, actual_K),
+                                    dtype=orig_lp_ids.tensor.dtype
+                                    if hasattr(orig_lp_ids, "tensor")
+                                    else torch.long,
+                                    device=orig_lps.device,
+                                )
+                                if orig_lp_ids is not None
+                                else None,
+                                "ranks": torch.zeros(
+                                    total_beam_width, dtype=torch.long, device=orig_lps.device
+                                )
+                                if orig_ranks is not None
+                                else None,
+                                "completed_beams": set(),
+                            }
+
+                        cache_entry = runner._beam_logprobs_cache[req_id]
+
+                        # Scatter write chunk data lines directly to their physical beam slots
+                        for local_row_idx, physical_beam_id in enumerate(active_beams):
+                            if physical_beam_id not in cache_entry["completed_beams"]:
+                                cache_entry["lps"][physical_beam_id] = actual_lps[local_row_idx]
+                                if actual_lp_ids is not None:
+                                    cache_entry["lp_ids"][physical_beam_id] = actual_lp_ids[
+                                        local_row_idx
+                                    ]
+                                if actual_ranks is not None:
+                                    cache_entry["ranks"][physical_beam_id] = actual_ranks[
+                                        local_row_idx
+                                    ]
+                                cache_entry["completed_beams"].add(physical_beam_id)
+
+                        # Evict and overwrite target boundaries only when ALL unique structural slots are filled
+                        if len(cache_entry["completed_beams"]) >= total_beam_width:
+                            final_lps[idx].copy_(cache_entry["lps"].view(-1))
+                            if final_lp_ids is not None:
+                                final_lp_ids[idx].copy_(cache_entry["lp_ids"].view(-1))
+                            if final_ranks is not None:
+                                final_ranks[idx, :total_beam_width].copy_(cache_entry["ranks"])
+
+                            del runner._beam_logprobs_cache[req_id]
+
+            # Safely resizes the original tensor wrapper and copies the elements in place
+            st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
+            lp_tensors.logprobs.resize_(final_lps.shape).copy_(final_lps)
+
+            if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
+                lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
+            if orig_ranks is not None and final_ranks is not None:
+                clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
+                lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
+                    clean_ranks_slice
+                )
 
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
 
@@ -944,66 +943,52 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
 
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
-    """NPU ``_prepare_inputs`` wrapper.
-
-    Signature: ``(scheduler_output, intermediate_tensors=None)``.
-    Returns the NPU 7-tuple
-    ``(attn_metadata, num_scheduled_tokens, num_input_tokens,
-    num_tokens_across_dp, logits_indices, spec_decode_metadata,
-    max_num_scheduled_tokens)``.
-
-    Two NPU-specific differences vs the GPU wrapper:
-
-    - The NPU attention metadata builder runs *inside* the original
-      ``_prepare_inputs``, so Job A (publishing ``req_ids`` to the contextvar)
-      must happen *before* delegating, not after.
-    - ``_prepare_inputs`` is called from ``execute_model``, while sampling and
-      ``_bookkeeping_sync`` run in a separate ``sample_tokens`` call. If an
-      early return skips bookkeeping, a stale ``InputBatchProxy`` could survive
-      to the next step, so we defensively un-proxy at entry.
-
-    The per-beam RoPE position overwrite needs no extra device copy: NPU
-    ``self.positions`` is a ``CpuGpuBuffer`` and ``_overwrite_position_ids``
-    writes the ``.gpu`` (device) tensor in place, which ``_preprocess`` reads.
-    The physical ``slot_mapping`` is materialized from linear positions inside
-    the original before the overwrite, so it is unaffected.
-    """
-
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(self, scheduler_output, intermediate_tensors=None):
-        # Drop a stale proxy left over from a prior step (see docstring).
         if isinstance(self.input_batch, InputBatchProxy):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
 
-        # Job A: publish req_ids BEFORE the original builds attention metadata.
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        
+        # --- NPU FIX: Remap inputs BEFORE the original runs ---
+        if beam_data:
+            # Extract num_scheduled_tokens from scheduler_output upfront
+            # (In vLLM V1, this is typically a dict or list mapping batch entries to token counts)
+            num_scheduled_tokens = list(scheduler_output.num_scheduled_tokens.values())
+            
+            # This mutates position IDs and installs InputBatchProxy *before* the internal NPU builder runs
+            new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
+            forced_logits_tensor = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
+        else:
+            forced_logits_tensor = None
+
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
+        # Now, when the original runs, its internal attention builder reads from our proxy seamlessly
         out = _orig_prepare_inputs(self, scheduler_output, intermediate_tensors)
 
-        beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data:
             return out
 
+        # Unpack the original output tuple
         (
             attn_metadata,
             num_scheduled_tokens,
             num_input_tokens,
             num_tokens_across_dp,
-            logits_indices,
+            logits_indices, # This is the original stale tensor
             spec_decode_metadata,
             max_num_scheduled_tokens,
         ) = out
 
-        new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
-        logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
-
+        # Overwrite the stale logits_indices with our multi-beam expanded version
         return (
             attn_metadata,
             num_scheduled_tokens,
             num_input_tokens,
             num_tokens_across_dp,
-            logits_indices,
+            forced_logits_tensor, # Pass the correct expanded tensor out
             spec_decode_metadata,
             max_num_scheduled_tokens,
         )
