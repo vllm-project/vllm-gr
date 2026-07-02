@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared types for vllm_gr engine patches.
 
-Defines MegaRequestStepUpdate
+Defines BeamRequestStepUpdate
 """
 
 from __future__ import annotations
@@ -14,11 +14,11 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
 
 # ---------------------------------------------------------------------------
-# MegaRequestStepUpdate — Improved Beam handling by a single Mega request
+# BeamRequestStepUpdate — Improved Beam handling by a single Beam request
 # ---------------------------------------------------------------------------
 
 
-class MegaRequestStepUpdate(
+class BeamRequestStepUpdate(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
     omit_defaults=True,  # type: ignore[call-arg]

@@ -100,8 +100,8 @@ def prepare_inputs(
     scale = float(1.0 / (head_size**0.5))
 
     shared_tokens_len = kv_seq_len - suffix_kv_len
-    mega_seq_len = shared_tokens_len + beam_width * suffix_kv_len
-    blocks_per_req = (mega_seq_len + block_size - 1) // block_size
+    beam_seq_len = shared_tokens_len + beam_width * suffix_kv_len
+    blocks_per_req = (beam_seq_len + block_size - 1) // block_size
 
     num_reqs = batch_size
 
@@ -134,7 +134,7 @@ def prepare_inputs(
 
     seq_lens_list = []
     for i in range(num_reqs):
-        seq_lens_list.append(mega_seq_len)
+        seq_lens_list.append(beam_seq_len)
 
     seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
 
@@ -167,7 +167,7 @@ def prepare_inputs(
         scale=scale,
         num_reqs=num_reqs,
         num_seqs=num_seqs,
-        max_seq_len=mega_seq_len,
+        max_seq_len=beam_seq_len,
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         batch_size=batch_size,
@@ -283,7 +283,7 @@ def run_cascade_beam_attention(
     device = inputs.query.device
 
     from vllm_gr.v1.attention.backends.beam_attn import (
-        MEGA_DATA_VAR,
+        BEAM_DATA_VAR,
         BeamAttentionImpl,
         BeamAttentionMetadataBuilder,
     )
@@ -313,22 +313,22 @@ def run_cascade_beam_attention(
 
     common_attn_metadata = MockCommonAttentionMetadata(inputs)
 
-    mega_info: dict[str, Any] = {
-        "mega_data": {},
+    beam_info: dict[str, Any] = {
+        "beam_data": {},
         "req_ids": [f"req_{i}" for i in range(inputs.num_reqs)],
     }
 
-    mega_data = cast(dict[str, Any], mega_info["mega_data"])
+    beam_data = cast(dict[str, Any], beam_info["beam_data"])
     for i in range(inputs.num_reqs):
-        mega_data[f"req_{i}"] = {
-            "is_mega_decode": True,
+        beam_data[f"req_{i}"] = {
+            "is_beam_decode": True,
             "prefix_len": inputs.shared_tokens_len,
-            "mega_beam_width": inputs.beam_width,
-            "mega_decode_steps": inputs.suffix_kv_len,
+            "beam_beam_width": inputs.beam_width,
+            "beam_decode_steps": inputs.suffix_kv_len,
             "cache_len": inputs.shared_tokens_len // inputs.block_size * inputs.block_size,
         }
 
-    token = MEGA_DATA_VAR.set(mega_info)
+    token = BEAM_DATA_VAR.set(beam_info)
 
     try:
         builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
@@ -348,7 +348,7 @@ def run_cascade_beam_attention(
             fast_build=False,
         )
     finally:
-        MEGA_DATA_VAR.reset(token)
+        BEAM_DATA_VAR.reset(token)
 
     impl = BeamAttentionImpl(
         num_heads=inputs.query.shape[1],

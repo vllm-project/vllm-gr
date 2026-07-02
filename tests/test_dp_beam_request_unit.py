@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for Data Parallelism support in mega-request beam search (no GPU required).
+"""Unit tests for Data Parallelism support in beam-request beam search (no GPU required).
 
 Tests cover the following DP beam search features:
-  - data_parallel_rank threading through beam_search → _mega_request_step
-  - DP-aware engine routing in add_requests_async / mega_request_step_update_async
+  - data_parallel_rank threading through beam_search → _beam_request_step
+  - DP-aware engine routing in add_requests_async / beam_request_step_update_async
   - FIRST_REQ coordinator notification
-  - reqs_in_flight tracking for batch and mega-request step
-  - MegaRequestStepUpdate.data_parallel_rank serialization
+  - reqs_in_flight tracking for batch and beam-request step
+  - BeamRequestStepUpdate.data_parallel_rank serialization
   - register_beam_output rank passthrough
-  - current_wave propagation via mega_request_step_update_async
-  - Cleanup (_mega_request_cleanup) passes data_parallel_rank
+  - current_wave propagation via beam_request_step_update_async
+  - Cleanup (_beam_request_cleanup) passes data_parallel_rank
 """
 
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
@@ -26,20 +26,20 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.entrypoints.openai.serving_engine import (
-    _mega_request_cleanup,
-    _mega_request_step,
+    _beam_request_cleanup,
+    _beam_request_step,
 )
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
-    mega_request_step_update_async,
+    beam_request_step_update_async,
 )
 from vllm_gr.v1.engine.core_client_patch import register_beam_output_fn
 from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
-from vllm_gr.v1.engine.types import MegaRequestStepUpdate
+from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 # Ensure custom enum members exist in this process.
 _add_enum_member("ADD_BATCH", b"\x05")
-_add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
+_add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -129,8 +129,8 @@ def _make_beam_update(
     prefix_len: int = 2,
     beam_width: int = 1,
     data_parallel_rank: int | None = None,
-) -> MegaRequestStepUpdate:
-    return MegaRequestStepUpdate(
+) -> BeamRequestStepUpdate:
+    return BeamRequestStepUpdate(
         session_id=session_id,
         parent_beam_ids=parent_beam_ids if parent_beam_ids is not None else ["p0"],
         child_beam_ids=child_beam_ids if child_beam_ids is not None else ["c0"],
@@ -204,16 +204,16 @@ class TestAddRequestsAsyncDP:
 
 
 # ===========================================================================
-# Section 2 — DP mega_request_step_update_async
+# Section 2 — DP beam_request_step_update_async
 # ===========================================================================
 
 
-class TestMegaRequestStepUpdateAsyncDP:
+class TestBeamRequestStepUpdateAsyncDP:
     def test_dp_beam_update_routes_by_rank(self) -> None:
         mock_self = _make_dp_client_mock(num_engines=3)
         update = _make_beam_update(data_parallel_rank=2, child_beam_ids=["c0"], pruned_ids=[])
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         mock_self._send_input.assert_awaited_once()
         engine_arg = mock_self._send_input.call_args[0][2]
@@ -223,7 +223,7 @@ class TestMegaRequestStepUpdateAsyncDP:
         mock_self = _make_dp_client_mock()
         update = _make_beam_update(data_parallel_rank=None)
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         # Engine argument to _send_input should be None
         engine_arg = mock_self._send_input.call_args[0][2]
@@ -240,7 +240,7 @@ class TestMegaRequestStepUpdateAsyncDP:
             beam_width=2,
         )
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         assert "new-0" in mock_self.reqs_in_flight
         assert "new-1" in mock_self.reqs_in_flight
@@ -261,7 +261,7 @@ class TestMegaRequestStepUpdateAsyncDP:
             beam_width=1,
         )
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         assert "old-0" not in mock_self.reqs_in_flight
         assert "old-1" in mock_self.reqs_in_flight
@@ -271,7 +271,7 @@ class TestMegaRequestStepUpdateAsyncDP:
         mock_self = _make_dp_client_mock(engines_running=False)
         update = _make_beam_update(data_parallel_rank=0)
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         mock_self.first_req_send_socket.send.assert_awaited_once()
 
@@ -279,7 +279,7 @@ class TestMegaRequestStepUpdateAsyncDP:
         mock_self = _make_dp_client_mock(engines_running=True)
         update = _make_beam_update(data_parallel_rank=0)
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         mock_self.first_req_send_socket.send.assert_not_awaited()
 
@@ -287,7 +287,7 @@ class TestMegaRequestStepUpdateAsyncDP:
         mock_self = _make_dp_client_mock(client_index=5)
         update = _make_beam_update(data_parallel_rank=0)
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         assert update.client_index == 5
 
@@ -332,27 +332,27 @@ class TestRegisterBeamOutputDP:
 
 
 # ===========================================================================
-# Section 4 — MegaRequestStepUpdate DP rank serialization
+# Section 4 — BeamRequestStepUpdate DP rank serialization
 # ===========================================================================
 
 
-class TestMegaRequestStepUpdateDPRank:
+class TestBeamRequestStepUpdateDPRank:
     def test_data_parallel_rank_survives_msgpack(self) -> None:
         update = _make_beam_update(data_parallel_rank=3)
         encoded = msgspec.msgpack.encode(update)
-        decoded = msgspec.msgpack.decode(encoded, type=MegaRequestStepUpdate)
+        decoded = msgspec.msgpack.decode(encoded, type=BeamRequestStepUpdate)
         assert decoded.data_parallel_rank == 3
 
     def test_data_parallel_rank_none_survives_msgpack(self) -> None:
         update = _make_beam_update(data_parallel_rank=None)
         encoded = msgspec.msgpack.encode(update)
-        decoded = msgspec.msgpack.decode(encoded, type=MegaRequestStepUpdate)
+        decoded = msgspec.msgpack.decode(encoded, type=BeamRequestStepUpdate)
         assert decoded.data_parallel_rank is None
 
     def test_data_parallel_rank_zero_survives_msgpack(self) -> None:
         update = _make_beam_update(data_parallel_rank=0)
         encoded = msgspec.msgpack.encode(update)
-        decoded = msgspec.msgpack.decode(encoded, type=MegaRequestStepUpdate)
+        decoded = msgspec.msgpack.decode(encoded, type=BeamRequestStepUpdate)
         assert decoded.data_parallel_rank == 0
 
 
@@ -364,29 +364,29 @@ class TestMegaRequestStepUpdateDPRank:
 class TestCleanupPassesRank:
     def test_cleanup_passes_data_parallel_rank(self) -> None:
         ec = MagicMock()
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
-        asyncio.run(_mega_request_cleanup(ec, "sess-0", ["x"], rank=1))
+        asyncio.run(_beam_request_cleanup(ec, "sess-0", ["x"], rank=1))
 
-        update: MegaRequestStepUpdate = ec.mega_request_step_update.call_args[0][0]
+        update: BeamRequestStepUpdate = ec.beam_request_step_update.call_args[0][0]
         assert update.data_parallel_rank == 1
 
     def test_cleanup_passes_none_rank(self) -> None:
         ec = MagicMock()
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
-        asyncio.run(_mega_request_cleanup(ec, "sess-0", ["x"], rank=None))
+        asyncio.run(_beam_request_cleanup(ec, "sess-0", ["x"], rank=None))
 
-        update = ec.mega_request_step_update.call_args[0][0]
+        update = ec.beam_request_step_update.call_args[0][0]
         assert update.data_parallel_rank is None
 
     def test_cleanup_sends_b0_message(self) -> None:
         ec = MagicMock()
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
-        asyncio.run(_mega_request_cleanup(ec, "sess-0", ["a", "b"], rank=0))
+        asyncio.run(_beam_request_cleanup(ec, "sess-0", ["a", "b"], rank=0))
 
-        update = ec.mega_request_step_update.call_args[0][0]
+        update = ec.beam_request_step_update.call_args[0][0]
         assert update.beam_width == 0
         assert set(update.pruned_ids) == {"a", "b"}
         assert update.session_id == "sess-0"
@@ -403,7 +403,7 @@ class TestCurrentWave:
         update = _make_beam_update(data_parallel_rank=0)
         update.current_wave = 0  # will be overwritten
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         assert update.current_wave == 9
 
@@ -412,7 +412,7 @@ class TestCurrentWave:
         update = _make_beam_update(data_parallel_rank=0)
         update.current_wave = 42
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         assert update.current_wave == 42
 
@@ -463,15 +463,15 @@ class TestAddRequestsAsyncNonDP:
         mock_self = _make_non_dp_client_mock()
         update = _make_beam_update(data_parallel_rank=None)
 
-        asyncio.run(mega_request_step_update_async(mock_self, update))
+        asyncio.run(beam_request_step_update_async(mock_self, update))
 
         call_args = mock_self._send_input.call_args[0]
-        assert call_args[0] is EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE
+        assert call_args[0] is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
         assert call_args[2] is None  # no engine
 
 
 # ===========================================================================
-# Section 8 — _mega_request_step passes rank
+# Section 8 — _beam_request_step passes rank
 # ===========================================================================
 
 
@@ -479,11 +479,11 @@ class TestStepFunctionsPassRank:
     def test_beam_request_step_passes_rank_in_update(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [SimpleNamespace(tokens=[10, 50])]
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="s",
                 fork_info=[(0, 50)],
@@ -500,17 +500,17 @@ class TestStepFunctionsPassRank:
             )
         )
 
-        update: MegaRequestStepUpdate = ec.mega_request_step_update.call_args[0][0]
+        update: BeamRequestStepUpdate = ec.beam_request_step_update.call_args[0][0]
         assert update.data_parallel_rank == 1
 
     def test_beam_request_step_none_rank_in_update(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [SimpleNamespace(tokens=[10, 50])]
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="s",
                 fork_info=[(0, 50)],
@@ -527,17 +527,17 @@ class TestStepFunctionsPassRank:
             )
         )
 
-        update = ec.mega_request_step_update.call_args[0][0]
+        update = ec.beam_request_step_update.call_args[0][0]
         assert update.data_parallel_rank is None
 
     def test_beam_request_step_register_beam_output_passes_rank(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.mega_request_step_update = AsyncMock()
+        ec.beam_request_step_update = AsyncMock()
 
         all_beams = [SimpleNamespace(tokens=[10, 50])]
         asyncio.run(
-            _mega_request_step(
+            _beam_request_step(
                 ec,
                 session_id="sess-2",
                 fork_info=[(0, 50)],

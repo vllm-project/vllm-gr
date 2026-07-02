@@ -28,7 +28,7 @@ from vllm_gr.inputs.data import GRPrompt, is_gr_prompt
 from vllm_gr.logger import init_logger
 from vllm_gr.outputs import GRRequestOutput
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
-from vllm_gr.v1.engine.types import MegaRequestStepUpdate
+from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 if TYPE_CHECKING:
     from vllm.beam_search import BeamSearchOutput
@@ -367,12 +367,12 @@ class GRLLM(LLM):
 
                 return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
 
-            def mega_request_cleanup(llm_engine, session_id, final_ids):
+            def beam_request_cleanup(llm_engine, session_id, final_ids):
                 if not final_ids:
                     return
                 try:
-                    llm_engine.engine_core.mega_request_step_update(
-                        MegaRequestStepUpdate(
+                    llm_engine.engine_core.beam_request_step_update(
+                        BeamRequestStepUpdate(
                             session_id=session_id,
                             parent_beam_ids=[],
                             child_beam_ids=[],
@@ -385,7 +385,7 @@ class GRLLM(LLM):
                     )
                 except Exception as e:
                     logger.error(
-                        "Failed to clear mega_request cache for session %s: %s", session_id, e
+                        "Failed to clear beam_request cache for session %s: %s", session_id, e
                     )
 
             has_catalog = getattr(self, "catalog", None) is not None
@@ -411,7 +411,7 @@ class GRLLM(LLM):
                     if len(instance.beams) == 0:
                         # This instance has no active beams (finished)
                         if j not in instance_completed_sessions and j in instance_prefill_id:
-                            mega_request_cleanup(
+                            beam_request_cleanup(
                                 llm_engine,
                                 instance_prefill_id[j],
                                 instance_prev_beam_internal_ids[j],
@@ -422,7 +422,7 @@ class GRLLM(LLM):
                     session_id = instance_prefill_id.get(j)
                     fork_info_j = instance_fork_info.get(j)
                     if token > 0 and fork_info_j is not None:
-                        # MEGA_REQUEST path
+                        # BEAM_REQUEST path
                         parent_beam_ids = []
                         child_beam_ids = []
                         beam_tokens = []
@@ -465,7 +465,7 @@ class GRLLM(LLM):
                             if pid not in used_parents
                         ]
 
-                        update = MegaRequestStepUpdate(
+                        update = BeamRequestStepUpdate(
                             session_id=session_id,
                             parent_beam_ids=parent_beam_ids,
                             child_beam_ids=child_beam_ids,
@@ -479,7 +479,7 @@ class GRLLM(LLM):
                             else tokenizer.eos_token_id,
                             lora_request=instance.beams[0].lora_request,
                         )
-                        llm_engine.engine_core.mega_request_step_update(update)
+                        llm_engine.engine_core.beam_request_step_update(update)
 
                         # Update tracking variables
                         instance_prev_beam_internal_ids[j] = child_beam_ids
@@ -549,7 +549,7 @@ class GRLLM(LLM):
                         continue
 
                     if result.outputs[0].finish_reason == "error":
-                        mega_request_cleanup(
+                        beam_request_cleanup(
                             llm_engine,
                             session_id,
                             instance_prev_beam_internal_ids[j],
@@ -690,7 +690,7 @@ class GRLLM(LLM):
 
             for j, instance in enumerate(instances_batch):
                 if j not in instance_completed_sessions and j in instance_prefill_id:
-                    mega_request_cleanup(
+                    beam_request_cleanup(
                         llm_engine,
                         instance_prefill_id[j],
                         instance_prev_beam_internal_ids[j],

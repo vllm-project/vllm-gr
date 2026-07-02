@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Monkey-patches for AsyncMPClient / AsyncLLM to support
-ADD_BATCH and MEGA_REQUEST_STEP_UPDATE."""
+ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ from vllm.logger import init_logger
 
 from vllm_gr.v1.engine.async_llm import (
     _add_requests_batch_fn,
-    mega_request_step_update_fn,
+    beam_request_step_update_fn,
     prepare_request_fn,
     register_beam_output_fn,
 )
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
-    mega_request_step_update_async,
+    beam_request_step_update_async,
 )
 
 logger = init_logger(__name__)
@@ -38,10 +38,10 @@ def sync_mp_add_requests(self, requests, force_batch=False):
     self._send_input(EngineCoreRequestType.ADD_BATCH, requests)
 
 
-def sync_mp_mega_request_step_update(self, update):
+def sync_mp_beam_request_step_update(self, update):
     from vllm.v1.engine import EngineCoreRequestType
 
-    self._send_input(EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE, update)
+    self._send_input(EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, update)
 
 
 def inproc_add_requests(self, requests, force_batch=False):
@@ -61,19 +61,19 @@ def inproc_add_requests(self, requests, force_batch=False):
         self.engine_core.input_queue.put_nowait((EngineCoreRequestType.ADD, preprocessed))
 
 
-def inproc_mega_request_step_update(self, update):
-    self.engine_core._handle_mega_request_step_update(update)
+def inproc_beam_request_step_update(self, update):
+    self.engine_core._handle_beam_request_step_update(update)
 
 
 # ---------------------------------------------------------------------------
-# apply_batch_fork_patches — wire ADD_BATCH / MEGA_REQUEST_STEP_UPDATE into client classes
+# apply_batch_fork_patches — wire ADD_BATCH / BEAM_REQUEST_STEP_UPDATE into client classes
 # ---------------------------------------------------------------------------
 
 
 def apply_batch_fork_patches():
-    """Monkey-patch AsyncMPClient and AsyncLLM with ADD_BATCH/MEGA_REQUEST_STEP_UPDATE
+    """Monkey-patch AsyncMPClient and AsyncLLM with ADD_BATCH/BEAM_REQUEST_STEP_UPDATE
     methods. Must be called after the enum members exist (i.e. after
-    _add_enum_member has been called for ADD_BATCH and MEGA_REQUEST_STEP_UPDATE in the
+    _add_enum_member has been called for ADD_BATCH and BEAM_REQUEST_STEP_UPDATE in the
     parent process)."""
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
@@ -82,22 +82,22 @@ def apply_batch_fork_patches():
 
     # Ensure enum members exist in parent process
     _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
 
     # Patch AsyncMPClient
     AsyncMPClient.add_requests_async = add_requests_async
-    AsyncMPClient.mega_request_step_update_async = mega_request_step_update_async
+    AsyncMPClient.beam_request_step_update_async = beam_request_step_update_async
 
     # Patch AsyncLLM
     AsyncLLM.prepare_request = prepare_request_fn
     AsyncLLM._add_requests_batch = _add_requests_batch_fn
     AsyncLLM.register_beam_output = register_beam_output_fn
-    AsyncLLM.mega_request_step_update = mega_request_step_update_fn
+    AsyncLLM.beam_request_step_update = beam_request_step_update_fn
 
     # Patch SyncMPClient
     SyncMPClient.add_requests = sync_mp_add_requests
-    SyncMPClient.mega_request_step_update = sync_mp_mega_request_step_update
+    SyncMPClient.beam_request_step_update = sync_mp_beam_request_step_update
 
     # Patch InprocClient
     InprocClient.add_requests = inproc_add_requests
-    InprocClient.mega_request_step_update = inproc_mega_request_step_update
+    InprocClient.beam_request_step_update = inproc_beam_request_step_update
