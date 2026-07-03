@@ -302,22 +302,38 @@ def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optiona
     return gpu_positions, cpu_positions
 
 
-def _overwrite_position_ids(
-    st: int,
-    b_uncached: int,
-    curr_offset: int,
+def _write_position_segments(
+    token_offset: int,
+    seg_starts: List[int],
+    seg_lens: List[int],
     gpu_pos: Optional[torch.Tensor],
     cpu_pos: Optional[torch.Tensor],
 ) -> None:
-    """Overwrites positional indexing structures in place on targets."""
+    """Write concatenated per-beam position-id segments in one vectorized pass.
+
+    Each active beam contributes ``range(st_b, st_b + len_b)``. The previous
+    implementation emitted one ``torch.arange`` per beam (up to ``beam_width``
+    GPU kernel launches per call); here we build the whole concatenation on CPU
+    with a handful of vectorized ops and a single host->device copy for
+    ``gpu_pos``. The result is element-wise identical to the per-beam writes.
+    """
+    if not seg_lens:
+        return
+    lens = torch.tensor(seg_lens, dtype=torch.int64)
+    total = int(lens.sum().item())
+    if total == 0:
+        return
+    starts = torch.tensor(seg_starts, dtype=torch.int64)
+    # Output offset where each segment begins (prefix sum minus own length).
+    seg_off = torch.cumsum(lens, dim=0) - lens
+    gidx = torch.arange(total, dtype=torch.int64)
+    seg_off_rep = torch.repeat_interleave(seg_off, lens)
+    starts_rep = torch.repeat_interleave(starts, lens)
+    positions = starts_rep + (gidx - seg_off_rep)
     if gpu_pos is not None:
-        gpu_pos[curr_offset : curr_offset + b_uncached] = torch.arange(
-            st, st + b_uncached, dtype=gpu_pos.dtype, device=gpu_pos.device
-        )
+        gpu_pos[token_offset : token_offset + total] = positions
     if cpu_pos is not None:
-        cpu_pos[curr_offset : curr_offset + b_uncached] = torch.arange(
-            st, st + b_uncached, dtype=cpu_pos.dtype, device=torch.device("cpu")
-        )
+        cpu_pos[token_offset : token_offset + total] = positions
 
 
 def _process_beam_decode_request(
@@ -340,6 +356,8 @@ def _process_beam_decode_request(
     valid_rows_for_req = 0
     logits_row_cnt = 0
     b_cache_len = cache_len
+    seg_starts: List[int] = []
+    seg_lens: List[int] = []
     for b in range(beam_width):
         if chunk_budget <= 0:
             break
@@ -350,7 +368,8 @@ def _process_beam_decode_request(
 
         if b_uncached > 0:
             st = cache_len if (prefix_len >= b_cache_len) else (prefix_len + b_past_suffix)
-            _overwrite_position_ids(st, b_uncached, curr_offset, gpu_pos, cpu_pos)
+            seg_starts.append(st)
+            seg_lens.append(b_uncached)
 
             if b_past_suffix + b_uncached >= decode_steps:
                 new_logits_indices.append(curr_offset + b_uncached - 1)
@@ -362,6 +381,10 @@ def _process_beam_decode_request(
             curr_offset += b_uncached
             chunk_budget -= b_uncached
             b_cache_len += b_uncached
+
+    # Batched position-id write: one vectorized build (CPU) + single H2D copy
+    # instead of one torch.arange per beam (up to beam_width GPU launches/call).
+    _write_position_segments(token_offset, seg_starts, seg_lens, gpu_pos, cpu_pos)
 
     return valid_rows_for_req, logits_row_cnt, curr_offset, active_beam_ids
 
