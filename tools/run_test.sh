@@ -1,5 +1,30 @@
 #!/bin/bash
 set -euo pipefail
+
+RUN_WHEEL=false
+
+usage() {
+    echo "Usage: $0 [--wheel]"
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --wheel)
+            RUN_WHEEL=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
 # test development suite
 ./tests/development/test_resource.sh
 # test pre-commit
@@ -24,9 +49,21 @@ if [ "${npu_state:-false}" == "true" ]; then
     TORCH_MULTIPROCESSING_METHOD="spawn" \
     LD_LIBRARY_PATH="${CONDA_PREFIX:-}/lib:${LD_LIBRARY_PATH:-}" \
     ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
-    python3 -m pytest -x --run-slow --durations=10 -s tests
+    bash tools/pre_commit/run_tests.sh
 else
     NODEENV_SSL_NO_VERIFY=1 \
     CUDA_VISIBLE_DEVICES=$idle_gpu \
     pre-commit run --all-files
+fi
+
+if [[ "$RUN_WHEEL" == "true" ]]; then
+    if [[ "${npu_state:-false}" == "true" ]]; then
+        VLLM_GR_TARGET_DEVICE=npu \
+        ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
+        ./tools/run_wheel_smoke_test.sh --python python3
+    else
+        VLLM_GR_TARGET_DEVICE=cuda \
+        CUDA_VISIBLE_DEVICES=$idle_gpu \
+        ./tools/run_wheel_smoke_test.sh --python python3
+    fi
 fi
