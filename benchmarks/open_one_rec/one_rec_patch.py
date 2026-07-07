@@ -8,8 +8,10 @@ import traceback
 from typing import Literal
 
 import aiohttp
+import requests
 import vllm
 import vllm.benchmarks.datasets
+import vllm.benchmarks.serve
 import vllm.benchmarks.throughput
 from tqdm import tqdm
 from vllm import LLM
@@ -25,6 +27,8 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     _update_payload_common,
     _validate_api_url,
 )
+from vllm.benchmarks.serve import add_cli_args as original_serve_add_cli_args
+from vllm.benchmarks.serve import main as original_serve_main
 from vllm.benchmarks.throughput import add_cli_args as original_add_cli_args
 from vllm.benchmarks.throughput import get_requests as original_get_requests
 from vllm.benchmarks.throughput import main as original_main
@@ -37,8 +41,85 @@ from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 # Constants
 # ============================================================================
 logger = logging.getLogger(__name__)
+HTTP_OK = 200
 DATASET_NAME = "onerec"
 DEFAULT_TASK_TYPES = "ad,product,label_cond,video,interactive,label_pred"
+
+
+# ============================================================================
+# Prometheus Metrics Collection
+# ============================================================================
+def _fetch_prometheus_metrics(metrics_url: str) -> dict:
+    """Fetch beam search metrics from the /metrics endpoint using Prometheus exposition format."""
+    try:
+        response = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if response.status_code != HTTP_OK:
+            return {}
+
+        metrics = {
+            "prefill_time": 0.0,
+            "decode_time": 0.0,
+            "sort_time": 0.0,
+            "requests": 0.0,
+            "beams": 0.0,
+        }
+
+        metric_names = {
+            "prefill_time": "vllm_gr_beam_search_prefill_time_seconds_total",
+            "decode_time": "vllm_gr_beam_search_decode_time_seconds_total",
+            "sort_time": "vllm_gr_beam_search_sort_time_seconds_total",
+            "requests": "vllm_gr_beam_search_requests_total",
+            "beams": "vllm_gr_beam_search_total_beams_generated_total",
+        }
+
+        # Parse exposition format line-by-line
+        for line in response.text.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Parse: metric_name{labels} value
+            for key, metric_name in metric_names.items():
+                if line.startswith(metric_name):
+                    try:
+                        value = float(line.split()[-1])
+                        metrics[key] = value
+                    except (ValueError, IndexError):
+                        pass
+
+        return metrics
+    except Exception:
+        return {}
+
+
+def _get_metrics_url(args) -> str | None:
+    """Build metrics base URL from serve args."""
+    if hasattr(args, "base_url") and args.base_url:
+        return args.base_url.rstrip("/")
+    elif hasattr(args, "port") and args.port:
+        host = getattr(args, "host", "127.0.0.1")
+        return f"http://{host}:{args.port}"
+    return None
+
+
+def _print_beam_search_delta(before: dict, after: dict):
+    """Print beam search metrics delta."""
+    if not before or not after:
+        return
+    num = after.get("requests", 0) - before.get("requests", 0)
+    if num <= 0:
+        return
+    avg_prefill = (after.get("prefill_time", 0) - before.get("prefill_time", 0)) / num
+    avg_decode = (after.get("decode_time", 0) - before.get("decode_time", 0)) / num
+    avg_sort = (after.get("sort_time", 0) - before.get("sort_time", 0)) / num
+    total = avg_prefill + avg_decode + avg_sort
+    print("---------------Beam Search Metrics----------------")
+    print(f"Avg Prefill Time (ms):                   {avg_prefill * 1000:.2f}")
+    print(f"Avg Decode Time (ms):                    {avg_decode * 1000:.2f}")
+    print(f"Avg Sort Time (ms):                      {avg_sort * 1000:.3f}")
+    print(f"Total Beam Time (ms):                    {total * 1000:.2f}")
+    print(f"Beam Search Requests:                    {int(num)}")
+    print("=" * 50)
 
 
 def _consume_use_beam_search_flag():
@@ -180,7 +261,7 @@ async def patched_async_request_openai_chat_completions(
     most_recent_timestamp = st
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
-            if response.status == 200:
+            if response.status == HTTP_OK:
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
                     chunk_bytes = chunk_bytes.strip()
@@ -491,6 +572,33 @@ def patched_main(args):
         original_main(args)
 
 
+def patched_serve_add_cli_args(parser):
+    """Patch serve.add_cli_args to include onerec in choices."""
+    original_serve_add_cli_args(parser)
+    _add_dataset_to_parser_choices(parser, DATASET_NAME)
+    _add_onerec_arguments(parser)
+    _add_beams_arguments(parser)
+    return parser
+
+
+def patched_serve_main(args):
+    """Patch serve.main to collect beam search metrics before/after."""
+    metrics_url = _get_metrics_url(args)
+    is_beam_search = USE_BEAM_SEARCH or (hasattr(args, "n") and getattr(args, "n", 1) > 1)
+
+    metrics_before = None
+    if is_beam_search and metrics_url:
+        metrics_before = _fetch_prometheus_metrics(metrics_url)
+
+    result = original_serve_main(args)
+
+    if is_beam_search and metrics_url:
+        metrics_after = _fetch_prometheus_metrics(metrics_url)
+        _print_beam_search_delta(metrics_before, metrics_after)
+
+    return result
+
+
 # ============================================================================
 # Apply Patches
 # ============================================================================
@@ -502,4 +610,13 @@ vllm.benchmarks.throughput.add_cli_args = patched_add_cli_args
 vllm.benchmarks.throughput.get_requests = patched_get_requests
 vllm.benchmarks.throughput.validate_args = patched_validate_args
 vllm.benchmarks.throughput.main = patched_main
+vllm.benchmarks.serve.add_cli_args = patched_serve_add_cli_args
+vllm.benchmarks.serve.get_samples = patched_get_samples
+vllm.benchmarks.serve.main = patched_serve_main
+
+# Also patch the CLI module if it already imported the original reference
+if "vllm.entrypoints.cli.benchmark.serve" in sys.modules:
+    sys.modules["vllm.entrypoints.cli.benchmark.serve"].add_cli_args = patched_serve_add_cli_args
+    sys.modules["vllm.entrypoints.cli.benchmark.serve"].main = patched_serve_main
+
 ASYNC_REQUEST_FUNCS["openai-chat"] = patched_async_request_openai_chat_completions

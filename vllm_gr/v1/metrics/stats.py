@@ -12,5 +12,8 @@ class RequestStateStats(BaseRequestStateStats):
 
     # Beam search overhead
     beam_search_overhead: float = 0.0
+    beam_search_prefill_time: float = 0.0
     beam_search_decode_time: float = 0.0
+    beam_search_sort_time: float = 0.0
     num_generation_tokens: int = 0
+    num_beams: int = 0

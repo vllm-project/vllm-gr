@@ -20,6 +20,7 @@ from vllm.utils import random_uuid
 
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
 from vllm_gr.v1.engine.types import BeamForkRequest
+from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
@@ -290,12 +291,13 @@ async def beam_search(
     completed = []
 
     beam_search_start: int = time.perf_counter()
+    prefill_start = beam_search_start  # Track initial start for prefill measurement
     pre_calc = 0 if sid_begin_token_id is None else 1
     if sid_end_token_id is not None:
         pre_calc += 1
     if max_tokens - pre_calc < 0:
         raise VLLMValidationError(
-            f"max tokens should be not lower than {pre_calc} to accomedate reserved begin/end tokens.",
+            f"max tokens should be not lower than {pre_calc} to accommodate reserved begin/end tokens.",
             parameter="max_tokens",
             value=max_tokens,
         )
@@ -532,7 +534,11 @@ async def beam_search(
         for beam in all_beams:
             beam.tokens.append(sid_end_token_id)
     completed.extend(all_beams)
+
+    # Measure beam sort time
+    beam_search_sort_start = time.perf_counter()
     sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
+    beam_search_sort_time = time.perf_counter() - beam_search_sort_start
     best_beams = sorted_completed[:beam_width]
 
     # Reconstruct full logprobs only for the final best beams by walking
@@ -550,11 +556,15 @@ async def beam_search(
         beam.text = tokenizer.decode(tokens)
 
     beam_search_decode_time = time.perf_counter() - beam_search_start
+    beam_search_prefill_time = beam_search_start - prefill_start
     beam_search_overhead = beam_search_decode_time - generation_time
     metrics = RequestStateStats(
         beam_search_overhead=beam_search_overhead,
+        beam_search_prefill_time=beam_search_prefill_time,
         beam_search_decode_time=beam_search_decode_time,
+        beam_search_sort_time=beam_search_sort_time,
         num_generation_tokens=num_generation_tokens,
+        num_beams=beam_width,
     )
 
     out = RequestOutput(
@@ -577,4 +587,16 @@ async def beam_search(
         prompt_logprobs=None,
         metrics=metrics,
     )
+
+    # Record beam search metrics for Prometheus
+    # Get the model name - it could be a property or method
+    try:
+        model_name = self.models.model_name
+        if callable(model_name):
+            model_name = model_name()
+        model_name = str(model_name)
+    except Exception:
+        model_name = "unknown"
+    record_beam_search_metrics(metrics, engine="0", model_name=model_name)
+
     yield out
