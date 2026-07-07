@@ -35,7 +35,6 @@ from vllm.benchmarks.throughput import validate_args as original_validate_args
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
-from vllm_gr.entrypoints.gr import GRLLM
 
 # ============================================================================
 # Constants
@@ -338,15 +337,21 @@ def _add_dataset_to_parser_choices(parser, dataset_name):
     return False
 
 
+def _has_option(parser, opt: str) -> bool:
+    """Return True if the parser already knows about option string ``opt``.
+
+    Used to avoid argparse's "conflicting option string" error when vLLM's
+    own benchmark parser has already registered the same flag.
+    """
+    for action in parser._actions:
+        if hasattr(action, "option_strings") and opt in action.option_strings:
+            return True
+    return False
+
+
 def _add_onerec_arguments(parser):
     """Helper to add OneRec-specific arguments to parser."""
     onerec_group = parser.add_argument_group("onerec dataset options")
-
-    def _has_option(opt: str) -> bool:
-        for action in parser._actions:
-            if hasattr(action, "option_strings") and opt in action.option_strings:
-                return True
-        return False
 
     onerec_group.add_argument(
         "--task-types",
@@ -354,12 +359,28 @@ def _add_onerec_arguments(parser):
         default=DEFAULT_TASK_TYPES,
         help="Comma-separated list of task types",
     )
-    if not _has_option("--custom-input-len"):
+    if not _has_option(parser, "--custom-input-len"):
         onerec_group.add_argument(
             "--custom-input-len",
             type=int,
             default=None,
             help="Target prompt token length; prompts are trimmed or repeated to match.",
+        )
+    # enable_thinking is normally controlled by each task's config, but we
+    # expose it on the CLI so users can override it for ablation runs.
+    if not _has_option(parser, "--enable-thinking"):
+        onerec_group.add_argument(
+            "--enable-thinking",
+            action="store_true",
+            default=None,
+            help="Force-enable thinking mode (overrides task config).",
+        )
+    if not _has_option(parser, "--disable-thinking"):
+        onerec_group.add_argument(
+            "--disable-thinking",
+            action="store_false",
+            dest="enable_thinking",
+            help="Force-disable thinking mode (overrides task config).",
         )
 
 
@@ -367,15 +388,7 @@ def _add_beams_arguments(parser):
     """Helper to add beam search arguments to parser."""
     beams_group = parser.add_argument_group("beam search options")
 
-    # Avoid adding arguments that may already be defined by vLLM's
-    # core benchmark parsers to prevent argparse conflicts.
-    def _has_option(opt: str) -> bool:
-        for a in parser._actions:
-            if hasattr(a, "option_strings") and opt in a.option_strings:
-                return True
-        return False
-
-    if not _has_option("--n"):
+    if not _has_option(parser, "--n"):
         beams_group.add_argument(
             "--n",
             type=int,
@@ -392,18 +405,20 @@ def patched_get_samples(args, tokenizer):
     if args.dataset_name == DATASET_NAME:
         dataset = OneRecDataset(
             task_types=args.task_types.split(","),
-            model_path=args.model,
             dataset_path=args.dataset_path,
             disable_shuffle=args.disable_shuffle,
             tokenizer=tokenizer,
-            custom_input_len=getattr(args, "custom_input_len", None),
+            custom_input_len=args.custom_input_len,
             sample_size=args.num_prompts,
+            enable_thinking=getattr(args, "enable_thinking", None),
         )
         return dataset.sample(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             request_id_prefix=args.request_id_prefix,
-            no_oversample=args.no_oversample,
+            # OneRec intentionally disables oversample: duplicated requests
+            # would inflate throughput via spurious KV-cache hits.
+            no_oversample=True,
         )
 
     return original_get_samples(args, tokenizer)
@@ -432,24 +447,45 @@ def patched_get_requests(args, tokenizer):
         dataset = OneRecDataset(
             dataset_path=args.dataset_path,
             task_types=args.task_types.split(","),
-            model_path=args.model,
             tokenizer=tokenizer,
-            custom_input_len=getattr(args, "custom_input_len", None),
+            custom_input_len=args.custom_input_len,
             sample_size=args.num_prompts,
+            # throughput benchmark doesn't register --disable-shuffle, so it
+            # may be absent from args; default to False (shuffle enabled).
             disable_shuffle=getattr(args, "disable_shuffle", False),
+            enable_thinking=getattr(args, "enable_thinking", None),
         )
         return dataset.sample(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
+            request_id_prefix=getattr(args, "request_id_prefix", ""),
+            # OneRec intentionally disables oversample (see patched_get_samples).
+            no_oversample=True,
         )
 
     return original_get_requests(args, tokenizer)
 
 
 def patched_validate_args(args):
-    """Patch validate_args to handle onerec dataset."""
+    """Patch validate_args to handle onerec dataset.
+
+    For onerec, run a minimal self-contained validation instead — the
+    upstream validator has dataset-specific branches (random/hf/sonnet)
+    that would misroute onerec (e.g. rewrite dataset_name to "random"
+    when dataset_path is empty).
+    """
     if args.dataset_name != DATASET_NAME:
         original_validate_args(args)
+        return
+
+    # onerec-specific minimal validation
+    if not getattr(args, "tokenizer", None):
+        args.tokenizer = args.model
+
+    if not getattr(args, "dataset_path", None):
+        raise ValueError(
+            "--dataset-path is required for onerec dataset. Example: --dataset-path ./data"
+        )
 
 
 def _run_offline_beam_search_benchmark(args):
@@ -467,6 +503,7 @@ def _run_offline_beam_search_benchmark(args):
     from transformers import AutoTokenizer
 
     from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
+    from vllm_gr.entrypoints.gr import GRLLM
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -491,7 +528,6 @@ def _run_offline_beam_search_benchmark(args):
     dataset = OneRecDataset(
         dataset_path=args.dataset_path,
         task_types=args.task_types.split(","),
-        model_path=args.model,
         tokenizer=tokenizer,
         custom_input_len=getattr(args, "custom_input_len", None),
         sample_size=args.num_prompts,

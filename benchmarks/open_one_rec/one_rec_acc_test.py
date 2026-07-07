@@ -17,6 +17,9 @@ except ImportError:
     print("Error: vLLM is not installed. Please install it to run this benchmark.")
     sys.exit(1)
 
+# Import patch to register onerec dataset and GR beam-search backends.
+# Must be imported before any vllm.benchmarks module usage.
+import benchmarks.open_one_rec.one_rec_patch  # noqa: F401
 from benchmarks.open_one_rec.open_one_rec_loader import TASK_REGISTRY, DataLoaderWrapper
 
 try:
@@ -242,9 +245,10 @@ def main():
     # 3. Prepare Data
     # prompts = mock_data_loader(task_config, args.num_prompts)  # Replace with real data loading
     logger.info(f"Loading real data from {args.dataset_path}...")
-    loader = DataLoaderWrapper(
-        model_path=args.model, benchmark_version="v1.0", data_dir=args.dataset_path
-    )
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    loader = DataLoaderWrapper(tokenizer=tokenizer, data_dir=args.dataset_path)
     split = task_config.get("splits", ["test"])[0]
     dataset = loader.load_data(
         task_name=args.task_type,

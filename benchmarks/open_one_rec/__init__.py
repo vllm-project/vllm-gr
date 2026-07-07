@@ -1,7 +1,5 @@
-try:
-    from . import one_rec_patch
+"""OpenOneRec benchmark helpers.
 
-    print("OpenOneRec patch applied.")
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    one_rec_patch = None  # type: ignore
-    print("OpenOneRec patch NOT applied.")
+Patches are applied explicitly by entrypoints (one_rec_main.py / one_rec_acc_test.py)
+to avoid polluting vllm globals on every package import. See one_rec_patch.py.
+"""

@@ -532,14 +532,14 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
 ```bash
 # Test imports
 python -c "
-from benchmarks.open_one_rec import OneRecDataset
+from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 from benchmarks.open_one_rec.open_one_rec_loader import BaseLoader
 print('✓ All imports successful')
 "
 
 # Test data loading
 python -c "
-from benchmarks.open_one_rec import OneRecDataset
+from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 dataset = OneRecDataset(
     task_types=['video'],
     model_path='OpenOneRec/OneRec-1.7B',

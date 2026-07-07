@@ -51,7 +51,7 @@ def extract_probability_from_logprobs(
 ) -> Dict[str, Any]:
     """
     Extract probability for positive class from generations list containing reasoning and JSON probabilities.
-    Applies softmax normalization to ensure probabilities sum to 1.
+    Applies L1 normalization (divide by sum) to ensure probabilities sum to 1.
 
     Args:
         generations: List of strings, each containing reasoning text followed by JSON probabilities
@@ -62,19 +62,29 @@ def extract_probability_from_logprobs(
     Returns:
         Dictionary containing:
         - parsed_probs: Original parsed probabilities before normalization
-        - normalized_probs: Softmax normalized probabilities
+        - normalized_probs: L1-normalized probabilities (each divided by their sum)
         - score: Final positive class probability (after normalization)
 
     Raises:
         ValueError: If JSON parsing fails or required tokens are missing
 
     Examples:
+        Input already sums to 1 (no-op normalization):
         >>> generations = ['{"是": 0.7, "否": 0.3}']
         >>> result = extract_probability_from_logprobs(generations)
         >>> result['score']
         0.7
         >>> result['normalized_probs']
         {'是': 0.7, '否': 0.3}
+
+        Input does NOT sum to 1 (L1 normalization rescales linearly,
+        NOT softmax — softmax of {3,1} would be {0.982, 0.018}):
+        >>> generations = ['{"是": 3.0, "否": 1.0}']
+        >>> result = extract_probability_from_logprobs(generations)
+        >>> round(result['score'], 4)
+        0.75
+        >>> result['normalized_probs']
+        {'是': 0.75, '否': 0.25}
     """
     parsed_list = []
     normalized_list = []
@@ -111,7 +121,7 @@ def extract_probability_from_logprobs(
             p_pos = float(probs_dict[positive_token])
             p_neg = float(probs_dict[negative_token])
 
-            # Apply softmax normalization (ensure probabilities sum to 1)
+            # Apply L1 normalization (divide by sum so probabilities sum to 1)
             total = p_pos + p_neg
             if total <= 0:
                 raise ValueError(f"Sum of probabilities is non-positive: {total}")

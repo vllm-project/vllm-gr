@@ -121,7 +121,6 @@ def get_loader(
 
     Args:
         task_name: Name of the task
-        benchmark_version: Version of the benchmark (used for task selection, not passed to loader)
         data_dir: Data directory path
         tokenizer: Tokenizer instance (optional, required for message-based formats)
         enable_thinking: Enable thinking mode (optional, overrides task config if set)
@@ -154,36 +153,27 @@ class DataLoaderWrapper:
 
     def __init__(
         self,
-        model_path: str,
-        benchmark_version: str,
+        tokenizer: Any,
         data_dir: str,
         enable_thinking: Optional[bool] = None,
         custom_input_len: Optional[int] = None,
     ):
-        self.model_path = model_path
-        self._tokenizer = self._create_tokenizer(model_path) if model_path else None
+        if tokenizer is None:
+            raise ValueError(
+                "tokenizer is required. Pass the tokenizer created by the "
+                "benchmark (or AutoTokenizer.from_pretrained(...)) explicitly."
+            )
 
         if custom_input_len is not None:
             custom_input_len = int(custom_input_len)
             if custom_input_len <= 0:
                 raise ValueError("custom_input_len must be a positive integer")
 
-        self.benchmark_version = benchmark_version
+        self.tokenizer = tokenizer
         self.data_dir = data_dir
         self.enable_thinking = enable_thinking
         self.custom_input_len = custom_input_len
         self._loader_cache = {}
-
-    def _create_tokenizer(self, model_path: str):
-        """Create tokenizer from model path"""
-        try:
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            logger.info(f"Tokenizer loaded from: {model_path}")
-            return tokenizer
-        except (OSError, ValueError, ImportError) as e:
-            raise RuntimeError(f"Failed to load tokenizer from {model_path}: {e}") from e
 
     def load_data(
         self,
@@ -196,7 +186,7 @@ class DataLoaderWrapper:
             self._loader_cache[task_name] = get_loader(
                 task_name=task_name,
                 data_dir=self.data_dir,
-                tokenizer=self._tokenizer,
+                tokenizer=self.tokenizer,
                 enable_thinking=self.enable_thinking,
                 custom_input_len=self.custom_input_len,
             )
@@ -233,8 +223,8 @@ class BaseLoader(ABC):
         if self.tokenizer is None:
             raise ValueError(
                 f"{self.task_name} requires tokenizer for messages-based format. "
-                f"Please provide model_path when initializing Benchmark.\n"
-                f"Example: Benchmark(task_types=['{self.task_name}'], model_path='your-model-path')"
+                f"Please provide a tokenizer when initializing the Benchmark.\n"
+                f"Example: Benchmark(task_types=['{self.task_name}'], tokenizer=your_tokenizer)"
             )
 
     def load_data(
@@ -618,12 +608,13 @@ class BaseLoader(ABC):
         idx: Any,
         metadata_dict: dict,
     ) -> dict:
-        """Convert metadata to JSON-serializable format"""
-        del metadata_dict["answer"]
+        """Build the per-sample metadata dict.
 
-        metadata = {
+        Drops the ``answer`` key (already promoted to the top-level
+        ``ground_truth`` field by the caller) and injects the row index.
+        Returns a new dict — does NOT mutate ``metadata_dict`` in place.
+        """
+        return {
             "row_index": int(idx) if hasattr(idx, "__int__") else str(idx),
-            **metadata_dict,
+            **{k: v for k, v in metadata_dict.items() if k != "answer"},
         }
-
-        return metadata
