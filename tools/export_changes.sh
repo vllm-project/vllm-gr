@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+ORIGINAL_REF=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD)
+REMOTE_BRANCH=$1
+COMMIT_MESSAGE=$2
+
 if ! git diff --quiet || ! git diff --cached --quiet; then
     echo "Error: Working tree has uncommitted changes. Please commit or stash them first."
     exit 1
@@ -61,4 +65,21 @@ fi
 # Cleanup
 rm -f "$PATCH_FILE" "$ADDED_FILES_LIST"
 
-echo "Done. Switched to $EXPORT_BRANCH."
+if [ -n "$REMOTE_BRANCH" ] && [ -n "$COMMIT_MESSAGE" ]; then
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "Committing changes with message: $COMMIT_MESSAGE"
+        git commit -a -m "$COMMIT_MESSAGE"
+        echo "Pushing to origin/$REMOTE_BRANCH..."
+        git push origin -f "HEAD:$REMOTE_BRANCH"
+    else
+        echo "No changes detected to commit."
+    fi
+    echo "Returning to original branch/commit: $ORIGINAL_REF"
+    git checkout "$ORIGINAL_REF"
+    echo "Done."
+else
+    if [ -n "$REMOTE_BRANCH" ] || [ -n "$COMMIT_MESSAGE" ]; then
+        echo "Warning: Both remote branch and commit message must be specified to auto-commit, push, and return."
+    fi
+    echo "Done. Switched to $EXPORT_BRANCH."
+fi

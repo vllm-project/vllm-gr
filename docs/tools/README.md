@@ -129,3 +129,11 @@ git commit -a                          # commit merges, conflicts etc.
 git commit -a                          # commit the changes
 git push origin HEAD:<your pr>         # push to PR branch
 ```
+
+Script can be called with 2 arguments: remote_branch_name and commit_message which simplify the use to:
+
+**usage:**
+
+``` bash
+./tools/export_changes.sh remote_branch_name "commit_message"
+```

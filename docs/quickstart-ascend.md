@@ -28,27 +28,57 @@ cd vllm-gr
 export MY_ENV=xGr-install # any valid env name will do
 conda create -n ${MY_ENV}  -c conda-forge python=3.11 numactl gcc=10.3.0  gxx=10.3.0
 conda activate ${MY_ENV}
+```
+
+If device is 910b install 910b ops
+
+```bash
 conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend::cann-toolkit==8.5.0 ascend::cann-910b-ops==8.5.0
+```
+
+If device is 910c install a3 ops
+
+```bash
+conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend::cann-toolkit==8.5.0 ascend::cann-a3-ops==8.5.0
+```
+
+For any other devices please follow the official [CANN installation documentation](https://ascend.github.io/docs/sources/ascend/quick_install.html).
+
+```bash
 source ${CONDA_PREFIX}/Ascend/ascend-toolkit/set_env.sh
 conda install -c https://repo.huaweicloud.com/ascend/repos/conda ascend::cann-nnal==8.5.0
 source ${CONDA_PREFIX}/Ascend/nnal/atb/set_env.sh
 ```
 
-3. **Install vllm-ascend (base environment)**
+3. **Install vllm**
+
+follow [vllm installation](https://docs.vllm.ai/en/latest/getting_started/installation) for more details.
+
+```bash
+python -m pip install vllm==0.14.1
+```
+
+4. **Install vllm-ascend (base environment)**
 
 vllm-gr does **not** install vllm-ascend. Install the Ascend platform stack first:
 
 ```bash
-pip install vllm-ascend==0.14.0rc1
+python -m pip install vllm-ascend==0.14.0rc1
 ```
 
+**Note**: For Npu A3 (910C) users - due to bug in vllm-ascend, it is required to install vllm-ascend from source
+
+```bash
+cd <working-dir>
+git clone https://github.com/vllm-project/vllm-ascend.git
+cd vllm-ascend
+git checkout v0.14.0rc1
+pip install .
+```
+
+Return to vllm-gr folder for next steps.
+
 See the [vllm-ascend v0.14.0rc1 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.14.0rc1).
-
-4. **Install GR-specific manual dependencies**
-
-NPU runtime no longer requires torchrec or fbgemm-gpu; jagged-tensor ops run
-through the native PyTorch fallback path. No additional GR-specific wheels
-are required on NPU.
 
 5. **Install vllm-gr**
 

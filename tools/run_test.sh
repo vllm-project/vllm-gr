@@ -24,7 +24,7 @@ if [ "${npu_state:-false}" == "true" ]; then
     TORCH_MULTIPROCESSING_METHOD="spawn" \
     LD_LIBRARY_PATH="${CONDA_PREFIX:-}/lib:${LD_LIBRARY_PATH:-}" \
     ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
-    python3 -m pytest --run-slow --durations=10 -s tests
+    python3 -m pytest -x --run-slow --durations=10 -s tests
 else
     NODEENV_SSL_NO_VERIFY=1 \
     CUDA_VISIBLE_DEVICES=$idle_gpu \
