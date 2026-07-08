@@ -79,9 +79,11 @@ output=$( python -m benchmarks.open_one_rec.one_rec_acc_test \
 --dataset-path "$DATASET_PATH" \
 --dataset-name  onerec \
 --num-prompts 100 \
+--max-concurrency 10 \
 --use-beam-search \
 --task-type video \
 --catalog-path "$CATALOG_PATH" \
+--backend CUSTOM \
 --n 128 )
 
 

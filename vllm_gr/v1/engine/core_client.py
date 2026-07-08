@@ -4,7 +4,7 @@
 import msgspec
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.v1.engine.types import BeamForkRequest
+from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
@@ -52,33 +52,29 @@ async def add_requests_async(self, requests, force_batch=False):
 
 
 # ---------------------------------------------------------------------------
-# AsyncMPClient.beam_fork_async  (new method — BEAM_FORK path)
+# AsyncMPClient.beam_request_step_update_async  (BEAM_REQUEST_STEP_UPDATE path)
 # ---------------------------------------------------------------------------
 
 
-async def beam_fork_async(self, fork_request: BeamForkRequest) -> None:
-    """Send BEAM_FORK to EngineCore."""
-    fork_request.client_index = self.client_index
+async def beam_request_step_update_async(self, update: BeamRequestStepUpdate) -> None:
+    """Send BEAM_REQUEST_STEP_UPDATE to EngineCore.
+
+    Transmits a single logical message for all branches of a decode step.
+    """
+    update.client_index = self.client_index
     if hasattr(self, "current_wave"):
-        fork_request.current_wave = self.current_wave
+        update.current_wave = self.current_wave
 
-    # Route to the engine determined at beam-search start.  We carry
-    # data_parallel_rank in the BeamForkRequest itself because by the time
-    # this is called the parent requests are already finished and removed
-    # from reqs_in_flight by process_engine_outputs.
     engine = None
-    if hasattr(self, "get_core_engine_for_request") and fork_request.data_parallel_rank is not None:
-        engine = self.core_engines[fork_request.data_parallel_rank]
-        # Register child IDs so abort routing works for future steps.
+    if hasattr(self, "get_core_engine_for_request") and update.data_parallel_rank is not None:
+        engine = self.core_engines[update.data_parallel_rank]
         if hasattr(self, "reqs_in_flight"):
-            for child_id in fork_request.child_ids:
+            for child_id in update.child_beam_ids:
                 self.reqs_in_flight[child_id] = engine
-            for abort_id in fork_request.abort_ids:
-                self.reqs_in_flight.pop(abort_id, None)
+            for pruned_id in update.pruned_ids:
+                self.reqs_in_flight.pop(pruned_id, None)
 
-    to_await = self._send_input(EngineCoreRequestType.BEAM_FORK, fork_request, engine)
-    # Notify coordinator when engines are idle (mirrors add_request_async).
-    # Guard on first_req_send_socket (only exists on DPAsyncMPClient).
+    to_await = self._send_input(EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, update, engine)
     if hasattr(self, "first_req_send_socket") and not self.engines_running:
         req_msg = msgspec.msgpack.encode(("FIRST_REQ", engine))
         await self.first_req_send_socket.send(req_msg)

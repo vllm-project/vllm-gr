@@ -116,7 +116,9 @@ def mypy(
 def main():
     ci = sys.argv[1] == "1"
     python_version = sys.argv[2]
-    file_groups = group_files(sys.argv[3:])
+    # Remove duplicate files (e.g. from unmerged git conflicts) to avoid mypy duplicate module errors
+    unique_files = list(dict.fromkeys(sys.argv[3:]))
+    file_groups = group_files(unique_files)
 
     if python_version == "local":
         python_version = f"{sys.version_info.major}.{sys.version_info.minor}"

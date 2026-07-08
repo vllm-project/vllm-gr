@@ -185,7 +185,7 @@ def main():
         "--catalog-path", type=str, default=None, help="Path to item validation (catalog) json file"
     )
     parser.add_argument(
-        "--concurrency-limit", type=int, default=None, help="maximum prompts to run concurrently"
+        "--max-concurrency", type=int, default=None, help="maximum prompts to run concurrently"
     )
     args = parser.parse_args()
 
@@ -229,8 +229,11 @@ def main():
                 model=args.model,
                 trust_remote_code=True,
                 max_logprobs=gen_config.get("num_beams", 1) * 2,
+                # max_seq_len=16384,
+                # max_num_batched_tokens=16384,  # 1B tokens
                 catalog_path=args.catalog_path if args.catalog_path is not None else None,
                 attention_config={"backend": args.backend} if args.backend is not None else None,
+                gpu_memory_utilization=0.7,
             )
         except Exception as e:
             logger.error(f"Failed to initialize vLLM: {e}")
@@ -281,7 +284,7 @@ def main():
         prompts_dict = [{"prompt": prompt} for prompt in prompts]
         gen_start = time.perf_counter()
         raw_offline_outputs = llm.beam_search(
-            prompts_dict, params, concurrency_limit=args.concurrency_limit
+            prompts_dict, params, concurrency_limit=args.max_concurrency
         )
         assert len(raw_offline_outputs) == len(prompts)
         gen_end = time.perf_counter()

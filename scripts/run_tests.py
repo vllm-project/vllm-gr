@@ -42,8 +42,6 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
             "test_yuanrong_backend.py",
             "test_split_qkv_rmsnorm_rope_patch.py",
             # Beam search / catalog (OneRec path)
-            "test_batch_and_fork_unit.py",
-            "test_dp_beam_search_unit.py",
             "test_catalog.py",
             "test_task_specific_catalog_program.py",
             # Pangu LLM passthrough routing

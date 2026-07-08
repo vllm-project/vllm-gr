@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_gr.v1.engine.types import BeamForkRequest
+from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 logger = init_logger(__name__)
 
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     pass
 
 # ---------------------------------------------------------------------------
-# AsyncLLM methods for ADD_BATCH / BEAM_FORK
+# AsyncLLM methods for ADD_BATCH / BEAM_REQUEST_STEP_UPDATE
 # ---------------------------------------------------------------------------
 
 
@@ -143,7 +143,7 @@ def register_beam_output_fn(
 ):
     """Register output queue for a beam fork child (no ZMQ send).
 
-    The actual request will be created by EngineCore's BEAM_FORK handler.
+    The actual request will be created by EngineCore's beam_request_step_update handler.
     We just need a queue in OutputProcessor to receive outputs."""
     from vllm.v1.engine import EngineCoreRequest
     from vllm.v1.engine.output_processor import RequestOutputCollector
@@ -172,6 +172,6 @@ def register_beam_output_fn(
     return queue
 
 
-async def beam_fork_fn(self, fork_request: BeamForkRequest) -> None:
-    """Send BEAM_FORK to EngineCore."""
-    await self.engine_core.beam_fork_async(fork_request)
+async def beam_request_step_update_fn(self, update: BeamRequestStepUpdate) -> None:
+    """Send BEAM_REQUEST_STEP_UPDATE to EngineCore to grouped processing."""
+    await self.engine_core.beam_request_step_update_async(update)

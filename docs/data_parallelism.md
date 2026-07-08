@@ -20,7 +20,6 @@ Assign each vLLM instance to a specific GPU using `CUDA_VISIBLE_DEVICES`. Ensure
 CUDA_VISIBLE_DEVICES=0 \
 vllm-gr serve \
     --port 9001 \
-    --trust-remote-code \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     --max_num_seqs 1024 \
@@ -219,7 +218,6 @@ for ((id=0; id<N; id++)); do
     CUDA_VISIBLE_DEVICES=$current_gpu \
     vllm-gr serve \
         --port $run_port \
-        --trust-remote-code \
         --default-chat-template-kwargs '{"enable_thinking": false}' \
         --max-logprobs 1024 \
         --max_num_seqs 1024 \

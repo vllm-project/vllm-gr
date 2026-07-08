@@ -50,6 +50,7 @@ def beam_search_example(model, beam_width: int, compare: str):
         max_logprobs=beam_width * 2,
         max_num_seqs=512 * 5,
         max_num_batched_tokens=4096 * 5,
+        attention_config={"backend": "CUSTOM"},
     )
     # Send beam search request to vllm-gr
     start = time.perf_counter()
