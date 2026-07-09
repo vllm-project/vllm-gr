@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
         if: github.event_name == 'issue_comment'
         with:
-          ref: refs/pull/${{ github.event.issue.number }}/head
+          ref: refs/pull/${{ github.event.issue.number }}/merge
 
       - uses: actions/setup-python@v5
         with:
