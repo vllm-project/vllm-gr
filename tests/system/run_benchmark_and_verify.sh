@@ -2,13 +2,13 @@
 
 run_port=7000
 timeout=600 # time for waiting server to go up
-p99_ttft_th=600
-p99_tpot_th=0.01
+p99_ttft_th=300
+p99_tpot_th=0.02
 pass_1_th=0.09
 pass_32_th=0.2
 recall_32_th=0.04
-elapsed_time_ol=70
-
+elapsed_time_online_th=15
+elapsed_time_offline_th=20
 device="gpu"
 #if exist npu-smi tune some threshold
 if command -v npu-smi &> /dev/null; then
@@ -17,8 +17,9 @@ if command -v npu-smi &> /dev/null; then
    echo "identify $board_id"
    case $board_id in
     "Ascend910_9362" )
-      p99_ttft_th=1000
-      elapsed_time_ol=92
+      p99_ttft_th=280
+      elapsed_time_online_th=20
+      elapsed_time_offline_th=60
        ;;
     * )
     echo "using default thresholds for $board_id" ;;
@@ -111,7 +112,7 @@ validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
 validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
 
 # Validate elapsed_time
-validate_metric "elapsed_time" "$elapsed_time" "$elapsed_time_ol" "le"
+validate_metric "elapsed_time" "$elapsed_time" "$elapsed_time_offline_th" "le"
 
 
 # online tests
@@ -214,10 +215,12 @@ echo "$output"
 pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
 pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
 recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
+elapsed_time_online=$(extract_numeric_value "$output" "elapsed_time") || exit 1
 
 echo "Parsed pass@1: $pass_1"
 echo "Parsed pass@32: $pass_32"
 echo "Parsed recall@32: $recall_32"
+echo "Parsed elapsed_time: $elapsed_time_online"
 
 # Validate pass@1
 validate_metric "pass@1" "$pass_1" "$pass_1_th" "ge"
@@ -227,6 +230,9 @@ validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
 
 # Validate recall@32
 validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
+
+# Validate elapsed_time
+validate_metric "elapsed_time" "$elapsed_time_online" "$elapsed_time_online_th" "le"
 
 
 
