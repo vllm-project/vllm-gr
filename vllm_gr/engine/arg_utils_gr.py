@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
+import weakref
 from dataclasses import dataclass
 
 from vllm.config import ModelConfig
-from vllm.engine.arg_utils import EngineArgs, get_kwargs
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs, get_kwargs
+from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -15,9 +19,35 @@ class ModelConfigGr(ModelConfig):
 
 
 origin_add_cli_args = EngineArgs.add_cli_args
+origin_async_add_cli_args = AsyncEngineArgs.add_cli_args
 origin_create_model_config = EngineArgs.create_model_config
 origin_create_engine_config = EngineArgs.create_engine_config
 origin_from_cli_args = EngineArgs.from_cli_args.__func__
+_engine_args_catalog_paths: dict[int, str | None] = {}
+_engine_args_catalog_finalizers: dict[int, weakref.finalize] = {}
+
+
+def _install_catalog_path_property() -> None:
+    existing = getattr(EngineArgs, "catalog_path", None)
+    if isinstance(existing, property):
+        return
+
+    def _get_catalog_path(self) -> str | None:
+        return _engine_args_catalog_paths.get(id(self))
+
+    def _set_catalog_path(self, value: str | None) -> None:
+        key = id(self)
+        _engine_args_catalog_paths[key] = value
+        if key not in _engine_args_catalog_finalizers:
+            _engine_args_catalog_finalizers[key] = weakref.finalize(
+                self,
+                lambda object_id=key: (
+                    _engine_args_catalog_paths.pop(object_id, None),
+                    _engine_args_catalog_finalizers.pop(object_id, None),
+                ),
+            )
+
+    EngineArgs.catalog_path = property(_get_catalog_path, _set_catalog_path)
 
 
 def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -36,6 +66,7 @@ def create_model_config(self) -> ModelConfig:
 
 
 def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
+    _install_catalog_path_property()
     engine_args = origin_from_cli_args(cls, args)
     engine_args.catalog_path = None
     if hasattr(args, "catalog_path"):
@@ -63,8 +94,9 @@ def _user_requested_custom_backend(self) -> bool:
 
 
 def create_engine_config(self, usage_context=None, headless=False):
+    custom_backend_requested = _user_requested_custom_backend(self)
     config = origin_create_engine_config(self, usage_context, headless)
-    if _user_requested_custom_backend(self):
+    if custom_backend_requested:
         # Persist the user intent in a field that survives platform
         # check_and_update_config resets and process serialization.
         additional_config = getattr(config, "additional_config", None)
@@ -81,8 +113,24 @@ def create_engine_config(self, usage_context=None, headless=False):
     return config
 
 
+def async_add_cli_args(
+    cls,
+    parser: FlexibleArgumentParser,
+    async_args_only: bool = False,
+) -> FlexibleArgumentParser:
+    parser = origin_async_add_cli_args(parser, async_args_only=async_args_only)
+    # AsyncEngineArgs.add_cli_args may call current_platform.pre_register_and_update()
+    # after general plugins load, which can overwrite GR engine-core patches on NPU.
+    from vllm_gr.patch import re_apply_patches
+
+    re_apply_patches()
+    return parser
+
+
 def patch_add_cli_args() -> None:
+    _install_catalog_path_property()
     EngineArgs.add_cli_args = add_cli_args
+    AsyncEngineArgs.add_cli_args = classmethod(async_add_cli_args)
     EngineArgs.create_model_config = create_model_config
     EngineArgs.create_engine_config = create_engine_config
     EngineArgs.from_cli_args = classmethod(from_cli_args)

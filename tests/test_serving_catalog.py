@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import random
 import tempfile
+import time
 from typing import Any
 
 import pytest
@@ -24,12 +25,19 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
 )
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.engine.serving import OpenAIServing
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
+from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.inputs import TokensPrompt
 
 if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is_available()):
     pytest.skip("GPU/NPU is not available", allow_module_level=True)
+
+
+def _get_test_model() -> str:
+    # Set REC_MODEL to use a locally prepared model path. If REC_MODEL is not
+    # set, the tests fall back to the Hugging Face model id and fetch remotely.
+    return os.environ.get("REC_MODEL", "OpenOneRec/OneRec-1.7B")
 
 
 async def _serving_catalog_generation_impl(loops: int) -> None:
@@ -58,7 +66,7 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
         catalog_path = tmp_catalog.name
 
     try:
-        model_name = "OpenOneRec/OneRec-1.7B"
+        model_name = _get_test_model()
 
         engine_args = AsyncEngineArgs(
             model=model_name,
@@ -83,14 +91,16 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
             )
 
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            # Dummy prompt
             prompt_file = os.path.join(
                 os.path.dirname(__file__), "resources/single_one_rec_prompt.txt"
             )
             with open(prompt_file, "r") as f:
                 prompt_text = f.read()
             prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-            prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+            engine_input = serving.renderer.process_for_engine(
+                TokensPrompt(prompt_token_ids=prompt_token_ids),
+                arrival_time=time.time(),
+            )
 
             beam_width = 1024
             beam_search_params_dict: dict[str, Any] = {
@@ -112,7 +122,7 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
             if loops <= 0:
                 loops = 1
             for i in range(loops):
-                generator = serving.beam_search(prompt, f"req_id_catalog_{i}", params)
+                generator = serving.beam_search(engine_input, f"req_id_catalog_{i}", params)
 
                 final_output = None
                 async for output in generator:

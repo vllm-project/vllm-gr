@@ -6,10 +6,8 @@ import time
 from collections.abc import AsyncGenerator, Mapping
 
 import numpy as np
-from vllm.beam_search import BeamSearchSequence
-from vllm.entrypoints.openai.protocol import VLLMValidationError
-from vllm.inputs.data import PromptType, TokensPrompt
-from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
+from vllm.exceptions import VLLMValidationError
+from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
@@ -17,15 +15,31 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 
-from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
+from vllm_gr.logprobs import (
+    extract_and_dedup_flat_logprobs,
+    grouped_logprobs_stride,
+    reconstruct_beam_logprobs,
+)
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
+
+try:
+    from vllm.entrypoints.generate.beam_search.utils import (
+        BeamSearchSequence,
+        create_sort_beams_key_function,
+    )
+except ModuleNotFoundError:
+    from vllm_gr.beam_search_compat import (
+        BeamSearchSequence,
+        create_sort_beams_key_function,
+    )
 
 logger = init_logger(__name__)
 
 _dp_rank_counter = 0
 _dp_rank_lock = asyncio.Lock()
+_BEAM_RESULT_TIMEOUT_S = 600.0
 
 
 # return rank for next beam search request in a round-robin manner across the data parallel ranks
@@ -38,10 +52,17 @@ async def _next_data_parallel_rank(data_parallel_size: int) -> int:
         return rank
 
 
-async def _collect_beam_result(q):
+async def _collect_beam_result(q, timeout_s: float = _BEAM_RESULT_TIMEOUT_S):
     """Drain output queue until finished."""
     while True:
-        out = await q.get()
+        try:
+            out = await asyncio.wait_for(q.get(), timeout=timeout_s)
+        # asyncio.wait_for raises asyncio.TimeoutError, which is not the same
+        # as the builtin TimeoutError on Python < 3.11.
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise TimeoutError(
+                f"Timed out after {timeout_s:g}s waiting for grouped beam output."
+            ) from exc
         if out.finished:
             return out
 
@@ -49,7 +70,13 @@ async def _collect_beam_result(q):
 async def _gather_beam_results(queues):
     """Gather results from multiple output queues."""
     tasks = [asyncio.create_task(_collect_beam_result(q)) for q in queues]
-    return list(await asyncio.gather(*tasks))
+    try:
+        return list(await asyncio.gather(*tasks))
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _add_batch_step(
@@ -80,10 +107,23 @@ async def _add_batch_step(
         queues.append(q)
         engine_core_requests.append(ec_req)
 
-    await engine_client._add_requests_batch(engine_core_requests, use_batch_message=use_beam_req)
-
     internal_ids = [r.request_id for r in engine_core_requests] if use_beam_req else []
-    output = await _gather_beam_results(queues)
+    try:
+        await engine_client._add_requests_batch(
+            engine_core_requests, use_batch_message=use_beam_req
+        )
+        output = await _gather_beam_results(queues)
+    except BaseException:
+        if use_beam_req and internal_ids:
+            await asyncio.shield(
+                _beam_request_cleanup(
+                    engine_client,
+                    internal_ids[0],
+                    internal_ids,
+                    data_parallel_rank,
+                )
+            )
+        raise
     return output, internal_ids
 
 
@@ -160,7 +200,18 @@ async def _beam_request_step(
     )
 
     # Await the singular unified engine execution response block
-    single_output = await _collect_beam_result(q)
+    try:
+        single_output = await _collect_beam_result(q)
+    except BaseException:
+        await asyncio.shield(
+            _beam_request_cleanup(
+                engine_client,
+                session_id,
+                list(dict.fromkeys(prev_beam_internal_ids + child_beam_ids)),
+                data_parallel_rank,
+            )
+        )
+        raise
 
     # Return the singular raw output instance wrapped as a single-element list
     # to maintain backward-compatible pipeline execution with the loop below
@@ -169,7 +220,7 @@ async def _beam_request_step(
 
 async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
     """Signals the core engine to fully purge all remaining session cache allocations."""
-    if not final_ids:
+    if not session_id:
         return
     try:
         await engine_client.beam_request_step_update(
@@ -220,7 +271,7 @@ def _extract_and_dedup_segment(
 
 async def beam_search(
     self,
-    prompt: PromptType,
+    prompt: EngineInput,
     request_id: str,
     params: BeamSearchParams,
     lora_request: LoRARequest | None = None,
@@ -232,6 +283,7 @@ async def beam_search(
     max_tokens = params.max_tokens
     ignore_eos = params.ignore_eos
     temperature = params.temperature
+    length_penalty = params.length_penalty
     begin_token = params.begin_token
     end_token = params.end_token
 
@@ -267,6 +319,7 @@ async def beam_search(
         )
 
     eos_token_id: int = tokenizer.eos_token_id
+    sort_beams_key = create_sort_beams_key_function(eos_token_id, length_penalty)
     sid_begin_token_id: int | None = None
     if begin_token is not None:
         sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
@@ -286,13 +339,12 @@ async def beam_search(
                 value=end_token,
             )
 
-    if is_explicit_encoder_decoder_prompt(prompt):
-        raise NotImplementedError
+    if prompt["type"] == "embeds":
+        raise NotImplementedError("Embedding prompt not supported for beam search")
 
-    prompt_text = prompt if isinstance(prompt, str) else prompt.get("prompt")
-    prompt_token_ids = [] if isinstance(prompt, str) else prompt.get("prompt_token_ids", [])
-    multi_modal_data = None if isinstance(prompt, str) else prompt.get("multi_modal_data")
-    mm_processor_kwargs = None
+    decoder_prompt = prompt if prompt["type"] != "enc_dec" else prompt["decoder_prompt"]
+    prompt_text = decoder_prompt.get("prompt")
+    prompt_token_ids = decoder_prompt["prompt_token_ids"]
 
     tokenized_length = len(prompt_token_ids)
     logprobs_num = beam_width
@@ -318,11 +370,10 @@ async def beam_search(
 
     all_beams = [
         BeamSearchSequence(
+            orig_prompt=prompt,
             tokens=initial_tokens,
             cum_logprob=0,
             logprobs=initial_logprobs,
-            multi_modal_data=multi_modal_data,
-            mm_processor_kwargs=mm_processor_kwargs,
             lora_request=lora_request,
         )
     ]
@@ -356,21 +407,14 @@ async def beam_search(
     prefill_id: str | None = None
 
     for token in range(max_tokens - pre_calc):
+        if not all_beams:
+            break
+
         if token == 1:
             beam_search_start = time.perf_counter()
 
         prompts_batch, lora_req_batch = zip(
-            *[
-                (
-                    TokensPrompt(
-                        prompt_token_ids=beam.tokens,
-                        multi_modal_data=beam.multi_modal_data,
-                        mm_processor_kwargs=beam.mm_processor_kwargs,
-                    ),
-                    beam.lora_request,
-                )
-                for beam in all_beams
-            ]
+            *[(beam.get_prompt(), beam.lora_request) for beam in all_beams]
         )
         if token > 0:
             num_generation_tokens += len(all_beams)
@@ -393,43 +437,58 @@ async def beam_search(
 
         gen_start = time.perf_counter()
 
-        # Execute Engine Step Pass
-        if use_beam_request and fork_info is not None:
-            output, prev_beam_internal_ids = await _beam_request_step(
-                self.engine_client,
-                session_id=prefill_id,
-                fork_info=fork_info,
-                prev_beam_internal_ids=prev_beam_internal_ids,
-                all_beams=all_beams,
-                request_id_batch=request_id_batch,
-                beam_search_params=beam_search_params,
-                eos_token_id=eos_token_id,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                prefix_len=len(initial_tokens),
-                priority=priority,
-                data_parallel_rank=rank,
-            )
-        else:
-            output, new_ids = await _add_batch_step(
-                self.engine_client,
-                prompts_batch,
-                lora_req_batch,
-                request_id_batch,
-                beam_search_params,
-                use_beam_request,
-                trace_headers,
-                priority=priority,
-                data_parallel_rank=rank,
-            )
-            if new_ids:
-                prev_beam_internal_ids = new_ids
-                if prefill_id is None:
-                    prefill_id = new_ids[0]
+        try:
+            # Execute Engine Step Pass
+            if use_beam_request and fork_info is not None:
+                output, prev_beam_internal_ids = await _beam_request_step(
+                    self.engine_client,
+                    session_id=prefill_id,
+                    fork_info=fork_info,
+                    prev_beam_internal_ids=prev_beam_internal_ids,
+                    all_beams=all_beams,
+                    request_id_batch=request_id_batch,
+                    beam_search_params=beam_search_params,
+                    eos_token_id=eos_token_id,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    prefix_len=len(initial_tokens),
+                    priority=priority,
+                    data_parallel_rank=rank,
+                )
+            else:
+                output, new_ids = await _add_batch_step(
+                    self.engine_client,
+                    prompts_batch,
+                    lora_req_batch,
+                    request_id_batch,
+                    beam_search_params,
+                    use_beam_request,
+                    trace_headers,
+                    priority=priority,
+                    data_parallel_rank=rank,
+                )
+                if new_ids:
+                    prev_beam_internal_ids = new_ids
+                    if prefill_id is None:
+                        prefill_id = new_ids[0]
 
-        valid_tokens_sets = None
-        if catalog_task is not None:
-            valid_tokens_sets = await catalog_task
+            valid_tokens_sets = None
+            if catalog_task is not None:
+                valid_tokens_sets = await catalog_task
+        except BaseException:
+            if catalog_task is not None and not catalog_task.done():
+                catalog_task.cancel()
+                await asyncio.gather(catalog_task, return_exceptions=True)
+            if use_beam_request and prefill_id is not None:
+                await asyncio.shield(
+                    _beam_request_cleanup(
+                        self.engine_client,
+                        prefill_id,
+                        prev_beam_internal_ids,
+                        rank,
+                    )
+                )
+            raise
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         new_beams = []
@@ -449,6 +508,15 @@ async def beam_search(
             # Under the optimized mode, 'output' contains exactly 1 combined RequestOutput instance
             beam_result = output[0]
             if beam_result.outputs[0].finish_reason == "error":
+                error_output = beam_result.outputs[0]
+                error_text = getattr(error_output, "text", None) or ""
+                error_stop_reason = getattr(error_output, "stop_reason", None)
+                error_detail = error_text or error_stop_reason or "unknown engine error"
+                logger.error(
+                    "Beam search encountered engine error for request %s: %s",
+                    request_id,
+                    error_detail,
+                )
                 await _beam_request_cleanup(
                     self.engine_client, prefill_id, prev_beam_internal_ids, rank
                 )
@@ -458,11 +526,12 @@ async def beam_search(
                     outputs=[
                         CompletionOutput(
                             index=0,
-                            text="",
+                            text=error_text,
                             token_ids=[],
                             cumulative_logprob=None,
                             logprobs=None,
                             finish_reason="error",
+                            stop_reason=error_stop_reason,
                         )
                     ],
                     finished=True,
@@ -472,15 +541,19 @@ async def beam_search(
                 return
 
             flat = beam_result.outputs[0].logprobs
-            if flat is not None:
+            try:
+                stride_k = grouped_logprobs_stride(flat, len(fork_info), logprobs_num)
+            except ValueError:
+                await _beam_request_cleanup(
+                    self.engine_client, prefill_id, prev_beam_internal_ids, rank
+                )
+                raise
+            else:
                 # Extract tracking attributes cleanly
                 raw_token_ids = flat.token_ids
                 raw_logprobs = flat.logprobs
                 raw_ranks = getattr(flat, "ranks", None)
                 raw_decoded = getattr(flat, "decoded_tokens", None)
-                total_logprobs = len(raw_token_ids)
-
-                stride_k = total_logprobs // logprobs_num
 
                 # Each logical beam block should extract its top choices natively
                 for b_idx in range(len(fork_info)):
@@ -514,24 +587,39 @@ async def beam_search(
                     beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
                     all_beams_token_id.extend(token_ids_pos)
                     all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
-            else:
-                beam_flat_cache = [None] * len(fork_info)
         else:
             # Baseline execution path for prefill / batch loops
             for i, result in enumerate(output):
                 current_beam = all_beams[i]
                 if result.outputs[0].finish_reason == "error":
+                    error_output = result.outputs[0]
+                    error_text = getattr(error_output, "text", None) or ""
+                    error_stop_reason = getattr(error_output, "stop_reason", None)
+                    error_detail = error_text or error_stop_reason or "unknown engine error"
+                    logger.error(
+                        "Beam search encountered engine error for request %s: %s",
+                        request_id,
+                        error_detail,
+                    )
+                    if use_beam_request and prefill_id is not None:
+                        await _beam_request_cleanup(
+                            self.engine_client,
+                            prefill_id,
+                            prev_beam_internal_ids,
+                            rank,
+                        )
                     yield RequestOutput(
                         request_id=request_id,
                         prompt=prompt_text,
                         outputs=[
                             CompletionOutput(
                                 index=0,
-                                text="",
+                                text=error_text,
                                 token_ids=[],
                                 cumulative_logprob=None,
                                 logprobs=None,
                                 finish_reason="error",
+                                stop_reason=error_stop_reason,
                             )
                         ],
                         finished=True,
@@ -570,9 +658,12 @@ async def beam_search(
                 cached = beam_flat_cache[idx // logprobs_num]
                 assert cached is not None
                 eos_beam = BeamSearchSequence(
-                    tokens=current_beam.tokens + [eos_token_id]
-                    if include_stop_str_in_output
-                    else current_beam.tokens,
+                    orig_prompt=current_beam.orig_prompt,
+                    tokens=(
+                        current_beam.tokens + [eos_token_id]
+                        if include_stop_str_in_output
+                        else current_beam.tokens
+                    ),
                     logprobs=initial_logprobs,
                     cum_logprob=float(all_beams_logprob[idx]),
                     finish_reason="stop",
@@ -598,12 +689,11 @@ async def beam_search(
             cached = beam_flat_cache[idx // logprobs_num]
             assert cached is not None
             new_beam = BeamSearchSequence(
+                orig_prompt=current_beam.orig_prompt,
                 tokens=current_beam.tokens + [token_id],
                 logprobs=initial_logprobs,
                 lora_request=current_beam.lora_request,
                 cum_logprob=float(all_beams_logprob[idx]),
-                multi_modal_data=current_beam.multi_modal_data,
-                mm_processor_kwargs=current_beam.mm_processor_kwargs,
             )
             new_beam._lp_parent = current_beam
             new_beam._lp_step_data = cached
@@ -625,7 +715,7 @@ async def beam_search(
 
     # Measure beam sort time
     beam_search_sort_start = time.perf_counter()
-    sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
+    sorted_completed = sorted(completed, key=sort_beams_key, reverse=True)
     beam_search_sort_time = time.perf_counter() - beam_search_sort_start
     best_beams = sorted_completed[:beam_width]
 

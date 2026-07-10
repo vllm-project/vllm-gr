@@ -1,29 +1,24 @@
-# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
-# Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
-# Date imported: 2026‑01‑09
-# License: Apache 2.0 License (inherited from source)
 """
-Base Loader for all task data loaders
+Base loader for OpenOneRec task datasets.
 
-Provides common functionality for data loading, sampling, and file path resolution.
+Provides common functionality for data loading, sampling, and file path
+resolution.
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
 from abc import ABC
 from dataclasses import dataclass
+from importlib import import_module
 from json import JSONDecodeError
-from typing import Any, Dict, Optional, Type
-
-import pandas as pd
+from typing import Any, Dict, Optional
 
 from .tasks.item_understand.config import ITEM_UNDERSTAND_CONFIG
-from .tasks.item_understand.evaluator import ItemUnderstandEvaluator
-from .tasks.label_pred import LabelPredEvaluator
 from .tasks.label_pred.config import LABEL_PRED_CONFIG
 from .tasks.rec_reason.config import REC_REASON_CONFIG
-from .tasks.rec_reason.evaluator import RecoReasonEvaluator
 from .tasks.recommendation.config import (
     AD_CONFIG,
     INTERACTIVE_CONFIG,
@@ -31,9 +26,50 @@ from .tasks.recommendation.config import (
     PRODUCT_CONFIG,
     VIDEO_CONFIG,
 )
-from .tasks.recommendation.evaluator import RecommendationEvaluator
+
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
+# Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
+# Date imported: 2026-01-09
+# License: Apache 2.0 License (inherited from source)
+
 
 logger = logging.getLogger(__name__)
+
+
+def _require_pandas():
+    try:
+        import pandas as pd
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "OpenOneRec benchmark requires pandas to read parquet dataset files."
+        ) from exc
+    return pd
+
+
+def _read_parquet(path: str, columns: Optional[list[str]] = None):
+    try:
+        import pyarrow.parquet as pq
+    except ModuleNotFoundError:
+        pd = _require_pandas()
+        return pd.read_parquet(path, columns=columns)
+
+    read_errors = []
+
+    try:
+        parquet_file = pq.ParquetFile(path)
+        table = parquet_file.read(columns=columns, use_threads=False)
+        return table.to_pandas(ignore_metadata=True)
+    except Exception as exc:
+        read_errors.append(("ParquetFile.read", exc))
+
+    try:
+        pd = _require_pandas()
+        return pd.read_parquet(path, columns=columns)
+    except Exception as exc:
+        read_errors.append(("pandas.read_parquet", exc))
+
+    error_summary = "; ".join(f"{name}: {type(exc).__name__}: {exc}" for name, exc in read_errors)
+    raise RuntimeError(f"Failed to read parquet file {path}. Tried: {error_summary}")
 
 
 @dataclass
@@ -42,8 +78,14 @@ class TaskRegistration:
 
     name: str
     config: Dict[str, Any]
-    evaluator_class: Type
+    evaluator_path: str
     category: str  # "general", "recommendation", "caption"
+
+    @property
+    def evaluator_class(self):
+        module_path, class_name = self.evaluator_path.split(":")
+        module = import_module(module_path)
+        return getattr(module, class_name)
 
 
 # ========================================
@@ -54,49 +96,49 @@ TASK_REGISTRY: Dict[str, TaskRegistration] = {
     "label_cond": TaskRegistration(
         name="label_cond",
         config=LABEL_COND_CONFIG,
-        evaluator_class=RecommendationEvaluator,
+        evaluator_path="benchmarks.open_one_rec.tasks.recommendation.evaluator:RecommendationEvaluator",
         category="recommendation",
     ),
     "video": TaskRegistration(
         name="video",
         config=VIDEO_CONFIG,
-        evaluator_class=RecommendationEvaluator,
+        evaluator_path="benchmarks.open_one_rec.tasks.recommendation.evaluator:RecommendationEvaluator",
         category="recommendation",
     ),
     "product": TaskRegistration(
         name="product",
         config=PRODUCT_CONFIG,
-        evaluator_class=RecommendationEvaluator,
+        evaluator_path="benchmarks.open_one_rec.tasks.recommendation.evaluator:RecommendationEvaluator",
         category="recommendation",
     ),
     "ad": TaskRegistration(
         name="ad",
         config=AD_CONFIG,
-        evaluator_class=RecommendationEvaluator,
+        evaluator_path="benchmarks.open_one_rec.tasks.recommendation.evaluator:RecommendationEvaluator",
         category="recommendation",
     ),
     "interactive": TaskRegistration(
         name="interactive",
         config=INTERACTIVE_CONFIG,
-        evaluator_class=RecommendationEvaluator,
+        evaluator_path="benchmarks.open_one_rec.tasks.recommendation.evaluator:RecommendationEvaluator",
         category="recommendation",
     ),
     "label_pred": TaskRegistration(
         name="label_pred",
         config=LABEL_PRED_CONFIG,
-        evaluator_class=LabelPredEvaluator,
+        evaluator_path="benchmarks.open_one_rec.tasks.label_pred.evaluator:LabelPredEvaluator",
         category="recommendation",
     ),
     "item_understand": TaskRegistration(
         name="item_understand",
         config=ITEM_UNDERSTAND_CONFIG,
-        evaluator_class=ItemUnderstandEvaluator,
+        evaluator_path="benchmarks.open_one_rec.tasks.item_understand.evaluator:ItemUnderstandEvaluator",
         category="caption",
     ),
     "rec_reason": TaskRegistration(
         name="rec_reason",
         config=REC_REASON_CONFIG,
-        evaluator_class=RecoReasonEvaluator,
+        evaluator_path="benchmarks.open_one_rec.tasks.rec_reason.evaluator:RecoReasonEvaluator",
         category="caption",
     ),
 }
@@ -310,6 +352,7 @@ class BaseLoader(ABC):
 
         if isinstance(value, float):
             try:
+                pd = _require_pandas()
                 return pd.isna(value)
             except (ValueError, TypeError):
                 return False
@@ -373,17 +416,12 @@ class BaseLoader(ABC):
         else:
             base_dir = "./data"
 
-        filename = f"{self.task_name}_{split}.parquet"
+        data_file = os.path.join(base_dir, self.task_name, f"{self.task_name}_{split}.parquet")
 
-        possible_paths = [
-            os.path.join(base_dir, self.task_name, filename),
-        ]
+        if os.path.exists(data_file):
+            return data_file
 
-        for file_path in possible_paths:
-            if os.path.exists(file_path):
-                return file_path
-
-        return possible_paths[0]
+        return data_file
 
     def _get_sample_data_file_path(self, split: str, sample_size: int) -> str:
         """Get sample data file path"""
@@ -392,25 +430,28 @@ class BaseLoader(ABC):
         else:
             base_dir = "./data"
 
-        possible_paths = [
-            os.path.join(
-                base_dir,
-                self.task_name,
-                f"{self.task_name}_{split}_sample_{sample_size}.parquet",
-            ),
-            os.path.join(
-                base_dir,
-                f"{self.task_name}_{split}_sample_{sample_size}.parquet",
-            ),
-        ]
+        task_sample_file = os.path.join(
+            base_dir,
+            self.task_name,
+            f"{self.task_name}_{split}_sample_{sample_size}.parquet",
+        )
 
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
+        if os.path.exists(task_sample_file):
+            return task_sample_file
 
-        return possible_paths[0]
+        root_sample_file = os.path.join(
+            base_dir,
+            f"{self.task_name}_{split}_sample_{sample_size}.parquet",
+        )
+        if os.path.exists(root_sample_file):
+            return root_sample_file
 
-    def _load_dataframe(self, split: str) -> pd.DataFrame:
+        # Preserve the original first-write layout under <data_dir>/<task_name>/.
+        # Only fall back to the root-level cache path when that cache already
+        # exists and we are reading legacy data.
+        return task_sample_file
+
+    def _load_dataframe(self, split: str) -> Any:
         """Load DataFrame from data file"""
         data_file = self._get_data_file_path(split)
 
@@ -419,14 +460,11 @@ class BaseLoader(ABC):
 
         logger.info(f"Loading data file: {data_file}")
 
-        if data_file.endswith(".parquet"):
-            df = pd.read_parquet(data_file)
-        else:
-            raise ValueError(f"Unsupported file format: {data_file}")
+        df = _read_parquet(data_file, columns=["messages", "metadata"])
 
         return df
 
-    def _sample_data(self, df: pd.DataFrame, sample_size: int) -> pd.DataFrame:
+    def _sample_data(self, df: Any, sample_size: int) -> Any:
         """Reproducibly sample data (take head) from DataFrame"""
         if sample_size >= len(df):
             return df
@@ -434,7 +472,7 @@ class BaseLoader(ABC):
         logger.info(f"Sampling {sample_size} samples (total: {len(df)})")
         return df.sample(sample_size, random_state=42)
 
-    def _save_sample_data(self, df: pd.DataFrame, split: str, sample_size: int):
+    def _save_sample_data(self, df: Any, split: str, sample_size: int):
         """Save sample data in parquet format"""
         sample_file = self._get_sample_data_file_path(split, sample_size)
 
@@ -445,7 +483,7 @@ class BaseLoader(ABC):
         df.to_parquet(sample_file, index=False)
         logger.info(f"Sample data saved to: {sample_file}")
 
-    def _load_sample_dataframe(self, split: str, sample_size: int) -> Optional[pd.DataFrame]:
+    def _load_sample_dataframe(self, split: str, sample_size: int) -> Optional[Any]:
         """Load sample dataframe from cache if exists"""
         sample_file = self._get_sample_data_file_path(split, sample_size)
 
@@ -454,10 +492,19 @@ class BaseLoader(ABC):
 
         logger.info(f"Loading sample data from cache: {sample_file}")
 
-        df = pd.read_parquet(sample_file)
+        try:
+            df = _read_parquet(sample_file, columns=["messages", "metadata"])
+        except Exception as exc:
+            logger.warning(
+                "Failed to load sample cache %s: %s: %s. Falling back to source dataset.",
+                sample_file,
+                type(exc).__name__,
+                exc,
+            )
+            return None
         return df
 
-    def _process_dataframe(self, df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    def _process_dataframe(self, df: Any) -> Dict[str, Dict[str, Any]]:
         """Process DataFrame and convert to model input format"""
         self._load_custom_chat_template()
 

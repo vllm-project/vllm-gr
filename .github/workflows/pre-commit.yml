@@ -42,7 +42,7 @@ jobs:
         with:
           path: .venv
           base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.14.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
 
       - name: Create virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -63,7 +63,7 @@ jobs:
       - name: Install base environment (vllm)
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
-          uv pip install vllm==0.14.1
+          uv pip install vllm==0.22.1
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'

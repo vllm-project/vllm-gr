@@ -1,3 +1,4 @@
+import asyncio
 import atexit
 import json
 import logging
@@ -5,6 +6,7 @@ import os
 import sys
 import time
 import traceback
+import types
 from typing import Literal
 
 import aiohttp
@@ -12,6 +14,17 @@ import requests
 import vllm
 import vllm.benchmarks.datasets
 import vllm.benchmarks.serve
+
+# vLLM's throughput benchmark imports uvloop unconditionally and calls
+# uvloop.run(...) for the async engine path. OpenOneRec imports that module
+# early so it can patch the benchmark entrypoints, but some test and
+# development environments do not have uvloop installed. This fallback keeps
+# the import working and degrades to asyncio.run(...).
+try:
+    import uvloop  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules["uvloop"] = types.SimpleNamespace(run=asyncio.run)
+
 import vllm.benchmarks.throughput
 from tqdm import tqdm
 from vllm.benchmarks.datasets import add_dataset_parser as original_add_parser
@@ -33,8 +46,6 @@ from vllm.benchmarks.throughput import get_requests as original_get_requests
 from vllm.benchmarks.throughput import main as original_main
 from vllm.benchmarks.throughput import validate_args as original_validate_args
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
-
-from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
 # ============================================================================
 # Constants
@@ -126,17 +137,12 @@ def _print_beam_search_delta(before: dict, after: dict):
     print("=" * 50)
 
 
-def _consume_use_beam_search_flag():
-    """Check for `--use-beam-search` in sys.argv, remove it, and return True if present.
-
-    This avoids argparse errors for unknown options while allowing users to pass
-    `--use-beam-search` on the command line. We intentionally consume the token
-    at import time so that the existing vLLM parsers won't see it."""
+def _detect_use_beam_search_flag():
+    """Detect whether `--use-beam-search` was requested on the command line."""
     if "--use-beam-search" in sys.argv:
         logger.info(
             "Detected --use-beam-search flag in command. Enabling beam search for this benchmark run."
         )
-        sys.argv.remove("--use-beam-search")
         return True
     return False
 
@@ -179,10 +185,29 @@ def _get_output_len_from_argv():
     return 0
 
 
-USE_BEAM_SEARCH = _consume_use_beam_search_flag()
+USE_BEAM_SEARCH = _detect_use_beam_search_flag()
 ARGS_N_BEAMS = _get_n_beams_from_argv()
 ARGS_OUTPUT_LEN = _get_output_len_from_argv()
-atexit.register(cleanup_dist_env_and_memory)
+
+
+def _register_cleanup_hook():
+    from vllm.platforms import current_platform
+
+    device_type = getattr(current_platform, "device_type", None)
+    if device_type == "npu":
+        logger.info("Skipping cleanup_dist_env_and_memory atexit hook on NPU.")
+        return
+
+    def _safe_cleanup():
+        try:
+            cleanup_dist_env_and_memory()
+        except Exception:  # pragma: no cover - best effort shutdown path
+            pass
+
+    atexit.register(_safe_cleanup)
+
+
+_register_cleanup_hook()
 
 # ============================================================================
 # Beam Search Patching
@@ -240,7 +265,7 @@ async def patched_async_request_openai_chat_completions(
         "use_beam_search": request_func_input.use_beam_search,
         "n": request_func_input.n,
         "temperature": temperature,
-        "max_tokens": request_func_input.output_len,
+        "max_completion_tokens": request_func_input.output_len,
         "stream": True,
         "stream_options": {
             "include_usage": True,
@@ -259,7 +284,7 @@ async def patched_async_request_openai_chat_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
-    ttft = 0.0
+    first_chunk_received = False
     st = time.perf_counter()
     output.start_time = st
     most_recent_timestamp = st
@@ -283,33 +308,41 @@ async def patched_async_request_openai_chat_completions(
                         chunk = message.removeprefix("data: ")
 
                         if chunk != "[DONE]":
-                            timestamp = time.perf_counter()
                             data = json.loads(chunk)
 
-                            if choices := data.get("choices"):
-                                delta = choices[0]["delta"]
-                                content = delta.get("content")
-                                reasoning_content = delta.get("reasoning_content")
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
+                            if error := data.get("error"):
+                                output.error = json.dumps(error, ensure_ascii=True)
+                                output.success = False
+                                if pbar:
+                                    pbar.update(1)
+                                return output
 
-                                # Decoding phase
+                            if choices := data.get("choices"):
+                                delta = choices[0].get("delta") or {}
+                                timestamp = time.perf_counter()
+                                if not first_chunk_received:
+                                    first_chunk_received = True
+                                    output.ttft = timestamp - st
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
 
-                                if reasoning_content:
-                                    generated_text += reasoning_content
-                                if content:
-                                    generated_text += content
+                                reasoning_content = delta.get("reasoning_content")
+                                content = delta.get("content")
+                                generated_text += reasoning_content or ""
+                                generated_text += content or ""
+                                most_recent_timestamp = timestamp
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
-
-                            most_recent_timestamp = timestamp
+                                if (pt := usage.get("prompt_tokens")) is not None:
+                                    output.prompt_len = pt
 
                 output.generated_text = generated_text
-                output.success = True
+                output.success = first_chunk_received
+                if not first_chunk_received:
+                    output.error = output.error or (
+                        "Never received a valid choices chunk to calculate TTFT."
+                        " This response will be marked as failed!"
+                    )
                 output.latency = most_recent_timestamp - st
             else:
                 output.error = response.reason or ""
@@ -388,6 +421,13 @@ def _add_beams_arguments(parser):
     """Helper to add beam search arguments to parser."""
     beams_group = parser.add_argument_group("beam search options")
 
+    if not _has_option(parser, "--use-beam-search"):
+        beams_group.add_argument(
+            "--use-beam-search",
+            action="store_true",
+            help="Enable beam search for this benchmark run",
+        )
+
     if not _has_option(parser, "--n"):
         beams_group.add_argument(
             "--n",
@@ -397,12 +437,19 @@ def _add_beams_arguments(parser):
         )
 
 
+def _get_onerec_dataset_cls():
+    from .open_one_rec_dataset import OneRecDataset
+
+    return OneRecDataset
+
+
 def patched_get_samples(args, tokenizer):
     """Patch get_samples to handle OneRecDataset."""
     if not hasattr(args, "request_id_prefix"):
         args.request_id_prefix = ""
 
     if args.dataset_name == DATASET_NAME:
+        OneRecDataset = _get_onerec_dataset_cls()
         dataset = OneRecDataset(
             task_types=args.task_types.split(","),
             dataset_path=args.dataset_path,
@@ -438,12 +485,14 @@ def patched_add_cli_args(parser):
     original_add_cli_args(parser)
     _add_dataset_to_parser_choices(parser, DATASET_NAME)
     _add_onerec_arguments(parser)
+    _add_beams_arguments(parser)
     return parser
 
 
 def patched_get_requests(args, tokenizer):
     """Patch get_requests to handle OneRecDataset."""
     if args.dataset_name == DATASET_NAME:
+        OneRecDataset = _get_onerec_dataset_cls()
         dataset = OneRecDataset(
             dataset_path=args.dataset_path,
             task_types=args.task_types.split(","),
@@ -502,8 +551,9 @@ def _run_offline_beam_search_benchmark(args):
         from vllm.sampling_params import BeamSearchParams
     from transformers import AutoTokenizer
 
-    from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
     from vllm_gr.entrypoints.gr import GRLLM
+
+    from .open_one_rec_dataset import OneRecDataset
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -657,6 +707,10 @@ vllm.benchmarks.serve.get_samples = patched_get_samples
 vllm.benchmarks.serve.main = patched_serve_main
 
 # Also patch the CLI module if it already imported the original reference
+if "vllm.entrypoints.cli.benchmark.throughput" in sys.modules:
+    sys.modules["vllm.entrypoints.cli.benchmark.throughput"].add_cli_args = patched_add_cli_args
+    sys.modules["vllm.entrypoints.cli.benchmark.throughput"].main = patched_main
+
 if "vllm.entrypoints.cli.benchmark.serve" in sys.modules:
     sys.modules["vllm.entrypoints.cli.benchmark.serve"].add_cli_args = patched_serve_add_cli_args
     sys.modules["vllm.entrypoints.cli.benchmark.serve"].main = patched_serve_main

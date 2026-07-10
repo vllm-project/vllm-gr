@@ -9,30 +9,29 @@ from typing import Tuple
 
 import numpy as np
 import torch
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionImpl,
+    AttentionMetadataBuilder,
     AttentionType,
+    CommonAttentionMetadata,
     MultipleOf,
-    is_quantized_kv_cache,
 )
 from vllm.v1.attention.backends.fa_utils import (
-    flash_attn_supports_fp8,
+    flash_attn_supports_quant_query_input,
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.v1.attention.backends.utils import (
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-    get_kv_cache_layout,
-)
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
@@ -231,7 +230,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         ):
             max_num_splits = self.max_num_splits
 
-        if CUDA_DEVICE and vllm_is_batch_invariant():
+        if CUDA_DEVICE and envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
         return max_num_splits
 
@@ -850,12 +849,12 @@ class BeamAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.attn_type = attn_type
         self.vllm_flash_attn_version = get_flash_attn_version() if not NPU_DEVICE else 0
-        self.batch_invariant_enabled = vllm_is_batch_invariant() if CUDA_DEVICE else False
+        self.batch_invariant_enabled = envs.VLLM_BATCH_INVARIANT if CUDA_DEVICE else False
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
             if NPU_DEVICE:
                 raise NotImplementedError("BeamAttention does not support fp8 kv-cache on NPU.")
-            if not flash_attn_supports_fp8():
+            if not BeamAttentionBackend.supports_kv_cache_dtype(self.kv_cache_dtype):
                 raise NotImplementedError(
                     "BeamAttention does not support fp8 kv-cache on this device."
                 )
@@ -868,7 +867,7 @@ class BeamAttentionImpl(AttentionImpl):
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of heads in the layer"
             )
-        self.supports_quant_query_input = True
+        self.supports_quant_query_input = BeamAttentionBackend.supports_quant_query_input()
         self.use_cascade = True
 
     @staticmethod
@@ -1209,6 +1208,10 @@ class BeamAttentionBackend(AttentionBackend):
     def supports_attn_type(cls, attn_type: str) -> bool:
         return attn_type == AttentionType.DECODER
 
+    @classmethod
+    def supports_quant_query_input(cls) -> bool:
+        return flash_attn_supports_quant_query_input()
+
     @staticmethod
     def get_impl_cls() -> type["BeamAttentionImpl"]:
         return BeamAttentionImpl
@@ -1254,21 +1257,22 @@ class BeamAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
-        if kv_cache_dtype.startswith("fp8"):
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
             if NPU_DEVICE:
-                return False  # fp8 kv-cache not yet supported on NPU
-            return flash_attn_supports_fp8()
-        return kv_cache_dtype in ["auto"]
+                return False
+            return get_flash_attn_version() == 3 and current_platform.is_device_capability_family(
+                90
+            )
+        return kv_cache_dtype in ["auto", "float16", "bfloat16"]
 
     @classmethod
     def supports_sink(cls) -> bool:
         if NPU_DEVICE:
-            return False  # sinks not yet supported on NPU
+            return False
         return is_flash_attn_varlen_func_available() and flash_attn_supports_sinks()
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # NPU does not use CUDA-style compute capability; accept it.
         if NPU_DEVICE:
             return True
         return capability >= DeviceCapability(8, 0)

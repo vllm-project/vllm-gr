@@ -1,8 +1,14 @@
 import random
+from typing import TYPE_CHECKING, Any
 
-from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest, TokenizerLike
+from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 
 from .open_one_rec_loader import TASK_REGISTRY, DataLoaderWrapper
+
+if TYPE_CHECKING:
+    from vllm.tokenizers import TokenizerLike
+else:
+    TokenizerLike = Any
 
 # -----------------------------------------------------------------------------
 # OpenOneRec Dataset Implementation

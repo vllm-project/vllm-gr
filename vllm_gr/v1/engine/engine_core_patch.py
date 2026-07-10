@@ -6,6 +6,7 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 from __future__ import annotations
 
 import threading
+import time
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +18,14 @@ from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
 
 logger = init_logger(__name__)
 
+# vllm-gr IPC protocol version between frontend clients and EngineCore.
+# Bumping this value is a breaking change: both sides must be upgraded together.
+VLLM_GR_PROTOCOL_VERSION = 1
+
+ADD_BATCH_WIRE_BYTE = b"\x06"
+BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE = b"\x07"
+
+
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
 # ---------------------------------------------------------------------------
@@ -24,6 +33,17 @@ logger = init_logger(__name__)
 
 def make_patched_engine_core_init(original_init):
     """Wrap EngineCore.__init__ to add beam state."""
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.beam_cache: dict[str, dict] = {}
+        self.beam_cache_lock = threading.Lock()
+
+    return patched_init
+
+
+def make_patched_engine_core_proc_init(original_init):
+    """Wrap EngineCoreProc.__init__ to add beam state for socket-thread helpers."""
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
@@ -53,13 +73,19 @@ def _add_enum_member(name: str, value: bytes) -> None:
 
     Args:
         name: The name of the new enum member (e.g., "ADD_BATCH")
-        value: The byte value for the enum member (e.g., b"\\x05")
+        value: The byte value for the enum member (e.g., b"\\x06")
 
     Raises:
         RuntimeError: If the enum's internal structure is incompatible
     """
     # Skip if already added
     if hasattr(EngineCoreRequestType, name):
+        existing_member = getattr(EngineCoreRequestType, name)
+        if existing_member.value != value:
+            raise ValueError(
+                f"EngineCoreRequestType.{name} already exists with value "
+                f"{existing_member.value!r}, cannot reassign to {value!r}"
+            )
         return
 
     # Validate that the enum has expected internal structure
@@ -80,6 +106,12 @@ def _add_enum_member(name: str, value: bytes) -> None:
                 f"Value type mismatch: expected {existing_value_type.__name__}, "
                 f"got {type(value).__name__}"
             )
+
+    existing_member = EngineCoreRequestType._value2member_map_.get(value)
+    if existing_member is not None:
+        raise ValueError(
+            f"EngineCoreRequestType value {value!r} is already used by {existing_member.name!r}"
+        )
 
     # Create the member instance bypassing enum's __new__
     # (This is the standard approach for runtime enum extension)
@@ -122,11 +154,12 @@ def apply_engine_core_child_patches():
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
     # Add new enum members: ADD_BATCH, BEAM_REQUEST_STEP_UPDATE
-    _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+    _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
 
-    # Wrap EngineCore.__init__ to add beam state
+    # Wrap EngineCore / EngineCoreProc.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
+    EngineCoreProc.__init__ = make_patched_engine_core_proc_init(EngineCoreProc.__init__)
 
     # Bind _cache_beam_request and _handle_beam_request_step_update on both classes
     EngineCore._cache_beam_request = _cache_beam_request
@@ -263,6 +296,78 @@ def apply_scheduler_patch():
         try:
             output = _original_schedule(self)
 
+            total_scheduled = getattr(output, "total_num_scheduled_tokens", 0)
+            num_requests = len(self.requests)
+            has_requests = self.has_requests()
+            if total_scheduled == 0 and has_requests:
+                # EngineCore calls schedule() about once per millisecond while it
+                # has an unschedulable request. Throttle this diagnostic so the
+                # logger itself does not turn a scheduler stall into a CPU/log-I/O
+                # storm.
+                now = time.monotonic()
+                last_log = getattr(self, "_vllm_gr_last_zero_schedule_log", 0.0)
+                zero_count = getattr(self, "_vllm_gr_zero_schedule_count", 0) + 1
+                self._vllm_gr_zero_schedule_count = zero_count
+                if now - last_log >= 5.0:
+                    self._vllm_gr_last_zero_schedule_log = now
+
+                    req_states = []
+                    for r in self.requests.values():
+                        num_tokens_with_spec = getattr(r, "num_tokens_with_spec", None)
+                        num_placeholders = getattr(r, "num_output_placeholders", 0)
+                        num_computed = getattr(r, "num_computed_tokens", None)
+                        schedulable_delta = (
+                            num_tokens_with_spec + num_placeholders - num_computed
+                            if isinstance(num_tokens_with_spec, int)
+                            and isinstance(num_placeholders, int)
+                            and isinstance(num_computed, int)
+                            else None
+                        )
+                        status = getattr(r, "status", None)
+                        req_states.append(
+                            {
+                                "id": r.request_id,
+                                "status": getattr(status, "name", str(status)),
+                                "tokens": getattr(r, "num_tokens", None),
+                                "tokens_with_spec": num_tokens_with_spec,
+                                "computed": num_computed,
+                                "placeholders": num_placeholders,
+                                "schedulable_delta": schedulable_delta,
+                                "prompt_tokens": getattr(r, "num_prompt_tokens", None),
+                                "max_tokens": getattr(r, "max_tokens", None),
+                                "is_beam_decode": getattr(r, "is_beam_decode", False),
+                                "beam_width": getattr(r, "beam_width", None),
+                                "beam_decode_steps": getattr(r, "beam_decode_steps", None),
+                                "prefix_len": getattr(r, "prefix_len", None),
+                            }
+                        )
+
+                    block_pool = getattr(self.kv_cache_manager, "block_pool", None)
+                    free_blocks = getattr(block_pool, "num_free_blocks", None)
+                    logger.warning(
+                        "[vllm-gr-stall] schedule returned 0 tokens while requests remain "
+                        "(consecutive_zero_schedules=%d num_requests=%d running=%d "
+                        "waiting=%d skipped_waiting=%d pause_state=%s "
+                        "max_num_scheduled_tokens=%s free_kv_blocks=%s). requests=%s",
+                        zero_count,
+                        num_requests,
+                        len(getattr(self, "running", ())),
+                        len(getattr(self, "waiting", ())),
+                        len(getattr(self, "skipped_waiting", ())),
+                        getattr(getattr(self, "_pause_state", None), "name", None),
+                        getattr(self, "max_num_scheduled_tokens", None),
+                        free_blocks,
+                        req_states,
+                    )
+            else:
+                self._vllm_gr_zero_schedule_count = 0
+                logger.debug(
+                    "[vllm-gr-scheduler] total_scheduled=%d has_requests=%s num_requests=%d",
+                    total_scheduled,
+                    has_requests,
+                    num_requests,
+                )
+
             # Propagate beam request attributes from Request objects to SchedulerOutput
             beam_data = {}
             if hasattr(output, "num_scheduled_tokens"):
@@ -297,8 +402,21 @@ def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optiona
     gpu_positions = None
     cpu_positions = None
     if hasattr(runner, "positions") and runner.positions is not None:
-        gpu_positions = getattr(runner.positions, "gpu", None)
-        cpu_positions = getattr(runner.positions, "cpu", None)
+        positions = runner.positions
+        gpu_candidate = getattr(positions, "gpu", None)
+        cpu_candidate = getattr(positions, "cpu", None)
+
+        if isinstance(gpu_candidate, torch.Tensor):
+            gpu_positions = gpu_candidate
+        elif isinstance(positions, torch.Tensor):
+            gpu_positions = positions
+
+        if isinstance(cpu_candidate, torch.Tensor):
+            cpu_positions = cpu_candidate
+        elif hasattr(runner, "_positions_cpu_buf") and isinstance(
+            runner._positions_cpu_buf, torch.Tensor
+        ):
+            cpu_positions = runner._positions_cpu_buf
     return gpu_positions, cpu_positions
 
 
@@ -410,7 +528,8 @@ def _remux_logprobs_tensors(
     new_st_ids, new_lps, new_lp_ids, new_ranks = [], [], [], []
     gpu_row_cursor = 0
 
-    for req_id, _, W_logits, *_ in request_row_configs:
+    for row_config in request_row_configs:
+        req_id, _, W_logits, *_ = row_config
         # --------------------------------------------------------------------
         # CASE A: INTERMEDIATE CHUNKED PREFILL (No output rows generated)
         # --------------------------------------------------------------------
@@ -428,8 +547,11 @@ def _remux_logprobs_tensors(
             )
             if orig_lp_ids is not None:
                 new_lp_ids.append(
-                    torch.zeros(
-                        (1, max_chained_dim), dtype=orig_lp_ids.dtype, device=orig_lp_ids.device
+                    torch.full(
+                        (1, max_chained_dim),
+                        -1,
+                        dtype=orig_lp_ids.dtype,
+                        device=orig_lp_ids.device,
                     )
                 )
             if orig_ranks is not None:
@@ -438,6 +560,10 @@ def _remux_logprobs_tensors(
                         (1, max_chained_dim), dtype=orig_ranks.dtype, device=orig_ranks.device
                     )
                 )
+            # V2 retains one placeholder sampler row for an incomplete beam
+            # chunk. V1 has no such row, so older 4-tuples default to zero.
+            if len(row_config) > 4:
+                gpu_row_cursor += row_config[4]
             continue
 
         # --------------------------------------------------------------------
@@ -461,7 +587,9 @@ def _remux_logprobs_tensors(
             )
             if W_logits * target_K < max_chained_dim:
                 req_lp_ids = torch.nn.functional.pad(
-                    req_lp_ids, (0, max_chained_dim - (W_logits * target_K)), value=0
+                    req_lp_ids,
+                    (0, max_chained_dim - (W_logits * target_K)),
+                    value=-1,
                 )
             new_lp_ids.append(req_lp_ids)
 
@@ -660,9 +788,25 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
                     new_logits_indices,
                 )
             )
+            logger.debug(
+                "_beam_remap_inputs req_id=%s seq_len=%d "
+                "beams_count=%d beams_with_logits=%d active=%s new_logits_indices_len=%d",
+                req_id,
+                seq_len,
+                beams_count,
+                beams_count_with_logits,
+                active_beam_ids,
+                len(new_logits_indices),
+            )
             row_to_req_id.extend([req_id] * beams_count)
             row_to_batch_idx.extend([batch_idx] * beams_count)
             logits_to_batch_idx.extend([batch_idx] * beams_count_with_logits)
+            logger.info_once(
+                "Grouped beam remap active on %s: beams=%d logits_rows=%d",
+                type(runner).__name__,
+                beams_count,
+                beams_count_with_logits,
+            )
 
             request_row_configs.append(
                 (req_id, input_row_idx, beams_count_with_logits, active_beam_ids)
@@ -722,6 +866,12 @@ def _beam_collapse_bookkeeping(
             orig_lp_ids = lp_tensors.logprob_token_ids
             orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
             actual_K = orig_lps.shape[1]
+            logger.debug(
+                "_beam_collapse_bookkeeping orig_lps.shape=%s st_ids.shape=%s actual_K=%d",
+                orig_lps.shape,
+                st_ids.shape,
+                actual_K,
+            )
 
             max_chained_dim = 0
             for req_id, _, W, *_ in request_row_configs:
@@ -790,20 +940,23 @@ def _beam_collapse_bookkeeping(
                                     device=orig_lps.device,
                                     dtype=orig_lps.dtype,
                                 ),
-                                "lp_ids": torch.zeros(
-                                    (total_beam_width, actual_K),
-                                    dtype=orig_lp_ids.tensor.dtype
-                                    if hasattr(orig_lp_ids, "tensor")
-                                    else torch.long,
-                                    device=orig_lps.device,
-                                )
-                                if orig_lp_ids is not None
-                                else None,
-                                "ranks": torch.zeros(
-                                    total_beam_width, dtype=torch.long, device=orig_lps.device
-                                )
-                                if orig_ranks is not None
-                                else None,
+                                "lp_ids": (
+                                    torch.full(
+                                        (total_beam_width, actual_K),
+                                        -1,
+                                        dtype=orig_lp_ids.dtype,
+                                        device=orig_lps.device,
+                                    )
+                                    if orig_lp_ids is not None
+                                    else None
+                                ),
+                                "ranks": (
+                                    torch.zeros(
+                                        total_beam_width, dtype=torch.long, device=orig_lps.device
+                                    )
+                                    if orig_ranks is not None
+                                    else None
+                                ),
                                 "completed_beams": set(),
                             }
 
@@ -825,13 +978,43 @@ def _beam_collapse_bookkeeping(
 
                         # Evict and overwrite target boundaries only when ALL unique structural slots are filled
                         if len(cache_entry["completed_beams"]) >= total_beam_width:
-                            final_lps[idx].copy_(cache_entry["lps"].view(-1))
+                            valid_logprobs = total_beam_width * actual_K
+                            final_lps[idx, :valid_logprobs].copy_(cache_entry["lps"].view(-1))
                             if final_lp_ids is not None:
-                                final_lp_ids[idx].copy_(cache_entry["lp_ids"].view(-1))
+                                final_lp_ids[idx, :valid_logprobs].copy_(
+                                    cache_entry["lp_ids"].view(-1)
+                                )
                             if final_ranks is not None:
                                 final_ranks[idx, :total_beam_width].copy_(cache_entry["ranks"])
 
                             del runner._beam_logprobs_cache[req_id]
+                            logger.info(
+                                "[vllm-gr-beam] completed split grouped-beam logits: "
+                                "request_id=%s completed=%d/%d actual_k=%d",
+                                req_id,
+                                total_beam_width,
+                                total_beam_width,
+                                actual_K,
+                            )
+                        else:
+                            # A grouped request uses max_tokens=1. Returning even
+                            # one sampled token before every physical beam has
+                            # produced logits would finish the logical session and
+                            # expose a partially padded logprob row to the client.
+                            num_sampled = getattr(sampler_output, "num_sampled", None)
+                            if num_sampled is not None:
+                                num_sampled[idx] = 0
+                            logger.warning(
+                                "[vllm-gr-beam] partial grouped-beam logits: "
+                                "request_id=%s chunk_logits=%d active_beams=%s "
+                                "completed=%d/%d num_sampled_forced_to_zero=%s",
+                                req_id,
+                                logits_num,
+                                active_beams,
+                                len(cache_entry["completed_beams"]),
+                                total_beam_width,
+                                num_sampled is not None,
+                            )
 
             try:
                 st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
@@ -851,6 +1034,73 @@ def _beam_collapse_bookkeeping(
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
 
 
+def _collapse_valid_sampled_token_ids(
+    request_row_configs,
+    valid_sampled_token_ids,
+    beam_data,
+    incomplete_req_ids,
+) -> list[list[int]]:
+    """Collapse physical beam samples into one scheduler token per request.
+
+    Grouped beam execution expands one logical scheduler request into multiple
+    model-runner rows. vLLM 0.22.1 requires ``ModelRunnerOutput`` to carry at
+    least one sampled token for a completed ``max_tokens=1`` request; returning
+    an empty list leaves the request RUNNING after all prompt tokens have been
+    computed, so the scheduler can never make progress again.
+
+    For a split grouped-beam chunk, ``_beam_logprobs_cache`` retains the request
+    ID until every physical beam has produced logits. Such requests must still
+    return an empty token list. Once complete, the first physical sampled token
+    is used only as the logical scheduler token; candidate selection continues
+    to use the flattened grouped logprobs.
+    """
+    collapsed: list[list[int]] = []
+    physical_row_cursor = 0
+    valid_sampled_token_ids = valid_sampled_token_ids or []
+
+    for row_config in request_row_configs:
+        req_id, _, num_logits_rows, *_ = row_config
+        num_logits_rows = max(int(num_logits_rows), 0)
+        physical_rows = valid_sampled_token_ids[
+            physical_row_cursor : physical_row_cursor + num_logits_rows
+        ]
+        physical_row_cursor += num_logits_rows
+
+        if req_id is None:
+            continue
+        if req_id in incomplete_req_ids or num_logits_rows == 0:
+            collapsed.append([])
+            continue
+
+        representative = next((tokens for tokens in physical_rows if tokens), None)
+        if representative is None:
+            if req_id in beam_data:
+                raise RuntimeError(
+                    f"Grouped beam logits completed without a sampled token for request {req_id!r}."
+                )
+            collapsed.append([])
+            continue
+
+        # Grouped requests always use max_tokens=1. The representative token
+        # advances and finishes the logical scheduler request; beam selection is
+        # based on the collapsed logprobs, not this token value.
+        collapsed.append([int(representative[0])])
+
+    return collapsed
+
+
+def _clear_beam_logprobs_cache(runner, scheduler_output) -> None:
+    """Discard accumulation state invalidated by finish or preemption."""
+    cache = getattr(runner, "_beam_logprobs_cache", None)
+    if not cache:
+        return
+
+    stale_req_ids = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
+    stale_req_ids.update(getattr(scheduler_output, "preempted_req_ids", ()) or ())
+    for req_id in stale_req_ids:
+        cache.pop(req_id, None)
+
+
 # ---------------------------------------------------------------------------
 # Factory functions (module-level so each captures its own original via
 # closure argument, avoiding late-binding bugs when patching multiple runners).
@@ -866,6 +1116,7 @@ def make_patched_execute_model(_orig_execute_model):
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
+        _clear_beam_logprobs_cache(self, scheduler_output)
         self._current_beam_data = getattr(scheduler_output, "beam_data", {})
         beam_info = {"beam_data": self._current_beam_data, "req_ids": []}
         token = BEAM_DATA_VAR.set(beam_info)
@@ -914,10 +1165,7 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-        if hasattr(self, "_beam_logprobs_cache") and self._beam_logprobs_cache:
-            if hasattr(scheduler_output, "finished_req_ids"):
-                for req_id in scheduler_output.finished_req_ids:
-                    self._beam_logprobs_cache.pop(req_id, None)
+        _clear_beam_logprobs_cache(self, scheduler_output)
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
@@ -925,6 +1173,21 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
         request_row_configs = scheduler_output._gr_request_row_configs
         orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
+
+        # Grouped beam search expands each logical request into multiple
+        # per-beam rows. The pinned CPU buffer for sampled token ids is
+        # sized for max_num_reqs, so resize it when beams exceed that.
+        sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+        sampled_token_ids = getattr(sampler_output, "sampled_token_ids", None)
+        if sampled_token_ids is not None:
+            num_samples = sampled_token_ids.shape[0]
+            if num_samples > self.sampled_token_ids_pinned_cpu.shape[0]:
+                self.sampled_token_ids_pinned_cpu = torch.empty(
+                    (num_samples, 1),
+                    dtype=self.sampled_token_ids_pinned_cpu.dtype,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
 
         try:
             res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
@@ -945,11 +1208,31 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         collapsed_req_ids, collapsed_idx, n = _beam_collapse_bookkeeping(
             self, orig_input_batch, request_row_configs, beam_data, sampler_output
         )
+        incomplete_req_ids = set(getattr(self, "_beam_logprobs_cache", ()))
+        collapsed_sampled_token_ids = _collapse_valid_sampled_token_ids(
+            request_row_configs,
+            valid_sampled_token_ids,
+            beam_data,
+            incomplete_req_ids,
+        )
+        if len(collapsed_sampled_token_ids) != n:
+            raise RuntimeError(
+                "Grouped beam sampled-token collapse produced an invalid row count: "
+                f"expected={n}, actual={len(collapsed_sampled_token_ids)}"
+            )
+
+        # vLLM 0.22.1 expects logprobs_lists to be a LogprobsLists (NamedTuple
+        # with slice_request). Rebuild it from the collapsed sampler tensors.
+        collapsed_logprobs = None
+        if logprobs_lists is not None:
+            lp_tensors = getattr(sampler_output, "logprobs_tensors", None)
+            if lp_tensors is not None:
+                collapsed_logprobs = lp_tensors.tolists()
 
         return (
             num_nans_in_logits,
-            [[] for _ in range(n)] if logprobs_lists is not None else None,
-            [[] for _ in range(n)],
+            collapsed_logprobs,
+            collapsed_sampled_token_ids,
             prompt_logprobs_dict,
             collapsed_req_ids,
             collapsed_idx,
@@ -963,10 +1246,12 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
     """NPU ``_prepare_inputs`` wrapper.
 
     Signature: ``(scheduler_output, intermediate_tensors=None)``.
-    Returns the NPU 7-tuple
-    ``(attn_metadata, num_scheduled_tokens, num_input_tokens,
-    num_tokens_across_dp, logits_indices, spec_decode_metadata,
-    max_num_scheduled_tokens)``.
+
+    vLLM-Ascend changed the return shape of ``_prepare_inputs`` between
+    releases:
+
+    - ``0.14.x`` returned a 7-tuple whose 5th element is ``logits_indices``.
+    - ``0.22.1rc1`` returns a 4-tuple whose 1st element is ``logits_indices``.
 
     Two NPU-specific differences vs the GPU wrapper:
 
@@ -1001,28 +1286,39 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         if not beam_data:
             return out
 
-        (
-            attn_metadata,
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
-            logits_indices,
-            spec_decode_metadata,
-            max_num_scheduled_tokens,
-        ) = out
+        if not isinstance(out, tuple):
+            raise TypeError(f"Unexpected NPU _prepare_inputs return type: {type(out).__name__}")
+
+        if len(out) == 7:
+            num_scheduled_tokens = out[1]
+            logits_index = 4
+        elif len(out) == 4:
+            req_ids = list(getattr(self.input_batch, "req_ids", []))
+            # vLLM-Ascend 0.22.1rc1 stores num_scheduled_tokens in scheduler_output
+            # as a dict keyed by req_id. Guard against future shape changes.
+            num_sched_map = getattr(scheduler_output, "num_scheduled_tokens", None)
+            if not isinstance(num_sched_map, dict):
+                raise ValueError(
+                    f"Unexpected NPU _prepare_inputs 4-tuple: "
+                    f"scheduler_output.num_scheduled_tokens is {type(num_sched_map).__name__}, "
+                    f"expected dict keyed by req_id."
+                )
+            try:
+                num_scheduled_tokens = [num_sched_map[req_id] for req_id in req_ids]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Missing num_scheduled_tokens for req_id {exc.args[0]} in NPU prepare_inputs"
+                ) from exc
+            logits_index = 0
+        else:
+            raise ValueError(f"Unexpected NPU _prepare_inputs return tuple length: {len(out)}")
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
 
-        return (
-            attn_metadata,
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
-            logits_indices,
-            spec_decode_metadata,
-            max_num_scheduled_tokens,
-        )
+        out_list = list(out)
+        out_list[logits_index] = logits_indices
+        return tuple(out_list)
 
     return patched_prepare_inputs
 
@@ -1038,10 +1334,7 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-        if hasattr(self, "_beam_logprobs_cache") and self._beam_logprobs_cache:
-            if hasattr(scheduler_output, "finished_req_ids"):
-                for req_id in scheduler_output.finished_req_ids:
-                    self._beam_logprobs_cache.pop(req_id, None)
+        _clear_beam_logprobs_cache(self, scheduler_output)
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
@@ -1070,10 +1363,28 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
         collapsed_req_ids, collapsed_idx, n = _beam_collapse_bookkeeping(
             self, orig_input_batch, request_row_configs, beam_data, sampler_output
         )
+        incomplete_req_ids = set(getattr(self, "_beam_logprobs_cache", ()))
+        collapsed_sampled_token_ids = _collapse_valid_sampled_token_ids(
+            request_row_configs,
+            valid_sampled_token_ids,
+            beam_data,
+            incomplete_req_ids,
+        )
+        if len(collapsed_sampled_token_ids) != n:
+            raise RuntimeError(
+                "Grouped beam sampled-token collapse produced an invalid row count: "
+                f"expected={n}, actual={len(collapsed_sampled_token_ids)}"
+            )
+
+        collapsed_logprobs = None
+        if logprobs_lists is not None:
+            lp_tensors = getattr(sampler_output, "logprobs_tensors", None)
+            if lp_tensors is not None:
+                collapsed_logprobs = lp_tensors.tolists()
 
         return (
-            [[] for _ in range(n)] if logprobs_lists is not None else None,
-            [[] for _ in range(n)],
+            collapsed_logprobs,
+            collapsed_sampled_token_ids,
             prompt_logprobs_dict,
             collapsed_req_ids,
             collapsed_idx,
@@ -1084,49 +1395,67 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
 
 def apply_worker_patches():
-    """Applies runtime overrides onto GPUModelRunner and NPUModelRunner execution entries."""
+    """Apply grouped-beam hooks to supported V1 GPU/NPU model runners."""
     from vllm_gr.utils.npu_adapter import is_npu_available
 
     try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
     except ImportError:
-        logger.warning("Failed to import GPUModelRunner segments, skipping GPU patches.")
-        GPUModelRunner = None
+        logger.warning("Failed to import V1 GPUModelRunner, skipping its patches.")
+        GPUModelRunnerV1 = None
 
     npu_available = is_npu_available()
+    NPUModelRunner = None
     if npu_available:
-        try:
-            from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-        except ImportError:
-            logger.warning("Failed to import NPUModelRunner, skipping NPU patches.")
-            NPUModelRunner = None
+        import_errors_v1: list[tuple[str, Exception]] = []
+        for module_path in (
+            "vllm_ascend.worker.model_runner_v1",
+            "vllm_ascend.worker.worker",
+        ):
+            try:
+                module = __import__(module_path, fromlist=["NPUModelRunner"])
+                NPUModelRunner = getattr(module, "NPUModelRunner")
+                logger.debug("apply_worker_patches: imported %s.NPUModelRunner", module_path)
+                break
+            except (ImportError, AttributeError) as exc:
+                import_errors_v1.append((module_path, exc))
+        if NPUModelRunner is None:
+            details = "; ".join(
+                f"{module_path}: {type(exc).__name__}: {exc}"
+                for module_path, exc in import_errors_v1
+            )
+            logger.warning(
+                "Failed to import NPUModelRunner (V1), skipping NPU V1 patches. Details: %s",
+                details,
+            )
     else:
-        NPUModelRunner = None
+        logger.debug("apply_worker_patches: NPU not available, skipping NPU runner patches.")
 
     # Return early if nothing to patch
-    if GPUModelRunner is None and NPUModelRunner is None:
-        logger.warning("No supported model runner found for patching.")
-        return
+    if GPUModelRunnerV1 is None and NPUModelRunner is None:
+        logger.warning("No supported V1 model runner found for patching.")
+        return 0
 
     # Track which runners have already been patched
     runners_to_patch = []
-    if GPUModelRunner is not None and not getattr(
-        GPUModelRunner, "_patched_for_beam_pos_ids", False
+    if GPUModelRunnerV1 is not None and not getattr(
+        GPUModelRunnerV1, "_patched_for_beam_pos_ids", False
     ):
-        runners_to_patch.append(("GPUModelRunner", GPUModelRunner))
+        runners_to_patch.append(("GPUModelRunnerV1", GPUModelRunnerV1))
     if NPUModelRunner is not None and not getattr(
         NPUModelRunner, "_patched_for_beam_pos_ids", False
     ):
         runners_to_patch.append(("NPUModelRunner", NPUModelRunner))
 
     if not runners_to_patch:
-        return
+        logger.debug("apply_worker_patches: no runners to patch")
+        return 0
 
     # Apply patches to each runner
     for runner_name, runner_class in runners_to_patch:
         runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
 
-        if runner_name == "GPUModelRunner":
+        if runner_name == "GPUModelRunnerV1":
             runner_class._prepare_inputs = make_patched_prepare_inputs_gpu(
                 runner_class._prepare_inputs
             )
@@ -1142,4 +1471,6 @@ def apply_worker_patches():
             )
 
         runner_class._patched_for_beam_pos_ids = True
-        logger.info("%s hooks patched successfully.", runner_name)
+        logger.info("[vllm-gr] %s grouped-beam hooks patched.", runner_name)
+
+    return len(runners_to_patch)

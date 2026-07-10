@@ -65,13 +65,6 @@ def prepare_request_fn(
 
     if tokenization_kwargs is None:
         tokenization_kwargs = {}
-    from vllm.entrypoints.utils import _validate_truncation_size
-
-    _validate_truncation_size(
-        self.model_config.max_model_len,
-        params.truncate_prompt_tokens,
-        tokenization_kwargs,
-    )
 
     # Convert Input --> Request.
     if isinstance(prompt, EngineCoreRequest):
@@ -79,16 +72,18 @@ def prepare_request_fn(
     else:
         if prompt_text is not None:
             raise ValueError("should only provide prompt_text with EngineCoreRequest")
+        # vLLM 0.22.1+ requires supported_tasks; we target new versions only.
         request = self.input_processor.process_inputs(
-            request_id,
-            prompt,
-            params,
-            arrival_time or time.time(),
-            lora_request,
-            tokenization_kwargs,
-            trace_headers,
-            priority,
-            data_parallel_rank,
+            request_id=request_id,
+            prompt=prompt,
+            params=params,
+            supported_tasks=getattr(self, "_supported_tasks", ("generate",)),
+            arrival_time=arrival_time,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
         )
         if isinstance(prompt, str):
             prompt_text = prompt
@@ -148,13 +143,16 @@ def register_beam_output_fn(
     from vllm.v1.engine import EngineCoreRequest
     from vllm.v1.engine.output_processor import RequestOutputCollector
 
+    registered_sampling_params = sampling_params.clone()
+    if eos_token_id is not None:
+        registered_sampling_params.update_from_generation_config({}, eos_token_id)
+
     ec_request = EngineCoreRequest(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=None,
-        sampling_params=sampling_params,
+        sampling_params=registered_sampling_params,
         pooling_params=None,
-        eos_token_id=eos_token_id,
         arrival_time=time.time(),
         lora_request=lora_request,
         cache_salt=None,

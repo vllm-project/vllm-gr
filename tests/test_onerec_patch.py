@@ -227,6 +227,11 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
     ps_mod = _get_or_create("vllm.distributed.parallel_state")
     ps_mod.cleanup_dist_env_and_memory = lambda *a, **k: None  # type: ignore[attr-defined]
 
+    platforms_mod = _get_or_create("vllm.platforms")
+    platforms_mod.current_platform = types.SimpleNamespace(  # type: ignore[attr-defined]
+        device_type="cpu"
+    )
+
     return modules
 
 
@@ -411,6 +416,40 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
                 hasattr(patch_mod, name),
                 f"patch module is missing expected symbol {name!r}; has the patch surface changed?",
             )
+
+    def test_cleanup_hook_is_not_registered_on_npu(self) -> None:
+        import vllm.platforms as platforms_mod
+
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        with (
+            mock.patch.object(
+                platforms_mod,
+                "current_platform",
+                types.SimpleNamespace(device_type="npu"),
+            ),
+            mock.patch.object(patch_mod.atexit, "register") as register,
+        ):
+            patch_mod._register_cleanup_hook()
+
+        register.assert_not_called()
+
+    def test_cleanup_hook_is_registered_on_gpu(self) -> None:
+        import vllm.platforms as platforms_mod
+
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        with (
+            mock.patch.object(
+                platforms_mod,
+                "current_platform",
+                types.SimpleNamespace(device_type="cuda"),
+            ),
+            mock.patch.object(patch_mod.atexit, "register") as register,
+        ):
+            patch_mod._register_cleanup_hook()
+
+        register.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

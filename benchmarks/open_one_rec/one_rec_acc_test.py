@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
@@ -87,6 +88,49 @@ class MockRequestOutput:
     def __init__(self, prompt, outputs: List[MockCompletionOutput]):
         self.prompt = prompt
         self.outputs = outputs
+
+
+def _extract_generation_text_from_beam_sequence(
+    beam_seq: Any, tokenizer: Any, fallback_prompt: str
+) -> str:
+    """Extract generation text from a BeamSearchSequence.
+
+    Prefer token-boundary slicing over character slicing. After the vLLM 0.22
+    upgrade the decoded beam text may not align byte-for-byte with the original
+    prompt string, so removing ``len(prompt)`` characters can truncate the
+    generated SID span and collapse recommendation metrics to zero.
+
+    Keep the injected ``<|sid_begin|>`` token in the returned text when the
+    offline beam-search prompt was normalized to append it. The evaluator
+    expects generations in ``<|sid_begin|>...<|sid_end|>`` form and will treat
+    ``<s_a_...><s_b_...><s_c_...><|sid_end|>`` as a raw string instead of a
+    structured SID block.
+    """
+    orig_prompt = getattr(beam_seq, "orig_prompt", None)
+    beam_tokens = getattr(beam_seq, "tokens", None)
+    if isinstance(orig_prompt, dict) and isinstance(beam_tokens, list):
+        if orig_prompt.get("type") == "enc_dec":
+            prompt_token_ids = orig_prompt["decoder_prompt"]["prompt_token_ids"]
+        else:
+            prompt_token_ids = orig_prompt["prompt_token_ids"]
+        start_idx = len(prompt_token_ids)
+        sid_begin_token_id = tokenizer.convert_tokens_to_ids("<|sid_begin|>")
+        if (
+            sid_begin_token_id is not None
+            and sid_begin_token_id != -1
+            and prompt_token_ids
+            and prompt_token_ids[-1] == sid_begin_token_id
+        ):
+            start_idx -= 1
+        return tokenizer.decode(beam_tokens[start_idx:])
+
+    text = getattr(beam_seq, "text", None)
+    if isinstance(text, str):
+        if text.startswith(fallback_prompt):
+            return text[len(fallback_prompt) :]
+        return text
+
+    return str(beam_seq)
 
 
 def run_api_inference(
@@ -240,6 +284,7 @@ def main():
             )
         except Exception as e:
             logger.error(f"Failed to initialize vLLM: {e}")
+            traceback.print_exc()
             sys.exit(1)
 
     # 3. Prepare Data
@@ -299,11 +344,10 @@ def main():
             # beam_search returns BeamSearchOutput with .outputs containing BeamSearchSequence objects
             # Each BeamSearchSequence has .text attribute
             mock_completions = []
-            prompt_len = len(prompts[i])
             if hasattr(raw_output, "sequences"):
                 for beam_seq in raw_output.sequences:
-                    text = (
-                        beam_seq.text[prompt_len:] if hasattr(beam_seq, "text") else str(beam_seq)
+                    text = _extract_generation_text_from_beam_sequence(
+                        beam_seq, tokenizer, prompts[i]
                     )
                     logprobs = getattr(beam_seq, "cum_logprob", None)
                     mock_completions.append(MockCompletionOutput(text, logprobs))

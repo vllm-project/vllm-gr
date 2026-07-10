@@ -25,6 +25,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
+import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
     EngineCoreRequestType,
@@ -34,8 +36,14 @@ from vllm.v1.engine import (
 from vllm_gr.entrypoints.openai.serving_engine import (
     _beam_request_cleanup,
     _beam_request_step,
+    _collect_beam_result,
 )
-from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_request_step_update
+from vllm_gr.entrypoints.openai.serving_engine import beam_search as serving_beam_search
+from vllm_gr.logprobs import append_fast, grouped_logprobs_stride
+from vllm_gr.v1.engine.core import (
+    _cache_beam_request,
+    _handle_beam_request_step_update,
+)
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
     beam_request_step_update_async,
@@ -51,12 +59,19 @@ from vllm_gr.v1.engine.core_client_patch import (
     sync_mp_add_requests,
     sync_mp_beam_request_step_update,
 )
-from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
+from vllm_gr.v1.engine.engine_core_patch import (
+    ADD_BATCH_WIRE_BYTE,
+    BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE,
+    _add_enum_member,
+    _collapse_valid_sampled_token_ids,
+    make_patched_bookkeeping_sync_gpu,
+    make_patched_bookkeeping_sync_npu,
+)
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 # Ensure custom enum members exist in this process for all tests below.
-_add_enum_member("ADD_BATCH", b"\x05")
-_add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+_add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+_add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
 
 # ---------------------------------------------------------------------------
 # Module-level picklable targets for subprocess tests (§6)
@@ -72,8 +87,8 @@ def _sub_patch_batch_fork_registers_enum() -> None:
     patch_batch_and_fork()
     assert hasattr(ERT, "ADD_BATCH"), "ADD_BATCH missing after patch"
     assert hasattr(ERT, "BEAM_REQUEST_STEP_UPDATE"), "BEAM_REQUEST_STEP_UPDATE missing after patch"
-    assert ERT.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
-    assert ERT.ADD_BATCH.value == b"\x05"
+    assert ERT.BEAM_REQUEST_STEP_UPDATE.value == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
+    assert ERT.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE
 
 
 def _sub_patch_batch_fork_wires_run_engine_core() -> None:
@@ -103,6 +118,28 @@ def _sub_patch_batch_fork_idempotent() -> None:
     assert first is second is run_engine_core, "Second call must be a no-op"
 
 
+def _sub_patch_batch_fork_preserves_later_platform_wrapper() -> None:
+    """Re-applying GR must not create GR -> platform -> GR recursion."""
+    from vllm.v1.engine.core import EngineCoreProc
+
+    from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
+    from vllm_gr.v1.engine.engine_core_patch import run_engine_core
+
+    patch_batch_and_fork()
+    captured_gr_wrapper = EngineCoreProc.run_engine_core
+    assert captured_gr_wrapper is run_engine_core
+    saved_original = run_engine_core._original_run_engine_core
+
+    def platform_wrapper(*args, **kwargs):
+        return captured_gr_wrapper(*args, **kwargs)
+
+    EngineCoreProc.run_engine_core = platform_wrapper
+    patch_batch_and_fork()
+
+    assert EngineCoreProc.run_engine_core is platform_wrapper
+    assert run_engine_core._original_run_engine_core is saved_original
+
+
 # ---------------------------------------------------------------------------
 # Shared test helpers
 # ---------------------------------------------------------------------------
@@ -125,6 +162,8 @@ def _make_mock_request(
     m._all_token_ids = token_ids if token_ids is not None else [10, 20, 30]
     m.block_hashes = block_hashes if block_hashes is not None else [0xAA, 0xBB]
     m.eos_token_id = eos_token_id
+    m.sampling_params = _sampling_params()
+    m.sampling_params.update_from_generation_config({}, eos_token_id)
     m.lora_request = None
     m.cache_salt = None
     m.mm_features = None
@@ -147,6 +186,16 @@ def _make_engine_self(
         aborts_queue=queue.SimpleQueue(),
         engine_index=engine_index,
     )
+
+
+def test_cache_beam_request_lazily_initializes_beam_state():
+    self_obj = SimpleNamespace()
+    request = _make_mock_request(request_id="lazy-init")
+
+    _cache_beam_request(self_obj, request)
+
+    assert "lazy-init" in self_obj.beam_cache
+    assert hasattr(self_obj, "beam_cache_lock")
 
 
 def _session_entry(
@@ -352,41 +401,162 @@ class TestTypesSerialization:
 
 class TestEnumPatching:
     def test_add_enum_member_creates_member(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
         member = EngineCoreRequestType.ADD_BATCH
-        assert member.value == b"\x05"
+        assert member.value == ADD_BATCH_WIRE_BYTE
         assert member.name == "ADD_BATCH"
         # Must be accessible via reverse value lookup
-        assert EngineCoreRequestType(b"\x05") is member
+        assert EngineCoreRequestType(ADD_BATCH_WIRE_BYTE) is member
         # Must appear exactly once in the name list
         assert sum(1 for n in EngineCoreRequestType._member_names_ if n == "ADD_BATCH") == 1
 
     def test_add_enum_member_idempotent(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("ADD_BATCH", b"\x05")
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        assert EngineCoreRequestType.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE
         count = sum(1 for name in EngineCoreRequestType._member_names_ if name == "ADD_BATCH")
         assert count == 1, "Duplicate member added"
         # Reverse lookup must still work after idempotent call
-        assert EngineCoreRequestType(b"\x05") is EngineCoreRequestType.ADD_BATCH
+        assert EngineCoreRequestType(ADD_BATCH_WIRE_BYTE) is EngineCoreRequestType.ADD_BATCH
 
     def test_beam_request_step_update_enum_value(self) -> None:
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
         member = EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
-        assert member.value == b"\x06"
+        assert member.value == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
         assert member.name == "BEAM_REQUEST_STEP_UPDATE"
         # Must be accessible via reverse value lookup
-        assert EngineCoreRequestType(b"\x06") is member
+        assert EngineCoreRequestType(BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE) is member
         assert (
             sum(1 for n in EngineCoreRequestType._member_names_ if n == "BEAM_REQUEST_STEP_UPDATE")
             == 1
         )
 
     def test_enum_lookup_by_value(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
-        assert EngineCoreRequestType(b"\x05") is EngineCoreRequestType.ADD_BATCH
-        assert EngineCoreRequestType(b"\x06") is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
+        assert EngineCoreRequestType(ADD_BATCH_WIRE_BYTE) is EngineCoreRequestType.ADD_BATCH
+        assert (
+            EngineCoreRequestType(BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
+            is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
+        )
+
+    def test_add_enum_member_rejects_value_collision(self) -> None:
+        with pytest.raises(ValueError, match="already used"):
+            _add_enum_member("COLLIDING_MEMBER", EngineCoreRequestType.WAKEUP.value)
+
+
+# ===========================================================================
+# Section 2b — vLLM 0.22.1 bookkeeping output collapse
+# ===========================================================================
+
+
+class TestBookkeepingOutputCollapse:
+    def test_completed_grouped_requests_keep_one_scheduler_token(self) -> None:
+        rows = [
+            ("beam-0", 0, 2, [0, 1]),
+            ("beam-1", 2, 2, [0, 1]),
+        ]
+
+        collapsed = _collapse_valid_sampled_token_ids(
+            rows,
+            [[101], [102], [201], [202]],
+            {"beam-0": {}, "beam-1": {}},
+            set(),
+        )
+
+        assert collapsed == [[101], [201]]
+
+    def test_incomplete_grouped_request_keeps_scheduler_token_empty(self) -> None:
+        collapsed = _collapse_valid_sampled_token_ids(
+            [("beam-0", 0, 2, [0, 1])],
+            [[101], [102]],
+            {"beam-0": {}},
+            {"beam-0"},
+        )
+
+        assert collapsed == [[]]
+
+    def test_zero_logit_chunk_keeps_scheduler_token_empty(self) -> None:
+        collapsed = _collapse_valid_sampled_token_ids(
+            [("beam-0", 0, 0, [])],
+            [],
+            {"beam-0": {}},
+            set(),
+        )
+
+        assert collapsed == [[]]
+
+    def test_completed_grouped_request_without_sample_raises(self) -> None:
+        with pytest.raises(RuntimeError, match="completed without a sampled token"):
+            _collapse_valid_sampled_token_ids(
+                [("beam-0", 0, 1, [0])],
+                [[]],
+                {"beam-0": {}},
+                set(),
+            )
+
+    def test_gpu_bookkeeping_returns_collapsed_scheduler_token(self) -> None:
+        original_batch = SimpleNamespace()
+        runner = SimpleNamespace(
+            input_batch=SimpleNamespace(_obj=original_batch),
+            sampled_token_ids_pinned_cpu=torch.empty((2, 1), dtype=torch.int32),
+            pin_memory=False,
+            _beam_logprobs_cache={},
+        )
+        scheduler_output = SimpleNamespace(
+            beam_data={"beam-0": {"is_beam_decode": True}},
+            _gr_request_row_configs=[("beam-0", 0, 2, [0, 1])],
+        )
+        sampler_output = SimpleNamespace(
+            sampled_token_ids=torch.tensor([[101], [102]], dtype=torch.int32),
+            logprobs_tensors=None,
+        )
+
+        def original_bookkeeping(_self, _scheduler_output, *_args, **_kwargs):
+            return ({}, None, [[101], [102]], {}, ["beam-0", "beam-0"], {}, [])
+
+        patched_bookkeeping = make_patched_bookkeeping_sync_gpu(original_bookkeeping)
+        with patch(
+            "vllm_gr.v1.engine.engine_core_patch._beam_collapse_bookkeeping",
+            return_value=(["beam-0"], {"beam-0": 0}, 1),
+        ):
+            result = patched_bookkeeping(runner, scheduler_output, sampler_output)
+
+        assert result[2] == [[101]]
+        assert result[4] == ["beam-0"]
+        assert runner.input_batch is original_batch
+
+    def test_npu_bookkeeping_preserves_logprobs_type_and_scheduler_token(self) -> None:
+        original_batch = SimpleNamespace()
+        runner = SimpleNamespace(
+            input_batch=SimpleNamespace(_obj=original_batch),
+            _beam_logprobs_cache={},
+        )
+        scheduler_output = SimpleNamespace(
+            beam_data={"beam-0": {"is_beam_decode": True}},
+            _gr_request_row_configs=[("beam-0", 0, 2, [0, 1])],
+        )
+        collapsed_logprobs = object()
+        logprobs_tensors = SimpleNamespace(tolists=lambda: collapsed_logprobs)
+        sampler_output = SimpleNamespace(
+            sampled_token_ids=torch.tensor([[101], [102]], dtype=torch.int32),
+            logprobs_tensors=logprobs_tensors,
+        )
+
+        def original_bookkeeping(_self, _scheduler_output, *_args, **_kwargs):
+            return (object(), [[101], [102]], {}, ["beam-0", "beam-0"], {}, [])
+
+        patched_bookkeeping = make_patched_bookkeeping_sync_npu(original_bookkeeping)
+        with patch(
+            "vllm_gr.v1.engine.engine_core_patch._beam_collapse_bookkeeping",
+            return_value=(["beam-0"], {"beam-0": 0}, 1),
+        ):
+            result = patched_bookkeeping(runner, scheduler_output, sampler_output)
+
+        assert result[0] is collapsed_logprobs
+        assert result[1] == [[101]]
+        assert result[3] == ["beam-0"]
+        assert runner.input_batch is original_batch
 
 
 # ===========================================================================
@@ -583,7 +753,7 @@ class TestBeamCache:
 
         assert not eng.input_queue.empty()
         _, kwargs = MockReq.call_args
-        assert kwargs["eos_token_id"] == 42
+        assert kwargs["sampling_params"].eos_token_id == 42
 
     def test_handle_overrides_eos_from_update(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry(eos_token_id=42)})
@@ -597,7 +767,7 @@ class TestBeamCache:
 
         assert not eng.input_queue.empty()
         _, kwargs = MockReq.call_args
-        assert kwargs["eos_token_id"] == 99
+        assert kwargs["sampling_params"].eos_token_id == 99
 
     def test_handle_missing_session_emits_error_outputs(self) -> None:
         eng = _make_engine_self(beam_cache={})
@@ -613,14 +783,12 @@ class TestBeamCache:
             _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2
-        error_req_ids = set()
-        for _ in range(2):
-            _client_idx, outputs = eng.output_queue.get_nowait()
-            assert len(outputs.outputs) == 1
-            assert outputs.outputs[0].finish_reason is FinishReason.ERROR
-            error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert eng.output_queue.qsize() == 1
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"unknown"}
+        assert outputs.outputs[0].request_id == "unknown"
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
+        assert eng.aborts_queue.get_nowait() == "unknown"
 
     def test_handle_length_mismatch_emits_error_outputs(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
@@ -635,13 +803,12 @@ class TestBeamCache:
         _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2
-        error_req_ids = set()
-        for _ in range(2):
-            _client_idx, outputs = eng.output_queue.get_nowait()
-            assert outputs.outputs[0].finish_reason is FinishReason.ERROR
-            error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert eng.output_queue.qsize() == 1
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"s0"}
+        assert outputs.outputs[0].request_id == "s0"
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
+        assert "s0" not in eng.beam_cache
 
     def test_handle_parent_count_mismatch_emits_error_outputs(self) -> None:
         # beam_width=2 but parent_beam_ids has 3 entries → mismatch
@@ -657,13 +824,11 @@ class TestBeamCache:
         _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2  # one error per child
-        error_req_ids = set()
-        for _ in range(2):
-            _client_idx, outputs = eng.output_queue.get_nowait()
-            assert outputs.outputs[0].finish_reason is FinishReason.ERROR
-            error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert eng.output_queue.qsize() == 1
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"s0"}
+        assert outputs.outputs[0].request_id == "s0"
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
 
     def test_handle_beam_width_child_count_mismatch_emits_error_outputs(self) -> None:
         # beam_width=3 but only 2 children and 2 token lists → mismatch
@@ -679,13 +844,29 @@ class TestBeamCache:
         _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2  # one error per child
-        error_req_ids = set()
-        for _ in range(2):
-            _client_idx, outputs = eng.output_queue.get_nowait()
-            assert outputs.outputs[0].finish_reason is FinishReason.ERROR
-            error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert eng.output_queue.qsize() == 1
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"s0"}
+        assert outputs.outputs[0].request_id == "s0"
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
+
+    def test_handle_uneven_beam_token_lengths_emits_session_error(self) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+        update = _make_beam_update(
+            session_id="s0",
+            parent_beam_ids=["p0", "p1"],
+            child_beam_ids=["c0", "c1"],
+            beam_tokens=[[50], [60, 61]],
+            beam_width=2,
+        )
+
+        _handle_beam_request_step_update(eng, update)
+
+        assert eng.input_queue.empty()
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"s0"}
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
+        assert "s0" not in eng.beam_cache
 
     def test_handle_b0_removes_session_from_cache(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
@@ -815,8 +996,133 @@ class TestBeamCache:
 # ===========================================================================
 
 
+def test_grouped_logprobs_stride_rejects_invalid_runner_output() -> None:
+    flat = SimpleNamespace(token_ids=[1, 2], logprobs=[-0.1])
+
+    with pytest.raises(ValueError, match="inconsistent logprobs tensors"):
+        grouped_logprobs_stride(flat, beam_count=2, logprobs_num=1)
+
+    flat = SimpleNamespace(token_ids=[], logprobs=[])
+    with pytest.raises(ValueError, match="too few logprobs"):
+        grouped_logprobs_stride(flat, beam_count=2, logprobs_num=1)
+
+
+def test_grouped_logprobs_stride_ignores_v2_structural_padding() -> None:
+    flat = SimpleNamespace(
+        token_ids=[10, 11, 20, 21, -1, -1],
+        logprobs=[-0.1, -0.2, -0.3, -0.4, float("-inf"), float("-inf")],
+        ranks=[1, 2, 1, 2, 0, 0],
+        decoded_tokens=[None] * 6,
+    )
+
+    assert grouped_logprobs_stride(flat, beam_count=2, logprobs_num=2) == 2
+
+
+def test_append_fast_keeps_flat_logprob_arrays_aligned() -> None:
+    flat = SimpleNamespace(
+        start_indices=[],
+        end_indices=[],
+        token_ids=[],
+        logprobs=[],
+        ranks=[],
+        decoded_tokens=[],
+    )
+
+    append_fast(
+        flat,
+        token_ids=[10, 11, -1],
+        logprobs=[-0.1, -0.2, float("-inf")],
+        ranks=iter([1, 2]),
+        decoded_tokens=iter(["a"]),
+    )
+
+    assert flat.token_ids == [10, 11]
+    assert flat.logprobs == [-0.1, -0.2]
+    assert flat.ranks == [1, 2]
+    assert flat.decoded_tokens == ["a", None]
+    assert flat.start_indices == [0]
+    assert flat.end_indices == [2]
+
+
 class TestClientPatches:
     # ── add_requests_async ──────────────────────────────────────────────────
+
+    def test_prepare_request_does_not_import_removed_truncation_helper(self) -> None:
+        mock_self = MagicMock()
+        mock_self.errored = False
+        mock_self.log_requests = False
+        mock_self.vllm_config.cache_config.kv_sharing_fast_prefill = False
+        mock_self._supported_tasks = ("generate",)
+        mock_self.input_processor.process_inputs = MagicMock(
+            return_value=MagicMock(request_id="req-0")
+        )
+
+        params = _sampling_params()
+
+        original_import = __import__
+
+        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "vllm.entrypoints.utils" and "_validate_truncation_size" in fromlist:
+                raise AssertionError("prepare_request_fn imported removed helper")
+            return original_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=guarded_import):
+            _, request = prepare_request_fn(
+                mock_self,
+                request_id="req-0",
+                prompt={"prompt": "hello"},
+                params=params,
+            )
+
+        assert request is mock_self.input_processor.process_inputs.return_value
+        mock_self.input_processor.process_inputs.assert_called_once_with(
+            request_id="req-0",
+            prompt={"prompt": "hello"},
+            params=params,
+            supported_tasks=("generate",),
+            arrival_time=None,
+            lora_request=None,
+            tokenization_kwargs={},
+            trace_headers=None,
+            priority=0,
+            data_parallel_rank=None,
+        )
+
+    def test_prepare_request_uses_cached_supported_tasks_without_engine_core_lookup(self) -> None:
+        mock_self = MagicMock()
+        mock_self.errored = False
+        mock_self.log_requests = False
+        mock_self.vllm_config.cache_config.kv_sharing_fast_prefill = False
+        mock_self._supported_tasks = ("generate",)
+        mock_self.engine_core.get_supported_tasks.side_effect = AssertionError(
+            "prepare_request_fn should not call engine_core.get_supported_tasks"
+        )
+        mock_self.input_processor.process_inputs = MagicMock(
+            return_value=MagicMock(request_id="req-0")
+        )
+
+        params = _sampling_params()
+
+        _, request = prepare_request_fn(
+            mock_self,
+            request_id="req-0",
+            prompt={"prompt": "hello"},
+            params=params,
+        )
+
+        assert request is mock_self.input_processor.process_inputs.return_value
+        mock_self.input_processor.process_inputs.assert_called_once_with(
+            request_id="req-0",
+            prompt={"prompt": "hello"},
+            params=params,
+            supported_tasks=("generate",),
+            arrival_time=None,
+            lora_request=None,
+            tokenization_kwargs={},
+            trace_headers=None,
+            priority=0,
+            data_parallel_rank=None,
+        )
 
     def test_add_requests_async_empty_is_noop(self) -> None:
         mock_self = _make_non_dp_client_mock()
@@ -904,6 +1210,7 @@ class TestClientPatches:
         ec_req = mock_self.output_processor.add_request.call_args[0][0]
         assert ec_req.external_req_id == "child-beam-7"
         assert ec_req.data_parallel_rank is None  # not passed → default
+        assert ec_req.sampling_params.eos_token_id is None
 
     def test_register_beam_output_passes_data_parallel_rank(self) -> None:
         mock_self = MagicMock()
@@ -922,6 +1229,22 @@ class TestClientPatches:
         ec_req = mock_self.output_processor.add_request.call_args[0][0]
         assert ec_req.data_parallel_rank == 3
         assert ec_req.external_req_id == "child-0"
+
+    def test_register_beam_output_applies_eos_to_sampling_params(self) -> None:
+        mock_self = MagicMock()
+        mock_self.errored = False
+        mock_self.log_requests = False
+
+        register_beam_output_fn(
+            mock_self,
+            request_id="child-1",
+            prompt_token_ids=[1, 2],
+            sampling_params=_sampling_params(),
+            eos_token_id=9,
+        )
+
+        ec_req = mock_self.output_processor.add_request.call_args[0][0]
+        assert ec_req.sampling_params.eos_token_id == 9
 
     # ── _add_requests_batch_fn ───────────────────────────────────────────
 
@@ -1067,8 +1390,11 @@ class TestClientPatches:
         apply_batch_fork_patches()
         assert hasattr(EngineCoreRequestType, "ADD_BATCH")
         assert hasattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE")
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
-        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
+        assert EngineCoreRequestType.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE
+        assert (
+            EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value
+            == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
+        )
 
     def test_apply_batch_fork_patches_four_classes(self) -> None:
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -1311,6 +1637,92 @@ class TestBeamSearchOrchestration:
 
         assert child_ids == ["mybatch-beam-0", "mybatch-beam-1"]
 
+    def test_beam_request_step_cleans_session_when_output_wait_fails(self) -> None:
+        ec = MagicMock()
+        ec.register_beam_output = MagicMock(return_value=asyncio.Queue())
+        ec.beam_request_step_update = AsyncMock()
+        all_beams = [SimpleNamespace(tokens=[10, 50])]
+
+        with patch(
+            "vllm_gr.entrypoints.openai.serving_engine._collect_beam_result",
+            new=AsyncMock(side_effect=TimeoutError("timed out")),
+        ):
+            with pytest.raises(TimeoutError, match="timed out"):
+                asyncio.run(
+                    _beam_request_step(
+                        ec,
+                        session_id="s",
+                        fork_info=[(0, 50)],
+                        prev_beam_internal_ids=["p0"],
+                        all_beams=all_beams,
+                        request_id_batch="r",
+                        beam_search_params=_sampling_params(),
+                        eos_token_id=2,
+                        lora_request=None,
+                        trace_headers=None,
+                        prefix_len=1,
+                        priority=0,
+                        data_parallel_rank=None,
+                    )
+                )
+
+        assert ec.beam_request_step_update.await_count == 2
+        cleanup = ec.beam_request_step_update.await_args_list[-1].args[0]
+        assert cleanup.session_id == "s"
+        assert cleanup.beam_width == 0
+
+    def test_collect_beam_result_times_out(self) -> None:
+        with pytest.raises(TimeoutError, match="waiting for grouped beam output"):
+            asyncio.run(_collect_beam_result(asyncio.Queue(), timeout_s=0.001))
+
+    def test_online_beam_search_uses_length_penalty_sort_key(self) -> None:
+        tokenizer = SimpleNamespace(eos_token_id=2, decode=lambda token_ids: "")
+        serving = SimpleNamespace(
+            input_processor=SimpleNamespace(tokenizer=tokenizer),
+            engine_client=SimpleNamespace(),
+            models=SimpleNamespace(catalog=None, model_name="model"),
+        )
+        params = SimpleNamespace(
+            beam_width=1,
+            max_tokens=0,
+            ignore_eos=False,
+            temperature=0.0,
+            length_penalty=0.7,
+            begin_token=None,
+            end_token=None,
+            include_stop_str_in_output=False,
+        )
+        sort_key = MagicMock(side_effect=lambda beam: beam.cum_logprob)
+        sort_key_factory = MagicMock(return_value=sort_key)
+
+        async def collect_outputs():
+            return [
+                output
+                async for output in serving_beam_search(
+                    serving,
+                    prompt={
+                        "type": "token",
+                        "prompt": "prompt",
+                        "prompt_token_ids": [1],
+                    },
+                    request_id="req",
+                    params=params,
+                )
+            ]
+
+        with (
+            patch(
+                "vllm_gr.entrypoints.openai.serving_engine.create_sort_beams_key_function",
+                sort_key_factory,
+            ),
+            patch("vllm_gr.entrypoints.openai.serving_engine.record_beam_search_metrics"),
+        ):
+            outputs = asyncio.run(collect_outputs())
+
+        assert len(outputs) == 1
+        sort_key_factory.assert_called_once_with(2, 0.7)
+        sort_key.assert_called()
+
     def test_beam_request_step_passes_data_parallel_rank(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
@@ -1418,13 +1830,17 @@ class TestBeamSearchOrchestration:
         assert update.prefix_len == 0
         assert update.data_parallel_rank == 3
 
-    def test_beam_request_cleanup_noop_when_empty_final_ids(self) -> None:
+    def test_beam_request_cleanup_purges_session_when_final_ids_are_empty(self) -> None:
         ec = MagicMock()
         ec.beam_request_step_update = AsyncMock()
 
         asyncio.run(_beam_request_cleanup(ec, "s", [], rank=None))
 
-        ec.beam_request_step_update.assert_not_awaited()
+        ec.beam_request_step_update.assert_awaited_once()
+        update = ec.beam_request_step_update.call_args.args[0]
+        assert update.session_id == "s"
+        assert update.beam_width == 0
+        assert update.pruned_ids == []
 
     def test_beam_request_cleanup_swallows_exception(self) -> None:
         ec = MagicMock()
@@ -1448,6 +1864,9 @@ class TestPatchWiring:
     def test_patch_batch_fork_idempotent(self) -> None:
         _run_subprocess(_sub_patch_batch_fork_idempotent)
 
+    def test_patch_batch_fork_preserves_later_platform_wrapper(self) -> None:
+        _run_subprocess(_sub_patch_batch_fork_preserves_later_platform_wrapper)
+
 
 # ===========================================================================
 # Section 7 — Integration / Cross-Process
@@ -1456,20 +1875,24 @@ class TestPatchWiring:
 
 class TestIntegrationCrossProcess:
     def test_enum_values_no_collision(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
 
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
-        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
+        assert EngineCoreRequestType.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE
+        assert (
+            EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value
+            == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
+        )
 
         # Our two values must not collide with any upstream member
         for name in EngineCoreRequestType._member_names_:
             if name in ("ADD_BATCH", "BEAM_REQUEST_STEP_UPDATE"):
                 continue
             member = getattr(EngineCoreRequestType, name)
-            assert member.value not in (b"\x05", b"\x06"), (
-                f"Collision: upstream member {name!r} already uses value {member.value!r}"
-            )
+            assert member.value not in (
+                ADD_BATCH_WIRE_BYTE,
+                BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE,
+            ), f"Collision: upstream member {name!r} already uses value {member.value!r}"
 
     def test_beam_request_step_update_encode_decode(self) -> None:
         from vllm.v1.serial_utils import MsgpackDecoder
@@ -1501,10 +1924,13 @@ class TestIntegrationCrossProcess:
         assert decoded.eos_token_id == 2
         assert decoded.data_parallel_rank == 1
 
-    def test_beam_request_step_update_wire_byte_is_x06(self) -> None:
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
-        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
+    def test_beam_request_step_update_wire_byte(self) -> None:
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
+        assert (
+            EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value
+            == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
+        )
 
-    def test_add_batch_wire_byte_is_x05(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
+    def test_add_batch_wire_byte(self) -> None:
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        assert EngineCoreRequestType.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE

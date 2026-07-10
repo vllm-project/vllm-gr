@@ -17,48 +17,48 @@ LLM path.
 
 import copy
 import gc
+import itertools
 import time
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import numpy as np
 from tqdm.auto import tqdm
-from vllm.beam_search import (
-    BeamSearchInstance,
-    BeamSearchOutput,
-    BeamSearchSequence,
-)
 from vllm.entrypoints.llm import LLM
-from vllm.inputs import TokensPrompt
 from vllm.logprobs import FlatLogprobs
+from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     extract_and_dedup_flat_logprobs,
+    grouped_logprobs_stride,
     reconstruct_beam_logprobs,
 )
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
+try:
+    from vllm.entrypoints.generate.beam_search.utils import (
+        BeamSearchInstance,
+        BeamSearchOutput,
+        BeamSearchSequence,
+        create_sort_beams_key_function,
+    )
+except ModuleNotFoundError:
+    from vllm_gr.beam_search_compat import (
+        BeamSearchInstance,
+        BeamSearchOutput,
+        BeamSearchSequence,
+        create_sort_beams_key_function,
+    )
+
 if TYPE_CHECKING:
-    from vllm.beam_search import BeamSearchOutput
-    from vllm.inputs import TextPrompt, TokensPrompt
+    from vllm.inputs import EngineInput, TextPrompt, TokensPrompt
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
 
 logger = init_logger(__name__)
-
-
-def _create_tokens_prompt_from_beam(beam: "BeamSearchSequence") -> "TokensPrompt":
-    """Create a TokensPrompt payload from a BeamSearchSequence."""
-    token_prompt_kwargs: dict = {"prompt_token_ids": beam.tokens}
-    if beam.multi_modal_data is not None:
-        token_prompt_kwargs["multi_modal_data"] = beam.multi_modal_data
-
-    if beam.mm_processor_kwargs is not None:
-        token_prompt_kwargs["mm_processor_kwargs"] = beam.mm_processor_kwargs
-    return TokensPrompt(**token_prompt_kwargs)
 
 
 def _extract_and_dedup_segment(
@@ -76,6 +76,14 @@ def _extract_and_dedup_segment(
     ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
     decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
 
+    expected_len = len(token_ids_pos)
+    if ranks_pos is not None and len(ranks_pos) != expected_len:
+        raise ValueError(f"ranks length mismatch: expected {expected_len}, got {len(ranks_pos)}")
+    if decoded_pos is not None and len(decoded_pos) != expected_len:
+        raise ValueError(
+            f"decoded_tokens length mismatch: expected {expected_len}, got {len(decoded_pos)}"
+        )
+
     # Dedup the sampled token (index 0) if it appears in the top-K
     if len(token_ids_pos) > logprobs_num:
         if any(token_ids_pos[0] == token_ids_pos[j] for j in range(1, logprobs_num + 1)):
@@ -92,7 +100,7 @@ def _extract_and_dedup_segment(
 
 def _beam_request_cleanup(llm_engine, session_id: str, final_ids: list[str]) -> None:
     """Clear beam_request cache for a finished/failed session."""
-    if not final_ids:
+    if not session_id:
         return
     try:
         llm_engine.engine_core.beam_request_step_update(
@@ -109,6 +117,57 @@ def _beam_request_cleanup(llm_engine, session_id: str, final_ids: list[str]) -> 
         )
     except Exception as e:
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
+
+
+def _normalize_offline_beam_prompt(
+    prompt: "EngineInput",
+    sid_begin_token_id: int | None,
+) -> tuple["EngineInput", list[int]]:
+    if isinstance(prompt, str):
+        raise TypeError(
+            "String prompts are not supported for offline beam search; "
+            "tokenize the prompt into an EngineInput dict first."
+        )
+    if not isinstance(prompt, dict):
+        raise TypeError(
+            f"Expected an EngineInput dict for offline beam search, "
+            f"got {type(prompt).__name__}."
+        )
+
+    prompt_type = prompt.get("type", "text")
+    if prompt_type == "embeds":
+        raise NotImplementedError("Embedding prompt not supported for beam search")
+
+    decoder_prompt = prompt if prompt_type != "enc_dec" else prompt["decoder_prompt"]
+    prompt_token_ids = list(decoder_prompt["prompt_token_ids"])
+    if sid_begin_token_id is not None:
+        prompt_token_ids.append(sid_begin_token_id)
+
+    if prompt_type == "enc_dec":
+        return (
+            cast(
+                "EngineInput",
+                {
+                    **prompt,
+                    "decoder_prompt": {
+                        **decoder_prompt,
+                        "prompt_token_ids": prompt_token_ids,
+                    },
+                },
+            ),
+            prompt_token_ids,
+        )
+
+    return (
+        cast(
+            "EngineInput",
+            {
+                **prompt,
+                "prompt_token_ids": prompt_token_ids,
+            },
+        ),
+        prompt_token_ids,
+    )
 
 
 def _prepare_beam_step_requests(
@@ -160,17 +219,28 @@ def _prepare_beam_step_requests(
 
             decode_sampling_params = copy.copy(beam_search_params)
             decode_sampling_params.n = W
+            eos_token_id = (
+                sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
+            )
+            registered_sampling_params = decode_sampling_params.clone()
+            if eos_token_id is not None:
+                registered_sampling_params.update_from_generation_config({}, eos_token_id)
+
+            logger.debug(
+                "BEAM_REQUEST step token=%d W=%d logprobs=%s n=%d",
+                token,
+                W,
+                decode_sampling_params.logprobs,
+                decode_sampling_params.n,
+            )
 
             # Register beam output
             ec_req = EngineCoreRequest(
                 request_id=session_id,
                 prompt_token_ids=instance.beams[0].tokens,
                 mm_features=None,
-                sampling_params=decode_sampling_params,
+                sampling_params=registered_sampling_params,
                 pooling_params=None,
-                eos_token_id=sid_end_token_id
-                if sid_end_token_id is not None
-                else tokenizer.eos_token_id,
                 arrival_time=time.time(),
                 lora_request=instance.beams[0].lora_request,
                 cache_salt=None,
@@ -192,9 +262,7 @@ def _prepare_beam_step_requests(
                 prefix_len=prefix_len,
                 beam_width=W,
                 sampling_params=decode_sampling_params,
-                eos_token_id=sid_end_token_id
-                if sid_end_token_id is not None
-                else tokenizer.eos_token_id,
+                eos_token_id=eos_token_id,
                 lora_request=instance.beams[0].lora_request,
             )
             llm_engine.engine_core.beam_request_step_update(update)
@@ -208,11 +276,11 @@ def _prepare_beam_step_requests(
             instance_prefix_len[j] = len(instance.beams[0].tokens)
 
             request_id_item = f"{request_id_batch}-0"
-            tokens_prompt = _create_tokens_prompt_from_beam(instance.beams[0])
             ec_req = llm_engine.input_processor.process_inputs(
                 request_id=request_id_item,
-                prompt=tokens_prompt,
+                prompt=instance.beams[0].get_prompt(),
                 params=beam_search_params,
+                supported_tasks=("generate",),
                 arrival_time=time.time(),
                 lora_request=instance.beams[0].lora_request,
             )
@@ -230,24 +298,93 @@ def _step_engine_and_collect_outputs(
     token: int,
     prompt_start: int,
     instance_prefill_id: dict[int, str],
+    max_steps_without_usable_output: int = 1024,
 ) -> dict[str, Any]:
-    """Execute LLM engine step until outputs for all active instances are gathered."""
-    active_indices = [j for j, instance in enumerate(instances_batch) if len(instance.beams) > 0]
-    step_outputs_accumulated = []
-    while active_indices:
-        step_outputs = llm_engine.step()
-        step_outputs_accumulated.extend(step_outputs)
+    """Execute engine steps until every active request has usable beam output.
 
-        outputs_map = {out.request_id: out for out in step_outputs}
+    vLLM V2 emits an output with ``num_sampled=0`` while a grouped beam
+    request is still being chunk-prefilled.  It has the request ID but no
+    candidate logprobs, so treating it as a completed beam-search step would
+    make the caller split an empty logprob vector across all beams.
+    """
+
+    def is_usable_beam_output(output: Any) -> bool:
+        if not output.outputs:
+            return False
+
+        completion = output.outputs[0]
+        # Errors must be returned to the caller for its normal cleanup path.
+        if completion.finish_reason == "error":
+            return True
+
+        flat_logprobs = completion.logprobs
+        if flat_logprobs is not None and flat_logprobs.token_ids:
+            return True
+
+        if completion.finish_reason is not None:
+            raise RuntimeError(
+                "Grouped beam request finished before producing candidate "
+                f"logprobs: request_id={output.request_id!r}, "
+                f"finish_reason={completion.finish_reason!r}. This usually "
+                "indicates async_scheduling was enabled or the V2 grouped-beam "
+                "worker hooks were not installed."
+            )
+
+        return False
+
+    active_indices = [j for j, instance in enumerate(instances_batch) if len(instance.beams) > 0]
+    expected_request_ids = {
+        j: (f"offline-beam-{prompt_start + j}-0" if token == 0 else instance_prefill_id[j])
+        for j in active_indices
+    }
+    usable_outputs: dict[str, Any] = {}
+    steps_without_usable_output = 0
+    while active_indices:
+        waiting_ids = [expected_request_ids[j] for j in active_indices]
+        logger.info(
+            "[vllm-gr-front-end] waiting for engine step: beam_token_step=%d "
+            "request_ids=%s",
+            token,
+            waiting_ids,
+        )
+        step_outputs = llm_engine.step()
+        logger.info(
+            "[vllm-gr-front-end] engine step returned: beam_token_step=%d "
+            "num_outputs=%d output_ids=%s",
+            token,
+            len(step_outputs),
+            [out.request_id for out in step_outputs],
+        )
         new_active_indices = []
         for j in active_indices:
-            session_id = instance_prefill_id.get(j)
-            search_id = f"offline-beam-{prompt_start + j}-0" if token == 0 else session_id
-            if search_id not in outputs_map:
+            search_id = expected_request_ids[j]
+            matching_output = next(
+                (
+                    out
+                    for out in reversed(step_outputs)
+                    if out.request_id == search_id and is_usable_beam_output(out)
+                ),
+                None,
+            )
+            if matching_output is None:
                 new_active_indices.append(j)
+            else:
+                usable_outputs[search_id] = matching_output
+        if len(new_active_indices) == len(active_indices):
+            steps_without_usable_output += 1
+            if steps_without_usable_output >= max_steps_without_usable_output:
+                waiting_ids = [expected_request_ids[j] for j in new_active_indices]
+                raise RuntimeError(
+                    "Grouped beam search made no progress while waiting for "
+                    "candidate logprobs after "
+                    f"{steps_without_usable_output} engine steps: request_ids={waiting_ids!r}. "
+                    "Check V2 grouped-beam hooks and scheduler state."
+                )
+        else:
+            steps_without_usable_output = 0
         active_indices = new_active_indices
 
-    return {out.request_id: out for out in step_outputs_accumulated}
+    return usable_outputs
 
 
 def _parse_step_logprobs(
@@ -286,7 +423,21 @@ def _parse_step_logprobs(
     total_logprobs = len(raw_token_ids)
 
     if token > 0 and fork_info_j is not None:
-        stride_k = total_logprobs // len(fork_info_j)
+        beam_count = len(fork_info_j)
+        stride_k = grouped_logprobs_stride(flat, beam_count, logprobs_num)
+
+        logger.info_once(
+            "Grouped beam output validated: beams=%d logprobs_per_beam=%d",
+            beam_count,
+            stride_k,
+        )
+        logger.debug(
+            "_parse_step_logprobs token=%d W=%d total_logprobs=%d stride_k=%d",
+            token,
+            beam_count,
+            total_logprobs,
+            stride_k,
+        )
 
         for b_idx in range(len(fork_info_j)):
             current_beam = instance.beams[b_idx]
@@ -350,13 +501,12 @@ def _handle_eos_beams(
         cached = beam_flat_cache[beam_idx]
         assert cached is not None
         eos_beam = BeamSearchSequence(
+            orig_prompt=current_beam.orig_prompt,
             tokens=current_beam.tokens + [tokenizer.eos_token_id],
             logprobs=initial_logprobs,
             cum_logprob=float(all_beams_logprob[idx]),
             finish_reason="stop",
             stop_reason=tokenizer.eos_token_id,
-            multi_modal_data=current_beam.multi_modal_data,
-            mm_processor_kwargs=current_beam.mm_processor_kwargs,
             lora_request=current_beam.lora_request,
         )
         eos_beam._lp_parent = current_beam
@@ -391,12 +541,11 @@ def _select_top_beams(
         cached = beam_flat_cache[beam_idx]
         assert cached is not None
         new_beam = BeamSearchSequence(
+            orig_prompt=current_beam.orig_prompt,
             tokens=current_beam.tokens + [token_id],
             logprobs=initial_logprobs,
             lora_request=current_beam.lora_request,
             cum_logprob=float(all_beams_logprob[idx]),
-            multi_modal_data=current_beam.multi_modal_data,
-            mm_processor_kwargs=current_beam.mm_processor_kwargs,
         )
         new_beam._lp_parent = current_beam
         new_beam._lp_step_data = cached
@@ -428,6 +577,17 @@ def _custom_beam_search_batch(
     instance_prefix_len = {}
     instance_completed_sessions = set()
 
+    def cleanup_incomplete_sessions() -> None:
+        for instance_idx, session_id in instance_prefill_id.items():
+            if instance_idx in instance_completed_sessions:
+                continue
+            _beam_request_cleanup(
+                llm_engine,
+                session_id,
+                instance_prev_beam_internal_ids.get(instance_idx, []),
+            )
+            instance_completed_sessions.add(instance_idx)
+
     for token in token_iter:
         # Check if all instances are done
         all_done = True
@@ -439,37 +599,49 @@ def _custom_beam_search_batch(
             break
 
         # Step 1: Prepare and update requests
-        engine_core_requests = _prepare_beam_step_requests(
-            llm_engine=llm_engine,
-            instances_batch=instances_batch,
-            token=token,
-            prompt_start=prompt_start,
-            tokenizer=tokenizer,
-            beam_search_params=beam_search_params,
-            sid_end_token_id=sid_end_token_id,
-            instance_prefill_id=instance_prefill_id,
-            instance_prev_beam_internal_ids=instance_prev_beam_internal_ids,
-            instance_fork_info=instance_fork_info,
-            instance_prefix_len=instance_prefix_len,
-            instance_completed_sessions=instance_completed_sessions,
-        )
+        try:
+            engine_core_requests = _prepare_beam_step_requests(
+                llm_engine=llm_engine,
+                instances_batch=instances_batch,
+                token=token,
+                prompt_start=prompt_start,
+                tokenizer=tokenizer,
+                beam_search_params=beam_search_params,
+                sid_end_token_id=sid_end_token_id,
+                instance_prefill_id=instance_prefill_id,
+                instance_prev_beam_internal_ids=instance_prev_beam_internal_ids,
+                instance_fork_info=instance_fork_info,
+                instance_prefix_len=instance_prefix_len,
+                instance_completed_sessions=instance_completed_sessions,
+            )
+        except BaseException:
+            cleanup_incomplete_sessions()
+            raise
 
         if engine_core_requests:
-            llm_engine.engine_core.add_requests(engine_core_requests, force_batch=True)
             for ec_req in engine_core_requests:
                 parts = ec_req.external_req_id.split("-")
                 j = int(parts[2]) - prompt_start
                 instance_prefill_id[j] = ec_req.request_id
                 instance_prev_beam_internal_ids[j] = [ec_req.request_id]
+            try:
+                llm_engine.engine_core.add_requests(engine_core_requests, force_batch=True)
+            except BaseException:
+                cleanup_incomplete_sessions()
+                raise
 
         # Step 2: Step engine and collect outputs
-        outputs_map = _step_engine_and_collect_outputs(
-            llm_engine=llm_engine,
-            instances_batch=instances_batch,
-            token=token,
-            prompt_start=prompt_start,
-            instance_prefill_id=instance_prefill_id,
-        )
+        try:
+            outputs_map = _step_engine_and_collect_outputs(
+                llm_engine=llm_engine,
+                instances_batch=instances_batch,
+                token=token,
+                prompt_start=prompt_start,
+                instance_prefill_id=instance_prefill_id,
+            )
+        except BaseException:
+            cleanup_incomplete_sessions()
+            raise
 
         # Step 3: Process outputs for each instance
         for j, instance in enumerate(instances_batch):
@@ -483,14 +655,20 @@ def _custom_beam_search_batch(
             if result is None:
                 continue
 
-            is_error, all_beams_token_id, all_beams_logprob, beam_flat_cache = _parse_step_logprobs(
-                result=result,
-                instance=instance,
-                token=token,
-                logprobs_num=logprobs_num,
-                fork_info_j=instance_fork_info.get(j),
-                catalog=catalog,
-            )
+            try:
+                is_error, all_beams_token_id, all_beams_logprob, beam_flat_cache = (
+                    _parse_step_logprobs(
+                        result=result,
+                        instance=instance,
+                        token=token,
+                        logprobs_num=logprobs_num,
+                        fork_info_j=instance_fork_info.get(j),
+                        catalog=catalog,
+                    )
+                )
+            except BaseException:
+                cleanup_incomplete_sessions()
+                raise
 
             if is_error:
                 _beam_request_cleanup(
@@ -527,14 +705,7 @@ def _custom_beam_search_batch(
             instance_fork_info[j] = fork_info
 
     # Step 4: Cleanup completed sessions
-    for j, instance in enumerate(instances_batch):
-        if j not in instance_completed_sessions and j in instance_prefill_id:
-            _beam_request_cleanup(
-                llm_engine,
-                instance_prefill_id[j],
-                instance_prev_beam_internal_ids[j],
-            )
-            instance_completed_sessions.add(j)
+    cleanup_incomplete_sessions()
 
 
 class GRLLM(LLM):
@@ -542,7 +713,10 @@ class GRLLM(LLM):
 
     Construction is fully delegated to :class:`vllm.entrypoints.llm.LLM`; the
     only added state is the optional ``catalog`` used to constrain beam-search
-    token sequences.
+    token sequences. Grouped beam decode requires synchronous scheduling:
+    V2 asynchronous scheduling can reserve the one allowed output token while
+    a chunked prefill is still incomplete, then finish the request before the
+    grouped sampler produces its candidate logprobs.
     """
 
     def __init__(
@@ -553,6 +727,15 @@ class GRLLM(LLM):
         **kwargs,
     ):
         self._shutdown_complete = False
+
+        if kwargs.get("async_scheduling") is True:
+            raise ValueError(
+                "GRLLM grouped beam search is incompatible with "
+                "async_scheduling=True; use async_scheduling=False."
+            )
+        # vLLM 0.22 enables this by default when unspecified. Force the safe
+        # scheduler even when callers passed None explicitly.
+        kwargs["async_scheduling"] = False
 
         super().__init__(
             model=model,
@@ -586,23 +769,21 @@ class GRLLM(LLM):
             concurrency_limit: The maximum number of concurrent requests.
                 If None, the number of concurrent requests is unlimited.
         """
-        # Lazy imports for beam search dependencies
-        import itertools
-        from typing import cast
-
-        # TODO: how does beam search work together with length penalty,
-        # frequency, penalty, and stopping criteria, etc.?
         logger.debug("Called beam_search")
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         temperature = params.temperature
         ignore_eos = params.ignore_eos
+        length_penalty = params.length_penalty
         begin_token = params.begin_token if hasattr(params, "begin_token") else None
         end_token = params.end_token if hasattr(params, "end_token") else None
 
-        lora_requests = self._get_beam_search_lora_requests(lora_request, prompts)
+        engine_inputs = list(self._preprocess_cmpl(prompts))
+        lora_requests = self._lora_request_to_seq(lora_request, len(engine_inputs))
 
         tokenizer = self.get_tokenizer()
+        eos_token_id = tokenizer.eos_token_id
+        sort_beams_key = create_sort_beams_key_function(eos_token_id, length_penalty)
         sid_begin_token_id: int | None = None
         if begin_token is not None:
             sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
@@ -627,63 +808,41 @@ class GRLLM(LLM):
             use_tqdm = False
 
         if concurrency_limit is None:
-            concurrency_limit = len(prompts)
+            concurrency_limit = len(engine_inputs)
 
         logprobs_num = beam_width
-        # generate beam_width candidates at each step
         beam_search_params = SamplingParams(
             logprobs=logprobs_num,
             max_tokens=1,
             temperature=temperature,
-            skip_clone=True,  # Internal beam search, safe to skip clone
+            skip_clone=True,
             detokenize=False,
             flat_logprobs=True,
         )
-        # NOTE: FlatLogprobs intentionally passed where BeamSearchSequence
-        # expects list[dict[int, Logprob]].  Intermediate logprobs are never
-        # read as dicts; the final beam.logprobs is replaced during
-        # reconstruction at the end.
-        # This reference is shared read-only across all beams — do not mutate
-        # after the initial append below.
         initial_logprobs = FlatLogprobs()
         if sid_begin_token_id is not None:
             initial_logprobs.append_fast([sid_begin_token_id], [0.0], [None], [None])
 
         instances: list[BeamSearchInstance] = []
 
-        for lora_req, prompt in zip(lora_requests, prompts):
-            # Add multimodal processor kwargs & data
-            mm_kwargs = {}
-            if "multi_modal_data" in prompt:
-                mm_kwargs["multi_modal_data"] = prompt["multi_modal_data"]
-            if "mm_processor_kwargs" in prompt:
-                mm_kwargs["mm_processor_kwargs"] = prompt["mm_processor_kwargs"]
-
-            if "prompt_token_ids" in prompt:
-                prompt = cast(TokensPrompt, prompt)  # Needed for mypy
-                prompt_tokens = prompt["prompt_token_ids"]
-            else:
-                prompt_tokens = tokenizer.encode(prompt["prompt"])
-
-            if sid_begin_token_id is not None or sid_end_token_id is not None:
-                prompt_tokens = list(prompt_tokens)
-                if sid_begin_token_id is not None:
-                    prompt_tokens.append(sid_begin_token_id)
+        for lora_req, prompt in zip(lora_requests, engine_inputs):
+            prompt, prompt_token_ids = _normalize_offline_beam_prompt(
+                prompt,
+                sid_begin_token_id,
+            )
 
             instance = BeamSearchInstance(
-                prompt_tokens,
+                prompt,
                 lora_request=lora_req,
                 logprobs=None,
-                **mm_kwargs,
             )
             instance.beams[0].logprobs = initial_logprobs
-            # Deferred logprobs: parent pointers on BeamSearchSequence (a plain
-            # @dataclass without __slots__).  If upstream adds __slots__, these
-            # dynamic attrs will break — upstream the fields if that happens.
             instance.beams[0]._lp_parent = None
             instance.beams[0]._lp_step_data = None
             instance.prompt_len = (
-                len(prompt_tokens) - 1 if sid_begin_token_id is not None else len(prompt_tokens)
+                len(prompt_token_ids) - 1
+                if sid_begin_token_id is not None
+                else len(prompt_token_ids)
             )
             instances.append(instance)
 
@@ -750,21 +909,12 @@ class GRLLM(LLM):
                     if len(all_beams) == 0:
                         break
 
-                    # create corresponding batch entries for prompt & optional lora
-                    prompts_batch, lora_req_batch = zip(
-                        *[
-                            (_create_tokens_prompt_from_beam(beam), beam.lora_request)
-                            for beam in all_beams
-                        ]
-                    )
-
-                    # only runs for one step
-                    # we don't need to use tqdm here
-                    output = self.generate(
-                        prompts_batch,
-                        sampling_params=beam_search_params,
+                    output = self._render_and_run_requests(
+                        prompts=(beam.get_prompt() for beam in all_beams),
+                        params=self._params_to_seq(beam_search_params, len(all_beams)),
+                        output_type=RequestOutput,
+                        lora_requests=[beam.lora_request for beam in all_beams],
                         use_tqdm=False,
-                        lora_request=lora_req_batch,
                     )
 
                     # Validate generated tokens using catalog if available
@@ -824,13 +974,12 @@ class GRLLM(LLM):
                                 current_beam = all_beams[start:end][beam_idx]
                                 cached = beam_flat_cache[beam_idx]
                                 completed_beam = BeamSearchSequence(
+                                    orig_prompt=current_beam.orig_prompt,
                                     tokens=current_beam.tokens + [tokenizer.eos_token_id],
                                     logprobs=initial_logprobs,
                                     cum_logprob=float(all_beams_logprob[idx]),
                                     finish_reason="stop",
                                     stop_reason=tokenizer.eos_token_id,
-                                    multi_modal_data=current_beam.multi_modal_data,
-                                    mm_processor_kwargs=current_beam.mm_processor_kwargs,
                                     lora_request=current_beam.lora_request,
                                 )
                                 completed_beam._lp_parent = current_beam
@@ -852,11 +1001,10 @@ class GRLLM(LLM):
                             current_beam = all_beams[start:end][beam_idx]
                             cached = beam_flat_cache[beam_idx]
                             new_beam = BeamSearchSequence(
+                                orig_prompt=current_beam.orig_prompt,
                                 tokens=current_beam.tokens + [int(all_beams_token_id[idx])],
                                 logprobs=initial_logprobs,
                                 cum_logprob=float(all_beams_logprob[idx]),
-                                multi_modal_data=current_beam.multi_modal_data,
-                                mm_processor_kwargs=current_beam.mm_processor_kwargs,
                                 lora_request=current_beam.lora_request,
                             )
                             new_beam._lp_parent = current_beam
@@ -874,7 +1022,7 @@ class GRLLM(LLM):
                     beam.tokens.append(sid_end_token_id)
             # Move remaining active beams into the completed list.
             instance.completed.extend(instance.beams)
-            sorted_completed = sorted(instance.completed, key=lambda x: x.cum_logprob, reverse=True)
+            sorted_completed = sorted(instance.completed, key=sort_beams_key, reverse=True)
             best_beams = sorted_completed[:beam_width]
 
             prompt_cache = cached_prompts[idx]

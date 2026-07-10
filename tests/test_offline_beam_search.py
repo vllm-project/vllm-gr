@@ -27,8 +27,14 @@ def _load_prompt_text() -> str:
         return f.read()
 
 
+def _get_test_model() -> str:
+    # Set REC_MODEL to use a locally prepared model path. If REC_MODEL is not
+    # set, the tests fall back to the Hugging Face model id and fetch remotely.
+    return os.environ.get("REC_MODEL", "OpenOneRec/OneRec-1.7B")
+
+
 def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
-    model_name = "OpenOneRec/OneRec-1.7B"
+    model_name = _get_test_model()
     beam_width = 128
     max_tokens = 5
 

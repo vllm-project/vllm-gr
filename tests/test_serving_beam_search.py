@@ -25,8 +25,9 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
 )
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.engine.serving import OpenAIServing
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
+from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 
@@ -34,8 +35,14 @@ if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is
     pytest.skip("GPU/NPU is not available", allow_module_level=True)
 
 
+def _get_test_model() -> str:
+    # Set REC_MODEL to use a locally prepared model path. If REC_MODEL is not
+    # set, the tests fall back to the Hugging Face model id and fetch remotely.
+    return os.environ.get("REC_MODEL", "OpenOneRec/OneRec-1.7B")
+
+
 async def beam_search_test(loops: int) -> None:
-    model_name = "OpenOneRec/OneRec-1.7B"
+    model_name = _get_test_model()
     beam_width = 512
     max_tokens = 5
 
@@ -65,7 +72,10 @@ async def beam_search_test(loops: int) -> None:
         with open(prompt_file, "r") as f:
             prompt_text = f.read()
         prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-        prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        engine_input = serving.renderer.process_for_engine(
+            TokensPrompt(prompt_token_ids=prompt_token_ids),
+            arrival_time=time.time(),
+        )
 
         beam_search_params: dict[str, Any] = {
             "beam_width": beam_width,
@@ -86,7 +96,7 @@ async def beam_search_test(loops: int) -> None:
         final_output: RequestOutput | None = None
         start: float = time.perf_counter()
         for i in range(loops):
-            generator = serving.beam_search(prompt, "req_id", params)
+            generator = serving.beam_search(engine_input, f"req_id_{i}", params)
             async for output in generator:
                 final_output = output
                 if final_output and final_output.metrics:

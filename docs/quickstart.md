@@ -36,7 +36,7 @@ pip --version
 vllm-gr does not install vllm. Prepare the GPU base environment first:
 
 ```bash
-uv pip install vllm==0.14.1 --torch-backend=auto
+uv pip install vllm==0.22.1 --torch-backend=auto
 ```
 
 4. **Install vllm-gr**

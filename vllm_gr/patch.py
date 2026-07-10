@@ -198,6 +198,32 @@ _ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
 _ASCEND_ORIGINAL_CACHED_GET_ATTN = None
 
 
+def _register_custom_attention_backend(force: bool = False) -> int:
+    """Register BeamAttentionBackend under vLLM's CUSTOM backend slot."""
+    try:
+        from vllm.v1.attention.backends.registry import (
+            AttentionBackendEnum,
+            register_backend,
+        )
+    except ImportError:
+        return 0
+
+    class_path = "vllm_gr.v1.attention.backends.beam_attn.BeamAttentionBackend"
+    current_path = None
+    if AttentionBackendEnum.CUSTOM.is_overridden():
+        try:
+            current_path = AttentionBackendEnum.CUSTOM.get_path()
+        except ValueError:
+            current_path = None
+
+    if not force and current_path == class_path:
+        return 0
+
+    register_backend(AttentionBackendEnum.CUSTOM, class_path)
+    logger.debug("vllm_gr: Registered CUSTOM attention backend: %s", class_path)
+    return 1
+
+
 def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
     """Preserve CUSTOM attention backend on all platforms.
 
@@ -206,12 +232,13 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
     ``get_attn_backend`` would return an Ascend-specific backend even when the
     config explicitly requests ``AttentionBackendEnum.CUSTOM``.
 
-    To avoid relying on an environment variable, this patch is applied
-    **unconditionally** on every platform.  It is a no-op whenever
-    ``backend != AttentionBackendEnum.CUSTOM``, so on GPU the CUDA platform's
-    native handling is preserved.  When ``backend == CUSTOM`` the patch returns
-    ``BeamAttentionBackend`` directly, bypassing any platform-specific
-    ``get_attn_backend_cls``.
+    The platform plugin also resets ``attention_config.backend`` to ``None``
+    during config preparation, so we persist the user's intent in
+    ``additional_config`` and use that as a fallback in the selector patch.
+
+    The selector wrapper is installed on every platform because it only
+    activates when ``backend == AttentionBackendEnum.CUSTOM``; for all other
+    backends it delegates to the original selector unchanged.
     """
     global _ASCEND_ATTN_BACKEND_PATCH_APPLIED
     global _ASCEND_ORIGINAL_CACHED_GET_ATTN
@@ -224,17 +251,16 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
     except ImportError:
         return 0
 
-    # Ensure BeamAttentionBackend is registered under CUSTOM.
+    patch_count = _register_custom_attention_backend(force=force)
+
     try:
         import vllm_gr.v1.attention.backends.beam_attn  # noqa: F401
     except Exception:
-        return 0
+        return patch_count
 
     if not AttentionBackendEnum.CUSTOM.is_overridden():
         _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
-        return 0
-
-    patch_count = 0
+        return patch_count
 
     # --- Patch selector._cached_get_attn_backend -----------------------
     try:
@@ -248,8 +274,30 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
 
     original_cached_fn = _ASCEND_ORIGINAL_CACHED_GET_ATTN
 
-    def _patched_cached_get_attn_backend(backend, attn_selector_config):
+    # Bind the original signature once so we can safely extract ``backend``
+    # even if upstream reorders or renames arguments in the future.
+    try:
+        import inspect
+
+        _cached_get_attn_backend_sig = inspect.signature(original_cached_fn)
+    except Exception:
+        # If introspection fails, fall back to the original unwrapped function.
+        _cached_get_attn_backend_sig = None
+
+    def _resolve_backend(*args, **kwargs):
+        if _cached_get_attn_backend_sig is not None:
+            try:
+                bound = _cached_get_attn_backend_sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                return bound.arguments.get("backend")
+            except TypeError:
+                pass
+        # Legacy fallback for the current upstream signature.
+        return args[0] if args else kwargs.get("backend")
+
+    def _patched_cached_get_attn_backend(*args, **kwargs):
         """Return BeamAttentionBackend when backend is CUSTOM."""
+        backend = _resolve_backend(*args, **kwargs)
         if backend == AttentionBackendEnum.CUSTOM:
             from vllm_gr.v1.attention.backends.beam_attn import (
                 BeamAttentionBackend,
@@ -267,7 +315,6 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
                 set_kv_cache_layout(required_layout)
 
             return BeamAttentionBackend
-
         # On Ascend NPU the platform plugin resets attention_config.backend to
         # None inside VllmConfig.__post_init__.  The reset happens before the
         # config is serialized to child processes, so EngineCore and Worker
@@ -299,9 +346,12 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
 
                     return BeamAttentionBackend
             except Exception:
-                pass
+                logger.debug(
+                    "vllm_gr: CUSTOM attention backend fallback failed",
+                    exc_info=True,
+                )
 
-        return original_cached_fn(backend, attn_selector_config)
+        return original_cached_fn(*args, **kwargs)
 
     selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
     patch_count += 1
@@ -321,7 +371,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
     if _GR_BEAM_PATCHES_APPLIED and not force:
         return 0
 
-    patch_count = 0
+    patch_count = _register_custom_attention_backend(force=force)
 
     try:
         from vllm_gr.logprobs_patch import patch_flat_logprobs
@@ -330,7 +380,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_flat_logprobs")
     except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_flat_logprobs: %s", exc)
+        logger.error("vllm_gr: Failed to apply patch_flat_logprobs: %s", exc)
 
     try:
         from vllm_gr.entrypoints.openai.beam_search_patch import (
@@ -342,7 +392,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_beam_search")
     except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_beam_search: %s", exc)
+        logger.error("vllm_gr: Failed to apply patch_beam_search: %s", exc)
 
     try:
         from vllm_gr.entrypoints.openai.beam_search_patch import patch_sampling
@@ -351,7 +401,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_sampling")
     except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_sampling: %s", exc)
+        logger.error("vllm_gr: Failed to apply patch_sampling: %s", exc)
 
     try:
         from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
@@ -360,7 +410,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_add_cli_args")
     except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_add_cli_args: %s", exc)
+        logger.error("vllm_gr: Failed to apply patch_add_cli_args: %s", exc)
 
     try:
         from vllm_gr.entrypoints.openai.serving_models import (
@@ -371,7 +421,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_OpenAIServingModels_init")
     except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_OpenAIServingModels_init: %s", exc)
+        logger.error("vllm_gr: Failed to apply patch_OpenAIServingModels_init: %s", exc)
 
     try:
         from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
@@ -380,7 +430,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         patch_count += 1
         logger.debug("vllm_gr: Applied patch_batch_and_fork")
     except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_batch_and_fork: %s", exc)
+        logger.error("vllm_gr: Failed to apply patch_batch_and_fork: %s", exc)
 
     # Optional: LMCache adapter patch
     try:
@@ -753,6 +803,23 @@ def _apply_patches(force: bool = False) -> int:
     ascend_attn_count = _apply_ascend_attention_backend_patch(force=force)
     beam_count = _apply_gr_beam_patches(force=force)
     npu_worker_count = _patch_npu_worker_init_device()
+
+    # Apply grouped-beam worker hooks wherever vLLM model runners are already
+    # loaded.  This is needed both in the EngineCore child process and in each
+    # spawned Worker process (the general-plugin reload path calls
+    # re_apply_patches, which ends up here).
+    try:
+        from vllm_gr.v1.engine.engine_core_patch import apply_worker_patches
+
+        worker_patch_count = apply_worker_patches()
+        if worker_patch_count > 0:
+            logger.info(
+                "vllm_gr: Applied grouped-beam worker patches (%d runner classes)",
+                worker_patch_count,
+            )
+    except Exception as exc:
+        logger.error("vllm_gr: Failed to apply grouped-beam worker patches: %s", exc)
+
     return (
         yuanrong_count
         + qkv_rmsnorm_rope_count
@@ -760,6 +827,7 @@ def _apply_patches(force: bool = False) -> int:
         + ascend_attn_count
         + beam_count
         + npu_worker_count
+        + worker_patch_count
     )
 
 

@@ -8,6 +8,7 @@ import importlib
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,6 +99,50 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
 
         assert "vllm_gr_attention_backend" not in result.additional_config
         assert result.attention_config.backend is not AttentionBackendEnum.CUSTOM
+
+    @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
+    def test_custom_backend_preserves_model_runner_selection(self, mock_origin_create):
+        """CUSTOM attention leaves vLLM's native runner selection untouched."""
+        from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+        fake_config = SimpleNamespace(
+            additional_config={},
+            attention_config=SimpleNamespace(backend=None),
+        )
+        mock_origin_create.return_value = fake_config
+
+        class FakeSelf:
+            attention_backend = "CUSTOM"
+            attention_config = None
+
+        with mock.patch.dict(
+            "os.environ", {"VLLM_USE_V2_MODEL_RUNNER": "1"}, clear=False
+        ) as environ:
+            result = create_engine_config(FakeSelf())
+            self.assertEqual(environ["VLLM_USE_V2_MODEL_RUNNER"], "1")
+
+        self.assertIs(result, fake_config)
+
+    @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
+    def test_non_custom_backend_preserves_model_runner_selection(self, mock_origin_create):
+        """Native attention must retain an explicit V2 runner selection."""
+        from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+        fake_config = SimpleNamespace(
+            additional_config={},
+            attention_config=SimpleNamespace(backend=None),
+        )
+        mock_origin_create.return_value = fake_config
+
+        class FakeSelf:
+            attention_backend = "FLASH_ATTN"
+            attention_config = None
+
+        with mock.patch.dict(
+            "os.environ", {"VLLM_USE_V2_MODEL_RUNNER": "1"}, clear=False
+        ) as environ:
+            create_engine_config(FakeSelf())
+            self.assertEqual(environ["VLLM_USE_V2_MODEL_RUNNER"], "1")
 
 
 class TestCustomBackendMarkerSerialization(unittest.TestCase):
