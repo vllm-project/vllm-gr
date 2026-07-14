@@ -5,6 +5,7 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
+import copy
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -726,6 +727,19 @@ class InputBatchProxy:
                 return s_meta
 
             orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
+            # No row expansion/remap needed → return the original object unchanged,
+            # avoiding a pointless copy.
+            if orig_req_len == len(logits_map):
+                return s_meta
+
+            # Projection needed: shallow-copy the metadata and rebind the beam-row
+            # tensors on the COPY only. The original SamplingMetadata (and thus the
+            # underlying InputBatch) is never mutated, so a subsequent ordinary
+            # request — or a second read in the same step — still sees the original
+            # unprojected tensors. Reading `val` from `s_meta` (not the copy) is what
+            # keeps every access safe: the original never changes shape, so
+            # `val[logits_map]` is always well-formed.
+            projected = copy.copy(s_meta)
             for attr in [
                 "temperature",
                 "top_p",
@@ -737,9 +751,9 @@ class InputBatchProxy:
             ]:
                 val = getattr(s_meta, attr, None)
                 if isinstance(val, torch.Tensor) and val.numel() > 0:
-                    if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
-                        object.__setattr__(s_meta, attr, val[logits_map])
-            return s_meta
+                    if val.shape[0] == orig_req_len:
+                        object.__setattr__(projected, attr, val[logits_map])
+            return projected
 
         elif name == "req_ids":
             return BeamReqIdsProxy(obj.req_ids, req_map)
