@@ -249,24 +249,44 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
     original_cached_fn = _ASCEND_ORIGINAL_CACHED_GET_ATTN
 
     def _patched_cached_get_attn_backend(backend, attn_selector_config):
-        """Return BeamAttentionBackend when backend is CUSTOM."""
+        """Return BeamAttentionBackend when backend is CUSTOM and vllm-gr marker present."""
         if backend == AttentionBackendEnum.CUSTOM:
-            from vllm_gr.v1.attention.backends.beam_attn import (
-                BeamAttentionBackend,
-            )
+            # CUSTOM is a shared third-party slot. Only force BeamAttentionBackend
+            # when the vllm-gr marker is present; otherwise let another plugin's
+            # CUSTOM registration win by delegating to the original selector.
+            try:
+                from vllm.config import get_current_vllm_config_or_none
 
-            # Replicate the KV cache layout adjustment from the original
-            # selector so that backends requiring a specific layout still
-            # get it applied.
-            required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
-            if required_layout is not None:
-                from vllm.v1.attention.backends.utils import (
-                    set_kv_cache_layout,
-                )
+                vllm_config = get_current_vllm_config_or_none()
+                if (
+                    vllm_config is not None
+                    and getattr(vllm_config, "additional_config", None)
+                    and isinstance(vllm_config.additional_config, dict)
+                    and vllm_config.additional_config.get("vllm_gr_attention_backend")
+                    == "CUSTOM"
+                ):
+                    from vllm_gr.v1.attention.backends.beam_attn import (
+                        BeamAttentionBackend,
+                    )
 
-                set_kv_cache_layout(required_layout)
+                    # Replicate the KV cache layout adjustment from the original
+                    # selector so that backends requiring a specific layout still
+                    # get it applied.
+                    required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
+                    if required_layout is not None:
+                        from vllm.v1.attention.backends.utils import (
+                            set_kv_cache_layout,
+                        )
 
-            return BeamAttentionBackend
+                        set_kv_cache_layout(required_layout)
+
+                    return BeamAttentionBackend
+            except Exception:
+                pass
+            # No vllm-gr marker — delegate to the original selector so another
+            # plugin's CUSTOM backend registration is respected.
+
+            return original_cached_fn(backend, attn_selector_config)
 
         # On Ascend NPU the platform plugin resets attention_config.backend to
         # None inside VllmConfig.__post_init__.  The reset happens before the

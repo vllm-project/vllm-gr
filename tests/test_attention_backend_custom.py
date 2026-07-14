@@ -154,7 +154,7 @@ class TestCustomBackendMarkerSerialization(unittest.TestCase):
 
 
 class TestNativePlatformBackendFallback(unittest.TestCase):
-    """Verify backend=None without marker delegates to native platform backend."""
+    """Verify selector delegates correctly for backend=CUSTOM with/without marker."""
 
     def test_backend_none_without_marker_does_not_return_beam(self):
         """Without marker, backend=None resolves to native platform backend."""
@@ -189,6 +189,91 @@ class TestNativePlatformBackendFallback(unittest.TestCase):
         from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
 
         assert result is not BeamAttentionBackend
+
+    def test_backend_custom_with_marker_returns_beam(self):
+        """backend=CUSTOM with vllm-gr marker returns BeamAttentionBackend."""
+        import vllm.v1.attention.selector as selector_mod
+        from vllm.config import AttentionConfig, VllmConfig
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        from vllm_gr.patch import _apply_ascend_attention_backend_patch
+
+        _apply_ascend_attention_backend_patch(force=True)
+
+        config = VllmConfig(attention_config=AttentionConfig())
+        config.attention_config.backend = AttentionBackendEnum.CUSTOM
+        config.additional_config["vllm_gr_attention_backend"] = "CUSTOM"
+
+        from vllm.config import set_current_vllm_config
+
+        with set_current_vllm_config(config):
+            import torch
+            from vllm.v1.attention.selector import AttentionSelectorConfig
+
+            selector_cfg = AttentionSelectorConfig(
+                head_size=48,
+                dtype=torch.float16,
+                kv_cache_dtype=None,
+                block_size=128,
+            )
+            result = selector_mod._cached_get_attn_backend(
+                AttentionBackendEnum.CUSTOM, selector_cfg
+            )
+
+        from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+
+        assert result is BeamAttentionBackend
+
+    @mock.patch("vllm.v1.attention.selector.resolve_obj_by_qualname")
+    @mock.patch("vllm.platforms.current_platform.get_attn_backend_cls")
+    def test_backend_custom_without_marker_delegates_to_registered_backend(
+        self, mock_get_cls, mock_resolve
+    ):
+        """backend=CUSTOM without marker delegates to the registered class."""
+        import vllm.v1.attention.selector as selector_mod
+        from vllm.config import AttentionConfig, VllmConfig
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        from vllm_gr.patch import _apply_ascend_attention_backend_patch
+
+        _apply_ascend_attention_backend_patch(force=True)
+
+        class FakeCustomBackend:
+            @staticmethod
+            def get_required_kv_cache_layout():
+                return None
+
+            @staticmethod
+            def get_name():
+                return "FakeCustomBackend"
+
+        mock_get_cls.return_value = "fake.path.FakeCustomBackend"
+        mock_resolve.return_value = FakeCustomBackend
+
+        config = VllmConfig(attention_config=AttentionConfig())
+        config.attention_config.backend = AttentionBackendEnum.CUSTOM
+        # additional_config empty (no marker)
+
+        from vllm.config import set_current_vllm_config
+
+        with set_current_vllm_config(config):
+            import torch
+            from vllm.v1.attention.selector import AttentionSelectorConfig
+
+            selector_cfg = AttentionSelectorConfig(
+                head_size=96,
+                dtype=torch.float16,
+                kv_cache_dtype=None,
+                block_size=128,
+            )
+            result = selector_mod._cached_get_attn_backend(
+                AttentionBackendEnum.CUSTOM, selector_cfg
+            )
+
+        from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+
+        assert result is not BeamAttentionBackend
+        assert result is FakeCustomBackend
 
 
 try:
