@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import msgspec
+import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
 
@@ -37,9 +38,19 @@ from vllm_gr.v1.engine.core_client_patch import register_beam_output_fn
 from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
-# Ensure custom enum members exist in this process.
-_add_enum_member("ADD_BATCH", b"\x05")
-_add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+
+@pytest.fixture(scope="module", autouse=True)
+def install_beam_enum_members() -> None:
+    """Ensure custom enum members exist for this module's tests.
+
+    Replaces the previous module-level ``_add_enum_member`` calls so that
+    merely *importing* this test module no longer mutates the global
+    ``EngineCoreRequestType``. Installed once per module session before the
+    first test runs (idempotent if already present).
+    """
+    _add_enum_member("ADD_BATCH", b"\x05")
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+
 
 # ---------------------------------------------------------------------------
 # Helpers

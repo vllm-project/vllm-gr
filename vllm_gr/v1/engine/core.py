@@ -262,7 +262,17 @@ def process_input_sockets(
                     continue
 
                 elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
-                    beam_update: BeamRequestStepUpdate = beam_request_decoder.decode(data_frames)
+                    # Beam update rebuilds a greedy n>1 SamplingParams from the
+                    # wire; wrap the decode so the scoped greedy-sampling
+                    # exemption is active *only* for this deserialization.
+                    from vllm_gr.v1.engine.engine_core_patch import (
+                        beam_update_decode_scope,
+                    )
+
+                    with beam_update_decode_scope():
+                        beam_update: BeamRequestStepUpdate = beam_request_decoder.decode(
+                            data_frames
+                        )
                     self._handle_beam_request_step_update(beam_update)
                     continue
 

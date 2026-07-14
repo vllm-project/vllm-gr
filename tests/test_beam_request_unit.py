@@ -18,13 +18,15 @@ Sections:
 from __future__ import annotations
 
 import asyncio
+import enum
 import queue
 import threading
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
+import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
     EngineCoreRequestType,
@@ -51,12 +53,25 @@ from vllm_gr.v1.engine.core_client_patch import (
     sync_mp_add_requests,
     sync_mp_beam_request_step_update,
 )
-from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
+from vllm_gr.v1.engine.engine_core_patch import (
+    _add_enum_member,
+    _add_enum_member_to,
+)
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
-# Ensure custom enum members exist in this process for all tests below.
-_add_enum_member("ADD_BATCH", b"\x05")
-_add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+
+@pytest.fixture(scope="module", autouse=True)
+def install_beam_enum_members() -> None:
+    """Ensure custom enum members exist for this module's tests.
+
+    Replaces the previous module-level ``_add_enum_member`` calls so that
+    merely *importing* this test module no longer mutates the global
+    ``EngineCoreRequestType``. The members are installed once per module
+    session, right before the first test runs (idempotent if already present).
+    """
+    _add_enum_member("ADD_BATCH", b"\x05")
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+
 
 # ---------------------------------------------------------------------------
 # Module-level picklable targets for subprocess tests (§6)
@@ -101,6 +116,118 @@ def _sub_patch_batch_fork_idempotent() -> None:
     patch_batch_and_fork()
     second = EngineCoreProc.run_engine_core
     assert first is second is run_engine_core, "Second call must be a no-op"
+
+
+def _sub_enum_conflict_check_on_real_enum() -> None:
+    """In a clean spawned process, conflict checks fire on the real enum.
+
+    Verifies that registering a value already owned by an upstream member
+    (ADD = b"\\x00") raises and leaves the real EngineCoreRequestType intact.
+    Runs in a subprocess so the global enum starts uncontaminated.
+    """
+    from vllm.v1.engine import EngineCoreRequestType as ERT
+
+    from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
+
+    upstream_names_before = list(ERT._member_names_)
+    upstream_values_before = dict(ERT._value2member_map_)
+
+    # Same value as upstream ADD (b"\x00") under a new name must fail.
+    try:
+        _add_enum_member("MY_COLLIDING", b"\x00")
+    except RuntimeError as exc:
+        assert "value already in use" in str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError for value collision with upstream ADD")
+
+    # Real enum must be untouched after the failed registration.
+    assert list(ERT._member_names_) == upstream_names_before
+    assert dict(ERT._value2member_map_) == upstream_values_before
+    assert ERT(b"\x00") is ERT.ADD
+
+    # And the legitimate members still register fine afterwards.
+    _add_enum_member("ADD_BATCH", b"\x05")
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+    assert ERT(b"\x05") is ERT.ADD_BATCH
+    assert ERT(b"\x06") is ERT.BEAM_REQUEST_STEP_UPDATE
+
+
+def _sub_scoped_greedy_sampling_patch_on_real_sampling_params() -> None:
+    """In a clean spawned process, lock the real production decode path.
+
+    The production path is NOT a bare SamplingParams construction — it is
+    ``MsgpackDecoder(BeamRequestStepUpdate).decode(...)`` rebuilding the nested
+    SamplingParams, which invokes ``__post_init__`` → ``_verify_greedy_sampling``.
+    This target pins that exact path so the scoped exemption cannot silently
+    regress to the old process-wide no-op.
+
+    Verifies:
+      1. Ordinary greedy SamplingParams(n>1) is still rejected by upstream.
+      2. The wire decode of a greedy n>1 BeamRequestStepUpdate raises *outside*
+         the scope (upstream verification active).
+      3. The same wire decode succeeds *inside* beam_update_decode_scope, and
+         the rebuilt sampling_params retains n == beam_width.
+      4. The rejection is immediately restored once the scope exits.
+    """
+    import msgspec
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.serial_utils import MsgpackDecoder
+
+    from vllm_gr.v1.engine.engine_core_patch import (
+        _install_scoped_greedy_sampling_patch,
+        beam_update_decode_scope,
+    )
+    from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+
+    _install_scoped_greedy_sampling_patch()
+
+    beam_width = 4
+    # Build the wire payload. Construction itself needs the scope (greedy n>1),
+    # but what we test is the *decode* below, not this construction.
+    with beam_update_decode_scope():
+        update = BeamRequestStepUpdate(
+            session_id="session-greedy",
+            parent_beam_ids=[f"p{i}" for i in range(beam_width)],
+            child_beam_ids=[f"c{i}" for i in range(beam_width)],
+            beam_tokens=[[100 + i] for i in range(beam_width)],
+            pruned_ids=[],
+            prefix_len=1,
+            beam_width=beam_width,
+            sampling_params=SamplingParams(temperature=0.0, n=beam_width, max_tokens=4),
+        )
+    payload = msgspec.msgpack.encode(update)
+    decoder = MsgpackDecoder(BeamRequestStepUpdate)
+
+    # 1. Ordinary greedy n>1 still rejected by upstream (no scope around it).
+    try:
+        SamplingParams(temperature=0.0, n=beam_width, max_tokens=4)
+    except ValueError as exc:
+        assert "n must be 1 when using greedy sampling" in str(exc), str(exc)
+    else:
+        raise AssertionError("Ordinary greedy n>1 should be rejected by upstream")
+
+    # 2. Wire decode of greedy n>1 raises OUTSIDE the scope.
+    try:
+        decoder.decode(payload)
+    except Exception as exc:  # msgspec.ValidationError on 0.14.1
+        assert "n must be 1 when using greedy sampling" in str(exc), str(exc)
+    else:
+        raise AssertionError("Wire decode of greedy n>1 should raise outside the decode scope")
+
+    # 3. Wire decode succeeds INSIDE the scope; n survives the round-trip.
+    with beam_update_decode_scope():
+        decoded = decoder.decode(payload)
+    assert decoded.sampling_params.n == beam_width, decoded.sampling_params.n
+    assert decoded.beam_width == beam_width
+    assert len(decoded.child_beam_ids) == beam_width
+
+    # 4. Rejection restored immediately once the scope exits.
+    try:
+        decoder.decode(payload)
+    except Exception as exc:
+        assert "n must be 1 when using greedy sampling" in str(exc)
+    else:
+        raise AssertionError("Rejection should be restored after the scope exits")
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +516,197 @@ class TestEnumPatching:
         assert EngineCoreRequestType(b"\x06") is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
 
 
+def _make_tmp_enum() -> type[enum.Enum]:
+    """A fresh byte-valued enum, structurally identical to EngineCoreRequestType.
+
+    Built per-call so conflict tests start from a clean, isolated state inside
+    the same process — no need for subprocess isolation for the conflict logic
+    itself.
+    """
+    return enum.Enum("_TmpEngineCoreRequestType", {"ADD": b"\x00", "ABORT": b"\x01"})
+
+
+def _snapshot(enum_cls: type[enum.Enum]) -> dict[str, object]:
+    return {
+        "value2member_map": dict(enum_cls._value2member_map_),
+        "member_map": dict(enum_cls._member_map_),
+        "member_names": list(enum_cls._member_names_),
+        # Class attributes for any *non-upstream* names we might register; a
+        # failed registration must not leave one of these behind on the class.
+        "class_attrs": {
+            n: getattr(enum_cls, n, _MISSING)
+            for n in ("ADD_BATCH", "BEAM_REQUEST_STEP_UPDATE", "MY_NEW", "some_helper")
+        },
+    }
+
+
+_MISSING = object()
+
+
+class TestEnumConflictChecks:
+    """Negative coverage for _add_enum_member_to using isolated temp enums."""
+
+    def test_same_name_same_value_is_idempotent(self) -> None:
+        enum_cls = _make_tmp_enum()
+        _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+        before = _snapshot(enum_cls)
+        # Second call with identical name+value is a no-op.
+        _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+        assert _snapshot(enum_cls) == before
+        # Still exactly one entry in the name list.
+        assert sum(1 for n in enum_cls._member_names_ if n == "ADD_BATCH") == 1
+
+    def test_same_name_different_value_raises(self) -> None:
+        enum_cls = _make_tmp_enum()
+        _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+        before = _snapshot(enum_cls)
+        with pytest.raises(RuntimeError, match="already in use with value"):
+            _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x09")
+        # Enum state must be untouched after the failed registration.
+        assert _snapshot(enum_cls) == before
+
+    def test_different_name_same_value_raises(self) -> None:
+        enum_cls = _make_tmp_enum()
+        _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+        before = _snapshot(enum_cls)
+        with pytest.raises(RuntimeError, match="value already in use by member"):
+            _add_enum_member_to(enum_cls, "BEAM_REQUEST_STEP_UPDATE", b"\x05")
+        assert _snapshot(enum_cls) == before
+
+    def test_collision_with_upstream_member_value_raises(self) -> None:
+        # A fresh enum already owns b"\x01" (ABORT); adding a new name on that
+        # value must fail rather than silently overwriting the reverse lookup.
+        enum_cls = _make_tmp_enum()
+        before = _snapshot(enum_cls)
+        with pytest.raises(RuntimeError, match="value already in use by member 'ABORT'"):
+            _add_enum_member_to(enum_cls, "MY_NEW", b"\x01")
+        assert _snapshot(enum_cls) == before
+        # Reverse lookup must still route to the original member.
+        assert enum_cls(b"\x01") is enum_cls.ABORT
+        # And no stray class attribute was left behind by the failed write.
+        assert not hasattr(enum_cls, "MY_NEW")
+
+    def test_collision_with_non_member_class_attribute_raises(self) -> None:
+        enum_cls = _make_tmp_enum()
+        # Plant a non-member class attribute (like a method/property would be).
+        type.__setattr__(enum_cls, "some_helper", "x")
+        before = _snapshot(enum_cls)
+        with pytest.raises(RuntimeError, match="non-member class attribute"):
+            _add_enum_member_to(enum_cls, "some_helper", b"\x05")
+        assert _snapshot(enum_cls) == before
+        # The pre-existing attribute value must be untouched.
+        assert getattr(enum_cls, "some_helper") == "x"
+
+    def test_same_name_different_value_leaves_no_class_attr(self) -> None:
+        enum_cls = _make_tmp_enum()
+        _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+        with pytest.raises(RuntimeError):
+            _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x09")
+        # ADD_BATCH still resolves to the original (b"\x05") member only.
+        assert enum_cls.ADD_BATCH.value == b"\x05"
+
+    def test_rollback_when_intermediate_write_fails(self) -> None:
+        # The defensive rollback must undo any writes that took effect before a
+        # failure. We trigger a failure at the _member_names_.append step (the
+        # third of four writes), after the value/name maps were already mutated,
+        # and assert both maps are restored.
+        #
+        # list.append is read-only, so we swap the whole _member_names_ for a
+        # list-like whose append raises for the target name. The final write
+        # (type.__setattr__) cannot be force-failed in-process because `type` is
+        # an immutable built-in; that last step's rollback is covered by code
+        # review and by the value/name-map rollback proven here.
+
+        class _FailOnAppendName:
+            def __init__(self, real: list) -> None:
+                self._real = real
+
+            def append(self, name: str) -> None:
+                if name == "BEAM_REQUEST_STEP_UPDATE":
+                    raise RuntimeError("simulated append failure")
+                self._real.append(name)
+
+            def __contains__(self, item: object) -> bool:
+                return item in self._real
+
+            def __iter__(self):
+                return iter(self._real)
+
+        enum_cls = _make_tmp_enum()
+        real_names = list(enum_cls._member_names_)
+        enum_cls._member_names_ = _FailOnAppendName(real_names)  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError, match="simulated append failure"):
+            _add_enum_member_to(enum_cls, "BEAM_REQUEST_STEP_UPDATE", b"\x06")
+
+        # Restore a real list, then assert full rollback of the prior writes.
+        enum_cls._member_names_ = real_names
+        assert b"\x06" not in enum_cls._value2member_map_
+        assert "BEAM_REQUEST_STEP_UPDATE" not in enum_cls._member_map_
+        assert "BEAM_REQUEST_STEP_UPDATE" not in enum_cls._member_names_
+        assert not hasattr(enum_cls, "BEAM_REQUEST_STEP_UPDATE")
+
+    def test_repeated_valid_registrations_are_stable(self) -> None:
+        enum_cls = _make_tmp_enum()
+        _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+        _add_enum_member_to(enum_cls, "BEAM_REQUEST_STEP_UPDATE", b"\x06")
+        _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")  # idempotent repeat
+        assert enum_cls.ADD_BATCH.value == b"\x05"
+        assert enum_cls.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
+        names = [
+            n for n in enum_cls._member_names_ if n in ("ADD_BATCH", "BEAM_REQUEST_STEP_UPDATE")
+        ]
+        assert names == ["ADD_BATCH", "BEAM_REQUEST_STEP_UPDATE"]
+        assert enum_cls(b"\x05") is enum_cls.ADD_BATCH
+        assert enum_cls(b"\x06") is enum_cls.BEAM_REQUEST_STEP_UPDATE
+
+
+class TestEnumCompatChecks:
+    """The runtime-extension technique probes actual capabilities, so an
+    incompatible upstream enum surfaces as a clear RuntimeError instead of a
+    low-level AttributeError/TypeError mid-write."""
+
+    def test_missing_internal_attribute_raises(self) -> None:
+        # An enum-like class without the internal maps is not extensible.
+        class NoMaps:
+            pass
+
+        with pytest.raises(RuntimeError, match="missing expected attribute"):
+            _add_enum_member_to(NoMaps, "X", b"\x05")
+
+    def test_read_only_value_map_raises(self) -> None:
+        enum_cls = _make_tmp_enum()
+        # Replace the value map with a read-only proxy (what an upstream that
+        # freezes its internals might do).
+        enum_cls._value2member_map_ = MappingProxyType(dict(enum_cls._value2member_map_))  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="not a writable mapping"):
+            _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+
+    def test_read_only_name_map_raises(self) -> None:
+        enum_cls = _make_tmp_enum()
+        enum_cls._member_map_ = MappingProxyType(dict(enum_cls._member_map_))  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="not a writable mapping"):
+            _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+
+    def test_non_appendable_name_list_raises(self) -> None:
+        enum_cls = _make_tmp_enum()
+        # A tuple has no .append — the name list must be a real list.
+        enum_cls._member_names_ = tuple(enum_cls._member_names_)  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="not appendable"):
+            _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+
+    def test_compat_failure_leaves_enum_unchanged(self) -> None:
+        # A failed compatibility probe must not partially mutate the enum.
+        enum_cls = _make_tmp_enum()
+        before = _snapshot(enum_cls)
+        enum_cls._value2member_map_ = MappingProxyType(dict(enum_cls._value2member_map_))  # type: ignore[assignment]
+        with pytest.raises(RuntimeError):
+            _add_enum_member_to(enum_cls, "ADD_BATCH", b"\x05")
+        # Restore writability and re-snapshot the read-only maps for comparison.
+        enum_cls._value2member_map_ = dict(enum_cls._value2member_map_)
+        assert _snapshot(enum_cls)["member_names"] == before["member_names"]
+
+
 # ===========================================================================
 # Section 3 — EngineCore Beam Cache
 # ===========================================================================
@@ -519,6 +837,38 @@ class TestBeamCache:
         assert mock_req.is_beam_decode is True
         assert mock_req.beam_decode_steps == 1  # each beam_tokens list has length 1
         assert mock_req.prefix_len == 5
+
+    def test_handle_accepts_greedy_n_gt_one_update(self) -> None:
+        # After the wire decode (covered in subprocess), the rebuilt update with
+        # a greedy n>1 SamplingParams must flow into normal Beam request
+        # handling. _handle_beam_request_step_update reuses update.sampling_params
+        # verbatim (no re-construction), so it must not re-trigger greedy
+        # verification and must still push the ADD request.
+        import copy as _copy
+
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+        # Construct the n>1 sp the same way the client does (copy + assign),
+        # which bypasses __post_init__ — see entrypoints/gr.py decode path.
+        sp = _copy.copy(_sampling_params(temperature=0.0))
+        sp.n = 4
+        update = _make_beam_update(
+            session_id="s0",
+            parent_beam_ids=["p0", "p1", "p2", "p3"],
+            child_beam_ids=["c0", "c1", "c2", "c3"],
+            beam_tokens=[[50], [60], [70], [80]],
+            beam_width=4,
+            sampling_params=sp,
+        )
+
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = MagicMock()
+            mock_req.block_hashes = []
+            MockReq.return_value = mock_req
+            _handle_beam_request_step_update(eng, update)
+
+        assert not eng.input_queue.empty()
+        assert mock_req.is_beam is True
+        assert mock_req.beam_width == 4
 
     def test_handle_block_hashes_from_session(self) -> None:
         eng = _make_engine_self(
@@ -1470,6 +1820,16 @@ class TestIntegrationCrossProcess:
             assert member.value not in (b"\x05", b"\x06"), (
                 f"Collision: upstream member {name!r} already uses value {member.value!r}"
             )
+
+    def test_enum_conflict_check_runs_in_clean_subprocess(self) -> None:
+        # Conflict checks against the real enum must run in a fresh interpreter
+        # so the global EngineCoreRequestType is uncontaminated.
+        _run_subprocess(_sub_enum_conflict_check_on_real_enum)
+
+    def test_scoped_greedy_sampling_patch_in_clean_subprocess(self) -> None:
+        # The scoped greedy patch must be verified against the real SamplingParams
+        # in a fresh interpreter (the global method is process-wide state).
+        _run_subprocess(_sub_scoped_greedy_sampling_patch_on_real_sampling_params)
 
     def test_beam_request_step_update_encode_decode(self) -> None:
         from vllm.v1.serial_utils import MsgpackDecoder

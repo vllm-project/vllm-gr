@@ -6,8 +6,10 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 from vllm.logger import init_logger
@@ -16,6 +18,63 @@ from vllm.v1.engine import EngineCoreRequestType
 from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
 
 logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Greedy-sampling exemption for beam decode
+# ---------------------------------------------------------------------------
+# Beam decode legitimately runs greedy (temperature=0) with n == beam_width > 1.
+# Upstream SamplingParams._verify_greedy_sampling rejects that combination, and
+# msgspec invokes __post_init__ (→ _verify_greedy_sampling) when the child
+# process deserializes a BeamRequestStepUpdate, so the check fires on the wire
+# decode path — not just on explicit construction.
+#
+# Instead of blanking the method process-wide (which also disarmed the check
+# for every ordinary greedy request), we keep the original method and install a
+# thin wrapper that suppresses the n>1 rejection *only* while a beam-update
+# decode is in flight (see _beam_decode_decoding below). All other requests
+# continue to use the upstream verification unchanged.
+_beam_decode_decoding: ContextVar[bool] = ContextVar("_beam_decode_decoding", default=False)
+_original_verify_greedy_sampling: Any = None
+_greedy_patch_applied: bool = False
+
+
+@contextmanager
+def beam_update_decode_scope() -> Iterator[None]:
+    """Mark a beam-update deserialization as in flight.
+
+    While active, the patched _verify_greedy_sampling skips the n>1 check so a
+    greedy beam-width>1 SamplingParams can be rebuilt from the wire. The scope
+    is intentionally tight: it must wrap *only* the decode call, never the rest
+    of request handling.
+    """
+    token = _beam_decode_decoding.set(True)
+    try:
+        yield
+    finally:
+        _beam_decode_decoding.reset(token)
+
+
+def _install_scoped_greedy_sampling_patch() -> None:
+    """Install the beam-scoped _verify_greedy_sampling wrapper (idempotent)."""
+    global _original_verify_greedy_sampling, _greedy_patch_applied
+    if _greedy_patch_applied:
+        return
+
+    from vllm.sampling_params import SamplingParams
+
+    _original_verify_greedy_sampling = SamplingParams._verify_greedy_sampling
+    original = _original_verify_greedy_sampling
+
+    def _verify_greedy_sampling(self) -> None:
+        if _beam_decode_decoding.get():
+            # Beam decode is rebuilding a greedy n>1 SamplingParams from the
+            # wire; the combination is intentional. Skip only this rejection.
+            return
+        original(self)
+
+    SamplingParams._verify_greedy_sampling = _verify_greedy_sampling
+    _greedy_patch_applied = True
+
 
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
@@ -38,62 +97,159 @@ def make_patched_engine_core_init(original_init):
 # ---------------------------------------------------------------------------
 
 
-def _add_enum_member(name: str, value: bytes) -> None:
-    """Dynamically add a member to EngineCoreRequestType if absent.
+def _add_enum_member_to(enum_cls: type, name: str, value: bytes) -> None:
+    """Dynamically add a member to ``enum_cls`` if absent and value is free.
 
     This uses object.__new__() to bypass enum's normal creation pathway,
     which is necessary because we're monkey-patching at runtime and cannot
     modify the original class definition in vLLM's codebase.
 
-    While this approach manipulates enum internals, it:
-    - Is a standard technique used by enum extension libraries (e.g. aenum)
-    - Includes validation to detect incompatibilities early
-    - Is contained to initialization time (not runtime performance critical)
-    - Is tested to ensure correctness
+    All compatibility checks run before *any* shared state is mutated, so a
+    failed call leaves the enum unchanged (atomic). The four internal writes
+    (value map, name map, name list, class attribute) are additionally wrapped
+    in a defensive rollback in case an unexpected error slips past validation.
 
     Args:
+        enum_cls: The enum class to extend (e.g. ``EngineCoreRequestType``).
         name: The name of the new enum member (e.g., "ADD_BATCH")
         value: The byte value for the enum member (e.g., b"\\x05")
 
     Raises:
-        RuntimeError: If the enum's internal structure is incompatible
+        RuntimeError: If the enum's internal structure is incompatible, or if
+            ``name``/``value`` collides with an existing member or class
+            attribute (idempotent re-registration of the same name+value is
+            allowed).
+        TypeError: If ``value``'s type does not match existing members.
     """
-    # Skip if already added
-    if hasattr(EngineCoreRequestType, name):
-        return
+    # Validate that the enum has the expected internal structure *and* that the
+    # runtime-extension technique we rely on still works on it. We probe the
+    # actual capabilities (read, write, member construction) rather than just
+    # attribute presence, so an incompatible upstream change surfaces as a clear
+    # RuntimeError instead of a low-level AttributeError/TypeError mid-write.
+    member_map = getattr(enum_cls, "_member_map_", None)
+    value2member_map = getattr(enum_cls, "_value2member_map_", None)
+    member_names = getattr(enum_cls, "_member_names_", None)
 
-    # Validate that the enum has expected internal structure
-    required_attrs = ["_value2member_map_", "_member_map_", "_member_names_"]
-    for attr in required_attrs:
-        if not hasattr(EngineCoreRequestType, attr):
+    def _missing(attr: str) -> RuntimeError:
+        return RuntimeError(
+            f"{enum_cls.__name__} missing expected attribute '{attr}'. "
+            f"This indicates an incompatible Python/vLLM version."
+        )
+
+    if member_map is None:
+        raise _missing("_member_map_")
+    if value2member_map is None:
+        raise _missing("_value2member_map_")
+    if member_names is None:
+        raise _missing("_member_names_")
+
+    # The value map must support both reverse lookup (`.get`) and registration
+    # (`__setitem__`); likewise the name map. The name list must be appendable.
+    for label, obj in (
+        ("_value2member_map_", value2member_map),
+        ("_member_map_", member_map),
+    ):
+        if not callable(getattr(obj, "get", None)) or not hasattr(obj, "__setitem__"):
             raise RuntimeError(
-                f"EngineCoreRequestType missing expected attribute '{attr}'. "
-                f"This indicates an incompatible Python/vLLM version. "
-                f"Please report this issue with your Python version."
+                f"{enum_cls.__name__}.{label} is not a writable mapping "
+                f"(type {type(obj).__name__}); runtime enum extension is not "
+                f"supported on this Python/vLLM version."
             )
+    append_fn = getattr(member_names, "append", None)
+    if not callable(append_fn):
+        raise RuntimeError(
+            f"{enum_cls.__name__}._member_names_ is not appendable "
+            f"(type {type(member_names).__name__}); runtime enum extension is "
+            f"not supported on this Python/vLLM version."
+        )
+
+    # Verify object.__new__(enum_cls) can still build a bare member. Some enum
+    # metaclasses override __new__/__init__ in ways that break this technique.
+    try:
+        object.__new__(enum_cls)  # dry-run; the real member is built below
+    except TypeError as exc:
+        raise RuntimeError(
+            f"object.__new__({enum_cls.__name__}) failed: {exc}. The runtime "
+            f"enum-extension technique is not compatible with this enum."
+        ) from exc
 
     # Verify the value type matches existing members
-    if EngineCoreRequestType._value2member_map_:
-        existing_value_type = type(next(iter(EngineCoreRequestType._value2member_map_.keys())))
+    if value2member_map:
+        existing_value_type = type(next(iter(value2member_map.keys())))
         if not isinstance(value, existing_value_type):
             raise TypeError(
                 f"Value type mismatch: expected {existing_value_type.__name__}, "
                 f"got {type(value).__name__}"
             )
 
-    # Create the member instance bypassing enum's __new__
-    # (This is the standard approach for runtime enum extension)
-    member = object.__new__(EngineCoreRequestType)
+    # ---- Conflict checks (read-only, all before any shared-state write) ----
+    existing_by_name = member_map.get(name)
+    if existing_by_name is not None:
+        # Same name already registered.
+        if existing_by_name.value == value:
+            # Idempotent: same name + same value → no-op success.
+            return
+        # Same name, different value → incompatible.
+        raise RuntimeError(
+            f"Cannot register enum member {name!r}={value!r} on "
+            f"{enum_cls.__name__}: name already in use with value "
+            f"{existing_by_name.value!r}. vLLM version may have changed; "
+            f"please align the wire value before proceeding."
+        )
+
+    existing_by_value = value2member_map.get(value)
+    if existing_by_value is not None:
+        # Same value, different name → would silently overwrite the value
+        # reverse-lookup and misroute wire decoding.
+        raise RuntimeError(
+            f"Cannot register enum member {name!r}={value!r} on "
+            f"{enum_cls.__name__}: value already in use by member "
+            f"{existing_by_value.name!r}. vLLM version may have changed; "
+            f"pick a free wire byte."
+        )
+
+    # A non-member class attribute with this name would shadow/be shadowed.
+    for klass in enum_cls.__mro__:
+        if name in klass.__dict__ and klass.__dict__[name] is not member_map.get(name):
+            raise RuntimeError(
+                f"Cannot register enum member {name!r} on {enum_cls.__name__}: "
+                f"name already used as a non-member class attribute."
+            )
+
+    # ---- Atomic registration (defensive rollback on unexpected failure) ----
+    member = object.__new__(enum_cls)
     member._name_ = name
     member._value_ = value
 
-    # Register in enum's internal maps
-    EngineCoreRequestType._value2member_map_[value] = member
-    EngineCoreRequestType._member_map_[name] = member
-    EngineCoreRequestType._member_names_.append(name)
+    wrote_value_map = wrote_name_map = appended_name = False
+    try:
+        value2member_map[value] = member
+        wrote_value_map = True
+        member_map[name] = member
+        wrote_name_map = True
+        enum_cls._member_names_.append(name)
+        appended_name = True
+        # Set as class attribute (must use type.__setattr__ to bypass enum's
+        # __setattr__).
+        type.__setattr__(enum_cls, name, member)
+    except BaseException:
+        # Reverse-order rollback of whatever took effect.
+        if appended_name and enum_cls._member_names_ and enum_cls._member_names_[-1] == name:
+            enum_cls._member_names_.pop()
+        if wrote_name_map and name in member_map:
+            del member_map[name]
+        if wrote_value_map and value in value2member_map:
+            del value2member_map[value]
+        raise
 
-    # Set as class attribute (must use type.__setattr__ to bypass enum's __setattr__)
-    type.__setattr__(EngineCoreRequestType, name, member)
+
+def _add_enum_member(name: str, value: bytes) -> None:
+    """Add a member to the upstream ``EngineCoreRequestType``.
+
+    Thin wrapper over :func:`_add_enum_member_to` preserving the historical
+    two-argument signature used by all production call sites.
+    """
+    _add_enum_member_to(EngineCoreRequestType, name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +291,11 @@ def apply_engine_core_child_patches():
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
 
-    from vllm.sampling_params import SamplingParams
-
-    # Force the greedy verification check to be a no-op to allow n > 1 under greedy beam search parameters
-    SamplingParams._verify_greedy_sampling = lambda self: None
+    # Install a beam-scoped greedy-sampling exemption (replaces the former
+    # process-wide no-op): ordinary greedy requests keep upstream verification;
+    # only a beam-update wire decode (wrapped by beam_update_decode_scope) may
+    # run greedy with n>1.
+    _install_scoped_greedy_sampling_patch()
 
     # Apply scheduler patches in the child process
     apply_scheduler_patch()
