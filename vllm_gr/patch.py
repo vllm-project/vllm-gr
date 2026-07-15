@@ -194,120 +194,92 @@ def _apply_yuanrong_npu_patch(force: bool = False) -> int:
 
 _KV_MERGE_PATCHES_APPLIED = False
 _GR_BEAM_PATCHES_APPLIED = False
-_ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
-_ASCEND_ORIGINAL_CACHED_GET_ATTN = None
+_ATTENTION_SELECTOR_PATCH_APPLIED = False
+_ORIGINAL_CACHED_GET_ATTN = None
 
 
-def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
-    """Preserve CUSTOM attention backend on all platforms.
+def _apply_attention_selector_patch(force: bool = False) -> int:
+    """Select Beam only when the current vLLM config explicitly requests it.
 
-    The vllm-ascend platform plugin ignores any user-specified attention
-    backend (other than FLASH_ATTN) in its ``get_attn_backend_cls()``, so
-    ``get_attn_backend`` would return an Ascend-specific backend even when the
-    config explicitly requests ``AttentionBackendEnum.CUSTOM``.
-
-    To avoid relying on an environment variable, this patch is applied
-    **unconditionally** on every platform.  It is a no-op whenever
-    ``backend != AttentionBackendEnum.CUSTOM``, so on GPU the CUDA platform's
-    native handling is preserved.  When ``backend == CUSTOM`` the patch returns
-    ``BeamAttentionBackend`` directly, bypassing any platform-specific
-    ``get_attn_backend_cls``.
+    ``CUSTOM`` is a shared vLLM extension slot.  This wrapper leaves the
+    original selector untouched unless the serializable vllm-gr marker is
+    present, so third-party backend registration and load order remain owned
+    by vLLM.  Reading the marker from the current config also survives the
+    Ascend plugin resetting ``attention_config.backend`` in child processes.
     """
-    global _ASCEND_ATTN_BACKEND_PATCH_APPLIED
-    global _ASCEND_ORIGINAL_CACHED_GET_ATTN
+    global _ATTENTION_SELECTOR_PATCH_APPLIED
+    global _ORIGINAL_CACHED_GET_ATTN
 
-    if _ASCEND_ATTN_BACKEND_PATCH_APPLIED and not force:
+    if _ATTENTION_SELECTOR_PATCH_APPLIED and not force:
         return 0
 
-    try:
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    except ImportError:
-        return 0
-
-    # Ensure BeamAttentionBackend is registered under CUSTOM.
-    try:
-        import vllm_gr.v1.attention.backends.beam_attn  # noqa: F401
-    except Exception:
-        return 0
-
-    if not AttentionBackendEnum.CUSTOM.is_overridden():
-        _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
-        return 0
-
-    patch_count = 0
-
-    # --- Patch selector._cached_get_attn_backend -----------------------
     try:
         import vllm.v1.attention.selector as selector_mod
     except ImportError:
+        logger.debug(
+            "vllm_gr: Could not import vllm.v1.attention.selector, skipping attention selector patch"
+        )
         return 0
 
     # Save the original on first call to avoid double-wrapping on re-apply.
-    if _ASCEND_ORIGINAL_CACHED_GET_ATTN is None:
-        _ASCEND_ORIGINAL_CACHED_GET_ATTN = selector_mod._cached_get_attn_backend
+    if _ORIGINAL_CACHED_GET_ATTN is None:
+        _ORIGINAL_CACHED_GET_ATTN = selector_mod._cached_get_attn_backend
 
-    original_cached_fn = _ASCEND_ORIGINAL_CACHED_GET_ATTN
+    original_cached_fn = _ORIGINAL_CACHED_GET_ATTN
 
     def _patched_cached_get_attn_backend(backend, attn_selector_config):
-        """Return BeamAttentionBackend when backend is CUSTOM."""
-        if backend == AttentionBackendEnum.CUSTOM:
-            from vllm_gr.v1.attention.backends.beam_attn import (
-                BeamAttentionBackend,
-            )
+        from vllm.config import get_current_vllm_config_or_none
 
-            # Replicate the KV cache layout adjustment from the original
-            # selector so that backends requiring a specific layout still
-            # get it applied.
-            required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
-            if required_layout is not None:
-                from vllm.v1.attention.backends.utils import (
-                    set_kv_cache_layout,
+        from vllm_gr.v1.attention.backend_selector import is_beam_attention_enabled
+
+        vllm_config = get_current_vllm_config_or_none()
+        if not is_beam_attention_enabled(vllm_config):
+            return original_cached_fn(backend, attn_selector_config)
+
+        try:
+            from vllm.platforms import current_platform
+            from vllm.v1.attention.backends.utils import set_kv_cache_layout
+
+            from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+
+            device_capability = current_platform.get_device_capability()
+            if device_capability is None:
+                raise RuntimeError(
+                    "BeamAttentionBackend requires a platform with a device capability."
                 )
 
+            invalid_reasons = BeamAttentionBackend.validate_configuration(
+                device_capability=device_capability,
+                **attn_selector_config._asdict(),
+            )
+            if invalid_reasons:
+                raise ValueError(
+                    f"BeamAttentionBackend is not valid for this configuration: {invalid_reasons}"
+                )
+
+            required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
+            if required_layout is not None:
                 set_kv_cache_layout(required_layout)
-
+                logger.info(
+                    "Using %s KV cache layout for %s backend.",
+                    required_layout,
+                    BeamAttentionBackend.get_name(),
+                )
             return BeamAttentionBackend
-
-        # On Ascend NPU the platform plugin resets attention_config.backend to
-        # None inside VllmConfig.__post_init__.  The reset happens before the
-        # config is serialized to child processes, so EngineCore and Worker
-        # processes see backend=None even though the user requested CUSTOM.
-        # We store a marker in additional_config (untouched by the platform)
-        # and use it as a fallback here.
-        if backend is None:
-            try:
-                from vllm.config import get_current_vllm_config_or_none
-
-                vllm_config = get_current_vllm_config_or_none()
-                if (
-                    vllm_config is not None
-                    and getattr(vllm_config, "additional_config", None)
-                    and isinstance(vllm_config.additional_config, dict)
-                    and vllm_config.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
-                ):
-                    from vllm_gr.v1.attention.backends.beam_attn import (
-                        BeamAttentionBackend,
-                    )
-
-                    required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
-                    if required_layout is not None:
-                        from vllm.v1.attention.backends.utils import (
-                            set_kv_cache_layout,
-                        )
-
-                        set_kv_cache_layout(required_layout)
-
-                    return BeamAttentionBackend
-            except Exception:
-                pass
-
-        return original_cached_fn(backend, attn_selector_config)
+        except Exception as exc:
+            logger.exception(
+                "vllm_gr: Explicit Beam attention selection failed "
+                "(additional_config.vllm_gr_attention_backend=BEAM): %s",
+                exc,
+            )
+            raise RuntimeError(
+                "vllm-gr Beam attention was explicitly requested but could not be initialized"
+            ) from exc
 
     selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
-    patch_count += 1
-
-    _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
-    return patch_count
+    _ATTENTION_SELECTOR_PATCH_APPLIED = True
+    logger.info("vllm_gr: Applied attention selector patch for explicit Beam backend selection")
+    return 1
 
 
 def _apply_gr_beam_patches(force: bool = False) -> int:
@@ -704,21 +676,10 @@ _NPU_WORKER_PATCH_APPLIED = False
 
 
 def _patch_npu_worker_init_device() -> int:
-    """Wrap NPUWorker.init_device to call re_apply_patches() first.
-
-    When vllm-ascend overrides ``worker_cls`` to ``NPUWorker`` (bypassing
-    ``GRNPUWorker``), ``re_apply_patches()`` is not called in worker processes.
-    NPUWorker instantiates NPUModelRunner inside ``init_device()``, and model
-    layer creation calls ``get_attn_backend()``.  We therefore run
-    ``re_apply_patches()`` **before** the original ``init_device()`` so the
-    selector patch is in place before any attention backend is resolved.
-    """
+    """Wrap NPUWorker.init_device to install patches before runner creation."""
     global _NPU_WORKER_PATCH_APPLIED
 
-    if not _is_npu_platform():
-        return 0
-
-    if _NPU_WORKER_PATCH_APPLIED:
+    if not _is_npu_platform() or _NPU_WORKER_PATCH_APPLIED:
         return 0
 
     try:
@@ -729,9 +690,7 @@ def _patch_npu_worker_init_device() -> int:
     original_init_device = NPUWorker.init_device
 
     def _patched_init_device(self):
-        # Apply patches BEFORE original init_device() because NPUWorker
-        # instantiates NPUModelRunner inside init_device(), and model
-        # layer creation calls get_attn_backend().
+        # NPUWorker creates NPUModelRunner here; install selector patches first.
         re_apply_patches()
         return original_init_device(self)
 
@@ -750,14 +709,14 @@ def _apply_patches(force: bool = False) -> int:
     yuanrong_count = _apply_yuanrong_npu_patch(force=force)
     qkv_rmsnorm_rope_count = apply_split_qkv_rmsnorm_rope_patch(force=force)
     kv_merge_count = _apply_kv_merge_patch(force=force)
-    ascend_attn_count = _apply_ascend_attention_backend_patch(force=force)
+    attention_selector_count = _apply_attention_selector_patch(force=force)
     beam_count = _apply_gr_beam_patches(force=force)
     npu_worker_count = _patch_npu_worker_init_device()
     return (
         yuanrong_count
         + qkv_rmsnorm_rope_count
         + kv_merge_count
-        + ascend_attn_count
+        + attention_selector_count
         + beam_count
         + npu_worker_count
     )

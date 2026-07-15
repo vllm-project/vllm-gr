@@ -130,7 +130,7 @@ vllm-gr serve \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
     --catalog-path "$CATALOG_PATH" \
-    --attention-backend CUSTOM \
+    --vllm-gr-beam-attn \
     OpenOneRec/OneRec-1.7B &
 
 SERVER_PID=$!

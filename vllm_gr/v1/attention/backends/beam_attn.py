@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Beam-Consecutive Suffix Gather Attention Backend."""
 
-import contextvars
 import copy
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 import torch
@@ -27,7 +25,6 @@ from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
@@ -40,9 +37,12 @@ from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     extract_suffix_kv_pytorch,
     merge_tnd_attention_outputs,
 )
+from vllm_gr.v1.attention.beam_utils import (
+    BEAM_DATA_VAR,
+)
+from vllm_gr.v1.attention.beam_utils import compute_beam_bounds as _compute_beam_bounds
 
 logger = init_logger(__name__)
-BEAM_DATA_VAR = contextvars.ContextVar("beam_data", default=None)
 # Device flag – must be checked after torch is loaded.
 NPU_DEVICE = is_npu_available()
 CUDA_DEVICE = is_cuda_available()
@@ -72,31 +72,6 @@ else:
     get_scheduler_metadata = _flash_attn_varlen_unavailable
     merge_attn_states = _flash_attn_varlen_unavailable
     flash_attn_supports_sinks = _flash_attn_varlen_unavailable
-
-
-def _compute_beam_bounds(
-    b: int,
-    b_prefix_len: int,
-    b_cache_len: int,
-    decode_steps: int,
-    chunk_budget: int,
-) -> Tuple[int, int, int, int]:
-    """Calculates active lookahead allocations and historical trace lengths."""
-    delta = max(0, b_cache_len - b_prefix_len)
-    remaining_prefix = b_prefix_len - b_cache_len
-    b_physical = delta // decode_steps
-    b_uncached = 0
-    b_suffix_len = 0
-
-    b_past_suffix = max(0, min(decode_steps, delta - b_physical * decode_steps))
-    if remaining_prefix >= 0:
-        # Scenario A: Prefix Incomplete - compute remaining prefix + suffix of first beam
-        b_uncached = min(chunk_budget, remaining_prefix + decode_steps)
-    else:
-        # Scenario B: Compute only suffix of beams
-        b_uncached = min(chunk_budget, max(decode_steps - b_past_suffix, 0))
-    b_suffix_len = b_uncached + b_past_suffix
-    return b_uncached, b_suffix_len, b_past_suffix, b_physical
 
 
 # ---------------------------------------------------------------------------
@@ -1192,7 +1167,6 @@ class BeamAttentionImpl(AttentionImpl):
         return output
 
 
-@register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
     accept_output_buffer = True
     supported_dtypes = [torch.float16, torch.bfloat16]
@@ -1203,7 +1177,7 @@ class BeamAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "CUSTOM"
+        return "BEAM"
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:

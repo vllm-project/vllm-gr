@@ -1,194 +1,267 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Regression tests for isolating vllm-gr Beam from vLLM's CUSTOM slot."""
 
-# mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import sys
+import types
 import unittest
 from pathlib import Path
-from unittest import mock
+from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+import pytest
+
+from vllm_gr.v1.attention.backend_selector import (
+    VLLM_GR_ATTENTION_BACKEND_KEY,
+    VLLM_GR_BEAM_ATTENTION_BACKEND,
+    is_beam_attention_enabled,
+)
+
+PATCH_PATH = Path(__file__).parents[1] / "vllm_gr" / "patch.py"
 
 
-class TestCustomAttentionBackendMarker(unittest.TestCase):
-    """Verify CUSTOM backend marker persistence across CLI/API paths."""
+def _package(name: str) -> types.ModuleType:
+    module = types.ModuleType(name)
+    module.__path__ = []  # type: ignore[attr-defined]
+    return module
+
+
+def _load_patch_module(monkeypatch: pytest.MonkeyPatch, *, vllm_config, beam_backend):
+    """Load patch.py against a minimal vLLM runtime without GPU/NPU imports."""
+    vllm = _package("vllm")
+    vllm_v1 = _package("vllm.v1")
+    vllm_v1_attention = _package("vllm.v1.attention")
+    vllm_v1_backends = _package("vllm.v1.attention.backends")
+    vllm_config_module = types.ModuleType("vllm.config")
+    vllm_config_module.get_current_vllm_config_or_none = lambda: vllm_config
+
+    selector_module = types.ModuleType("vllm.v1.attention.selector")
+    calls = []
+
+    def original_selector(backend, attn_selector_config):
+        calls.append((backend, attn_selector_config))
+        return "third-party-custom-backend"
+
+    selector_module._cached_get_attn_backend = original_selector
+
+    platform_module = types.ModuleType("vllm.platforms")
+    platform_module.current_platform = SimpleNamespace(
+        get_device_capability=lambda: SimpleNamespace(major=9, minor=0)
+    )
+    backend_utils_module = types.ModuleType("vllm.v1.attention.backends.utils")
+    layouts = []
+    backend_utils_module.set_kv_cache_layout = layouts.append
+
+    beam_module = types.ModuleType("vllm_gr.v1.attention.backends.beam_attn")
+    beam_module.BeamAttentionBackend = beam_backend
+    ops_module = types.ModuleType("vllm_gr.ops.npu.split_qkv_rmsnorm_rope")
+    ops_module.apply_split_qkv_rmsnorm_rope_patch = lambda force=False: 0
+
+    modules = {
+        "vllm": vllm,
+        "vllm.v1": vllm_v1,
+        "vllm.v1.attention": vllm_v1_attention,
+        "vllm.v1.attention.backends": vllm_v1_backends,
+        "vllm.config": vllm_config_module,
+        "vllm.v1.attention.selector": selector_module,
+        "vllm.platforms": platform_module,
+        "vllm.v1.attention.backends.utils": backend_utils_module,
+        "vllm_gr.v1.attention.backends.beam_attn": beam_module,
+        "vllm_gr.ops.npu.split_qkv_rmsnorm_rope": ops_module,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    spec = importlib.util.spec_from_file_location("_vllm_gr_patch_test", PATCH_PATH)
+    assert spec is not None and spec.loader is not None
+    patch_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(patch_module)
+    assert patch_module._apply_attention_selector_patch() == 1
+    return selector_module, calls, layouts
+
+
+def _load_arg_utils_module(monkeypatch: pytest.MonkeyPatch):
+    vllm = _package("vllm")
+    vllm_config = types.ModuleType("vllm.config")
+    vllm_config.ModelConfig = type("ModelConfig", (), {})
+    vllm_engine = _package("vllm.engine")
+    vllm_arg_utils = types.ModuleType("vllm.engine.arg_utils")
+
+    class EngineArgs:
+        @staticmethod
+        def add_cli_args(parser):
+            return parser
+
+        def create_model_config(self):
+            return SimpleNamespace()
+
+        def create_engine_config(self):
+            return SimpleNamespace(additional_config=self.additional_config)
+
+        @classmethod
+        def from_cli_args(cls, _args):
+            return SimpleNamespace(additional_config={})
+
+    vllm_arg_utils.EngineArgs = EngineArgs
+    vllm_arg_utils.get_kwargs = lambda _cls: {"catalog_path": {"default": None}}
+    vllm_argparse = types.ModuleType("vllm.utils.argparse_utils")
+    vllm_argparse.FlexibleArgumentParser = object
+    for name, module in {
+        "vllm": vllm,
+        "vllm.config": vllm_config,
+        "vllm.engine": vllm_engine,
+        "vllm.engine.arg_utils": vllm_arg_utils,
+        "vllm.utils.argparse_utils": vllm_argparse,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    module_path = Path(__file__).parents[1] / "vllm_gr" / "engine" / "arg_utils_gr.py"
+    spec = importlib.util.spec_from_file_location("_vllm_gr_arg_utils_test", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _BeamBackend:
+    @classmethod
+    def validate_configuration(cls, **_kwargs):
+        return []
 
     @classmethod
-    def setUpClass(cls):
-        """Apply patches so EngineArgs.create_engine_config is wrapped."""
-        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+    def get_required_kv_cache_layout(cls):
+        return "NHD"
 
-        patch_add_cli_args()
-
-    def _make_fake_config(self, backend=None, marker=None):
-        """Build a lightweight VllmConfig-like object for mocking."""
-        from vllm.config import AttentionConfig, VllmConfig
-
-        attention_config = AttentionConfig()
-        if backend is not None:
-            attention_config.backend = backend
-        elif backend is None:
-            attention_config.backend = None
-
-        config = VllmConfig(attention_config=attention_config)
-        if marker is not None:
-            config.additional_config["vllm_gr_attention_backend"] = marker
-        return config
-
-    @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
-    def test_attention_backend_cli_custom_persists_marker(self, mock_origin_create):
-        """--attention-backend CUSTOM sets marker and restores backend."""
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-        from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-        # Simulate: platform reset backend to None inside original create_engine_config
-        fake_config = self._make_fake_config(backend=None)
-        mock_origin_create.return_value = fake_config
-
-        class FakeSelf:
-            attention_backend = "CUSTOM"
-            attention_config = None
-
-        result = create_engine_config(FakeSelf())
-
-        assert result.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
-        assert result.attention_config.backend == AttentionBackendEnum.CUSTOM
-
-    @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
-    def test_attention_config_backend_custom_persists_marker(self, mock_origin_create):
-        """--attention-config backend=CUSTOM sets marker and restores backend."""
-        from vllm.config import AttentionConfig
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-        from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-        fake_config = self._make_fake_config(backend=None)
-        mock_origin_create.return_value = fake_config
-
-        class FakeSelf:
-            attention_backend = None
-            attention_config = AttentionConfig(backend=AttentionBackendEnum.CUSTOM)
-
-        result = create_engine_config(FakeSelf())
-
-        assert result.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
-        assert result.attention_config.backend == AttentionBackendEnum.CUSTOM
-
-    @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
-    def test_non_custom_backend_does_not_set_marker(self, mock_origin_create):
-        """Non-CUSTOM backend leaves additional_config untouched."""
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-        from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-        fake_config = self._make_fake_config(backend=AttentionBackendEnum.FLASH_ATTN)
-        mock_origin_create.return_value = fake_config
-
-        class FakeSelf:
-            attention_backend = "FLASH_ATTN"
-            attention_config = None
-
-        result = create_engine_config(FakeSelf())
-
-        assert "vllm_gr_attention_backend" not in result.additional_config
-        assert result.attention_config.backend is not AttentionBackendEnum.CUSTOM
+    @staticmethod
+    def get_name():
+        return "BEAM"
 
 
-class TestCustomBackendMarkerSerialization(unittest.TestCase):
-    """Verify marker survives pickle round-trip."""
-
-    def test_marker_survives_pickle(self):
-        """Pickle preserves both backend=CUSTOM and the marker."""
-        from vllm.config import AttentionConfig, VllmConfig
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-        config = VllmConfig(attention_config=AttentionConfig())
-        config.attention_config.backend = AttentionBackendEnum.CUSTOM
-        config.additional_config["vllm_gr_attention_backend"] = "CUSTOM"
-
-        _pickle = importlib.import_module("pickle")
-        serialized = _pickle.dumps(config)
-        restored = _pickle.loads(serialized)
-
-        assert restored.attention_config.backend == AttentionBackendEnum.CUSTOM
-        assert restored.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
-
-    def test_marker_restores_custom_backend_selection(self):
-        """When backend=None in child but marker present, selector still returns Beam."""
-        import vllm.v1.attention.selector as selector_mod
-        from vllm.config import AttentionConfig, VllmConfig
-
-        # Make sure the patch is applied
-        from vllm_gr.patch import _apply_ascend_attention_backend_patch
-        from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
-
-        _apply_ascend_attention_backend_patch(force=True)
-
-        # Simulate child process: config deserialized with backend=None but marker present
-        child_config = VllmConfig(attention_config=AttentionConfig())
-        child_config.attention_config.backend = None
-        child_config.additional_config["vllm_gr_attention_backend"] = "CUSTOM"
-
-        # Temporarily bind as current config so get_current_vllm_config_or_none works
-        from vllm.config import set_current_vllm_config
-
-        with set_current_vllm_config(child_config):
-            import torch
-            from vllm.v1.attention.selector import AttentionSelectorConfig
-
-            selector_cfg = AttentionSelectorConfig(
-                head_size=128,
-                dtype=torch.bfloat16,
-                kv_cache_dtype=None,
-                block_size=128,
-            )
-            result = selector_mod._cached_get_attn_backend(None, selector_cfg)
-
-        assert result is BeamAttentionBackend
+def _selector_config():
+    return SimpleNamespace(
+        _asdict=lambda: {
+            "head_size": 128,
+            "dtype": "bfloat16",
+            "kv_cache_dtype": "auto",
+            "block_size": 16,
+            "use_mla": False,
+            "has_sink": False,
+            "use_sparse": False,
+            "use_mm_prefix": False,
+            "attn_type": "decoder",
+        }
+    )
 
 
-class TestNativePlatformBackendFallback(unittest.TestCase):
-    """Verify backend=None without marker delegates to native platform backend."""
+def test_marker_is_explicit_and_serializable() -> None:
+    assert not is_beam_attention_enabled(None)
+    assert not is_beam_attention_enabled(SimpleNamespace(additional_config={}))
+    assert not is_beam_attention_enabled(
+        SimpleNamespace(additional_config={VLLM_GR_ATTENTION_BACKEND_KEY: "beam"})
+    )
 
-    def test_backend_none_without_marker_does_not_return_beam(self):
-        """Without marker, backend=None resolves to native platform backend."""
-        import vllm.v1.attention.selector as selector_mod
-        from vllm.config import AttentionConfig, VllmConfig
 
-        from vllm_gr.patch import _apply_ascend_attention_backend_patch
+def test_beam_cli_marker_does_not_change_generic_custom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_arg_utils_module(monkeypatch)
+    generic_custom_args = SimpleNamespace(catalog_path=None, vllm_gr_beam_attn=False)
+    generic_custom_engine_args = module.from_cli_args(None, generic_custom_args)
+    assert module.create_engine_config(generic_custom_engine_args).additional_config == {}
 
-        _apply_ascend_attention_backend_patch(force=True)
+    beam_args = SimpleNamespace(catalog_path=None, vllm_gr_beam_attn=True)
+    beam_engine_args = module.from_cli_args(None, beam_args)
+    beam_config = module.create_engine_config(beam_engine_args)
+    assert beam_config.additional_config == {
+        VLLM_GR_ATTENTION_BACKEND_KEY: VLLM_GR_BEAM_ATTENTION_BACKEND
+    }
+    assert is_beam_attention_enabled(
+        SimpleNamespace(
+            additional_config={VLLM_GR_ATTENTION_BACKEND_KEY: VLLM_GR_BEAM_ATTENTION_BACKEND}
+        )
+    )
 
-        # Config with backend=None and NO marker
-        config = VllmConfig(attention_config=AttentionConfig())
-        config.attention_config.backend = None
-        # additional_config empty (no marker)
 
-        from vllm.config import set_current_vllm_config
+def test_custom_without_marker_delegates_to_original_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This represents a third-party backend already registered under CUSTOM.
+    config = SimpleNamespace(
+        additional_config={}, attention_config=SimpleNamespace(backend="CUSTOM")
+    )
+    selector, calls, layouts = _load_patch_module(
+        monkeypatch, vllm_config=config, beam_backend=_BeamBackend
+    )
 
-        with set_current_vllm_config(config):
-            import torch
-            from vllm.v1.attention.selector import AttentionSelectorConfig
+    assert (
+        selector._cached_get_attn_backend("CUSTOM", _selector_config())
+        == "third-party-custom-backend"
+    )
+    assert len(calls) == 1
+    assert layouts == []
 
-            # Force cache miss by using a different head_size
-            selector_cfg = AttentionSelectorConfig(
-                head_size=64,
-                dtype=torch.float16,
-                kv_cache_dtype=None,
-                block_size=128,
-            )
-            result = selector_mod._cached_get_attn_backend(None, selector_cfg)
 
-        # Result should NOT be BeamAttentionBackend; it delegates to original.
-        from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+def test_beam_marker_selects_beam_after_npu_backend_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``backend=None`` models the serialised NPU child config after Ascend reset.
+    config = SimpleNamespace(
+        additional_config={VLLM_GR_ATTENTION_BACKEND_KEY: VLLM_GR_BEAM_ATTENTION_BACKEND},
+        attention_config=SimpleNamespace(backend=None),
+    )
+    selector, calls, layouts = _load_patch_module(
+        monkeypatch, vllm_config=config, beam_backend=_BeamBackend
+    )
 
-        assert result is not BeamAttentionBackend
+    assert selector._cached_get_attn_backend(None, _selector_config()) is _BeamBackend
+    assert calls == []
+    assert layouts == ["NHD"]
+
+
+def test_explicit_beam_failure_does_not_fall_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    class InvalidBeamBackend(_BeamBackend):
+        @classmethod
+        def validate_configuration(cls, **_kwargs):
+            return ["dtype not supported"]
+
+    config = SimpleNamespace(
+        additional_config={VLLM_GR_ATTENTION_BACKEND_KEY: VLLM_GR_BEAM_ATTENTION_BACKEND}
+    )
+    selector, calls, _ = _load_patch_module(
+        monkeypatch, vllm_config=config, beam_backend=InvalidBeamBackend
+    )
+
+    with pytest.raises(RuntimeError, match="Beam attention was explicitly requested"):
+        selector._cached_get_attn_backend("CUSTOM", _selector_config())
+    assert calls == []
+
+
+def test_beam_layout_failure_does_not_fall_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = SimpleNamespace(
+        additional_config={VLLM_GR_ATTENTION_BACKEND_KEY: VLLM_GR_BEAM_ATTENTION_BACKEND}
+    )
+    selector, calls, _ = _load_patch_module(
+        monkeypatch, vllm_config=config, beam_backend=_BeamBackend
+    )
+
+    def fail_layout(_layout):
+        raise ValueError("layout is unavailable")
+
+    sys.modules["vllm.v1.attention.backends.utils"].set_kv_cache_layout = fail_layout
+    with pytest.raises(RuntimeError, match="Beam attention was explicitly requested"):
+        selector._cached_get_attn_backend(None, _selector_config())
+    assert calls == []
+
+
+def test_beam_backend_does_not_register_custom_globally() -> None:
+    source = (
+        Path(__file__).parents[1] / "vllm_gr" / "v1" / "attention" / "backends" / "beam_attn.py"
+    ).read_text()
+
+    assert "register_backend" not in source
+    assert "AttentionBackendEnum" not in source
 
 
 try:
@@ -201,34 +274,18 @@ except Exception:
 
 @unittest.skipIf(_IS_NPU, "NPU platform: NPUWorker is expected to be present")
 class TestNpuWorkerPatchSkippedOnNonNpu(unittest.TestCase):
-    """Verify non-NPU environments do not import or patch NPUWorker."""
+    """Preserve upstream coverage for the NPU worker initialization patch."""
 
     def test_patch_npu_worker_returns_zero_without_npu(self):
-        """_patch_npu_worker_init_device returns 0 when NPUWorker absent."""
         from vllm_gr.patch import _patch_npu_worker_init_device
 
-        # On a standard CUDA/CPU install vllm_ascend is not importable.
-        patch_count = _patch_npu_worker_init_device()
-        assert patch_count == 0
+        assert _patch_npu_worker_init_device() == 0
 
     def test_npu_worker_module_not_imported_on_non_npu(self):
-        """The vllm_ascend.worker.worker module is not present in sys.modules."""
-        # On an NPU machine vllm_ascend itself may already be loaded by the
-        # platform runtime; we only care that NPUWorker is not imported / patched.
         assert "vllm_ascend.worker.worker" not in sys.modules
 
     def test_re_apply_patches_does_not_import_npu_worker(self):
-        """Running re_apply_patches on non-NPU does not pull in NPUWorker."""
-
         from vllm_gr.patch import re_apply_patches
 
-        before = set(sys.modules.keys())
         re_apply_patches()
-        after = set(sys.modules.keys())
-
-        _ = after - before
         assert "vllm_ascend.worker.worker" not in sys.modules
-
-
-if __name__ == "__main__":
-    unittest.main()

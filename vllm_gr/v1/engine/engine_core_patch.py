@@ -13,7 +13,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
+from vllm_gr.v1.attention.beam_utils import BEAM_DATA_VAR, compute_beam_bounds
 
 logger = init_logger(__name__)
 
@@ -362,7 +362,7 @@ def _process_beam_decode_request(
         if chunk_budget <= 0:
             break
 
-        b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+        b_uncached, b_suffix_len, b_past_suffix, b_physical = compute_beam_bounds(
             b, prefix_len, b_cache_len, decode_steps, chunk_budget
         )
 
@@ -862,7 +862,6 @@ def make_patched_execute_model(_orig_execute_model):
 
     Shared by GPU and NPU runners.
     """
-    from vllm_gr.v1.attention.backends.beam_attn import BEAM_DATA_VAR
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):

@@ -2,10 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 from dataclasses import dataclass
+from typing import Any
 
 from vllm.config import ModelConfig
 from vllm.engine.arg_utils import EngineArgs, get_kwargs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+from vllm_gr.v1.attention.backend_selector import (
+    VLLM_GR_ATTENTION_BACKEND_KEY,
+    VLLM_GR_BEAM_ATTENTION_BACKEND,
+)
 
 
 @dataclass
@@ -25,6 +31,12 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     model_kwargs = get_kwargs(ModelConfigGr)
     model_group = parser.add_argument_group(title="ModelConfig", description=ModelConfigGr.__doc__)
     model_group.add_argument("--catalog-path", **model_kwargs["catalog_path"])
+    gr_group = parser.add_argument_group(title="vLLM-GR")
+    gr_group.add_argument(
+        "--vllm-gr-beam-attn",
+        action="store_true",
+        help="Use vllm-gr's BeamAttentionBackend instead of the vLLM CUSTOM registry.",
+    )
     return parser
 
 
@@ -40,45 +52,27 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.catalog_path = None
     if hasattr(args, "catalog_path"):
         engine_args.catalog_path = args.catalog_path
+    engine_args.vllm_gr_beam_attn = bool(getattr(args, "vllm_gr_beam_attn", False))
     return engine_args
 
 
-def _user_requested_custom_backend(self) -> bool:
-    """Return True if the user explicitly requested CUSTOM attention backend."""
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+def create_engine_config(self, *args: Any, **kwargs: Any):
+    """Add the explicit Beam marker without changing generic CUSTOM usage."""
+    if not getattr(self, "vllm_gr_beam_attn", False):
+        return origin_create_engine_config(self, *args, **kwargs)
 
-    if self.attention_backend is not None:
-        if isinstance(self.attention_backend, str):
-            if self.attention_backend.upper() == "CUSTOM":
-                return True
-        elif self.attention_backend == AttentionBackendEnum.CUSTOM:
-            return True
-    attention_config = getattr(self, "attention_config", None)
-    if (
-        attention_config is not None
-        and getattr(attention_config, "backend", None) == AttentionBackendEnum.CUSTOM
-    ):
-        return True
-    return False
+    if not isinstance(self.additional_config, dict):
+        raise ValueError("--vllm-gr-beam-attn requires --additional-config to be a JSON object.")
 
-
-def create_engine_config(self, usage_context=None, headless=False):
-    config = origin_create_engine_config(self, usage_context, headless)
-    if _user_requested_custom_backend(self):
-        # Persist the user intent in a field that survives platform
-        # check_and_update_config resets and process serialization.
-        additional_config = getattr(config, "additional_config", None)
-        if additional_config is None:
-            config.additional_config = {}
-            additional_config = config.additional_config
-        if isinstance(additional_config, dict):
-            additional_config["vllm_gr_attention_backend"] = "CUSTOM"
-        attention_config = getattr(config, "attention_config", None)
-        if attention_config is not None and getattr(attention_config, "backend", None) is None:
-            from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-            attention_config.backend = AttentionBackendEnum.CUSTOM
-    return config
+    original_additional_config = self.additional_config
+    self.additional_config = {
+        **original_additional_config,
+        VLLM_GR_ATTENTION_BACKEND_KEY: VLLM_GR_BEAM_ATTENTION_BACKEND,
+    }
+    try:
+        return origin_create_engine_config(self, *args, **kwargs)
+    finally:
+        self.additional_config = original_additional_config
 
 
 def patch_add_cli_args() -> None:

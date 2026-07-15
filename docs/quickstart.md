@@ -79,9 +79,12 @@ vllm-gr serve OpenOneRec/OneRec-1.7B \
   --max-num-seqs 1024 \
   --max-num-batched-tokens 16384 \
   --scheduling-policy priority \
-  --attention-backend CUSTOM \
+  --vllm-gr-beam-attn \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
+
+`--vllm-gr-beam-attn` explicitly enables vllm-gr's Beam attention backend.
+`--attention-backend CUSTOM` remains available for vLLM and third-party CUSTOM plugins.
 
 ### On the second terminal: Run single request against server with CLI
 

@@ -704,13 +704,9 @@ class GRLLM(LLM):
             )
             max_tokens = pre_calc
         vllm_config = getattr(self.llm_engine, "vllm_config", None)
-        attention_backend = None
-        if vllm_config is not None and hasattr(vllm_config, "attention_config"):
-            attention_backend = getattr(vllm_config.attention_config, "backend", None)
-        use_custom_attn = attention_backend is not None and (
-            "CUSTOM" in str(attention_backend).upper()
-            or getattr(attention_backend, "name", "").upper() == "CUSTOM"
-        )
+        from vllm_gr.v1.attention.backend_selector import is_beam_attention_enabled
+
+        use_custom_attn = is_beam_attention_enabled(vllm_config)
         for prompt_start in range(0, len(prompts), concurrency_limit):
             instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
 

@@ -92,7 +92,7 @@ vllm-gr serve OpenOneRec/OneRec-1.7B \
     --max-num-seqs 1024 \
     --max-num-batched-tokens 16384 \
     --scheduling-policy priority \
-    --attention-backend CUSTOM
+    --vllm-gr-beam-attn
 ```
 
 ```bash
