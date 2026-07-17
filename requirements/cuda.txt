@@ -1,2 +1,3 @@
 -r common.txt
+-r recif.txt
 # Keep LMCache out of the default install for now.

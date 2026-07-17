@@ -19,6 +19,16 @@ import logging
 logger = logging.getLogger("vllm_gr.plugin")
 
 
+def _register_models() -> None:
+    try:
+        from vllm_gr.models.recif import register_recif_model
+    except ImportError as exc:  # pragma: no cover - optional runtime dependency
+        logger.debug("model registration skipped: %s", exc)
+        return
+
+    register_recif_model()
+
+
 def initialize_runtime() -> dict[str, int]:
     """Initialize the current process for vllm-gr runtime usage.
 
@@ -29,6 +39,7 @@ def initialize_runtime() -> dict[str, int]:
     from vllm_gr.patch import re_apply_patches
 
     patch_count = re_apply_patches()
+    _register_models()
 
     state = {"patch_count": patch_count}
     logger.debug("vllm-gr runtime initialized: patches=%d", patch_count)
