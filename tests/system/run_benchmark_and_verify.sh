@@ -1,5 +1,40 @@
 #!/bin/bash
 
+MODEL_PATH="${VLLM_GR_TEST_MODEL:-OpenOneRec/OneRec-1.7B}"
+
+if [[ -n "${VLLM_GR_TEST_MODEL:-}" ]]; then
+  if [[ ! -d "$MODEL_PATH" ]]; then
+    echo "Error: VLLM_GR_TEST_MODEL is not a directory: $MODEL_PATH" >&2
+    exit 1
+  fi
+  if [[ ! -f "$MODEL_PATH/config.json" ]]; then
+    echo "Error: config.json was not found in VLLM_GR_TEST_MODEL: $MODEL_PATH" >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "${DATASET_PATH:-}" ]]; then
+  echo "Error: DATASET_PATH must point to the local OpenOneRec benchmark data." >&2
+  exit 1
+fi
+if [[ ! -d "$DATASET_PATH" ]]; then
+  echo "Error: DATASET_PATH is not a directory: $DATASET_PATH" >&2
+  exit 1
+fi
+
+if [[ -z "${CATALOG_PATH:-}" ]]; then
+  echo "Error: CATALOG_PATH must point to the local video catalog JSON." >&2
+  exit 1
+fi
+if [[ ! -f "$CATALOG_PATH" ]]; then
+  echo "Error: CATALOG_PATH is not a file: $CATALOG_PATH" >&2
+  exit 1
+fi
+
+echo "Using model: $MODEL_PATH"
+echo "Using dataset: $DATASET_PATH"
+echo "Using catalog: $CATALOG_PATH"
+
 run_port=7000
 timeout=600 # time for waiting server to go up
 p99_ttft_th=300
@@ -76,7 +111,7 @@ echo "offline test"
 
 output=$( python -m benchmarks.open_one_rec.one_rec_acc_test \
 --gr \
---model OpenOneRec/OneRec-1.7B \
+--model "$MODEL_PATH" \
 --dataset-path "$DATASET_PATH" \
 --dataset-name  onerec \
 --num-prompts 100 \
@@ -131,7 +166,7 @@ vllm-gr serve \
     --scheduling-policy priority \
     --catalog-path "$CATALOG_PATH" \
     --attention-backend CUSTOM \
-    OpenOneRec/OneRec-1.7B &
+    "$MODEL_PATH" &
 
 SERVER_PID=$!
 
@@ -152,7 +187,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   bench serve \
   --endpoint /v1/chat/completions \
   --backend openai-chat  \
-  --model OpenOneRec/OneRec-1.7B  \
+  --model "$MODEL_PATH"  \
   --dataset-name onerec \
   --dataset-path "$DATASET_PATH" \
   --task-type video  \
@@ -167,7 +202,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   bench serve \
   --endpoint /v1/chat/completions \
   --backend openai-chat  \
-  --model OpenOneRec/OneRec-1.7B  \
+  --model "$MODEL_PATH"  \
   --dataset-name onerec \
   --dataset-path "$DATASET_PATH" \
   --task-type video  \
@@ -200,7 +235,7 @@ echo "Parsed P99 TPOT: ${p99_tpot} ms"
 validate_metric "P99 TPOT" "$p99_tpot" "$p99_tpot_th" "le"
 
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
---model OpenOneRec/OneRec-1.7B \
+--model "$MODEL_PATH" \
 --dataset-path "$DATASET_PATH" \
 --dataset-name  onerec \
 --num-prompts 100 \

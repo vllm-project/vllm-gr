@@ -22,9 +22,12 @@ The current implementation targets inference scenarios and does not aim for full
 
 ## Installation
 
-**Install vllm / vllm-ascend first, then `pip install vllm-gr`.** Platform dependencies are auto-detected by `setup.py` — no `[gpu]` / `[npu]` extras needed.
+**Install vLLM 0.22.1 first (and vLLM-Ascend 0.22.1rc1 on NPU), then
+`pip install vllm-gr`.** This release targets that API pair only. Platform
+dependencies are auto-detected by `setup.py` — no `[gpu]` / `[npu]` extras
+needed.
 
-For detailed instructions, see [quickstart](docs/quickstart.md) or [quick start ascend](docs/quick_start_ascend.md)
+For detailed instructions, see [quickstart](docs/quickstart.md) or [quick start ascend](docs/quickstart-ascend.md).
 
 ## Unified self-validation
 

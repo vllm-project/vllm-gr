@@ -20,6 +20,7 @@ from setuptools_scm import get_version
 logger = logging.getLogger("vllm_gr.setup")
 
 _VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
+VLLM_GR_BASE_VERSION = "0.22.1"
 
 # Module-level cache so that detect_target_device() is evaluated exactly once
 # per setup.py invocation, avoiding duplicate log output and potential
@@ -108,9 +109,9 @@ def get_vllm_gr_version() -> str:
     Get the vllm-gr version with optional device-specific suffix.
 
     Version format examples:
-        - 0.3.0 (cuda, no suffix)
-        - 0.3.0+npu
-        - 0.3.0+cpu
+        - 0.22.1 (cuda, no suffix)
+        - 0.22.1+npu
+        - 0.22.1+cpu
 
     Environment variables:
         VLLM_GR_VERSION_OVERRIDE: Override version completely
@@ -118,15 +119,11 @@ def get_vllm_gr_version() -> str:
     """
     if env_version := os.getenv("VLLM_GR_VERSION_OVERRIDE"):
         logger.info("Overriding version with %s from VLLM_GR_VERSION_OVERRIDE", env_version)
-        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        version = get_version(write_to="vllm_gr/_version.py")
+        version = env_version
     else:
-        try:
-            version = get_version()
-        except Exception as exc:
-            logger.warning("Failed to get version from git, using fallback: %s", exc)
-            version = "0.0.0.dev0"
-
+        # vllm-gr releases follow the matching vLLM public version. Do not let
+        # an untagged source checkout produce an unrelated 0.1.devN version.
+        version = VLLM_GR_BASE_VERSION
         device = detect_target_device()
 
         if device == "cuda":

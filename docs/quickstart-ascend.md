@@ -3,9 +3,11 @@
 
 ## Prerequisites
 
-- Python 3.11
+- Python 3.11 or 3.12
 - Pip 23+
-- CANN 8.5.0+
+- CANN 9.0.0
+- PyTorch / torch-npu 2.10.0
+- Triton-Ascend 3.2.1
 - Conda 24.11+
 - 32GB+ RAM (recommended)
 
@@ -33,20 +35,20 @@ conda activate ${MY_ENV}
 If device is 910b install 910b ops
 
 ```bash
-conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend::cann-toolkit==8.5.0 ascend::cann-910b-ops==8.5.0
+conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend::cann-toolkit==9.0.0 ascend::cann-910b-ops==9.0.0
 ```
 
 If device is 910c install a3 ops
 
 ```bash
-conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend::cann-toolkit==8.5.0 ascend::cann-a3-ops==8.5.0
+conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend::cann-toolkit==9.0.0 ascend::cann-a3-ops==9.0.0
 ```
 
 For any other devices please follow the official [CANN installation documentation](https://ascend.github.io/docs/sources/ascend/quick_install.html).
 
 ```bash
 source ${CONDA_PREFIX}/Ascend/ascend-toolkit/set_env.sh
-conda install -c https://repo.huaweicloud.com/ascend/repos/conda ascend::cann-nnal==8.5.0
+conda install -c https://repo.huaweicloud.com/ascend/repos/conda ascend::cann-nnal==9.0.0
 source ${CONDA_PREFIX}/Ascend/nnal/atb/set_env.sh
 ```
 
@@ -55,30 +57,32 @@ source ${CONDA_PREFIX}/Ascend/nnal/atb/set_env.sh
 follow [vllm installation](https://docs.vllm.ai/en/latest/getting_started/installation) for more details.
 
 ```bash
-python -m pip install vllm==0.14.1
+python -m pip install vllm==0.22.1
 ```
+
+This vllm-gr release supports the vLLM 0.22.1 API only.
 
 4. **Install vllm-ascend (base environment)**
 
 vllm-gr does **not** install vllm-ascend. Install the Ascend platform stack first:
 
 ```bash
-python -m pip install vllm-ascend==0.14.0rc1
+python -m pip install vllm-ascend==0.22.1rc1
 ```
 
-**Note**: For Npu A3 (910C) users - due to bug in vllm-ascend, it is required to install vllm-ascend from source
+To install the matching release from source instead:
 
 ```bash
 cd <working-dir>
 git clone https://github.com/vllm-project/vllm-ascend.git
 cd vllm-ascend
-git checkout v0.14.0rc1
+git checkout v0.22.1rc1
 pip install .
 ```
 
 Return to vllm-gr folder for next steps.
 
-See the [vllm-ascend v0.14.0rc1 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.14.0rc1).
+See the [vllm-ascend v0.22.1rc1 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.22.1rc1).
 
 5. **Install vllm-gr**
 
@@ -90,6 +94,13 @@ For developer mode:
 
 ```bash
 VLLM_GR_TARGET_DEVICE=npu pip install -e ".[dev]" --no-build-isolation
+```
+
+Confirm that the complete Ascend runtime pair was resolved correctly:
+
+```bash
+python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); print("vllm-ascend", m.version("vllm-ascend")); print("vllm-gr", m.version("vllm-gr"))'
+python -m pip check
 ```
 
 6. **Verify installation**
