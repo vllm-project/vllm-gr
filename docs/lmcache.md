@@ -41,7 +41,9 @@ LMCache typically operates through a **Controller-Worker** model. The workers (i
  Other modes are not supported since:
  a. LMCache MP (Multi-Process) mode: in this mode LMCache runs as a standalone server process that multiple vLLM instances connect to over ZMQ. This allows all vLLM processes on the same node to share a single L1 cache, maximizing KV cache reuse, providing process isolation, and enabling independent scaling of cache and inference resources (Multiprocess Mode docs, Architecture Guide).
  In this mode lmcache.server process can store KVC chunks in process's memory, in shared memory (/dev/shm/) or on RAMdisk (/mnt/lmcache/).
- Currently MP mode can't be used with vllm-gr since vllm version 0.14.0 rc1 and lmcache (all versions from v0.3.13 to v0.4.3) disagree on network protocol to send KVC data with.
+ LMCache MP mode is not part of the vLLM 0.22.1rc1 compatibility gate for
+ this release; validate the LMCache/vLLM wire-protocol combination before
+ enabling it in production.
  b. RAMdisk: In this mode there is no LMCache process involved (neither controller nor server).
  In this mode all vllm-gr processes are configured to store KVC chunks in a shared RAMdisk (/mnt/lmcache/).
  This mode works well but performance is very low (e.g.: TTFT is high).

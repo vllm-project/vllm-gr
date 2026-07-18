@@ -36,8 +36,14 @@ pip --version
 vllm-gr does not install vllm. Prepare the GPU base environment first:
 
 ```bash
-uv pip install vllm==0.14.1 --torch-backend=auto
+uv pip install vllm==0.22.1rc1 \
+  --extra-index-url https://wheels.vllm.ai/b284862ea9b8413d21e4b4dd1eb46f8ba3e40627 \
+  --index-strategy first-index \
+  --torch-backend=auto
 ```
+
+The release-candidate wheel is hosted in vLLM's per-commit wheel index rather
+than PyPI. Commit `b284862e` is the source of the `v0.22.1rc1` tag.
 
 4. **Install vllm-gr**
 

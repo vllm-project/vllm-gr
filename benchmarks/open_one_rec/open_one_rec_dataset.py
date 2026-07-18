@@ -1,6 +1,7 @@
 import random
 
-from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest, TokenizerLike
+from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
+from vllm.tokenizers import TokenizerLike
 
 from .open_one_rec_loader import TASK_REGISTRY, DataLoaderWrapper
 

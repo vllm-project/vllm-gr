@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
-from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -19,7 +18,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-def prepare_request_fn(
+async def prepare_request_fn(
     self,
     request_id,
     prompt,
@@ -37,10 +36,8 @@ def prepare_request_fn(
     EngineCore. Returns (output_queue, engine_core_request) for later
     batch send via _add_requests_batch().
 
-    This is intentionally synchronous to avoid event-loop overhead
-    when preparing many requests in a tight loop (e.g. beam search).
-    The caller is responsible for any pause-state gating before
-    entering the preparation loop."""
+    The 0.22 input processor validates requests against the asynchronously
+    discovered supported-task set, so request preparation is asynchronous."""
     from vllm.pooling_params import PoolingParams
     from vllm.v1.engine import EngineCoreRequest
     from vllm.v1.engine.output_processor import RequestOutputCollector
@@ -63,16 +60,6 @@ def prepare_request_fn(
             "prompt logprobs"
         )
 
-    if tokenization_kwargs is None:
-        tokenization_kwargs = {}
-    from vllm.entrypoints.utils import _validate_truncation_size
-
-    _validate_truncation_size(
-        self.model_config.max_model_len,
-        params.truncate_prompt_tokens,
-        tokenization_kwargs,
-    )
-
     # Convert Input --> Request.
     if isinstance(prompt, EngineCoreRequest):
         request = prompt
@@ -83,27 +70,24 @@ def prepare_request_fn(
             request_id,
             prompt,
             params,
-            arrival_time or time.time(),
-            lora_request,
-            tokenization_kwargs,
-            trace_headers,
-            priority,
-            data_parallel_rank,
+            supported_tasks=await self.get_supported_tasks(),
+            arrival_time=arrival_time,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
         )
-        if isinstance(prompt, str):
-            prompt_text = prompt
-        elif isinstance(prompt, Mapping):
-            # Get the value, and if it's not a string, default to an empty string
-            value = prompt.get("prompt")
-            prompt_text = value if isinstance(value, str) else ""
-        else:
-            prompt_text = ""
+        from vllm.renderers.inputs.preprocess import extract_prompt_components
+
+        prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
     self.input_processor.assign_request_id(request)
 
     self._run_output_handler()
 
     # Create a new output collector for the request.
+    params = request.params
     queue = RequestOutputCollector(params.output_kind, request.request_id)
 
     # Register the request in OutputProcessor (this process) but
@@ -148,13 +132,15 @@ def register_beam_output_fn(
     from vllm.v1.engine import EngineCoreRequest
     from vllm.v1.engine.output_processor import RequestOutputCollector
 
+    if eos_token_id is not None:
+        sampling_params.update_from_generation_config({}, eos_token_id)
+
     ec_request = EngineCoreRequest(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=None,
         sampling_params=sampling_params,
         pooling_params=None,
-        eos_token_id=eos_token_id,
         arrival_time=time.time(),
         lora_request=lora_request,
         cache_salt=None,

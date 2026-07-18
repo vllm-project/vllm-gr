@@ -148,8 +148,8 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
     datasets.get_samples = lambda *a, **k: None  # type: ignore[attr-defined]
     datasets.add_dataset_parser = lambda *a, **k: None  # type: ignore[attr-defined]
 
-    # The patch module also imports BenchmarkDataset/SampleRequest/TokenizerLike
-    # from this module — give it dummy symbols. BenchmarkDataset needs
+    # The patch module also imports BenchmarkDataset/SampleRequest from this
+    # module — give it dummy symbols. BenchmarkDataset needs
     # DEFAULT_SEED and an __init__ that accepts the parent params
     # (dataset_path/random_seed/disable_shuffle) like the real one.
     class _StubBenchmarkDataset:  # mimics vllm.benchmarks.datasets.BenchmarkDataset
@@ -200,7 +200,11 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
         request_id: str | None = None
 
     datasets.SampleRequest = _StubSampleRequest  # type: ignore[attr-defined]
-    datasets.TokenizerLike = type("TokenizerLike", (), {})  # type: ignore[attr-defined]
+
+    # TokenizerLike is exported from vllm.tokenizers in vLLM 0.22+ rather than
+    # transitively through vllm.benchmarks.datasets.
+    tokenizers = _get_or_create("vllm.tokenizers")
+    tokenizers.TokenizerLike = type("TokenizerLike", (), {})  # type: ignore[attr-defined]
 
     throughput = _get_or_create("vllm.benchmarks.throughput")
     throughput.add_cli_args = lambda *a, **k: None  # type: ignore[attr-defined]

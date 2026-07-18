@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 from tqdm.auto import tqdm
-from vllm.beam_search import (
+from vllm.entrypoints.generate.beam_search.utils import (
     BeamSearchInstance,
     BeamSearchOutput,
     BeamSearchSequence,
@@ -42,7 +42,7 @@ from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 if TYPE_CHECKING:
-    from vllm.beam_search import BeamSearchOutput
+    from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
     from vllm.inputs import TextPrompt, TokensPrompt
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
@@ -52,13 +52,7 @@ logger = init_logger(__name__)
 
 def _create_tokens_prompt_from_beam(beam: "BeamSearchSequence") -> "TokensPrompt":
     """Create a TokensPrompt payload from a BeamSearchSequence."""
-    token_prompt_kwargs: dict = {"prompt_token_ids": beam.tokens}
-    if beam.multi_modal_data is not None:
-        token_prompt_kwargs["multi_modal_data"] = beam.multi_modal_data
-
-    if beam.mm_processor_kwargs is not None:
-        token_prompt_kwargs["mm_processor_kwargs"] = beam.mm_processor_kwargs
-    return TokensPrompt(**token_prompt_kwargs)
+    return beam.get_prompt()
 
 
 def _extract_and_dedup_segment(
@@ -160,6 +154,10 @@ def _prepare_beam_step_requests(
 
             decode_sampling_params = copy.copy(beam_search_params)
             decode_sampling_params.n = W
+            eos_token_id = (
+                sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
+            )
+            decode_sampling_params.update_from_generation_config({}, eos_token_id)
 
             # Register beam output
             ec_req = EngineCoreRequest(
@@ -168,9 +166,6 @@ def _prepare_beam_step_requests(
                 mm_features=None,
                 sampling_params=decode_sampling_params,
                 pooling_params=None,
-                eos_token_id=sid_end_token_id
-                if sid_end_token_id is not None
-                else tokenizer.eos_token_id,
                 arrival_time=time.time(),
                 lora_request=instance.beams[0].lora_request,
                 cache_salt=None,
@@ -213,6 +208,7 @@ def _prepare_beam_step_requests(
                 request_id=request_id_item,
                 prompt=tokens_prompt,
                 params=beam_search_params,
+                supported_tasks=llm_engine.get_supported_tasks(),
                 arrival_time=time.time(),
                 lora_request=instance.beams[0].lora_request,
             )
@@ -350,13 +346,12 @@ def _handle_eos_beams(
         cached = beam_flat_cache[beam_idx]
         assert cached is not None
         eos_beam = BeamSearchSequence(
+            orig_prompt=current_beam.orig_prompt,
             tokens=current_beam.tokens + [tokenizer.eos_token_id],
             logprobs=initial_logprobs,
             cum_logprob=float(all_beams_logprob[idx]),
             finish_reason="stop",
             stop_reason=tokenizer.eos_token_id,
-            multi_modal_data=current_beam.multi_modal_data,
-            mm_processor_kwargs=current_beam.mm_processor_kwargs,
             lora_request=current_beam.lora_request,
         )
         eos_beam._lp_parent = current_beam
@@ -391,12 +386,11 @@ def _select_top_beams(
         cached = beam_flat_cache[beam_idx]
         assert cached is not None
         new_beam = BeamSearchSequence(
+            orig_prompt=current_beam.orig_prompt,
             tokens=current_beam.tokens + [token_id],
             logprobs=initial_logprobs,
             lora_request=current_beam.lora_request,
             cum_logprob=float(all_beams_logprob[idx]),
-            multi_modal_data=current_beam.multi_modal_data,
-            mm_processor_kwargs=current_beam.mm_processor_kwargs,
         )
         new_beam._lp_parent = current_beam
         new_beam._lp_step_data = cached
@@ -552,6 +546,13 @@ class GRLLM(LLM):
         catalog_path: Optional[str] = None,
         **kwargs,
     ):
+        # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
+        # vllm-gr default before LLM.__init__ constructs VllmConfig so the V1
+        # beam-search worker patches remain active.
+        from vllm_gr._env_check import configure_model_runner_default
+
+        configure_model_runner_default()
+
         self._shutdown_complete = False
 
         super().__init__(
@@ -588,7 +589,6 @@ class GRLLM(LLM):
         """
         # Lazy imports for beam search dependencies
         import itertools
-        from typing import cast
 
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?
@@ -599,8 +599,6 @@ class GRLLM(LLM):
         ignore_eos = params.ignore_eos
         begin_token = params.begin_token if hasattr(params, "begin_token") else None
         end_token = params.end_token if hasattr(params, "end_token") else None
-
-        lora_requests = self._get_beam_search_lora_requests(lora_request, prompts)
 
         tokenizer = self.get_tokenizer()
         sid_begin_token_id: int | None = None
@@ -650,31 +648,31 @@ class GRLLM(LLM):
             initial_logprobs.append_fast([sid_begin_token_id], [0.0], [None], [None])
 
         instances: list[BeamSearchInstance] = []
+        engine_inputs = self._preprocess_cmpl(prompts)
+        lora_requests = self._lora_request_to_seq(lora_request, len(engine_inputs))
 
-        for lora_req, prompt in zip(lora_requests, prompts):
-            # Add multimodal processor kwargs & data
-            mm_kwargs = {}
-            if "multi_modal_data" in prompt:
-                mm_kwargs["multi_modal_data"] = prompt["multi_modal_data"]
-            if "mm_processor_kwargs" in prompt:
-                mm_kwargs["mm_processor_kwargs"] = prompt["mm_processor_kwargs"]
+        for lora_req, prompt in zip(lora_requests, engine_inputs):
+            if prompt["type"] == "embeds":
+                raise NotImplementedError("Embedding prompt not supported for beam search")
 
-            if "prompt_token_ids" in prompt:
-                prompt = cast(TokensPrompt, prompt)  # Needed for mypy
-                prompt_tokens = prompt["prompt_token_ids"]
-            else:
-                prompt_tokens = tokenizer.encode(prompt["prompt"])
+            engine_prompt = copy.deepcopy(prompt)
+            decoder_prompt = (
+                engine_prompt
+                if engine_prompt["type"] != "enc_dec"
+                else engine_prompt["decoder_prompt"]
+            )
+            prompt_tokens = decoder_prompt["prompt_token_ids"]
 
             if sid_begin_token_id is not None or sid_end_token_id is not None:
                 prompt_tokens = list(prompt_tokens)
                 if sid_begin_token_id is not None:
                     prompt_tokens.append(sid_begin_token_id)
+                decoder_prompt["prompt_token_ids"] = prompt_tokens
 
             instance = BeamSearchInstance(
-                prompt_tokens,
+                engine_prompt,
                 lora_request=lora_req,
                 logprobs=None,
-                **mm_kwargs,
             )
             instance.beams[0].logprobs = initial_logprobs
             # Deferred logprobs: parent pointers on BeamSearchSequence (a plain
@@ -824,13 +822,12 @@ class GRLLM(LLM):
                                 current_beam = all_beams[start:end][beam_idx]
                                 cached = beam_flat_cache[beam_idx]
                                 completed_beam = BeamSearchSequence(
+                                    orig_prompt=current_beam.orig_prompt,
                                     tokens=current_beam.tokens + [tokenizer.eos_token_id],
                                     logprobs=initial_logprobs,
                                     cum_logprob=float(all_beams_logprob[idx]),
                                     finish_reason="stop",
                                     stop_reason=tokenizer.eos_token_id,
-                                    multi_modal_data=current_beam.multi_modal_data,
-                                    mm_processor_kwargs=current_beam.mm_processor_kwargs,
                                     lora_request=current_beam.lora_request,
                                 )
                                 completed_beam._lp_parent = current_beam
@@ -852,11 +849,10 @@ class GRLLM(LLM):
                             current_beam = all_beams[start:end][beam_idx]
                             cached = beam_flat_cache[beam_idx]
                             new_beam = BeamSearchSequence(
+                                orig_prompt=current_beam.orig_prompt,
                                 tokens=current_beam.tokens + [int(all_beams_token_id[idx])],
                                 logprobs=initial_logprobs,
                                 cum_logprob=float(all_beams_logprob[idx]),
-                                multi_modal_data=current_beam.multi_modal_data,
-                                mm_processor_kwargs=current_beam.mm_processor_kwargs,
                                 lora_request=current_beam.lora_request,
                             )
                             new_beam._lp_parent = current_beam

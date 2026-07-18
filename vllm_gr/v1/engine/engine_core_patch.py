@@ -58,8 +58,14 @@ def _add_enum_member(name: str, value: bytes) -> None:
     Raises:
         RuntimeError: If the enum's internal structure is incompatible
     """
-    # Skip if already added
+    # Skip if already added with the expected wire value.
     if hasattr(EngineCoreRequestType, name):
+        existing = getattr(EngineCoreRequestType, name)
+        if existing.value != value:
+            raise RuntimeError(
+                f"EngineCoreRequestType.{name} already exists with wire value "
+                f"{existing.value!r}, expected {value!r}"
+            )
         return
 
     # Validate that the enum has expected internal structure
@@ -79,6 +85,12 @@ def _add_enum_member(name: str, value: bytes) -> None:
             raise TypeError(
                 f"Value type mismatch: expected {existing_value_type.__name__}, "
                 f"got {type(value).__name__}"
+            )
+        if value in EngineCoreRequestType._value2member_map_:
+            existing = EngineCoreRequestType._value2member_map_[value]
+            raise RuntimeError(
+                f"EngineCoreRequestType wire value {value!r} is already used by "
+                f"{existing.name}; cannot register {name}"
             )
 
     # Create the member instance bypassing enum's __new__
@@ -122,8 +134,9 @@ def apply_engine_core_child_patches():
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
     # Add new enum members: ADD_BATCH, BEAM_REQUEST_STEP_UPDATE
-    _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+    # 0x05 is reserved by vLLM 0.22 for WAKEUP.
+    _add_enum_member("ADD_BATCH", b"\x06")
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
 
     # Wrap EngineCore.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
@@ -297,8 +310,16 @@ def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optiona
     gpu_positions = None
     cpu_positions = None
     if hasattr(runner, "positions") and runner.positions is not None:
-        gpu_positions = getattr(runner.positions, "gpu", None)
-        cpu_positions = getattr(runner.positions, "cpu", None)
+        if isinstance(runner.positions, torch.Tensor):
+            # vLLM-Ascend 0.22 uses a plain device tensor in PCP paths.
+            gpu_positions = runner.positions
+        else:
+            gpu_positions = getattr(runner.positions, "gpu", None)
+            cpu_positions = getattr(runner.positions, "cpu", None)
+    if cpu_positions is None:
+        # vLLM-Ascend 0.22 keeps a dedicated pinned host buffer even when
+        # ``positions`` itself is a plain device tensor.
+        cpu_positions = getattr(runner, "_positions_cpu_buf", None)
     return gpu_positions, cpu_positions
 
 
@@ -962,11 +983,10 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
     """NPU ``_prepare_inputs`` wrapper.
 
-    Signature: ``(scheduler_output, intermediate_tensors=None)``.
-    Returns the NPU 7-tuple
-    ``(attn_metadata, num_scheduled_tokens, num_input_tokens,
-    num_tokens_across_dp, logits_indices, spec_decode_metadata,
-    max_num_scheduled_tokens)``.
+    vLLM-Ascend 0.22 uses the upstream-style signature
+    ``(scheduler_output, num_scheduled_tokens)`` and returns
+    ``(logits_indices, spec_decode_metadata, total_num_scheduled_tokens,
+    num_scheduled_tokens_compressed_list)``.
 
     Two NPU-specific differences vs the GPU wrapper:
 
@@ -978,15 +998,14 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
       early return skips bookkeeping, a stale ``InputBatchProxy`` could survive
       to the next step, so we defensively un-proxy at entry.
 
-    The per-beam RoPE position overwrite needs no extra device copy: NPU
-    ``self.positions`` is a ``CpuGpuBuffer`` and ``_overwrite_position_ids``
-    writes the ``.gpu`` (device) tensor in place, which ``_preprocess`` reads.
-    The physical ``slot_mapping`` is materialized from linear positions inside
-    the original before the overwrite, so it is unaffected.
+    The per-beam RoPE position overwrite handles both the normal
+    ``CpuGpuBuffer`` and the plain device tensor used by 0.22 PCP paths. The
+    physical ``slot_mapping`` is materialized from linear positions inside the
+    original before the overwrite, so it is unaffected.
     """
 
     @wraps(_orig_prepare_inputs)
-    def patched_prepare_inputs(self, scheduler_output, intermediate_tensors=None):
+    def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
         # Drop a stale proxy left over from a prior step (see docstring).
         if isinstance(self.input_batch, InputBatchProxy):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
@@ -995,33 +1014,27 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        out = _orig_prepare_inputs(self, scheduler_output, intermediate_tensors)
+        out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data:
             return out
 
         (
-            attn_metadata,
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
             logits_indices,
             spec_decode_metadata,
-            max_num_scheduled_tokens,
+            total_num_scheduled_tokens,
+            num_scheduled_tokens_compressed_list,
         ) = out
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
 
         return (
-            attn_metadata,
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
             logits_indices,
             spec_decode_metadata,
-            max_num_scheduled_tokens,
+            total_num_scheduled_tokens,
+            num_scheduled_tokens_compressed_list,
         )
 
     return patched_prepare_inputs

@@ -54,6 +54,12 @@ def _maybe_launch_beam_search_serve() -> bool:
 
 
 def main() -> None:
+    # Configure this before importing vLLM. The parent value is inherited by
+    # EngineCore and Worker subprocesses launched by the serve command.
+    from vllm_gr._env_check import configure_model_runner_default
+
+    configure_model_runner_default()
+
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 

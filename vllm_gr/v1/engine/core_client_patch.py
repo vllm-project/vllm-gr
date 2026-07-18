@@ -81,8 +81,8 @@ def apply_batch_fork_patches():
     from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
 
     # Ensure enum members exist in parent process
-    _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+    _add_enum_member("ADD_BATCH", b"\x06")
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
 
     # Patch AsyncMPClient
     AsyncMPClient.add_requests_async = add_requests_async

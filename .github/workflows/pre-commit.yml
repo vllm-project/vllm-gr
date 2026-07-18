@@ -42,7 +42,7 @@ jobs:
         with:
           path: .venv
           base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.14.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+          key: venv-${{ runner.os }}-vllm0.22.1rc1-b284862e-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
 
       - name: Create virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -63,7 +63,9 @@ jobs:
       - name: Install base environment (vllm)
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
-          uv pip install vllm==0.14.1
+          uv pip install vllm==0.22.1rc1 \
+            --extra-index-url https://wheels.vllm.ai/b284862ea9b8413d21e4b4dd1eb46f8ba3e40627 \
+            --index-strategy first-index
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -75,6 +77,10 @@ jobs:
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
+
+      - name: Verify vLLM compatibility
+        run: |
+          python -c 'import importlib.metadata as m; version = m.version("vllm").partition("+")[0]; assert version == "0.22.1rc1", f"Expected vLLM 0.22.1rc1, found {version}"'
 
       - uses: pre-commit/action@v3.0.1
         with:
@@ -114,5 +120,8 @@ jobs:
         env:
           DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
+          # CI enforces the defaults in run_benchmark_and_verify.sh. Override
+          # individual threshold variables here after an A100 baseline refresh.
+          KPI_GATING_MODE: enforce
         run: |
           ./tests/system/run_benchmark_and_verify.sh

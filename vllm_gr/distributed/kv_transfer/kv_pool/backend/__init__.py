@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""KV pool backend implementations for vllm-GR."""
+"""Compatibility namespace for KV pool backends.
 
-from vllm_gr.distributed.kv_transfer.kv_pool.backend.yuanrong_backend import (
-    YuanrongBackend,
-)
+vLLM-Ascend 0.22 owns the YuanRong backend and KV-pool implementation.  No
+backend is re-exported here so importing vllm-gr does not eagerly require the
+optional YuanRong runtime.
+"""
 
-__all__ = ["YuanrongBackend"]
+__all__: list[str] = []

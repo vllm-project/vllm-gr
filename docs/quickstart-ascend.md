@@ -55,30 +55,35 @@ source ${CONDA_PREFIX}/Ascend/nnal/atb/set_env.sh
 follow [vllm installation](https://docs.vllm.ai/en/latest/getting_started/installation) for more details.
 
 ```bash
-python -m pip install vllm==0.14.1
+python -m pip install vllm==0.22.1rc1 \
+  --extra-index-url https://wheels.vllm.ai/b284862ea9b8413d21e4b4dd1eb46f8ba3e40627
 ```
+
+The vLLM release-candidate wheel is hosted in the official per-commit wheel
+index rather than PyPI. Commit `b284862e` is the source of the `v0.22.1rc1`
+tag.
 
 4. **Install vllm-ascend (base environment)**
 
 vllm-gr does **not** install vllm-ascend. Install the Ascend platform stack first:
 
 ```bash
-python -m pip install vllm-ascend==0.14.0rc1
+python -m pip install vllm-ascend==0.22.1rc1
 ```
 
-**Note**: For Npu A3 (910C) users - due to bug in vllm-ascend, it is required to install vllm-ascend from source
+To install the matching release from source instead:
 
 ```bash
 cd <working-dir>
 git clone https://github.com/vllm-project/vllm-ascend.git
 cd vllm-ascend
-git checkout v0.14.0rc1
+git checkout v0.22.1rc1
 pip install .
 ```
 
 Return to vllm-gr folder for next steps.
 
-See the [vllm-ascend v0.14.0rc1 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.14.0rc1).
+See the [vllm-ascend v0.22.1rc1 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.22.1rc1).
 
 5. **Install vllm-gr**
 

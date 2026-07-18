@@ -53,9 +53,33 @@ class TestPanguPluginInitializeRuntime(unittest.TestCase):
     def test_initialize_runtime_does_not_raise(self):
         from vllm_gr import plugin
 
-        with mock.patch("vllm_gr.patch.re_apply_patches", return_value=0):
+        with (
+            mock.patch("vllm_gr._env_check.check_runtime_versions"),
+            mock.patch("vllm_gr.patch.re_apply_patches", return_value=0),
+        ):
             state = plugin.initialize_runtime()
         self.assertIn("patch_count", state)
+
+
+class TestModelRunnerDefault(unittest.TestCase):
+    def test_defaults_to_v1_when_unset(self):
+        from vllm_gr._env_check import configure_model_runner_default
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+            configure_model_runner_default()
+            self.assertEqual(os.environ["VLLM_USE_V2_MODEL_RUNNER"], "0")
+
+    def test_preserves_explicit_v2_override(self):
+        from vllm_gr._env_check import configure_model_runner_default
+
+        with mock.patch.dict(
+            os.environ,
+            {"VLLM_USE_V2_MODEL_RUNNER": "1"},
+            clear=False,
+        ):
+            configure_model_runner_default()
+            self.assertEqual(os.environ["VLLM_USE_V2_MODEL_RUNNER"], "1")
 
 
 @unittest.skipUnless(_HAS_VLLM, _SKIP)

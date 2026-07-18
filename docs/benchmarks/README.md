@@ -165,7 +165,10 @@ You can refer also to [`Quickstart`](../quickstart.md) menu.
 2. **Install vLLM (base environment)**
 
   ```bash
-  uv pip install vllm==0.14.1 --torch-backend=auto
+  uv pip install vllm==0.22.1rc1 \
+    --extra-index-url https://wheels.vllm.ai/b284862ea9b8413d21e4b4dd1eb46f8ba3e40627 \
+    --index-strategy first-index \
+    --torch-backend=auto
   ```
 
 3. **Install vllm-gr**

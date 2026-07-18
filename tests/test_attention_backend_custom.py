@@ -99,6 +99,23 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
         assert "vllm_gr_attention_backend" not in result.additional_config
         assert result.attention_config.backend is not AttentionBackendEnum.CUSTOM
 
+    @mock.patch("vllm_gr.engine.arg_utils_gr.origin_create_engine_config")
+    def test_catalog_path_persists_in_additional_config(self, mock_origin_create):
+        """GR-only model options must not be injected into ModelConfig."""
+        from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+        fake_config = self._make_fake_config()
+        mock_origin_create.return_value = fake_config
+
+        class FakeSelf:
+            attention_backend = None
+            attention_config = None
+            catalog_path = "/tmp/catalog.json"
+
+        result = create_engine_config(FakeSelf())
+
+        assert result.additional_config["vllm_gr_catalog_path"] == "/tmp/catalog.json"
+
 
 class TestCustomBackendMarkerSerialization(unittest.TestCase):
     """Verify marker survives pickle round-trip."""
@@ -189,6 +206,53 @@ class TestNativePlatformBackendFallback(unittest.TestCase):
         from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
 
         assert result is not BeamAttentionBackend
+
+
+class TestBeamAttentionVllmApiContract(unittest.TestCase):
+    """Pin the vLLM 0.22 attention APIs used only on accelerator paths."""
+
+    def test_impl_accepts_vllm_sinks_keyword(self):
+        """Attention forwards extra implementation arguments as ``sinks``."""
+        import inspect
+
+        from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+
+        parameters = inspect.signature(BeamAttentionImpl.__init__).parameters
+        assert "sinks" in parameters
+        assert "running_sinks" not in parameters
+
+    def test_fa3_scheduler_uses_num_heads_kv_keyword(self):
+        """FA3 requires the scheduler keyword ``num_heads_kv``."""
+        from types import SimpleNamespace
+
+        import torch
+
+        import vllm_gr.v1.attention.backends.beam_attn as beam_attn
+
+        builder = object.__new__(beam_attn.BeamAttentionMetadataBuilder)
+        builder.aot_schedule = True
+        builder.cache_config = SimpleNamespace(cache_dtype="auto")
+        builder.kv_cache_dtype = torch.bfloat16
+        builder.num_heads_q = 16
+        builder.num_kv_heads = 4
+        builder.headdim = 128
+        builder.block_size = 16
+        builder.aot_sliding_window = (-1, -1)
+
+        with mock.patch.object(beam_attn, "get_scheduler_metadata", return_value={}) as scheduler:
+            builder._get_schedule(
+                batch_size=2,
+                cu_query_lens=torch.tensor([0, 1, 2], dtype=torch.int32),
+                max_query_len=1,
+                seqlens=torch.tensor([8, 8], dtype=torch.int32),
+                max_seq_len=8,
+                causal=True,
+                max_num_splits=0,
+            )
+
+        kwargs = scheduler.call_args.kwargs
+        assert kwargs["num_heads_kv"] == 4
+        assert "num_kv_heads" not in kwargs
 
 
 try:
