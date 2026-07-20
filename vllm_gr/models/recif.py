@@ -102,14 +102,38 @@ class RecifForCausalLM(_VllmQwen3MoeForCausalLM):
             tuple[str, torch.Tensor | Mapping[str, torch.Tensor]]
         ],
     ) -> set[str]:
-        """Convert and load the two-file RECIF checkpoint into vLLM.
-
-        The returned value follows vLLM's normal ``load_weights`` contract: a
-        set containing the parameter names that were loaded.
-        """
 
         arch = architecture_from_config(self.config)
-        prepared = prepare_vllm_weights(weights, arch)
+
+        # vLLM只会传入 _model_rank0.pt 的权重，
+        # 手动补充 external_rank0.pt 中的三个SID head
+        weights = list(weights)
+
+        ckpt_dir = self.config.model_path
+        external_path = os.path.join(
+            ckpt_dir,
+            "external_rank0.pt",
+        )
+
+        if os.path.exists(external_path):
+            external = torch.load(
+                external_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+
+            weights.append(
+                (
+                    "lm_heads",
+                    external["lm_heads"],
+                )
+            )
+
+        prepared = prepare_vllm_weights(
+            weights,
+            arch,
+        )
+
         return super().load_weights(prepared)
 
 
