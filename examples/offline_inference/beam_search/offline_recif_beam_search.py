@@ -19,6 +19,7 @@ def main():
     llm = LLM(
         model=args.model,
         max_logprobs=max(bf),
+        skip_tokenizer_init=True,
         max_num_seqs=args.beam,
     )
     triples, scores = beam_search(
