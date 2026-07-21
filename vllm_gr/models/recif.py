@@ -81,6 +81,9 @@ class RecifForCausalLM(_VllmQwen3MoeForCausalLM):
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         config = vllm_config.model_config.hf_text_config
 
+        # 保存checkpoint路径，供load_weights加载external_rank0.pt使用
+        self.model_path = vllm_config.model_config.model
+
         # The embedding table and the merged LM head both use three disjoint
         # 8192-token SID ranges. Keep this aligned with training.
         if int(config.vocab_size) != FULL_VOCAB:
@@ -94,7 +97,11 @@ class RecifForCausalLM(_VllmQwen3MoeForCausalLM):
                 "heads are independent from the input embedding table."
             )
 
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        super().__init__(
+            vllm_config=vllm_config,
+            prefix=prefix,
+        )
+
 
     def load_weights(
         self,
@@ -105,13 +112,12 @@ class RecifForCausalLM(_VllmQwen3MoeForCausalLM):
 
         arch = architecture_from_config(self.config)
 
-        # vLLM只会传入 _model_rank0.pt 的权重，
-        # 手动补充 external_rank0.pt 中的三个SID head
+        # vLLM默认只会传入主模型权重(_model_rank0.pt)
+        # 手动补充RECIF额外的SID heads
         weights = list(weights)
 
-        ckpt_dir = self.config.model_path
         external_path = os.path.join(
-            ckpt_dir,
+            self.model_path,
             "external_rank0.pt",
         )
 
