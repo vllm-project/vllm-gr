@@ -468,10 +468,18 @@ def beam_search(
 
         candidates = []
         offset = level * VOCAB
+        end = offset + VOCAB
         for (tokens, sid, score), output in zip(beams, outputs):
             for token_id, logprob in _topk_logprobs(
                 _first_token_logprobs(output), bf[level]
             ):
+                if not offset <= token_id < end:
+                    raise RuntimeError(
+                        "RECIF received a logprob outside the current SID "
+                        f"level: level={level}, token_id={token_id}. Construct "
+                        "vllm.LLM with logprobs_mode='processed_logprobs' so "
+                        "allowed_token_ids is applied before log-softmax."
+                    )
                 candidates.append(
                     (
                         tokens + [token_id],

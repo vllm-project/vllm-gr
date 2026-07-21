@@ -21,6 +21,9 @@ def main():
         max_logprobs=max(bf),
         skip_tokenizer_init=True,
         max_num_seqs=args.beam,
+        # RECIF scores each SID level over its own 8192-token head.  Use
+        # probabilities after allowed_token_ids masks the other two heads.
+        logprobs_mode="processed_logprobs",
     )
     triples, scores = beam_search(
         llm,
