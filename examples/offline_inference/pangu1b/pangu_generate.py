@@ -37,9 +37,18 @@ _DEFAULT_DATASET = _REPO_ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.
 _ANSWER_RE = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
 
-def _pangu_engine_kwargs() -> dict[str, Any]:
+def _is_npu_platform() -> bool:
+    """Return whether vLLM selected the Ascend platform."""
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return False
+    return getattr(current_platform, "device_type", None) == "npu"
+
+
+def _pangu_engine_kwargs(block_size: int | None = None) -> dict[str, Any]:
     """Recommended vLLM engine flags for openPangu Embedded 1B."""
-    return {
+    kwargs: dict[str, Any] = {
         "trust_remote_code": True,
         "dtype": "bfloat16",
         "max_model_len": int(os.environ.get("PANGU1B_MAX_MODEL_LEN", "32768")),
@@ -47,6 +56,16 @@ def _pangu_engine_kwargs() -> dict[str, Any]:
         "enable_chunked_prefill": False,
         "enable_prefix_caching": False,
     }
+    # vLLM defaults to block_size=16. vLLM-Ascend's native attention
+    # backends require a kernel block size of 128, but its platform hook only
+    # promotes the default when chunked prefill or prefix caching is enabled.
+    # Pangu intentionally disables both, so select the compatible value here.
+    if block_size is None and _is_npu_platform():
+        block_size = 128
+    if block_size is not None:
+        kwargs["block_size"] = block_size
+        logger.info("Using Pangu KV cache block size %d", block_size)
+    return kwargs
 
 
 def _resolve_dataset_path(path: str | Path) -> Path:
@@ -111,6 +130,7 @@ def run_offline_eval(
     temperature: float,
     tensor_parallel_size: int,
     gpu_memory_utilization: float,
+    block_size: int | None = None,
 ) -> dict[str, Any]:
     try:
         from vllm import SamplingParams
@@ -128,7 +148,7 @@ def run_offline_eval(
         model=model,
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
-        **_pangu_engine_kwargs(),
+        **_pangu_engine_kwargs(block_size),
     )
 
     sampling = SamplingParams(
@@ -195,6 +215,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument(
+        "--block-size",
+        type=int,
+        default=(
+            int(os.environ["PANGU1B_BLOCK_SIZE"]) if os.environ.get("PANGU1B_BLOCK_SIZE") else None
+        ),
+        help="KV cache block size; defaults to 128 on Ascend NPU",
+    )
+    parser.add_argument(
         "--min-accuracy",
         type=float,
         default=float(os.environ.get("PANGU1B_MIN_ACCURACY", "0.5")),
@@ -211,6 +239,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.block_size is not None and args.block_size <= 0:
+        parser.error("--block-size must be greater than zero")
 
     dataset_path = _resolve_dataset_path(args.dataset_path)
     if not dataset_path.is_file():
@@ -226,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         temperature=args.temperature,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        block_size=args.block_size,
     )
 
     summary = {

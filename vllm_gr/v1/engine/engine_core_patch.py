@@ -5,7 +5,6 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
-import threading
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +16,8 @@ from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
 
 logger = init_logger(__name__)
 
+_BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
+
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
 # ---------------------------------------------------------------------------
@@ -25,10 +26,19 @@ logger = init_logger(__name__)
 def make_patched_engine_core_init(original_init):
     """Wrap EngineCore.__init__ to add beam state."""
 
+    if getattr(original_init, _BEAM_STATE_INIT_MARKER, False):
+        return original_init
+
+    @wraps(original_init)
     def patched_init(self, *args, **kwargs):
+        # Initialize before calling upstream. EngineCoreProc starts its input
+        # thread from __init__, so beam state must exist throughout startup.
+        from vllm_gr.v1.engine.core import _ensure_beam_state
+
+        _ensure_beam_state(self)
         original_init(self, *args, **kwargs)
-        self.beam_cache: dict[str, dict] = {}
-        self.beam_cache_lock = threading.Lock()
+
+    setattr(patched_init, _BEAM_STATE_INIT_MARKER, True)
 
     return patched_init
 
@@ -58,8 +68,14 @@ def _add_enum_member(name: str, value: bytes) -> None:
     Raises:
         RuntimeError: If the enum's internal structure is incompatible
     """
-    # Skip if already added
+    # Skip if already added with the expected wire value.
     if hasattr(EngineCoreRequestType, name):
+        existing = getattr(EngineCoreRequestType, name)
+        if existing.value != value:
+            raise RuntimeError(
+                f"EngineCoreRequestType.{name} already exists with wire value "
+                f"{existing.value!r}, expected {value!r}"
+            )
         return
 
     # Validate that the enum has expected internal structure
@@ -79,6 +95,12 @@ def _add_enum_member(name: str, value: bytes) -> None:
             raise TypeError(
                 f"Value type mismatch: expected {existing_value_type.__name__}, "
                 f"got {type(value).__name__}"
+            )
+        if value in EngineCoreRequestType._value2member_map_:
+            existing = EngineCoreRequestType._value2member_map_[value]
+            raise RuntimeError(
+                f"EngineCoreRequestType wire value {value!r} is already used by "
+                f"{existing.name}; cannot register {name}"
             )
 
     # Create the member instance bypassing enum's __new__
@@ -110,7 +132,10 @@ def apply_engine_core_child_patches():
     """
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
-    if getattr(EngineCore, "_patched_for_beam_requests", False):
+    init_patches_applied = getattr(EngineCore.__init__, _BEAM_STATE_INIT_MARKER, False) and getattr(
+        EngineCoreProc.__init__, _BEAM_STATE_INIT_MARKER, False
+    )
+    if getattr(EngineCore, "_patched_for_beam_requests", False) and init_patches_applied:
         return
 
     from vllm_gr.v1.engine.core import (
@@ -122,15 +147,20 @@ def apply_engine_core_child_patches():
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
     # Add new enum members: ADD_BATCH, BEAM_REQUEST_STEP_UPDATE
-    _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+    # 0x05 is reserved by vLLM 0.22 for WAKEUP.
+    _add_enum_member("ADD_BATCH", b"\x06")
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
 
-    # Wrap EngineCore.__init__ to add beam state
+    # Wrap both constructors. Patching EngineCoreProc explicitly protects
+    # against changes in upstream inheritance and plugin loading order.
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
+    EngineCoreProc.__init__ = make_patched_engine_core_init(EngineCoreProc.__init__)
 
-    # Bind _cache_beam_request and _handle_beam_request_step_update on both classes
+    # Bind request handlers explicitly on both classes.
     EngineCore._cache_beam_request = _cache_beam_request
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
+    EngineCoreProc._cache_beam_request = _cache_beam_request
+    EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
@@ -147,6 +177,7 @@ def apply_engine_core_child_patches():
     apply_worker_patches()
 
     EngineCore._patched_for_beam_requests = True
+    EngineCoreProc._patched_for_beam_requests = True
     logger.debug("Engine-core patches applied in child process.")
 
 
@@ -154,7 +185,12 @@ def apply_engine_core_child_patches():
 _run_engine_core_active = False
 
 
-def run_engine_core(*args, **kwargs):
+def run_engine_core(
+    *args,
+    dp_rank: int = 0,
+    local_dp_rank: int = 0,
+    **kwargs,
+):
     """Wrapper for EngineCoreProc.run_engine_core that applies patches
     before the engine starts.  This is a module-level function so that
     multiprocessing 'spawn' can pickle it by qualified name.
@@ -229,7 +265,12 @@ def run_engine_core(*args, **kwargs):
     _run_engine_core_active = True
     try:
         apply_engine_core_child_patches()
-        original_run(*args, **kwargs)
+        original_run(
+            *args,
+            dp_rank=dp_rank,
+            local_dp_rank=local_dp_rank,
+            **kwargs,
+        )
     finally:
         _run_engine_core_active = False
 
@@ -297,8 +338,16 @@ def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optiona
     gpu_positions = None
     cpu_positions = None
     if hasattr(runner, "positions") and runner.positions is not None:
-        gpu_positions = getattr(runner.positions, "gpu", None)
-        cpu_positions = getattr(runner.positions, "cpu", None)
+        if isinstance(runner.positions, torch.Tensor):
+            # vLLM-Ascend 0.22 uses a plain device tensor in PCP paths.
+            gpu_positions = runner.positions
+        else:
+            gpu_positions = getattr(runner.positions, "gpu", None)
+            cpu_positions = getattr(runner.positions, "cpu", None)
+    if cpu_positions is None:
+        # vLLM-Ascend 0.22 keeps a dedicated pinned host buffer even when
+        # ``positions`` itself is a plain device tensor.
+        cpu_positions = getattr(runner, "_positions_cpu_buf", None)
     return gpu_positions, cpu_positions
 
 
@@ -962,11 +1011,10 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
     """NPU ``_prepare_inputs`` wrapper.
 
-    Signature: ``(scheduler_output, intermediate_tensors=None)``.
-    Returns the NPU 7-tuple
-    ``(attn_metadata, num_scheduled_tokens, num_input_tokens,
-    num_tokens_across_dp, logits_indices, spec_decode_metadata,
-    max_num_scheduled_tokens)``.
+    vLLM-Ascend 0.22 uses the upstream-style signature
+    ``(scheduler_output, num_scheduled_tokens)`` and returns
+    ``(logits_indices, spec_decode_metadata, total_num_scheduled_tokens,
+    num_scheduled_tokens_compressed_list)``.
 
     Two NPU-specific differences vs the GPU wrapper:
 
@@ -978,15 +1026,14 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
       early return skips bookkeeping, a stale ``InputBatchProxy`` could survive
       to the next step, so we defensively un-proxy at entry.
 
-    The per-beam RoPE position overwrite needs no extra device copy: NPU
-    ``self.positions`` is a ``CpuGpuBuffer`` and ``_overwrite_position_ids``
-    writes the ``.gpu`` (device) tensor in place, which ``_preprocess`` reads.
-    The physical ``slot_mapping`` is materialized from linear positions inside
-    the original before the overwrite, so it is unaffected.
+    The per-beam RoPE position overwrite handles both the normal
+    ``CpuGpuBuffer`` and the plain device tensor used by 0.22 PCP paths. The
+    physical ``slot_mapping`` is materialized from linear positions inside the
+    original before the overwrite, so it is unaffected.
     """
 
     @wraps(_orig_prepare_inputs)
-    def patched_prepare_inputs(self, scheduler_output, intermediate_tensors=None):
+    def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
         # Drop a stale proxy left over from a prior step (see docstring).
         if isinstance(self.input_batch, InputBatchProxy):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
@@ -995,33 +1042,27 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        out = _orig_prepare_inputs(self, scheduler_output, intermediate_tensors)
+        out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data:
             return out
 
         (
-            attn_metadata,
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
             logits_indices,
             spec_decode_metadata,
-            max_num_scheduled_tokens,
+            total_num_scheduled_tokens,
+            num_scheduled_tokens_compressed_list,
         ) = out
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
 
         return (
-            attn_metadata,
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
             logits_indices,
             spec_decode_metadata,
-            max_num_scheduled_tokens,
+            total_num_scheduled_tokens,
+            num_scheduled_tokens_compressed_list,
         )
 
     return patched_prepare_inputs
@@ -1089,16 +1130,34 @@ def apply_worker_patches():
 
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except ImportError:
-        logger.warning("Failed to import GPUModelRunner segments, skipping GPU patches.")
+    except ImportError as exc:
+        logger.warning(
+            "Failed to import vllm.v1.worker.gpu_model_runner.GPUModelRunner; "
+            "skipping vllm-gr GPU beam-search runner patches for this attempt. "
+            "ImportError: %s",
+            exc,
+        )
+        logger.debug("GPUModelRunner import traceback", exc_info=True)
         GPUModelRunner = None
 
     npu_available = is_npu_available()
     if npu_available:
         try:
-            from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-        except ImportError:
-            logger.warning("Failed to import NPUModelRunner, skipping NPU patches.")
+            # Import through vllm-ascend's supported worker entry point. Its
+            # module initializes vllm_ascend.ops before model_runner_v1, which
+            # avoids the device_op -> ops -> fused_moe -> device_op cycle that
+            # a direct model_runner_v1 import can trigger.
+            from vllm_ascend.worker.worker import NPUModelRunner
+        except ImportError as exc:
+            logger.warning(
+                "Failed to import NPUModelRunner through "
+                "vllm_ascend.worker.worker; skipping "
+                "vllm-gr NPU beam-search runner patches for this attempt. "
+                "The vLLM-Ascend NPU runtime itself is not disabled. "
+                "ImportError: %s",
+                exc,
+            )
+            logger.debug("NPUModelRunner import traceback", exc_info=True)
             NPUModelRunner = None
     else:
         NPUModelRunner = None

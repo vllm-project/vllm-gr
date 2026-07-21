@@ -136,6 +136,34 @@ class TestPangu1bAccuracyUnitHooks(unittest.TestCase):
         self.assertEqual(extract_final_answer("Step by step ... answer is 42."), "42")
         self.assertEqual(extract_final_answer("She ate 3/8 of the pizza."), "3/8")
 
+    def test_npu_defaults_to_compatible_block_size(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "pangu_generate_npu_block_size_test",
+            PANGU_EXAMPLE,
+        )
+        assert spec is not None and spec.loader is not None
+        pangu_generate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pangu_generate)
+
+        with mock.patch.object(pangu_generate, "_is_npu_platform", return_value=True):
+            kwargs = pangu_generate._pangu_engine_kwargs()
+
+        self.assertEqual(kwargs["block_size"], 128)
+
+    def test_explicit_block_size_override_is_preserved(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "pangu_generate_block_size_override_test",
+            PANGU_EXAMPLE,
+        )
+        assert spec is not None and spec.loader is not None
+        pangu_generate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pangu_generate)
+
+        with mock.patch.object(pangu_generate, "_is_npu_platform", return_value=True):
+            kwargs = pangu_generate._pangu_engine_kwargs(64)
+
+        self.assertEqual(kwargs["block_size"], 64)
+
     def test_default_dataset_exists(self) -> None:
         self.assertTrue(DEFAULT_DATASET.is_file())
         raw = DEFAULT_DATASET.read_text(encoding="utf-8").strip()

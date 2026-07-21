@@ -36,8 +36,11 @@ pip --version
 vllm-gr does not install vllm. Prepare the GPU base environment first:
 
 ```bash
-uv pip install vllm==0.14.1 --torch-backend=auto
+uv pip install vllm==0.22.1 \
+  --torch-backend=auto
 ```
+
+This vllm-gr release supports the vLLM 0.22.1 API only.
 
 4. **Install vllm-gr**
 
@@ -51,6 +54,13 @@ For developer mode (includes pytest, ruff, etc.):
 
 ```bash
 pip install -e ".[dev]"
+```
+
+Confirm that the resolved environment contains the supported runtime:
+
+```bash
+python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); print("vllm-gr", m.version("vllm-gr"))'
+python -m pip check
 ```
 
 Platform dependencies come from the shared `requirements/common.txt`; there are no CUDA-only extras. See [getting_started/installation/](getting_started/installation/README.md).

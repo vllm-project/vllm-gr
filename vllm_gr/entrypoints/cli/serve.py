@@ -5,13 +5,11 @@ from __future__ import annotations
 
 import argparse
 
-import uvloop
+from vllm.entrypoints.cli.serve import ServeSubcommand
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-from vllm_gr.entrypoints.api_server import run_server
 
 DESCRIPTION = """Launch a local OpenAI-compatible API server for vllm-gr.
 
@@ -21,17 +19,10 @@ general plugin. Useful for serving OneRec-style checkpoints.
 """
 
 
-class GRServeSubcommand(CLISubcommand):
+class GRServeSubcommand(ServeSubcommand):
     """The `serve` subcommand for vllm-gr CLI."""
 
     name = "serve"
-
-    @staticmethod
-    def cmd(args: argparse.Namespace) -> None:
-        if hasattr(args, "model_tag") and args.model_tag is not None:
-            args.model = args.model_tag
-
-        uvloop.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)

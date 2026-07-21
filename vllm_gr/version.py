@@ -13,12 +13,12 @@ except ImportError as exc:
     warnings.warn(
         f"Failed to import version from _version.py: {exc}\n"
         "This typically happens in development mode before building.\n"
-        "Using fallback version 'dev'.",
+        "Using source-tree fallback version '0.22.1'.",
         RuntimeWarning,
         stacklevel=2,
     )
-    __version__ = "dev"
-    __version_tuple__ = (0, 0, "dev")
+    __version__ = "0.22.1"
+    __version_tuple__ = (0, 22, 1)
 
 
 def _is_dev_version(version: str, version_tuple: tuple[str | int, ...]) -> bool:

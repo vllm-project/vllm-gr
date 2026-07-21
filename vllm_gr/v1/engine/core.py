@@ -5,8 +5,8 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
+import threading
 import time
-from functools import partial
 from typing import Any
 
 from vllm.logger import init_logger
@@ -19,6 +19,26 @@ from vllm.v1.engine import (
 
 logger = init_logger(__name__)
 
+_BEAM_STATE_INIT_LOCK = threading.Lock()
+
+
+def _ensure_beam_state(self) -> None:
+    """Initialize per-engine beam state, including for late plugin loading."""
+    if (
+        getattr(self, "beam_cache", None) is not None
+        and getattr(self, "beam_cache_lock", None) is not None
+    ):
+        return
+
+    # General plugins may first load from inside EngineCore.__init__. In that
+    # case, wrapping the class cannot affect the constructor already in flight,
+    # so the request handlers also need a thread-safe lazy fallback.
+    with _BEAM_STATE_INIT_LOCK:
+        if getattr(self, "beam_cache", None) is None:
+            self.beam_cache: dict[str, dict] = {}
+        if getattr(self, "beam_cache_lock", None) is None:
+            self.beam_cache_lock = threading.Lock()
+
 
 # ------------------------------------------------------------------------------------
 # _cache_beam_request / _handle_beam_request_step_update  (ported from source core.py)
@@ -30,15 +50,19 @@ def _cache_beam_request(self, request) -> None:
 
     Thread-safe: uses beam_cache_lock to prevent data races.
     """
+    _ensure_beam_state(self)
     with self.beam_cache_lock:
         self.beam_cache[request.request_id] = {
             "all_token_ids": list(request._all_token_ids),
             "block_hashes": list(request.block_hashes),
-            "eos_token_id": request.eos_token_id,
+            "eos_token_id": request.sampling_params.eos_token_id
+            if request.sampling_params is not None
+            else None,
             "lora_request": request.lora_request,
             "cache_salt": request.cache_salt,
             "mm_features": request.mm_features,
             "prompt_embeds": request.prompt_embeds,
+            "prompt_is_token_ids": request.prompt_is_token_ids,
             "num_prompt_tokens": request.num_prompt_tokens,
         }
 
@@ -47,6 +71,7 @@ def _handle_beam_request_step_update(self, update) -> None:
     """Apply a grouped step update using only the prefill cache entry."""
     from vllm.v1.request import Request
 
+    _ensure_beam_state(self)
     session_id = update.session_id
     beam_width = update.beam_width
 
@@ -122,7 +147,12 @@ def _handle_beam_request_step_update(self, update) -> None:
     cache_salt = session_cached["cache_salt"]
     mm_features = session_cached["mm_features"]
     prompt_embeds = session_cached["prompt_embeds"]
+    prompt_is_token_ids = session_cached["prompt_is_token_ids"]
     eos = session_cached["eos_token_id"]
+
+    eos_token_id = update.eos_token_id if update.eos_token_id is not None else eos
+    if eos_token_id is not None:
+        update.sampling_params.update_from_generation_config({}, eos_token_id)
 
     # Pack the shared prefill and all beam suffixes into a single contiguous Beam Request
     beam_token_ids = list(prefill_tokens)
@@ -136,7 +166,6 @@ def _handle_beam_request_step_update(self, update) -> None:
         prompt_token_ids=beam_token_ids,
         sampling_params=update.sampling_params,
         pooling_params=None,
-        eos_token_id=(update.eos_token_id if update.eos_token_id is not None else eos),
         client_index=update.client_index,
         arrival_time=arrival,
         lora_request=(update.lora_request or lora_request),
@@ -144,6 +173,7 @@ def _handle_beam_request_step_update(self, update) -> None:
         priority=update.priority,
         trace_headers=update.trace_headers,
         prompt_embeds=prompt_embeds,
+        prompt_is_token_ids=prompt_is_token_ids,
         mm_features=mm_features,
         block_hasher=None,
     )
@@ -151,8 +181,8 @@ def _handle_beam_request_step_update(self, update) -> None:
     # Start with the prefill block hashes; block_hasher extends it incrementally
     req.block_hashes = prefill_block_hashes
     if self.request_block_hasher is not None:
-        req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
-        req.block_hashes.extend(req.get_hash_new_full_blocks())
+        req._block_hasher = self.request_block_hasher
+        req.update_block_hashes()
 
     # Metadata Enrichment
     req.is_beam = True
@@ -188,18 +218,24 @@ def process_input_sockets(
     ADD_BATCH and BEAM_REQUEST_STEP_UPDATE decoders."""
     from contextlib import ExitStack
 
+    import msgspec
     import zmq
     from vllm.utils.network_utils import make_zmq_socket
-    from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
+    from vllm.v1.engine import (
+        EngineCoreReadyResponse,
+        EngineCoreRequest,
+        EngineCoreRequestType,
+    )
     from vllm.v1.serial_utils import MsgpackDecoder
 
     from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
     # Msgpack serialization decoding.
-    add_request_decoder = MsgpackDecoder(EngineCoreRequest)
-    add_batch_decoder = MsgpackDecoder(list[EngineCoreRequest])
-    beam_request_decoder = MsgpackDecoder(BeamRequestStepUpdate)
-    generic_decoder = MsgpackDecoder()
+    decoder_kwargs = {"oob_tensor_provider": self.tensor_ipc_receiver}
+    add_request_decoder = MsgpackDecoder(EngineCoreRequest, **decoder_kwargs)
+    add_batch_decoder = MsgpackDecoder(list[EngineCoreRequest], **decoder_kwargs)
+    beam_request_decoder = MsgpackDecoder(BeamRequestStepUpdate, **decoder_kwargs)
+    generic_decoder = MsgpackDecoder(**decoder_kwargs)
 
     with ExitStack() as stack, zmq.Context() as ctx:
         input_sockets = [
@@ -225,8 +261,15 @@ def process_input_sockets(
 
         # Register sockets with poller.
         poller = zmq.Poller()
+        ready_response = EngineCoreReadyResponse(
+            max_model_len=self.vllm_config.model_config.max_model_len,
+            num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
+            dp_stats_address=self.frontend_stats_publish_address,
+            dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
+        )
+        ready_payload = msgspec.msgpack.encode(ready_response)
         for input_socket in input_sockets:
-            input_socket.send(b"")
+            input_socket.send(ready_payload)
             poller.register(input_socket, zmq.POLLIN)
 
         if coord_socket is not None:
@@ -238,6 +281,9 @@ def process_input_sockets(
         while True:
             for input_socket, _ in poller.poll():
                 type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                if type_frame.buffer == b"READY":
+                    assert input_socket == coord_socket
+                    continue
                 request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
                 request: Any

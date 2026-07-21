@@ -25,8 +25,8 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
 )
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.engine.serving import OpenAIServing
+from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingModels
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 
@@ -35,7 +35,7 @@ if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is
 
 
 async def beam_search_test(loops: int) -> None:
-    model_name = "OpenOneRec/OneRec-1.7B"
+    model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
     beam_width = 512
     max_tokens = 5
 

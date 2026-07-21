@@ -54,10 +54,16 @@ def _maybe_launch_beam_search_serve() -> bool:
 
 
 def main() -> None:
+    # Configure this before importing vLLM. The parent value is inherited by
+    # EngineCore and Worker subprocesses launched by the serve command.
+    from vllm_gr._env_check import configure_model_runner_default
+
+    configure_model_runner_default()
+
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    import vllm_gr.entrypoints.cli.serve as gr_serve
+    import vllm_gr.entrypoints.cli.check_env as gr_check_env
 
     # Handle --gr flag for beam search serving mode
     _maybe_launch_beam_search_serve()
@@ -78,7 +84,16 @@ def main() -> None:
     subparsers = parser.add_subparsers(required=False, dest="subparser")
     cmds = {}
 
-    for cmd in gr_serve.cmd_init():
+    # Keep the diagnostic path independent from the heavy serving import
+    # graph. A broken optional serving dependency must not prevent check-env
+    # from explaining the runtime problem.
+    command_list = gr_check_env.cmd_init()
+    if len(sys.argv) < 2 or sys.argv[1] != "check-env":
+        import vllm_gr.entrypoints.cli.serve as gr_serve
+
+        command_list = [*gr_serve.cmd_init(), *command_list]
+
+    for cmd in command_list:
         cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
         cmds[cmd.name] = cmd
 

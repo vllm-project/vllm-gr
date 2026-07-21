@@ -1,38 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
-from dataclasses import dataclass
+import logging
 
-from vllm.config import ModelConfig
-from vllm.engine.arg_utils import EngineArgs, get_kwargs
+from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-
-@dataclass
-class ModelConfigGr(ModelConfig):
-    catalog_path: str | None = None
-    """ Optionally define a path for valid results file"""
-
-
 origin_add_cli_args = EngineArgs.add_cli_args
-origin_create_model_config = EngineArgs.create_model_config
 origin_create_engine_config = EngineArgs.create_engine_config
 origin_from_cli_args = EngineArgs.from_cli_args.__func__
+logger = logging.getLogger("vllm_gr.engine.arg_utils_gr")
 
 
 def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     parser = origin_add_cli_args(parser)
-    model_kwargs = get_kwargs(ModelConfigGr)
-    model_group = parser.add_argument_group(title="ModelConfig", description=ModelConfigGr.__doc__)
-    model_group.add_argument("--catalog-path", **model_kwargs["catalog_path"])
+    model_group = parser.add_argument_group(title="vLLM-GR")
+    model_group.add_argument(
+        "--catalog-path",
+        type=str,
+        default=None,
+        help="Optional JSON catalog used to constrain generation results.",
+    )
     return parser
-
-
-def create_model_config(self) -> ModelConfig:
-    config = origin_create_model_config(self)
-    config.__class__ = ModelConfigGr
-    config.catalog_path = getattr(self, "catalog_path", None)
-    return config
 
 
 def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
@@ -62,17 +51,58 @@ def _user_requested_custom_backend(self) -> bool:
     return False
 
 
+def _apply_npu_default_block_size(config) -> None:
+    """Use an Ascend-compatible default without overriding user intent.
+
+    vLLM 0.22 resolves an unspecified block size to 16 before the Ascend
+    platform hook runs. vLLM-Ascend 0.22.1rc1 keeps that value when both
+    chunked prefill and prefix caching are disabled, although its standard
+    attention backends require a kernel block size of 128.
+    """
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return
+    if getattr(current_platform, "device_type", None) != "npu":
+        return
+
+    cache_config = getattr(config, "cache_config", None)
+    model_config = getattr(config, "model_config", None)
+    if cache_config is None:
+        return
+    if getattr(cache_config, "user_specified_block_size", False):
+        return
+    # Hybrid attention/state models have model-specific cache sizing rules in
+    # vLLM-Ascend and must not be forced onto the dense-attention default.
+    if model_config is not None and getattr(model_config, "is_hybrid", False):
+        return
+    if cache_config.block_size != 128:
+        logger.info(
+            "Using Ascend-compatible default KV cache block size 128 "
+            "(vLLM resolved the unspecified value to %s).",
+            cache_config.block_size,
+        )
+        cache_config.block_size = 128
+
+
 def create_engine_config(self, usage_context=None, headless=False):
     config = origin_create_engine_config(self, usage_context, headless)
-    if _user_requested_custom_backend(self):
-        # Persist the user intent in a field that survives platform
-        # check_and_update_config resets and process serialization.
-        additional_config = getattr(config, "additional_config", None)
-        if additional_config is None:
-            config.additional_config = {}
-            additional_config = config.additional_config
-        if isinstance(additional_config, dict):
+    _apply_npu_default_block_size(config)
+    catalog_path = getattr(self, "catalog_path", None)
+    custom_backend = _user_requested_custom_backend(self)
+    if catalog_path is not None or custom_backend:
+        # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
+        # forbidden. Keep GR-only values in VllmConfig.additional_config so
+        # that they also survive process serialization.
+        additional_config = config.additional_config
+        if not isinstance(additional_config, dict):
+            raise ValueError("vLLM-GR options require --additional-config to be a JSON object")
+        if catalog_path is not None:
+            additional_config["vllm_gr_catalog_path"] = catalog_path
+        if custom_backend:
             additional_config["vllm_gr_attention_backend"] = "CUSTOM"
+
+    if custom_backend:
         attention_config = getattr(config, "attention_config", None)
         if attention_config is not None and getattr(attention_config, "backend", None) is None:
             from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -83,6 +113,5 @@ def create_engine_config(self, usage_context=None, headless=False):
 
 def patch_add_cli_args() -> None:
     EngineArgs.add_cli_args = add_cli_args
-    EngineArgs.create_model_config = create_model_config
     EngineArgs.create_engine_config = create_engine_config
     EngineArgs.from_cli_args = classmethod(from_cli_args)

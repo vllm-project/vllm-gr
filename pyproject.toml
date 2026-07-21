@@ -70,6 +70,7 @@ include = ["vllm_gr*"]
 "vllm_gr" = ["_version.py", "*.json"]
 
 [tool.setuptools_scm]
+fallback_version = "0.22.1"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

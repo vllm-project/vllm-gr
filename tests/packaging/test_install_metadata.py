@@ -82,6 +82,37 @@ def test_common_requirements_exclude_vllm_and_dev_tools() -> None:
     assert "ruff" not in lines
 
 
+def test_release_version_by_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_versions = {
+        "cuda": "0.22.1",
+        "npu": "0.22.1+npu",
+        "cpu": "0.22.1+cpu",
+    }
+
+    for device, expected in expected_versions.items():
+        gr_setup = _load_setup_module()
+        monkeypatch.delenv("VLLM_GR_VERSION_OVERRIDE", raising=False)
+        monkeypatch.setattr(gr_setup, "detect_target_device", lambda device=device: device)
+        write_version = MagicMock(return_value=expected)
+        monkeypatch.setattr(gr_setup, "get_version", write_version)
+
+        assert gr_setup.get_vllm_gr_version() == expected
+        assert gr_setup.VLLM_GR_BASE_VERSION == "0.22.1"
+        write_version.assert_called_once_with(write_to="vllm_gr/_version.py")
+
+
+def test_release_version_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    gr_setup = _load_setup_module()
+    monkeypatch.setenv("VLLM_GR_VERSION_OVERRIDE", "0.22.1.dev1")
+    write_version = MagicMock(return_value="0.22.1.dev1")
+    monkeypatch.setattr(gr_setup, "get_version", write_version)
+
+    assert gr_setup.get_vllm_gr_version() == "0.22.1.dev1"
+    write_version.assert_called_once_with(write_to="vllm_gr/_version.py")
+
+
 def test_warn_deprecated_extra_install_emits_warning() -> None:
     import warnings
 

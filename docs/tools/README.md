@@ -102,6 +102,17 @@ Run test with:
 ./tools/run_test.sh
 ```
 
+The OneRec integration tests use `OpenOneRec/OneRec-1.7B` by default. To use
+a model downloaded to a regular local directory, set `VLLM_GR_TEST_MODEL` to
+the directory containing `config.json` and the model weights. Set
+`HF_HUB_OFFLINE=1` as well to prevent fallback network access:
+
+```bash
+VLLM_GR_TEST_MODEL=/path/to/OneRec-1.7B \
+HF_HUB_OFFLINE=1 \
+./tools/run_test.sh
+```
+
 ### Github Actions tester
 
 Execute a full workflows execution. Its create an empty environment via docker and perform all workflows define in .github/workflows.

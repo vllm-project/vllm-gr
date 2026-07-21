@@ -10,35 +10,15 @@ runtime:
 
 - :func:`_apply_gr_beam_patches` — offline / OpenAI beam-search and
   catalog-constrained generation support.
-- :func:`_apply_yuanrong_npu_patch`, :func:`_apply_kv_merge_patch`,
-  :func:`apply_split_qkv_rmsnorm_rope_patch` — NPU (Ascend) runtime hooks.
 
 The previous ``_apply_gr_core_patches`` that replaced vLLM core types
 (``EngineCoreRequest`` / ``Request`` / ``NewRequestData``) with GR-extended
 variants has been removed together with the recommend runtime.
 """
 
-import importlib
 import logging
-import math
-import sys
-import threading
-import types
-from typing import Any
-
-from vllm_gr.ops.npu.split_qkv_rmsnorm_rope import apply_split_qkv_rmsnorm_rope_patch
 
 logger = logging.getLogger("vllm_gr.patch")
-
-_YUANRONG_PATCHES_APPLIED = False
-
-
-_ASCEND_BACKEND_PACKAGE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend"
-_ASCEND_POOL_WORKER_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
-_ASCEND_CONFIG_DATA_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data"
-_ASCEND_MOONCAKE_MODULE = f"{_ASCEND_BACKEND_PACKAGE}.mooncake_backend"
-_ASCEND_YUANRONG_MODULE = f"{_ASCEND_BACKEND_PACKAGE}.yuanrong_backend"
-_LOCAL_YUANRONG_BACKEND_MODULE = "vllm_gr.distributed.kv_transfer.kv_pool.backend.yuanrong_backend"
 
 
 def _is_npu_platform() -> bool:
@@ -49,150 +29,6 @@ def _is_npu_platform() -> bool:
     return getattr(current_platform, "device_type", None) == "npu"
 
 
-def _build_yuanrong_backend_class() -> type[Any]:
-    module = importlib.import_module(_LOCAL_YUANRONG_BACKEND_MODULE)
-    backend_cls = getattr(module, "YuanrongBackend")
-    backend_cls.__module__ = _ASCEND_YUANRONG_MODULE
-    return backend_cls
-
-
-def _install_mooncake_backend_shim_if_needed() -> int:
-    existing = sys.modules.get(_ASCEND_MOONCAKE_MODULE)
-    if existing is not None:
-        return 0
-
-    try:
-        importlib.import_module(_ASCEND_MOONCAKE_MODULE)
-        return 0
-    except ModuleNotFoundError as exc:
-        if getattr(exc, "name", None) not in {
-            "mooncake",
-            "mooncake.store",
-            _ASCEND_MOONCAKE_MODULE,
-        }:
-            raise
-    except ImportError as exc:
-        if "mooncake" not in str(exc).lower():
-            raise
-
-    backend_module = importlib.import_module(f"{_ASCEND_BACKEND_PACKAGE}.backend")
-    backend_base = getattr(backend_module, "Backend")
-
-    class MooncakeBackend(backend_base):
-        def __init__(self, *_args, **_kwargs):
-            raise ModuleNotFoundError(
-                "Mooncake backend dependencies are not installed. "
-                "Install the mooncake runtime package to use backend='mooncake'."
-            )
-
-    MooncakeBackend.__name__ = "MooncakeBackend"
-    MooncakeBackend.__qualname__ = "MooncakeBackend"
-    MooncakeBackend.__module__ = _ASCEND_MOONCAKE_MODULE
-
-    module = types.ModuleType(_ASCEND_MOONCAKE_MODULE)
-    module.__package__ = _ASCEND_BACKEND_PACKAGE
-    module.MooncakeBackend = MooncakeBackend
-    module.__all__ = ["MooncakeBackend"]
-    sys.modules[_ASCEND_MOONCAKE_MODULE] = module
-
-    backend_pkg = sys.modules.get(_ASCEND_BACKEND_PACKAGE)
-    if backend_pkg is not None:
-        setattr(backend_pkg, "mooncake_backend", module)
-
-    return 1
-
-
-def _install_yuanrong_module(backend_cls: type[Any]) -> int:
-    existing = sys.modules.get(_ASCEND_YUANRONG_MODULE)
-    if existing is not None and getattr(existing, "YuanrongBackend", None) is backend_cls:
-        return 0
-
-    module = existing if existing is not None else types.ModuleType(_ASCEND_YUANRONG_MODULE)
-    module.__package__ = _ASCEND_BACKEND_PACKAGE
-    module.YuanrongBackend = backend_cls
-    module.__all__ = ["YuanrongBackend"]
-    sys.modules[_ASCEND_YUANRONG_MODULE] = module
-
-    backend_pkg = sys.modules.get(_ASCEND_BACKEND_PACKAGE)
-    if backend_pkg is not None:
-        setattr(backend_pkg, "yuanrong_backend", module)
-
-    return 1
-
-
-def _patch_yuanrong_backend_map(backend_cls: type[Any]) -> int:
-    pool_worker = sys.modules.get(_ASCEND_POOL_WORKER_MODULE)
-    if pool_worker is None:
-        raise RuntimeError(
-            "_patch_yuanrong_backend_map requires the pool_worker module to "
-            "be loaded before patching"
-        )
-    backend_map = getattr(pool_worker, "backend_map", None)
-    if not isinstance(backend_map, dict):
-        logger.warning(
-            "Skipping Yuanrong backend monkey-patch because %s.backend_map is "
-            "missing or not a dict",
-            _ASCEND_POOL_WORKER_MODULE,
-        )
-        return 0
-
-    changes = 0
-    if backend_map.get("yuanrong") is not backend_cls:
-        backend_map["yuanrong"] = backend_cls
-        changes += 1
-    if getattr(pool_worker, "YuanrongBackend", None) is not backend_cls:
-        setattr(pool_worker, "YuanrongBackend", backend_cls)
-        changes += 1
-    return changes
-
-
-def _apply_yuanrong_npu_patch(force: bool = False) -> int:
-    global _YUANRONG_PATCHES_APPLIED
-
-    if _YUANRONG_PATCHES_APPLIED and not force:
-        return 0
-
-    if not _is_npu_platform():
-        return 0
-
-    shim_count = 0
-    try:
-        shim_count = _install_mooncake_backend_shim_if_needed()
-        importlib.import_module(_ASCEND_POOL_WORKER_MODULE)
-    except (ModuleNotFoundError, ImportError) as exc:
-        logger.debug(
-            "Skipping Yuanrong backend monkey-patch because %s is unavailable: %s",
-            _ASCEND_POOL_WORKER_MODULE,
-            exc,
-        )
-        return 0
-
-    try:
-        backend_cls = _build_yuanrong_backend_class()
-    except (ModuleNotFoundError, ImportError, AttributeError) as exc:
-        logger.debug(
-            "Skipping Yuanrong backend monkey-patch because dependencies are unavailable: %s",
-            exc,
-        )
-        return 0
-    except Exception:
-        logger.exception("Failed to build Yuanrong backend monkey-patch")
-        raise
-
-    patch_count = shim_count
-    patch_count += _install_yuanrong_module(backend_cls)
-    patch_count += _patch_yuanrong_backend_map(backend_cls)
-    _YUANRONG_PATCHES_APPLIED = True
-
-    if patch_count > 0:
-        logger.info(
-            "vllm_gr: Applied %d Yuanrong NPU monkey patch(es)",
-            patch_count,
-        )
-    return patch_count
-
-
-_KV_MERGE_PATCHES_APPLIED = False
 _GR_BEAM_PATCHES_APPLIED = False
 _ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
 _ASCEND_ORIGINAL_CACHED_GET_ATTN = None
@@ -248,7 +84,7 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
 
     original_cached_fn = _ASCEND_ORIGINAL_CACHED_GET_ATTN
 
-    def _patched_cached_get_attn_backend(backend, attn_selector_config):
+    def _patched_cached_get_attn_backend(backend, attn_selector_config, num_heads=None):
         """Return BeamAttentionBackend when backend is CUSTOM."""
         if backend == AttentionBackendEnum.CUSTOM:
             from vllm_gr.v1.attention.backends.beam_attn import (
@@ -301,7 +137,7 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
             except Exception:
                 pass
 
-        return original_cached_fn(backend, attn_selector_config)
+        return original_cached_fn(backend, attn_selector_config, num_heads=num_heads)
 
     selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
     patch_count += 1
@@ -335,7 +171,6 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
     try:
         from vllm_gr.entrypoints.openai.beam_search_patch import (
             patch_beam_search,
-            patch_sampling,
         )
 
         patch_beam_search()
@@ -464,242 +299,6 @@ def patch_lmcache_adapter():
     module.patch_installed_lmcache_adapter()
 
 
-def _apply_kv_merge_patch(force: bool = False) -> int:
-    """Patch vllm-ascend to support K+V merged KV cache tensors.
-
-    This patch adds support for paged-KV-style KV cache where K and V are concatenated
-    into a single tensor per layer (kv_cache_per_layer=1), instead of the default
-    separate K and V tensors (kv_cache_per_layer=2).
-
-    The patch modifies:
-    1. ChunkedTokenDatabase: adds kv_cache_per_layer attribute and set method
-    2. ChunkedTokenDatabase.prepare_value_layer: handles merged tensor case
-    3. KVPoolWorker.register_kv_caches: auto-detects merged vs separate tensors
-
-    This is needed for backward compatibility with older vllm-ascend versions
-    that don't have the "support kv hebing" commit.
-    """
-    global _KV_MERGE_PATCHES_APPLIED
-
-    if _KV_MERGE_PATCHES_APPLIED and not force:
-        return 0
-
-    if not _is_npu_platform():
-        return 0
-
-    try:
-        config_data_mod = importlib.import_module(_ASCEND_CONFIG_DATA_MODULE)
-        pool_worker_mod = importlib.import_module(_ASCEND_POOL_WORKER_MODULE)
-    except (ModuleNotFoundError, ImportError) as exc:
-        logger.debug(
-            "Skipping KV merge monkey-patch because ascend modules are unavailable: %s",
-            exc,
-        )
-        return 0
-
-    patch_count = 0
-    ChunkedTokenDatabase = getattr(config_data_mod, "ChunkedTokenDatabase", None)
-    KVPoolWorker = getattr(pool_worker_mod, "KVPoolWorker", None)
-
-    if ChunkedTokenDatabase is None or KVPoolWorker is None:
-        logger.debug(
-            "Skipping KV merge monkey-patch: ChunkedTokenDatabase or KVPoolWorker not found"
-        )
-        return 0
-
-    if not hasattr(ChunkedTokenDatabase, "kv_cache_per_layer"):
-        original_init = ChunkedTokenDatabase.__init__
-
-        def patched_init(self, metadata, block_size, use_mla, partitions):
-            original_init(self, metadata, block_size, use_mla, partitions)
-            self.kv_cache_per_layer = 2
-
-        ChunkedTokenDatabase.__init__ = patched_init
-        patch_count += 1
-        logger.debug("vllm_gr: Patched ChunkedTokenDatabase.__init__ to add kv_cache_per_layer")
-
-    if not hasattr(ChunkedTokenDatabase, "set_kv_cache_per_layer"):
-
-        def set_kv_cache_per_layer(self, kv_cache_per_layer: int):
-            self.kv_cache_per_layer = kv_cache_per_layer
-
-        ChunkedTokenDatabase.set_kv_cache_per_layer = set_kv_cache_per_layer
-        patch_count += 1
-        logger.debug("vllm_gr: Added ChunkedTokenDatabase.set_kv_cache_per_layer method")
-
-    original_prepare_value_layer = getattr(ChunkedTokenDatabase, "prepare_value_layer", None)
-    if original_prepare_value_layer is not None:
-
-        def patched_prepare_value_layer(
-            self, start: int, end: int, block_ids: list[int], layer_id: int
-        ):
-            block_id = block_ids[start // self.block_size]
-            kv_cache_per_layer = getattr(self, "kv_cache_per_layer", 2)
-            if kv_cache_per_layer == 1:
-                addr = self.kv_caches_base_addr[layer_id] + block_id * self.block_len[0]
-                length = int(self.block_len[0] / self.block_size * (end - start))
-                return [addr], [length]
-            return original_prepare_value_layer(self, start, end, block_ids, layer_id)
-
-        ChunkedTokenDatabase.prepare_value_layer = patched_prepare_value_layer
-        patch_count += 1
-        logger.debug(
-            "vllm_gr: Patched ChunkedTokenDatabase.prepare_value_layer for kv_cache_per_layer=1"
-        )
-
-    original_prepare_value = getattr(ChunkedTokenDatabase, "prepare_value", None)
-    if original_prepare_value is not None:
-
-        def patched_prepare_value(self, start: int, end: int, block_ids: list[int]):
-            addr_list = []
-            size_list = []
-            block_id = block_ids[start // self.block_size]
-            for index, base_addr in enumerate(self.kv_caches_base_addr):
-                block_len = (
-                    self.block_len[index % len(self.block_len)]
-                    if self.use_mla
-                    else self.block_len[0]
-                )
-                addr = base_addr + block_id * block_len
-                length = int(block_len / self.block_size * (end - start))
-                addr_list.append(addr)
-                size_list.append(length)
-            return addr_list, size_list, block_id
-
-        ChunkedTokenDatabase.prepare_value = patched_prepare_value
-        patch_count += 1
-        logger.debug(
-            "vllm_gr: Patched ChunkedTokenDatabase.prepare_value for block_len indexing fix"
-        )
-
-    original_register_kv_caches = getattr(KVPoolWorker, "register_kv_caches", None)
-    if original_register_kv_caches is not None:
-
-        def patched_register_kv_caches(self, kv_caches: dict):
-            _, first_kv_cache_value = next(iter(kv_caches.items()))
-            is_merged = isinstance(first_kv_cache_value, object) and not isinstance(
-                first_kv_cache_value, (list, tuple)
-            )
-
-            if is_merged:
-                self.kv_cache_per_layer = 1
-                self.token_database.kv_cache_per_layer = 1
-
-                self.kv_caches = kv_caches
-                self.kv_caches_base_addr = []
-                ptrs = []
-                lengths = []
-
-                first_kv_cache = first_kv_cache_value
-                self.num_blocks = first_kv_cache.shape[0]
-                kv_elem_size = first_kv_cache.element_size()
-                block_rank = 3
-                block_shape = first_kv_cache.shape[-block_rank:]
-                self.block_len = [kv_elem_size * math.prod(block_shape)]
-
-                logger.info(
-                    "Registering KV_Caches (merged). use_mla: %s, kv_cache_per_layer: %d, shape %s",
-                    self.use_mla,
-                    self.kv_cache_per_layer,
-                    first_kv_cache.shape,
-                )
-
-                for layer_name, cache_or_caches in kv_caches.items():
-                    base_addr = cache_or_caches.data_ptr()
-                    self.kv_caches_base_addr.append(base_addr)
-                    region_len = self.num_blocks * self.block_len[0]
-                    ptrs.append(base_addr)
-                    lengths.append(region_len)
-
-                logger.info(
-                    "kv_caches_base_addr count: %d, num_layers: %d, kv_cache_per_layer: %d",
-                    len(self.kv_caches_base_addr),
-                    self.num_layers,
-                    self.kv_cache_per_layer,
-                )
-
-                self.m_store.register_buffer(ptrs, lengths)
-                self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
-                self.token_database.set_block_len(self.block_len)
-                if hasattr(self.token_database, "set_kv_cache_per_layer"):
-                    self.token_database.set_kv_cache_per_layer(self.kv_cache_per_layer)
-
-                if self.use_layerwise:
-                    self.get_event = threading.Event()
-                    if self.kv_role in ["kv_producer", "kv_both"]:
-                        ready_event_sending = threading.Event()
-                        self.kv_send_thread = pool_worker_mod.KVCacheStoreLayerSendingThread(
-                            self.m_store,
-                            self.token_database,
-                            self.block_size,
-                            self.tp_rank,
-                            self.dcp_size,
-                            self.put_step,
-                            ready_event_sending,
-                            self.num_layers,
-                        )
-                        self.kv_send_thread.start()
-                    ready_event = threading.Event()
-                    self.kv_recv_thread = pool_worker_mod.KVCacheStoreLayerRecvingThread(
-                        self.m_store,
-                        self.token_database,
-                        self.block_size,
-                        self.tp_rank,
-                        self.dcp_size,
-                        ready_event,
-                        self.get_event,
-                    )
-                    self.kv_recv_thread.start()
-                    ready_event.wait()
-                else:
-                    if self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put:
-                        ready_event_sending = threading.Event()
-                        self.kv_send_thread = pool_worker_mod.KVCacheStoreSendingThread(
-                            self.m_store,
-                            self.token_database,
-                            self.block_size,
-                            self.tp_rank,
-                            self.dcp_size,
-                            self.put_step,
-                            self.kv_role,
-                            ready_event_sending,
-                        )
-                        self.kv_send_thread.start()
-                        ready_event_sending.wait()
-                    if self.load_async:
-                        ready_event = threading.Event()
-                        self.kv_recv_thread = pool_worker_mod.KVCacheStoreRecvingThread(
-                            self.m_store,
-                            self.token_database,
-                            self.block_size,
-                            self.tp_rank,
-                            self.dcp_size,
-                            ready_event,
-                        )
-                        self.kv_recv_thread.start()
-                        ready_event.wait()
-            else:
-                self.kv_cache_per_layer = 2
-                if hasattr(self.token_database, "set_kv_cache_per_layer"):
-                    self.token_database.set_kv_cache_per_layer(2)
-                original_register_kv_caches(self, kv_caches)
-
-        KVPoolWorker.register_kv_caches = patched_register_kv_caches
-        patch_count += 1
-        logger.debug(
-            "vllm_gr: Patched KVPoolWorker.register_kv_caches for kv_cache_per_layer detection"
-        )
-
-    _KV_MERGE_PATCHES_APPLIED = True
-
-    if patch_count > 0:
-        logger.info(
-            "vllm_gr: Applied %d KV merge monkey patch(es) for paged-KV-style KV cache",
-            patch_count,
-        )
-    return patch_count
-
-
 _NPU_WORKER_PATCH_APPLIED = False
 
 
@@ -723,7 +322,14 @@ def _patch_npu_worker_init_device() -> int:
 
     try:
         from vllm_ascend.worker.worker import NPUWorker
-    except ImportError:
+    except ImportError as exc:
+        logger.warning(
+            "Failed to import vllm_ascend.worker.worker.NPUWorker; the "
+            "vllm-gr delayed NPU patch retry hook was not installed for this "
+            "attempt. ImportError: %s",
+            exc,
+        )
+        logger.debug("NPUWorker import traceback", exc_info=True)
         return 0
 
     original_init_device = NPUWorker.init_device
@@ -741,26 +347,14 @@ def _patch_npu_worker_init_device() -> int:
 
 
 def _apply_patches(force: bool = False) -> int:
-    """Apply all runtime patches needed by vllm-gr.
-
-    After removing the GR core-type patches, this only applies the beam-search,
-    NPU (Yuanrong / KV-merge / split-QKV-RMSNorm-RoPE) patches that are still
-    used by the OneRec beam-search path and the NPU runtime.
-    """
-    yuanrong_count = _apply_yuanrong_npu_patch(force=force)
-    qkv_rmsnorm_rope_count = apply_split_qkv_rmsnorm_rope_patch(force=force)
-    kv_merge_count = _apply_kv_merge_patch(force=force)
+    """Apply all runtime patches needed by vllm-gr."""
     ascend_attn_count = _apply_ascend_attention_backend_patch(force=force)
-    beam_count = _apply_gr_beam_patches(force=force)
+    # Import/patch NPUWorker before the beam patch tries to access
+    # NPUModelRunner. vllm-ascend's worker module deliberately initializes
+    # vllm_ascend.ops first, avoiding an import-order cycle through device_op.
     npu_worker_count = _patch_npu_worker_init_device()
-    return (
-        yuanrong_count
-        + qkv_rmsnorm_rope_count
-        + kv_merge_count
-        + ascend_attn_count
-        + beam_count
-        + npu_worker_count
-    )
+    beam_count = _apply_gr_beam_patches(force=force)
+    return ascend_attn_count + beam_count + npu_worker_count
 
 
 def re_apply_patches() -> int:

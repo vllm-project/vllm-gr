@@ -25,6 +25,7 @@ import unittest
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import IO, Any, Iterator
+from unittest import mock
 
 import requests
 
@@ -35,7 +36,14 @@ DEFAULT_DATASET = ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
 PANGU_EXAMPLE_DIR = ROOT / "examples" / "offline_inference" / "pangu1b"
 DEFAULT_SERVE_TIMEOUT = int(os.environ.get("PANGU1B_SERVE_TIMEOUT", "600"))
 SERVED_MODEL_NAME = os.environ.get("PANGU1B_SERVED_MODEL_NAME", "pangu1b-st")
-DEFAULT_MIN_ACCURACY = os.environ.get("PANGU1B_MIN_ACCURACY", 0.5)
+
+
+def _get_min_accuracy() -> float:
+    """Read the online accuracy threshold as a numeric value."""
+    return float(os.environ.get("PANGU1B_MIN_ACCURACY", "0.5"))
+
+
+DEFAULT_MIN_ACCURACY = _get_min_accuracy()
 
 
 def _find_free_port() -> int:
@@ -45,7 +53,7 @@ def _find_free_port() -> int:
 
 
 def _build_serve_cmd(model_path: str, port: int) -> list[str]:
-    return [
+    cmd = [
         sys.executable,
         "-m",
         "vllm_gr.entrypoints.cli.main",
@@ -69,6 +77,18 @@ def _build_serve_cmd(model_path: str, port: int) -> list[str]:
         "--no-enable-chunked-prefill",
         "--no-enable-prefix-caching",
     ]
+    block_size = os.environ.get("PANGU1B_BLOCK_SIZE")
+    if block_size is None:
+        try:
+            from vllm.platforms import current_platform
+        except Exception:
+            pass
+        else:
+            if getattr(current_platform, "device_type", None) == "npu":
+                block_size = "128"
+    if block_size is not None:
+        cmd.extend(["--block-size", block_size])
+    return cmd
 
 
 def _read_log_file(log_file: IO[str] | None) -> str:
@@ -275,6 +295,36 @@ class TestPangu1bOnlineUnitHooks(unittest.TestCase):
         self.assertNotIn("--model-family", cmd)
         self.assertIn("--served-model-name", cmd)
         self.assertEqual(cmd[cmd.index("--served-model-name") + 1], SERVED_MODEL_NAME)
+
+    def test_min_accuracy_environment_value_is_float(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"PANGU1B_MIN_ACCURACY": "0.75"},
+        ):
+            threshold = _get_min_accuracy()
+
+        self.assertIsInstance(threshold, float)
+        self.assertEqual(threshold, 0.75)
+
+    def test_serve_command_builder_accepts_block_size_override(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"PANGU1B_BLOCK_SIZE": "64"},
+        ):
+            cmd = _build_serve_cmd("/tmp/pangu", 18080)
+
+        self.assertEqual(cmd[cmd.index("--block-size") + 1], "64")
+
+    def test_serve_command_builder_defaults_to_128_on_npu(self) -> None:
+        fake_platform = mock.Mock(device_type="npu")
+        with (
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch("vllm.platforms.current_platform", fake_platform),
+        ):
+            os.environ.pop("PANGU1B_BLOCK_SIZE", None)
+            cmd = _build_serve_cmd("/tmp/pangu", 18080)
+
+        self.assertEqual(cmd[cmd.index("--block-size") + 1], "128")
 
     def test_default_dataset_exists(self) -> None:
         self.assertTrue(DEFAULT_DATASET.is_file())

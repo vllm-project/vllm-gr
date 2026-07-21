@@ -28,7 +28,7 @@ def _load_prompt_text() -> str:
 
 
 def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
-    model_name = "OpenOneRec/OneRec-1.7B"
+    model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
     beam_width = 128
     max_tokens = 5
 

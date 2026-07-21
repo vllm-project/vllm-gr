@@ -24,8 +24,8 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
 )
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.engine.serving import OpenAIServing
+from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingModels
 from vllm.inputs import TokensPrompt
 
 if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is_available()):
@@ -58,7 +58,7 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
         catalog_path = tmp_catalog.name
 
     try:
-        model_name = "OpenOneRec/OneRec-1.7B"
+        model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
 
         engine_args = AsyncEngineArgs(
             model=model_name,

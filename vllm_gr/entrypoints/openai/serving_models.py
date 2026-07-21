@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.openai.serving_models import (
+from vllm.entrypoints.openai.models.serving import (
     BaseModelPath,
     LoRAModulePath,
     OpenAIServingModels,
@@ -59,7 +59,13 @@ def init_gr(
     _original_init(self, engine_client, base_model_paths, lora_modules=lora_modules)
     self.catalog = None
     tokenizer = self.input_processor.tokenizer
-    catalog_path = getattr(getattr(self, "model_config", None), "catalog_path", None)
+    vllm_config = getattr(engine_client, "vllm_config", None)
+    additional_config = getattr(vllm_config, "additional_config", None)
+    catalog_path = (
+        additional_config.get("vllm_gr_catalog_path")
+        if isinstance(additional_config, dict)
+        else None
+    )
     if catalog_path:
         self.catalog = Catalog(tokenizer)
         self.catalog.load(catalog_path)

@@ -10,8 +10,7 @@ Worker subprocess), which discovers and executes this entry point.
 This module is the formal runtime initialization boundary for vllm-gr.
 After removing the GR adapter / recommend runtime, its only responsibility
 is to apply the vLLM monkey patches needed by the OneRec beam-search path
-(catalog-constrained generation) and by the NPU runtime (Yuanrong KV
-transfer, paged-KV cache merge, split-QKV-RMSNorm-RoPE fusion).
+(catalog-constrained generation).
 """
 
 import logging
@@ -36,7 +35,13 @@ def initialize_runtime() -> dict[str, int]:
     this can be used both by the vLLM plugin loader and by explicit engine
     startup paths in the main process.
     """
+    from vllm_gr._env_check import check_environment, configure_model_runner_default
+
+    configure_model_runner_default()
+
     from vllm_gr.patch import re_apply_patches
+
+    check_environment()
 
     patch_count = re_apply_patches()
     _register_models()
