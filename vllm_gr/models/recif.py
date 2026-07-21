@@ -224,15 +224,6 @@ def prepare_vllm_weights(
     ],
     arch: Mapping[str, int],
 ) -> list[tuple[str, torch.Tensor]]:
-    """Convert RECIF checkpoint entries into weights loadable by vLLM.
-
-    Raw Megatron backbone tensors are converted to Hugging Face-style Qwen3-MoE
-    names. The three external SID heads are concatenated into ``lm_head.weight``
-    so vLLM can use its native logits processor and tensor-parallel LM head.
-
-    Already-converted HF/vLLM tensors are passed through unchanged, which also
-    makes this helper usable after an offline checkpoint conversion.
-    """
 
     megatron: dict[str, torch.Tensor] = {}
     passthrough: list[tuple[str, torch.Tensor]] = []
@@ -342,50 +333,6 @@ def build_prefix(history_sids, device):
         toks += [0, sa, sb + VOCAB, sc + 2 * VOCAB]
     toks += [0]  # target item's ctx slot
     return torch.tensor([toks], dtype=torch.long, device=device)
-
-
-
-def load_model_and_heads(ckpt_dir, config_json, device, dtype=torch.bfloat16):
-    from transformers import Qwen3MoeConfig, Qwen3MoeModel
-
-    base = json.load(open(config_json))
-    arch = {k: base[k] for k in (
-        'num_hidden_layers', 'num_attention_heads', 'num_key_value_heads',
-        'head_dim', 'hidden_size', 'num_experts')}
-
-    # Backbone (headless), vocab forced to the substituted 3*8192 = 24576.
-    cfg = Qwen3MoeConfig(**base)
-    cfg.vocab_size = 3 * VOCAB
-    model = Qwen3MoeModel(cfg).to(dtype)
-
-    raw = torch.load(os.path.join(ckpt_dir, '_model_rank0.pt'),
-                     map_location='cpu', weights_only=False)
-    sd = {k: v for k, v in raw.items() if not k.endswith('_extra_state')}
-    hf_sd = megatron_to_hf(sd, arch)
-    # Qwen3MoeModel is the bare backbone (it *is* `model`), so its submodule
-    # keys have no `model.` prefix — strip the prefix our HF map produced.
-    hf_sd = {(k[len('model.'):] if k.startswith('model.') else k): v
-             for k, v in hf_sd.items()}
-    missing, unexpected = model.load_state_dict(hf_sd, strict=False)
-    # rotary_emb buffers / non-persistent buffers are expected-missing; flag real gaps.
-    real_missing = [m for m in missing if 'rotary' not in m and 'inv_freq' not in m]
-    if real_missing:
-        raise RuntimeError(f"Missing backbone weights: {real_missing[:10]}")
-    if unexpected:
-        raise RuntimeError(f"Unexpected backbone keys: {unexpected[:10]}")
-    model = model.to(device).eval()
-
-    # 3 external SID heads: Linear(hidden, 8192, bias=False) per byte level.
-    ext = torch.load(os.path.join(ckpt_dir, 'external_rank0.pt'),
-                     map_location='cpu', weights_only=False)
-    head_sd = ext['lm_heads']
-    H = base['hidden_size']
-    heads = torch.nn.ModuleList([torch.nn.Linear(H, VOCAB, bias=False) for _ in range(3)])
-    for k in range(3):
-        heads[k].weight.data.copy_(head_sd[f'heads.{k}.weight'])
-    heads = heads.to(device, dtype=dtype).eval()
-    return model, heads
-
 
 def _logprob_value(value: Any) -> float:
     """Read a log probability from vLLM Logprob objects or numeric stubs."""
@@ -519,7 +466,6 @@ __all__ = [
     "beam_search",
     "build_prefix",
     "bytes_to_sid",
-    "load_model_and_heads",
     "megatron_to_hf",
     "prepare_vllm_weights",
     "register_recif_model",
