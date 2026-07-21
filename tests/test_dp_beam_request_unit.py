@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import msgspec
+import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
 
@@ -181,6 +182,20 @@ class TestAddRequestsAsyncDP:
         assert "r1" in mock_self.reqs_in_flight
         assert mock_self.reqs_in_flight["r0"] == mock_self.reqs_in_flight["r1"]
 
+    def test_dp_add_batch_establishes_beam_session_affinity(self) -> None:
+        mock_self = _make_dp_client_mock()
+        reqs = [
+            _make_request_mock("r0", data_parallel_rank=1),
+            _make_request_mock("r1", data_parallel_rank=1),
+        ]
+
+        asyncio.run(add_requests_async(mock_self, reqs, force_batch=True))
+
+        assert mock_self._vllm_gr_beam_session_engines == {
+            "r0": "engine-1",
+            "r1": "engine-1",
+        }
+
     def test_dp_add_batch_sends_first_req_when_engines_idle(self) -> None:
         mock_self = _make_dp_client_mock(engines_running=False)
         reqs = [_make_request_mock("r0"), _make_request_mock("r1")]
@@ -202,6 +217,18 @@ class TestAddRequestsAsyncDP:
 
         mock_self._ensure_stats_update_task.assert_called()
 
+    def test_dp_add_batch_rejects_mixed_ranks(self) -> None:
+        mock_self = _make_dp_client_mock()
+        reqs = [
+            _make_request_mock("r0", data_parallel_rank=0),
+            _make_request_mock("r1", data_parallel_rank=1),
+        ]
+
+        with pytest.raises(ValueError, match="same data_parallel_rank"):
+            asyncio.run(add_requests_async(mock_self, reqs, force_batch=True))
+
+        mock_self._send_input.assert_not_awaited()
+
 
 # ===========================================================================
 # Section 2 — DP beam_request_step_update_async
@@ -219,17 +246,44 @@ class TestBeamRequestStepUpdateAsyncDP:
         engine_arg = mock_self._send_input.call_args[0][2]
         assert engine_arg == "engine-2"
 
-    def test_dp_beam_update_no_routing_when_rank_is_none(self) -> None:
+    def test_dp_beam_update_without_rank_or_affinity_is_rejected(self) -> None:
         mock_self = _make_dp_client_mock()
+        update = _make_beam_update(data_parallel_rank=None)
+
+        with pytest.raises(ValueError, match="has no engine affinity"):
+            asyncio.run(beam_request_step_update_async(mock_self, update))
+
+        mock_self._send_input.assert_not_awaited()
+
+    def test_dp_beam_update_uses_cached_session_affinity_without_rank(self) -> None:
+        mock_self = _make_dp_client_mock()
+        mock_self._vllm_gr_beam_session_engines = {"session-0": "engine-1"}
         update = _make_beam_update(data_parallel_rank=None)
 
         asyncio.run(beam_request_step_update_async(mock_self, update))
 
-        # Engine argument to _send_input should be None
         engine_arg = mock_self._send_input.call_args[0][2]
-        assert engine_arg is None
+        assert engine_arg == "engine-1"
 
-    def test_dp_beam_update_tracks_child_beam_ids_in_flight(self) -> None:
+    def test_first_beam_update_discards_sibling_affinity_candidates(self) -> None:
+        mock_self = _make_dp_client_mock()
+        mock_self._vllm_gr_beam_session_engines = {
+            "session-0": "engine-0",
+            "sibling": "engine-0",
+        }
+        update = _make_beam_update(
+            data_parallel_rank=None,
+            parent_beam_ids=["session-0", "sibling"],
+            child_beam_ids=["c0", "c1"],
+            beam_tokens=[[50], [60]],
+            beam_width=2,
+        )
+
+        asyncio.run(beam_request_step_update_async(mock_self, update))
+
+        assert mock_self._vllm_gr_beam_session_engines == {"session-0": "engine-0"}
+
+    def test_dp_beam_update_tracks_logical_session_in_flight(self) -> None:
         mock_self = _make_dp_client_mock()
         update = _make_beam_update(
             data_parallel_rank=0,
@@ -242,10 +296,9 @@ class TestBeamRequestStepUpdateAsyncDP:
 
         asyncio.run(beam_request_step_update_async(mock_self, update))
 
-        assert "new-0" in mock_self.reqs_in_flight
-        assert "new-1" in mock_self.reqs_in_flight
-        assert mock_self.reqs_in_flight["new-0"] == "engine-0"
-        assert mock_self.reqs_in_flight["new-1"] == "engine-0"
+        assert mock_self.reqs_in_flight["session-0"] == "engine-0"
+        assert "new-0" not in mock_self.reqs_in_flight
+        assert "new-1" not in mock_self.reqs_in_flight
 
     def test_dp_beam_update_removes_pruned_ids_from_flight(self) -> None:
         mock_self = _make_dp_client_mock()
@@ -265,7 +318,34 @@ class TestBeamRequestStepUpdateAsyncDP:
 
         assert "old-0" not in mock_self.reqs_in_flight
         assert "old-1" in mock_self.reqs_in_flight
-        assert "new-0" in mock_self.reqs_in_flight
+        assert mock_self.reqs_in_flight["session-0"] == "engine-0"
+
+    def test_dp_beam_update_rejects_rank_different_from_session_affinity(self) -> None:
+        mock_self = _make_dp_client_mock()
+        mock_self._vllm_gr_beam_session_engines = {"session-0": "engine-1"}
+        update = _make_beam_update(data_parallel_rank=0)
+
+        with pytest.raises(ValueError, match="is pinned"):
+            asyncio.run(beam_request_step_update_async(mock_self, update))
+
+        mock_self._send_input.assert_not_awaited()
+
+    def test_dp_cleanup_removes_session_affinity(self) -> None:
+        mock_self = _make_dp_client_mock()
+        mock_self._vllm_gr_beam_session_engines = {"session-0": "engine-0"}
+        mock_self.reqs_in_flight["session-0"] = "engine-0"
+        update = _make_beam_update(
+            data_parallel_rank=0,
+            beam_width=0,
+            parent_beam_ids=[],
+            child_beam_ids=[],
+            beam_tokens=[],
+        )
+
+        asyncio.run(beam_request_step_update_async(mock_self, update))
+
+        assert "session-0" not in mock_self._vllm_gr_beam_session_engines
+        assert "session-0" not in mock_self.reqs_in_flight
 
     def test_dp_beam_update_sends_first_req_when_engines_idle(self) -> None:
         mock_self = _make_dp_client_mock(engines_running=False)

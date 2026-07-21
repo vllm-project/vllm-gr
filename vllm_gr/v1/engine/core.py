@@ -67,6 +67,72 @@ def _cache_beam_request(self, request) -> None:
         }
 
 
+def _emit_beam_request_error(self, update, message: str) -> None:
+    """Finish the logical beam request with an error visible to its caller."""
+    logger.error(
+        "BEAM_REQUEST_STEP_UPDATE rejected: session=%s: %s",
+        update.session_id,
+        message,
+    )
+    self.output_queue.put_nowait(
+        (
+            update.client_index,
+            EngineCoreOutputs(
+                engine_index=self.engine_index,
+                finished_requests={update.session_id},
+                outputs=[
+                    EngineCoreOutput(
+                        request_id=update.session_id,
+                        new_token_ids=[],
+                        finish_reason=FinishReason.ERROR,
+                        stop_reason=message,
+                    )
+                ],
+            ),
+        )
+    )
+
+
+def _validate_beam_request_step_update(update) -> str | None:
+    """Return a user-facing validation error for a decoded beam update."""
+    if not isinstance(update.session_id, str) or not update.session_id:
+        return "session_id must be a non-empty string"
+
+    beam_width = update.beam_width
+    if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 0:
+        return f"beam_width must be a non-negative integer, got {beam_width!r}"
+
+    # beam_width=0 is the existing cleanup message. Its pruned_ids are the
+    # branches that the frontend wants to forget; the other arrays are unused.
+    if beam_width == 0:
+        return None
+
+    if not isinstance(update.prefix_len, int) or isinstance(update.prefix_len, bool):
+        return f"prefix_len must be an integer, got {update.prefix_len!r}"
+    if update.prefix_len < 0:
+        return f"prefix_len must be non-negative, got {update.prefix_len}"
+
+    parallel_lengths = {
+        "beam_tokens": len(update.beam_tokens),
+        "parent_beam_ids": len(update.parent_beam_ids),
+        "child_beam_ids": len(update.child_beam_ids),
+    }
+    mismatched = {name: size for name, size in parallel_lengths.items() if size != beam_width}
+    if mismatched:
+        return f"parallel array lengths must equal beam_width={beam_width}, got {mismatched}"
+
+    decode_steps = len(update.beam_tokens[0])
+    if decode_steps == 0:
+        return "beam_tokens entries must contain at least one decode token"
+    if any(len(tokens) != decode_steps for tokens in update.beam_tokens):
+        return "all beam_tokens entries must have the same decode length"
+
+    if len(set(update.child_beam_ids)) != len(update.child_beam_ids):
+        return "child_beam_ids must be unique"
+
+    return None
+
+
 def _handle_beam_request_step_update(self, update) -> None:
     """Apply a grouped step update using only the prefill cache entry."""
     from vllm.v1.request import Request
@@ -74,6 +140,10 @@ def _handle_beam_request_step_update(self, update) -> None:
     _ensure_beam_state(self)
     session_id = update.session_id
     beam_width = update.beam_width
+
+    if validation_error := _validate_beam_request_step_update(update):
+        _emit_beam_request_error(self, update, validation_error)
+        return
 
     # Clear the session completely upon generation termination / cleanup message
     if beam_width == 0:
@@ -87,55 +157,12 @@ def _handle_beam_request_step_update(self, update) -> None:
                 self.aborts_queue.put_nowait(abort_id)
         return
 
-    # Validate parallel arrays
-    if (
-        len(update.beam_tokens) != beam_width
-        or len(update.parent_beam_ids) != beam_width
-        or len(update.child_beam_ids) != beam_width
-    ):
-        logger.error("BEAM_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
-        for child_id in update.child_beam_ids:
-            self.output_queue.put_nowait(
-                (
-                    update.client_index,
-                    EngineCoreOutputs(
-                        engine_index=self.engine_index,
-                        finished_requests={child_id},
-                        outputs=[
-                            EngineCoreOutput(
-                                request_id=child_id,
-                                new_token_ids=[],
-                                finish_reason=FinishReason.ERROR,
-                            )
-                        ],
-                    ),
-                )
-            )
-        return
-
     # Fetch the shared prefill cache entry
     with self.beam_cache_lock:
         session_cached = self.beam_cache.get(session_id)
 
     if session_cached is None and update.beam_width > 0:
-        logger.error("BEAM_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
-        for child_id in update.child_beam_ids:
-            self.output_queue.put_nowait(
-                (
-                    update.client_index,
-                    EngineCoreOutputs(
-                        engine_index=self.engine_index,
-                        finished_requests={child_id},
-                        outputs=[
-                            EngineCoreOutput(
-                                request_id=child_id,
-                                new_token_ids=[],
-                                finish_reason=FinishReason.ERROR,
-                            )
-                        ],
-                    ),
-                )
-            )
+        _emit_beam_request_error(self, update, "beam session was not found in the prefill cache")
         return
 
     arrival = time.time()
@@ -150,14 +177,21 @@ def _handle_beam_request_step_update(self, update) -> None:
     prompt_is_token_ids = session_cached["prompt_is_token_ids"]
     eos = session_cached["eos_token_id"]
 
+    if update.prefix_len > len(prefill_tokens):
+        _emit_beam_request_error(
+            self,
+            update,
+            f"prefix_len={update.prefix_len} exceeds cached prefill length={len(prefill_tokens)}",
+        )
+        return
+
     eos_token_id = update.eos_token_id if update.eos_token_id is not None else eos
     if eos_token_id is not None:
         update.sampling_params.update_from_generation_config({}, eos_token_id)
 
     # Pack the shared prefill and all beam suffixes into a single contiguous Beam Request
     beam_token_ids = list(prefill_tokens)
-    decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
-    assert all(len(t) == decode_steps for t in update.beam_tokens)
+    decode_steps = len(update.beam_tokens[0])
     for gen_tokens in update.beam_tokens:
         beam_token_ids.extend(gen_tokens)
 
@@ -237,6 +271,44 @@ def process_input_sockets(
     beam_request_decoder = MsgpackDecoder(BeamRequestStepUpdate, **decoder_kwargs)
     generic_decoder = MsgpackDecoder(**decoder_kwargs)
 
+    def process_message(type_frame, data_frames) -> None:
+        """Decode and dispatch one message from the input socket thread."""
+        request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+
+        request: Any
+        if request_type == EngineCoreRequestType.ADD:
+            req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+            try:
+                request = self.preprocess_add_request(req)
+            except Exception:
+                self._handle_request_preproc_error(req)
+                return
+
+        elif request_type == EngineCoreRequestType.ADD_BATCH:
+            batch: list[EngineCoreRequest] = add_batch_decoder.decode(data_frames)
+            for req in batch:
+                try:
+                    request = self.preprocess_add_request(req)
+                except Exception:
+                    self._handle_request_preproc_error(req)
+                    continue
+                self._cache_beam_request(request[0])
+                self.input_queue.put_nowait((EngineCoreRequestType.ADD, request))
+            return
+
+        elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
+            beam_update: BeamRequestStepUpdate = beam_request_decoder.decode(data_frames)
+            self._handle_beam_request_step_update(beam_update)
+            return
+
+        else:
+            request = generic_decoder.decode(data_frames)
+
+            if request_type == EngineCoreRequestType.ABORT:
+                self.aborts_queue.put_nowait(request)
+
+        self.input_queue.put_nowait((request_type, request))
+
     with ExitStack() as stack, zmq.Context() as ctx:
         input_sockets = [
             stack.enter_context(
@@ -284,38 +356,13 @@ def process_input_sockets(
                 if type_frame.buffer == b"READY":
                     assert input_socket == coord_socket
                     continue
-                request_type = EngineCoreRequestType(bytes(type_frame.buffer))
-
-                request: Any
-                if request_type == EngineCoreRequestType.ADD:
-                    req: EngineCoreRequest = add_request_decoder.decode(data_frames)
-                    try:
-                        request = self.preprocess_add_request(req)
-                    except Exception:
-                        self._handle_request_preproc_error(req)
-                        continue
-
-                elif request_type == EngineCoreRequestType.ADD_BATCH:
-                    batch: list[EngineCoreRequest] = add_batch_decoder.decode(data_frames)
-                    for req in batch:
-                        try:
-                            request = self.preprocess_add_request(req)
-                        except Exception:
-                            self._handle_request_preproc_error(req)
-                            continue
-                        self._cache_beam_request(request[0])
-                        self.input_queue.put_nowait((EngineCoreRequestType.ADD, request))
-                    continue
-
-                elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
-                    beam_update: BeamRequestStepUpdate = beam_request_decoder.decode(data_frames)
-                    self._handle_beam_request_step_update(beam_update)
-                    continue
-
-                else:
-                    request = generic_decoder.decode(data_frames)
-
-                    if request_type == EngineCoreRequestType.ABORT:
-                        self.aborts_queue.put_nowait(request)
-
-                self.input_queue.put_nowait((request_type, request))
+                try:
+                    process_message(type_frame, data_frames)
+                except Exception:
+                    # Once the input thread dies, the EngineCore can otherwise
+                    # remain alive but permanently stop consuming requests.
+                    # Escalate undecodable/unknown wire messages to the core
+                    # loop so the normal ENGINE_CORE_DEAD path wakes callers.
+                    logger.exception("Fatal EngineCore input protocol error")
+                    self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
+                    return

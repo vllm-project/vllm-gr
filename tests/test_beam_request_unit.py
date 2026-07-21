@@ -548,7 +548,7 @@ class TestBeamCache:
             child_beam_ids=["c0", "c1"],
             beam_tokens=[[50], [60]],
             beam_width=2,
-            prefix_len=5,
+            prefix_len=3,
         )
 
         with patch("vllm.v1.request.Request") as MockReq:
@@ -562,7 +562,7 @@ class TestBeamCache:
         assert mock_req.beam_width == 2
         assert mock_req.is_beam_decode is True
         assert mock_req.beam_decode_steps == 1  # each beam_tokens list has length 1
-        assert mock_req.prefix_len == 5
+        assert mock_req.prefix_len == 3
 
     def test_handle_block_hashes_from_session(self) -> None:
         eng = _make_engine_self(
@@ -658,14 +658,13 @@ class TestBeamCache:
             _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2
-        error_req_ids = set()
-        for _ in range(2):
-            _client_idx, outputs = eng.output_queue.get_nowait()
-            assert len(outputs.outputs) == 1
-            assert outputs.outputs[0].finish_reason is FinishReason.ERROR
-            error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert eng.output_queue.qsize() == 1
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"unknown"}
+        assert len(outputs.outputs) == 1
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
+        assert outputs.outputs[0].request_id == "unknown"
+        assert "not found" in outputs.outputs[0].stop_reason
 
     def test_handle_length_mismatch_emits_error_outputs(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
@@ -680,13 +679,12 @@ class TestBeamCache:
         _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2
-        error_req_ids = set()
-        for _ in range(2):
-            _client_idx, outputs = eng.output_queue.get_nowait()
-            assert outputs.outputs[0].finish_reason is FinishReason.ERROR
-            error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert eng.output_queue.qsize() == 1
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"s0"}
+        assert outputs.outputs[0].request_id == "s0"
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
+        assert "parallel array lengths" in outputs.outputs[0].stop_reason
 
     def test_handle_parent_count_mismatch_emits_error_outputs(self) -> None:
         # beam_width=2 but parent_beam_ids has 3 entries → mismatch
@@ -702,13 +700,11 @@ class TestBeamCache:
         _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2  # one error per child
-        error_req_ids = set()
-        for _ in range(2):
-            _client_idx, outputs = eng.output_queue.get_nowait()
-            assert outputs.outputs[0].finish_reason is FinishReason.ERROR
-            error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert eng.output_queue.qsize() == 1
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"s0"}
+        assert outputs.outputs[0].request_id == "s0"
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
 
     def test_handle_beam_width_child_count_mismatch_emits_error_outputs(self) -> None:
         # beam_width=3 but only 2 children and 2 token lists → mismatch
@@ -724,13 +720,50 @@ class TestBeamCache:
         _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2  # one error per child
-        error_req_ids = set()
-        for _ in range(2):
-            _client_idx, outputs = eng.output_queue.get_nowait()
-            assert outputs.outputs[0].finish_reason is FinishReason.ERROR
-            error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert eng.output_queue.qsize() == 1
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.finished_requests == {"s0"}
+        assert outputs.outputs[0].request_id == "s0"
+        assert outputs.outputs[0].finish_reason is FinishReason.ERROR
+
+    def test_handle_unequal_decode_lengths_returns_session_error(self) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+        update = _make_beam_update(
+            session_id="s0",
+            parent_beam_ids=["p0", "p1"],
+            child_beam_ids=["c0", "c1"],
+            beam_tokens=[[50], [60, 61]],
+            beam_width=2,
+        )
+
+        _handle_beam_request_step_update(eng, update)
+
+        assert eng.input_queue.empty()
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.outputs[0].request_id == "s0"
+        assert "same decode length" in outputs.outputs[0].stop_reason
+
+    def test_handle_negative_beam_width_returns_session_error(self) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+        update = _make_beam_update(session_id="s0", beam_width=-1)
+
+        _handle_beam_request_step_update(eng, update)
+
+        assert eng.input_queue.empty()
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.outputs[0].request_id == "s0"
+        assert "non-negative integer" in outputs.outputs[0].stop_reason
+
+    def test_handle_prefix_beyond_cache_returns_session_error(self) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry(token_ids=[10, 20, 30])})
+        update = _make_beam_update(session_id="s0", prefix_len=4)
+
+        _handle_beam_request_step_update(eng, update)
+
+        assert eng.input_queue.empty()
+        _client_idx, outputs = eng.output_queue.get_nowait()
+        assert outputs.outputs[0].request_id == "s0"
+        assert "exceeds cached prefill length" in outputs.outputs[0].stop_reason
 
     def test_handle_b0_removes_session_from_cache(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
@@ -884,12 +917,20 @@ class TestClientPatches:
         mock_self._send_input.assert_awaited_once()
         assert mock_self._send_input.call_args[0][0] is EngineCoreRequestType.ADD_BATCH
 
-    def test_add_requests_async_multiple_sends_add_batch(self) -> None:
+    def test_add_requests_async_multiple_without_force_use_upstream_add(self) -> None:
+        mock_self = _make_non_dp_client_mock()
+        mock_self.add_request_async = AsyncMock()
+        reqs = [MagicMock(), MagicMock()]
+        asyncio.run(add_requests_async(mock_self, reqs))
+        assert mock_self.add_request_async.await_count == 2
+        mock_self._send_input.assert_not_awaited()
+
+    def test_add_requests_async_multiple_force_sends_add_batch(self) -> None:
         mock_self = _make_non_dp_client_mock()
         reqs = [MagicMock(), MagicMock()]
-        for r in reqs:
-            r.client_index = 0
-        asyncio.run(add_requests_async(mock_self, reqs))
+        for request in reqs:
+            request.data_parallel_rank = None
+        asyncio.run(add_requests_async(mock_self, reqs, force_batch=True))
         mock_self._send_input.assert_awaited_once()
         assert mock_self._send_input.call_args[0][0] is EngineCoreRequestType.ADD_BATCH
 
@@ -1022,13 +1063,13 @@ class TestClientPatches:
         mock_self._send_input.assert_called_once()
         assert mock_self._send_input.call_args[0][0] is EngineCoreRequestType.ADD_BATCH
 
-    def test_sync_mp_add_requests_multiple_sends_add_batch(self) -> None:
+    def test_sync_mp_add_requests_multiple_without_force_use_upstream_add(self) -> None:
         mock_self = MagicMock()
         mock_self.is_dp = False
         reqs = [MagicMock(), MagicMock()]
         sync_mp_add_requests(mock_self, reqs)
-        mock_self._send_input.assert_called_once()
-        assert mock_self._send_input.call_args[0][0] is EngineCoreRequestType.ADD_BATCH
+        assert mock_self.add_request.call_count == 2
+        mock_self._send_input.assert_not_called()
 
     def test_sync_mp_beam_request_step_update_sends_correct_type(self) -> None:
         mock_self = MagicMock()
@@ -1054,6 +1095,16 @@ class TestClientPatches:
         inproc_add_requests(mock_self, [req], force_batch=False)
         mock_self.add_request.assert_called_once_with(req)
 
+    def test_inproc_multiple_without_force_do_not_enter_beam_cache(self) -> None:
+        mock_self = MagicMock()
+        reqs = [MagicMock(), MagicMock()]
+
+        inproc_add_requests(mock_self, reqs, force_batch=False)
+
+        assert mock_self.add_request.call_count == 2
+        mock_self.engine_core._cache_beam_request.assert_not_called()
+        mock_self.engine_core.preprocess_add_request.assert_not_called()
+
     def test_inproc_add_requests_multiple_caches_and_queues(self) -> None:
         inproc_q = queue.SimpleQueue()
         mock_core = MagicMock()
@@ -1065,7 +1116,7 @@ class TestClientPatches:
         mock_self.engine_core = mock_core
 
         reqs = [MagicMock(), MagicMock()]
-        inproc_add_requests(mock_self, reqs)  # multiple requests → always batch path
+        inproc_add_requests(mock_self, reqs, force_batch=True)
 
         assert mock_core._cache_beam_request.call_count == 2
         assert inproc_q.qsize() == 2
@@ -1090,7 +1141,7 @@ class TestClientPatches:
         mock_self.engine_core = mock_core
 
         reqs = [MagicMock(), MagicMock()]
-        inproc_add_requests(mock_self, reqs)
+        inproc_add_requests(mock_self, reqs, force_batch=True)
 
         # Error handler called for the failing request
         mock_core._handle_request_preproc_error.assert_called_once_with(reqs[0])

@@ -31,8 +31,10 @@ def sync_mp_add_requests(self, requests, force_batch=False):
 
     if not requests:
         return
-    if len(requests) == 1 and not force_batch:
-        return self.add_request(requests[0])
+    if not force_batch:
+        for request in requests:
+            self.add_request(request)
+        return
     if getattr(self, "is_dp", False):
         self.engines_running = True
     self._send_input(EngineCoreRequestType.ADD_BATCH, requests)
@@ -49,8 +51,10 @@ def inproc_add_requests(self, requests, force_batch=False):
 
     if not requests:
         return
-    if len(requests) == 1 and not force_batch:
-        return self.add_request(requests[0])
+    if not force_batch:
+        for request in requests:
+            self.add_request(request)
+        return
     for req in requests:
         try:
             preprocessed = self.engine_core.preprocess_add_request(req)
