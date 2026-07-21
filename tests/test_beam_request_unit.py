@@ -35,6 +35,7 @@ from vllm_gr.entrypoints.openai.serving_engine import (
     _beam_request_cleanup,
     _beam_request_step,
 )
+from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_request_step_update
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
@@ -53,6 +54,8 @@ from vllm_gr.v1.engine.core_client_patch import (
 )
 from vllm_gr.v1.engine.engine_core_patch import (
     _add_enum_member,
+    _build_beam_request_metadata,
+    _process_beam_decode_request,
     make_patched_engine_core_init,
 )
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
@@ -108,6 +111,24 @@ def _sub_patch_batch_fork_idempotent() -> None:
     patch_batch_and_fork()
     second = EngineCoreProc.run_engine_core
     assert first is second is run_engine_core, "Second call must be a no-op"
+
+
+def _sub_patch_preserves_greedy_validation() -> None:
+    """Installing GR must not change ordinary vLLM sampling validation."""
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
+
+    patch_batch_and_fork()
+
+    try:
+        SamplingParams(temperature=0.0, n=2)
+    except ValueError as exc:
+        assert "n must be 1 when using greedy sampling" in str(exc)
+    else:
+        raise AssertionError("GR disabled vLLM greedy sampling validation")
+
+    assert SamplingParams(temperature=1.0, n=2).n == 2
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +292,28 @@ def _run_subprocess(target: Any) -> None:
 # ===========================================================================
 
 
+class TestBeamDecodeSamplingParams:
+    def test_clone_preserves_single_logical_request_semantics(self) -> None:
+        params = _sampling_params()
+
+        cloned = clone_beam_decode_sampling_params(params)
+
+        assert cloned is not params
+        assert cloned.n == 1
+        assert cloned.temperature == params.temperature
+        assert cloned.logprobs == params.logprobs
+
+    def test_clone_rejects_parallel_output_semantics(self) -> None:
+        params = SamplingParams(temperature=1.0, n=2)
+
+        try:
+            clone_beam_decode_sampling_params(params)
+        except ValueError as exc:
+            assert "SamplingParams.n == 1" in str(exc)
+        else:
+            raise AssertionError("Grouped-beam params accepted SamplingParams.n > 1")
+
+
 class TestTypesSerialization:
     def test_roundtrip_all_fields(self) -> None:
         sp = _sampling_params()
@@ -306,6 +349,7 @@ class TestTypesSerialization:
         assert decoded.sampling_params.max_tokens == sp.max_tokens
         assert decoded.sampling_params.logprobs == sp.logprobs
         assert decoded.sampling_params.temperature == sp.temperature
+        assert decoded.sampling_params.n == 1
         # optional fields not explicitly set — must arrive at their defaults
         assert decoded.priority == 0
         assert decoded.lora_request is None
@@ -563,6 +607,67 @@ class TestBeamCache:
         assert mock_req.is_beam_decode is True
         assert mock_req.beam_decode_steps == 1  # each beam_tokens list has length 1
         assert mock_req.prefix_len == 5
+
+    def test_beam_width_protocol_to_runner_contract(self) -> None:
+        """beam_width flows independently of SamplingParams.n through execution."""
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+        update = _make_beam_update(
+            session_id="s0",
+            parent_beam_ids=["p0", "p1", "p2"],
+            child_beam_ids=["c0", "c1", "c2"],
+            beam_tokens=[[50], [60], [70]],
+            beam_width=3,
+            prefix_len=3,
+        )
+
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = SimpleNamespace(block_hashes=[], num_computed_tokens=6)
+            MockReq.return_value = mock_req
+            _handle_beam_request_step_update(eng, update)
+
+        metadata = _build_beam_request_metadata(mock_req, num_scheduled_tokens=3)
+        assert metadata is not None
+        assert update.sampling_params.n == 1
+        assert metadata["beam_width"] == 3
+
+        logits_indices: list[int] = []
+        rows, rows_with_logits, _, active_beam_ids = _process_beam_decode_request(
+            metadata,
+            seq_len=3,
+            token_offset=0,
+            gpu_pos=None,
+            cpu_pos=None,
+            new_logits_indices=logits_indices,
+        )
+        assert rows == 3
+        assert rows_with_logits == 3
+        assert active_beam_ids == [0, 1, 2]
+        assert logits_indices == [0, 1, 2]
+
+    def test_scheduler_rejects_missing_beam_width(self) -> None:
+        req = SimpleNamespace(request_id="s0", is_beam_decode=True, num_computed_tokens=1)
+
+        try:
+            _build_beam_request_metadata(req, num_scheduled_tokens=1)
+        except RuntimeError as exc:
+            assert "missing required beam_width" in str(exc)
+        else:
+            raise AssertionError("Scheduler accepted missing beam_width metadata")
+
+    def test_scheduler_rejects_invalid_beam_width(self) -> None:
+        req = SimpleNamespace(
+            request_id="s0",
+            is_beam_decode=True,
+            beam_width=0,
+            num_computed_tokens=1,
+        )
+
+        try:
+            _build_beam_request_metadata(req, num_scheduled_tokens=1)
+        except RuntimeError as exc:
+            assert "invalid beam_width=0" in str(exc)
+        else:
+            raise AssertionError("Scheduler accepted invalid beam_width metadata")
 
     def test_handle_block_hashes_from_session(self) -> None:
         eng = _make_engine_self(
@@ -1198,7 +1303,7 @@ class TestBeamSearchOrchestration:
         assert update.pruned_ids == []
         assert update.eos_token_id == 2
         assert update.data_parallel_rank is None
-        assert update.sampling_params.n == 2  # W beams
+        assert update.sampling_params.n == 1
 
     def test_beam_request_step_beam_tokens_are_delta_from_prefix(self) -> None:
         ec = MagicMock()
@@ -1492,6 +1597,9 @@ class TestPatchWiring:
 
     def test_patch_batch_fork_idempotent(self) -> None:
         _run_subprocess(_sub_patch_batch_fork_idempotent)
+
+    def test_patch_batch_fork_preserves_greedy_validation(self) -> None:
+        _run_subprocess(_sub_patch_preserves_greedy_validation)
 
 
 # ===========================================================================

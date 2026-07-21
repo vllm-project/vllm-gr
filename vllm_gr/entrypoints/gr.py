@@ -38,6 +38,7 @@ from vllm_gr.logprobs import (
     extract_and_dedup_flat_logprobs,
     reconstruct_beam_logprobs,
 )
+from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
@@ -152,8 +153,9 @@ def _prepare_beam_step_requests(
                 prefix_len = instance_prefix_len[j]
                 beam_tokens.append(full_tokens[prefix_len:])
 
-            decode_sampling_params = copy.copy(beam_search_params)
-            decode_sampling_params.n = W
+            # One grouped-beam execution is one logical upstream request.
+            # Beam width travels separately in BeamRequestStepUpdate.
+            decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params)
             eos_token_id = (
                 sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
             )

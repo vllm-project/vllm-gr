@@ -1,6 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from copy import copy
+
 from vllm.sampling_params import BeamSearchParams as BaseBeamSearchParams
+from vllm.sampling_params import (
+    SamplingParams,
+)
+
+
+def clone_beam_decode_sampling_params(params: SamplingParams) -> SamplingParams:
+    """Clone sampling params for one logical grouped-beam request.
+
+    Beam width is carried by GR's explicit beam metadata, not by the upstream
+    ``SamplingParams.n`` parallel-output field.
+    """
+    if params.n != 1:
+        raise ValueError(
+            "GR grouped-beam requests require SamplingParams.n == 1; "
+            "use BeamRequestStepUpdate.beam_width for the active beam count."
+        )
+    return copy(params)
 
 
 class BeamSearchParams(
