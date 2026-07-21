@@ -5,7 +5,7 @@
 
 - Python 3.11+
 - Pip 23+
-- CUDA 11.8+ (for GPU inference)
+- CUDA 13.0 (for GPU inference)
 - 32GB+ RAM (recommended)
 
 ## Setup
@@ -31,18 +31,7 @@ pip --version
 #pip 25.0.1 from /your-path/vllm-gr/.venv/lib/python3.12/site-packages/pip (python 3.12)
 ```
 
-3. **Install vLLM (base environment)**
-
-vllm-gr does not install vllm. Prepare the GPU base environment first:
-
-```bash
-uv pip install vllm==0.22.1 \
-  --torch-backend=auto
-```
-
-This vllm-gr release supports the vLLM 0.22.1 API only.
-
-4. **Install vllm-gr**
+3. **Install vllm-gr**
 
 For standard installation:
 
@@ -67,7 +56,7 @@ Platform dependencies come from the shared `requirements/common.txt`; there are 
 
 > **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
 
-5. **Verify installation**
+4. **Verify installation**
 
 ```bash
 python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
@@ -89,7 +78,6 @@ vllm-gr serve OpenOneRec/OneRec-1.7B \
   --max-num-seqs 1024 \
   --max-num-batched-tokens 16384 \
   --scheduling-policy priority \
-  --attention-backend CUSTOM \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
 

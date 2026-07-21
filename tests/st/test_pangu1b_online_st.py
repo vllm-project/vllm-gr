@@ -68,6 +68,8 @@ def _build_serve_cmd(model_path: str, port: int) -> list[str]:
         "--trust-remote-code",
         "--dtype",
         "bfloat16",
+        "--attention-backend",
+        "FLASH_ATTN",
         "--max-model-len",
         os.environ.get("PANGU1B_MAX_MODEL_LEN", "4096"),
         "--max-num-seqs",

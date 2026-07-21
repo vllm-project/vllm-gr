@@ -23,7 +23,6 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
   --dataset-path ./data \
   --task-type video \
   --num-prompts 1000 \
-  --backend CUSTOM \
   --result-dir results/acc_test_results
 ```
 
@@ -39,7 +38,6 @@ vllm-gr serve OpenOneRec/OneRec-1.7B \
   --max-num-seqs 1024 \
   --max-num-batched-tokens 16384 \
   --scheduling-policy priority \
-  --attention-backend CUSTOM \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
 

@@ -77,7 +77,6 @@ def test_common_requirements_exclude_vllm_and_dev_tools() -> None:
         for line in content.splitlines()
         if line.strip() and not line.strip().startswith("#")
     }
-    assert not any(line.startswith("vllm") for line in lines)
     assert "pytest" not in lines
     assert "ruff" not in lines
 

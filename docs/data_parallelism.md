@@ -25,7 +25,6 @@ vllm-gr serve \
     --max_num_seqs 1024 \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
-    --attention-backend CUSTOM \
     OpenOneRec/OneRec-1.7B
 ```
 
@@ -40,7 +39,6 @@ vllm-gr serve \
     --max_num_seqs 1024 \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
-    --attention-backend CUSTOM \
     OpenOneRec/OneRec-1.7B
 ```
 
@@ -223,7 +221,6 @@ for ((id=0; id<N; id++)); do
         --max_num_seqs 1024 \
         --max_num_batched_tokens 16384 \
         --scheduling-policy priority \
-        --attention-backend CUSTOM \
         $MODEL > "$log_file" 2>&1 &
 
     VLLM_PIDS+=($!)

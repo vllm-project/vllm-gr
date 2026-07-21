@@ -44,7 +44,6 @@ python benchmarks/open_one_rec/tools/convert_catalog.py \
     --max-num-seqs 1024 \
     --max-num-batched-tokens 16384 \
     --scheduling-policy priority \
-    --attention-backend CUSTOM \
     --catalog-path ${MyFolder}/catalog.json
 
 ```
