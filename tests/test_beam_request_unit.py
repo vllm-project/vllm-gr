@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
+import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
     EngineCoreRequestType,
@@ -1140,6 +1141,12 @@ class TestClientPatches:
         assert hasattr(EngineCore, "_cache_beam_request")
         assert hasattr(EngineCore, "_handle_beam_request_step_update")
         assert getattr(EngineCore, "_patched_for_beam_requests", False) is True
+
+    def test_apply_batch_fork_patches_preserves_greedy_validation(self) -> None:
+        apply_batch_fork_patches()
+
+        with pytest.raises(ValueError, match="n must be 1 when using greedy sampling"):
+            SamplingParams(n=2, temperature=0)
 
 
 # ===========================================================================

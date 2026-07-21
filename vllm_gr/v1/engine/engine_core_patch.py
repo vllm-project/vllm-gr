@@ -165,11 +165,6 @@ def apply_engine_core_child_patches():
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
 
-    from vllm.sampling_params import SamplingParams
-
-    # Force the greedy verification check to be a no-op to allow n > 1 under greedy beam search parameters
-    SamplingParams._verify_greedy_sampling = lambda self: None
-
     # Apply scheduler patches in the child process
     apply_scheduler_patch()
 
