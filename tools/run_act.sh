@@ -32,5 +32,6 @@ else
     # Update trap to also clean up the secret file
     trap 'rm -f "$secret_file"; echo "Unlocking GPU $idle_gpu (PID: $lock_pid)..."; unlock_gpu "$lock_pid"' EXIT
 fi
-act "${token[@]}"  --container-options "--runtime=nvidia --gpus device=$cuda_dev"  --env NVIDIA_DRIVER_CAPABILITIES=all --artifact-server-path "${HOME}"/artifacts \
+act "${token[@]}"  --container-options "--runtime=nvidia --gpus device=$cuda_dev -v ${HOME}/.cache/act-cache:/data/actions/cache" \
+--env NVIDIA_DRIVER_CAPABILITIES=all --artifact-server-path "${HOME}"/artifacts \
 -P self-hosted=ghcr.io/catthehacker/ubuntu:act-latest

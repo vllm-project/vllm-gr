@@ -22,12 +22,13 @@ import argparse
 import json
 import logging
 import os
-import re
 import sys
 import time
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +94,19 @@ def _normalize_numeric(value: str) -> str:
 
 
 def extract_final_answer(text: str) -> str | None:
-    """Extract the last numeric token from model output (GSM8K-style)."""
-    matches = _ANSWER_RE.findall(text.replace(",", ""))
+    """Extract answer from \boxed{} notation, with fallback to last number."""
+    text_clean = text.replace(",", "")
+
+    # Priority 1: Try \boxed{} notation first (explicit answer marker)
+    match = re.search(r"\\boxed\{([^}]+)\}", text)
+    if match:
+        boxed_content = match.group(1)
+        numbers = _ANSWER_RE.findall(boxed_content)
+        if numbers:
+            return _normalize_numeric(numbers[0])
+
+    # Priority 2: Fall back to last numeric token
+    matches = _ANSWER_RE.findall(text_clean)
     if not matches:
         return None
     return _normalize_numeric(matches[-1])
@@ -154,7 +166,7 @@ def run_offline_eval(
     sampling = SamplingParams(
         max_tokens=max_tokens,
         temperature=temperature,
-        top_p=1.0 if temperature > 0 else 1.0,
+        top_p=1.0,
     )
 
     prompts = [build_prompt(str(row["question"])) for row in records]

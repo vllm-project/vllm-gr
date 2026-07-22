@@ -121,3 +121,26 @@ jobs:
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
         run: |
           ./tests/system/run_benchmark_and_verify.sh
+
+      - name: Cache Pangu 1B model
+        uses: corca-ai/local-cache@v2
+        id: cache-pangu1b
+        with:
+          path: openPangu-Embedded-1B-V1.1
+          base: /data/actions/cache
+          key: pangu1b-model-${{ runner.os }}
+
+      - name: Download Pangu 1B model
+        if: steps.cache-pangu1b.outputs.cache-hit != 'true'
+        run: |
+          pip install modelscope
+          modelscope download --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
+            --local_dir ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
+
+      - name: Run Pangu 1B accuracy and verification
+        env:
+          PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
+          PANGU1B_MIN_ACCURACY: 1.00
+        run: |
+          bash ./tests/system/run_pangu1b_acc_and_verify.sh
+          bash ./tests/system/run_pangu1b_online_and_verify.sh
