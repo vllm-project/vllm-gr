@@ -12,6 +12,8 @@ from vllm.entrypoints.openai.models.serving import (
 )
 from vllm.tokenizers import TokenizerLike
 
+from vllm_gr.config import GRConfig
+
 _original_init = OpenAIServingModels.__init__
 
 
@@ -60,12 +62,7 @@ def init_gr(
     self.catalog = None
     tokenizer = self.input_processor.tokenizer
     vllm_config = getattr(engine_client, "vllm_config", None)
-    additional_config = getattr(vllm_config, "additional_config", None)
-    catalog_path = (
-        additional_config.get("vllm_gr_catalog_path")
-        if isinstance(additional_config, dict)
-        else None
-    )
+    catalog_path = GRConfig.from_vllm_config(vllm_config).catalog_path
     if catalog_path:
         self.catalog = Catalog(tokenizer)
         self.catalog.load(catalog_path)

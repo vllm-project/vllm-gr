@@ -18,7 +18,16 @@ variants has been removed together with the recommend runtime.
 
 import logging
 
+from vllm_gr.config import GRAttentionBackend, GRConfig
+
 logger = logging.getLogger("vllm_gr.patch")
+
+
+def _get_current_gr_attention_backend() -> GRAttentionBackend | None:
+    """Read the validated GR backend marker used by the attention selector."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    return GRConfig.from_vllm_config(get_current_vllm_config_or_none()).attention_backend
 
 
 def _is_npu_platform() -> bool:
@@ -111,31 +120,20 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
         # We store a marker in additional_config (untouched by the platform)
         # and use it as a fallback here.
         if backend is None:
-            try:
-                from vllm.config import get_current_vllm_config_or_none
+            if _get_current_gr_attention_backend() is GRAttentionBackend.CUSTOM:
+                from vllm_gr.v1.attention.backends.beam_attn import (
+                    BeamAttentionBackend,
+                )
 
-                vllm_config = get_current_vllm_config_or_none()
-                if (
-                    vllm_config is not None
-                    and getattr(vllm_config, "additional_config", None)
-                    and isinstance(vllm_config.additional_config, dict)
-                    and vllm_config.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
-                ):
-                    from vllm_gr.v1.attention.backends.beam_attn import (
-                        BeamAttentionBackend,
+                required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
+                if required_layout is not None:
+                    from vllm.v1.attention.backends.utils import (
+                        set_kv_cache_layout,
                     )
 
-                    required_layout = BeamAttentionBackend.get_required_kv_cache_layout()
-                    if required_layout is not None:
-                        from vllm.v1.attention.backends.utils import (
-                            set_kv_cache_layout,
-                        )
+                    set_kv_cache_layout(required_layout)
 
-                        set_kv_cache_layout(required_layout)
-
-                    return BeamAttentionBackend
-            except Exception:
-                pass
+                return BeamAttentionBackend
 
         return original_cached_fn(backend, attn_selector_config, num_heads=num_heads)
 

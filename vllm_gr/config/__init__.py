@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Configuration module for vllm-GR.
+"""Typed configuration boundary for vLLM-GR."""
 
-After removing the GR adapter / FuXi runtime, this package no longer
-exports model-specific config classes. It is retained as an empty
-namespace for future use.
-"""
+from vllm_gr.config.models import GRAttentionBackend, GRConfig
+
+__all__ = ["GRAttentionBackend", "GRConfig"]
