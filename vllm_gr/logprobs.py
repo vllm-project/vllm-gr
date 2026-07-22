@@ -38,19 +38,23 @@ def extract_and_dedup_flat_logprobs(flat, logprobs_num):
     duplicate is position 0 (sampled token) when it also appears in the
     top-K (positions 1..K).  Returns exactly ``logprobs_num`` entries.
     """
-    start = flat.start_indices[0]
-    end = flat.end_indices[0]
-    token_ids = flat.token_ids[start:end]
-    lps = flat.logprobs[start:end]
-    ranks = flat.ranks[start:end]
-    decoded = flat.decoded_tokens[start:end]
-    if len(token_ids) > logprobs_num:
-        if any(token_ids[0] == token_ids[j] for j in range(1, logprobs_num + 1)):
-            s = slice(1, logprobs_num + 1)
-        else:
-            s = slice(logprobs_num)
-        token_ids, lps, ranks, decoded = (token_ids[s], lps[s], ranks[s], decoded[s])
-    return token_ids, lps, ranks, decoded
+    from vllm_gr.beam import deduplicate_segment
+
+    segment = deduplicate_segment(
+        flat.token_ids,
+        flat.logprobs,
+        flat.ranks,
+        flat.decoded_tokens,
+        start_offset=flat.start_indices[0],
+        end_offset=flat.end_indices[0],
+        candidate_count=logprobs_num,
+    )
+    return (
+        list(segment.token_ids),
+        list(segment.logprobs),
+        list(segment.ranks) if segment.ranks is not None else None,
+        list(segment.decoded_tokens) if segment.decoded_tokens is not None else None,
+    )
 
 
 def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):
