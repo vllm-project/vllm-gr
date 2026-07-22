@@ -86,28 +86,33 @@ def _apply_npu_default_block_size(config) -> None:
 
 
 def create_engine_config(self, usage_context=None, headless=False):
+    custom_backend = _user_requested_custom_backend(self)
+    if custom_backend:
+        # Register before vLLM validates the requested backend. CUDA can then
+        # use its native selection path; NPU intent is restored below if the
+        # Ascend platform hook erased it while creating the config.
+        from vllm_gr.v1.attention.backends import register_beam_attention_backend
+
+        register_beam_attention_backend()
+
     config = origin_create_engine_config(self, usage_context, headless)
     _apply_npu_default_block_size(config)
     catalog_path = getattr(self, "catalog_path", None)
-    custom_backend = _user_requested_custom_backend(self)
-    if catalog_path is not None or custom_backend:
+    if catalog_path is not None:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
         # forbidden. Keep GR-only values in VllmConfig.additional_config so
         # that they also survive process serialization.
         additional_config = config.additional_config
         if not isinstance(additional_config, dict):
             raise ValueError("vLLM-GR options require --additional-config to be a JSON object")
-        if catalog_path is not None:
-            additional_config["vllm_gr_catalog_path"] = catalog_path
-        if custom_backend:
-            additional_config["vllm_gr_attention_backend"] = "CUSTOM"
+        additional_config["vllm_gr_catalog_path"] = catalog_path
 
     if custom_backend:
-        attention_config = getattr(config, "attention_config", None)
-        if attention_config is not None and getattr(attention_config, "backend", None) is None:
-            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm_gr.platform.npu.attention_backend import (
+            preserve_custom_backend_intent,
+        )
 
-            attention_config.backend = AttentionBackendEnum.CUSTOM
+        preserve_custom_backend_intent(config, requested=True)
     return config
 
 
