@@ -1,13 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import argparse
 
-from vllm import LLM
-
-from vllm_gr.models.recif import beam_search, bytes_to_sid
+from vllm_gr.entrypoints.beam_search_config import BeamSearchModel
+from vllm_gr.entrypoints.gr import GRLLM
+from vllm_gr.sampling_params import BeamSearchParams
 
 
 def main():
     parser = argparse.ArgumentParser(description="RECIF offline beam search")
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model_path", required=True)
     parser.add_argument("--history", required=True)
     parser.add_argument("--bf", default="8,8,8")
     parser.add_argument("--beam", type=int, default=64)
@@ -16,29 +19,28 @@ def main():
     history_sids = [int(value) for value in args.history.split(",")]
     bf = tuple(int(value) for value in args.bf.split(","))
 
-    llm = LLM(
-        model=args.model,
+    llm = GRLLM(
+        model=args.model_path,
+        beam_search_model=BeamSearchModel.RECIF,
         max_logprobs=max(bf),
         skip_tokenizer_init=True,
-        max_num_seqs=args.beam,
-        # RECIF scores each SID level over its own 8192-token head.  Use
-        # probabilities after allowed_token_ids masks the other two heads.
+        max_num_seqs=max(args.beam, bf[0]),
         logprobs_mode="processed_logprobs",
     )
-    triples, scores = beam_search(
-        llm,
-        history_sids,
-        bf=bf,
-        beam=args.beam,
+    params = BeamSearchParams(
+        beam_width=args.beam,
+        max_tokens=3,
+        temperature=0.0,
+        ignore_eos=True,
+        branch_factors=bf,
+    )
+    outputs = llm.beam_search(
+        [{"history_sids": history_sids}],
+        params,
     )
 
-    for rank, ((sa, sb, sc), score) in enumerate(zip(triples, scores)):
-        print(
-            rank,
-            (int(sa), int(sb), int(sc)),
-            bytes_to_sid(sa, sb, sc),
-            float(score),
-        )
+    for rank, sequence in enumerate(outputs[0].sequences):
+        print(rank, getattr(sequence, "sid"), float(sequence.cum_logprob))
 
 
 if __name__ == "__main__":

@@ -13,3 +13,6 @@ class BeamSearchParams(
 
     begin_token: str | None = None
     end_token: str | None = None
+    # Per-level expansion widths for hierarchical SID models. Keeping this
+    # optional preserves the existing OneRec call contract.
+    branch_factors: tuple[int, int, int] | None = None

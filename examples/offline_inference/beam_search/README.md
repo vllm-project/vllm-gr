@@ -41,7 +41,8 @@ vLLM-gr with BW=128 took 0.627150 seconds
 
 ## RECIF
 
-RECIF uses vLLM's `LLM` with the `beam_search` helper from `vllm_gr.models.recif`:
+RECIF uses `GRLLM` with `BeamSearchModel.RECIF` and the common
+`GRLLM.beam_search()` entry point:
 
 ```bash
 python offline_recif_beam_search.py \

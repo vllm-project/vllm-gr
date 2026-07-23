@@ -32,6 +32,7 @@ import torch.nn as nn
 VOCAB = 8192
 NUM_SID_LEVELS = 3
 FULL_VOCAB = NUM_SID_LEVELS * VOCAB
+RECIF_ARCHITECTURE = "RecifForCausalLM"
 
 _ARCHITECTURE_KEYS = (
     "num_hidden_layers",
@@ -443,6 +444,106 @@ def beam_search(
     return triples.numpy(), scores.numpy()
 
 
+def prepare_beam_search_inputs(
+    llm: Any,
+    prompts: Sequence[Any],
+):
+    """Convert batched int64 SID histories to tokenizer-free vLLM prompts."""
+
+    from vllm.inputs import TokensPrompt
+
+    from vllm_gr.entrypoints.beam_search_config import PreparedBeamInputs
+
+    token_prompts: list[TokensPrompt] = []
+    for index, prompt in enumerate(prompts):
+        if not isinstance(prompt, Mapping) or "history_sids" not in prompt:
+            raise TypeError(
+                "RECIF prompts must contain 'history_sids'; "
+                f"invalid prompt at index {index}"
+            )
+        history_sids = prompt["history_sids"]
+        if not isinstance(history_sids, Sequence) or isinstance(
+            history_sids, (str, bytes)
+        ):
+            raise TypeError("RECIF history_sids must be a sequence of integers")
+        token_ids = build_prefix(history_sids, "cpu")[0].tolist()
+        token_prompts.append(TokensPrompt(prompt_token_ids=token_ids))
+
+    engine_inputs = list(llm._preprocess_cmpl(token_prompts))
+    generated_starts = []
+    for prompt in engine_inputs:
+        decoder_prompt = (
+            prompt if prompt["type"] != "enc_dec" else prompt["decoder_prompt"]
+        )
+        generated_starts.append(len(decoder_prompt["prompt_token_ids"]))
+    return PreparedBeamInputs(
+        engine_inputs=engine_inputs,
+        generated_starts=generated_starts,
+        output_starts=list(generated_starts),
+        prompt_texts=[""] * len(engine_inputs),
+    )
+
+
+def build_beam_search_steps(params: Any):
+    """Build RECIF's three per-level expansion and token-range policies."""
+
+    from vllm_gr.entrypoints.beam_search_config import BeamSearchStep
+
+    branch_factors = getattr(params, "branch_factors", None) or (8, 8, 8)
+    if len(branch_factors) != NUM_SID_LEVELS:
+        raise ValueError("RECIF branch_factors must contain exactly three values")
+    if any(value < 1 or value > VOCAB for value in branch_factors):
+        raise ValueError("RECIF branch_factors values must be in [1, 8192]")
+
+    steps: list[BeamSearchStep] = []
+    for level, expand_width in enumerate(branch_factors):
+        start = level * VOCAB
+        keep_width = branch_factors[0] if level == 0 else params.beam_width
+        steps.append(
+            BeamSearchStep(
+                expand_width=expand_width,
+                keep_width=keep_width,
+                allowed_token_ids=list(range(start, start + VOCAB)),
+            )
+        )
+    return steps
+
+
+def finalize_beam_search_outputs(
+    instances: list[Any],
+    prepared: Any,
+    initial_logprobs: Any,
+    beam_width: int,
+):
+    """Convert each winning three-token RECIF path back to an int64 SID."""
+
+    from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
+
+    from vllm_gr.entrypoints.beam_search_config import select_best_beams
+    from vllm_gr.logprobs import reconstruct_beam_logprobs
+
+    outputs = []
+    for index, instance in enumerate(instances):
+        best_beams = select_best_beams(instance, beam_width)
+        prompt_len = prepared.output_starts[index]
+        for result in best_beams:
+            reconstruct_beam_logprobs(result, initial_logprobs)
+            generated_tokens = result.tokens[prompt_len:]
+            if len(generated_tokens) != NUM_SID_LEVELS:
+                raise RuntimeError(
+                    "RECIF beam search must generate three SID levels"
+                )
+            sid = bytes_to_sid(
+                generated_tokens[0],
+                generated_tokens[1] - VOCAB,
+                generated_tokens[2] - 2 * VOCAB,
+            )
+            result.text = str(sid)
+            setattr(result, "sid", sid)
+        outputs.append(BeamSearchOutput(sequences=best_beams))
+    return outputs
+
+
 def register_recif_model() -> None:
     """Register the custom architecture before constructing ``vllm.LLM``."""
 
@@ -452,7 +553,7 @@ def register_recif_model() -> None:
         return
 
     ModelRegistry.register_model(
-        "RecifForCausalLM",
+        RECIF_ARCHITECTURE,
         "vllm_gr.models.recif:RecifForCausalLM",
     )
 
@@ -460,13 +561,17 @@ def register_recif_model() -> None:
 __all__ = [
     "FULL_VOCAB",
     "NUM_SID_LEVELS",
+    "RECIF_ARCHITECTURE",
     "RecifForCausalLM",
     "VOCAB",
     "architecture_from_config",
     "beam_search",
     "build_prefix",
+    "build_beam_search_steps",
     "bytes_to_sid",
     "megatron_to_hf",
+    "finalize_beam_search_outputs",
+    "prepare_beam_search_inputs",
     "prepare_vllm_weights",
     "register_recif_model",
     "sid_to_bytes",
