@@ -165,11 +165,6 @@ def apply_engine_core_child_patches():
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
 
-    from vllm.sampling_params import SamplingParams
-
-    # Force the greedy verification check to be a no-op to allow n > 1 under greedy beam search parameters
-    SamplingParams._verify_greedy_sampling = lambda self: None
-
     # Apply scheduler patches in the child process
     apply_scheduler_patch()
 
@@ -275,6 +270,38 @@ def run_engine_core(
         _run_engine_core_active = False
 
 
+def _build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional[Dict[str, Any]]:
+    """Build scheduler metadata for a grouped beam-decode request.
+
+    ``beam_width`` is execution metadata carried by ``BeamRequestStepUpdate``;
+    it must never be inferred from ``SamplingParams.n`` or silently defaulted.
+    A missing or invalid value means the EngineCore protocol chain is broken,
+    so fail before the model runner can execute with incorrect batch geometry.
+    """
+    if not getattr(req, "is_beam_decode", False):
+        return None
+
+    if not hasattr(req, "beam_width"):
+        raise RuntimeError(
+            f"Grouped beam request {req.request_id!r} is missing required beam_width metadata"
+        )
+
+    beam_width = req.beam_width
+    if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 1:
+        raise RuntimeError(
+            f"Grouped beam request {req.request_id!r} has invalid beam_width={beam_width!r}; "
+            "expected a positive integer"
+        )
+
+    return {
+        "is_beam_decode": True,
+        "beam_width": beam_width,
+        "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
+        "prefix_len": getattr(req, "prefix_len", 0),
+        "cache_len": req.num_computed_tokens - num_scheduled_tokens,
+    }
+
+
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from functools import wraps
@@ -309,15 +336,12 @@ def apply_scheduler_patch():
             if hasattr(output, "num_scheduled_tokens"):
                 for req_id in output.num_scheduled_tokens.keys():
                     req = self.requests.get(req_id)
-                    if req and getattr(req, "is_beam_decode", False):
-                        beam_data[req_id] = {
-                            "is_beam_decode": True,
-                            "beam_width": getattr(req, "beam_width", 1),
-                            "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
-                            "prefix_len": getattr(req, "prefix_len", 0),
-                            "cache_len": req.num_computed_tokens
-                            - output.num_scheduled_tokens[req_id],
-                        }
+                    if req:
+                        metadata = _build_beam_request_metadata(
+                            req, output.num_scheduled_tokens[req_id]
+                        )
+                        if metadata is not None:
+                            beam_data[req_id] = metadata
             output.beam_data = beam_data
             return output
         finally:

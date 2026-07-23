@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import copy
 import time
 from collections.abc import AsyncGenerator, Mapping
 
@@ -17,6 +16,7 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
+from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
@@ -117,11 +117,9 @@ async def _beam_request_step(
         full_tokens = all_beams[new_idx].tokens
         beam_tokens.append(full_tokens[prefix_len:])
 
-    # -------------------------------------------------------------------------
-    # Declare true active beam sizing directly to the core sampler
-    # -------------------------------------------------------------------------
-    decode_sampling_params = copy.copy(beam_search_params)
-    decode_sampling_params.n = beam_width  # Explicitly tell the engine we have beam_width beams
+    # SamplingParams.n retains its upstream meaning: this is one logical
+    # request. The active beam count is carried explicitly by beam_width.
+    decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params)
 
     # Listen exclusively to the parent session_id stream queue
     q = engine_client.register_beam_output(
