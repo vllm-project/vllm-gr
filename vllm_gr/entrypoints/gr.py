@@ -33,6 +33,11 @@ from vllm.logprobs import FlatLogprobs
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
+from vllm_gr.beam_search_decision_utils import (
+    extract_and_dedup_segment,
+    find_eos_indices,
+    select_top_indices,
+)
 from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     extract_and_dedup_flat_logprobs,
@@ -54,35 +59,6 @@ logger = init_logger(__name__)
 def _create_tokens_prompt_from_beam(beam: "BeamSearchSequence") -> "TokensPrompt":
     """Create a TokensPrompt payload from a BeamSearchSequence."""
     return beam.get_prompt()
-
-
-def _extract_and_dedup_segment(
-    raw_token_ids: list[int],
-    raw_logprobs: list[float],
-    raw_ranks: list[int] | None,
-    raw_decoded: list[str] | None,
-    start_offset: int,
-    end_offset: int,
-    logprobs_num: int,
-) -> tuple[list[int], list[float], list[int] | None, list[str] | None]:
-    """Extract a slice of token ids, logprobs, ranks, and decoded tokens and dedup."""
-    token_ids_pos = raw_token_ids[start_offset:end_offset]
-    logprobs_pos = raw_logprobs[start_offset:end_offset]
-    ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
-    decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
-
-    # Dedup the sampled token (index 0) if it appears in the top-K
-    if len(token_ids_pos) > logprobs_num:
-        if any(token_ids_pos[0] == token_ids_pos[j] for j in range(1, logprobs_num + 1)):
-            s = slice(1, logprobs_num + 1)
-        else:
-            s = slice(logprobs_num)
-        token_ids_pos = token_ids_pos[s]
-        logprobs_pos = logprobs_pos[s]
-        ranks_pos = ranks_pos[s] if ranks_pos is not None else None
-        decoded_pos = decoded_pos[s] if decoded_pos is not None else None
-
-    return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
 
 
 def _beam_request_cleanup(llm_engine, session_id: str, final_ids: list[str]) -> None:
@@ -291,7 +267,7 @@ def _parse_step_logprobs(
             start_offset = b_idx * stride_k
             end_offset = start_offset + stride_k
 
-            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = _extract_and_dedup_segment(
+            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_segment(
                 raw_token_ids,
                 raw_logprobs,
                 raw_ranks,
@@ -341,7 +317,7 @@ def _handle_eos_beams(
     initial_logprobs: "FlatLogprobs",
 ) -> np.ndarray:
     """Detect and process EOS termination for beams, masking their logprobs to -inf."""
-    eos_idx = np.where(all_beams_token_id == tokenizer.eos_token_id)[0]
+    eos_idx = find_eos_indices(all_beams_token_id, tokenizer.eos_token_id)
     for idx in eos_idx:
         beam_idx = idx // logprobs_num
         current_beam = instance.beams[beam_idx]
@@ -375,10 +351,7 @@ def _select_top_beams(
     initial_logprobs: "FlatLogprobs",
 ) -> list[tuple[int, int]]:
     """Select the top candidates, update instance.beams, and return new fork info."""
-    if all_beams_logprob.size > beam_width:
-        topn_idx = np.argpartition(np.negative(all_beams_logprob), beam_width)[:beam_width]
-    else:
-        topn_idx = np.arange(all_beams_logprob.size)
+    topn_idx = select_top_indices(all_beams_logprob, beam_width)
 
     new_beams = []
     for idx in topn_idx:
@@ -818,7 +791,10 @@ class GRLLM(LLM):
                         all_beams_logprob = np.array(all_beams_logprob)
                         # Handle EOS tokens
                         if not ignore_eos:
-                            eos_idx = np.where(all_beams_token_id == tokenizer.eos_token_id)[0]
+                            eos_idx = find_eos_indices(
+                                all_beams_token_id,
+                                tokenizer.eos_token_id,
+                            )
                             for idx in eos_idx:
                                 beam_idx = idx // logprobs_num
                                 current_beam = all_beams[start:end][beam_idx]
@@ -839,12 +815,7 @@ class GRLLM(LLM):
                             all_beams_logprob[eos_idx] = -np.inf
 
                         # Select top beams
-                        if len(all_beams_logprob) <= beam_width:
-                            topn_idx = np.arange(len(all_beams_logprob))
-                        else:
-                            topn_idx = np.argpartition(np.negative(all_beams_logprob), beam_width)[
-                                :beam_width
-                            ]
+                        topn_idx = select_top_indices(all_beams_logprob, beam_width)
                         new_beams = []
                         for idx in topn_idx:
                             beam_idx = idx // logprobs_num
