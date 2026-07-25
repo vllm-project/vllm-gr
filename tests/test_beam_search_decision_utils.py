@@ -7,6 +7,7 @@ import pytest
 from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_segment,
     find_eos_indices,
+    mask_candidate_logprobs,
     select_top_indices,
 )
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs
@@ -85,6 +86,36 @@ def test_logprobs_wrapper_uses_shared_legacy_extraction() -> None:
         [2, 3, 4],
         ["b", "c", "d"],
     )
+
+
+def test_mask_candidate_logprobs_without_catalog_returns_list_copy() -> None:
+    logprobs = [-0.1, -0.2]
+
+    result = mask_candidate_logprobs([7, 3], logprobs, None)
+
+    assert result == logprobs
+    assert result is not logprobs
+
+
+def test_mask_candidate_logprobs_preserves_candidates_and_order() -> None:
+    result = mask_candidate_logprobs(
+        [7, 3, 5, 9],
+        [-0.1, -float("inf"), -0.3, -0.4],
+        {3, 9},
+    )
+
+    assert result == [-float("inf"), -float("inf"), -float("inf"), -0.4]
+    assert len(result) == 4
+
+
+def test_mask_candidate_logprobs_preserves_legacy_zip_length() -> None:
+    result = mask_candidate_logprobs(
+        [7, 3, 5],
+        [-0.1, -0.2],
+        set(),
+    )
+
+    assert result == [-float("inf"), -float("inf")]
 
 
 def test_find_eos_indices_matches_parent_expression() -> None:

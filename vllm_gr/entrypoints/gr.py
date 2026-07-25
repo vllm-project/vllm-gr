@@ -18,6 +18,7 @@ LLM path.
 import copy
 import gc
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
@@ -36,6 +37,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_segment,
     find_eos_indices,
+    mask_candidate_logprobs,
     select_top_indices,
 )
 from vllm_gr.logger import init_logger
@@ -54,6 +56,14 @@ if TYPE_CHECKING:
     from vllm.sampling_params import BeamSearchParams
 
 logger = init_logger(__name__)
+
+BeamCandidateCache = tuple[
+    Sequence[int],
+    Sequence[float],
+    Sequence[int | None] | None,
+    Sequence[str | None] | None,
+]
+ForkInfo = list[tuple[int, int]]
 
 
 def _create_tokens_prompt_from_beam(beam: "BeamSearchSequence") -> "TokensPrompt":
@@ -92,7 +102,7 @@ def _prepare_beam_step_requests(
     sid_end_token_id: int | None,
     instance_prefill_id: dict[int, str],
     instance_prev_beam_internal_ids: dict[int, list[str]],
-    instance_fork_info: dict[int, list],
+    instance_fork_info: dict[int, ForkInfo],
     instance_prefix_len: dict[int, int],
     instance_completed_sessions: set[int],
 ) -> list["EngineCoreRequest"]:
@@ -229,9 +239,9 @@ def _parse_step_logprobs(
     instance: "BeamSearchInstance",
     token: int,
     logprobs_num: int,
-    fork_info_j: list | None,
+    fork_info_j: ForkInfo | None,
     catalog: Optional[Any] = None,
-) -> tuple[bool, list[int], list[float], list[tuple]]:
+) -> tuple[bool, list[int], list[float], list[BeamCandidateCache]]:
     """Parse flat logprobs from engine step results.
 
     Returns:
@@ -245,7 +255,7 @@ def _parse_step_logprobs(
 
     all_beams_token_id = []
     all_beams_logprob = []
-    beam_flat_cache = []
+    beam_flat_cache: list[BeamCandidateCache] = []
 
     flat = result.outputs[0].logprobs
     if flat is None:
@@ -279,10 +289,11 @@ def _parse_step_logprobs(
             if catalog is not None:
                 generated_tokens = current_beam.tokens[instance.prompt_len :]
                 valid_tokens_set = catalog.valid(generated_tokens)
-                logprobs_pos = [
-                    lp if token_id in valid_tokens_set else -float("inf")
-                    for token_id, lp in zip(token_ids_pos, logprobs_pos)
-                ]
+                logprobs_pos = mask_candidate_logprobs(
+                    token_ids_pos,
+                    logprobs_pos,
+                    valid_tokens_set,
+                )
 
             beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
             all_beams_token_id.extend(token_ids_pos)
@@ -295,10 +306,11 @@ def _parse_step_logprobs(
             current_beam = instance.beams[0]
             generated_tokens = current_beam.tokens[instance.prompt_len :]
             valid_tokens_set = catalog.valid(generated_tokens)
-            logprobs_pos = [
-                lp if token_id in valid_tokens_set else -float("inf")
-                for token_id, lp in zip(token_ids_pos, logprobs_pos)
-            ]
+            logprobs_pos = mask_candidate_logprobs(
+                token_ids_pos,
+                logprobs_pos,
+                valid_tokens_set,
+            )
 
         beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
         all_beams_token_id.extend(token_ids_pos)
@@ -307,73 +319,74 @@ def _parse_step_logprobs(
     return False, all_beams_token_id, all_beams_logprob, beam_flat_cache
 
 
-def _handle_eos_beams(
-    instance: "BeamSearchInstance",
-    all_beams_token_id: np.ndarray,
-    all_beams_logprob: np.ndarray,
-    beam_flat_cache: list,
-    logprobs_num: int,
-    tokenizer,
+def _complete_eos_candidates(
+    *,
+    completed: list["BeamSearchSequence"],
+    parents: Sequence["BeamSearchSequence"],
+    token_ids: np.ndarray,
+    scores: np.ndarray,
+    beam_flat_cache: Sequence[BeamCandidateCache],
+    candidates_per_parent: int,
+    eos_token_id: int,
     initial_logprobs: "FlatLogprobs",
 ) -> np.ndarray:
-    """Detect and process EOS termination for beams, masking their logprobs to -inf."""
-    eos_idx = find_eos_indices(all_beams_token_id, tokenizer.eos_token_id)
-    for idx in eos_idx:
-        beam_idx = idx // logprobs_num
-        current_beam = instance.beams[beam_idx]
-        cached = beam_flat_cache[beam_idx]
-        assert cached is not None
+    """Complete EOS candidates and return a masked score copy."""
+
+    eos_indices = find_eos_indices(token_ids, eos_token_id)
+    for candidate_index in eos_indices:
+        parent_index = candidate_index // candidates_per_parent
+        parent = parents[parent_index]
         eos_beam = BeamSearchSequence(
-            orig_prompt=current_beam.orig_prompt,
-            tokens=current_beam.tokens + [tokenizer.eos_token_id],
+            orig_prompt=parent.orig_prompt,
+            tokens=parent.tokens + [eos_token_id],
             logprobs=initial_logprobs,
-            cum_logprob=float(all_beams_logprob[idx]),
+            cum_logprob=float(scores[candidate_index]),
             finish_reason="stop",
-            stop_reason=tokenizer.eos_token_id,
-            lora_request=current_beam.lora_request,
+            stop_reason=eos_token_id,
+            lora_request=parent.lora_request,
         )
-        eos_beam._lp_parent = current_beam
-        eos_beam._lp_step_data = cached
-        instance.completed.append(eos_beam)
+        eos_beam._lp_parent = parent
+        eos_beam._lp_step_data = beam_flat_cache[parent_index]
+        completed.append(eos_beam)
 
-    all_beams_logprob_copy = all_beams_logprob.copy()
-    all_beams_logprob_copy[eos_idx] = -np.inf
-    return all_beams_logprob_copy
+    masked_scores = scores.copy()
+    masked_scores[eos_indices] = -np.inf
+    return masked_scores
 
 
-def _select_top_beams(
-    instance: "BeamSearchInstance",
-    all_beams_token_id: np.ndarray,
-    all_beams_logprob: np.ndarray,
-    beam_flat_cache: list,
-    beam_width: int,
-    logprobs_num: int,
+def _materialize_selected_beams(
+    *,
+    parents: Sequence["BeamSearchSequence"],
+    selected_indices: Sequence[int],
+    token_ids: np.ndarray,
+    scores: np.ndarray,
+    beam_flat_cache: Sequence[BeamCandidateCache],
+    candidates_per_parent: int,
     initial_logprobs: "FlatLogprobs",
-) -> list[tuple[int, int]]:
-    """Select the top candidates, update instance.beams, and return new fork info."""
-    topn_idx = select_top_indices(all_beams_logprob, beam_width)
+) -> tuple[list["BeamSearchSequence"], ForkInfo]:
+    """Build selected child beams and their grouped-request fork mapping."""
 
-    new_beams = []
-    for idx in topn_idx:
-        beam_idx = idx // logprobs_num
-        current_beam = instance.beams[beam_idx]
-        token_id = int(all_beams_token_id[idx])
-        cached = beam_flat_cache[beam_idx]
+    new_beams: list[BeamSearchSequence] = []
+    fork_info: ForkInfo = []
+    for candidate_index in selected_indices:
+        parent_index = candidate_index // candidates_per_parent
+        parent = parents[parent_index]
+        token_id = int(token_ids[candidate_index])
+        cached = beam_flat_cache[parent_index]
         assert cached is not None
         new_beam = BeamSearchSequence(
-            orig_prompt=current_beam.orig_prompt,
-            tokens=current_beam.tokens + [token_id],
+            orig_prompt=parent.orig_prompt,
+            tokens=parent.tokens + [token_id],
             logprobs=initial_logprobs,
-            lora_request=current_beam.lora_request,
-            cum_logprob=float(all_beams_logprob[idx]),
+            lora_request=parent.lora_request,
+            cum_logprob=float(scores[candidate_index]),
         )
-        new_beam._lp_parent = current_beam
+        new_beam._lp_parent = parent
         new_beam._lp_step_data = cached
         new_beams.append(new_beam)
+        fork_info.append((parent_index, token_id))
 
-    instance.beams = new_beams
-
-    return [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
+    return new_beams, fork_info
 
 
 def _custom_beam_search_batch(
@@ -391,11 +404,11 @@ def _custom_beam_search_batch(
     catalog: Optional[Any] = None,
 ) -> None:
     """Run beam search in batch mode for custom attention backend."""
-    instance_prefill_id = {}
-    instance_prev_beam_internal_ids = {}
-    instance_fork_info = {}
-    instance_prefix_len = {}
-    instance_completed_sessions = set()
+    instance_prefill_id: dict[int, str] = {}
+    instance_prev_beam_internal_ids: dict[int, list[str]] = {}
+    instance_fork_info: dict[int, ForkInfo] = {}
+    instance_prefix_len: dict[int, int] = {}
+    instance_completed_sessions: set[int] = set()
 
     for token in token_iter:
         # Check if all instances are done
@@ -474,25 +487,28 @@ def _custom_beam_search_batch(
             all_beams_token_id = np.array(all_beams_token_id)
             all_beams_logprob = np.array(all_beams_logprob)
             if not ignore_eos:
-                all_beams_logprob = _handle_eos_beams(
-                    instance=instance,
-                    all_beams_token_id=all_beams_token_id,
-                    all_beams_logprob=all_beams_logprob,
+                all_beams_logprob = _complete_eos_candidates(
+                    completed=instance.completed,
+                    parents=instance.beams,
+                    token_ids=all_beams_token_id,
+                    scores=all_beams_logprob,
                     beam_flat_cache=beam_flat_cache,
-                    logprobs_num=logprobs_num,
-                    tokenizer=tokenizer,
+                    candidates_per_parent=logprobs_num,
+                    eos_token_id=tokenizer.eos_token_id,
                     initial_logprobs=initial_logprobs,
                 )
 
-            fork_info = _select_top_beams(
-                instance=instance,
-                all_beams_token_id=all_beams_token_id,
-                all_beams_logprob=all_beams_logprob,
+            topn_idx = select_top_indices(all_beams_logprob, beam_width)
+            new_beams, fork_info = _materialize_selected_beams(
+                parents=instance.beams,
+                selected_indices=topn_idx,
+                token_ids=all_beams_token_id,
+                scores=all_beams_logprob,
                 beam_flat_cache=beam_flat_cache,
-                beam_width=beam_width,
-                logprobs_num=logprobs_num,
+                candidates_per_parent=logprobs_num,
                 initial_logprobs=initial_logprobs,
             )
+            instance.beams = new_beams
             instance_fork_info[j] = fork_info
 
     # Step 4: Cleanup completed sessions
@@ -754,7 +770,7 @@ class GRLLM(LLM):
                         # Gather all logprobs and cumulative scores for this instance
                         all_beams_token_id = []
                         all_beams_logprob = []
-                        beam_flat_cache: list[tuple | None] = []
+                        beam_flat_cache: list[BeamCandidateCache] = []
                         beam_outputs = output[start:end]  # outputs for this instance's beams
 
                         for i, (current_beam, result) in enumerate(
@@ -767,10 +783,11 @@ class GRLLM(LLM):
                                 )
                                 if has_catalog:
                                     valid_tokens_set = valid_tokens_sets[start + i]
-                                    logprobs_pos = [
-                                        lp if token_id in valid_tokens_set else -float("inf")
-                                        for token_id, lp in zip(token_ids_pos, logprobs_pos)
-                                    ]
+                                    logprobs_pos = mask_candidate_logprobs(
+                                        token_ids_pos,
+                                        logprobs_pos,
+                                        valid_tokens_set,
+                                    )
                                 beam_flat_cache.append(
                                     (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)
                                 )
@@ -791,47 +808,28 @@ class GRLLM(LLM):
                         all_beams_logprob = np.array(all_beams_logprob)
                         # Handle EOS tokens
                         if not ignore_eos:
-                            eos_idx = find_eos_indices(
-                                all_beams_token_id,
-                                tokenizer.eos_token_id,
+                            all_beams_logprob = _complete_eos_candidates(
+                                completed=instance.completed,
+                                parents=all_beams[start:end],
+                                token_ids=all_beams_token_id,
+                                scores=all_beams_logprob,
+                                beam_flat_cache=beam_flat_cache,
+                                candidates_per_parent=logprobs_num,
+                                eos_token_id=tokenizer.eos_token_id,
+                                initial_logprobs=initial_logprobs,
                             )
-                            for idx in eos_idx:
-                                beam_idx = idx // logprobs_num
-                                current_beam = all_beams[start:end][beam_idx]
-                                cached = beam_flat_cache[beam_idx]
-                                completed_beam = BeamSearchSequence(
-                                    orig_prompt=current_beam.orig_prompt,
-                                    tokens=current_beam.tokens + [tokenizer.eos_token_id],
-                                    logprobs=initial_logprobs,
-                                    cum_logprob=float(all_beams_logprob[idx]),
-                                    finish_reason="stop",
-                                    stop_reason=tokenizer.eos_token_id,
-                                    lora_request=current_beam.lora_request,
-                                )
-                                completed_beam._lp_parent = current_beam
-                                completed_beam._lp_step_data = cached
-                                instance.completed.append(completed_beam)
-                            # Exclude EOS from further consideration
-                            all_beams_logprob[eos_idx] = -np.inf
 
                         # Select top beams
                         topn_idx = select_top_indices(all_beams_logprob, beam_width)
-                        new_beams = []
-                        for idx in topn_idx:
-                            beam_idx = idx // logprobs_num
-                            current_beam = all_beams[start:end][beam_idx]
-                            cached = beam_flat_cache[beam_idx]
-                            new_beam = BeamSearchSequence(
-                                orig_prompt=current_beam.orig_prompt,
-                                tokens=current_beam.tokens + [int(all_beams_token_id[idx])],
-                                logprobs=initial_logprobs,
-                                cum_logprob=float(all_beams_logprob[idx]),
-                                lora_request=current_beam.lora_request,
-                            )
-                            new_beam._lp_parent = current_beam
-                            new_beam._lp_step_data = cached
-                            new_beams.append(new_beam)
-
+                        new_beams, _ = _materialize_selected_beams(
+                            parents=all_beams[start:end],
+                            selected_indices=topn_idx,
+                            token_ids=all_beams_token_id,
+                            scores=all_beams_logprob,
+                            beam_flat_cache=beam_flat_cache,
+                            candidates_per_parent=logprobs_num,
+                            initial_logprobs=initial_logprobs,
+                        )
                         instance.beams = new_beams
 
         outputs = []

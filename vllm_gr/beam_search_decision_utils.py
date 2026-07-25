@@ -8,9 +8,24 @@ on the same lists and arrays as the original implementation and do not create
 an intermediate beam domain model.
 """
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 import numpy as np
+
+
+def mask_candidate_logprobs(
+    token_ids: Sequence[int],
+    logprobs: Sequence[float],
+    allowed_token_ids: Collection[int] | None,
+) -> list[float]:
+    """Mask disallowed candidates without filtering or reordering them."""
+
+    if allowed_token_ids is None:
+        return list(logprobs)
+    return [
+        logprob if token_id in allowed_token_ids else -float("inf")
+        for token_id, logprob in zip(token_ids, logprobs)
+    ]
 
 
 def extract_and_dedup_segment(
