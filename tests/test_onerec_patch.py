@@ -93,9 +93,9 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
     - vllm.benchmarks.lib.endpoint_request_func (ASYNC_REQUEST_FUNCS dict)
 
     Also satisfies the side-effect imports the patch module performs
-    (``from vllm import LLM``, ``from vllm.distributed.parallel_state import
-    cleanup_dist_env_and_memory``, etc.) by leaving them as bare ModuleType
-    attributes — the patch module only needs them importable, not functional.
+    (for example, ``from vllm import LLM``) by leaving them as bare
+    ModuleType attributes — the patch module only needs them importable,
+    not functional.
     """
     modules: dict[str, types.ModuleType] = {}
 
@@ -226,10 +226,6 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
     ):
         setattr(erf, sym, type(sym, (), {}))
     erf.RequestFuncInput.__init__ = lambda self, *a, **k: None
-
-    # vllm.distributed.parallel_state.cleanup_dist_env_and_memory
-    ps_mod = _get_or_create("vllm.distributed.parallel_state")
-    ps_mod.cleanup_dist_env_and_memory = lambda *a, **k: None  # type: ignore[attr-defined]
 
     return modules
 
@@ -370,6 +366,66 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
             patch_mod.patched_async_request_openai_chat_completions,
             "ASYNC_REQUEST_FUNCS['openai-chat'] not patched",
         )
+
+    def test_explicit_patch_import_does_not_register_atexit_cleanup(self) -> None:
+        """Online benchmark clients must not run engine cleanup at process exit."""
+        with mock.patch("atexit.register") as register:
+            import benchmarks.open_one_rec.one_rec_patch  # noqa: F401
+
+        register.assert_not_called()
+
+    def test_offline_beam_search_scopes_engine_cleanup(self) -> None:
+        """The offline path still closes the GRLLM instance that it owns."""
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+        from benchmarks.open_one_rec import open_one_rec_dataset
+
+        class _StubBeamSearchParams:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        sampling_params = types.ModuleType("vllm_gr.sampling_params")
+        sampling_params.BeamSearchParams = _StubBeamSearchParams  # type: ignore[attr-defined]
+        sys.modules[sampling_params.__name__] = sampling_params
+        self._stub_modules[sampling_params.__name__] = sampling_params
+
+        entrypoints = types.ModuleType("vllm_gr.entrypoints")
+        entrypoints.__path__ = []
+        gr_module = types.ModuleType("vllm_gr.entrypoints.gr")
+        engine = mock.MagicMock()
+        engine.__enter__.return_value = engine
+        engine.beam_search.return_value = []
+        gr_module.GRLLM = mock.Mock(return_value=engine)  # type: ignore[attr-defined]
+        entrypoints.gr = gr_module  # type: ignore[attr-defined]
+        sys.modules[entrypoints.__name__] = entrypoints
+        sys.modules[gr_module.__name__] = gr_module
+        self._stub_modules[entrypoints.__name__] = entrypoints
+        self._stub_modules[gr_module.__name__] = gr_module
+
+        request = types.SimpleNamespace(prompt="prompt", expected_output_len=2)
+        dataset = mock.MagicMock()
+        dataset.sample.return_value = [request]
+        dataset_class = mock.Mock(return_value=dataset)
+
+        transformers = sys.modules["transformers"]
+        args = types.SimpleNamespace(
+            model="fake-model",
+            dataset_path="./data",
+            task_types="ad",
+            num_prompts=1,
+            n=2,
+            output_len=None,
+            output_json=None,
+        )
+
+        with (
+            mock.patch.object(open_one_rec_dataset, "OneRecDataset", dataset_class),
+            mock.patch.object(transformers, "AutoTokenizer") as auto_tokenizer,
+        ):
+            auto_tokenizer.from_pretrained.return_value = object()
+            patch_mod._run_offline_beam_search_benchmark(args)
+
+        engine.__enter__.assert_called_once_with()
+        engine.__exit__.assert_called_once()
 
     def test_idempotent_reimport_keeps_patches(self) -> None:
         """Re-importing the patch module (sys.modules cache hit) MUST NOT undo patches."""
