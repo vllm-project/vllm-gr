@@ -10,9 +10,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
+from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
+from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
 logger = init_logger(__name__)
 
@@ -48,81 +49,6 @@ def make_patched_engine_core_init(original_init):
 
 
 # ---------------------------------------------------------------------------
-# Helpers: add enum members to EngineCoreRequestType at runtime
-# ---------------------------------------------------------------------------
-
-
-def _add_enum_member(name: str, value: bytes) -> None:
-    """Dynamically add a member to EngineCoreRequestType if absent.
-
-    This uses object.__new__() to bypass enum's normal creation pathway,
-    which is necessary because we're monkey-patching at runtime and cannot
-    modify the original class definition in vLLM's codebase.
-
-    While this approach manipulates enum internals, it:
-    - Is a standard technique used by enum extension libraries (e.g. aenum)
-    - Includes validation to detect incompatibilities early
-    - Is contained to initialization time (not runtime performance critical)
-    - Is tested to ensure correctness
-
-    Args:
-        name: The name of the new enum member (e.g., "ADD_BATCH")
-        value: The byte value for the enum member (e.g., b"\\x05")
-
-    Raises:
-        RuntimeError: If the enum's internal structure is incompatible
-    """
-    # Skip if already added with the expected wire value.
-    if hasattr(EngineCoreRequestType, name):
-        existing = getattr(EngineCoreRequestType, name)
-        if existing.value != value:
-            raise RuntimeError(
-                f"EngineCoreRequestType.{name} already exists with wire value "
-                f"{existing.value!r}, expected {value!r}"
-            )
-        return
-
-    # Validate that the enum has expected internal structure
-    required_attrs = ["_value2member_map_", "_member_map_", "_member_names_"]
-    for attr in required_attrs:
-        if not hasattr(EngineCoreRequestType, attr):
-            raise RuntimeError(
-                f"EngineCoreRequestType missing expected attribute '{attr}'. "
-                f"This indicates an incompatible Python/vLLM version. "
-                f"Please report this issue with your Python version."
-            )
-
-    # Verify the value type matches existing members
-    if EngineCoreRequestType._value2member_map_:
-        existing_value_type = type(next(iter(EngineCoreRequestType._value2member_map_.keys())))
-        if not isinstance(value, existing_value_type):
-            raise TypeError(
-                f"Value type mismatch: expected {existing_value_type.__name__}, "
-                f"got {type(value).__name__}"
-            )
-        if value in EngineCoreRequestType._value2member_map_:
-            existing = EngineCoreRequestType._value2member_map_[value]
-            raise RuntimeError(
-                f"EngineCoreRequestType wire value {value!r} is already used by "
-                f"{existing.name}; cannot register {name}"
-            )
-
-    # Create the member instance bypassing enum's __new__
-    # (This is the standard approach for runtime enum extension)
-    member = object.__new__(EngineCoreRequestType)
-    member._name_ = name
-    member._value_ = value
-
-    # Register in enum's internal maps
-    EngineCoreRequestType._value2member_map_[value] = member
-    EngineCoreRequestType._member_map_[name] = member
-    EngineCoreRequestType._member_names_.append(name)
-
-    # Set as class attribute (must use type.__setattr__ to bypass enum's __setattr__)
-    type.__setattr__(EngineCoreRequestType, name, member)
-
-
-# ---------------------------------------------------------------------------
 # Child-process patch applicator — called from patched run_engine_core
 # ---------------------------------------------------------------------------
 
@@ -139,10 +65,7 @@ def apply_engine_core_request_patches() -> None:
 
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
-    # Add new enum members: ADD_BATCH, BEAM_REQUEST_STEP_UPDATE
-    # 0x05 is reserved by vLLM 0.22 for WAKEUP.
-    _add_enum_member("ADD_BATCH", b"\x06")
-    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
+    register_engine_core_request_types()
 
     # Wrap both constructors. Patching EngineCoreProc explicitly protects
     # against changes in upstream inheritance and plugin loading order.
@@ -274,42 +197,8 @@ def run_engine_core(
         _run_engine_core_active = False
 
 
-def _build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional[Dict[str, Any]]:
-    """Build scheduler metadata for a grouped beam-decode request.
-
-    ``beam_width`` is execution metadata carried by ``BeamRequestStepUpdate``;
-    it must never be inferred from ``SamplingParams.n`` or silently defaulted.
-    A missing or invalid value means the EngineCore protocol chain is broken,
-    so fail before the model runner can execute with incorrect batch geometry.
-    """
-    if not getattr(req, "is_beam_decode", False):
-        return None
-
-    if not hasattr(req, "beam_width"):
-        raise RuntimeError(
-            f"Grouped beam request {req.request_id!r} is missing required beam_width metadata"
-        )
-
-    beam_width = req.beam_width
-    if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 1:
-        raise RuntimeError(
-            f"Grouped beam request {req.request_id!r} has invalid beam_width={beam_width!r}; "
-            "expected a positive integer"
-        )
-
-    return {
-        "is_beam_decode": True,
-        "beam_width": beam_width,
-        "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
-        "prefix_len": getattr(req, "prefix_len", 0),
-        "cache_len": req.num_computed_tokens - num_scheduled_tokens,
-    }
-
-
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
-    from functools import wraps
-
     from vllm.v1.core.sched.scheduler import Scheduler
 
     if getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False):
@@ -338,12 +227,10 @@ def apply_scheduler_patch():
             # Propagate beam request attributes from Request objects to SchedulerOutput
             beam_data = {}
             if hasattr(output, "num_scheduled_tokens"):
-                for req_id in output.num_scheduled_tokens.keys():
+                for req_id, num_scheduled_tokens in output.num_scheduled_tokens.items():
                     req = self.requests.get(req_id)
                     if req:
-                        metadata = _build_beam_request_metadata(
-                            req, output.num_scheduled_tokens[req_id]
-                        )
+                        metadata = build_beam_request_metadata(req, num_scheduled_tokens)
                         if metadata is not None:
                             beam_data[req_id] = metadata
             output.beam_data = beam_data

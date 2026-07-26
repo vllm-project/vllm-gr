@@ -72,10 +72,9 @@ def inproc_beam_request_step_update(self, update):
 
 def apply_request_type_patches() -> None:
     """Register the GR request types used on the EngineCore wire protocol."""
-    from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
+    from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
-    _add_enum_member("ADD_BATCH", b"\x06")
-    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
+    register_engine_core_request_types()
 
 
 def apply_engine_client_patches() -> None:

@@ -53,16 +53,18 @@ from vllm_gr.v1.engine.core_client_patch import (
     sync_mp_beam_request_step_update,
 )
 from vllm_gr.v1.engine.engine_core_patch import (
-    _add_enum_member,
-    _build_beam_request_metadata,
     _process_beam_decode_request,
     make_patched_engine_core_init,
 )
+from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.engine.wire import (
+    _add_enum_member,
+    register_engine_core_request_types,
+)
 
 # Ensure custom enum members exist in this process for all tests below.
-_add_enum_member("ADD_BATCH", b"\x06")
-_add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
+register_engine_core_request_types()
 
 # ---------------------------------------------------------------------------
 # Module-level picklable targets for subprocess tests (§6)
@@ -625,7 +627,7 @@ class TestBeamCache:
             MockReq.return_value = mock_req
             _handle_beam_request_step_update(eng, update)
 
-        metadata = _build_beam_request_metadata(mock_req, num_scheduled_tokens=3)
+        metadata = build_beam_request_metadata(mock_req, num_scheduled_tokens=3)
         assert metadata is not None
         assert update.sampling_params.n == 1
         assert metadata["beam_width"] == 3
@@ -648,7 +650,7 @@ class TestBeamCache:
         req = SimpleNamespace(request_id="s0", is_beam_decode=True, num_computed_tokens=1)
 
         try:
-            _build_beam_request_metadata(req, num_scheduled_tokens=1)
+            build_beam_request_metadata(req, num_scheduled_tokens=1)
         except RuntimeError as exc:
             assert "missing required beam_width" in str(exc)
         else:
@@ -663,7 +665,7 @@ class TestBeamCache:
         )
 
         try:
-            _build_beam_request_metadata(req, num_scheduled_tokens=1)
+            build_beam_request_metadata(req, num_scheduled_tokens=1)
         except RuntimeError as exc:
             assert "invalid beam_width=0" in str(exc)
         else:

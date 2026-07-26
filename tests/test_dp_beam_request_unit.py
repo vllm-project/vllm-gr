@@ -34,12 +34,11 @@ from vllm_gr.v1.engine.core_client import (
     beam_request_step_update_async,
 )
 from vllm_gr.v1.engine.core_client_patch import register_beam_output_fn
-from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
 # Ensure custom enum members exist in this process.
-_add_enum_member("ADD_BATCH", b"\x06")
-_add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
+register_engine_core_request_types()
 
 # ---------------------------------------------------------------------------
 # Helpers
