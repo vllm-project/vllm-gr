@@ -42,7 +42,7 @@ if [ $rc -ne 0 ] || [ -z "$idle_gpu" ]; then
     exit 1
 fi
 
-if [ -n "$CONDA_PREFIX" ]; then
+if [ -n "${CONDA_PREFIX:-}" ]; then
     export LD_LIBRARY_PATH=${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}
     export PATH=${CONDA_PREFIX}/bin:${PATH:-}
 fi

@@ -81,6 +81,10 @@ jobs:
           python -c 'import importlib.metadata as m; version = m.version("vllm").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM 0.22.1, found {version}"'
           python -c 'import importlib.metadata as m; version = m.version("vllm-gr").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM-GR 0.22.1, found {version}"'
 
+      - name: Kill Process on device
+        run: |
+          bash ./scripts/kill_vllm_on_device.sh
+
       - uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files
@@ -144,3 +148,7 @@ jobs:
         run: |
           bash ./tests/system/run_pangu1b_acc_and_verify.sh
           bash ./tests/system/run_pangu1b_online_and_verify.sh
+
+      - name: Check Clear Device
+        run: |
+          bash ./scripts/check_vllm_on_device.sh
