@@ -35,9 +35,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.beam_search_decision_utils import (
+    complete_eos_candidates,
     extract_and_dedup_segment,
-    find_eos_indices,
     mask_candidate_logprobs,
+    materialize_selected_beams,
     select_top_indices,
 )
 from vllm_gr.logger import init_logger
@@ -319,76 +320,6 @@ def _parse_step_logprobs(
     return False, all_beams_token_id, all_beams_logprob, beam_flat_cache
 
 
-def _complete_eos_candidates(
-    *,
-    completed: list["BeamSearchSequence"],
-    parents: Sequence["BeamSearchSequence"],
-    token_ids: np.ndarray,
-    scores: np.ndarray,
-    beam_flat_cache: Sequence[BeamCandidateCache],
-    candidates_per_parent: int,
-    eos_token_id: int,
-    initial_logprobs: "FlatLogprobs",
-) -> np.ndarray:
-    """Complete EOS candidates and return a masked score copy."""
-
-    eos_indices = find_eos_indices(token_ids, eos_token_id)
-    for candidate_index in eos_indices:
-        parent_index = candidate_index // candidates_per_parent
-        parent = parents[parent_index]
-        eos_beam = BeamSearchSequence(
-            orig_prompt=parent.orig_prompt,
-            tokens=parent.tokens + [eos_token_id],
-            logprobs=initial_logprobs,
-            cum_logprob=float(scores[candidate_index]),
-            finish_reason="stop",
-            stop_reason=eos_token_id,
-            lora_request=parent.lora_request,
-        )
-        eos_beam._lp_parent = parent
-        eos_beam._lp_step_data = beam_flat_cache[parent_index]
-        completed.append(eos_beam)
-
-    masked_scores = scores.copy()
-    masked_scores[eos_indices] = -np.inf
-    return masked_scores
-
-
-def _materialize_selected_beams(
-    *,
-    parents: Sequence["BeamSearchSequence"],
-    selected_indices: Sequence[int],
-    token_ids: np.ndarray,
-    scores: np.ndarray,
-    beam_flat_cache: Sequence[BeamCandidateCache],
-    candidates_per_parent: int,
-    initial_logprobs: "FlatLogprobs",
-) -> tuple[list["BeamSearchSequence"], ForkInfo]:
-    """Build selected child beams and their grouped-request fork mapping."""
-
-    new_beams: list[BeamSearchSequence] = []
-    fork_info: ForkInfo = []
-    for candidate_index in selected_indices:
-        parent_index = candidate_index // candidates_per_parent
-        parent = parents[parent_index]
-        token_id = int(token_ids[candidate_index])
-        cached = beam_flat_cache[parent_index]
-        assert cached is not None
-        new_beam = BeamSearchSequence(
-            orig_prompt=parent.orig_prompt,
-            tokens=parent.tokens + [token_id],
-            logprobs=initial_logprobs,
-            lora_request=parent.lora_request,
-            cum_logprob=float(scores[candidate_index]),
-        )
-        new_beam._lp_parent = parent
-        new_beam._lp_step_data = cached
-        new_beams.append(new_beam)
-        fork_info.append((parent_index, token_id))
-
-    return new_beams, fork_info
-
-
 def _custom_beam_search_batch(
     llm_engine,
     instances_batch: list[BeamSearchInstance],
@@ -487,8 +418,7 @@ def _custom_beam_search_batch(
             all_beams_token_id = np.array(all_beams_token_id)
             all_beams_logprob = np.array(all_beams_logprob)
             if not ignore_eos:
-                all_beams_logprob = _complete_eos_candidates(
-                    completed=instance.completed,
+                eos_beams, all_beams_logprob = complete_eos_candidates(
                     parents=instance.beams,
                     token_ids=all_beams_token_id,
                     scores=all_beams_logprob,
@@ -496,10 +426,13 @@ def _custom_beam_search_batch(
                     candidates_per_parent=logprobs_num,
                     eos_token_id=tokenizer.eos_token_id,
                     initial_logprobs=initial_logprobs,
+                    include_eos_token=True,
+                    inherit_lora_request=True,
                 )
+                instance.completed.extend(eos_beams)
 
             topn_idx = select_top_indices(all_beams_logprob, beam_width)
-            new_beams, fork_info = _materialize_selected_beams(
+            new_beams, fork_info = materialize_selected_beams(
                 parents=instance.beams,
                 selected_indices=topn_idx,
                 token_ids=all_beams_token_id,
@@ -808,8 +741,7 @@ class GRLLM(LLM):
                         all_beams_logprob = np.array(all_beams_logprob)
                         # Handle EOS tokens
                         if not ignore_eos:
-                            all_beams_logprob = _complete_eos_candidates(
-                                completed=instance.completed,
+                            eos_beams, all_beams_logprob = complete_eos_candidates(
                                 parents=all_beams[start:end],
                                 token_ids=all_beams_token_id,
                                 scores=all_beams_logprob,
@@ -817,11 +749,14 @@ class GRLLM(LLM):
                                 candidates_per_parent=logprobs_num,
                                 eos_token_id=tokenizer.eos_token_id,
                                 initial_logprobs=initial_logprobs,
+                                include_eos_token=True,
+                                inherit_lora_request=True,
                             )
+                            instance.completed.extend(eos_beams)
 
                         # Select top beams
                         topn_idx = select_top_indices(all_beams_logprob, beam_width)
-                        new_beams, _ = _materialize_selected_beams(
+                        new_beams, _ = materialize_selected_beams(
                             parents=all_beams[start:end],
                             selected_indices=topn_idx,
                             token_ids=all_beams_token_id,
