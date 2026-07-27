@@ -145,6 +145,26 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
     _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
     return patch_count
 
+def patch_sliced_logits() -> None:
+    global _SLICED_LOGITS_PATCHED
+    if _SLICED_LOGITS_PATCHED:
+        return
+    try:
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm_gr.ops.sliced_logits import is_vocab_slice_enabled, compute_sliced_logits
+
+        orig_get_logits = LogitsProcessor._get_logits
+
+        def patched_get_logits(self, hidden_states, lm_head, embedding_bias):
+            if is_vocab_slice_enabled():
+                return compute_sliced_logits(hidden_states, lm_head, embedding_bias)
+            return orig_get_logits(self, hidden_states, lm_head, embedding_bias)
+
+        LogitsProcessor._get_logits = patched_get_logits
+        _SLICED_LOGITS_PATCHED = True
+        logger.info("vllm_gr: Patched LogitsProcessor._get_logits for sliced vocabulary projection")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_sliced_logits: %s", exc)
 
 def _apply_gr_beam_patches(force: bool = False) -> int:
     """Apply beam-search related patches from vllm-gr.
@@ -216,6 +236,13 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         logger.debug("vllm_gr: Applied patch_batch_and_fork")
     except Exception as exc:
         logger.debug("vllm_gr: Skipping patch_batch_and_fork: %s", exc)
+
+    try:
+        patch_sliced_logits()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_sliced_logits")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_sliced_logits: %s", exc)
 
     # Optional: LMCache adapter patch
     try:
