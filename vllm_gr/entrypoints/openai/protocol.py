@@ -23,4 +23,5 @@ def to_beam_search_params(self, max_tokens: int, default_sampling_params: dict) 
         include_stop_str_in_output=self.include_stop_str_in_output,
         begin_token=extra_args.get("begin_token"),
         end_token=extra_args.get("end_token"),
+        catalog_strategy=extra_args.get("catalog_strategy", "fill"),
     )

@@ -88,6 +88,7 @@ def complete_eos_candidates(
     parents: Sequence[BeamSearchSequence],
     token_ids: np.ndarray,
     scores: np.ndarray,
+    beam_idx: np.ndarray,
     beam_flat_cache: Sequence[BeamCandidateCache | None],
     candidates_per_parent: int,
     eos_token_id: int,
@@ -100,7 +101,7 @@ def complete_eos_candidates(
     eos_beams: list[BeamSearchSequence] = []
     eos_indices = find_eos_indices(token_ids, eos_token_id)
     for candidate_index in eos_indices:
-        parent_index = candidate_index // candidates_per_parent
+        parent_index = beam_idx[candidate_index]
         parent = parents[parent_index]
         cached = beam_flat_cache[parent_index]
         assert cached is not None
@@ -126,12 +127,29 @@ def complete_eos_candidates(
     return eos_beams, masked_scores
 
 
-def select_top_indices(scores: np.ndarray, beam_width: int) -> np.ndarray:
+def select_top_indices(
+    scores: np.ndarray, beam_width: int, catalog_strategy: str = "fill"
+) -> np.ndarray:
     """Return top candidate indices with the legacy ``argpartition`` order."""
-
-    if scores.size > beam_width:
-        return np.argpartition(np.negative(scores), beam_width)[:beam_width]
-    return np.arange(scores.size)
+    # For "null" strategy: only pick from finite (valid catalog) entries so that
+    # -inf slots from catalog-filtered tokens are never selected.
+    if catalog_strategy == "null":
+        finite_mask = np.isfinite(scores)
+        finite_idx = np.where(finite_mask)[0]
+        if finite_idx.size == 0:
+            # No valid candidates left — stop generating for this instance
+            return []
+        if finite_idx.size > beam_width:
+            # argpartition requires kth < arr.size, so only call it when
+            # there are strictly more candidates than we need to keep.
+            topn_idx = finite_idx[np.argpartition(-scores[finite_idx], beam_width)[:beam_width]]
+        else:
+            topn_idx = finite_idx  # at most beam_width finite entries; take all
+    elif scores.size > beam_width:
+        topn_idx = np.argpartition(np.negative(scores), beam_width)[:beam_width]
+    else:
+        topn_idx = np.arange(scores.size)
+    return topn_idx
 
 
 def materialize_selected_beams(

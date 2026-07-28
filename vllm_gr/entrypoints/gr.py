@@ -47,6 +47,7 @@ from vllm_gr.logprobs import (
     reconstruct_beam_logprobs,
 )
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.utils.catalog import Catalog
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
@@ -242,21 +243,24 @@ def _parse_step_logprobs(
     logprobs_num: int,
     fork_info_j: ForkInfo | None,
     catalog: Optional[Any] = None,
-) -> tuple[bool, list[int], list[float], list[BeamCandidateCache]]:
+    catalog_strategy: str = "fill",
+) -> tuple[bool, list[int], list[float], list[int], list[BeamCandidateCache]]:
     """Parse flat logprobs from engine step results.
 
     Returns:
         is_error: bool indicating if the engine returned an error
         all_beams_token_id: list of token ids across candidate beams
         all_beams_logprob: list of cumulative logprobs
+        all_beams_beam_idx: list of beam indices for each entry
         beam_flat_cache: list of parsed segments for each parent beam
     """
     if result.outputs[0].finish_reason == "error":
-        return True, [], [], []
+        return True, [], [], [], []
 
     all_beams_token_id = []
     all_beams_logprob = []
-    beam_flat_cache: list[BeamCandidateCache] = []
+    all_beams_beam_idx = []
+    beam_flat_cache = []
 
     flat = result.outputs[0].logprobs
     if flat is None:
@@ -299,6 +303,7 @@ def _parse_step_logprobs(
             beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
             all_beams_token_id.extend(token_ids_pos)
             all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
+            all_beams_beam_idx.extend([b_idx] * len(token_ids_pos))
     else:
         token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_flat_logprobs(
             flat, logprobs_num
@@ -316,8 +321,9 @@ def _parse_step_logprobs(
         beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
         all_beams_token_id.extend(token_ids_pos)
         all_beams_logprob.extend(instance.beams[0].cum_logprob + lp for lp in logprobs_pos)
+        all_beams_beam_idx.extend([0] * len(token_ids_pos))
 
-    return False, all_beams_token_id, all_beams_logprob, beam_flat_cache
+    return False, all_beams_token_id, all_beams_logprob, all_beams_beam_idx, beam_flat_cache
 
 
 def _custom_beam_search_batch(
@@ -333,6 +339,7 @@ def _custom_beam_search_batch(
     initial_logprobs: "FlatLogprobs",
     logprobs_num: int,
     catalog: Optional[Any] = None,
+    catalog_strategy: str = "fill",
 ) -> None:
     """Run beam search in batch mode for custom attention backend."""
     instance_prefill_id: dict[int, str] = {}
@@ -396,13 +403,16 @@ def _custom_beam_search_batch(
             if result is None:
                 continue
 
-            is_error, all_beams_token_id, all_beams_logprob, beam_flat_cache = _parse_step_logprobs(
-                result=result,
-                instance=instance,
-                token=token,
-                logprobs_num=logprobs_num,
-                fork_info_j=instance_fork_info.get(j),
-                catalog=catalog,
+            is_error, all_beams_token_id, all_beams_logprob, all_beams_beam_idx, beam_flat_cache = (
+                _parse_step_logprobs(
+                    result=result,
+                    instance=instance,
+                    token=token,
+                    logprobs_num=logprobs_num,
+                    fork_info_j=instance_fork_info.get(j),
+                    catalog=catalog,
+                    catalog_strategy=catalog_strategy,
+                )
             )
 
             if is_error:
@@ -417,11 +427,13 @@ def _custom_beam_search_batch(
 
             all_beams_token_id = np.array(all_beams_token_id)
             all_beams_logprob = np.array(all_beams_logprob)
+            all_beams_beam_idx_arr = np.array(all_beams_beam_idx, dtype=np.intp)
             if not ignore_eos:
                 eos_beams, all_beams_logprob = complete_eos_candidates(
                     parents=instance.beams,
                     token_ids=all_beams_token_id,
                     scores=all_beams_logprob,
+                    beam_idx=all_beams_beam_idx_arr,
                     beam_flat_cache=beam_flat_cache,
                     candidates_per_parent=logprobs_num,
                     eos_token_id=tokenizer.eos_token_id,
@@ -431,7 +443,7 @@ def _custom_beam_search_batch(
                 )
                 instance.completed.extend(eos_beams)
 
-            topn_idx = select_top_indices(all_beams_logprob, beam_width)
+            topn_idx = select_top_indices(all_beams_logprob, beam_width, catalog_strategy)
             new_beams, fork_info = materialize_selected_beams(
                 parents=instance.beams,
                 selected_indices=topn_idx,
@@ -486,8 +498,6 @@ class GRLLM(LLM):
 
         self.catalog = None
         if catalog_path is not None:
-            from vllm_gr.entrypoints.openai.serving_models import Catalog
-
             self.catalog = Catalog(self.get_tokenizer())
             self.catalog.load(catalog_path)
 
@@ -523,6 +533,7 @@ class GRLLM(LLM):
         ignore_eos = params.ignore_eos
         begin_token = params.begin_token if hasattr(params, "begin_token") else None
         end_token = params.end_token if hasattr(params, "end_token") else None
+        catalog_strategy = getattr(params, "catalog_strategy", "fill")
 
         tokenizer = self.get_tokenizer()
         sid_begin_token_id: int | None = None
@@ -658,6 +669,7 @@ class GRLLM(LLM):
                     initial_logprobs=initial_logprobs,
                     logprobs_num=logprobs_num,
                     catalog=self.catalog,
+                    catalog_strategy=catalog_strategy,
                 )
             else:
                 for _ in token_iter:
@@ -703,7 +715,11 @@ class GRLLM(LLM):
                         # Gather all logprobs and cumulative scores for this instance
                         all_beams_token_id = []
                         all_beams_logprob = []
-                        beam_flat_cache: list[BeamCandidateCache] = []
+                        # Explicit beam index for each entry in all_beams_token_id/logprob.
+                        # Replaces idx // logprobs_num so that null-strategy beams (empty lists)
+                        # don't shift the mapping for subsequent beams.
+                        all_beams_beam_idx: list[int] = []
+                        beam_flat_cache: list[tuple | None] = []
                         beam_outputs = output[start:end]  # outputs for this instance's beams
 
                         for i, (current_beam, result) in enumerate(
@@ -728,6 +744,7 @@ class GRLLM(LLM):
                                 all_beams_logprob.extend(
                                     current_beam.cum_logprob + lp for lp in logprobs_pos
                                 )
+                                all_beams_beam_idx.extend([i] * len(token_ids_pos))
                             else:
                                 raise ValueError(
                                     "Beam search generation expected non-empty logprobs "
@@ -739,12 +756,14 @@ class GRLLM(LLM):
                         # Convert to numpy for efficient processing
                         all_beams_token_id = np.array(all_beams_token_id)
                         all_beams_logprob = np.array(all_beams_logprob)
+                        all_beams_beam_idx_arr = np.array(all_beams_beam_idx, dtype=np.intp)
                         # Handle EOS tokens
                         if not ignore_eos:
                             eos_beams, all_beams_logprob = complete_eos_candidates(
                                 parents=all_beams[start:end],
                                 token_ids=all_beams_token_id,
                                 scores=all_beams_logprob,
+                                beam_idx=all_beams_beam_idx_arr,
                                 beam_flat_cache=beam_flat_cache,
                                 candidates_per_parent=logprobs_num,
                                 eos_token_id=tokenizer.eos_token_id,
@@ -755,7 +774,9 @@ class GRLLM(LLM):
                             instance.completed.extend(eos_beams)
 
                         # Select top beams
-                        topn_idx = select_top_indices(all_beams_logprob, beam_width)
+                        topn_idx = select_top_indices(
+                            all_beams_logprob, beam_width, catalog_strategy
+                        )
                         new_beams, _ = materialize_selected_beams(
                             parents=all_beams[start:end],
                             selected_indices=topn_idx,

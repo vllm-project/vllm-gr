@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from copy import copy
 
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import BeamSearchParams as BaseBeamSearchParams
 from vllm.sampling_params import (
     SamplingParams,
@@ -32,3 +33,16 @@ class BeamSearchParams(
 
     begin_token: str | None = None
     end_token: str | None = None
+    # Controls behavior when a beam has no valid catalog token in the model's
+    # top-K logprobs (all logprobs filtered to -inf).
+    # "fill": fill logprob slots with valid catalog tokens at low score.
+    # "null":   leave all logprobs as -inf; the beam is excluded from selection.
+    catalog_strategy: str = "fill"
+
+    def __post_init__(self) -> None:
+        if self.catalog_strategy not in ("fill", "null"):
+            raise VLLMValidationError(
+                f"catalog_strategy must be 'fill' or 'null', got {self.catalog_strategy!r}",
+                parameter="catalog_strategy",
+                value=self.catalog_strategy,
+            )

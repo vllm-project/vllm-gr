@@ -178,10 +178,12 @@ def _run_decision_adapter(
     if case.ignore_eos:
         selection_scores = score_array
     else:
+        beam_idx = np.arange(len(token_array)) // case.logprobs_num
         completed, selection_scores = complete_eos_candidates(
             parents=parents,
             token_ids=token_array,
             scores=score_array,
+            beam_idx=beam_idx,
             beam_flat_cache=beam_flat_cache,
             candidates_per_parent=case.logprobs_num,
             eos_token_id=case.eos_token_id,

@@ -72,10 +72,12 @@ def _run_legacy_decision_step(
     if ignore_eos:
         selection_scores = score_array
     else:
+        beam_idx = np.arange(len(token_ids)) // candidates_per_parent
         eos_beams, selection_scores = complete_eos_candidates(
             parents=instance.beams,
             token_ids=token_array,
             scores=score_array,
+            beam_idx=beam_idx,
             beam_flat_cache=beam_flat_cache,
             candidates_per_parent=candidates_per_parent,
             eos_token_id=eos_token_id,
@@ -120,7 +122,7 @@ def test_initial_candidate_extraction_matches_legacy_sampled_token_rule(
         decoded_tokens=[None, "b", "c", "d"],
     )
 
-    is_error, token_ids, scores, cache = _parse_step_logprobs(
+    is_error, token_ids, scores, beam_idx, cache = _parse_step_logprobs(
         result=_result_with_flat(flat),
         instance=instance,
         token=0,
@@ -131,6 +133,7 @@ def test_initial_candidate_extraction_matches_legacy_sampled_token_rule(
     assert not is_error
     assert token_ids == expected_token_ids
     assert scores == pytest.approx([-0.5 + value for value in expected_logprobs])
+    assert beam_idx == [0] * len(expected_token_ids)
     assert cache[0][0] == expected_token_ids
     assert cache[0][1] == expected_logprobs
     assert len(cache[0][2]) == len(expected_token_ids)
@@ -144,7 +147,7 @@ def test_grouped_flat_logprobs_uses_floor_stride_and_ignores_remainder() -> None
         token_ids=[7, 3, 7, 8, 4, 8, 999],
         logprobs=[-0.01, -0.1, -0.2, -0.02, -0.3, -0.4, -9.0],
     )
-    is_error, token_ids, scores, cache = _parse_step_logprobs(
+    is_error, token_ids, scores, beam_idx, cache = _parse_step_logprobs(
         result=_result_with_flat(flat),
         instance=instance,
         token=1,
@@ -155,6 +158,7 @@ def test_grouped_flat_logprobs_uses_floor_stride_and_ignores_remainder() -> None
     assert not is_error
     assert token_ids == [3, 7, 4, 8]
     assert scores == pytest.approx([-0.6, -0.7, -0.5, -0.6])
+    assert beam_idx == [0, 0, 1, 1]
     assert [entry[0] for entry in cache] == [[3, 7], [4, 8]]
     assert all(entry[2] is None and entry[3] is None for entry in cache)
     assert 999 not in token_ids
@@ -178,7 +182,7 @@ def test_catalog_mask_keeps_candidate_count_order_and_query_timing() -> None:
             catalog_calls.append(generated_tokens)
             return {3}
 
-    is_error, token_ids, scores, cache = _parse_step_logprobs(
+    is_error, token_ids, scores, beam_idx, cache = _parse_step_logprobs(
         result=_result_with_flat(flat),
         instance=instance,
         token=0,
@@ -188,6 +192,7 @@ def test_catalog_mask_keeps_candidate_count_order_and_query_timing() -> None:
     )
 
     assert not is_error
+    assert beam_idx == [0, 0]
     assert catalog_calls == [[99]]
     assert token_ids == [7, 3]
     assert scores == [-float("inf"), -0.7]
@@ -311,6 +316,7 @@ def test_eos_completion_returns_masked_score_copy() -> None:
         parents=[parent],
         token_ids=np.asarray([2, 11]),
         scores=scores,
+        beam_idx=np.array([0, 0]),
         beam_flat_cache=cache,
         candidates_per_parent=2,
         eos_token_id=2,

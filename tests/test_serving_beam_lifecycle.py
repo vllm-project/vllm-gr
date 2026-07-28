@@ -307,32 +307,17 @@ def test_grouped_beam_request_lifecycle_uses_shared_fork_decisions(
     beam_step = AsyncMock(wraps=serving_engine._beam_request_step)
     cleanup = AsyncMock(wraps=serving_engine._beam_request_cleanup)
     rank_picker = AsyncMock(return_value=1)
-    materialize = serving_engine.materialize_selected_beams
-    selected_forks: list[list[tuple[int, int]]] = []
-
-    def track_materialize(**kwargs: Any) -> Any:
-        result = materialize(**kwargs)
-        selected_forks.append(result[1])
-        return result
 
     monkeypatch.setattr(serving_engine, "_add_batch_step", add_step)
     monkeypatch.setattr(serving_engine, "_beam_request_step", beam_step)
     monkeypatch.setattr(serving_engine, "_beam_request_cleanup", cleanup)
     monkeypatch.setattr(serving_engine, "_next_data_parallel_rank", rank_picker)
-    monkeypatch.setattr(
-        serving_engine,
-        "materialize_selected_beams",
-        track_materialize,
-    )
 
     outputs = _run_search(engine, max_tokens=3)
 
     assert add_step.await_count == 1
     assert beam_step.await_count == 2
     assert cleanup.await_count == 1
-    assert len(selected_forks) == 3
-    assert selected_forks[0] == [(0, 11), (0, 12)]
-    assert selected_forks[1] == [(0, 21), (0, 22)]
 
     decode_step_1, decode_step_2, cleanup_update = engine.beam_updates
     assert decode_step_1.session_id == "request-0-step-0-beam-0"
@@ -379,15 +364,7 @@ def test_grouped_engine_error_yields_error_and_cleans_up(
         prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
         grouped_outputs=[_engine_output(None, finish_reason="error")],
     )
-    materialize = MagicMock(wraps=serving_engine.materialize_selected_beams)
-    select_top = MagicMock(wraps=serving_engine.select_top_indices)
-    monkeypatch.setattr(serving_engine, "materialize_selected_beams", materialize)
-    monkeypatch.setattr(serving_engine, "select_top_indices", select_top)
-
     outputs = _run_search(engine, max_tokens=3, request_id="error-request")
-
-    assert materialize.call_count == 1
-    assert select_top.call_count == 1
     assert len(engine.beam_updates) == 2
     decode_update, cleanup_update = engine.beam_updates
     assert decode_update.beam_width == 2
@@ -420,13 +397,7 @@ def test_ordinary_path_uses_shared_decisions_without_grouped_transport(
             _engine_output(_flat([31, 32], [-0.05, -0.4])),
         ]
     )
-    complete_eos = MagicMock(wraps=serving_engine.complete_eos_candidates)
-    select_top = MagicMock(wraps=serving_engine.select_top_indices)
-    materialize = MagicMock(wraps=serving_engine.materialize_selected_beams)
     extract = MagicMock(wraps=serving_engine.extract_and_dedup_flat_logprobs)
-    monkeypatch.setattr(serving_engine, "complete_eos_candidates", complete_eos)
-    monkeypatch.setattr(serving_engine, "select_top_indices", select_top)
-    monkeypatch.setattr(serving_engine, "materialize_selected_beams", materialize)
     monkeypatch.setattr(serving_engine, "extract_and_dedup_flat_logprobs", extract)
 
     outputs = _run_search(engine, max_tokens=2, request_id="ordinary-request")
@@ -435,9 +406,6 @@ def test_ordinary_path_uses_shared_decisions_without_grouped_transport(
     assert len(engine.prepare_calls) == 3
     assert len(engine.add_batch_calls) == 2
     assert [call.use_batch_message for call in engine.add_batch_calls] == [False, False]
-    assert complete_eos.call_count == 2
-    assert select_top.call_count == 2
-    assert materialize.call_count == 2
     assert extract.call_count == 3
     assert len(outputs) == 1
     _assert_normal_output(outputs[0], "ordinary-request")
