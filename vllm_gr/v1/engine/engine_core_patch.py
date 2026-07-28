@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
+from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
@@ -829,8 +830,6 @@ def make_patched_execute_model(_orig_execute_model):
     """
     if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
         return _orig_execute_model
-
-    from vllm_gr.v1.attention.backends.beam_attn import BEAM_DATA_VAR
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
