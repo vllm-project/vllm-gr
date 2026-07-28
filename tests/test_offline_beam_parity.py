@@ -9,12 +9,12 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 from vllm.inputs import tokens_input
 from vllm.logprobs import FlatLogprobs
 
-from vllm_gr.beam_search_decision_utils import select_top_indices
-from vllm_gr.entrypoints.gr import (
-    _complete_eos_candidates,
-    _materialize_selected_beams,
-    _parse_step_logprobs,
+from vllm_gr.beam_search_decision_utils import (
+    complete_eos_candidates,
+    materialize_selected_beams,
+    select_top_indices,
 )
+from vllm_gr.entrypoints.gr import _parse_step_logprobs
 
 CandidateCache = tuple[
     list[int],
@@ -72,8 +72,7 @@ def _run_legacy_decision_step(
     if ignore_eos:
         selection_scores = score_array
     else:
-        selection_scores = _complete_eos_candidates(
-            completed=instance.completed,
+        eos_beams, selection_scores = complete_eos_candidates(
             parents=instance.beams,
             token_ids=token_array,
             scores=score_array,
@@ -81,9 +80,12 @@ def _run_legacy_decision_step(
             candidates_per_parent=candidates_per_parent,
             eos_token_id=eos_token_id,
             initial_logprobs=FlatLogprobs(),
+            include_eos_token=True,
+            inherit_lora_request=True,
         )
+        instance.completed.extend(eos_beams)
     selected_indices = select_top_indices(selection_scores, beam_width)
-    instance.beams, fork_info = _materialize_selected_beams(
+    instance.beams, fork_info = materialize_selected_beams(
         parents=instance.beams,
         selected_indices=selected_indices,
         token_ids=token_array,
@@ -228,7 +230,7 @@ def test_selected_beams_keep_legacy_argpartition_order_and_geometry(
         expected_indices = np.arange(len(scores))
     initial_logprobs = FlatLogprobs()
 
-    new_beams, fork_info = _materialize_selected_beams(
+    new_beams, fork_info = materialize_selected_beams(
         parents=parents,
         selected_indices=expected_indices,
         token_ids=np.asarray(token_ids),
@@ -264,7 +266,7 @@ def test_selected_beams_keep_legacy_argpartition_order_and_geometry(
 
 def test_selected_beam_rejects_missing_parent_candidate_cache() -> None:
     with pytest.raises(AssertionError):
-        _materialize_selected_beams(
+        materialize_selected_beams(
             parents=[_beam([10])],
             selected_indices=[0],
             token_ids=np.asarray([11]),
@@ -303,11 +305,9 @@ def test_eos_completion_returns_masked_score_copy() -> None:
     parent = _beam([10], -0.5)
     cache = [_candidate_cache([2, 11], [-0.1, -0.3])]
     scores = np.asarray([-0.6, -0.8])
-    completed: list[BeamSearchSequence] = []
     initial_logprobs = FlatLogprobs()
 
-    masked_scores = _complete_eos_candidates(
-        completed=completed,
+    completed, masked_scores = complete_eos_candidates(
         parents=[parent],
         token_ids=np.asarray([2, 11]),
         scores=scores,
@@ -315,6 +315,8 @@ def test_eos_completion_returns_masked_score_copy() -> None:
         candidates_per_parent=2,
         eos_token_id=2,
         initial_logprobs=initial_logprobs,
+        include_eos_token=True,
+        inherit_lora_request=True,
     )
 
     assert masked_scores is not scores

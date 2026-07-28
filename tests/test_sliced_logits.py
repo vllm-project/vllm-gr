@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from vllm_gr.entrypoints.openai.serving_engine import _extract_and_dedup_segment
+from vllm_gr.beam_search_decision_utils import extract_and_dedup_segment
 from vllm_gr.entrypoints.openai.serving_models import Catalog
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs
 from vllm_gr.ops.sliced_logits import (
@@ -101,8 +101,8 @@ def test_token_id_remapping() -> None:
     remapped_ids, _, _, _ = extract_and_dedup_flat_logprobs(flat, logprobs_num=3)
     assert list(remapped_ids) == [20000, 20001, 20002]
 
-    # Test _extract_and_dedup_segment
-    seg_ids, _, _, _ = _extract_and_dedup_segment(
+    # Test extract_and_dedup_segment
+    seg_ids, _, _, _ = extract_and_dedup_segment(
         raw_token_ids=[5, 10],
         raw_logprobs=[-0.2, -0.8],
         raw_ranks=[0, 1],
