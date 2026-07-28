@@ -35,22 +35,34 @@ def validate_attention_backend(value: object) -> GRAttentionBackend | None:
 def validate_vocab_offset(value: object) -> int | None:
     if value is None:
         return None
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
+    if isinstance(value, bool):
+        raise ValueError(
+            f"vllm-gr vocab_offset must be a non-negative integer or null, got {value!r}"
+        )
     try:
-        return int(value)
+        val = int(value)
+        if val < 0:
+            raise ValueError("vllm-gr vocab_offset must be non-negative")
+        return val
     except (ValueError, TypeError) as exc:
-        raise ValueError(f"vllm-gr vocab_offset must be an integer or null, got {value!r}") from exc
+        raise ValueError(
+            f"vllm-gr vocab_offset must be a non-negative integer or null, got {value!r}"
+        ) from exc
 
 
 def validate_vocab_slice_size(value: object) -> int | None:
     if value is None:
         return None
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
+    if isinstance(value, bool):
+        raise ValueError(
+            f"vllm-gr vocab_slice_size must be a positive integer or null, got {value!r}"
+        )
     try:
-        return int(value)
+        val = int(value)
+        if val <= 0:
+            raise ValueError("vllm-gr vocab_slice_size must be positive")
+        return val
     except (ValueError, TypeError) as exc:
         raise ValueError(
-            f"vllm-gr vocab_slice_size must be an integer or null, got {value!r}"
+            f"vllm-gr vocab_slice_size must be a positive integer or null, got {value!r}"
         ) from exc

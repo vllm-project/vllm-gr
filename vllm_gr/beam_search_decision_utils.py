@@ -77,9 +77,11 @@ def extract_and_dedup_segment(
         decoded_pos = decoded_pos[selected] if decoded_pos is not None else None
 
     if is_vocab_slice_enabled():
-        offset, _, _ = get_vocab_slice_config()
-        if offset is not None:
-            token_ids_pos = [tid + offset if tid < offset else tid for tid in token_ids_pos]
+        offset, slice_size, _ = get_vocab_slice_config()
+        if offset is not None and slice_size is not None and slice_size > 0:
+            token_ids_pos = [
+                tid + offset if 0 <= tid < slice_size else tid for tid in token_ids_pos
+            ]
 
     return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
 
