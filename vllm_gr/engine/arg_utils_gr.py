@@ -191,6 +191,9 @@ def create_engine_config(self, usage_context=None, headless=False):
         else existing_gr_config.vocab_slice_size,
     )
     if effective_gr_config != existing_gr_config:
+        # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
+        # forbidden. Keep GR-only values in VllmConfig.additional_config so
+        # that they also survive process serialization.
         effective_gr_config.write_to_vllm_config(config)
 
     if effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM:
