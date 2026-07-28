@@ -7,11 +7,11 @@ Optimizes output projection (lm_head) by slicing the weight matrix to a contiguo
 subset of the vocabulary (e.g., 24k tokens out of 170k).
 """
 
-import os
+from typing import Any, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Any
 from vllm.logger import init_logger
 
 logger = init_logger("vllm.ops.sliced_logits")
@@ -24,6 +24,7 @@ _QUANT_GROUP_SIZE: int = 128
 
 class SlicedLMHeadProxy(nn.Module):
     """Lightweight proxy object for quantized lm_head apply."""
+
     def __init__(self, original_lm_head, sliced_weight, sliced_num_embeddings):
         super().__init__()
         if not isinstance(sliced_weight, nn.Parameter):
@@ -34,12 +35,8 @@ class SlicedLMHeadProxy(nn.Module):
         self.org_vocab_size = sliced_num_embeddings
 
 
-
-
 def set_vocab_slice_config(
-    offset: Optional[int],
-    slice_size: Optional[int],
-    quant_group_size: int = 128
+    offset: Optional[int], slice_size: Optional[int], quant_group_size: int = 128
 ) -> None:
     """Configures global vocabulary slice settings."""
     global _VOCAB_OFFSET, _VOCAB_SLICE_SIZE, _QUANT_GROUP_SIZE
@@ -77,8 +74,11 @@ def compute_sliced_logits(
     off = offset if offset is not None else cfg_offset
     sz = slice_size if slice_size is not None else cfg_slice_size
 
-    if not hasattr(lm_head, "_sliced_weight") or getattr(lm_head, "_sliced_offset", None) != off or getattr(lm_head, "_sliced_size", None) != sz:
-
+    if (
+        not hasattr(lm_head, "_sliced_weight")
+        or getattr(lm_head, "_sliced_offset", None) != off
+        or getattr(lm_head, "_sliced_size", None) != sz
+    ):
         if off is None or sz is None:
             raise ValueError("Vocabulary slice offset and slice_size must be specified.")
 
@@ -86,21 +86,32 @@ def compute_sliced_logits(
         end_idx = ((off + sz + quant_group_size - 1) // quant_group_size) * quant_group_size
         aligned_slice_size = end_idx - offset_aligned
 
-        sliced_w = lm_head.weight[offset_aligned : offset_aligned + aligned_slice_size].detach().clone().contiguous()
+        sliced_w = (
+            lm_head.weight[offset_aligned : offset_aligned + aligned_slice_size]
+            .detach()
+            .clone()
+            .contiguous()
+        )
         if not isinstance(sliced_w, nn.Parameter):
             sliced_w = nn.Parameter(sliced_w, requires_grad=False)
 
         lm_head._sliced_weight = sliced_w
         lm_head._sliced_bias = (
-            embedding_bias[offset_aligned : offset_aligned + aligned_slice_size].detach().clone().contiguous()
-            if embedding_bias is not None else None
+            embedding_bias[offset_aligned : offset_aligned + aligned_slice_size]
+            .detach()
+            .clone()
+            .contiguous()
+            if embedding_bias is not None
+            else None
         )
         lm_head._sliced_offset = off
         lm_head._sliced_size = sz
         lm_head._sliced_rel_start = off - offset_aligned
         lm_head._sliced_rel_end = lm_head._sliced_rel_start + sz
-        lm_head._sliced_need_crop = (aligned_slice_size > sz)        
-        lm_head._sliced_proxy = SlicedLMHeadProxy(lm_head, lm_head._sliced_weight, aligned_slice_size)
+        lm_head._sliced_need_crop = aligned_slice_size > sz
+        lm_head._sliced_proxy = SlicedLMHeadProxy(
+            lm_head, lm_head._sliced_weight, aligned_slice_size
+        )
         logger.info(
             f"vllm_gr: Cached pre-sliced contiguous lm_head weights (offset={off}, "
             f"slice_size={sz}, aligned range=[{offset_aligned}:{end_idx}])"

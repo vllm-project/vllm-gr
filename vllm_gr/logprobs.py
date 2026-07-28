@@ -11,6 +11,13 @@ from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_segment,
 )
 
+__all__ = [
+    "append_fast",
+    "extract_and_dedup_flat_logprobs",
+    "extract_and_dedup_segment",
+    "reconstruct_beam_logprobs",
+]
+
 
 def append_fast(
     self,
@@ -34,8 +41,6 @@ def append_fast(
     else:
         self.decoded_tokens.extend(itertools.islice(decoded_tokens, len(token_ids)))
     self.end_indices.append(len(self.logprobs))
-
-
 
 
 def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):

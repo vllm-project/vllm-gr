@@ -12,6 +12,7 @@ from vllm.entrypoints.openai.models.serving import (
 )
 from vllm.tokenizers import TokenizerLike
 
+from vllm_gr.config import GRConfig
 from vllm_gr.logger import init_logger
 
 logger = init_logger(__name__)
@@ -22,9 +23,11 @@ _original_init = OpenAIServingModels.__init__
 def compute_catalog_slice_config(catalog_path: str, tokenizer_or_model: Any):
     """Calculate (vocab_offset, vocab_slice_size) from a JSON catalog file."""
     import json
+
     try:
         if isinstance(tokenizer_or_model, str):
             from transformers import AutoTokenizer
+
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_model, trust_remote_code=True)
         else:
             tokenizer = tokenizer_or_model
@@ -114,18 +117,10 @@ def init_gr(
     self.catalog = None
     tokenizer = self.input_processor.tokenizer
     vllm_config = getattr(engine_client, "vllm_config", None)
-    additional_config = getattr(vllm_config, "additional_config", None)
-    catalog_path = (
-        additional_config.get("vllm_gr_catalog_path")
-        if isinstance(additional_config, dict)
-        else None
-    )
+    catalog_path = GRConfig.from_vllm_config(vllm_config).catalog_path
     if catalog_path:
         self.catalog = Catalog(tokenizer)
         self.catalog.load(catalog_path)
-        if isinstance(additional_config, dict) and self.catalog.vocab_offset is not None:
-            additional_config["vllm_gr_vocab_offset"] = self.catalog.vocab_offset
-            additional_config["vllm_gr_vocab_slice_size"] = self.catalog.vocab_slice_size
 
 
 def patch_OpenAIServingModels_init():

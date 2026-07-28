@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger("vllm_gr.plugin")
 
 
-def initialize_runtime() -> dict[str, int]:
+def initialize_runtime() -> dict[str, object]:
     """Initialize the current process for vllm-gr runtime usage.
 
     Safe to call repeatedly. The underlying patch helper is idempotent, so
@@ -29,13 +29,17 @@ def initialize_runtime() -> dict[str, int]:
 
     configure_model_runner_default()
 
-    from vllm_gr.patch import re_apply_patches
+    from vllm_gr.patch import get_last_beam_patch_report, re_apply_patches
 
     check_environment()
 
     patch_count = re_apply_patches()
 
-    state = {"patch_count": patch_count}
+    report = get_last_beam_patch_report()
+    state: dict[str, object] = {
+        "patch_count": patch_count,
+        "patches": report.statuses() if report is not None else {},
+    }
     logger.debug("vllm-gr runtime initialized: patches=%d", patch_count)
     return state
 
@@ -43,4 +47,4 @@ def initialize_runtime() -> dict[str, int]:
 def register() -> None:
     """Entry point used by vLLM's general plugin loader."""
     state = initialize_runtime()
-    logger.debug("vllm-gr plugin loaded (%d patches applied)", state["patch_count"])
+    logger.debug("vllm-gr plugin loaded (%s patches applied)", state["patch_count"])

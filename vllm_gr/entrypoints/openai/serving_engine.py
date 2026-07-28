@@ -17,6 +17,8 @@ from vllm.utils import random_uuid
 
 from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_flat_logprobs,
+)
+from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_segment as _extract_and_dedup_segment,
 )
 from vllm_gr.logprobs import reconstruct_beam_logprobs
@@ -188,8 +190,6 @@ async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
         )
     except Exception as e:
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
-
-
 
 
 async def beam_search(

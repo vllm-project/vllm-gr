@@ -10,13 +10,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
+from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
+from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
 logger = init_logger(__name__)
 
 _BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
+_SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
+_WORKER_EXECUTE_PATCH_MARKER = "_vllm_gr_beam_execute_patch"
+_WORKER_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_patch"
+_WORKER_BOOKKEEPING_PATCH_MARKER = "_vllm_gr_beam_bookkeeping_patch"
 
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
@@ -44,99 +49,13 @@ def make_patched_engine_core_init(original_init):
 
 
 # ---------------------------------------------------------------------------
-# Helpers: add enum members to EngineCoreRequestType at runtime
-# ---------------------------------------------------------------------------
-
-
-def _add_enum_member(name: str, value: bytes) -> None:
-    """Dynamically add a member to EngineCoreRequestType if absent.
-
-    This uses object.__new__() to bypass enum's normal creation pathway,
-    which is necessary because we're monkey-patching at runtime and cannot
-    modify the original class definition in vLLM's codebase.
-
-    While this approach manipulates enum internals, it:
-    - Is a standard technique used by enum extension libraries (e.g. aenum)
-    - Includes validation to detect incompatibilities early
-    - Is contained to initialization time (not runtime performance critical)
-    - Is tested to ensure correctness
-
-    Args:
-        name: The name of the new enum member (e.g., "ADD_BATCH")
-        value: The byte value for the enum member (e.g., b"\\x05")
-
-    Raises:
-        RuntimeError: If the enum's internal structure is incompatible
-    """
-    # Skip if already added with the expected wire value.
-    if hasattr(EngineCoreRequestType, name):
-        existing = getattr(EngineCoreRequestType, name)
-        if existing.value != value:
-            raise RuntimeError(
-                f"EngineCoreRequestType.{name} already exists with wire value "
-                f"{existing.value!r}, expected {value!r}"
-            )
-        return
-
-    # Validate that the enum has expected internal structure
-    required_attrs = ["_value2member_map_", "_member_map_", "_member_names_"]
-    for attr in required_attrs:
-        if not hasattr(EngineCoreRequestType, attr):
-            raise RuntimeError(
-                f"EngineCoreRequestType missing expected attribute '{attr}'. "
-                f"This indicates an incompatible Python/vLLM version. "
-                f"Please report this issue with your Python version."
-            )
-
-    # Verify the value type matches existing members
-    if EngineCoreRequestType._value2member_map_:
-        existing_value_type = type(next(iter(EngineCoreRequestType._value2member_map_.keys())))
-        if not isinstance(value, existing_value_type):
-            raise TypeError(
-                f"Value type mismatch: expected {existing_value_type.__name__}, "
-                f"got {type(value).__name__}"
-            )
-        if value in EngineCoreRequestType._value2member_map_:
-            existing = EngineCoreRequestType._value2member_map_[value]
-            raise RuntimeError(
-                f"EngineCoreRequestType wire value {value!r} is already used by "
-                f"{existing.name}; cannot register {name}"
-            )
-
-    # Create the member instance bypassing enum's __new__
-    # (This is the standard approach for runtime enum extension)
-    member = object.__new__(EngineCoreRequestType)
-    member._name_ = name
-    member._value_ = value
-
-    # Register in enum's internal maps
-    EngineCoreRequestType._value2member_map_[value] = member
-    EngineCoreRequestType._member_map_[name] = member
-    EngineCoreRequestType._member_names_.append(name)
-
-    # Set as class attribute (must use type.__setattr__ to bypass enum's __setattr__)
-    type.__setattr__(EngineCoreRequestType, name, member)
-
-
-# ---------------------------------------------------------------------------
 # Child-process patch applicator — called from patched run_engine_core
 # ---------------------------------------------------------------------------
 
 
-def apply_engine_core_child_patches():
-    """Apply all patches inside the EngineCore child process.
-
-    This must be called at the start of run_engine_core (the child process
-    entry point) because multiprocessing 'spawn' starts a fresh Python
-    interpreter that does not inherit monkey patches from the parent.
-    """
+def apply_engine_core_request_patches() -> None:
+    """Install EngineCore request dispatch and beam-state support."""
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
-
-    init_patches_applied = getattr(EngineCore.__init__, _BEAM_STATE_INIT_MARKER, False) and getattr(
-        EngineCoreProc.__init__, _BEAM_STATE_INIT_MARKER, False
-    )
-    if getattr(EngineCore, "_patched_for_beam_requests", False) and init_patches_applied:
-        return
 
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
@@ -146,10 +65,7 @@ def apply_engine_core_child_patches():
 
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
-    # Add new enum members: ADD_BATCH, BEAM_REQUEST_STEP_UPDATE
-    # 0x05 is reserved by vLLM 0.22 for WAKEUP.
-    _add_enum_member("ADD_BATCH", b"\x06")
-    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
+    register_engine_core_request_types()
 
     # Wrap both constructors. Patching EngineCoreProc explicitly protects
     # against changes in upstream inheritance and plugin loading order.
@@ -165,15 +81,21 @@ def apply_engine_core_child_patches():
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
 
-    # Apply scheduler patches in the child process
-    apply_scheduler_patch()
-
-    # Apply worker patches (e.g., GPUModelRunner)
-    apply_worker_patches()
-
     EngineCore._patched_for_beam_requests = True
     EngineCoreProc._patched_for_beam_requests = True
-    logger.debug("Engine-core patches applied in child process.")
+    logger.debug("Engine-core request patches applied.")
+
+
+def apply_engine_core_child_patches() -> None:
+    """Compatibility helper that installs all EngineCore-side capabilities.
+
+    This is called by the process-entry wrapper in a freshly spawned
+    interpreter. Each capability has its own idempotent applicator so a
+    partially initialized process can be checked and repaired explicitly.
+    """
+    apply_engine_core_request_patches()
+    apply_scheduler_patch()
+    apply_worker_patches()
 
 
 # Re-entry guard to detect recursive calls
@@ -259,7 +181,12 @@ def run_engine_core(
     # Set re-entry guard and apply patches
     _run_engine_core_active = True
     try:
-        apply_engine_core_child_patches()
+        # Use the shared initialization mechanism with an EngineCore-only
+        # plan. In a spawned child this repairs targets that became importable
+        # only after the frontend initialized without importing API modules.
+        from vllm_gr.patch import initialize_engine_core_beam_patches
+
+        initialize_engine_core_beam_patches()
         original_run(
             *args,
             dp_rank=dp_rank,
@@ -270,45 +197,11 @@ def run_engine_core(
         _run_engine_core_active = False
 
 
-def _build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional[Dict[str, Any]]:
-    """Build scheduler metadata for a grouped beam-decode request.
-
-    ``beam_width`` is execution metadata carried by ``BeamRequestStepUpdate``;
-    it must never be inferred from ``SamplingParams.n`` or silently defaulted.
-    A missing or invalid value means the EngineCore protocol chain is broken,
-    so fail before the model runner can execute with incorrect batch geometry.
-    """
-    if not getattr(req, "is_beam_decode", False):
-        return None
-
-    if not hasattr(req, "beam_width"):
-        raise RuntimeError(
-            f"Grouped beam request {req.request_id!r} is missing required beam_width metadata"
-        )
-
-    beam_width = req.beam_width
-    if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 1:
-        raise RuntimeError(
-            f"Grouped beam request {req.request_id!r} has invalid beam_width={beam_width!r}; "
-            "expected a positive integer"
-        )
-
-    return {
-        "is_beam_decode": True,
-        "beam_width": beam_width,
-        "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
-        "prefix_len": getattr(req, "prefix_len", 0),
-        "cache_len": req.num_computed_tokens - num_scheduled_tokens,
-    }
-
-
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
-    from functools import wraps
-
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    if getattr(Scheduler, "_patched_for_beam_requests", False):
+    if getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False):
         return
 
     _original_schedule = Scheduler.schedule
@@ -334,12 +227,10 @@ def apply_scheduler_patch():
             # Propagate beam request attributes from Request objects to SchedulerOutput
             beam_data = {}
             if hasattr(output, "num_scheduled_tokens"):
-                for req_id in output.num_scheduled_tokens.keys():
+                for req_id, num_scheduled_tokens in output.num_scheduled_tokens.items():
                     req = self.requests.get(req_id)
                     if req:
-                        metadata = _build_beam_request_metadata(
-                            req, output.num_scheduled_tokens[req_id]
-                        )
+                        metadata = build_beam_request_metadata(req, num_scheduled_tokens)
                         if metadata is not None:
                             beam_data[req_id] = metadata
             output.beam_data = beam_data
@@ -348,6 +239,7 @@ def apply_scheduler_patch():
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
 
     Scheduler.schedule = patched_schedule
+    setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)
     Scheduler._patched_for_beam_requests = True
     logger.debug("Scheduler.schedule patched for beam-requests propagation.")
 
@@ -935,6 +827,9 @@ def make_patched_execute_model(_orig_execute_model):
 
     Shared by GPU and NPU runners.
     """
+    if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
+        return _orig_execute_model
+
     from vllm_gr.v1.attention.backends.beam_attn import BEAM_DATA_VAR
 
     @wraps(_orig_execute_model)
@@ -950,12 +845,16 @@ def make_patched_execute_model(_orig_execute_model):
             self._current_beam_info = None
             BEAM_DATA_VAR.reset(token)
 
+    setattr(patched_execute_model, _WORKER_EXECUTE_PATCH_MARKER, True)
     return patched_execute_model
 
 
 def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
     """GPU ``_prepare_inputs`` wrapper: ``(scheduler_output, num_scheduled_tokens)``
     returning ``(logits_indices, spec_decode_metadata)``."""
+
+    if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
+        return _orig_prepare_inputs
 
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
@@ -978,12 +877,16 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
             spec_decode_metadata,
         )
 
+    setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
 
 
 def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
     """GPU ``_bookkeeping_sync`` wrapper: returns the 7-tuple including
     ``num_nans_in_logits``."""
+
+    if getattr(_orig_bookkeeping_sync, _WORKER_BOOKKEEPING_PATCH_MARKER, False):
+        return _orig_bookkeeping_sync
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
@@ -1029,6 +932,7 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
             invalid_req_indices,
         )
 
+    setattr(patched_bookkeeping_sync, _WORKER_BOOKKEEPING_PATCH_MARKER, True)
     return patched_bookkeeping_sync
 
 
@@ -1055,6 +959,9 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
     physical ``slot_mapping`` is materialized from linear positions inside the
     original before the overwrite, so it is unaffected.
     """
+
+    if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
+        return _orig_prepare_inputs
 
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
@@ -1089,6 +996,7 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
             num_scheduled_tokens_compressed_list,
         )
 
+    setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
 
 
@@ -1100,6 +1008,9 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
     hidden_states, num_scheduled_tokens, spec_decode_metadata)`` positionally,
     so ``sampler_output`` is ``args[0]``.
     """
+
+    if getattr(_orig_bookkeeping_sync, _WORKER_BOOKKEEPING_PATCH_MARKER, False):
+        return _orig_bookkeeping_sync
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
@@ -1145,27 +1056,28 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
             invalid_req_indices,
         )
 
+    setattr(patched_bookkeeping_sync, _WORKER_BOOKKEEPING_PATCH_MARKER, True)
     return patched_bookkeeping_sync
 
 
-def apply_worker_patches():
-    """Applies runtime overrides onto GPUModelRunner and NPUModelRunner execution entries."""
+def is_worker_runner_patched(runner_class) -> bool:
+    """Return whether all grouped-beam hooks are present on a runner class."""
+    return bool(
+        getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)
+        and getattr(runner_class._prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False)
+        and getattr(
+            runner_class._bookkeeping_sync,
+            _WORKER_BOOKKEEPING_PATCH_MARKER,
+            False,
+        )
+    )
+
+
+def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
+    """Discover the ModelRunner target for the active platform."""
     from vllm_gr.utils.npu_adapter import is_npu_available
 
-    try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except ImportError as exc:
-        logger.warning(
-            "Failed to import vllm.v1.worker.gpu_model_runner.GPUModelRunner; "
-            "skipping vllm-gr GPU beam-search runner patches for this attempt. "
-            "ImportError: %s",
-            exc,
-        )
-        logger.debug("GPUModelRunner import traceback", exc_info=True)
-        GPUModelRunner = None
-
-    npu_available = is_npu_available()
-    if npu_available:
+    if is_npu_available():
         try:
             # Import through vllm-ascend's supported worker entry point. Its
             # module initializes vllm_ascend.ops before model_runner_v1, which
@@ -1182,25 +1094,30 @@ def apply_worker_patches():
                 exc,
             )
             logger.debug("NPUModelRunner import traceback", exc_info=True)
-            NPUModelRunner = None
-    else:
-        NPUModelRunner = None
+            return ()
+        return (("NPUModelRunner", NPUModelRunner),)
 
-    # Return early if nothing to patch
-    if GPUModelRunner is None and NPUModelRunner is None:
-        logger.warning("No supported model runner found for patching.")
-        return
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except ImportError as exc:
+        logger.warning(
+            "Failed to import vllm.v1.worker.gpu_model_runner.GPUModelRunner; "
+            "skipping vllm-gr GPU beam-search runner patches for this attempt. "
+            "ImportError: %s",
+            exc,
+        )
+        logger.debug("GPUModelRunner import traceback", exc_info=True)
+        return ()
+    return (("GPUModelRunner", GPUModelRunner),)
 
-    # Track which runners have already been patched
-    runners_to_patch = []
-    if GPUModelRunner is not None and not getattr(
-        GPUModelRunner, "_patched_for_beam_pos_ids", False
-    ):
-        runners_to_patch.append(("GPUModelRunner", GPUModelRunner))
-    if NPUModelRunner is not None and not getattr(
-        NPUModelRunner, "_patched_for_beam_pos_ids", False
-    ):
-        runners_to_patch.append(("NPUModelRunner", NPUModelRunner))
+
+def apply_worker_patches() -> None:
+    """Apply Beam hooks to the active-platform ModelRunner target."""
+    runners_to_patch = [
+        (runner_name, runner_class)
+        for runner_name, runner_class in discover_active_worker_runners()
+        if not is_worker_runner_patched(runner_class)
+    ]
 
     if not runners_to_patch:
         return

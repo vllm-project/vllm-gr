@@ -65,7 +65,7 @@ def extract_and_dedup_segment(
     if is_vocab_slice_enabled():
         offset, _, _ = get_vocab_slice_config()
         if offset is not None:
-            token_ids_pos = [tid + offset for tid in token_ids_pos]
+            token_ids_pos = [tid + offset if tid < offset else tid for tid in token_ids_pos]
 
     return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
 
@@ -86,7 +86,6 @@ def extract_and_dedup_flat_logprobs(flat: Any, logprobs_num: int):
         flat.end_indices[0],
         logprobs_num,
     )
-
 
 
 def find_eos_indices(token_ids: np.ndarray, eos_token_id: int) -> np.ndarray:
