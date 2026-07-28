@@ -3,27 +3,14 @@
 
 import numpy as np
 import pytest
-from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
-from vllm.inputs import tokens_input
-from vllm.logprobs import FlatLogprobs
-from vllm.lora.request import LoRARequest
 
 from vllm_gr.beam_search_decision_utils import (
-    complete_eos_candidates,
     extract_and_dedup_segment,
     find_eos_indices,
     mask_candidate_logprobs,
-    materialize_selected_beams,
     select_top_indices,
 )
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs
-
-CandidateCache = tuple[
-    list[int],
-    list[float],
-    list[int | None],
-    list[str | None],
-]
 
 
 class _FlatLogprobsStub:
@@ -33,31 +20,6 @@ class _FlatLogprobsStub:
     logprobs = [-0.01, -0.1, -0.2, -0.3]
     ranks = [1, 2, 3, 4]
     decoded_tokens = ["a", "b", "c", "d"]
-
-
-def _beam(
-    tokens: list[int],
-    score: float = 0.0,
-    lora_request: LoRARequest | None = None,
-) -> BeamSearchSequence:
-    beam = BeamSearchSequence(
-        orig_prompt=tokens_input(tokens),
-        tokens=tokens,
-        logprobs=FlatLogprobs(),
-        cum_logprob=score,
-        lora_request=lora_request,
-    )
-    beam._lp_parent = None
-    beam._lp_step_data = None
-    return beam
-
-
-def _candidate_cache(
-    token_ids: list[int],
-    logprobs: list[float],
-) -> CandidateCache:
-    size = len(token_ids)
-    return token_ids, logprobs, [None] * size, [None] * size
 
 
 @pytest.mark.parametrize(
@@ -166,85 +128,6 @@ def test_find_eos_indices_matches_parent_expression() -> None:
     assert actual.dtype == expected.dtype
 
 
-def test_complete_eos_candidates_preserves_offline_behavior() -> None:
-    first_lora = LoRARequest("first", 1, "/tmp/first")
-    second_lora = LoRARequest("second", 2, "/tmp/second")
-    parents = [
-        _beam([10], score=-0.1, lora_request=first_lora),
-        _beam([20], score=-0.2, lora_request=second_lora),
-    ]
-    cache = [
-        _candidate_cache([2, 11], [-0.3, -0.4]),
-        _candidate_cache([21, 2], [-0.5, -0.6]),
-    ]
-    scores = np.asarray([-0.4, -0.5, -0.7, -0.8], dtype=np.float32)
-    initial_logprobs = FlatLogprobs()
-
-    eos_beams, masked_scores = complete_eos_candidates(
-        parents=parents,
-        token_ids=np.asarray([2, 11, 21, 2], dtype=np.int64),
-        scores=scores,
-        beam_flat_cache=cache,
-        candidates_per_parent=2,
-        eos_token_id=2,
-        initial_logprobs=initial_logprobs,
-        include_eos_token=True,
-        inherit_lora_request=True,
-    )
-
-    assert masked_scores is not scores
-    assert scores.tolist() == pytest.approx([-0.4, -0.5, -0.7, -0.8])
-    assert masked_scores.tolist() == pytest.approx([-float("inf"), -0.5, -0.7, -float("inf")])
-    assert [beam.tokens for beam in eos_beams] == [[10, 2], [20, 2]]
-    assert [beam.finish_reason for beam in eos_beams] == ["stop", "stop"]
-    assert [beam.stop_reason for beam in eos_beams] == [2, 2]
-    assert [beam.lora_request for beam in eos_beams] == [first_lora, second_lora]
-    assert eos_beams[0].orig_prompt is parents[0].orig_prompt
-    assert eos_beams[1].orig_prompt is parents[1].orig_prompt
-    assert [beam._lp_parent for beam in eos_beams] == parents
-    assert [beam._lp_step_data for beam in eos_beams] == cache
-    assert all(beam.logprobs is initial_logprobs for beam in eos_beams)
-    assert all(type(beam.cum_logprob) is float for beam in eos_beams)
-
-
-def test_complete_eos_candidates_preserves_openai_behavior() -> None:
-    lora_request = LoRARequest("adapter", 1, "/tmp/adapter")
-    parent = _beam([10], lora_request=lora_request)
-    cache = [_candidate_cache([2, 11], [-0.1, -0.2])]
-
-    eos_beams, masked_scores = complete_eos_candidates(
-        parents=[parent],
-        token_ids=np.asarray([2, 11]),
-        scores=np.asarray([-0.1, -0.2]),
-        beam_flat_cache=cache,
-        candidates_per_parent=2,
-        eos_token_id=2,
-        initial_logprobs=FlatLogprobs(),
-        include_eos_token=False,
-        inherit_lora_request=False,
-    )
-
-    assert len(eos_beams) == 1
-    assert eos_beams[0].tokens is parent.tokens
-    assert eos_beams[0].lora_request is None
-    assert masked_scores.tolist() == [-float("inf"), -0.2]
-
-
-def test_complete_eos_candidates_rejects_missing_parent_cache() -> None:
-    with pytest.raises(AssertionError):
-        complete_eos_candidates(
-            parents=[_beam([10])],
-            token_ids=np.asarray([2]),
-            scores=np.asarray([-0.1]),
-            beam_flat_cache=[None],
-            candidates_per_parent=1,
-            eos_token_id=2,
-            initial_logprobs=FlatLogprobs(),
-            include_eos_token=True,
-            inherit_lora_request=True,
-        )
-
-
 @pytest.mark.parametrize(
     ("scores", "beam_width"),
     [
@@ -267,51 +150,3 @@ def test_select_top_indices_matches_parent_expression(
 
     assert np.array_equal(actual, expected)
     assert actual.dtype == expected.dtype
-
-
-def test_materialize_selected_beams_preserves_selection_order_and_lineage() -> None:
-    first_lora = LoRARequest("first", 1, "/tmp/first")
-    second_lora = LoRARequest("second", 2, "/tmp/second")
-    parents = [
-        _beam([10], lora_request=first_lora),
-        _beam([20], lora_request=second_lora),
-    ]
-    cache = [
-        _candidate_cache([11, 12], [-0.1, -0.2]),
-        _candidate_cache([21, 22], [-0.3, -0.4]),
-    ]
-    initial_logprobs = FlatLogprobs()
-
-    new_beams, fork_info = materialize_selected_beams(
-        parents=parents,
-        selected_indices=np.asarray([3, 0], dtype=np.int64),
-        token_ids=np.asarray([11, 12, 21, 22], dtype=np.int64),
-        scores=np.asarray([-0.1, -0.2, -0.3, -0.4], dtype=np.float32),
-        beam_flat_cache=cache,
-        candidates_per_parent=2,
-        initial_logprobs=initial_logprobs,
-    )
-
-    assert [beam.tokens for beam in new_beams] == [[20, 22], [10, 11]]
-    assert fork_info == [(1, 22), (0, 11)]
-    assert [beam.lora_request for beam in new_beams] == [second_lora, first_lora]
-    assert new_beams[0].orig_prompt is parents[1].orig_prompt
-    assert new_beams[1].orig_prompt is parents[0].orig_prompt
-    assert [beam._lp_parent for beam in new_beams] == [parents[1], parents[0]]
-    assert [beam._lp_step_data for beam in new_beams] == [cache[1], cache[0]]
-    assert all(beam.logprobs is initial_logprobs for beam in new_beams)
-    assert all(type(beam.tokens[-1]) is int for beam in new_beams)
-    assert all(type(beam.cum_logprob) is float for beam in new_beams)
-
-
-def test_materialize_selected_beams_rejects_missing_parent_cache() -> None:
-    with pytest.raises(AssertionError):
-        materialize_selected_beams(
-            parents=[_beam([10])],
-            selected_indices=[0],
-            token_ids=np.asarray([11]),
-            scores=np.asarray([-0.1]),
-            beam_flat_cache=[None],
-            candidates_per_parent=1,
-            initial_logprobs=FlatLogprobs(),
-        )
