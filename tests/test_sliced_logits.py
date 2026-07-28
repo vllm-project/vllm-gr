@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import pytest
 import torch
 import torch.nn as nn
@@ -9,10 +10,10 @@ from vllm_gr.ops.sliced_logits import (
     set_vocab_slice_config,
     get_vocab_slice_config,
     is_vocab_slice_enabled,
-    init_vocab_slice_config_from_env,
 )
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs
 from vllm_gr.entrypoints.openai.serving_engine import _extract_and_dedup_segment
+from vllm_gr.entrypoints.openai.serving_models import Catalog
 
 
 class MockLMHead(nn.Module):
@@ -96,7 +97,7 @@ def test_token_id_remapping():
 
     flat = MockFlatLogprobs(token_ids=[0, 1, 2], logprobs=[-0.1, -0.5, -1.0])
     remapped_ids, _, _, _ = extract_and_dedup_flat_logprobs(flat, logprobs_num=3)
-    assert remapped_ids == [20000, 20001, 20002]
+    assert list(remapped_ids) == [20000, 20001, 20002]
 
     # Test _extract_and_dedup_segment
     seg_ids, _, _, _ = _extract_and_dedup_segment(
@@ -108,25 +109,47 @@ def test_token_id_remapping():
         end_offset=2,
         logprobs_num=2,
     )
-    assert seg_ids == [20005, 20010]
+    assert list(seg_ids) == [20005, 20010]
 
     # Reset config
     set_vocab_slice_config(None, None)
     assert not is_vocab_slice_enabled()
 
 
-def test_env_vars_config(monkeypatch):
+
+def test_catalog_slice_config(tmp_path):
     set_vocab_slice_config(None, None)
-    monkeypatch.setenv("VLLM_GR_VOCAB_OFFSET", "20000")
-    monkeypatch.setenv("VLLM_GR_VOCAB_SLICE_SIZE", "24576")
-    init_vocab_slice_config_from_env()
+    assert not is_vocab_slice_enabled()
+
+    class DummyTokenizer:
+        def convert_tokens_to_ids(self, tokens):
+            mapping = {
+                "<|sid_begin|>": 1,
+                "<s_a_100>": 1000,
+                "<s_b_200>": 1200,
+                "<s_c_500>": 2499,
+                "<|sid_end|>": 2,
+            }
+            if isinstance(tokens, list):
+                return [mapping.get(t, None) for t in tokens]
+            return mapping.get(tokens, None)
+
+    catalog_data = [
+        ["<|sid_begin|>", "<s_a_100>", "<s_b_200>", "<s_c_500>", "<|sid_end|>"]
+    ]
+    catalog_file = tmp_path / "test_catalog.json"
+    catalog_file.write_text(json.dumps(catalog_data))
+
+    cat = Catalog(DummyTokenizer())
+    cat.load(str(catalog_file))
 
     assert is_vocab_slice_enabled()
-    offset, slice_size, quant_g = get_vocab_slice_config()
-    assert offset == 20000
-    assert slice_size == 24576
+    assert cat.vocab_offset == 1000
+    assert cat.vocab_slice_size == 1500  # 2499 - 1000 + 1
+    offset, slice_size, _ = get_vocab_slice_config()
+    assert offset == 1000
+    assert slice_size == 1500
 
-    monkeypatch.delenv("VLLM_GR_VOCAB_OFFSET")
-    monkeypatch.delenv("VLLM_GR_VOCAB_SLICE_SIZE")
-    init_vocab_slice_config_from_env()
+    set_vocab_slice_config(None, None)
     assert not is_vocab_slice_enabled()
+

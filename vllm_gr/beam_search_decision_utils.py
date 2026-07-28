@@ -9,8 +9,11 @@ an intermediate beam domain model.
 """
 
 from collections.abc import Collection, Sequence
+from typing import Any
 
 import numpy as np
+
+from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 
 
 def mask_candidate_logprobs(
@@ -59,7 +62,31 @@ def extract_and_dedup_segment(
         ranks_pos = ranks_pos[selected] if ranks_pos is not None else None
         decoded_pos = decoded_pos[selected] if decoded_pos is not None else None
 
+    if is_vocab_slice_enabled():
+        offset, _, _ = get_vocab_slice_config()
+        if offset is not None:
+            token_ids_pos = [tid + offset for tid in token_ids_pos]
+
     return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
+
+
+def extract_and_dedup_flat_logprobs(flat: Any, logprobs_num: int):
+    """Extract position-0 logprobs from FlatLogprobs, dedup sampled token.
+
+    Flat arrays store [sampled, top1, ..., topK] — the only possible
+    duplicate is position 0 (sampled token) when it also appears in the
+    top-K (positions 1..K).  Returns exactly ``logprobs_num`` entries.
+    """
+    return extract_and_dedup_segment(
+        flat.token_ids,
+        flat.logprobs,
+        flat.ranks,
+        flat.decoded_tokens,
+        flat.start_indices[0],
+        flat.end_indices[0],
+        logprobs_num,
+    )
+
 
 
 def find_eos_indices(token_ids: np.ndarray, eos_token_id: int) -> np.ndarray:

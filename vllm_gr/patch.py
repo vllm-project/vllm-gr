@@ -32,7 +32,7 @@ def _is_npu_platform() -> bool:
 _GR_BEAM_PATCHES_APPLIED = False
 _ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
 _ASCEND_ORIGINAL_CACHED_GET_ATTN = None
-
+_SLICED_LOGITS_PATCHED = False
 
 def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
     """Preserve CUSTOM attention backend on all platforms.
@@ -113,7 +113,6 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
         if backend is None:
             try:
                 from vllm.config import get_current_vllm_config_or_none
-
                 vllm_config = get_current_vllm_config_or_none()
                 if (
                     vllm_config is not None
@@ -150,14 +149,54 @@ def patch_sliced_logits() -> None:
     if _SLICED_LOGITS_PATCHED:
         return
     try:
+        from vllm.config import get_current_vllm_config_or_none
         from vllm.model_executor.layers.logits_processor import LogitsProcessor
-        from vllm_gr.ops.sliced_logits import is_vocab_slice_enabled, compute_sliced_logits
+        from vllm_gr.ops.sliced_logits import (
+            compute_sliced_logits,
+            is_vocab_slice_enabled,
+            set_vocab_slice_config,
+        )
+
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            vllm_config is not None
+            and getattr(vllm_config, "additional_config", None)
+            and isinstance(vllm_config.additional_config, dict)
+        ):
+            offset = vllm_config.additional_config.get("vllm_gr_vocab_offset")
+            slice_size = vllm_config.additional_config.get("vllm_gr_vocab_slice_size")
+            if offset is not None and slice_size is not None:
+                set_vocab_slice_config(offset, slice_size)
+
+        orig_init = LogitsProcessor.__init__
+
+        def patched_init(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            if not is_vocab_slice_enabled():
+                vllm_cfg = get_current_vllm_config_or_none()
+                if (
+                    vllm_cfg is not None
+                    and getattr(vllm_cfg, "additional_config", None)
+                    and isinstance(vllm_cfg.additional_config, dict)
+                ):
+                    offset = vllm_cfg.additional_config.get("vllm_gr_vocab_offset")
+                    slice_size = vllm_cfg.additional_config.get("vllm_gr_vocab_slice_size")
+                    if offset is not None and slice_size is not None:
+                        set_vocab_slice_config(offset, slice_size)
+
+        LogitsProcessor.__init__ = patched_init
 
         orig_get_logits = LogitsProcessor._get_logits
 
         def patched_get_logits(self, hidden_states, lm_head, embedding_bias):
             if is_vocab_slice_enabled():
-                return compute_sliced_logits(hidden_states, lm_head, embedding_bias)
+                return compute_sliced_logits(
+                    hidden_states,
+                    lm_head,
+                    embedding_bias,
+                    logits_processor=self,
+                    orig_get_logits=orig_get_logits,
+                )
             return orig_get_logits(self, hidden_states, lm_head, embedding_bias)
 
         LogitsProcessor._get_logits = patched_get_logits
@@ -165,6 +204,7 @@ def patch_sliced_logits() -> None:
         logger.info("vllm_gr: Patched LogitsProcessor._get_logits for sliced vocabulary projection")
     except Exception as exc:
         logger.debug("vllm_gr: Skipping patch_sliced_logits: %s", exc)
+
 
 def _apply_gr_beam_patches(force: bool = False) -> int:
     """Apply beam-search related patches from vllm-gr.

@@ -35,6 +35,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.beam_search_decision_utils import (
+    extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
     find_eos_indices,
     mask_candidate_logprobs,
@@ -42,7 +43,6 @@ from vllm_gr.beam_search_decision_utils import (
 )
 from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
-    extract_and_dedup_flat_logprobs,
     reconstruct_beam_logprobs,
 )
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params

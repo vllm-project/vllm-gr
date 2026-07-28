@@ -6,7 +6,10 @@ per-element append."""
 import itertools
 from collections.abc import Iterable
 
-from vllm_gr.beam_search_decision_utils import extract_and_dedup_segment
+from vllm_gr.beam_search_decision_utils import (
+    extract_and_dedup_flat_logprobs,
+    extract_and_dedup_segment,
+)
 
 
 def append_fast(
@@ -33,22 +36,6 @@ def append_fast(
     self.end_indices.append(len(self.logprobs))
 
 
-def extract_and_dedup_flat_logprobs(flat, logprobs_num):
-    """Extract position-0 logprobs from FlatLogprobs, dedup sampled token.
-
-    Flat arrays store [sampled, top1, ..., topK] — the only possible
-    duplicate is position 0 (sampled token) when it also appears in the
-    top-K (positions 1..K).  Returns exactly ``logprobs_num`` entries.
-    """
-    return extract_and_dedup_segment(
-        flat.token_ids,
-        flat.logprobs,
-        flat.ranks,
-        flat.decoded_tokens,
-        flat.start_indices[0],
-        flat.end_indices[0],
-        logprobs_num,
-    )
 
 
 def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):

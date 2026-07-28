@@ -99,6 +99,15 @@ def create_engine_config(self, usage_context=None, headless=False):
             raise ValueError("vLLM-GR options require --additional-config to be a JSON object")
         if catalog_path is not None:
             additional_config["vllm_gr_catalog_path"] = catalog_path
+            model_name = getattr(self, "model", None)
+            if model_name is not None:
+                from vllm_gr.entrypoints.openai.serving_models import compute_catalog_slice_config
+                offset, slice_size = compute_catalog_slice_config(catalog_path, model_name)
+                if offset is not None and slice_size is not None:
+                    additional_config["vllm_gr_vocab_offset"] = offset
+                    additional_config["vllm_gr_vocab_slice_size"] = slice_size
+                    from vllm_gr.ops.sliced_logits import set_vocab_slice_config
+                    set_vocab_slice_config(offset, slice_size)
         if custom_backend:
             additional_config["vllm_gr_attention_backend"] = "CUSTOM"
 

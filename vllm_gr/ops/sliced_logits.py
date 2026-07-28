@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, Any
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.ops.sliced_logits")
 
 # Global configuration variables for static offset mode
 _VOCAB_OFFSET: Optional[int] = None
@@ -34,26 +34,6 @@ class SlicedLMHeadProxy(nn.Module):
         self.org_vocab_size = sliced_num_embeddings
 
 
-def init_vocab_slice_config_from_env() -> None:
-    """Reads vocabulary slice configuration from environment variables once."""
-    global _VOCAB_OFFSET, _VOCAB_SLICE_SIZE
-    _VOCAB_OFFSET = None
-    if "VLLM_GR_VOCAB_OFFSET" in os.environ:
-        try:
-            _VOCAB_OFFSET = int(os.environ["VLLM_GR_VOCAB_OFFSET"])
-        except ValueError:
-            pass
-
-    _VOCAB_SLICE_SIZE = None
-    if "VLLM_GR_VOCAB_SLICE_SIZE" in os.environ:
-        try:
-            _VOCAB_SLICE_SIZE = int(os.environ["VLLM_GR_VOCAB_SLICE_SIZE"])
-        except ValueError:
-            pass
-
-
-# Read initial environment variables once at module load
-init_vocab_slice_config_from_env()
 
 
 def set_vocab_slice_config(
@@ -84,10 +64,13 @@ def compute_sliced_logits(
     embedding_bias: Optional[torch.Tensor] = None,
     offset: Optional[int] = None,
     slice_size: Optional[int] = None,
-    quant_group_size: int = 128
+    quant_group_size: int = 128,
+    logits_processor: Optional[Any] = None,
+    orig_get_logits: Optional[Any] = None,
 ) -> torch.Tensor:
     """
     Computes logits using pre-sliced, contiguous vocabulary projection weights.
+    Supports proxying via LogitsProcessor for full Tensor Parallelism (TP) and custom quantization.
     Fully optimized for torch.compile and CUDA graph execution.
     """
     cfg_offset, cfg_slice_size, _ = get_vocab_slice_config()
@@ -123,13 +106,17 @@ def compute_sliced_logits(
             f"slice_size={sz}, aligned range=[{offset_aligned}:{end_idx}])"
         )
 
-    # Check if a custom quantization method is active
-    quant_method = getattr(lm_head, "quant_method", None)
-    if quant_method is not None:
-        logits = quant_method.apply(lm_head._sliced_proxy, hidden_states, bias=lm_head._sliced_bias)
+    proxy = lm_head._sliced_proxy
+    if logits_processor is not None and orig_get_logits is not None:
+        logits = orig_get_logits(logits_processor, hidden_states, proxy, lm_head._sliced_bias)
     else:
-        logits = F.linear(hidden_states, lm_head._sliced_weight, lm_head._sliced_bias)
+        quant_method = getattr(lm_head, "quant_method", None)
+        if quant_method is not None:
+            logits = quant_method.apply(proxy, hidden_states, bias=lm_head._sliced_bias)
+        else:
+            logits = F.linear(hidden_states, lm_head._sliced_weight, lm_head._sliced_bias)
 
-    if lm_head._sliced_need_crop:
+    if lm_head._sliced_need_crop and logits is not None:
         logits = logits[..., lm_head._sliced_rel_start : lm_head._sliced_rel_end]
+
     return logits

@@ -15,7 +15,11 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 
-from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
+from vllm_gr.beam_search_decision_utils import (
+    extract_and_dedup_flat_logprobs,
+    extract_and_dedup_segment as _extract_and_dedup_segment,
+)
+from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
@@ -186,33 +190,6 @@ async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
 
 
-def _extract_and_dedup_segment(
-    raw_token_ids,
-    raw_logprobs,
-    raw_ranks,
-    raw_decoded,
-    start_offset: int,
-    end_offset: int,
-    logprobs_num: int,
-):
-    # Extract the precise segment dedicated to this beam's top alternative choices
-    token_ids_pos = raw_token_ids[start_offset:end_offset]
-    logprobs_pos = raw_logprobs[start_offset:end_offset]
-    ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
-    decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
-
-    # Dedup the sampled token (index 0) if it appears in the top-K
-    if len(token_ids_pos) > logprobs_num:
-        if any(token_ids_pos[0] == token_ids_pos[j] for j in range(1, logprobs_num + 1)):
-            s = slice(1, logprobs_num + 1)
-        else:
-            s = slice(logprobs_num)
-        token_ids_pos = token_ids_pos[s]
-        logprobs_pos = logprobs_pos[s]
-        ranks_pos = ranks_pos[s] if ranks_pos is not None else None
-        decoded_pos = decoded_pos[s] if decoded_pos is not None else None
-
-    return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
 
 
 async def beam_search(
