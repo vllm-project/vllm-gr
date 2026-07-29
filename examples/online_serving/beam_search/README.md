@@ -16,8 +16,7 @@ vllm-gr serve OpenOneRec/OneRec-1.7B \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \
     --max-num-batched-tokens 16384 \
-    --scheduling-policy priority \
-    --attention-backend CUSTOM
+    --scheduling-policy priority
 ```
 
 run client (on another terminal)

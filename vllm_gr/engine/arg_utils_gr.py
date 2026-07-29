@@ -170,7 +170,7 @@ def create_engine_config(self, usage_context=None, headless=False):
     if effective_catalog_path is not None:
         model_name = getattr(self, "model", None)
         if model_name is not None:
-            from vllm_gr.entrypoints.openai.serving_models import (
+            from vllm_gr.utils.catalog import (
                 compute_catalog_slice_config,
             )
 

@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
-from typing import Any
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.models.serving import (
@@ -10,110 +8,11 @@ from vllm.entrypoints.openai.models.serving import (
     LoRAModulePath,
     OpenAIServingModels,
 )
-from vllm.tokenizers import TokenizerLike
 
 from vllm_gr.config import GRConfig
-from vllm_gr.logger import init_logger
-
-logger = init_logger(__name__)
+from vllm_gr.utils.catalog import Catalog
 
 _original_init = OpenAIServingModels.__init__
-
-
-def compute_catalog_slice_config(
-    catalog_path: str,
-    tokenizer_or_model: Any,
-    trust_remote_code: bool = False,
-):
-    """Calculate (vocab_offset, vocab_slice_size) from a JSON catalog file."""
-    import json
-
-    try:
-        if isinstance(tokenizer_or_model, str):
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_or_model, trust_remote_code=trust_remote_code
-            )
-        else:
-            tokenizer = tokenizer_or_model
-
-        with open(catalog_path) as f:
-            catalog_data = json.load(f)
-
-        min_tid = float("inf")
-        max_tid = -float("inf")
-
-        for seq in catalog_data:
-            token_ids = tokenizer.convert_tokens_to_ids(seq)
-            for token_str, token_id in zip(seq, token_ids):
-                if token_id is not None and token_id != -1:
-                    if not (isinstance(token_str, str) and token_str.startswith("<|sid_")):
-                        if token_id < min_tid:
-                            min_tid = token_id
-                        if token_id > max_tid:
-                            max_tid = token_id
-
-        if min_tid != float("inf") and max_tid != -float("inf"):
-            return int(min_tid), int(max_tid - min_tid + 1)
-    except Exception as e:
-        logger.warning("vllm_gr: Failed to compute catalog slice config: %s", e)
-    return None, None
-
-
-class Catalog:
-    def __init__(self, tokenizer: TokenizerLike):
-        self.tokenizer = tokenizer
-        self.trie: dict[int, Any] = {}
-        self.vocab_offset: int | None = None
-        self.vocab_slice_size: int | None = None
-
-    def load(self, path: str):
-        try:
-            with open(path) as f:
-                catalog_data = json.load(f)
-        except FileNotFoundError:
-            raise ValueError(f"Catalog file not found: {path}")
-        except json.JSONDecodeError:
-            raise ValueError(f"Failed to decode JSON from catalog file: {path}")
-
-        for seq_idx, seq in enumerate(catalog_data):
-            token_ids = self.tokenizer.convert_tokens_to_ids(seq)
-            node = self.trie
-            for i, (token_str, token_id) in enumerate(zip(seq, token_ids)):
-                if token_id is None or token_id == -1:
-                    raise ValueError(
-                        f"Failed to map token {token_str!r} to a valid token ID using the tokenizer "
-                        f"(got {token_id!r}). Token occurs at index {i} of sequence #{seq_idx} in catalog {path!r}. "
-                        "Please verify that special/semantic tokens are registered in the model's tokenizer."
-                    )
-                if token_id not in node:
-                    node[token_id] = {}
-                node = node[token_id]
-
-        offset, slice_size = compute_catalog_slice_config(path, self.tokenizer)
-        if offset is not None and slice_size is not None:
-            self.vocab_offset = offset
-            self.vocab_slice_size = slice_size
-            from vllm_gr.ops.sliced_logits import set_vocab_slice_config
-
-            set_vocab_slice_config(self.vocab_offset, self.vocab_slice_size)
-            logger.info(
-                "vllm_gr: Catalog vocabulary slice configured: offset=%d, slice_size=%d (min_token_id=%d, max_token_id=%d)",
-                self.vocab_offset,
-                self.vocab_slice_size,
-                self.vocab_offset,
-                self.vocab_offset + self.vocab_slice_size - 1,
-            )
-
-    def valid(self, token_ids: list[int]) -> set[int]:
-        node = self.trie
-        for tid in token_ids:
-            if tid in node:
-                node = node[tid]
-            else:
-                return set()
-        return set(node.keys())
 
 
 def init_gr(

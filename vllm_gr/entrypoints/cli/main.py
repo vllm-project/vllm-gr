@@ -20,18 +20,10 @@ def _version() -> str:
         return __version__
 
 
-def _maybe_launch_beam_search_serve() -> bool:
-    """Check for --gr flag in serve command and launch beam search serving.
-
-    Returns True if the --gr flag was handled and the original vLLM main
-    should be invoked afterwards.
-    """
-    if "serve" not in sys.argv or "--gr" not in sys.argv:
-        return False
-
-    logger.info(
-        "vllm detected --gr flag in serve command. Launching vllm-gr specialized serving path."
-    )
+def _handle_gr_flags() -> None:
+    """Handle specific gr related flags."""
+    if "serve" not in sys.argv:
+        return
 
     # Check for LMCache connector in args
     for idx, arg in enumerate(sys.argv):
@@ -46,11 +38,7 @@ def _maybe_launch_beam_search_serve() -> bool:
 
                     os.environ["VLLM_GR_LMCACHE_PATCH"] = "1"
 
-    # Beam search patches are already applied through the unified
-    # _apply_gr_beam_patches() in patch.py via the plugin system.
-    # Remove the --gr flag so vLLM's parser doesn't complain.
-    sys.argv.remove("--gr")
-    return True
+    return
 
 
 def main() -> None:
@@ -65,8 +53,11 @@ def main() -> None:
 
     import vllm_gr.entrypoints.cli.check_env as gr_check_env
 
-    # Handle --gr flag for beam search serving mode
-    _maybe_launch_beam_search_serve()
+    _handle_gr_flags()
+
+    from vllm_gr.entrypoints.utils import patch_banner
+
+    patch_banner()
 
     cli_env_setup()
 

@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm_gr.beam_search_decision_utils import extract_and_dedup_segment
-from vllm_gr.entrypoints.openai.serving_models import Catalog
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs
 from vllm_gr.ops.sliced_logits import (
     compute_sliced_logits,
@@ -18,6 +17,7 @@ from vllm_gr.ops.sliced_logits import (
     is_vocab_slice_enabled,
     set_vocab_slice_config,
 )
+from vllm_gr.utils.catalog import Catalog
 
 
 class MockLMHead(nn.Module):  # type: ignore[misc]

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm_gr.entrypoints.openai.serving_models import Catalog
+from vllm_gr.utils.catalog import Catalog
 
 
 @pytest.fixture  # type: ignore
@@ -64,6 +64,112 @@ def test_catalog_functionality(mock_tokenizer: MagicMock) -> None:
         assert catalog.valid([99]) == set()
         # Case 6: Valid start, invalid continuation
         assert catalog.valid([1, 99]) == set()
+
+    finally:
+        if os.path.exists(catalog_path):
+            os.remove(catalog_path)
+
+
+def test_catalog_size_smaller_than_beam_width(mock_tokenizer: MagicMock) -> None:
+    """Test catalog where the number of items is much smaller than typical beam widths."""
+    # Catalog with only 3 items
+    catalog_data = [
+        ["1", "2", "3"],
+        ["1", "2", "4"],
+        ["5", "6", "7"],
+    ]
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        json.dump(catalog_data, f)
+        catalog_path = f.name
+
+    try:
+        catalog = Catalog(mock_tokenizer)
+        catalog.load(catalog_path)
+
+        # Empty prefix should return all start tokens
+        assert set(catalog.valid([])) == {1, 5}
+
+        # Prefix [1, 2] should return next valid tokens {3, 4}
+        assert set(catalog.valid([1, 2])) == {3, 4}
+
+        # Each full path should be exhausted
+        assert catalog.valid([1, 2, 3]) == set()
+        assert catalog.valid([1, 2, 4]) == set()
+        assert catalog.valid([5, 6, 7]) == set()
+
+    finally:
+        if os.path.exists(catalog_path):
+            os.remove(catalog_path)
+
+
+def test_catalog_single_item(mock_tokenizer: MagicMock) -> None:
+    """Test catalog containing only one item."""
+    catalog_data = [
+        ["1", "2", "3", "4"],
+    ]
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        json.dump(catalog_data, f)
+        catalog_path = f.name
+
+    try:
+        catalog = Catalog(mock_tokenizer)
+        catalog.load(catalog_path)
+
+        # Empty prefix should return the single start token
+        assert set(catalog.valid([])) == {1}
+
+        # Following the only path
+        assert set(catalog.valid([1])) == {2}
+        assert set(catalog.valid([1, 2])) == {3}
+        assert set(catalog.valid([1, 2, 3])) == {4}
+        assert catalog.valid([1, 2, 3, 4]) == set()
+
+        # Any deviation from the single path should return empty
+        assert catalog.valid([2]) == set()
+        assert catalog.valid([1, 99]) == set()
+
+    finally:
+        if os.path.exists(catalog_path):
+            os.remove(catalog_path)
+
+
+def test_catalog_multiple_items_long_shared_prefix(mock_tokenizer: MagicMock) -> None:
+    """Test catalog with multiple items sharing a long common prefix."""
+    # All 5 sequences share a 6-token prefix, then diverge
+    catalog_data = [
+        ["10", "20", "30", "40", "50", "60", "100"],
+        ["10", "20", "30", "40", "50", "60", "101"],
+        ["10", "20", "30", "40", "50", "60", "102"],
+        ["10", "20", "30", "40", "50", "60", "103"],
+        ["10", "20", "30", "40", "50", "60", "104"],
+    ]
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        json.dump(catalog_data, f)
+        catalog_path = f.name
+
+    try:
+        catalog = Catalog(mock_tokenizer)
+        catalog.load(catalog_path)
+
+        # Empty prefix should return start tokens (only 10 in this case)
+        assert set(catalog.valid([])) == {10}
+
+        # Following the shared prefix
+        assert set(catalog.valid([10])) == {20}
+        assert set(catalog.valid([10, 20])) == {30}
+        assert set(catalog.valid([10, 20, 30])) == {40}
+        assert set(catalog.valid([10, 20, 30, 40])) == {50}
+        assert set(catalog.valid([10, 20, 30, 40, 50])) == {60}
+
+        # After shared prefix, all 5 divergence tokens are valid
+        assert set(catalog.valid([10, 20, 30, 40, 50, 60])) == {100, 101, 102, 103, 104}
+
+        # Each divergence path should be terminal
+        assert catalog.valid([10, 20, 30, 40, 50, 60, 100]) == set()
+        assert catalog.valid([10, 20, 30, 40, 50, 60, 104]) == set()
 
     finally:
         if os.path.exists(catalog_path):
