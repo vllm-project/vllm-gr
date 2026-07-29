@@ -22,6 +22,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from vllm.v1.sample.sampler import Sampler
+
 from vllm_gr.config import GRAttentionBackend, GRConfig
 
 logger = logging.getLogger("vllm_gr.patch")
@@ -251,6 +253,20 @@ def patch_sliced_logits() -> None:
             return orig_get_logits(self, hidden_states, lm_head, embedding_bias)
 
         LogitsProcessor._get_logits = patched_get_logits
+
+        try:
+            orig_gather = Sampler.gather_logprobs
+
+            @staticmethod
+            def patched_gather_logprobs(logprobs, num_logprobs, token_ids, *args, **kwargs):
+                if logprobs is not None and logprobs.numel() > 0:
+                    num_logprobs = min(num_logprobs, logprobs.size(-1))
+                return orig_gather(logprobs, num_logprobs, token_ids, *args, **kwargs)
+
+            Sampler.gather_logprobs = patched_gather_logprobs
+        except Exception as e:
+            logger.debug("vllm_gr: Could not patch Sampler.gather_logprobs: %s", e)
+
         _SLICED_LOGITS_PATCHED = True
         logger.info("vllm_gr: Patched LogitsProcessor._get_logits for sliced vocabulary projection")
     except Exception as exc:
