@@ -74,6 +74,9 @@ patches:
     target: vllm.v1.attention.backends.registry.AttentionBackendEnum.CUSTOM
     risk: high
     contract: custom-attention-registry
+    ownership:
+      metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata
+      backend_registration_and_execution: vllm_gr.v1.attention.backends.beam_attn
 
   - id: GR-PATCH-014
     target: LMCacheConnectorV1Impl

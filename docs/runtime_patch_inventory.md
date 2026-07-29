@@ -233,6 +233,11 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 - Mutation: supported process-global registry override
 - Risk: High
 - Behavior: registers the GR Beam Attention backend in the official CUSTOM slot.
+- Ownership:
+    - Beam Attention metadata and builder:
+      `vllm_gr.v1.attention.backends.beam_attn_metadata`;
+    - backend registration and platform execution:
+      `vllm_gr.v1.attention.backends.beam_attn`.
 - Ownership risk:
     - CUSTOM is one shared process-global slot;
     - later registration may replace an earlier owner;

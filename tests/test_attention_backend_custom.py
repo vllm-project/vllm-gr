@@ -313,9 +313,9 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
 
         import torch
 
-        import vllm_gr.v1.attention.backends.beam_attn as beam_attn
+        import vllm_gr.v1.attention.backends.beam_attn_metadata as beam_attn_metadata
 
-        builder = object.__new__(beam_attn.BeamAttentionMetadataBuilder)
+        builder = object.__new__(beam_attn_metadata.BeamAttentionMetadataBuilder)
         builder.aot_schedule = True
         builder.cache_config = SimpleNamespace(cache_dtype="auto")
         builder.kv_cache_dtype = torch.bfloat16
@@ -325,7 +325,11 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         builder.block_size = 16
         builder.aot_sliding_window = (-1, -1)
 
-        with mock.patch.object(beam_attn, "get_scheduler_metadata", return_value={}) as scheduler:
+        with mock.patch.object(
+            beam_attn_metadata,
+            "get_scheduler_metadata",
+            return_value={},
+        ) as scheduler:
             builder._get_schedule(
                 batch_size=2,
                 cu_query_lens=torch.tensor([0, 1, 2], dtype=torch.int32),
