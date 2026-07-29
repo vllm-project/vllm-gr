@@ -71,12 +71,16 @@ class Catalog:
         except json.JSONDecodeError:
             raise ValueError(f"Failed to decode JSON from catalog file: {path}")
 
-        for seq in catalog_data:
+        for seq_idx, seq in enumerate(catalog_data):
             token_ids = self.tokenizer.convert_tokens_to_ids(seq)
             node = self.trie
             for i, (token_str, token_id) in enumerate(zip(seq, token_ids)):
                 if token_id is None or token_id == -1:
-                    raise ValueError(f"Invalid token ID: {seq[i]} at index {i}")
+                    raise ValueError(
+                        f"Failed to map token {token_str!r} to a valid token ID using the tokenizer "
+                        f"(got {token_id!r}). Token occurs at index {i} of sequence #{seq_idx} in catalog {path!r}. "
+                        "Please verify that special/semantic tokens are registered in the model's tokenizer."
+                    )
                 if token_id not in node:
                     node[token_id] = {}
                 node = node[token_id]
