@@ -22,6 +22,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from vllm.v1.sample.sampler import Sampler
+
 from vllm_gr.config import GRAttentionBackend, GRConfig
 
 logger = logging.getLogger("vllm_gr.patch")
@@ -90,6 +92,7 @@ def _is_npu_platform() -> bool:
 _LAST_BEAM_PATCH_REPORT: BeamPatchReport | None = None
 _ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
 _ASCEND_ORIGINAL_CACHED_GET_ATTN = None
+_SLICED_LOGITS_PATCHED = False
 
 
 def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
@@ -191,6 +194,83 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
 
     _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
     return patch_count
+
+
+def patch_sliced_logits() -> None:
+    global _SLICED_LOGITS_PATCHED
+    if _SLICED_LOGITS_PATCHED:
+        return
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+        from vllm_gr.ops.sliced_logits import (
+            compute_sliced_logits,
+            is_vocab_slice_enabled,
+            set_vocab_slice_config,
+        )
+
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            vllm_config is not None
+            and getattr(vllm_config, "additional_config", None)
+            and isinstance(vllm_config.additional_config, dict)
+        ):
+            offset = vllm_config.additional_config.get("vllm_gr_vocab_offset")
+            slice_size = vllm_config.additional_config.get("vllm_gr_vocab_slice_size")
+            if offset is not None and slice_size is not None:
+                set_vocab_slice_config(offset, slice_size)
+
+        orig_init = LogitsProcessor.__init__
+
+        def patched_init(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            if not is_vocab_slice_enabled():
+                vllm_cfg = get_current_vllm_config_or_none()
+                if (
+                    vllm_cfg is not None
+                    and getattr(vllm_cfg, "additional_config", None)
+                    and isinstance(vllm_cfg.additional_config, dict)
+                ):
+                    offset = vllm_cfg.additional_config.get("vllm_gr_vocab_offset")
+                    slice_size = vllm_cfg.additional_config.get("vllm_gr_vocab_slice_size")
+                    if offset is not None and slice_size is not None:
+                        set_vocab_slice_config(offset, slice_size)
+
+        LogitsProcessor.__init__ = patched_init
+
+        orig_get_logits = LogitsProcessor._get_logits
+
+        def patched_get_logits(self, hidden_states, lm_head, embedding_bias):
+            if is_vocab_slice_enabled():
+                return compute_sliced_logits(
+                    hidden_states,
+                    lm_head,
+                    embedding_bias,
+                    logits_processor=self,
+                    orig_get_logits=orig_get_logits,
+                )
+            return orig_get_logits(self, hidden_states, lm_head, embedding_bias)
+
+        LogitsProcessor._get_logits = patched_get_logits
+
+        try:
+            orig_gather = Sampler.gather_logprobs
+
+            @staticmethod
+            def patched_gather_logprobs(logprobs, num_logprobs, token_ids, *args, **kwargs):
+                if logprobs is not None and logprobs.numel() > 0:
+                    num_logprobs = min(num_logprobs, logprobs.size(-1))
+                return orig_gather(logprobs, num_logprobs, token_ids, *args, **kwargs)
+
+            Sampler.gather_logprobs = patched_gather_logprobs
+        except Exception as e:
+            logger.debug("vllm_gr: Could not patch Sampler.gather_logprobs: %s", e)
+
+        _SLICED_LOGITS_PATCHED = True
+        logger.info("vllm_gr: Patched LogitsProcessor._get_logits for sliced vocabulary projection")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_sliced_logits: %s", exc)
 
 
 def _call_patch(module_name: str, function_name: str) -> None:
@@ -564,6 +644,13 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
     """
     del force  # Repeated initialization probes every target before applying it.
     patch_count = initialize_required_beam_patches().applied_count
+
+    try:
+        patch_sliced_logits()
+        patch_count += 1
+        logger.debug("vllm_gr: Applied patch_sliced_logits")
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping patch_sliced_logits: %s", exc)
 
     # Optional: LMCache adapter patch
     try:

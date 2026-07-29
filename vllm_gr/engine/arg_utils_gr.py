@@ -162,13 +162,38 @@ def create_engine_config(self, usage_context=None, headless=False):
     existing_gr_config = GRConfig.from_vllm_config(config)
     catalog_path = getattr(self, "catalog_path", None)
     backend_is_explicit, backend_override = _explicit_gr_attention_backend(self)
+
+    effective_catalog_path = (
+        catalog_path if catalog_path is not None else existing_gr_config.catalog_path
+    )
+    offset, slice_size = None, None
+    if effective_catalog_path is not None:
+        model_name = getattr(self, "model", None)
+        if model_name is not None:
+            from vllm_gr.utils.catalog import (
+                compute_catalog_slice_config,
+            )
+
+            trust_remote_code = bool(getattr(self, "trust_remote_code", False))
+            offset, slice_size = compute_catalog_slice_config(
+                effective_catalog_path,
+                model_name,
+                trust_remote_code=trust_remote_code,
+            )
+            if offset is not None and slice_size is not None:
+                from vllm_gr.ops.sliced_logits import set_vocab_slice_config
+
+                set_vocab_slice_config(offset, slice_size)
+
     effective_gr_config = GRConfig(
-        catalog_path=(
-            catalog_path if catalog_path is not None else existing_gr_config.catalog_path
-        ),
+        catalog_path=effective_catalog_path,
         attention_backend=(
             backend_override if backend_is_explicit else existing_gr_config.attention_backend
         ),
+        vocab_offset=offset if offset is not None else existing_gr_config.vocab_offset,
+        vocab_slice_size=slice_size
+        if slice_size is not None
+        else existing_gr_config.vocab_slice_size,
     )
     if effective_gr_config != existing_gr_config:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields

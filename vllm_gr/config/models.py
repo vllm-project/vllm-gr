@@ -17,11 +17,15 @@ class GRConfig:
 
     catalog_path: str | None = None
     attention_backend: GRAttentionBackend | None = None
+    vocab_offset: int | None = None
+    vocab_slice_size: int | None = None
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
             validate_catalog_path,
+            validate_vocab_offset,
+            validate_vocab_slice_size,
         )
 
         object.__setattr__(self, "catalog_path", validate_catalog_path(self.catalog_path))
@@ -30,10 +34,19 @@ class GRConfig:
             "attention_backend",
             validate_attention_backend(self.attention_backend),
         )
+        object.__setattr__(self, "vocab_offset", validate_vocab_offset(self.vocab_offset))
+        object.__setattr__(
+            self, "vocab_slice_size", validate_vocab_slice_size(self.vocab_slice_size)
+        )
 
     @property
     def enabled(self) -> bool:
-        return self.catalog_path is not None or self.attention_backend is not None
+        return (
+            self.catalog_path is not None
+            or self.attention_backend is not None
+            or self.vocab_offset is not None
+            or self.vocab_slice_size is not None
+        )
 
     @classmethod
     def from_vllm_config(cls, vllm_config: object | None) -> GRConfig:

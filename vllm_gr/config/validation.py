@@ -30,3 +30,39 @@ def validate_attention_backend(value: object) -> GRAttentionBackend | None:
         raise ValueError(
             f"unsupported vllm-gr attention_backend {value!r}; supported: {supported}"
         ) from exc
+
+
+def validate_vocab_offset(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(
+            f"vllm-gr vocab_offset must be a non-negative integer or null, got {value!r}"
+        )
+    try:
+        val = int(value)
+        if val < 0:
+            raise ValueError("vllm-gr vocab_offset must be non-negative")
+        return val
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"vllm-gr vocab_offset must be a non-negative integer or null, got {value!r}"
+        ) from exc
+
+
+def validate_vocab_slice_size(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(
+            f"vllm-gr vocab_slice_size must be a positive integer or null, got {value!r}"
+        )
+    try:
+        val = int(value)
+        if val <= 0:
+            raise ValueError("vllm-gr vocab_slice_size must be positive")
+        return val
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"vllm-gr vocab_slice_size must be a positive integer or null, got {value!r}"
+        ) from exc
