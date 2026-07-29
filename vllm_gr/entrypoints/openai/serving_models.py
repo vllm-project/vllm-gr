@@ -20,7 +20,11 @@ logger = init_logger(__name__)
 _original_init = OpenAIServingModels.__init__
 
 
-def compute_catalog_slice_config(catalog_path: str, tokenizer_or_model: Any):
+def compute_catalog_slice_config(
+    catalog_path: str,
+    tokenizer_or_model: Any,
+    trust_remote_code: bool = False,
+):
     """Calculate (vocab_offset, vocab_slice_size) from a JSON catalog file."""
     import json
 
@@ -28,7 +32,9 @@ def compute_catalog_slice_config(catalog_path: str, tokenizer_or_model: Any):
         if isinstance(tokenizer_or_model, str):
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_model, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_or_model, trust_remote_code=trust_remote_code
+            )
         else:
             tokenizer = tokenizer_or_model
 

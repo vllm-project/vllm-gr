@@ -174,7 +174,12 @@ def create_engine_config(self, usage_context=None, headless=False):
                 compute_catalog_slice_config,
             )
 
-            offset, slice_size = compute_catalog_slice_config(effective_catalog_path, model_name)
+            trust_remote_code = bool(getattr(self, "trust_remote_code", False))
+            offset, slice_size = compute_catalog_slice_config(
+                effective_catalog_path,
+                model_name,
+                trust_remote_code=trust_remote_code,
+            )
             if offset is not None and slice_size is not None:
                 from vllm_gr.ops.sliced_logits import set_vocab_slice_config
 
