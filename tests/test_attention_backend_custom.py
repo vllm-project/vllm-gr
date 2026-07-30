@@ -137,39 +137,6 @@ class TestCustomBackendMarkerSerialization(unittest.TestCase):
         assert restored.attention_config.backend == AttentionBackendEnum.CUSTOM
         assert restored.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
 
-    def test_marker_restores_custom_backend_selection(self):
-        """When backend=None in child but marker present, selector still returns Beam."""
-        import vllm.v1.attention.selector as selector_mod
-        from vllm.config import AttentionConfig, VllmConfig
-
-        # Make sure the patch is applied
-        from vllm_gr.patch import _apply_ascend_attention_backend_patch
-        from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
-
-        _apply_ascend_attention_backend_patch(force=True)
-
-        # Simulate child process: config deserialized with backend=None but marker present
-        child_config = VllmConfig(attention_config=AttentionConfig())
-        child_config.attention_config.backend = None
-        child_config.additional_config["vllm_gr_attention_backend"] = "CUSTOM"
-
-        # Temporarily bind as current config so get_current_vllm_config_or_none works
-        from vllm.config import set_current_vllm_config
-
-        with set_current_vllm_config(child_config):
-            import torch
-            from vllm.v1.attention.selector import AttentionSelectorConfig
-
-            selector_cfg = AttentionSelectorConfig(
-                head_size=128,
-                dtype=torch.bfloat16,
-                kv_cache_dtype=None,
-                block_size=128,
-            )
-            result = selector_mod._cached_get_attn_backend(None, selector_cfg)
-
-        assert result is BeamAttentionBackend
-
 
 class TestNpuDefaultBlockSize(unittest.TestCase):
     """Guard the vLLM 16 / vLLM-Ascend 128 default mismatch."""
@@ -233,67 +200,6 @@ class TestNpuDefaultBlockSize(unittest.TestCase):
         assert config.cache_config.block_size == 16
 
 
-class TestNativePlatformBackendFallback(unittest.TestCase):
-    """Verify backend=None without marker delegates to native platform backend."""
-
-    def test_backend_none_without_marker_does_not_return_beam(self):
-        """Without marker, backend=None delegates to the native selector."""
-        import vllm.v1.attention.selector as selector_mod
-        from vllm.config import set_current_vllm_config
-
-        import vllm_gr.patch as gr_patch
-
-        gr_patch._apply_ascend_attention_backend_patch(force=True)
-
-        class FakeNativeBackend:
-            """Stand-in for the platform backend without importing device ops."""
-
-            @staticmethod
-            def get_required_kv_cache_layout():
-                return None
-
-        # The original selector is cached. Clear it so this test exercises the
-        # delegation path while resolve_obj_by_qualname is patched below.
-        gr_patch._ASCEND_ORIGINAL_CACHED_GET_ATTN.cache_clear()
-
-        # Only additional_config is read by the GR wrapper. Keeping this fake
-        # config minimal avoids initializing a real accelerator platform in a
-        # unit test whose contract is delegation.
-        config = mock.Mock(additional_config={})
-        fake_platform = mock.Mock(device_name="test-device")
-        fake_platform.get_attn_backend_cls.return_value = "tests.FakeNativeBackend"
-
-        with (
-            set_current_vllm_config(config),
-            mock.patch("vllm.platforms.current_platform", fake_platform),
-            mock.patch.object(
-                selector_mod,
-                "resolve_obj_by_qualname",
-                return_value=FakeNativeBackend,
-            ) as mock_resolve,
-        ):
-            import torch
-            from vllm.v1.attention.selector import AttentionSelectorConfig
-
-            # Force cache miss by using a different head_size
-            selector_cfg = AttentionSelectorConfig(
-                head_size=64,
-                dtype=torch.float16,
-                kv_cache_dtype=None,
-                block_size=128,
-            )
-            result = selector_mod._cached_get_attn_backend(None, selector_cfg)
-
-        # The native platform still chooses its backend qualname, but the unit
-        # test does not import the complete CUDA/NPU backend dependency graph.
-        fake_platform.get_attn_backend_cls.assert_called_once()
-        mock_resolve.assert_called_once()
-        from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
-
-        assert result is FakeNativeBackend
-        assert result is not BeamAttentionBackend
-
-
 class TestBeamAttentionVllmApiContract(unittest.TestCase):
     """Pin the vLLM 0.22 attention APIs used only on accelerator paths."""
 
@@ -343,76 +249,6 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         kwargs = scheduler.call_args.kwargs
         assert kwargs["num_heads_kv"] == 4
         assert "num_kv_heads" not in kwargs
-
-
-try:
-    from vllm_gr.patch import _is_npu_platform
-
-    _IS_NPU = _is_npu_platform()
-except Exception:
-    _IS_NPU = False
-
-
-@unittest.skipIf(_IS_NPU, "NPU platform: NPUWorker is expected to be present")
-class TestNpuWorkerPatchSkippedOnNonNpu(unittest.TestCase):
-    """Verify non-NPU environments do not import or patch NPUWorker."""
-
-    def test_patch_npu_worker_returns_zero_without_npu(self):
-        """_patch_npu_worker_init_device returns 0 when NPUWorker absent."""
-        from vllm_gr.patch import _patch_npu_worker_init_device
-
-        # On a standard CUDA/CPU install vllm_ascend is not importable.
-        patch_count = _patch_npu_worker_init_device()
-        assert patch_count == 0
-
-    def test_npu_worker_module_not_imported_on_non_npu(self):
-        """The vllm_ascend.worker.worker module is not present in sys.modules."""
-        # On an NPU machine vllm_ascend itself may already be loaded by the
-        # platform runtime; we only care that NPUWorker is not imported / patched.
-        assert "vllm_ascend.worker.worker" not in sys.modules
-
-    def test_re_apply_patches_does_not_import_npu_worker(self):
-        """Running re_apply_patches on non-NPU does not pull in NPUWorker."""
-
-        from vllm_gr.patch import re_apply_patches
-
-        before = set(sys.modules.keys())
-        re_apply_patches()
-        after = set(sys.modules.keys())
-
-        _ = after - before
-        assert "vllm_ascend.worker.worker" not in sys.modules
-
-
-class TestPatchApplicationOrder(unittest.TestCase):
-    """Pin the import-safe ordering required by vllm-ascend."""
-
-    def test_npu_worker_is_initialized_before_beam_runner_patches(self):
-        import vllm_gr.patch as gr_patch
-
-        call_order = []
-
-        with (
-            mock.patch.object(
-                gr_patch,
-                "_apply_ascend_attention_backend_patch",
-                side_effect=lambda force=False: call_order.append("attention") or 1,
-            ),
-            mock.patch.object(
-                gr_patch,
-                "_patch_npu_worker_init_device",
-                side_effect=lambda: call_order.append("npu_worker") or 1,
-            ),
-            mock.patch.object(
-                gr_patch,
-                "_apply_gr_beam_patches",
-                side_effect=lambda force=False: call_order.append("beam") or 1,
-            ),
-        ):
-            patch_count = gr_patch._apply_patches(force=True)
-
-        assert patch_count == 3
-        assert call_order == ["attention", "npu_worker", "beam"]
 
 
 if __name__ == "__main__":

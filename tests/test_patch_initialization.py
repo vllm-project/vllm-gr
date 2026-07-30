@@ -50,6 +50,45 @@ def test_engine_core_plan_excludes_frontend_responsibilities() -> None:
     ]
 
 
+def test_runtime_patch_order_preserves_ascend_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_gr.patch as runtime_patch
+
+    call_order: list[str] = []
+
+    def apply_attention(force: bool = False) -> int:
+        call_order.append("attention")
+        return 1
+
+    def patch_npu_worker() -> int:
+        call_order.append("npu_worker")
+        return 1
+
+    def apply_beam(force: bool = False) -> int:
+        call_order.append("beam")
+        return 1
+
+    monkeypatch.setattr(
+        runtime_patch,
+        "_apply_ascend_attention_backend_patch",
+        apply_attention,
+    )
+    monkeypatch.setattr(
+        runtime_patch,
+        "_patch_npu_worker_init_device",
+        patch_npu_worker,
+    )
+    monkeypatch.setattr(
+        runtime_patch,
+        "_apply_gr_beam_patches",
+        apply_beam,
+    )
+
+    assert runtime_patch._apply_patches(force=True) == 3
+    assert call_order == ["attention", "npu_worker", "beam"]
+
+
 def test_initialization_applies_and_validates_required_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

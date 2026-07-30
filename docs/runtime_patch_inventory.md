@@ -45,7 +45,8 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 
 ### GR-PATCH-001 — CUSTOM Attention Selector Compatibility
 
-- Source: `vllm_gr/patch.py`
+- Source: `vllm_gr/v1/ascend_compat.py`
+- Orchestration: `vllm_gr/patch.py`
 - Target: `vllm.v1.attention.selector._cached_get_attn_backend`
 - Mutation: private cached-function replacement
 - Platform: primarily NPU
@@ -61,6 +62,8 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 
 ### GR-PATCH-002 — NPUWorker Initialization Hook
 
+- Source: `vllm_gr/v1/ascend_compat.py`
+- Orchestration: `vllm_gr/patch.py`
 - Target: `vllm_ascend.worker.worker.NPUWorker.init_device`
 - Mutation: lifecycle method wrapper
 - Platform: NPU

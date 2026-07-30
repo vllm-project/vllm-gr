@@ -11,11 +11,15 @@ patches:
     contract: plugin-entrypoint
 
   - id: GR-PATCH-001
+    source: vllm_gr/v1/ascend_compat.py
+    orchestration: vllm_gr/patch.py
     target: vllm.v1.attention.selector._cached_get_attn_backend
     risk: critical
     contract: attention-selector-signature
 
   - id: GR-PATCH-002
+    source: vllm_gr/v1/ascend_compat.py
+    orchestration: vllm_gr/patch.py
     target: vllm_ascend.worker.worker.NPUWorker.init_device
     risk: high
     contract: null
