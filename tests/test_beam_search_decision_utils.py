@@ -339,6 +339,7 @@ def test_complete_eos_candidates_propagates_catalog_node() -> None:
         token_ids=np.asarray([2, 11], dtype=np.int64),
         scores=np.asarray([-0.1, -0.2], dtype=np.float32),
         beam_flat_cache=cache,
+        beam_idx=np.asarray([0, 0], dtype=np.int64),
         candidates_per_parent=2,
         eos_token_id=2,
         initial_logprobs=FlatLogprobs(),

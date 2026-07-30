@@ -174,3 +174,102 @@ def test_catalog_multiple_items_long_shared_prefix(mock_tokenizer: MagicMock) ->
     finally:
         if os.path.exists(catalog_path):
             os.remove(catalog_path)
+
+
+def test_apply_catalog_filter_terminal_only_node_fill_strategy(mock_tokenizer: MagicMock) -> None:
+    catalog_data = [["1", "2"]]
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        json.dump(catalog_data, f)
+        catalog_path = f.name
+    try:
+        catalog = Catalog(mock_tokenizer)
+        catalog.load(catalog_path)
+        node = catalog.trie[1][2]
+        result = catalog.apply_catalog_filter(
+            [11, 12],
+            [-0.1, -0.2],
+            None,
+            None,
+            node,
+            "fill",
+        )
+        assert result == ([], [], None, None)
+        result = catalog.apply_catalog_filter(
+            [11, 12],
+            [-0.1, -0.2],
+            None,
+            None,
+            node,
+            "null",
+        )
+        assert result == ([], [], None, None)
+    finally:
+        if os.path.exists(catalog_path):
+            os.remove(catalog_path)
+
+
+def test_apply_catalog_filter_terminal_and_children_fill_strategy(
+    mock_tokenizer: MagicMock,
+) -> None:
+    catalog_data = [["1", "2"], ["1", "2", "3"]]
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        json.dump(catalog_data, f)
+        catalog_path = f.name
+    try:
+        catalog = Catalog(mock_tokenizer)
+        catalog.load(catalog_path)
+        node = catalog.trie[1][2]
+        tids, lps, ranks, decoded = catalog.apply_catalog_filter(
+            [11, 12],
+            [-0.1, -0.2],
+            None,
+            None,
+            node,
+            "fill",
+        )
+        assert tids == [3, 3]  # only token 3 is valid, both slots filled with it
+        tids, lps, ranks, decoded = catalog.apply_catalog_filter(
+            [11, 3],
+            [-0.1, -0.2],
+            None,
+            None,
+            node,
+            "null",
+        )
+        assert lps == [-float("inf"), -0.2]
+    finally:
+        if os.path.exists(catalog_path):
+            os.remove(catalog_path)
+
+
+def test_apply_catalog_filter_passthrough_dir_node(mock_tokenizer: MagicMock) -> None:
+    catalog_data = [["1", "2", "3"]]
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        json.dump(catalog_data, f)
+        catalog_path = f.name
+    try:
+        catalog = Catalog(mock_tokenizer)
+        catalog.load(catalog_path)
+        node = catalog.trie[1]
+        tids, lps, ranks, decoded = catalog.apply_catalog_filter(
+            [2, 99],
+            [-0.1, -0.2],
+            None,
+            None,
+            node,
+            "null",
+        )
+        assert lps == [-0.1, -float("inf")]
+        tids, lps, ranks, decoded = catalog.apply_catalog_filter(
+            [99, 2],
+            [-0.1, -0.2],
+            None,
+            None,
+            node,
+            "fill",
+        )
+        assert tids[0] == 2
+        assert tids[1] == 2
+    finally:
+        if os.path.exists(catalog_path):
+            os.remove(catalog_path)

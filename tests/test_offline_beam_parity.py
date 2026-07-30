@@ -220,7 +220,7 @@ def test_catalog_mask_uses_catalog_node_when_available() -> None:
             calls.append(generated_tokens)
             return {7, 3}  # if called, would NOT mask token 7
 
-    is_error, token_ids, scores, cache = _parse_step_logprobs(
+    is_error, token_ids, scores, beam_idx, cache = _parse_step_logprobs(
         result=_result_with_flat(flat),
         instance=instance,
         token=0,

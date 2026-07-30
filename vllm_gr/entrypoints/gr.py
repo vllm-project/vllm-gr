@@ -292,19 +292,19 @@ def _parse_step_logprobs(
                 logprobs_num,
             )
             if catalog is not None:
-                valid_node = getattr(current_beam, '_catalog_node', None)
+                valid_node = getattr(current_beam, "_catalog_node", None)
                 if valid_node is not None:
-                    valid_tokens_set = set(valid_node.keys())
+                    valid_tokens_node = valid_node
                 else:
                     # Fallback: compute via full traversal if _catalog_node
                     # was not initialized (e.g. test code paths that call
                     # _parse_step_logprobs with catalog but no node cache).
                     generated_tokens = current_beam.tokens[instance.prompt_len :]
-                    valid_tokens_set = catalog.valid(generated_tokens)
+                    valid_tokens_node = catalog.valid(generated_tokens)
                 logprobs_pos = mask_candidate_logprobs(
                     token_ids_pos,
                     logprobs_pos,
-                    valid_tokens_set,
+                    valid_tokens_node,
                 )
 
             beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
@@ -317,16 +317,16 @@ def _parse_step_logprobs(
         )
         if catalog is not None:
             current_beam = instance.beams[0]
-            valid_node = getattr(current_beam, '_catalog_node', None)
+            valid_node = getattr(current_beam, "_catalog_node", None)
             if valid_node is not None:
-                valid_tokens_set = set(valid_node.keys())
+                valid_tokens_node = valid_node
             else:
                 generated_tokens = current_beam.tokens[instance.prompt_len :]
-                valid_tokens_set = catalog.valid(generated_tokens)
+                valid_tokens_node = catalog.valid(generated_tokens)
             logprobs_pos = mask_candidate_logprobs(
                 token_ids_pos,
                 logprobs_pos,
-                valid_tokens_set,
+                valid_tokens_node,
             )
 
         beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
@@ -729,16 +729,14 @@ class GRLLM(LLM):
                         for instance in instances_batch:
                             prompt_len = instance.prompt_len
                             for beam in instance.beams:
-                                valid_node = getattr(beam, '_catalog_node', None)
+                                valid_node = getattr(beam, "_catalog_node", None)
                                 if valid_node is not None:
-                                    valid_tokens_sets.append(set(valid_node.keys()))
+                                    valid_tokens_sets.append(valid_node)
                                 else:
                                     # Fallback: compute via full traversal if
                                     # _catalog_node was not initialized.
                                     generated_tokens = beam.tokens[prompt_len:]
-                                    valid_tokens_sets.append(
-                                        self.catalog.valid(generated_tokens)
-                                    )
+                                    valid_tokens_sets.append(self.catalog.valid(generated_tokens))
 
                     for (start, end), instance in zip(instance_start_and_end, instances_batch):
                         # Gather all logprobs and cumulative scores for this instance
