@@ -269,6 +269,87 @@ def test_select_top_indices_matches_parent_expression(
     assert actual.dtype == expected.dtype
 
 
+def test_materialize_selected_beams_propagates_catalog_node_on_valid_token() -> None:
+    parent = _beam([10])
+    parent._catalog_node = {11: {12: {}}, 99: {}}
+    cache = [_candidate_cache([11, 99], [-0.1, -0.2])]
+    new_beams, fork_info = materialize_selected_beams(
+        parents=[parent],
+        selected_indices=np.asarray([0]),
+        token_ids=np.asarray([11, 99], dtype=np.int64),
+        scores=np.asarray([-0.1, -0.2], dtype=np.float32),
+        beam_flat_cache=cache,
+        candidates_per_parent=2,
+        initial_logprobs=FlatLogprobs(),
+    )
+
+    assert len(new_beams) == 1
+    assert new_beams[0].tokens == [10, 11]
+    # Must be *the same dict object* as parent._catalog_node[11],
+    # proving we're caching the trie node pointer, not copying it.
+    assert new_beams[0]._catalog_node is parent._catalog_node[11]
+
+
+def test_materialize_selected_beams_propagates_catalog_node_on_invalid_token() -> None:
+    parent = _beam([10])
+    parent._catalog_node = {11: {12: {}}}
+    cache = [_candidate_cache([99], [-0.1])]
+    new_beams, fork_info = materialize_selected_beams(
+        parents=[parent],
+        selected_indices=np.asarray([0]),
+        token_ids=np.asarray([99], dtype=np.int64),
+        scores=np.asarray([-0.1], dtype=np.float32),
+        beam_flat_cache=cache,
+        candidates_per_parent=1,
+        initial_logprobs=FlatLogprobs(),
+    )
+
+    assert len(new_beams) == 1
+    assert new_beams[0].tokens == [10, 99]
+    # token 99 is not a child of parent._catalog_node, so new node is empty dict
+    assert new_beams[0]._catalog_node == {}
+
+
+def test_materialize_selected_beams_sets_catalog_node_none_when_parent_missing() -> None:
+    parent = _beam([10])  # no _catalog_node set
+    cache = [_candidate_cache([11], [-0.1])]
+    new_beams, fork_info = materialize_selected_beams(
+        parents=[parent],
+        selected_indices=np.asarray([0]),
+        token_ids=np.asarray([11], dtype=np.int64),
+        scores=np.asarray([-0.1], dtype=np.float32),
+        beam_flat_cache=cache,
+        candidates_per_parent=1,
+        initial_logprobs=FlatLogprobs(),
+    )
+
+    assert new_beams[0]._catalog_node is None
+
+
+def test_complete_eos_candidates_propagates_catalog_node() -> None:
+    parent = _beam([10])
+    parent._catalog_node = {2: {99: {}}}
+    cache = [_candidate_cache([2, 11], [-0.1, -0.2])]
+
+    eos_beams, masked_scores = complete_eos_candidates(
+        parents=[parent],
+        token_ids=np.asarray([2, 11], dtype=np.int64),
+        scores=np.asarray([-0.1, -0.2], dtype=np.float32),
+        beam_flat_cache=cache,
+        candidates_per_parent=2,
+        eos_token_id=2,
+        initial_logprobs=FlatLogprobs(),
+        include_eos_token=True,
+        inherit_lora_request=True,
+    )
+
+    assert len(eos_beams) == 1
+    assert eos_beams[0].tokens == [10, 2]
+    # Must be *the same dict object* as parent._catalog_node[2],
+    # proving pointer propagation through the EOS path.
+    assert eos_beams[0]._catalog_node is parent._catalog_node[2]
+
+
 def test_materialize_selected_beams_preserves_selection_order_and_lineage() -> None:
     first_lora = LoRARequest("first", 1, "/tmp/first")
     second_lora = LoRARequest("second", 2, "/tmp/second")

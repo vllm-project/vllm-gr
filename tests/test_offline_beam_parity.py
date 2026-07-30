@@ -195,6 +195,41 @@ def test_catalog_mask_keeps_candidate_count_order_and_query_timing() -> None:
     assert cache[0][1] == [-float("inf"), -0.2]
 
 
+def test_catalog_mask_uses_catalog_node_when_available() -> None:
+    """When beam has _catalog_node, the optimized path must NOT call catalog.valid()."""
+    parent = _beam([10, 99], -0.5)
+    parent._catalog_node = {3: {}}  # pre-computed node: only token 3 is valid
+    instance = SimpleNamespace(beams=[parent], completed=[], prompt_len=1)
+    flat = SimpleNamespace(
+        start_indices=[0],
+        end_indices=[2],
+        token_ids=[7, 3],
+        logprobs=[-0.1, -0.2],
+        ranks=[None, 2],
+        decoded_tokens=[None, "three"],
+    )
+    calls: list[list[int]] = []
+
+    class _Catalog:
+        def valid(self, generated_tokens: list[int]) -> set[int]:
+            calls.append(generated_tokens)
+            return {7, 3}  # if called, would NOT mask token 7
+
+    is_error, token_ids, scores, cache = _parse_step_logprobs(
+        result=_result_with_flat(flat),
+        instance=instance,
+        token=0,
+        logprobs_num=2,
+        fork_info_j=None,
+        catalog=_Catalog(),
+    )
+
+    assert not is_error
+    assert calls == [], "catalog.valid() must NOT be called when _catalog_node is set"
+    assert scores == [-float("inf"), -0.7]  # only token 3 survives (dict {3: {}} keys)
+    assert cache[0][1] == [-float("inf"), -0.2]
+
+
 @pytest.mark.parametrize(
     ("scores", "beam_width", "candidates_per_parent"),
     [

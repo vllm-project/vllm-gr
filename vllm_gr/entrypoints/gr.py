@@ -288,8 +288,15 @@ def _parse_step_logprobs(
                 logprobs_num,
             )
             if catalog is not None:
-                generated_tokens = current_beam.tokens[instance.prompt_len :]
-                valid_tokens_set = catalog.valid(generated_tokens)
+                valid_node = getattr(current_beam, '_catalog_node', None)
+                if valid_node is not None:
+                    valid_tokens_set = set(valid_node.keys())
+                else:
+                    # Fallback: compute via full traversal if _catalog_node
+                    # was not initialized (e.g. test code paths that call
+                    # _parse_step_logprobs with catalog but no node cache).
+                    generated_tokens = current_beam.tokens[instance.prompt_len :]
+                    valid_tokens_set = catalog.valid(generated_tokens)
                 logprobs_pos = mask_candidate_logprobs(
                     token_ids_pos,
                     logprobs_pos,
@@ -305,8 +312,12 @@ def _parse_step_logprobs(
         )
         if catalog is not None:
             current_beam = instance.beams[0]
-            generated_tokens = current_beam.tokens[instance.prompt_len :]
-            valid_tokens_set = catalog.valid(generated_tokens)
+            valid_node = getattr(current_beam, '_catalog_node', None)
+            if valid_node is not None:
+                valid_tokens_set = set(valid_node.keys())
+            else:
+                generated_tokens = current_beam.tokens[instance.prompt_len :]
+                valid_tokens_set = catalog.valid(generated_tokens)
             logprobs_pos = mask_candidate_logprobs(
                 token_ids_pos,
                 logprobs_pos,
@@ -604,6 +615,16 @@ class GRLLM(LLM):
             # dynamic attrs will break — upstream the fields if that happens.
             instance.beams[0]._lp_parent = None
             instance.beams[0]._lp_step_data = None
+            # Catalog prefix node: initialize to the trie root for O(1)
+            # node access instead of O(t) full re-traversal each step.
+            _cat = getattr(self, "catalog", None)
+            if _cat is not None:
+                _init_node = _cat.trie
+                if sid_begin_token_id is not None:
+                    _init_node = _init_node.get(sid_begin_token_id, {})
+                instance.beams[0]._catalog_node = _init_node
+            else:
+                instance.beams[0]._catalog_node = None
             instance.prompt_len = (
                 len(prompt_tokens) - 1 if sid_begin_token_id is not None else len(prompt_tokens)
             )
@@ -696,8 +717,16 @@ class GRLLM(LLM):
                         for instance in instances_batch:
                             prompt_len = instance.prompt_len
                             for beam in instance.beams:
-                                generated_tokens = beam.tokens[prompt_len:]
-                                valid_tokens_sets.append(self.catalog.valid(generated_tokens))
+                                valid_node = getattr(beam, '_catalog_node', None)
+                                if valid_node is not None:
+                                    valid_tokens_sets.append(set(valid_node.keys()))
+                                else:
+                                    # Fallback: compute via full traversal if
+                                    # _catalog_node was not initialized.
+                                    generated_tokens = beam.tokens[prompt_len:]
+                                    valid_tokens_sets.append(
+                                        self.catalog.valid(generated_tokens)
+                                    )
 
                     for (start, end), instance in zip(instance_start_and_end, instances_batch):
                         # Gather all logprobs and cumulative scores for this instance

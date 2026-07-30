@@ -309,6 +309,16 @@ async def beam_search(
     # upstream the fields if that happens.
     all_beams[0]._lp_parent = None
     all_beams[0]._lp_step_data = None
+    # Catalog prefix node: initialize to the trie root so each beam tracks
+    # its position in the catalog trie via O(1) parent-offset propagation
+    # rather than O(t) re-traversal at every step.
+    if self.models.catalog is not None:
+        initial_node = self.models.catalog.trie
+        if sid_begin_token_id is not None:
+            initial_node = initial_node.get(sid_begin_token_id, {})
+        all_beams[0]._catalog_node = initial_node
+    else:
+        all_beams[0]._catalog_node = None
     completed = []
 
     beam_search_start: int = time.perf_counter()
@@ -348,18 +358,29 @@ async def beam_search(
         request_id_batch = f"{request_id}-{random_uuid()}"
 
         # Launch catalog filtering in parallel with the engine step.
+        # O(1) prefix node access via beam._catalog_node
+        # instead of O(t) full trie re-traversal from root.
         catalog_task = None
         if self.models.catalog is not None:
-
-            def get_valid_tokens_set(beam) -> set[int]:
-                generated_tokens = beam.tokens[len(prompt_token_ids) :]
-                return self.models.catalog.valid(generated_tokens)
 
             async def _run_catalog(coros):
                 return list(await asyncio.gather(*coros))
 
             catalog_task = asyncio.create_task(
-                _run_catalog([asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams])
+                _run_catalog(
+                    [
+                        asyncio.to_thread(
+                            lambda beam=beam: (
+                                set(beam._catalog_node.keys())
+                                if getattr(beam, '_catalog_node', None) is not None
+                                else self.models.catalog.valid(
+                                    beam.tokens[len(prompt_token_ids):]
+                                )
+                            )
+                        )
+                        for beam in all_beams
+                    ]
+                )
             )
 
         gen_start = time.perf_counter()
