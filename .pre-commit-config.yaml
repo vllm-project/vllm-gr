@@ -43,7 +43,7 @@ repos:
     - id: ruff-format
 
   - repo: https://github.com/crate-ci/typos
-    rev: v1.38.1
+    rev: v1.43.5
     hooks:
     - id: typos
       args: [--force-exclude]
@@ -156,6 +156,14 @@ repos:
       pass_filenames: false
       additional_dependencies: [regex]
 
+  # prevent use torch.cuda APIs
+    - id: check-torch-cuda-call
+      name: "Prevent new 'torch.cuda' APIs call"
+      entry: python tools/pre_commit/check_torch_cuda.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
+
     - id: validate-config
       name: Validate configuration has default values and that each field has a docstring
       entry: python tools/pre_commit/validate_config.py
@@ -168,6 +176,12 @@ repos:
       language: python
       types: [python]
       additional_dependencies: [regex]
+
+    - id: check-boolean-context-manager
+      name: Check for boolean ops in with-statements
+      entry: python tools/pre_commit/check_boolean_context_manager.py
+      language: python
+      types: [python]
 
     - id: run-tests
       name: Run all tests
