@@ -6,7 +6,7 @@ The GPU test (``test_cascade_beam_attn_gpu.py``) is the only test that
 checks *correctness* -- backend output against a reference -- but it is
 CUDA-only: it skips unless ``torch.cuda.is_available()`` and its reference is
 built on ``flash_attn_varlen_func``, which is unavailable on NPU. As a result
-the NPU cascade path (``cascade_attention_npu`` ->
+the NPU cascade path (``beam_attn_npu.cascade_attention`` ->
 ``merge_tnd_attention_outputs``) had no correctness coverage.
 
 This module fills that gap. It runs the real backend

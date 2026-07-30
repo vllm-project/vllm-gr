@@ -282,7 +282,7 @@ def build_beam_attn_metadata(
         builder._is_cuda = device_type == "cuda"
         builder._is_npu = device_type == "npu"
         if npu_causal_atten_mask is not None:
-            # cascade_attention_npu reads this for the causal STD/suffix calls.
+            # NPU cascade execution reads this for the causal STD/suffix calls.
             builder.npu_causal_atten_mask = npu_causal_atten_mask
 
         return builder.build(

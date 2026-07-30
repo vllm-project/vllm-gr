@@ -242,7 +242,11 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 - Ownership:
     - Beam Attention metadata and builder:
       `vllm_gr.v1.attention.backends.beam_attn_metadata`;
-    - backend registration and platform execution:
+    - GPU execution:
+      `vllm_gr.v1.attention.backends.beam_attn_gpu`;
+    - NPU execution:
+      `vllm_gr.v1.attention.backends.beam_attn_npu`;
+    - backend registration and facade:
       `vllm_gr.v1.attention.backends.beam_attn`.
 - Ownership risk:
     - CUSTOM is one shared process-global slot;

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Beam-Consecutive Suffix Gather Attention Backend."""
 
+from types import ModuleType
+
 import torch
 import vllm.envs as envs
 from vllm.config.cache import CacheDType
@@ -14,10 +16,6 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
-from vllm.v1.attention.backends.fa_utils import (
-    get_flash_attn_version,
-    is_flash_attn_varlen_func_available,
-)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
@@ -28,46 +26,27 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
     _get_fp8_dtype_for_flashattn,
 )
-from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
-    extract_suffix_kv_pytorch,
-    merge_tnd_attention_outputs,
-)
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR  # noqa: F401
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds  # noqa: F401
 
 logger = init_logger(__name__)
-# Device flag – must be checked after torch is loaded.
 NPU_DEVICE = is_npu_available()
 CUDA_DEVICE = is_cuda_available()
 
-if NPU_DEVICE:
-    import torch_npu  # noqa: F401
-if CUDA_DEVICE:
-    from vllm_gr.v1.attention.backends.beam_attn_triton import (
-        extract_suffix_kv,
+
+def _get_platform_execution_module() -> ModuleType:
+    if NPU_DEVICE and not CUDA_DEVICE:
+        from vllm_gr.v1.attention.backends import beam_attn_npu
+
+        return beam_attn_npu
+    if CUDA_DEVICE and not NPU_DEVICE:
+        from vllm_gr.v1.attention.backends import beam_attn_gpu
+
+        return beam_attn_gpu
+    raise RuntimeError(
+        "BeamAttention requires exactly one active CUDA or NPU device "
+        f"(CUDA_DEVICE={CUDA_DEVICE}, NPU_DEVICE={NPU_DEVICE})."
     )
-
-if is_flash_attn_varlen_func_available():
-    from vllm.v1.attention.backends.fa_utils import (
-        flash_attn_supports_sinks,
-        flash_attn_varlen_func,
-        reshape_and_cache_flash,
-    )
-    from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-else:
-
-    def _flash_attn_varlen_unavailable(*args, **kwargs):
-        raise RuntimeError("BeamAttentionBackend requires FlashAttention varlen support")
-
-    flash_attn_varlen_func = _flash_attn_varlen_unavailable
-    reshape_and_cache_flash = _flash_attn_varlen_unavailable
-    merge_attn_states = _flash_attn_varlen_unavailable
-    flash_attn_supports_sinks = _flash_attn_varlen_unavailable
-
-
-# ---------------------------------------------------------------------------
-# CORE EXECUTION REFACTOR
-# ---------------------------------------------------------------------------
 
 
 class BeamAttentionImpl(AttentionImpl):
@@ -108,13 +87,10 @@ class BeamAttentionImpl(AttentionImpl):
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.attn_type = attn_type
-        self.vllm_flash_attn_version = (
-            get_flash_attn_version(
-                requires_alibi=alibi_slopes is not None,
-                head_size=head_size,
-            )
-            if not NPU_DEVICE
-            else 0
+        platform_execution = _get_platform_execution_module()
+        self.vllm_flash_attn_version = platform_execution.get_flash_attn_version(
+            requires_alibi=alibi_slopes is not None,
+            head_size=head_size,
         )
         self.batch_invariant_enabled = envs.VLLM_BATCH_INVARIANT if CUDA_DEVICE else False
 
@@ -130,215 +106,14 @@ class BeamAttentionImpl(AttentionImpl):
         if self.sinks is not None:
             if NPU_DEVICE:
                 raise NotImplementedError("Sinks are not yet supported on NPU.")
-            assert flash_attn_supports_sinks(), "Sinks are only supported in FlashAttention 3"
+            assert platform_execution.supports_sinks(), (
+                "Sinks are only supported in FlashAttention 3"
+            )
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of heads in the layer"
             )
         self.supports_quant_query_input = True
         self.use_cascade = True
-
-    @staticmethod
-    def cascade_attention_gpu(
-        output: torch.Tensor,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        attn_metadata: BeamAttentionMetadata,
-        sliding_window_size: list[int] | tuple[int, int] | None,
-        scale: float,
-        logits_soft_cap: float,
-        vllm_flash_attn_version: int,
-        s_aux: torch.Tensor | None = None,
-        alibi_slopes: torch.Tensor | None = None,
-    ):
-        if attn_metadata.std_indices is not None:
-            if attn_metadata.prefix_indices is None:
-                std_query = query[: attn_metadata.num_std_indices]
-            else:
-                std_query = query[attn_metadata.std_indices]
-            std_out = flash_attn_varlen_func(
-                q=std_query,
-                k=key_cache,
-                v=value_cache,
-                cu_seqlens_q=attn_metadata.std_cu_seqlens_q_device,
-                max_seqlen_q=attn_metadata.std_max_q_len,
-                seqused_k=attn_metadata.std_seqlens_kv_device,
-                max_seqlen_k=attn_metadata.std_max_seq_len,
-                softmax_scale=scale,
-                causal=attn_metadata.causal,
-                alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=attn_metadata.std_block_table,
-                softcap=logits_soft_cap,
-                fa_version=vllm_flash_attn_version,
-            )
-            if attn_metadata.prefix_indices is None:
-                output[: attn_metadata.num_std_indices] = std_out
-            else:
-                output[attn_metadata.std_indices] = std_out
-
-        if attn_metadata.prefix_indices is not None:
-            if attn_metadata.std_indices is None:
-                beam_query = query[: attn_metadata.num_prefix_indices]
-            else:
-                beam_query = query[attn_metadata.prefix_indices]
-
-            prefix_out, prefix_lse = flash_attn_varlen_func(
-                q=beam_query,
-                k=key_cache,
-                v=value_cache,
-                cu_seqlens_q=attn_metadata.prefix_cu_seqlens_q_device,
-                seqused_k=attn_metadata.prefix_seqlens_kv_device,
-                max_seqlen_q=attn_metadata.prefix_max_q_len,
-                max_seqlen_k=attn_metadata.prefix_max_seq_len,
-                softmax_scale=scale,
-                causal=False,
-                alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=attn_metadata.prefix_block_table,
-                softcap=logits_soft_cap,
-                return_softmax_lse=True,
-                fa_version=vllm_flash_attn_version,
-                scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
-                num_splits=attn_metadata.max_num_splits,
-                s_aux=s_aux,
-            )
-
-            contig_k, contig_v = extract_suffix_kv(
-                key_cache,
-                value_cache,
-                attn_metadata.suffix_slot_mapping_out,
-                attn_metadata.suffix_total_tokens,
-                attn_metadata.block_size,
-            )
-
-            suffix_out, suffix_lse = flash_attn_varlen_func(
-                q=beam_query,
-                k=contig_k,
-                v=contig_v,
-                cu_seqlens_q=attn_metadata.suffix_cu_seqlens_q_device,
-                cu_seqlens_k=attn_metadata.suffix_cu_seqlens_k_device,
-                seqused_k=None,
-                max_seqlen_q=attn_metadata.suffix_max_q_len,
-                max_seqlen_k=attn_metadata.suffix_max_seq_len,
-                softmax_scale=scale,
-                causal=True,
-                alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=None,
-                softcap=logits_soft_cap,
-                return_softmax_lse=True,
-                fa_version=vllm_flash_attn_version,
-            )
-            group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
-            if (
-                attn_metadata.suffix_max_q_len == 1
-                and attn_metadata.suffix_max_seq_len == 1
-                and group_size > 1
-                and not vllm_flash_attn_version == 3
-            ):
-                suffix_lse = (
-                    suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
-                    .transpose(1, 2)
-                    .contiguous()
-                    .view(attn_metadata.num_heads, -1)
-                )
-
-            out = torch.empty_like(beam_query)
-            merge_attn_states(out, prefix_out, prefix_lse, suffix_out, suffix_lse)
-            if attn_metadata.std_indices is None:
-                output[: attn_metadata.num_prefix_indices] = out
-            else:
-                output[attn_metadata.prefix_indices] = out
-
-    @staticmethod
-    def cascade_attention_npu(
-        output: torch.Tensor,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        attn_metadata: BeamAttentionMetadata,
-        sliding_window_size: list[int] | tuple[int, int] | None,
-        scale: float,
-        logits_soft_cap: float,
-        vllm_flash_attn_version: int,
-        s_aux: torch.Tensor | None = None,
-        alibi_slopes: torch.Tensor | None = None,
-    ):
-        # Standard attention
-        if attn_metadata.std_indices is not None:
-            if attn_metadata.prefix_indices is None:
-                std_query = query[: attn_metadata.num_std_indices]
-            else:
-                std_query = query[attn_metadata.std_indices]
-            std_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                query=std_query,
-                key=key_cache.view(*key_cache.shape[:-2], -1),
-                value=value_cache.view(*value_cache.shape[:-2], -1),
-                atten_mask=attn_metadata.npu_causal_atten_mask if attn_metadata.causal else None,
-                block_table=attn_metadata.std_block_table,
-                input_layout="TND",
-                block_size=attn_metadata.block_size,
-                actual_seq_qlen=attn_metadata.std_cu_seqlens_q_cpu,
-                actual_seq_kvlen=attn_metadata.std_seqlens_kv_cpu,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                num_query_heads=attn_metadata.num_heads,
-                softmax_scale=scale,
-                sparse_mode=3 if attn_metadata.causal else 0,
-            )
-            if attn_metadata.prefix_indices is None:
-                output[: attn_metadata.num_std_indices] = std_out
-            else:
-                output[attn_metadata.std_indices] = std_out
-        # Prefix/Suffix attention
-        if attn_metadata.prefix_indices is not None:
-            if attn_metadata.std_indices is None:
-                beam_query = query[: attn_metadata.num_prefix_indices]
-            else:
-                beam_query = query[attn_metadata.prefix_indices]
-            prefix_out, prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                query=beam_query,
-                key=key_cache.view(*key_cache.shape[:-2], -1),
-                value=value_cache.view(*value_cache.shape[:-2], -1),
-                block_table=attn_metadata.prefix_block_table,
-                input_layout="TND",
-                atten_mask=None,
-                block_size=attn_metadata.block_size,
-                actual_seq_qlen=attn_metadata.prefix_cu_seqlens_q_cpu,
-                actual_seq_kvlen=attn_metadata.prefix_seqlens_kv_cpu,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                num_query_heads=attn_metadata.num_heads,
-                softmax_scale=scale,
-                return_softmax_lse=True,
-                sparse_mode=0,  # prefix attention is non-causal (full)
-            )
-
-            contig_k, contig_v = extract_suffix_kv_pytorch(
-                key_cache, value_cache, attn_metadata.suffix_slot_mapping_out
-            )
-
-            suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                beam_query,
-                contig_k,
-                contig_v,
-                num_query_heads=attn_metadata.num_heads,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
-                actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
-                softmax_scale=scale,
-                atten_mask=attn_metadata.npu_causal_atten_mask,
-                block_table=None,
-                block_size=0,
-                sparse_mode=3,
-                inner_precise=0,
-                input_layout="TND",
-                return_softmax_lse=True,
-            )
-            out, _ = merge_tnd_attention_outputs(prefix_out, prefix_lse, suffix_out, suffix_lse)
-            if attn_metadata.std_indices is None:
-                output[: attn_metadata.num_prefix_indices] = out
-            else:
-                output[attn_metadata.prefix_indices] = out
 
     @staticmethod
     def cascade_attention(
@@ -353,35 +128,21 @@ class BeamAttentionImpl(AttentionImpl):
         vllm_flash_attn_version: int,
         s_aux: torch.Tensor | None = None,
         alibi_slopes: torch.Tensor | None = None,
-    ):
-        if CUDA_DEVICE and not NPU_DEVICE:
-            BeamAttentionImpl.cascade_attention_gpu(
-                output=output,
-                query=query,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                attn_metadata=attn_metadata,
-                sliding_window_size=sliding_window_size,
-                scale=scale,
-                logits_soft_cap=logits_soft_cap,
-                vllm_flash_attn_version=vllm_flash_attn_version,
-                s_aux=s_aux,
-                alibi_slopes=alibi_slopes,
-            )
-        elif NPU_DEVICE and not CUDA_DEVICE:
-            BeamAttentionImpl.cascade_attention_npu(
-                output=output,
-                query=query,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                attn_metadata=attn_metadata,
-                sliding_window_size=sliding_window_size,
-                scale=scale,
-                logits_soft_cap=logits_soft_cap,
-                vllm_flash_attn_version=vllm_flash_attn_version,
-                s_aux=s_aux,
-                alibi_slopes=alibi_slopes,
-            )
+    ) -> None:
+        platform_execution = _get_platform_execution_module()
+        platform_execution.cascade_attention(
+            output=output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            attn_metadata=attn_metadata,
+            sliding_window_size=sliding_window_size,
+            scale=scale,
+            logits_soft_cap=logits_soft_cap,
+            vllm_flash_attn_version=vllm_flash_attn_version,
+            s_aux=s_aux,
+            alibi_slopes=alibi_slopes,
+        )
 
     def forward(
         self,
@@ -406,6 +167,8 @@ class BeamAttentionImpl(AttentionImpl):
         if attn_metadata is None:
             return output.fill_(0)
 
+        platform_execution = _get_platform_execution_module()
+
         # NPU provides kv_cache as a tuple (key_cache, value_cache);
         # GPU provides a stacked tensor [2, num_blocks, ...]
         if isinstance(kv_cache, tuple):
@@ -415,24 +178,21 @@ class BeamAttentionImpl(AttentionImpl):
 
         if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
             if NPU_DEVICE:
-                torch_npu._npu_reshape_and_cache(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.slot_mapping,
-                )
-            elif CUDA_DEVICE:
-                reshape_and_cache_flash(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.slot_mapping,
-                    self.kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
+                k_scale = None
+                v_scale = None
+            else:
+                k_scale = layer._k_scale
+                v_scale = layer._v_scale
+            platform_execution.reshape_and_cache(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
 
         if self.kv_cache_dtype.startswith("fp8"):
             dtype = BeamAttentionBackend.get_fp8_dtype_for_flashattn(self.kv_cache_dtype)
@@ -441,7 +201,7 @@ class BeamAttentionImpl(AttentionImpl):
 
         sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
 
-        BeamAttentionImpl.cascade_attention(
+        platform_execution.cascade_attention(
             output=output,
             query=query,
             key_cache=key_cache,
@@ -525,8 +285,12 @@ class BeamAttentionBackend(AttentionBackend):
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
             if NPU_DEVICE:
                 return False  # fp8 kv-cache not yet supported on NPU
-            return get_flash_attn_version() == 3 and current_platform.is_device_capability_family(
-                90
+            if not CUDA_DEVICE:
+                return False
+            platform_execution = _get_platform_execution_module()
+            return (
+                platform_execution.get_flash_attn_version() == 3
+                and current_platform.is_device_capability_family(90)
             )
         return kv_cache_dtype in ["auto", "float16", "bfloat16"]
 
@@ -534,7 +298,10 @@ class BeamAttentionBackend(AttentionBackend):
     def supports_sink(cls) -> bool:
         if NPU_DEVICE:
             return False  # sinks not yet supported on NPU
-        return is_flash_attn_varlen_func_available() and flash_attn_supports_sinks()
+        if not CUDA_DEVICE:
+            return False
+        platform_execution = _get_platform_execution_module()
+        return platform_execution.is_available() and platform_execution.supports_sinks()
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -555,8 +322,11 @@ class BeamAttentionBackend(AttentionBackend):
         use_sparse,
         device_capability,
     ) -> str | None:
-        if not NPU_DEVICE and not is_flash_attn_varlen_func_available():
-            return "No FlashAttention varlen support."
+        if not NPU_DEVICE:
+            if not CUDA_DEVICE:
+                return "No FlashAttention varlen support."
+            if not _get_platform_execution_module().is_available():
+                return "No FlashAttention varlen support."
         if dtype not in cls.supported_dtypes:
             return f"Unsupported dtype {dtype}."
         if not cls.supports_head_size(head_size):
