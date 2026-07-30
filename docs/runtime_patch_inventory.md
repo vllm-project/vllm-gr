@@ -199,6 +199,9 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 
 ### GR-PATCH-011 — GPU ModelRunner Override
 
+- Source: `vllm_gr/v1/worker/gpu_model_runner_patch.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
+- Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
@@ -214,6 +217,9 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 
 ### GR-PATCH-012 — NPU ModelRunner Override
 
+- Source: `vllm_gr/v1/worker/npu_model_runner_patch.py`
+- Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
+- Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
     - `NPUModelRunner.execute_model`
     - `NPUModelRunner._prepare_inputs`

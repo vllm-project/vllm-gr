@@ -443,7 +443,7 @@ def _validate_scheduler_patch() -> str | None:
 
 
 def _validate_model_runner_patch() -> str | None:
-    from vllm_gr.v1.engine.engine_core_patch import (
+    from vllm_gr.v1.worker.model_runner_patch import (
         discover_active_worker_runners,
         is_worker_runner_patched,
     )
@@ -551,31 +551,32 @@ def _engine_core_beam_patches() -> tuple[BeamPatch, ...]:
 
     def patch(
         name: str,
+        module_name: str,
         function_name: str,
         verify: Callable[[], str | None],
     ) -> BeamPatch:
         return BeamPatch(
             name=name,
-            apply=lambda: _call_patch(
-                "vllm_gr.v1.engine.engine_core_patch",
-                function_name,
-            ),
+            apply=lambda: _call_patch(module_name, function_name),
             verify=verify,
         )
 
     return (
         patch(
             "engine_core_requests",
+            "vllm_gr.v1.engine.engine_core_patch",
             "apply_engine_core_request_patches",
             _validate_engine_core_request_group,
         ),
         patch(
             "scheduler",
+            "vllm_gr.v1.engine.engine_core_patch",
             "apply_scheduler_patch",
             _validate_scheduler_patch,
         ),
         patch(
             "model_runner",
+            "vllm_gr.v1.worker.model_runner_patch",
             "apply_worker_patches",
             _validate_model_runner_patch,
         ),

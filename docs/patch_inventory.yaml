@@ -61,11 +61,17 @@ patches:
     contract: scheduler-contract
 
   - id: GR-PATCH-011
+    source: vllm_gr/v1/worker/gpu_model_runner_patch.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py
+    installer: vllm_gr/v1/worker/model_runner_patch.py
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
     risk: critical
     contract: gpu-model-runner-signatures
 
   - id: GR-PATCH-012
+    source: vllm_gr/v1/worker/npu_model_runner_patch.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py
+    installer: vllm_gr/v1/worker/model_runner_patch.py
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
     risk: critical
     contract: null

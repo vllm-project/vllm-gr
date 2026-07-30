@@ -211,7 +211,7 @@ def test_model_runner_verifier_checks_shared_discovery_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
-    from vllm_gr.v1.engine import engine_core_patch
+    from vllm_gr.v1.worker import model_runner_patch
 
     class PatchedRunner:
         pass
@@ -220,7 +220,7 @@ def test_model_runner_verifier_checks_shared_discovery_set(
         pass
 
     monkeypatch.setattr(
-        engine_core_patch,
+        model_runner_patch,
         "discover_active_worker_runners",
         lambda: (
             ("PatchedRunner", PatchedRunner),
@@ -228,7 +228,7 @@ def test_model_runner_verifier_checks_shared_discovery_set(
         ),
     )
     monkeypatch.setattr(
-        engine_core_patch,
+        model_runner_patch,
         "is_worker_runner_patched",
         lambda runner: runner is PatchedRunner,
     )
@@ -236,6 +236,12 @@ def test_model_runner_verifier_checks_shared_discovery_set(
     assert (
         runtime_patch._validate_model_runner_patch()
         == "MissingRunner beam execution hooks are not installed"
+    )
+
+    monkeypatch.setattr(model_runner_patch, "discover_active_worker_runners", lambda: ())
+    assert (
+        runtime_patch._validate_model_runner_patch()
+        == "No supported active-platform ModelRunner is available"
     )
 
 
