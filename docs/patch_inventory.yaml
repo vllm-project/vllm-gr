@@ -4,6 +4,17 @@ verified_baseline:
   vllm: "0.22.1"
   vllm_ascend: "0.22.1rc1"
 
+backend_provider:
+  api_version: 1
+  protocol: vllm_gr.platforms.protocol.GRBackendProvider
+  registry: vllm_gr.platforms.registry
+  activation: vllm_gr.platforms.loader.activate_current_backend
+  builtin_backends:
+    - cuda
+  entrypoint_backends:
+    npu: vllm_gr.platforms.npu:NPU_BACKEND
+  process_local: true
+
 patches:
   - id: GR-PATCH-000
     owner: vllm_gr/plugin.py
@@ -13,6 +24,7 @@ patches:
       - tests/test_patch_initialization.py::test_plugin_exposes_simple_per_patch_status
     process_roles: [main, engine_core, worker]
     target: vllm_gr.plugin.register
+    engine_core_bootstrap: vllm_gr.v1.engine.engine_core_patch.run_engine_core
     risk: high
     contract: plugin-entrypoint
     removal_condition: runtime patch installation is no longer required
@@ -20,6 +32,8 @@ patches:
   - id: GR-PATCH-001
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_ascend_attention_backend_patch
+    orchestration: vllm_gr/platforms/npu.py
+    backend: npu
     activation: CUSTOM is registered and its backend slot is overridden
     validator_or_test:
       - tests/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
@@ -33,6 +47,8 @@ patches:
   - id: GR-PATCH-002
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.patch_npu_worker_init_device
+    orchestration: vllm_gr/platforms/npu.py
+    backend: npu
     activation: the active platform is NPU and the hook is not installed
     validator_or_test:
       - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
@@ -153,6 +169,7 @@ patches:
     owner: vllm_gr/v1/worker/gpu_model_runner_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
+    selection: active-backend-provider
     activation: GPUModelRunner is discovered for the active platform and its hooks are incomplete
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
@@ -168,6 +185,7 @@ patches:
     owner: vllm_gr/v1/worker/npu_model_runner_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
+    selection: active-backend-provider
     activation: NPUModelRunner is discovered for the active platform and its hooks are incomplete
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
@@ -192,7 +210,9 @@ patches:
     risk: high
     contract: custom-attention-registry
     ownership:
-      metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata
+      common_metadata: vllm_gr.v1.attention.backends.beam_attn_metadata
+      cuda_metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata_gpu
+      npu_metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata_npu
       gpu_execution: vllm_gr.v1.attention.backends.beam_attn_gpu
       npu_execution: vllm_gr.v1.attention.backends.beam_attn_npu
       backend_registration_and_facade: vllm_gr.v1.attention.backends.beam_attn

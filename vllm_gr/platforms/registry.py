@@ -10,16 +10,19 @@ from .errors import (
     BackendAlreadyActiveError,
     BackendNotActiveError,
     DuplicateBackendRegistrationError,
+    IncompatibleBackendAPIError,
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
-from .protocol import GRBackendProvider
+from .protocol import BACKEND_API_VERSION, GRBackendProvider
 
 _REQUIRED_PROVIDER_METHODS = (
+    "configure_engine",
     "check_environment",
     "apply_runtime_patches",
     "get_model_runner_hooks",
-    "get_attention_execution",
+    "get_attention_hooks",
+    "release_accelerator_memory",
 )
 
 _BACKENDS: dict[str, GRBackendProvider] = {}
@@ -62,6 +65,20 @@ def _validate_backend_provider(provider: Any, *, source: str) -> str:
         raise InvalidBackendProviderError(
             "Backend entry must be a provider object, not a class; "
             f"source={source!r}; {_registry_context()}"
+        )
+
+    api_version = getattr(provider, "api_version", None)
+    if type(api_version) is not int:
+        raise InvalidBackendProviderError(
+            "Backend provider api_version must be an integer; "
+            f"found={api_version!r}; source={source!r}; {_registry_context()}"
+        )
+    if api_version != BACKEND_API_VERSION:
+        raise IncompatibleBackendAPIError(
+            "Backend provider API version is incompatible with vllm-gr core; "
+            f"provider_api_version={api_version}; "
+            f"core_api_version={BACKEND_API_VERSION}; source={source!r}; "
+            f"{_registry_context()}"
         )
 
     device_type = getattr(provider, "device_type", None)

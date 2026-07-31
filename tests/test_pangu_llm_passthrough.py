@@ -15,6 +15,7 @@ import gc
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,7 +55,11 @@ class TestPanguPluginInitializeRuntime(unittest.TestCase):
         from vllm_gr import plugin
 
         with (
-            mock.patch("vllm_gr._env_check.check_environment"),
+            mock.patch.object(
+                plugin,
+                "initialize_process_backend",
+                return_value=SimpleNamespace(device_type="cuda"),
+            ),
             mock.patch("vllm_gr.patch.re_apply_patches", return_value=0),
             mock.patch("vllm_gr.patch.get_last_beam_patch_report", return_value=None),
         ):
@@ -95,15 +100,15 @@ class TestPanguGrllmShutdown(unittest.TestCase):
         engine.shutdown = mock.Mock()
         llm.llm_engine = engine
 
-        with mock.patch(
-            "vllm_gr.utils.npu_adapter.release_accelerator_memory",
-            create=True,
-        ):
+        release_memory = mock.Mock()
+        backend = mock.Mock(release_accelerator_memory=release_memory)
+        with mock.patch("vllm_gr.platforms.get_active_backend", return_value=backend):
             with mock.patch.object(gc, "collect") as mock_gc:
                 GRLLM.shutdown(llm)
 
         engine.shutdown.assert_called_once_with()
         mock_gc.assert_called_once_with()
+        release_memory.assert_called_once_with()
         self.assertIsNone(llm.llm_engine)
         self.assertTrue(llm._shutdown_complete)
 

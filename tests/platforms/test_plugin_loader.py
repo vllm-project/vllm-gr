@@ -16,18 +16,25 @@ from vllm_gr.platforms import loader
 from vllm_gr.platforms.builtins import register_builtin_backends
 from vllm_gr.platforms.errors import (
     DuplicateBackendRegistrationError,
+    IncompatibleBackendAPIError,
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
+from vllm_gr.platforms.protocol import BACKEND_API_VERSION
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
+    activate_backend,
     resolve_backend,
 )
 
 
 @dataclass(frozen=True)
 class FakeProvider:
+    api_version: int = BACKEND_API_VERSION
     device_type: str = "fake"
+
+    def configure_engine(self, config: Any) -> None:
+        del config
 
     def check_environment(self) -> dict[str, str]:
         return {}
@@ -39,8 +46,11 @@ class FakeProvider:
     def get_model_runner_hooks(self) -> Any:
         return object()
 
-    def get_attention_execution(self) -> Any:
+    def get_attention_hooks(self) -> Any:
         return object()
+
+    def release_accelerator_memory(self) -> None:
+        return None
 
 
 @dataclass
@@ -73,16 +83,27 @@ def _install_entry_points(
     return discover
 
 
-def test_loads_external_provider_from_entry_point(
+def test_external_npu_provider_exposes_complete_runtime_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = FakeProvider()
-    entry_point = FakeEntryPoint("fake", provider)
+    register_builtin_backends()
+    with pytest.raises(UnsupportedBackendError):
+        resolve_backend("npu")
+
+    provider = FakeProvider(device_type="npu")
+    entry_point = FakeEntryPoint("npu", provider)
     discover = _install_entry_points(monkeypatch, entry_point)
 
     loader.load_backend_plugins()
 
-    assert resolve_backend("fake") is provider
+    assert resolve_backend("npu") is provider
+    assert activate_backend("npu") is provider
+    provider.configure_engine(SimpleNamespace())
+    assert provider.check_environment() == {}
+    assert provider.apply_runtime_patches() == 0
+    assert provider.get_model_runner_hooks() is not None
+    assert provider.get_attention_hooks() is not None
+    provider.release_accelerator_memory()
     discover.assert_called_once_with(group=loader.ENTRYPOINT_GROUP)
     assert entry_point.load_count == 1
 
@@ -101,6 +122,22 @@ def test_entry_point_name_must_match_provider_device_type(
     message = str(exc_info.value)
     assert "entrypoint_name='other'" in message
     assert "provider_device_type='fake'" in message
+
+
+def test_rejects_incompatible_provider_api_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_entry_points(
+        monkeypatch,
+        FakeEntryPoint("fake", FakeProvider(api_version=BACKEND_API_VERSION + 1)),
+    )
+
+    with pytest.raises(IncompatibleBackendAPIError) as exc_info:
+        loader.load_backend_plugins()
+
+    message = str(exc_info.value)
+    assert f"provider_api_version={BACKEND_API_VERSION + 1}" in message
+    assert f"core_api_version={BACKEND_API_VERSION}" in message
 
 
 def test_plugin_loader_is_idempotent(
@@ -178,4 +215,4 @@ def test_activate_current_backend_rejects_unknown_platform(
 
     message = str(exc_info.value)
     assert "requested='cpu'" in message
-    assert "available=('cuda', 'npu')" in message
+    assert "available=('cuda',)" in message

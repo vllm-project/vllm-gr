@@ -13,6 +13,22 @@ from vllm_gr.config import GRAttentionBackend, GRConfig
 from vllm_gr.config.parser import ATTENTION_BACKEND_KEY, CATALOG_PATH_KEY
 
 
+@pytest.fixture(autouse=True)
+def _active_cuda_provider():
+    from vllm_gr.platforms.cuda import CUDA_BACKEND
+    from vllm_gr.platforms.registry import (
+        _reset_backend_registry_for_tests,
+        activate_backend,
+        register_backend,
+    )
+
+    _reset_backend_registry_for_tests()
+    register_backend(CUDA_BACKEND)
+    activate_backend("cuda")
+    yield
+    _reset_backend_registry_for_tests()
+
+
 def _vllm_config(additional_config: object | None = None) -> SimpleNamespace:
     return SimpleNamespace(additional_config={} if additional_config is None else additional_config)
 

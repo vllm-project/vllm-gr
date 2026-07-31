@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -20,18 +20,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
-
-
-def get_scheduler_metadata(*args, **kwargs):
-    from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
-
-    if not is_flash_attn_varlen_func_available():
-        raise RuntimeError("BeamAttentionMetadataBuilder requires FlashAttention scheduler support")
-    from vllm.v1.attention.backends.fa_utils import (
-        get_scheduler_metadata as _get_scheduler_metadata,
-    )
-
-    return _get_scheduler_metadata(*args, **kwargs)
 
 
 def _get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
@@ -50,7 +38,6 @@ class BeamAttentionMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     causal: bool = True
-    npu_causal_atten_mask: torch.Tensor | None = None
 
     # Standard Requests batch routing
     std_indices: torch.Tensor | None = None
@@ -105,7 +92,7 @@ class BeamAttentionMetadata:
     num_kv_heads: int = 0
 
 
-class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
+class BaseBeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
 
@@ -117,13 +104,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        device_type = getattr(device, "type", str(device).partition(":")[0])
-        self._is_cuda = device_type == "cuda"
-        self._is_npu = device_type == "npu"
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
-        self.compilation_config = vllm_config.compilation_config
 
         self.num_heads_q = self.model_config.get_num_attention_heads(self.parallel_config)
         self.num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
@@ -132,49 +115,14 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self.block_size = kv_cache_spec.block_size
         self.max_num_splits = 0
         self.aot_schedule = False
-
-        self.use_full_cuda_graph = self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
-
-        if self.use_full_cuda_graph and self.aot_schedule:
-            self.scheduler_metadata = torch.zeros(
-                vllm_config.scheduler_config.max_num_seqs + 1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if hasattr(vllm_config, "attention_config") and hasattr(
-                vllm_config.attention_config, "flash_attn_max_num_splits_for_cuda_graph"
-            ):
-                self.max_num_splits = (
-                    vllm_config.attention_config.flash_attn_max_num_splits_for_cuda_graph
-                )
-
         self.aot_sliding_window: tuple[int, int] | None = None
 
-        if self._is_npu:
-            self.npu_causal_atten_mask = (
-                torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(self.device)
-            )
-        else:
-            self.npu_causal_atten_mask = None
-
     def _update_aot_schedule(self, fast_build: bool):
-        self.aot_schedule = self.aot_schedule and not fast_build
-        if self.aot_sliding_window is None:
-            self.aot_sliding_window = (-1, -1)
+        del fast_build
 
     def _get_max_num_splits(self, num_actual_tokens: int) -> int:
-        max_num_splits = 0
-        if (
-            self.use_full_cuda_graph
-            and self.max_cudagraph_size is not None
-            and num_actual_tokens <= self.max_cudagraph_size
-        ):
-            max_num_splits = self.max_num_splits
-
-        if self._is_cuda and envs.VLLM_BATCH_INVARIANT:
-            max_num_splits = 1
-        return max_num_splits
+        del num_actual_tokens
+        return 0
 
     def _get_schedule(
         self,
@@ -186,30 +134,56 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         causal: bool,
         max_num_splits: int,
     ) -> dict | None:
-        if not self.aot_schedule:
-            return None
-
-        cache_dtype = self.cache_config.cache_dtype
-        if cache_dtype.startswith("fp8"):
-            qkv_dtype = _get_fp8_dtype_for_flashattn(cache_dtype)
-        else:
-            qkv_dtype = self.kv_cache_dtype
-
-        return get_scheduler_metadata(
-            batch_size=batch_size,
-            max_seqlen_q=max_query_len,
-            max_seqlen_k=max_seq_len,
-            num_heads_q=self.num_heads_q,
-            num_heads_kv=self.num_kv_heads,
-            headdim=self.headdim,
-            cache_seqlens=seqlens,
-            qkv_dtype=qkv_dtype,
-            cu_seqlens_q=cu_query_lens,
-            page_size=self.block_size,
-            causal=causal,
-            window_size=self.aot_sliding_window,
-            num_splits=max_num_splits,
+        del (
+            batch_size,
+            cu_query_lens,
+            max_query_len,
+            seqlens,
+            max_seq_len,
+            causal,
+            max_num_splits,
         )
+        return None
+
+    def _metadata_cls(self) -> type[BeamAttentionMetadata]:
+        return BeamAttentionMetadata
+
+    def _platform_metadata_kwargs(self) -> dict[str, Any]:
+        return {}
+
+    def _create_std_device_tensors(
+        self,
+        std_cu_seqlens_q_cpu: list[int],
+        std_seqlens_kv_cpu: list[int],
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        del std_cu_seqlens_q_cpu, std_seqlens_kv_cpu, device
+        return None, None
+
+    def _create_beam_device_tensors(
+        self,
+        prefix_seqlens_kv_cpu: list[int],
+        prefix_cu_seqlens_q_cpu: list[int],
+        suffix_seqlens_kv_cpu: list[int],
+        suffix_cu_seqlens_q_cpu: list[int],
+        suffix_cu_seqlens_kv_cpu: list[int],
+        device: torch.device,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        del (
+            prefix_seqlens_kv_cpu,
+            prefix_cu_seqlens_q_cpu,
+            suffix_seqlens_kv_cpu,
+            suffix_cu_seqlens_q_cpu,
+            suffix_cu_seqlens_kv_cpu,
+            device,
+        )
+        return None, None, None, None, None
 
     def _segment_requests(
         self,
@@ -440,16 +414,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 std_req_idxs, :num_std_blocks
             ].contiguous()
 
-            if self._is_cuda:
-                std_cu_seqlens_q_device = torch.tensor(
-                    [0] + std_cu_seqlens_q_cpu, dtype=torch.int32, device=device
-                )
-                std_seqlens_kv_device = torch.tensor(
-                    std_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-            else:  # NPU
-                std_cu_seqlens_q_device = None
-                std_seqlens_kv_device = None
+            std_cu_seqlens_q_device, std_seqlens_kv_device = self._create_std_device_tensors(
+                std_cu_seqlens_q_cpu,
+                std_seqlens_kv_cpu,
+                device,
+            )
 
             return (
                 std_indices_tensor,
@@ -501,29 +470,20 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 suffix_total_tokens = 0
                 suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
 
-            if self._is_cuda:
-                prefix_seqlens_kv_device = torch.tensor(
-                    prefix_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-                prefix_cu_seqlens_q_device = torch.tensor(
-                    [0] + prefix_cu_seqlens_q_cpu, dtype=torch.int32, device=device
-                )
-
-                suffix_seqlens_kv_device = torch.tensor(
-                    suffix_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-                suffix_cu_seqlens_q_device = torch.tensor(
-                    [0] + suffix_cu_seqlens_q_cpu, dtype=torch.int32, device=device
-                )
-                suffix_cu_seqlens_k_device = torch.tensor(
-                    [0] + suffix_cu_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-            else:  # NPU
-                prefix_seqlens_kv_device = None
-                prefix_cu_seqlens_q_device = None
-                suffix_seqlens_kv_device = None
-                suffix_cu_seqlens_q_device = None
-                suffix_cu_seqlens_k_device = None
+            (
+                prefix_seqlens_kv_device,
+                prefix_cu_seqlens_q_device,
+                suffix_seqlens_kv_device,
+                suffix_cu_seqlens_q_device,
+                suffix_cu_seqlens_k_device,
+            ) = self._create_beam_device_tensors(
+                prefix_seqlens_kv_cpu,
+                prefix_cu_seqlens_q_cpu,
+                suffix_seqlens_kv_cpu,
+                suffix_cu_seqlens_q_cpu,
+                suffix_cu_seqlens_kv_cpu,
+                device,
+            )
 
             prefix_scheduler_metadata = self._get_schedule(
                 batch_size=len(prefix_seqlens_q_cpu),
@@ -673,7 +633,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             max_num_splits,
         )
 
-        meta = BeamAttentionMetadata(
+        meta = self._metadata_cls()(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
@@ -682,7 +642,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             causal=common_attn_metadata.causal,
-            npu_causal_atten_mask=getattr(self, "npu_causal_atten_mask", None),
             std_indices=std_indices_tensor,
             std_cu_seqlens_q_device=std_cu_seqlens_q_device,
             std_seqlens_kv_device=std_seqlens_kv_device,
@@ -724,6 +683,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             block_size=block_size,
             num_heads=self.num_heads_q,
             num_kv_heads=self.num_kv_heads,
+            **self._platform_metadata_kwargs(),
         )
         return meta
 
@@ -745,3 +705,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             ].contiguous()
 
         return new_metadata
+
+
+# Compatibility type retained for the public beam_attn facade. Runtime builder
+# selection is owned by the active backend Provider.
+BeamAttentionMetadataBuilder = BaseBeamAttentionMetadataBuilder

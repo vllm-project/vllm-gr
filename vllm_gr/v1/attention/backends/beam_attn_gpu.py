@@ -7,6 +7,9 @@ from __future__ import annotations
 from typing import Any, NoReturn, cast
 
 import torch
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version as _get_flash_attn_version,
 )
@@ -16,6 +19,9 @@ from vllm.v1.attention.backends.fa_utils import (
 
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata_gpu import (
+    CUDABeamAttentionMetadataBuilder,
 )
 from vllm_gr.v1.attention.backends.beam_attn_triton import extract_suffix_kv
 
@@ -60,6 +66,93 @@ def get_flash_attn_version(
 
 def supports_sinks() -> bool:
     return bool(is_available() and flash_attn_supports_sinks())
+
+
+def supports_batch_invariance() -> bool:
+    return True
+
+
+def supports_kv_cache_dtype(kv_cache_dtype: Any | None) -> bool:
+    if kv_cache_dtype is None:
+        return True
+    if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        return get_flash_attn_version() == 3 and current_platform.is_device_capability_family(90)
+    return kv_cache_dtype in ("auto", "float16", "bfloat16")
+
+
+def supports_compute_capability(capability: DeviceCapability) -> bool:
+    return capability >= DeviceCapability(8, 0)
+
+
+def validate_combination(
+    *,
+    head_size: int,
+    dtype: Any,
+    kv_cache_dtype: Any,
+    block_size: int | None,
+    use_mla: bool,
+    has_sink: bool,
+    use_sparse: bool,
+    device_capability: DeviceCapability,
+) -> str | None:
+    if not is_available():
+        return "No FlashAttention varlen support."
+    if dtype not in (torch.float16, torch.bfloat16):
+        return f"Unsupported dtype {dtype}."
+    if head_size % 8 != 0 or head_size > 256:
+        return f"Unsupported head_size={head_size}."
+    if not supports_kv_cache_dtype(kv_cache_dtype):
+        return f"Unsupported kv_cache_dtype={kv_cache_dtype}."
+    if block_size is not None and block_size % 16 != 0:
+        return f"block_size={block_size} not multiple of 16."
+    if not supports_compute_capability(device_capability):
+        return "Requires GPU compute capability >= 8.0."
+    if has_sink and not supports_sinks():
+        return "No FlashAttention sink support."
+    if use_mla:
+        return "No MLA support."
+    if use_sparse:
+        return "No sparse support."
+    return None
+
+
+def get_kv_cache_shape(
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    cache_dtype_str: str = "auto",
+) -> tuple[int, ...]:
+    del cache_dtype_str
+    return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+
+def get_kv_cache_stride_order(
+    include_num_layers_dimension: bool = False,
+) -> tuple[int, ...]:
+    cache_layout = get_kv_cache_layout()
+    if cache_layout == "NHD" and include_num_layers_dimension:
+        return (2, 0, 1, 3, 4, 5)
+    if cache_layout == "NHD":
+        return (0, 1, 2, 3, 4)
+    if cache_layout == "HND" and include_num_layers_dimension:
+        return (2, 4, 0, 1, 3, 5)
+    if cache_layout == "HND":
+        return (0, 1, 3, 2, 4)
+    raise ValueError(f"Unknown cache layout format {cache_layout}.")
+
+
+def split_kv_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    key_cache, value_cache = kv_cache.unbind(0)
+    return key_cache, value_cache
+
+
+def get_kv_scales(layer: Any) -> tuple[Any, Any]:
+    return layer._k_scale, layer._v_scale
+
+
+def get_metadata_builder_cls() -> type[CUDABeamAttentionMetadataBuilder]:
+    return CUDABeamAttentionMetadataBuilder
 
 
 def reshape_and_cache(

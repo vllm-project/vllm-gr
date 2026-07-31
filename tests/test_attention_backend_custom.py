@@ -23,12 +23,27 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
     def setUpClass(cls):
         """Apply patches so EngineArgs.create_engine_config is wrapped."""
         from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+        from vllm_gr.platforms.cuda import CUDA_BACKEND
+        from vllm_gr.platforms.registry import (
+            _reset_backend_registry_for_tests,
+            activate_backend,
+            register_backend,
+        )
 
         patch_add_cli_args()
+        _reset_backend_registry_for_tests()
+        register_backend(CUDA_BACKEND)
+        activate_backend("cuda")
+
+    @classmethod
+    def tearDownClass(cls):
+        from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
+
+        _reset_backend_registry_for_tests()
 
     def _make_fake_config(self, backend=None, marker=None):
         """Build a lightweight VllmConfig-like object for mocking."""
-        from vllm.config import AttentionConfig, VllmConfig
+        from vllm.config import AttentionConfig, DeviceConfig, VllmConfig
 
         attention_config = AttentionConfig()
         if backend is not None:
@@ -36,7 +51,10 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
         elif backend is None:
             attention_config.backend = None
 
-        config = VllmConfig(attention_config=attention_config)
+        config = VllmConfig(
+            attention_config=attention_config,
+            device_config=DeviceConfig(device="cpu"),
+        )
         if marker is not None:
             config.additional_config["vllm_gr_attention_backend"] = marker
         return config
@@ -123,10 +141,13 @@ class TestCustomBackendMarkerSerialization(unittest.TestCase):
 
     def test_marker_survives_pickle(self):
         """Pickle preserves both backend=CUSTOM and the marker."""
-        from vllm.config import AttentionConfig, VllmConfig
+        from vllm.config import AttentionConfig, DeviceConfig, VllmConfig
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        config = VllmConfig(attention_config=AttentionConfig())
+        config = VllmConfig(
+            attention_config=AttentionConfig(),
+            device_config=DeviceConfig(device="cpu"),
+        )
         config.attention_config.backend = AttentionBackendEnum.CUSTOM
         config.additional_config["vllm_gr_attention_backend"] = "CUSTOM"
 
@@ -152,50 +173,34 @@ class TestNpuDefaultBlockSize(unittest.TestCase):
         )
 
     def test_npu_uses_128_when_block_size_was_not_explicit(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
+        from vllm_gr.platforms.npu import NPU_BACKEND
 
         config = self._config()
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
+        NPU_BACKEND.configure_engine(config)
 
         assert config.cache_config.block_size == 128
 
     def test_npu_preserves_explicit_block_size(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
+        from vllm_gr.platforms.npu import NPU_BACKEND
 
         config = self._config(user_specified=True)
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
+        NPU_BACKEND.configure_engine(config)
 
         assert config.cache_config.block_size == 16
 
     def test_npu_preserves_hybrid_model_block_size(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
+        from vllm_gr.platforms.npu import NPU_BACKEND
 
         config = self._config(is_hybrid=True)
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
+        NPU_BACKEND.configure_engine(config)
 
         assert config.cache_config.block_size == 16
 
     def test_gpu_keeps_vllm_default(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
+        from vllm_gr.platforms.cuda import CUDA_BACKEND
 
         config = self._config()
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="cuda"),
-        ):
-            _apply_npu_default_block_size(config)
+        CUDA_BACKEND.configure_engine(config)
 
         assert config.cache_config.block_size == 16
 
@@ -219,9 +224,9 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
 
         import torch
 
-        import vllm_gr.v1.attention.backends.beam_attn_metadata as beam_attn_metadata
+        import vllm_gr.v1.attention.backends.beam_attn_metadata_gpu as beam_attn_metadata
 
-        builder = object.__new__(beam_attn_metadata.BeamAttentionMetadataBuilder)
+        builder = object.__new__(beam_attn_metadata.CUDABeamAttentionMetadataBuilder)
         builder.aot_schedule = True
         builder.cache_config = SimpleNamespace(cache_dtype="auto")
         builder.kv_cache_dtype = torch.bfloat16

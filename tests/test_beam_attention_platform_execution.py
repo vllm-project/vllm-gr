@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Platform isolation and delegation contracts for Beam Attention."""
+"""Platform isolation and Provider delegation contracts for Beam Attention."""
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
-from vllm_gr.v1.attention import backends
+from vllm_gr.platforms.errors import BackendNotActiveError
+from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
 from vllm_gr.v1.attention.backends import beam_attn
 
 
-def test_facade_import_does_not_load_platform_execution_modules() -> None:
+def test_facade_import_does_not_load_or_resolve_platform_hooks() -> None:
     project_root = Path(__file__).resolve().parents[1]
     code = """
 import sys
@@ -36,124 +38,119 @@ assert "vllm_gr.v1.attention.backends.beam_attn_npu" not in sys.modules
     )
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
-    ("cuda_available", "npu_available", "expected"),
-    [
-        (True, False, "gpu"),
-        (False, True, "npu"),
-        (False, False, None),
-        (True, True, None),
-    ],
-)
-def test_platform_dispatch_selects_exactly_one_execution_module(
+def test_attention_hooks_require_an_active_provider() -> None:
+    _reset_backend_registry_for_tests()
+    with pytest.raises(BackendNotActiveError):
+        beam_attn.BeamAttentionBackend.supports_batch_invariance()
+
+
+def test_platform_modules_implement_attention_hook_surface() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    required = {
+        "is_available",
+        "get_flash_attn_version",
+        "supports_batch_invariance",
+        "supports_kv_cache_dtype",
+        "supports_sinks",
+        "supports_compute_capability",
+        "validate_combination",
+        "get_kv_cache_shape",
+        "get_kv_cache_stride_order",
+        "split_kv_cache",
+        "get_kv_scales",
+        "reshape_and_cache",
+        "cascade_attention",
+        "get_metadata_builder_cls",
+    }
+
+    for filename in ("beam_attn_gpu.py", "beam_attn_npu.py"):
+        path = project_root / "vllm_gr" / "v1" / "attention" / "backends" / filename
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        assert required <= functions
+
+    gpu_source = (project_root / "vllm_gr/v1/attention/backends/beam_attn_gpu.py").read_text(
+        encoding="utf-8"
+    )
+    assert "torch_npu" not in gpu_source
+    assert "vllm_ascend" not in gpu_source
+
+
+def test_cascade_attention_resolves_provider_hooks_lazily(
     monkeypatch: pytest.MonkeyPatch,
-    cuda_available: bool,
-    npu_available: bool,
-    expected: str | None,
 ) -> None:
-    gpu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_gpu")
-    npu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_npu")
-    monkeypatch.setitem(sys.modules, gpu_module.__name__, gpu_module)
-    monkeypatch.setitem(sys.modules, npu_module.__name__, npu_module)
-    monkeypatch.setattr(backends, "beam_attn_gpu", gpu_module, raising=False)
-    monkeypatch.setattr(backends, "beam_attn_npu", npu_module, raising=False)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", cuda_available)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", npu_available)
+    captured: dict[str, Any] = {}
+    hooks = SimpleNamespace(cascade_attention=lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(beam_attn, "_get_active_attention_hooks", lambda: hooks)
 
-    if expected is None:
-        with pytest.raises(RuntimeError, match="exactly one active CUDA or NPU"):
-            beam_attn._get_platform_execution_module()
-        return
+    output = torch.empty(1)
+    metadata = SimpleNamespace()
+    beam_attn.BeamAttentionImpl.cascade_attention(
+        output=output,
+        query=torch.empty(2),
+        key_cache=torch.empty(3),
+        value_cache=torch.empty(4),
+        attn_metadata=metadata,
+        sliding_window_size=[7, 0],
+        scale=0.25,
+        logits_soft_cap=12.0,
+        vllm_flash_attn_version=3,
+    )
 
-    selected = beam_attn._get_platform_execution_module()
-    assert selected is (gpu_module if expected == "gpu" else npu_module)
+    assert captured["output"] is output
+    assert captured["attn_metadata"] is metadata
+    assert captured["sliding_window_size"] == [7, 0]
+    assert captured["vllm_flash_attn_version"] == 3
 
 
-@pytest.mark.parametrize("tuple_cache", [False, True])  # type: ignore[misc]
-def test_forward_preserves_cache_and_attention_arguments(
+def test_forward_uses_hooks_cached_by_impl(
     monkeypatch: pytest.MonkeyPatch,
-    tuple_cache: bool,
 ) -> None:
     calls: dict[str, Any] = {}
+    key_cache = torch.zeros(2, 2)
+    value_cache = torch.ones(2, 2)
+    k_scale = torch.tensor(1.0)
+    v_scale = torch.tensor(2.0)
 
-    def reshape_and_cache(*args: Any) -> None:
-        calls["reshape"] = args
-
-    def cascade_attention(**kwargs: Any) -> None:
-        calls["cascade"] = kwargs
-
-    execution = SimpleNamespace(
-        reshape_and_cache=reshape_and_cache,
-        cascade_attention=cascade_attention,
+    hooks = SimpleNamespace(
+        split_kv_cache=lambda cache: (cache[0], cache[1]),
+        get_kv_scales=lambda layer: (layer._k_scale, layer._v_scale),
+        reshape_and_cache=lambda *args: calls.setdefault("reshape", args),
+        cascade_attention=lambda **kwargs: calls.setdefault("cascade", kwargs),
     )
     monkeypatch.setattr(
         beam_attn,
-        "_get_platform_execution_module",
-        lambda: execution,
+        "_get_active_attention_hooks",
+        lambda: pytest.fail("forward must not re-read the Provider registry"),
     )
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", tuple_cache)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", not tuple_cache)
 
     impl = object.__new__(beam_attn.BeamAttentionImpl)
+    impl._hooks = hooks
     impl.kv_sharing_target_layer_name = None
     impl.kv_cache_dtype = "auto"
     impl.sliding_window = (6, 0)
     impl.scale = 0.5
     impl.logits_soft_cap = 9.0
     impl.vllm_flash_attn_version = 3
-    impl.sinks = torch.empty(1)
-    impl.alibi_slopes = torch.empty(2)
+    impl.sinks = None
+    impl.alibi_slopes = None
 
-    key_cache = torch.zeros(2, 2)
-    value_cache = torch.ones(2, 2)
-    kv_cache: Any
-    if tuple_cache:
-        kv_cache = (key_cache, value_cache)
-    else:
-        kv_cache = torch.stack((key_cache, value_cache))
-
-    key = torch.empty(1)
-    value = torch.empty(1)
-    query = torch.empty(1)
     output = torch.empty(1)
     slot_mapping = torch.tensor([0])
     metadata = SimpleNamespace(slot_mapping=slot_mapping)
-    k_scale = torch.tensor(1.0)
-    v_scale = torch.tensor(2.0)
-    layer = (
-        SimpleNamespace() if tuple_cache else SimpleNamespace(_k_scale=k_scale, _v_scale=v_scale)
-    )
-
     returned = impl.forward(
-        layer=layer,
-        query=query,
-        key=key,
-        value=value,
-        kv_cache=kv_cache,
+        layer=SimpleNamespace(_k_scale=k_scale, _v_scale=v_scale),
+        query=torch.empty(1),
+        key=torch.empty(1),
+        value=torch.empty(1),
+        kv_cache=(key_cache, value_cache),
         attn_metadata=metadata,
         output=output,
     )
 
     assert returned is output
-    reshape_args = calls["reshape"]
-    assert reshape_args[0] is key
-    assert reshape_args[1] is value
-    torch.testing.assert_close(reshape_args[2], key_cache)
-    torch.testing.assert_close(reshape_args[3], value_cache)
-    assert reshape_args[4] is slot_mapping
-    assert reshape_args[5] == "auto"
-    assert reshape_args[6] is (None if tuple_cache else k_scale)
-    assert reshape_args[7] is (None if tuple_cache else v_scale)
-
-    cascade_args = calls["cascade"]
-    assert cascade_args["output"] is output
-    assert cascade_args["query"] is query
-    torch.testing.assert_close(cascade_args["key_cache"], key_cache)
-    torch.testing.assert_close(cascade_args["value_cache"], value_cache)
-    assert cascade_args["attn_metadata"] is metadata
-    assert cascade_args["sliding_window_size"] == [6, 0]
-    assert cascade_args["scale"] == 0.5
-    assert cascade_args["logits_soft_cap"] == 9.0
-    assert cascade_args["vllm_flash_attn_version"] == 3
-    assert cascade_args["s_aux"] is impl.sinks
-    assert cascade_args["alibi_slopes"] is impl.alibi_slopes
+    assert calls["reshape"][2] is key_cache
+    assert calls["reshape"][3] is value_cache
+    assert calls["reshape"][6] is k_scale
+    assert calls["reshape"][7] is v_scale
+    assert calls["cascade"]["attn_metadata"] is metadata

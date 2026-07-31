@@ -62,14 +62,21 @@ aligned with it.
 - Process roles: main process, EngineCore subprocess, worker subprocess
 - Platforms: GPU and NPU
 - Risk: High
-- Behavior: initializes the current process and applies the active GR runtime patches.
-- Main dependency: vLLM general plugins are loaded in every relevant process.
+- Behavior:
+    - configures the supported ModelRunner default;
+    - activates the process-local backend provider selected by vLLM;
+    - validates the provider environment before importing or applying runtime patches;
+    - applies backend compatibility patches before the common GR patch plan.
+- Initialization paths:
+    - main and Worker processes use the general plugin entry point;
+    - a spawn-based EngineCore wrapper invokes the same process-backend initializer before its minimal patch plan, because upstream general plugin loading occurs later in EngineCore startup.
+- Process model: main, EngineCore, and Worker processes activate their own backend. An active backend is never inferred from another process.
 - Removal condition: no removal is expected while vLLM-GR requires runtime patch installation. The entry point may be simplified when patch installation becomes more narrowly scoped.
 
 ### GR-PATCH-001 — CUSTOM Attention Selector Compatibility
 
 - Source: `vllm_gr/v1/ascend_compat.py`
-- Orchestration: `vllm_gr/patch.py`
+- Orchestration owner: entry-point NPU provider in `vllm_gr/platforms/npu.py`
 - Target: `vllm.v1.attention.selector._cached_get_attn_backend`
 - Mutation: private cached-function replacement
 - Platform: primarily NPU
@@ -86,7 +93,7 @@ aligned with it.
 ### GR-PATCH-002 — NPUWorker Initialization Hook
 
 - Source: `vllm_gr/v1/ascend_compat.py`
-- Orchestration: `vllm_gr/patch.py`
+- Orchestration owner: entry-point NPU provider in `vllm_gr/platforms/npu.py`
 - Target: `vllm_ascend.worker.worker.NPUWorker.init_device`
 - Mutation: lifecycle method wrapper
 - Platform: NPU
@@ -228,6 +235,7 @@ aligned with it.
 - Source: `vllm_gr/v1/worker/gpu_model_runner_patch.py`
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
+- Target selection: process-local active backend provider
 - Targets:
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
@@ -246,6 +254,7 @@ aligned with it.
 - Source: `vllm_gr/v1/worker/npu_model_runner_patch.py`
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
+- Target selection: process-local active backend provider
 - Targets:
     - `NPUModelRunner.execute_model`
     - `NPUModelRunner._prepare_inputs`
@@ -266,12 +275,12 @@ aligned with it.
 - Risk: High
 - Behavior: registers the GR Beam Attention backend in the official CUSTOM slot.
 - Ownership:
-    - Beam Attention metadata and builder:
+    - shared Beam Attention metadata and builder base:
       `vllm_gr.v1.attention.backends.beam_attn_metadata`;
-    - GPU execution:
-      `vllm_gr.v1.attention.backends.beam_attn_gpu`;
-    - NPU execution:
-      `vllm_gr.v1.attention.backends.beam_attn_npu`;
+    - CUDA metadata builder and execution:
+      `beam_attn_metadata_gpu` and `beam_attn_gpu`;
+    - NPU metadata, builder, and execution:
+      `beam_attn_metadata_npu` and `beam_attn_npu`;
     - backend registration and facade:
       `vllm_gr.v1.attention.backends.beam_attn`.
 - Compatibility facade:

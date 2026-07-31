@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch_npu
 
-from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-    BeamAttentionMetadata,
+from vllm_gr.v1.attention.backends.beam_attn_metadata_npu import (
+    NPUBeamAttentionMetadata,
+    NPUBeamAttentionMetadataBuilder,
 )
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
     extract_suffix_kv_pytorch,
@@ -31,6 +34,91 @@ def get_flash_attn_version(
 
 def supports_sinks() -> bool:
     return False
+
+
+def supports_batch_invariance() -> bool:
+    return False
+
+
+def supports_kv_cache_dtype(kv_cache_dtype: Any | None) -> bool:
+    if kv_cache_dtype is None:
+        return True
+    return kv_cache_dtype in ("auto", "float16", "bfloat16")
+
+
+def supports_compute_capability(capability: Any) -> bool:
+    del capability
+    return True
+
+
+def validate_combination(
+    *,
+    head_size: int,
+    dtype: Any,
+    kv_cache_dtype: Any,
+    block_size: int | None,
+    use_mla: bool,
+    has_sink: bool,
+    use_sparse: bool,
+    device_capability: Any,
+) -> str | None:
+    del device_capability
+    if dtype not in (torch.float16, torch.bfloat16):
+        return f"Unsupported dtype {dtype}."
+    if head_size % 8 != 0 or head_size > 256:
+        return f"Unsupported head_size={head_size}."
+    if not supports_kv_cache_dtype(kv_cache_dtype):
+        return f"Unsupported kv_cache_dtype={kv_cache_dtype}."
+    if block_size is not None and block_size % 16 != 0:
+        return f"block_size={block_size} not multiple of 16."
+    if has_sink:
+        return "No FlashAttention sink support."
+    if use_mla:
+        return "No MLA support."
+    if use_sparse:
+        return "No sparse support."
+    return None
+
+
+def get_kv_cache_shape(
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    cache_dtype_str: str = "auto",
+) -> tuple[int, ...]:
+    del cache_dtype_str
+    return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+
+def get_kv_cache_stride_order(
+    include_num_layers_dimension: bool = False,
+) -> tuple[int, ...]:
+    from vllm.v1.attention.backends.utils import get_kv_cache_layout
+
+    cache_layout = get_kv_cache_layout()
+    if cache_layout == "NHD" and include_num_layers_dimension:
+        return (2, 0, 1, 3, 4, 5)
+    if cache_layout == "NHD":
+        return (0, 1, 2, 3, 4)
+    if cache_layout == "HND" and include_num_layers_dimension:
+        return (2, 4, 0, 1, 3, 5)
+    if cache_layout == "HND":
+        return (0, 1, 3, 2, 4)
+    raise ValueError(f"Unknown cache layout format {cache_layout}.")
+
+
+def split_kv_cache(kv_cache: Any) -> tuple[Any, Any]:
+    return kv_cache[0], kv_cache[1]
+
+
+def get_kv_scales(layer: Any) -> tuple[None, None]:
+    del layer
+    return None, None
+
+
+def get_metadata_builder_cls() -> type[NPUBeamAttentionMetadataBuilder]:
+    return NPUBeamAttentionMetadataBuilder
 
 
 def reshape_and_cache(
@@ -58,7 +146,7 @@ def cascade_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
-    attn_metadata: BeamAttentionMetadata,
+    attn_metadata: NPUBeamAttentionMetadata,
     sliding_window_size: list[int] | tuple[int, int] | None,
     scale: float,
     logits_soft_cap: float,

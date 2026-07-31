@@ -12,6 +12,7 @@ import pytest
 
 from vllm_gr.platforms import cuda, npu
 from vllm_gr.platforms.builtins import register_builtin_backends
+from vllm_gr.platforms.errors import UnsupportedBackendError
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     resolve_backend,
@@ -26,12 +27,13 @@ def teardown_function() -> None:
     _reset_backend_registry_for_tests()
 
 
-def test_builtin_providers_register_idempotently() -> None:
+def test_only_cuda_is_registered_as_a_builtin() -> None:
     register_builtin_backends()
     register_builtin_backends()
 
     assert resolve_backend("cuda") is cuda.CUDA_BACKEND
-    assert resolve_backend("npu") is npu.NPU_BACKEND
+    with pytest.raises(UnsupportedBackendError):
+        resolve_backend("npu")
 
 
 def test_cuda_provider_lazily_returns_platform_modules(
@@ -51,7 +53,7 @@ def test_cuda_provider_lazily_returns_platform_modules(
     monkeypatch.setattr(cuda, "import_module", import_module)
 
     assert cuda.CUDA_BACKEND.get_model_runner_hooks() is gpu_runner
-    assert cuda.CUDA_BACKEND.get_attention_execution() is gpu_attention
+    assert cuda.CUDA_BACKEND.get_attention_hooks() is gpu_attention
     assert imported == [
         "vllm_gr.v1.worker.gpu_model_runner_patch",
         "vllm_gr.v1.attention.backends.beam_attn_gpu",
@@ -75,7 +77,7 @@ def test_npu_provider_lazily_returns_platform_modules(
     monkeypatch.setattr(npu, "import_module", import_module)
 
     assert npu.NPU_BACKEND.get_model_runner_hooks() is npu_runner
-    assert npu.NPU_BACKEND.get_attention_execution() is npu_attention
+    assert npu.NPU_BACKEND.get_attention_hooks() is npu_attention
     assert imported == [
         "vllm_gr.v1.worker.npu_model_runner_patch",
         "vllm_gr.v1.attention.backends.beam_attn_npu",

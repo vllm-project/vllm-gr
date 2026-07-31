@@ -21,8 +21,11 @@ from typing import Any, Iterator, cast
 import torch
 
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
-from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-    BeamAttentionMetadataBuilder,
+from vllm_gr.v1.attention.backends.beam_attn_metadata_gpu import (
+    CUDABeamAttentionMetadataBuilder,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata_npu import (
+    NPUBeamAttentionMetadataBuilder,
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
@@ -268,19 +271,23 @@ def build_beam_attn_metadata(
 
     token = BEAM_DATA_VAR.set(beam_info)
     try:
-        builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
+        device_type = getattr(device, "type", str(device).partition(":")[0])
+        builder_cls = (
+            NPUBeamAttentionMetadataBuilder
+            if device_type == "npu"
+            else CUDABeamAttentionMetadataBuilder
+        )
+        builder = builder_cls.__new__(builder_cls)
         builder.device = device
         builder.block_size = inputs.block_size
         builder.aot_schedule = False
         builder.aot_sliding_window = None
-        builder.use_full_cuda_graph = False
-        builder.max_cudagraph_size = None
         builder.max_num_splits = 0
         builder.num_heads_q = inputs.query.shape[1]
         builder.num_kv_heads = inputs.num_kv_heads
-        device_type = getattr(device, "type", str(device).partition(":")[0])
-        builder._is_cuda = device_type == "cuda"
-        builder._is_npu = device_type == "npu"
+        if device_type == "cuda":
+            builder.use_full_cuda_graph = False
+            builder.max_cudagraph_size = None
         if npu_causal_atten_mask is not None:
             # NPU cascade execution reads this for the causal STD/suffix calls.
             builder.npu_causal_atten_mask = npu_causal_atten_mask

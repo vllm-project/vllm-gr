@@ -2,16 +2,38 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Thin NPU provider with lazy Ascend-specific imports."""
 
+import logging
 from dataclasses import dataclass
 from importlib import import_module
 from typing import cast
 
-from .protocol import BeamAttentionExecution, ModelRunnerPatchHooks
+from .protocol import BACKEND_API_VERSION, BeamAttentionHooks, ModelRunnerPatchHooks
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class NPUBackendProvider:
+    api_version: int = BACKEND_API_VERSION
     device_type: str = "npu"
+
+    def configure_engine(self, config: object) -> None:
+        """Apply the Ascend dense-attention block-size default."""
+        cache_config = getattr(config, "cache_config", None)
+        model_config = getattr(config, "model_config", None)
+        if cache_config is None:
+            return
+        if getattr(cache_config, "user_specified_block_size", False):
+            return
+        if model_config is not None and getattr(model_config, "is_hybrid", False):
+            return
+        if cache_config.block_size != 128:
+            logger.info(
+                "Using Ascend-compatible default KV cache block size 128 "
+                "(vLLM resolved the unspecified value to %s).",
+                cache_config.block_size,
+            )
+            cache_config.block_size = 128
 
     def check_environment(self) -> dict[str, str]:
         from vllm_gr._env_check import check_ascend_environment
@@ -33,11 +55,18 @@ class NPUBackendProvider:
             import_module("vllm_gr.v1.worker.npu_model_runner_patch"),
         )
 
-    def get_attention_execution(self) -> BeamAttentionExecution:
+    def get_attention_hooks(self) -> BeamAttentionHooks:
         return cast(
-            BeamAttentionExecution,
+            BeamAttentionHooks,
             import_module("vllm_gr.v1.attention.backends.beam_attn_npu"),
         )
+
+    def release_accelerator_memory(self) -> None:
+        import torch
+
+        from vllm_gr.platforms.memory import cleanup_torch_backend
+
+        cleanup_torch_backend(getattr(torch, "npu", None), collect_ipc=False)
 
 
 NPU_BACKEND = NPUBackendProvider()

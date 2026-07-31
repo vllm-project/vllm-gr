@@ -17,6 +17,7 @@ from vllm_gr.platforms.errors import (
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
+from vllm_gr.platforms.protocol import BACKEND_API_VERSION
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     activate_backend,
@@ -28,7 +29,11 @@ from vllm_gr.platforms.registry import (
 
 @dataclass(frozen=True)
 class FakeProvider:
+    api_version: int = BACKEND_API_VERSION
     device_type: str = "fake"
+
+    def configure_engine(self, config: Any) -> None:
+        del config
 
     def check_environment(self) -> dict[str, str]:
         return {}
@@ -40,8 +45,11 @@ class FakeProvider:
     def get_model_runner_hooks(self) -> Any:
         return object()
 
-    def get_attention_execution(self) -> Any:
+    def get_attention_hooks(self) -> Any:
         return object()
+
+    def release_accelerator_memory(self) -> None:
+        return None
 
 
 def setup_function() -> None:
@@ -154,7 +162,7 @@ def test_provider_surface_validation_does_not_call_getters() -> None:
             calls.append("model-runner")
             return object()
 
-        def get_attention_execution(self) -> Any:
+        def get_attention_hooks(self) -> Any:
             calls.append("attention")
             return object()
 
@@ -168,6 +176,7 @@ def test_provider_class_and_missing_methods_are_rejected() -> None:
         register_backend(FakeProvider)
 
     class IncompleteProvider:
+        api_version = BACKEND_API_VERSION
         device_type = "incomplete"
 
     with pytest.raises(InvalidBackendProviderError, match="required callable"):
