@@ -47,7 +47,7 @@ def test_beam_data_var_defaults_to_none_and_reset_restores_default() -> None:
 
 
 def test_execute_model_wrapper_publishes_and_restores_context() -> None:
-    from vllm_gr.v1.engine.engine_core_patch import make_patched_execute_model
+    from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
 
     beam_data = {"request": {"is_beam_decode": True}}
     scheduler_output = SimpleNamespace(beam_data=beam_data)

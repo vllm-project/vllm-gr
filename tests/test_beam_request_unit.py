@@ -52,16 +52,14 @@ from vllm_gr.v1.engine.core_client_patch import (
     sync_mp_add_requests,
     sync_mp_beam_request_step_update,
 )
-from vllm_gr.v1.engine.engine_core_patch import (
-    _process_beam_decode_request,
-    make_patched_engine_core_init,
-)
+from vllm_gr.v1.engine.engine_core_patch import make_patched_engine_core_init
 from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.engine.wire import (
     _add_enum_member,
     register_engine_core_request_types,
 )
+from vllm_gr.v1.worker.model_runner_common import _process_beam_decode_request
 
 # Ensure custom enum members exist in this process for all tests below.
 register_engine_core_request_types()

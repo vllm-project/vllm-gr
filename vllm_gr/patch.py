@@ -13,15 +13,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm.v1.sample.sampler import Sampler
-
+from vllm_gr import lmcache_patch
+from vllm_gr.ops import sliced_logits_patch
 from vllm_gr.v1 import ascend_compat
 
 logger = logging.getLogger("vllm_gr.patch")
-
-_apply_ascend_attention_backend_patch = ascend_compat.apply_ascend_attention_backend_patch
-_patch_npu_worker_init_device = ascend_compat.patch_npu_worker_init_device
-_is_npu_platform = ascend_compat.is_npu_platform
 
 
 class BeamPatchStatus(str, Enum):
@@ -70,84 +66,6 @@ class BeamPatchInitializationError(RuntimeError):
 
 
 _LAST_BEAM_PATCH_REPORT: BeamPatchReport | None = None
-_SLICED_LOGITS_PATCHED = False
-
-
-def patch_sliced_logits() -> None:
-    global _SLICED_LOGITS_PATCHED
-    if _SLICED_LOGITS_PATCHED:
-        return
-    try:
-        from vllm.config import get_current_vllm_config_or_none
-        from vllm.model_executor.layers.logits_processor import LogitsProcessor
-
-        from vllm_gr.ops.sliced_logits import (
-            compute_sliced_logits,
-            is_vocab_slice_enabled,
-            set_vocab_slice_config,
-        )
-
-        vllm_config = get_current_vllm_config_or_none()
-        if (
-            vllm_config is not None
-            and getattr(vllm_config, "additional_config", None)
-            and isinstance(vllm_config.additional_config, dict)
-        ):
-            offset = vllm_config.additional_config.get("vllm_gr_vocab_offset")
-            slice_size = vllm_config.additional_config.get("vllm_gr_vocab_slice_size")
-            if offset is not None and slice_size is not None:
-                set_vocab_slice_config(offset, slice_size)
-
-        orig_init = LogitsProcessor.__init__
-
-        def patched_init(self, *args, **kwargs):
-            orig_init(self, *args, **kwargs)
-            if not is_vocab_slice_enabled():
-                vllm_cfg = get_current_vllm_config_or_none()
-                if (
-                    vllm_cfg is not None
-                    and getattr(vllm_cfg, "additional_config", None)
-                    and isinstance(vllm_cfg.additional_config, dict)
-                ):
-                    offset = vllm_cfg.additional_config.get("vllm_gr_vocab_offset")
-                    slice_size = vllm_cfg.additional_config.get("vllm_gr_vocab_slice_size")
-                    if offset is not None and slice_size is not None:
-                        set_vocab_slice_config(offset, slice_size)
-
-        LogitsProcessor.__init__ = patched_init
-
-        orig_get_logits = LogitsProcessor._get_logits
-
-        def patched_get_logits(self, hidden_states, lm_head, embedding_bias):
-            if is_vocab_slice_enabled():
-                return compute_sliced_logits(
-                    hidden_states,
-                    lm_head,
-                    embedding_bias,
-                    logits_processor=self,
-                    orig_get_logits=orig_get_logits,
-                )
-            return orig_get_logits(self, hidden_states, lm_head, embedding_bias)
-
-        LogitsProcessor._get_logits = patched_get_logits
-
-        try:
-            orig_gather = Sampler.gather_logprobs
-
-            @staticmethod
-            def patched_gather_logprobs(logprobs, num_logprobs, token_ids, *args, **kwargs):
-                if logprobs is not None and logprobs.numel() > 0:
-                    num_logprobs = min(num_logprobs, logprobs.size(-1))
-                return orig_gather(logprobs, num_logprobs, token_ids, *args, **kwargs)
-
-            Sampler.gather_logprobs = patched_gather_logprobs
-        except Exception as e:
-            logger.debug("vllm_gr: Could not patch Sampler.gather_logprobs: %s", e)
-
-        _SLICED_LOGITS_PATCHED = True
-        logger.info("vllm_gr: Patched LogitsProcessor._get_logits for sliced vocabulary projection")
-    except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_sliced_logits: %s", exc)
 
 
 def _call_patch(module_name: str, function_name: str) -> None:
@@ -523,51 +441,12 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
     del force  # Repeated initialization probes every target before applying it.
     patch_count = initialize_required_beam_patches().applied_count
 
-    try:
-        patch_sliced_logits()
+    if sliced_logits_patch.apply_sliced_logits_patch():
         patch_count += 1
-        logger.debug("vllm_gr: Applied patch_sliced_logits")
-    except Exception as exc:
-        logger.debug("vllm_gr: Skipping patch_sliced_logits: %s", exc)
 
-    # Optional: LMCache adapter patch
     try:
-        import importlib.util
-        from pathlib import Path
-
-        adapter_path = (
-            Path(__file__).resolve().parent
-            / "3rd_party"
-            / "lmcache"
-            / "integration"
-            / "vllm"
-            / "vllm_v1_adapter.py"
-        )
-        if adapter_path.exists():
-            import os
-            import sys
-
-            should_patch = False
-            if os.getenv("VLLM_GR_LMCACHE_PATCH", "").lower() in (
-                "1",
-                "true",
-                "yes",
-                "y",
-            ):
-                should_patch = True
-            elif any("LMCacheConnectorV1" in arg for arg in sys.argv):
-                should_patch = True
-
-            if should_patch:
-                spec = importlib.util.spec_from_file_location(
-                    "vllm_gr_3rd_party_lmcache_integration_vllm_v1_adapter",
-                    adapter_path,
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                module.patch_installed_lmcache_adapter()
-                patch_count += 1
-                logger.debug("vllm_gr: Applied LMCache adapter patch")
+        if lmcache_patch.is_lmcache_adapter_requested() and lmcache_patch.apply_lmcache_adapter():
+            patch_count += 1
     except Exception as exc:
         logger.debug("vllm_gr: Skipping LMCache adapter patch: %s", exc)
 
@@ -579,44 +458,13 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
     return patch_count
 
 
-def patch_lmcache_adapter():
-    """Apply LMCache adapter patch.
-
-    Public helper used by engine_core_patch.py in child processes where
-    only the LMCache monkey patch must be installed, without re-running
-    the full patch sequence.
-    """
-    import importlib.util
-    from pathlib import Path
-
-    module_path = (
-        Path(__file__).resolve().parent
-        / "3rd_party"
-        / "lmcache"
-        / "integration"
-        / "vllm"
-        / "vllm_v1_adapter.py"
-    )
-    if not module_path.exists():
-        return
-    spec = importlib.util.spec_from_file_location(
-        "vllm_gr_3rd_party_lmcache_integration_vllm_v1_adapter",
-        module_path,
-    )
-    if spec.loader is None:
-        return
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.patch_installed_lmcache_adapter()
-
-
 def _apply_patches(force: bool = False) -> int:
     """Apply all runtime patches needed by vllm-gr."""
-    ascend_attn_count = _apply_ascend_attention_backend_patch(force=force)
+    ascend_attn_count = ascend_compat.apply_ascend_attention_backend_patch(force=force)
     # Import/patch NPUWorker before the beam patch tries to access
     # NPUModelRunner. vllm-ascend's worker module deliberately initializes
     # vllm_ascend.ops first, avoiding an import-order cycle through device_op.
-    npu_worker_count = _patch_npu_worker_init_device()
+    npu_worker_count = ascend_compat.patch_npu_worker_init_device()
     beam_count = _apply_gr_beam_patches(force=force)
     return ascend_attn_count + npu_worker_count + beam_count
 

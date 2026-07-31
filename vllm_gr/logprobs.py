@@ -6,15 +6,8 @@ per-element append."""
 import itertools
 from collections.abc import Iterable
 
-from vllm_gr.beam_search_decision_utils import (
-    extract_and_dedup_flat_logprobs,
-    extract_and_dedup_segment,
-)
-
 __all__ = [
     "append_fast",
-    "extract_and_dedup_flat_logprobs",
-    "extract_and_dedup_segment",
     "reconstruct_beam_logprobs",
 ]
 

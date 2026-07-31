@@ -251,6 +251,11 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
       `vllm_gr.v1.attention.backends.beam_attn_npu`;
     - backend registration and facade:
       `vllm_gr.v1.attention.backends.beam_attn`.
+- Compatibility facade:
+    - `beam_attn` intentionally continues to export
+      `BeamAttentionMetadata`, `BeamAttentionMetadataBuilder`,
+      `BEAM_DATA_VAR`, and `_compute_beam_bounds`;
+    - new internal code should import those symbols from their owner modules.
 - Ownership risk:
     - CUSTOM is one shared process-global slot;
     - later registration may replace an earlier owner;
@@ -259,6 +264,9 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 
 ### GR-PATCH-014 — LMCache Integration Override
 
+- Source: `vllm_gr/3rd_party/lmcache/integration/vllm/vllm_v1_adapter.py`
+- Installer: `vllm_gr/lmcache_patch.py`
+- Orchestration: `vllm_gr/patch.py`
 - Targets:
     - `RequestTracker.from_new_request`
     - `ReqMeta.from_request_tracker`
@@ -270,6 +278,20 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 - Activation: optional; enabled only when the LMCache integration is requested.
 - Dependencies include tracker lifecycle, connector parent state, connector metadata requests, slot mappings, and load/save semantics.
 - Removal condition: LMCache exposes the required grouped Beam metadata and lifecycle extension points directly.
+
+### GR-PATCH-015 — Sliced Vocabulary Projection
+
+- Source: `vllm_gr/ops/sliced_logits.py`
+- Installer: `vllm_gr/ops/sliced_logits_patch.py`
+- Orchestration: `vllm_gr/patch.py`
+- Targets:
+    - `LogitsProcessor.__init__`
+    - `LogitsProcessor._get_logits`
+    - `Sampler.gather_logprobs`
+- Risk: Medium
+- Activation: hooks are installed during runtime initialization; sliced projection is
+  used only when a valid vocabulary slice is configured.
+- Removal condition: vLLM exposes stable output-projection and logprob-width extension points.
 
 ## Benchmark-only Runtime Mutations
 

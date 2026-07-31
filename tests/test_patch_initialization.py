@@ -70,13 +70,13 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         return 1
 
     monkeypatch.setattr(
-        runtime_patch,
-        "_apply_ascend_attention_backend_patch",
+        runtime_patch.ascend_compat,
+        "apply_ascend_attention_backend_patch",
         apply_attention,
     )
     monkeypatch.setattr(
-        runtime_patch,
-        "_patch_npu_worker_init_device",
+        runtime_patch.ascend_compat,
+        "patch_npu_worker_init_device",
         patch_npu_worker,
     )
     monkeypatch.setattr(
@@ -87,6 +87,36 @@ def test_runtime_patch_order_preserves_ascend_initialization(
 
     assert runtime_patch._apply_patches(force=True) == 3
     assert call_order == ["attention", "npu_worker", "beam"]
+
+
+def test_optional_patch_count_tracks_actual_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_gr.patch as runtime_patch
+
+    monkeypatch.setattr(
+        runtime_patch,
+        "initialize_required_beam_patches",
+        lambda: BeamPatchReport(()),
+    )
+    monkeypatch.setattr(
+        runtime_patch.sliced_logits_patch,
+        "apply_sliced_logits_patch",
+        mock.Mock(side_effect=(True, False)),
+    )
+    monkeypatch.setattr(
+        runtime_patch.lmcache_patch,
+        "is_lmcache_adapter_requested",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        runtime_patch.lmcache_patch,
+        "apply_lmcache_adapter",
+        mock.Mock(side_effect=(True, False)),
+    )
+
+    assert runtime_patch._apply_gr_beam_patches() == 2
+    assert runtime_patch._apply_gr_beam_patches() == 0
 
 
 def test_initialization_applies_and_validates_required_patch(

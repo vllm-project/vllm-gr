@@ -22,18 +22,18 @@ def _temporary_filter_requests(metadata, predicate):
     return original_requests
 
 
-def patch_installed_lmcache_adapter() -> None:
+def patch_installed_lmcache_adapter() -> bool:
     try:
         adapter = importlib.import_module("lmcache.integration.vllm.vllm_v1_adapter")
     except ModuleNotFoundError:
         logger.warning("Installed lmcache v1 adapter not found; skipping lmcache runtime patch.")
-        return
+        return False
     except Exception as exc:
         logger.exception(
             "Unable to import installed lmcache adapter for runtime patch.",
             exc_info=exc,
         )
-        return
+        return False
 
     def patch_request_tracker_from_new_request():
         def from_new_request(
@@ -151,3 +151,4 @@ def patch_installed_lmcache_adapter() -> None:
     patch_request_tracker_from_new_request()
     patch_reqmeta_from_request_tracker()
     patch_lmcache_connector_v1_impl()
+    return True

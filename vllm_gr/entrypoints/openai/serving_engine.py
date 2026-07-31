@@ -17,11 +17,12 @@ from vllm.utils import random_uuid
 
 from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
+    extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
     materialize_selected_beams,
     select_top_indices,
 )
-from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
+from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics

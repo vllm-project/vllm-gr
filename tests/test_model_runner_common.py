@@ -210,11 +210,3 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
 
     assert runner._current_beam_data == {}
     assert runner._current_beam_info is None
-
-
-def test_old_path_reexports_common_helpers() -> None:
-    from vllm_gr.v1.engine import engine_core_patch as old
-
-    assert old.InputBatchProxy is common.InputBatchProxy
-    assert old._beam_remap_inputs is common._beam_remap_inputs
-    assert old.make_patched_execute_model is common.make_patched_execute_model

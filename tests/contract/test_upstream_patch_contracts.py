@@ -18,7 +18,7 @@ def test_patch_inventory_has_expected_ids() -> None:
     patch_ids = re.findall(r"^\s*- id: (GR-PATCH-\d{3})$", inventory, flags=re.MULTILINE)
 
     assert len(patch_ids) == len(set(patch_ids))
-    assert patch_ids == [f"GR-PATCH-{index:03d}" for index in range(15)]
+    assert patch_ids == [f"GR-PATCH-{index:03d}" for index in range(16)]
 
 
 def test_engine_wire_values_do_not_conflict() -> None:

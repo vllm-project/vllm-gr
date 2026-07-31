@@ -89,8 +89,24 @@ patches:
       gpu_execution: vllm_gr.v1.attention.backends.beam_attn_gpu
       npu_execution: vllm_gr.v1.attention.backends.beam_attn_npu
       backend_registration_and_facade: vllm_gr.v1.attention.backends.beam_attn
+      compatibility_exports:
+        - BeamAttentionMetadata
+        - BeamAttentionMetadataBuilder
+        - BEAM_DATA_VAR
+        - _compute_beam_bounds
 
   - id: GR-PATCH-014
+    source: vllm_gr/3rd_party/lmcache/integration/vllm/vllm_v1_adapter.py
+    installer: vllm_gr/lmcache_patch.py
+    orchestration: vllm_gr/patch.py
     target: LMCacheConnectorV1Impl
     risk: critical
     contract: null
+
+  - id: GR-PATCH-015
+    source: vllm_gr/ops/sliced_logits.py
+    installer: vllm_gr/ops/sliced_logits_patch.py
+    orchestration: vllm_gr/patch.py
+    target: LogitsProcessor and Sampler
+    risk: medium
+    contract: sliced-vocabulary-projection
