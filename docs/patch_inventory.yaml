@@ -4,22 +4,31 @@ verified_baseline:
   vllm: "0.22.1"
   vllm_ascend: "0.22.1rc1"
 
+backend_provider:
+  protocol: vllm_gr.platforms.protocol.GRBackendProvider
+  registry: vllm_gr.platforms.registry
+  activation: vllm_gr.platforms.loader.activate_current_backend
+  process_local: true
+
 patches:
   - id: GR-PATCH-000
     target: vllm_gr.plugin.register
+    engine_core_bootstrap: vllm_gr.v1.engine.engine_core_patch.run_engine_core
     risk: high
     contract: plugin-entrypoint
 
   - id: GR-PATCH-001
     source: vllm_gr/v1/ascend_compat.py
-    orchestration: vllm_gr/patch.py
+    orchestration: vllm_gr/platforms/npu.py
+    backend: npu
     target: vllm.v1.attention.selector._cached_get_attn_backend
     risk: critical
     contract: attention-selector-signature
 
   - id: GR-PATCH-002
     source: vllm_gr/v1/ascend_compat.py
-    orchestration: vllm_gr/patch.py
+    orchestration: vllm_gr/platforms/npu.py
+    backend: npu
     target: vllm_ascend.worker.worker.NPUWorker.init_device
     risk: high
     contract: null
@@ -68,6 +77,7 @@ patches:
     source: vllm_gr/v1/worker/gpu_model_runner_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py
     installer: vllm_gr/v1/worker/model_runner_patch.py
+    selection: active-backend-provider
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
     risk: critical
     contract: gpu-model-runner-signatures
@@ -76,6 +86,7 @@ patches:
     source: vllm_gr/v1/worker/npu_model_runner_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py
     installer: vllm_gr/v1/worker/model_runner_patch.py
+    selection: active-backend-provider
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
     risk: critical
     contract: null
