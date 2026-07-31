@@ -91,8 +91,7 @@ vllm-gr serve OpenOneRec/OneRec-1.7B \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \
     --max-num-batched-tokens 16384 \
-    --scheduling-policy priority \
-    --attention-backend CUSTOM
+    --scheduling-policy priority
 ```
 
 ```bash
@@ -150,7 +149,7 @@ You can refer also to [`Quickstart`](../quickstart.md) menu.
 
 - Python 3.11+
 - Pip 23+
-- CUDA 11.8+ (for GPU inference)
+- CUDA 13.0 (for GPU inference)
 - 32GB+ RAM (recommended)
 
 ### Setup

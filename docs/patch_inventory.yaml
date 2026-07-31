@@ -1,0 +1,96 @@
+schema_version: 1
+
+verified_baseline:
+  vllm: "0.22.1"
+  vllm_ascend: "0.22.1rc1"
+
+patches:
+  - id: GR-PATCH-000
+    target: vllm_gr.plugin.register
+    risk: high
+    contract: plugin-entrypoint
+
+  - id: GR-PATCH-001
+    source: vllm_gr/v1/ascend_compat.py
+    orchestration: vllm_gr/patch.py
+    target: vllm.v1.attention.selector._cached_get_attn_backend
+    risk: critical
+    contract: attention-selector-signature
+
+  - id: GR-PATCH-002
+    source: vllm_gr/v1/ascend_compat.py
+    orchestration: vllm_gr/patch.py
+    target: vllm_ascend.worker.worker.NPUWorker.init_device
+    risk: high
+    contract: null
+
+  - id: GR-PATCH-003
+    target: vllm.logprobs.FlatLogprobs.append_fast
+    risk: medium
+    contract: null
+
+  - id: GR-PATCH-004
+    target: OpenAIServing.beam_search
+    risk: high
+    contract: null
+
+  - id: GR-PATCH-005
+    target: vllm.engine.arg_utils.EngineArgs
+    risk: high
+    contract: engine-args-descriptors
+
+  - id: GR-PATCH-006
+    target: OpenAIServingModels.__init__
+    risk: high
+    contract: null
+
+  - id: GR-PATCH-007
+    target: EngineCore clients and AsyncLLM
+    risk: critical
+    contract: null
+
+  - id: GR-PATCH-008
+    target: vllm.v1.engine.EngineCoreRequestType
+    risk: critical
+    contract: engine-wire-values
+
+  - id: GR-PATCH-009
+    target: vllm.v1.engine.core.EngineCoreProc
+    risk: critical
+    contract: engine-core-signatures
+
+  - id: GR-PATCH-010
+    target: vllm.v1.core.sched.scheduler.Scheduler.schedule
+    risk: critical
+    contract: scheduler-contract
+
+  - id: GR-PATCH-011
+    source: vllm_gr/v1/worker/gpu_model_runner_patch.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py
+    installer: vllm_gr/v1/worker/model_runner_patch.py
+    target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
+    risk: critical
+    contract: gpu-model-runner-signatures
+
+  - id: GR-PATCH-012
+    source: vllm_gr/v1/worker/npu_model_runner_patch.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py
+    installer: vllm_gr/v1/worker/model_runner_patch.py
+    target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
+    risk: critical
+    contract: null
+
+  - id: GR-PATCH-013
+    target: vllm.v1.attention.backends.registry.AttentionBackendEnum.CUSTOM
+    risk: high
+    contract: custom-attention-registry
+    ownership:
+      metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata
+      gpu_execution: vllm_gr.v1.attention.backends.beam_attn_gpu
+      npu_execution: vllm_gr.v1.attention.backends.beam_attn_npu
+      backend_registration_and_facade: vllm_gr.v1.attention.backends.beam_attn
+
+  - id: GR-PATCH-014
+    target: LMCacheConnectorV1Impl
+    risk: critical
+    contract: null

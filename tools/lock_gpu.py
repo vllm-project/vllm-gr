@@ -2,12 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import ctypes
+import os
 import sys
 import time
 
 
 def lock_gpu(gpu_id: int, mem_to_alloc_mb: int):
     try:
+        if "__EGL_VENDOR_LIBRARY_FILENAMES" not in os.environ:
+            standard_vendor_files = [
+                "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+                "/etc/glvnd/egl_vendor.d/10_nvidia.json",
+            ]
+            if not any(os.path.exists(f) for f in standard_vendor_files):
+                cfg_path = "/tmp/10_nvidia_auto.json"
+                if not os.path.exists(cfg_path):
+                    try:
+                        with open(cfg_path, "w") as f:
+                            f.write(
+                                '{"file_format_version":"1.0.0",'
+                                '"ICD":{"library_path":"libEGL_nvidia.so.0"}}'
+                            )
+                    except Exception:
+                        pass
+                if os.path.exists(cfg_path):
+                    os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] = cfg_path
+
         egl = ctypes.CDLL("libEGL.so.1")
         gl = ctypes.CDLL("libGL.so.1")
 

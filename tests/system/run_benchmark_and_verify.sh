@@ -40,7 +40,7 @@ timeout=600 # time for waiting server to go up
 p99_ttft_th=300
 p99_tpot_th=0.02
 pass_1_th=0.09
-pass_32_th=0.2
+pass_32_th=0.3
 recall_32_th=0.04
 elapsed_time_online_th=15
 elapsed_time_offline_th=20
@@ -54,7 +54,7 @@ if command -v npu-smi &> /dev/null; then
     "Ascend910_9362" )
       p99_ttft_th=280
       elapsed_time_online_th=20
-      elapsed_time_offline_th=60
+      elapsed_time_offline_th=25
        ;;
     * )
     echo "using default thresholds for $board_id" ;;

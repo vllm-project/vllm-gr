@@ -56,9 +56,11 @@ class TestPanguPluginInitializeRuntime(unittest.TestCase):
         with (
             mock.patch("vllm_gr._env_check.check_environment"),
             mock.patch("vllm_gr.patch.re_apply_patches", return_value=0),
+            mock.patch("vllm_gr.patch.get_last_beam_patch_report", return_value=None),
         ):
             state = plugin.initialize_runtime()
         self.assertIn("patch_count", state)
+        self.assertIn("patches", state)
 
 
 class TestModelRunnerDefault(unittest.TestCase):

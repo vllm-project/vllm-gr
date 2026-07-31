@@ -1,4 +1,3 @@
-import atexit
 import json
 import logging
 import os
@@ -32,7 +31,6 @@ from vllm.benchmarks.throughput import add_cli_args as original_add_cli_args
 from vllm.benchmarks.throughput import get_requests as original_get_requests
 from vllm.benchmarks.throughput import main as original_main
 from vllm.benchmarks.throughput import validate_args as original_validate_args
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
 
@@ -182,7 +180,6 @@ def _get_output_len_from_argv():
 USE_BEAM_SEARCH = _consume_use_beam_search_flag()
 ARGS_N_BEAMS = _get_n_beams_from_argv()
 ARGS_OUTPUT_LEN = _get_output_len_from_argv()
-atexit.register(cleanup_dist_env_and_memory)
 
 # ============================================================================
 # Beam Search Patching
@@ -508,21 +505,6 @@ def _run_offline_beam_search_benchmark(args):
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    # Initialize GRLLM
-    logger.info(f"Initializing GRLLM with model: {args.model}")
-    llm = GRLLM(
-        model=args.model,
-        trust_remote_code=True,
-        max_logprobs=args.max_logprobs if hasattr(args, "max_logprobs") else 2048,
-        attention_config={"backend": "CUSTOM"},
-        # Add other relevant vLLM arguments if available in args
-        **(
-            {"max_num_batched_tokens": getattr(args, "max_num_batched_tokens", None)}
-            if hasattr(args, "max_num_batched_tokens") and args.max_num_batched_tokens
-            else {}
-        ),
-    )
-
     # Load dataset
     logger.info(f"Loading OneRec dataset from {args.dataset_path}")
     dataset = OneRecDataset(
@@ -561,10 +543,25 @@ def _run_offline_beam_search_benchmark(args):
     logger.info(f"Running beam search benchmark with {beam_width} beams on {len(prompts)} prompts")
     logger.info(f"Max tokens per request: {max_tokens}")
 
-    # Run beam search
-    start_time = time.perf_counter()
-    outputs = llm.beam_search(prompts, params)
-    end_time = time.perf_counter()
+    # Keep engine cleanup scoped to the process that owns the offline engine.
+    # Online benchmarks are clients of a separate server and must not register
+    # process-wide vLLM distributed cleanup callbacks.
+    logger.info(f"Initializing GRLLM with model: {args.model}")
+    with GRLLM(
+        model=args.model,
+        trust_remote_code=True,
+        max_logprobs=args.max_logprobs if hasattr(args, "max_logprobs") else 2048,
+        attention_config={"backend": "CUSTOM"},
+        # Add other relevant vLLM arguments if available in args
+        **(
+            {"max_num_batched_tokens": getattr(args, "max_num_batched_tokens", None)}
+            if hasattr(args, "max_num_batched_tokens") and args.max_num_batched_tokens
+            else {}
+        ),
+    ) as llm:
+        start_time = time.perf_counter()
+        outputs = llm.beam_search(prompts, params)
+        end_time = time.perf_counter()
 
     # Calculate metrics
     total_tokens = sum(len(output.sequences) * max_tokens for output in outputs)

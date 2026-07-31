@@ -39,6 +39,7 @@ class GRServeSubcommand(ServeSubcommand):
         )
 
         serve_parser = make_arg_parser(serve_parser)
+        serve_parser.set_defaults(attention_backend="CUSTOM")
 
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
         return serve_parser

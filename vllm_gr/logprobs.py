@@ -6,6 +6,18 @@ per-element append."""
 import itertools
 from collections.abc import Iterable
 
+from vllm_gr.beam_search_decision_utils import (
+    extract_and_dedup_flat_logprobs,
+    extract_and_dedup_segment,
+)
+
+__all__ = [
+    "append_fast",
+    "extract_and_dedup_flat_logprobs",
+    "extract_and_dedup_segment",
+    "reconstruct_beam_logprobs",
+]
+
 
 def append_fast(
     self,
@@ -29,28 +41,6 @@ def append_fast(
     else:
         self.decoded_tokens.extend(itertools.islice(decoded_tokens, len(token_ids)))
     self.end_indices.append(len(self.logprobs))
-
-
-def extract_and_dedup_flat_logprobs(flat, logprobs_num):
-    """Extract position-0 logprobs from FlatLogprobs, dedup sampled token.
-
-    Flat arrays store [sampled, top1, ..., topK] — the only possible
-    duplicate is position 0 (sampled token) when it also appears in the
-    top-K (positions 1..K).  Returns exactly ``logprobs_num`` entries.
-    """
-    start = flat.start_indices[0]
-    end = flat.end_indices[0]
-    token_ids = flat.token_ids[start:end]
-    lps = flat.logprobs[start:end]
-    ranks = flat.ranks[start:end]
-    decoded = flat.decoded_tokens[start:end]
-    if len(token_ids) > logprobs_num:
-        if any(token_ids[0] == token_ids[j] for j in range(1, logprobs_num + 1)):
-            s = slice(1, logprobs_num + 1)
-        else:
-            s = slice(logprobs_num)
-        token_ids, lps, ranks, decoded = (token_ids[s], lps[s], ranks[s], decoded[s])
-    return token_ids, lps, ranks, decoded
 
 
 def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):

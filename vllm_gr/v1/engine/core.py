@@ -82,9 +82,8 @@ def _handle_beam_request_step_update(self, update) -> None:
 
         # We MUST abort the running beam-request session_id itself!
         self.aborts_queue.put_nowait(session_id)
-        if update.pruned_ids:
-            for abort_id in update.pruned_ids:
-                self.aborts_queue.put_nowait(abort_id)
+        for abort_id in update.pruned_ids:
+            self.aborts_queue.put_nowait(abort_id)
         return
 
     # Validate parallel arrays
@@ -117,7 +116,7 @@ def _handle_beam_request_step_update(self, update) -> None:
     with self.beam_cache_lock:
         session_cached = self.beam_cache.get(session_id)
 
-    if session_cached is None and update.beam_width > 0:
+    if session_cached is None and beam_width > 0:
         logger.error("BEAM_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
         for child_id in update.child_beam_ids:
             self.output_queue.put_nowait(
@@ -139,8 +138,6 @@ def _handle_beam_request_step_update(self, update) -> None:
         return
 
     arrival = time.time()
-    inputs_to_push = []
-
     prefill_tokens = session_cached["all_token_ids"]
     prefill_block_hashes = list(session_cached["block_hashes"])
     lora_request = session_cached["lora_request"]
@@ -191,15 +188,10 @@ def _handle_beam_request_step_update(self, update) -> None:
     req.beam_decode_steps = decode_steps
     req.prefix_len = update.prefix_len
 
-    inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
+    self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, update.current_wave)))
 
-    # Non-blocking concurrent queue pushes
-    for item in inputs_to_push:
-        self.input_queue.put_nowait(item)
-
-    if update.pruned_ids:
-        for abort_id in update.pruned_ids:
-            self.aborts_queue.put_nowait(abort_id)
+    for abort_id in update.pruned_ids:
+        self.aborts_queue.put_nowait(abort_id)
 
 
 # ---------------------------------------------------------------------------
@@ -224,18 +216,15 @@ def process_input_sockets(
     from vllm.v1.engine import (
         EngineCoreReadyResponse,
         EngineCoreRequest,
-        EngineCoreRequestType,
     )
-    from vllm.v1.serial_utils import MsgpackDecoder
 
+    from vllm_gr.v1.engine.codec import (
+        build_engine_core_decoders,
+        decode_engine_core_payload,
+    )
     from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
-    # Msgpack serialization decoding.
-    decoder_kwargs = {"oob_tensor_provider": self.tensor_ipc_receiver}
-    add_request_decoder = MsgpackDecoder(EngineCoreRequest, **decoder_kwargs)
-    add_batch_decoder = MsgpackDecoder(list[EngineCoreRequest], **decoder_kwargs)
-    beam_request_decoder = MsgpackDecoder(BeamRequestStepUpdate, **decoder_kwargs)
-    generic_decoder = MsgpackDecoder(**decoder_kwargs)
+    decoders = build_engine_core_decoders(self.tensor_ipc_receiver)
 
     with ExitStack() as stack, zmq.Context() as ctx:
         input_sockets = [
@@ -285,10 +274,15 @@ def process_input_sockets(
                     assert input_socket == coord_socket
                     continue
                 request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+                decoded_payload = decode_engine_core_payload(
+                    decoders,
+                    request_type,
+                    data_frames,
+                )
 
                 request: Any
                 if request_type == EngineCoreRequestType.ADD:
-                    req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                    req: EngineCoreRequest = decoded_payload
                     try:
                         request = self.preprocess_add_request(req)
                     except Exception:
@@ -296,7 +290,7 @@ def process_input_sockets(
                         continue
 
                 elif request_type == EngineCoreRequestType.ADD_BATCH:
-                    batch: list[EngineCoreRequest] = add_batch_decoder.decode(data_frames)
+                    batch: list[EngineCoreRequest] = decoded_payload
                     for req in batch:
                         try:
                             request = self.preprocess_add_request(req)
@@ -308,12 +302,12 @@ def process_input_sockets(
                     continue
 
                 elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
-                    beam_update: BeamRequestStepUpdate = beam_request_decoder.decode(data_frames)
+                    beam_update: BeamRequestStepUpdate = decoded_payload
                     self._handle_beam_request_step_update(beam_update)
                     continue
 
                 else:
-                    request = generic_decoder.decode(data_frames)
+                    request = decoded_payload
 
                     if request_type == EngineCoreRequestType.ABORT:
                         self.aborts_queue.put_nowait(request)

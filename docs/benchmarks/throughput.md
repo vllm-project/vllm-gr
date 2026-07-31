@@ -43,7 +43,6 @@ Run the server and client separately for a production‑style setup.
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --max-num-seqs 1024 \
   --max-num-batched-tokens 16384 \
-  --attention-backend CUSTOM \
   --scheduling-policy priority
 ```
 
