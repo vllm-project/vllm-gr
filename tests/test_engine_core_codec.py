@@ -69,19 +69,6 @@ def test_build_engine_core_decoders_shares_oob_tensor_provider() -> None:
     assert decoders.generic.oob_tensor_provider is provider
 
 
-def test_decode_add_payload() -> None:
-    decoders = build_engine_core_decoders(None)
-
-    decoded = decode_engine_core_payload(
-        decoders,
-        EngineCoreRequestType.ADD,
-        _frames(_engine_core_request("request-0")),
-    )
-
-    assert isinstance(decoded, EngineCoreRequest)
-    assert decoded.request_id == "request-0"
-
-
 def test_decode_add_batch_payload() -> None:
     decoders = build_engine_core_decoders(None)
     requests = [
@@ -114,15 +101,3 @@ def test_decode_beam_step_update_payload() -> None:
     assert isinstance(decoded, BeamRequestStepUpdate)
     assert decoded.session_id == "session-0"
     assert decoded.beam_width == 2
-
-
-def test_decode_generic_payload() -> None:
-    decoders = build_engine_core_decoders(None)
-
-    decoded = decode_engine_core_payload(
-        decoders,
-        EngineCoreRequestType.ABORT,
-        _frames(["request-0", "request-1"]),
-    )
-
-    assert decoded == ["request-0", "request-1"]

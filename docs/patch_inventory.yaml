@@ -6,81 +6,188 @@ verified_baseline:
 
 patches:
   - id: GR-PATCH-000
+    owner: vllm_gr/plugin.py
+    installer: vllm_gr.plugin.register
+    activation: vLLM loads the vllm.general_plugins entry point
+    validator_or_test:
+      - tests/test_patch_initialization.py::test_plugin_exposes_simple_per_patch_status
+    process_roles: [main, engine_core, worker]
     target: vllm_gr.plugin.register
     risk: high
     contract: plugin-entrypoint
+    removal_condition: runtime patch installation is no longer required
 
   - id: GR-PATCH-001
-    source: vllm_gr/v1/ascend_compat.py
-    orchestration: vllm_gr/patch.py
+    owner: vllm_gr/v1/ascend_compat.py
+    installer: vllm_gr.v1.ascend_compat.apply_ascend_attention_backend_patch
+    activation: CUSTOM is registered and its backend slot is overridden
+    validator_or_test:
+      - tests/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
+      - tests/integration/test_ascend_attention_backend.py
+    process_roles: [engine_core, worker]
     target: vllm.v1.attention.selector._cached_get_attn_backend
     risk: critical
     contract: attention-selector-signature
+    removal_condition: vLLM-Ascend preserves and resolves explicit CUSTOM backend intent
 
   - id: GR-PATCH-002
-    source: vllm_gr/v1/ascend_compat.py
-    orchestration: vllm_gr/patch.py
+    owner: vllm_gr/v1/ascend_compat.py
+    installer: vllm_gr.v1.ascend_compat.patch_npu_worker_init_device
+    activation: the active platform is NPU and the hook is not installed
+    validator_or_test:
+      - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+    process_roles: [worker]
     target: vllm_ascend.worker.worker.NPUWorker.init_device
     risk: high
     contract: null
+    removal_condition: stable NPU worker initialization installs compatibility before ModelRunner construction
 
   - id: GR-PATCH-003
+    owner: vllm_gr/logprobs.py
+    installer: vllm_gr.logprobs_patch.patch_flat_logprobs
+    activation: the required frontend patch plan detects the method is not installed
+    validator_or_test:
+      - vllm_gr.patch._validate_flat_logprobs_patch
+      - tests/test_patch_initialization.py
+    process_roles: [offline_frontend, api_server]
     target: vllm.logprobs.FlatLogprobs.append_fast
     risk: medium
     contract: null
+    removal_condition: the GR implementation is no longer needed or is available upstream
 
   - id: GR-PATCH-004
-    target: OpenAIServing.beam_search
+    owner: vllm_gr/entrypoints/openai/serving_engine.py and protocol.py
+    installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_beam_search and patch_sampling
+    activation: the required frontend patch plan detects either method is not installed
+    validator_or_test:
+      - vllm_gr.patch._validate_openai_beam_search_patch
+      - vllm_gr.patch._validate_chat_sampling_patch
+      - tests/test_serving_beam_lifecycle.py
+    process_roles: [api_server]
+    target: OpenAIServing.beam_search and ChatCompletionRequest.to_beam_search_params
     risk: high
     contract: null
+    removal_condition: upstream exposes grouped-Beam serving and sampling extension points
 
   - id: GR-PATCH-005
+    owner: vllm_gr/engine/arg_utils_gr.py
+    installer: vllm_gr.engine.arg_utils_gr.patch_add_cli_args
+    activation: the required frontend patch plan detects GR EngineArgs methods are not installed
+    validator_or_test:
+      - vllm_gr.patch._validate_engine_args_patch
+      - tests/test_attention_backend_custom.py
+    process_roles: [main, api_server]
     target: vllm.engine.arg_utils.EngineArgs
     risk: high
     contract: engine-args-descriptors
+    removal_condition: vLLM configuration hooks cover every active GR option
 
   - id: GR-PATCH-006
+    owner: vllm_gr/entrypoints/openai/serving_models.py
+    installer: vllm_gr.entrypoints.openai.serving_models.patch_OpenAIServingModels_init
+    activation: the required frontend patch plan detects the constructor is not installed
+    validator_or_test:
+      - vllm_gr.patch._validate_serving_models_patch
+      - tests/test_serving_catalog.py
+    process_roles: [api_server]
     target: OpenAIServingModels.__init__
     risk: high
     contract: null
+    removal_condition: Catalog state uses composition or a stable serving extension point
 
   - id: GR-PATCH-007
+    owner: vllm_gr/v1/engine/core_client.py, core_client_patch.py, and async_llm.py
+    installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_batch_and_fork
+    activation: the required frontend patch plan detects grouped Beam client methods are incomplete
+    validator_or_test:
+      - vllm_gr.patch._validate_batch_and_fork_patch
+      - tests/test_beam_request_unit.py
+      - tests/test_dp_beam_request_unit.py
+    process_roles: [api_server]
     target: EngineCore clients and AsyncLLM
     risk: critical
     contract: null
+    removal_condition: vLLM exposes stable grouped request, control-message, and routing hooks
 
   - id: GR-PATCH-008
+    owner: vllm_gr/v1/engine/wire.py
+    installer: vllm_gr.v1.engine.wire.register_engine_core_request_types
+    activation: frontend and EngineCore installers require the GR wire values
+    validator_or_test:
+      - vllm_gr.patch._validate_request_types_patch
+      - tests/contract/test_engine_core_protocol_contracts.py
+    process_roles: [api_server, engine_core]
     target: vllm.v1.engine.EngineCoreRequestType
     risk: critical
     contract: engine-wire-values
+    removal_condition: stable upstream messages carry grouped Beam operations without Enum mutation
 
   - id: GR-PATCH-009
+    owner: vllm_gr/v1/engine/core.py and engine_core_patch.py
+    installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
+    activation: the EngineCore patch plan detects request dispatch is incomplete
+    validator_or_test:
+      - vllm_gr.patch._validate_engine_core_request_group
+      - vllm_gr.patch._validate_engine_core_entrypoint_patch
+      - tests/test_beam_request_unit.py
+    process_roles: [engine_core]
     target: vllm.v1.engine.core.EngineCoreProc
     risk: critical
     contract: engine-core-signatures
+    removal_condition: vLLM exposes stable control-message and request-dispatch extension points
 
   - id: GR-PATCH-010
+    owner: vllm_gr/v1/engine/engine_core_patch.py and scheduler_metadata.py
+    installer: vllm_gr.v1.engine.engine_core_patch.apply_scheduler_patch
+    activation: the EngineCore patch plan detects scheduler metadata propagation is absent
+    validator_or_test:
+      - vllm_gr.patch._validate_scheduler_patch
+      - tests/contract/test_engine_core_protocol_contracts.py
+    process_roles: [engine_core]
     target: vllm.v1.core.sched.scheduler.Scheduler.schedule
     risk: critical
     contract: scheduler-contract
+    removal_condition: explicit upstream scheduler metadata hooks carry grouped Beam state
 
   - id: GR-PATCH-011
-    source: vllm_gr/v1/worker/gpu_model_runner_patch.py
+    owner: vllm_gr/v1/worker/gpu_model_runner_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py
-    installer: vllm_gr/v1/worker/model_runner_patch.py
+    installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
+    activation: GPUModelRunner is discovered for the active platform and its hooks are incomplete
+    validator_or_test:
+      - vllm_gr.patch._validate_model_runner_patch
+      - tests/test_gpu_model_runner_patch.py
+      - tests/test_model_runner_patch.py
+    process_roles: [gpu_worker]
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
     risk: critical
     contract: gpu-model-runner-signatures
+    removal_condition: stable upstream grouped input and output hooks replace private runner mutation
 
   - id: GR-PATCH-012
-    source: vllm_gr/v1/worker/npu_model_runner_patch.py
+    owner: vllm_gr/v1/worker/npu_model_runner_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py
-    installer: vllm_gr/v1/worker/model_runner_patch.py
+    installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
+    activation: NPUModelRunner is discovered for the active platform and its hooks are incomplete
+    validator_or_test:
+      - vllm_gr.patch._validate_model_runner_patch
+      - tests/test_npu_model_runner_patch.py
+      - tests/test_model_runner_patch.py
+    process_roles: [npu_worker]
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
     risk: critical
     contract: null
+    removal_condition: vLLM-Ascend exposes stable grouped input and output hooks
 
   - id: GR-PATCH-013
+    owner: vllm_gr/v1/attention/backends/beam_attn.py
+    installer: vllm_gr.v1.attention.backends.beam_attn register_backend decorator
+    activation: the facade module is imported and CUSTOM is selected for GR Beam Attention
+    validator_or_test:
+      - tests/test_beam_attention_platform_execution.py
+      - tests/test_beam_attention_metadata.py
+      - tests/test_attention_backend_custom.py
+    process_roles: [engine_core, worker]
     target: vllm.v1.attention.backends.registry.AttentionBackendEnum.CUSTOM
     risk: high
     contract: custom-attention-registry
@@ -94,19 +201,31 @@ patches:
         - BeamAttentionMetadataBuilder
         - BEAM_DATA_VAR
         - _compute_beam_bounds
+    removal_condition: vLLM supports named third-party backend identities without a shared CUSTOM slot
 
   - id: GR-PATCH-014
-    source: vllm_gr/3rd_party/lmcache/integration/vllm/vllm_v1_adapter.py
-    installer: vllm_gr/lmcache_patch.py
-    orchestration: vllm_gr/patch.py
+    owner: vllm_gr/3rd_party/lmcache/integration/vllm/vllm_v1_adapter.py
+    installer: vllm_gr.lmcache_patch.apply_lmcache_adapter
+    activation: VLLM_GR_LMCACHE_PATCH is true or argv selects LMCacheConnectorV1
+    validator_or_test:
+      - vllm_gr.lmcache_patch.apply_lmcache_adapter return value
+      - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
+    process_roles: [worker]
     target: LMCacheConnectorV1Impl
     risk: critical
     contract: null
+    removal_condition: LMCache exposes grouped Beam metadata and lifecycle extension points
 
   - id: GR-PATCH-015
-    source: vllm_gr/ops/sliced_logits.py
-    installer: vllm_gr/ops/sliced_logits_patch.py
-    orchestration: vllm_gr/patch.py
+    owner: vllm_gr/ops/sliced_logits.py
+    installer: vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch
+    activation: hooks install at runtime initialization and execute only with a valid vocabulary slice
+    validator_or_test:
+      - vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch return value
+      - tests/test_sliced_logits.py
+      - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
+    process_roles: [worker]
     target: LogitsProcessor and Sampler
     risk: medium
     contract: sliced-vocabulary-projection
+    removal_condition: vLLM exposes stable output-projection and logprob-width hooks

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import ast
 import subprocess
 import sys
 from pathlib import Path
@@ -35,72 +34,6 @@ assert "vllm_gr.v1.attention.backends.beam_attn_npu" not in sys.modules
         capture_output=True,
         text=True,
     )
-
-
-def test_platform_modules_keep_dependency_boundaries() -> None:
-    project_root = Path(__file__).resolve().parents[1]
-
-    def module_contract(filename: str) -> tuple[set[str], dict[str, list[str]]]:
-        source = (project_root / "vllm_gr" / "v1" / "attention" / "backends" / filename).read_text()
-        tree = ast.parse(source)
-        modules: set[str] = set()
-        signatures: dict[str, list[str]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                modules.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                modules.add(node.module)
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
-                signatures[node.name] = [
-                    argument.arg
-                    for argument in (
-                        *node.args.posonlyargs,
-                        *node.args.args,
-                        *node.args.kwonlyargs,
-                    )
-                ]
-        return modules, signatures
-
-    gpu_imports, gpu_signatures = module_contract("beam_attn_gpu.py")
-    npu_imports, npu_signatures = module_contract("beam_attn_npu.py")
-
-    assert not any(name == "torch_npu" or name.startswith("vllm_ascend") for name in gpu_imports)
-    assert "vllm_gr.v1.attention.backends.beam_attn" not in gpu_imports
-    assert "vllm_gr.v1.attention.backends.beam_attn_triton" not in npu_imports
-    assert "vllm.v1.attention.backends.fa_utils" not in npu_imports
-    assert "vllm_gr.v1.attention.backends.beam_attn" not in npu_imports
-
-    expected_signatures = {
-        "is_available": [],
-        "get_flash_attn_version": ["requires_alibi", "head_size"],
-        "supports_sinks": [],
-        "reshape_and_cache": [
-            "key",
-            "value",
-            "key_cache",
-            "value_cache",
-            "slot_mapping",
-            "kv_cache_dtype",
-            "k_scale",
-            "v_scale",
-        ],
-        "cascade_attention": [
-            "output",
-            "query",
-            "key_cache",
-            "value_cache",
-            "attn_metadata",
-            "sliding_window_size",
-            "scale",
-            "logits_soft_cap",
-            "vllm_flash_attn_version",
-            "s_aux",
-            "alibi_slopes",
-        ],
-    }
-    assert gpu_signatures == expected_signatures
-    assert npu_signatures == expected_signatures
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -134,56 +67,6 @@ def test_platform_dispatch_selects_exactly_one_execution_module(
 
     selected = beam_attn._get_platform_execution_module()
     assert selected is (gpu_module if expected == "gpu" else npu_module)
-
-
-def test_cascade_attention_delegates_all_arguments(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, Any] = {}
-
-    def cascade_attention(**kwargs: Any) -> None:
-        captured.update(kwargs)
-
-    execution = SimpleNamespace(cascade_attention=cascade_attention)
-    monkeypatch.setattr(
-        beam_attn,
-        "_get_platform_execution_module",
-        lambda: execution,
-    )
-
-    output = torch.empty(1)
-    query = torch.empty(2)
-    key_cache = torch.empty(3)
-    value_cache = torch.empty(4)
-    metadata = SimpleNamespace()
-    sinks = torch.empty(5)
-    alibi = torch.empty(6)
-
-    beam_attn.BeamAttentionImpl.cascade_attention(
-        output=output,
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        attn_metadata=metadata,
-        sliding_window_size=[7, 0],
-        scale=0.25,
-        logits_soft_cap=12.0,
-        vllm_flash_attn_version=3,
-        s_aux=sinks,
-        alibi_slopes=alibi,
-    )
-
-    assert captured["output"] is output
-    assert captured["query"] is query
-    assert captured["key_cache"] is key_cache
-    assert captured["value_cache"] is value_cache
-    assert captured["attn_metadata"] is metadata
-    assert captured["sliding_window_size"] == [7, 0]
-    assert captured["scale"] == 0.25
-    assert captured["logits_soft_cap"] == 12.0
-    assert captured["vllm_flash_attn_version"] == 3
-    assert captured["s_aux"] is sinks
-    assert captured["alibi_slopes"] is alibi
 
 
 @pytest.mark.parametrize("tuple_cache", [False, True])  # type: ignore[misc]

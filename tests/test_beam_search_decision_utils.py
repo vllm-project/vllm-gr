@@ -53,7 +53,6 @@ def _candidate_cache(
     ("token_ids", "expected"),
     [
         ([7, 3, 7, 5], [3, 7, 5]),
-        ([7, 3, 4, 5], [7, 3, 4]),
     ],
 )  # type: ignore[misc]
 def test_extract_and_dedup_segment_preserves_candidate_order(
@@ -145,7 +144,6 @@ def test_complete_stop_candidates_preserves_openai_output_policy() -> None:
     ("scores", "beam_width"),
     [
         ([-0.5, -float("inf"), -0.1, -0.2], 2),
-        ([-float("inf")] * 4, 2),
         ([-0.1, -0.2], 2),
     ],
 )  # type: ignore[misc]

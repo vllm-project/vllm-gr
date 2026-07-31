@@ -190,11 +190,18 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
 
     scheduler_output = SimpleNamespace(beam_data={"beam": {"is_beam_decode": True}})
     runner = SimpleNamespace()
+    should_raise = False
 
-    def execute_model(self: Any, output: Any) -> None:
+    def execute_model(self: Any, output: Any) -> str:
         assert output is scheduler_output
         assert BEAM_DATA_VAR.get() is self._current_beam_info
-        raise ExpectedError
+        assert self._current_beam_info == {
+            "beam_data": scheduler_output.beam_data,
+            "req_ids": [],
+        }
+        if should_raise:
+            raise ExpectedError
+        return "result"
 
     wrapped = common.make_patched_execute_model(execute_model)
     assert common.make_patched_execute_model(wrapped) is wrapped
@@ -202,6 +209,10 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     outer = {"level": "outer"}
     token = BEAM_DATA_VAR.set(outer)
     try:
+        assert wrapped(runner, scheduler_output) == "result"
+        assert BEAM_DATA_VAR.get() is outer
+
+        should_raise = True
         with pytest.raises(ExpectedError):
             wrapped(runner, scheduler_output)
         assert BEAM_DATA_VAR.get() is outer

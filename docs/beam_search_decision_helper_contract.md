@@ -182,6 +182,26 @@ Contract:
 The fork mapping is consumed by grouped BeamRequest transport. Ordinary and
 grouped serving paths still use the same materialization decision.
 
+## Deferred Logprob Lineage
+
+Offline and OpenAI Beam Search attach two dynamic attributes to the upstream
+`BeamSearchSequence` dataclass:
+
+- `_lp_parent` points to the parent `BeamSearchSequence`, or is `None` on the
+  root Beam;
+- `_lp_step_data` stores the parent's aligned `BeamCandidateCache` tuple for
+  the selected step, or is `None` on the root Beam.
+
+`complete_eos_candidates()` and `materialize_selected_beams()` own assigning
+both attributes to newly materialized Beams. The entry points initialize them
+on root Beams, and `vllm_gr.logprobs.reconstruct_beam_logprobs()` walks the
+lineage only for final outputs. This avoids copying all `FlatLogprobs` lists at
+every step.
+
+These attributes rely on `BeamSearchSequence` remaining a dataclass without
+`__slots__`. Any upstream change to that object layout requires either adding
+first-class upstream fields or replacing this dynamic lineage representation.
+
 ## Entry-Point Ownership
 
 Offline continues to own synchronous engine execution, CUSTOM grouped
@@ -208,3 +228,7 @@ Changes at this boundary must preserve:
 - grouped `fork_info`;
 - Offline and OpenAI output-policy differences;
 - existing Catalog behavior in each entry point.
+
+The helper owner is `vllm_gr/beam_search_decision_utils.py`. Candidate helpers
+must not be re-exported from `vllm_gr/logprobs.py`; callers import them from the
+owner module directly.

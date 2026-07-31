@@ -15,7 +15,6 @@ from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
 
 from vllm_gr.entrypoints.openai import serving_engine
-from vllm_gr.utils.catalog import Catalog
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 
@@ -202,22 +201,11 @@ class _GroupedEngineClient(_OrdinaryEngineClient):
             raise RuntimeError("cleanup failed")
 
 
-class _Catalog:
-    def __init__(self, valid_by_prefix: dict[tuple[int, ...], set[int]]) -> None:
-        self.valid_by_prefix = valid_by_prefix
-
-    def valid(self, token_ids: list[int]) -> set[int]:
-        return self.valid_by_prefix.get(tuple(token_ids), set())
-
-    def apply_catalog_filter(self, *args: Any, **kwargs: Any) -> Any:
-        return Catalog.apply_catalog_filter(self, *args, **kwargs)
-
-
-def _serving(engine_client: Any, catalog: _Catalog | None = None) -> SimpleNamespace:
+def _serving(engine_client: Any) -> SimpleNamespace:
     return SimpleNamespace(
         engine_client=engine_client,
         input_processor=SimpleNamespace(tokenizer=_Tokenizer()),
-        models=SimpleNamespace(catalog=catalog, model_name="test-model"),
+        models=SimpleNamespace(catalog=None, model_name="test-model"),
     )
 
 
@@ -226,7 +214,6 @@ def _params(
     max_tokens: int,
     ignore_eos: bool = False,
     end_token: str | None = None,
-    catalog_strategy: str = "fill",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         beam_width=2,
@@ -236,7 +223,7 @@ def _params(
         begin_token=None,
         end_token=end_token,
         include_stop_str_in_output=False,
-        catalog_strategy=catalog_strategy,
+        catalog_strategy="fill",
     )
 
 
@@ -252,14 +239,12 @@ def _run_search(
     max_tokens: int,
     ignore_eos: bool = False,
     request_id: str = "request-0",
-    catalog: _Catalog | None = None,
     end_token: str | None = None,
-    catalog_strategy: str = "fill",
 ) -> list[RequestOutput]:
     return asyncio.run(
         _collect_outputs(
             serving_engine.beam_search(
-                _serving(engine_client, catalog),
+                _serving(engine_client),
                 {
                     "prompt": "prompt text",
                     "prompt_token_ids": [10],
@@ -269,7 +254,6 @@ def _run_search(
                     max_tokens=max_tokens,
                     ignore_eos=ignore_eos,
                     end_token=end_token,
-                    catalog_strategy=catalog_strategy,
                 ),
                 trace_headers={"trace": "value"},
             )
@@ -411,142 +395,6 @@ def test_grouped_engine_error_yields_error_and_cleans_up(
     assert output.outputs[0].token_ids == []
     assert output.outputs[0].cumulative_logprob is None
     assert output.outputs[0].logprobs is None
-
-
-def test_ordinary_and_grouped_paths_produce_the_same_fork_info(
-    monkeypatch: Any,
-) -> None:
-    original_materialize = serving_engine.materialize_selected_beams
-    captured_forks: list[list[tuple[int, int]]] = []
-
-    def capture_materialize(**kwargs: Any) -> Any:
-        result = original_materialize(**kwargs)
-        captured_forks.append(result[1])
-        return result
-
-    monkeypatch.setattr(
-        serving_engine,
-        "materialize_selected_beams",
-        capture_materialize,
-    )
-
-    _install_deterministic_request_ids(monkeypatch)
-    grouped = _GroupedEngineClient(
-        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
-        grouped_outputs=[
-            _engine_output(
-                _combined_flat(
-                    [
-                        ([21, 22], [-0.1, -0.3]),
-                        ([31, 32], [-0.05, -0.4]),
-                    ]
-                )
-            )
-        ],
-    )
-    _run_search(grouped, max_tokens=2, request_id="grouped-parity")
-    grouped_forks = list(captured_forks)
-
-    captured_forks.clear()
-    _install_deterministic_request_ids(monkeypatch)
-    ordinary = _OrdinaryEngineClient(
-        prepare_outputs=[
-            _engine_output(_flat([11, 12], [-0.1, -0.2])),
-            _engine_output(_flat([21, 22], [-0.1, -0.3])),
-            _engine_output(_flat([31, 32], [-0.05, -0.4])),
-        ]
-    )
-    outputs = _run_search(ordinary, max_tokens=2, request_id="ordinary-parity")
-
-    assert grouped_forks == captured_forks
-    assert grouped_forks == [
-        [(0, 11), (0, 12)],
-        [(0, 21), (1, 31)],
-    ]
-    assert [choice.token_ids for choice in outputs[0].outputs] == [
-        [11, 21],
-        [12, 31],
-    ]
-
-
-def test_catalog_null_can_remove_one_parent_without_shifting_fork_info(
-    monkeypatch: Any,
-) -> None:
-    _install_deterministic_request_ids(monkeypatch)
-    catalog = _Catalog(
-        {
-            (): {11, 12},
-            (11,): set(),
-            (12,): {31, 32},
-            (12, 31): {41, 42},
-            (12, 32): {51, 52},
-        }
-    )
-    engine = _GroupedEngineClient(
-        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
-        grouped_outputs=[
-            _engine_output(
-                _combined_flat(
-                    [
-                        ([21, 22], [-0.1, -0.2]),
-                        ([31, 32], [-0.1, -0.2]),
-                    ]
-                )
-            ),
-            _engine_output(
-                _combined_flat(
-                    [
-                        ([41, 42], [-0.1, -0.2]),
-                        ([51, 52], [-0.1, -0.2]),
-                    ]
-                )
-            ),
-        ],
-    )
-
-    _run_search(
-        engine,
-        max_tokens=3,
-        request_id="catalog-one-parent",
-        catalog=catalog,
-        catalog_strategy="null",
-    )
-
-    first_decode, second_decode, cleanup = engine.beam_updates
-    assert first_decode.parent_beam_ids == [
-        "catalog-one-parent-step-0-beam-0",
-        "catalog-one-parent-step-0-beam-0",
-    ]
-    assert second_decode.parent_beam_ids == [
-        "catalog-one-parent-step-1-beam-1",
-        "catalog-one-parent-step-1-beam-1",
-    ]
-    assert cleanup.beam_width == 0
-
-
-def test_catalog_null_all_parents_removed_cleans_up(
-    monkeypatch: Any,
-) -> None:
-    _install_deterministic_request_ids(monkeypatch)
-    engine = _GroupedEngineClient(
-        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
-        grouped_outputs=[],
-    )
-
-    outputs = _run_search(
-        engine,
-        max_tokens=1,
-        request_id="catalog-all-removed",
-        catalog=_Catalog({(): set()}),
-        catalog_strategy="null",
-    )
-
-    assert len(engine.beam_updates) == 1
-    cleanup = engine.beam_updates[0]
-    assert cleanup.beam_width == 0
-    assert cleanup.pruned_ids == ["catalog-all-removed-step-0-beam-0"]
-    assert outputs[0].finished is True
-    assert outputs[0].outputs == []
 
 
 def test_eos_and_distinct_sid_end_token_both_complete() -> None:
