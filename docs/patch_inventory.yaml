@@ -4,6 +4,12 @@ verified_baseline:
   vllm: "0.22.1"
   vllm_ascend: "0.22.1rc1"
 
+backend_provider:
+  protocol: vllm_gr.platforms.protocol.GRBackendProvider
+  registry: vllm_gr.platforms.registry
+  activation: vllm_gr.platforms.loader.activate_current_backend
+  process_local: true
+
 patches:
   - id: GR-PATCH-000
     owner: vllm_gr/plugin.py
@@ -13,6 +19,7 @@ patches:
       - tests/test_patch_initialization.py::test_plugin_exposes_simple_per_patch_status
     process_roles: [main, engine_core, worker]
     target: vllm_gr.plugin.register
+    engine_core_bootstrap: vllm_gr.v1.engine.engine_core_patch.run_engine_core
     risk: high
     contract: plugin-entrypoint
     removal_condition: runtime patch installation is no longer required
@@ -25,6 +32,8 @@ patches:
       - tests/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
       - tests/integration/test_ascend_attention_backend.py
     process_roles: [engine_core, worker]
+    orchestration: vllm_gr/platforms/npu.py
+    backend: npu
     target: vllm.v1.attention.selector._cached_get_attn_backend
     risk: critical
     contract: attention-selector-signature
@@ -37,6 +46,8 @@ patches:
     validator_or_test:
       - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
     process_roles: [worker]
+    orchestration: vllm_gr/platforms/npu.py
+    backend: npu
     target: vllm_ascend.worker.worker.NPUWorker.init_device
     risk: high
     contract: null
@@ -159,6 +170,7 @@ patches:
       - tests/test_gpu_model_runner_patch.py
       - tests/test_model_runner_patch.py
     process_roles: [gpu_worker]
+    selection: active-backend-provider
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
     risk: critical
     contract: gpu-model-runner-signatures
@@ -174,16 +186,20 @@ patches:
       - tests/test_npu_model_runner_patch.py
       - tests/test_model_runner_patch.py
     process_roles: [npu_worker]
+    selection: active-backend-provider
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
     risk: critical
     contract: null
     removal_condition: vLLM-Ascend exposes stable grouped input and output hooks
 
   - id: GR-PATCH-013
-    owner: vllm_gr/v1/attention/backends/beam_attn.py
-    installer: vllm_gr.v1.attention.backends.beam_attn register_backend decorator
-    activation: the facade module is imported and CUSTOM is selected for GR Beam Attention
+    owner: vllm_gr/v1/attention/backends/beam_attn_registration.py and beam_attn.py
+    installer: vllm_gr.v1.attention.backends.beam_attn_registration.register_beam_attention_backend
+    activation: the EngineCore patch plan detects that the process-local CUSTOM slot does not resolve to BeamAttentionBackend
+    provider_migration: deferred-to-s3
     validator_or_test:
+      - vllm_gr.patch._validate_beam_attention_backend_registration
+      - tests/test_patch_initialization.py::test_engine_core_plan_registers_custom_attention_backend
       - tests/test_beam_attention_platform_execution.py
       - tests/test_beam_attention_metadata.py
       - tests/test_attention_backend_custom.py

@@ -1,61 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Core contracts for active-platform ModelRunner patch dispatch."""
+"""Provider-driven ModelRunner patch installation contracts."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import pytest
 
+from vllm_gr.platforms.errors import BackendNotActiveError
+from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
 from vllm_gr.v1.worker import gpu_model_runner_patch, model_runner_patch
 
 
-def test_dispatcher_selects_one_platform_module(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm import platforms
-
-    monkeypatch.setattr(
-        platforms,
-        "current_platform",
-        SimpleNamespace(device_type="npu"),
-    )
-    assert model_runner_patch._active_platform_module_name() == (
-        model_runner_patch._NPU_PATCH_MODULE
-    )
-    platforms.current_platform.device_type = "cuda"
-    assert model_runner_patch._active_platform_module_name() == (
-        model_runner_patch._GPU_PATCH_MODULE
-    )
-
-    selected = object()
-    imported: list[str] = []
-
-    def import_selected(name: str) -> object:
-        imported.append(name)
-        return selected
-
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_active_platform_module_name",
-        lambda: model_runner_patch._NPU_PATCH_MODULE,
-    )
-    monkeypatch.setattr(
-        model_runner_patch,
-        "import_module",
-        import_selected,
-    )
-
-    assert model_runner_patch._get_active_platform_module() is selected
-    assert imported == [model_runner_patch._NPU_PATCH_MODULE]
+def setup_function() -> None:
+    _reset_backend_registry_for_tests()
 
 
-def test_dispatcher_installs_three_wrappers_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def teardown_function() -> None:
+    _reset_backend_registry_for_tests()
+
+
+@dataclass
+class FakeBackend:
+    hooks: Any
+    device_type: str = "fake"
+    hook_reads: int = 0
+
+    def get_model_runner_hooks(self) -> Any:
+        self.hook_reads += 1
+        return self.hooks
+
+
+def _runner_class() -> type[Any]:
     class Runner:
-        def execute_model(self, scheduler_output: Any) -> None:
-            return None
+        def execute_model(self, scheduler_output: Any) -> str:
+            return "executed"
 
         def _prepare_inputs(
             self,
@@ -69,24 +52,102 @@ def test_dispatcher_installs_three_wrappers_once(
             scheduler_output: Any,
             *args: Any,
             **kwargs: Any,
-        ) -> None:
-            return None
+        ) -> str:
+            return "bookkept"
 
-    platform_module = SimpleNamespace(
-        discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
+    return Runner
+
+
+def _gpu_hooks(runner_class: type[Any]) -> SimpleNamespace:
+    return SimpleNamespace(
+        discover_worker_runners=lambda: (("GPUModelRunner", runner_class),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
         make_patched_bookkeeping_sync=gpu_model_runner_patch.make_patched_bookkeeping_sync,
     )
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_get_active_platform_module",
-        lambda: platform_module,
+
+
+def test_discovery_uses_active_backend_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr import platforms
+
+    runner_class = _runner_class()
+    backend = FakeBackend(_gpu_hooks(runner_class))
+    get_active = mock.Mock(return_value=backend)
+    monkeypatch.setattr(platforms, "get_active_backend", get_active)
+
+    assert model_runner_patch.discover_active_worker_runners() == (
+        ("GPUModelRunner", runner_class),
     )
+    get_active.assert_called_once_with()
+    assert backend.hook_reads == 1
+
+
+def test_apply_resolves_backend_and_hooks_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr import platforms
+
+    hooks = SimpleNamespace(discover_worker_runners=lambda: ())
+    backend = FakeBackend(hooks)
+    get_active = mock.Mock(return_value=backend)
+    monkeypatch.setattr(platforms, "get_active_backend", get_active)
 
     model_runner_patch.apply_worker_patches()
-    first = (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync)
-    assert model_runner_patch.is_worker_runner_patched(Runner)
-    assert getattr(Runner, "_patched_for_beam_pos_ids") is True
+
+    get_active.assert_called_once_with()
+    assert backend.hook_reads == 1
+
+
+def test_apply_installs_three_wrappers_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr import platforms
+
+    runner_class = _runner_class()
+    backend = FakeBackend(_gpu_hooks(runner_class), device_type="cuda")
+    monkeypatch.setattr(platforms, "get_active_backend", lambda: backend)
 
     model_runner_patch.apply_worker_patches()
-    assert (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync) == first
+    first = (
+        runner_class.execute_model,
+        runner_class._prepare_inputs,
+        runner_class._bookkeeping_sync,
+    )
+    assert model_runner_patch.is_worker_runner_patched(runner_class)
+    assert runner_class._patched_for_beam_pos_ids is True
+
+    model_runner_patch.apply_worker_patches()
+
+    assert (
+        runner_class.execute_model,
+        runner_class._prepare_inputs,
+        runner_class._bookkeeping_sync,
+    ) == first
+
+
+def test_apply_fails_without_active_backend() -> None:
+    with pytest.raises(BackendNotActiveError):
+        model_runner_patch.apply_worker_patches()
+
+
+def test_active_backend_is_not_read_by_wrapped_runtime_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr import platforms
+
+    runner_class = _runner_class()
+    backend = FakeBackend(_gpu_hooks(runner_class), device_type="cuda")
+    monkeypatch.setattr(platforms, "get_active_backend", lambda: backend)
+    model_runner_patch.apply_worker_patches()
+
+    def unexpected_registry_read() -> Any:
+        raise AssertionError("runtime wrapper read the backend registry")
+
+    monkeypatch.setattr(platforms, "get_active_backend", unexpected_registry_read)
+
+    runner = runner_class()
+    scheduler_output = SimpleNamespace(beam_data={})
+    assert runner.execute_model(scheduler_output) == "executed"
+    assert len(runner._prepare_inputs(scheduler_output, {})) == 2
+    assert runner._bookkeeping_sync(scheduler_output) == "bookkept"

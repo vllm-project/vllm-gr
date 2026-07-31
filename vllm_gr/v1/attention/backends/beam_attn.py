@@ -16,7 +16,6 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
@@ -25,6 +24,9 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
     _get_fp8_dtype_for_flashattn,
+)
+from vllm_gr.v1.attention.backends.beam_attn_registration import (
+    register_beam_attention_backend,
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR  # noqa: F401
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds  # noqa: F401
@@ -36,6 +38,7 @@ __all__ = [
     "BeamAttentionMetadata",
     "BeamAttentionMetadataBuilder",
     "_compute_beam_bounds",
+    "register_beam_attention_backend",
 ]
 
 logger = init_logger(__name__)
@@ -227,7 +230,6 @@ class BeamAttentionImpl(AttentionImpl):
         return output
 
 
-@register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
     accept_output_buffer = True
     supported_dtypes = [torch.float16, torch.bfloat16]
@@ -353,3 +355,6 @@ class BeamAttentionBackend(AttentionBackend):
         if use_sparse:
             return "No sparse support."
         return None
+
+
+register_beam_attention_backend()

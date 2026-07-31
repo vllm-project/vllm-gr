@@ -115,9 +115,9 @@ async def test_serving_beam_search(loops: int) -> None:
 def _run_gr_beam_search_target(loops: int) -> None:
     import asyncio
 
-    from vllm_gr.patch import re_apply_patches
+    from vllm_gr.plugin import initialize_runtime
 
-    re_apply_patches()
+    initialize_runtime()
     assert hasattr(BeamSearchParams, "begin_token")
 
     async def run_test() -> None:

@@ -68,6 +68,41 @@ register_engine_core_request_types()
 # Module-level picklable targets for subprocess tests (§6)
 # ---------------------------------------------------------------------------
 
+_PATCH_WIRING_TEST_HOOKS = SimpleNamespace(
+    discover_worker_runners=lambda: (),
+    make_patched_prepare_inputs=lambda original: original,
+    make_patched_bookkeeping_sync=lambda original: original,
+)
+_PATCH_WIRING_TEST_BACKEND = SimpleNamespace(
+    device_type="patch-wiring-test",
+    check_environment=lambda: {},
+    apply_runtime_patches=lambda *, force=False: 0,
+    get_model_runner_hooks=lambda: _PATCH_WIRING_TEST_HOOKS,
+    get_attention_execution=lambda: SimpleNamespace(),
+)
+
+
+def _activate_patch_wiring_test_backend() -> None:
+    """Satisfy the S2 process-provider contract without hardware imports."""
+    from vllm_gr.platforms import (
+        BackendNotActiveError,
+        activate_backend,
+        get_active_backend,
+        register_backend,
+    )
+
+    try:
+        get_active_backend()
+        return
+    except BackendNotActiveError:
+        pass
+
+    register_backend(
+        _PATCH_WIRING_TEST_BACKEND,
+        source="test:patch-wiring",
+    )
+    activate_backend(_PATCH_WIRING_TEST_BACKEND.device_type)
+
 
 def _sub_patch_batch_fork_registers_enum() -> None:
     """Verify patch_batch_and_fork adds BEAM_REQUEST_STEP_UPDATE to the enum."""
@@ -75,6 +110,7 @@ def _sub_patch_batch_fork_registers_enum() -> None:
 
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
+    _activate_patch_wiring_test_backend()
     patch_batch_and_fork()
     assert hasattr(ERT, "ADD_BATCH"), "ADD_BATCH missing after patch"
     assert hasattr(ERT, "BEAM_REQUEST_STEP_UPDATE"), "BEAM_REQUEST_STEP_UPDATE missing after patch"
@@ -89,6 +125,7 @@ def _sub_patch_batch_fork_wires_run_engine_core() -> None:
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
+    _activate_patch_wiring_test_backend()
     patch_batch_and_fork()
     assert EngineCoreProc.run_engine_core is run_engine_core, (
         f"run_engine_core not wired; got {EngineCoreProc.run_engine_core}"
@@ -106,6 +143,7 @@ def _sub_patch_batch_fork_idempotent() -> None:
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
+    _activate_patch_wiring_test_backend()
     patch_batch_and_fork()
     first = EngineCoreProc.run_engine_core
     patch_batch_and_fork()
@@ -119,6 +157,7 @@ def _sub_patch_preserves_greedy_validation() -> None:
 
     from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
 
+    _activate_patch_wiring_test_backend()
     patch_batch_and_fork()
 
     try:
@@ -1214,6 +1253,7 @@ class TestClientPatches:
     # ── apply_batch_fork_patches ─────────────────────────────────────────
 
     def test_apply_batch_fork_patches_adds_enum_members(self) -> None:
+        _activate_patch_wiring_test_backend()
         apply_batch_fork_patches()
         assert hasattr(EngineCoreRequestType, "ADD_BATCH")
         assert hasattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE")
@@ -1224,6 +1264,7 @@ class TestClientPatches:
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
 
+        _activate_patch_wiring_test_backend()
         apply_batch_fork_patches()
 
         assert AsyncMPClient.add_requests_async is add_requests_async
@@ -1240,6 +1281,7 @@ class TestClientPatches:
     def test_apply_batch_fork_patches_patches_engine_core_for_inproc(self) -> None:
         from vllm.v1.engine.core import EngineCore
 
+        _activate_patch_wiring_test_backend()
         apply_batch_fork_patches()
 
         assert hasattr(EngineCore, "_cache_beam_request")

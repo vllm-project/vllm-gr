@@ -146,9 +146,9 @@ async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "
 
 
 def _run_serving_catalog_generation_target(loops: int, catalog_strategy: str = "fill") -> None:
-    from vllm_gr.patch import re_apply_patches
+    from vllm_gr.plugin import initialize_runtime
 
-    re_apply_patches()
+    initialize_runtime()
     asyncio.run(_serving_catalog_generation_impl(loops, catalog_strategy))
 
 
@@ -185,9 +185,9 @@ def test_serving_catalog_dead_end_null(loops: int) -> None:
 def _run_null_all_dead_target() -> None:
     """Subprocess: verify that an impossible catalog causes a clean stop with
     no crash and no invalid catalog tokens in the output."""
-    from vllm_gr.patch import re_apply_patches
+    from vllm_gr.plugin import initialize_runtime
 
-    re_apply_patches()
+    initialize_runtime()
     asyncio.run(_null_all_dead_impl())
 
 
@@ -285,9 +285,9 @@ def test_serving_catalog_null_all_dead_no_crash(loops: int) -> None:
 
 def _run_uniqueness_test_target() -> None:
     """Subprocess: verify uniqueness of results across model-generated and fallback choices."""
-    from vllm_gr.patch import re_apply_patches
+    from vllm_gr.plugin import initialize_runtime
 
-    re_apply_patches()
+    initialize_runtime()
     asyncio.run(_uniqueness_impl())
 
 
