@@ -498,7 +498,11 @@ def build_beam_search_steps(params: Any):
     steps: list[BeamSearchStep] = []
     for level, expand_width in enumerate(branch_factors):
         start = level * VOCAB
-        keep_width = branch_factors[0] if level == 0 else params.beam_width
+        keep_width = (
+            min(expand_width, params.beam_width)
+            if level == 0
+            else params.beam_width
+        )
         steps.append(
             BeamSearchStep(
                 expand_width=expand_width,

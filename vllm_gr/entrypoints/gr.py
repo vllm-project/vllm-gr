@@ -19,7 +19,6 @@ import copy
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
@@ -47,12 +46,7 @@ from vllm_gr.beam_search_decision_utils import (
     select_top_indices,
 )
 from vllm_gr.logger import init_logger
-from vllm_gr.logprobs import extract_and_dedup_flat_logprobs
-from vllm_gr.models.one_rec import (
-    build_beam_search_steps as build_onerec_beam_search_steps,
-    finalize_beam_search_outputs as finalize_onerec_beam_search_outputs,
-    prepare_beam_search_inputs as prepare_onerec_beam_search_inputs,
-)
+from vllm_gr.models.model_adapter import create_model_adapter
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.utils.catalog import Catalog
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
@@ -638,6 +632,7 @@ class GRLLM(LLM):
         configure_model_runner_default()
 
         self._beam_search_model = BeamSearchModel(beam_search_model)
+        self.model_adapter = create_model_adapter(self._beam_search_model)
         self._shutdown_complete = False
 
         super().__init__(
@@ -674,39 +669,18 @@ class GRLLM(LLM):
         # frequency, penalty, and stopping criteria, etc.?
         logger.debug("Called beam_search")
         beam_width = params.beam_width
-        max_tokens = params.max_tokens
         temperature = params.temperature
-        ignore_eos = params.ignore_eos
         catalog_strategy = getattr(params, "catalog_strategy", "fill")
 
-        from vllm_gr.models.recif import (
-            build_beam_search_steps as build_recif_beam_search_steps,
-            finalize_beam_search_outputs as finalize_recif_beam_search_outputs,
-            prepare_beam_search_inputs as prepare_recif_beam_search_inputs,
+        adapted = self.model_adapter.adapt_beam_search_request(
+            self,
+            prompts,
+            params,
         )
-
-        is_recif = self._beam_search_model is BeamSearchModel.RECIF
-        if is_recif:
-            prepared = prepare_recif_beam_search_inputs(self, prompts)
-            steps = build_recif_beam_search_steps(params)
-            ignore_eos = True
-            catalog = None
-        else:
-            prepared = prepare_onerec_beam_search_inputs(self, prompts, params)
-            pre_calculated = int(prepared.begin_token_id is not None) + int(
-                prepared.end_token_id is not None
-            )
-            if max_tokens < pre_calculated:
-                logger.warning(
-                    "max_tokens is less than the number of pre-calculated "
-                    "tokens; using the pre-calculated token count"
-                )
-                max_tokens = pre_calculated
-            steps = build_onerec_beam_search_steps(
-                max_tokens - pre_calculated,
-                beam_width,
-            )
-            catalog = self.catalog
+        prepared = adapted.inputs
+        steps = adapted.steps
+        ignore_eos = adapted.ignore_eos
+        catalog = adapted.catalog
 
         if use_tqdm and concurrency_limit is not None:
             logger.warning(
@@ -759,9 +733,9 @@ class GRLLM(LLM):
             "CUSTOM" in str(attention_backend).upper()
             or getattr(attention_backend, "name", "").upper() == "CUSTOM"
         )
-        # RECIF changes SamplingParams at every SID level. Keep the existing
-        # fixed-parameter BEAM_REQUEST optimization unchanged for OneRec.
-        use_custom_attn = use_custom_attn and not is_recif
+        use_custom_attn = (
+            use_custom_attn and self.model_adapter.supports_custom_attention
+        )
         for prompt_start in range(0, len(prompts), concurrency_limit):
             instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
             if use_custom_attn:
@@ -820,14 +794,7 @@ class GRLLM(LLM):
                     use_tqdm=use_tqdm,
                 )
 
-        if is_recif:
-            return finalize_recif_beam_search_outputs(
-                instances,
-                prepared,
-                initial_logprobs,
-                beam_width,
-            )
-        return finalize_onerec_beam_search_outputs(
+        return self.model_adapter.finalize_beam_search_outputs(
             instances,
             prepared,
             initial_logprobs,
