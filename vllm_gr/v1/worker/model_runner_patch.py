@@ -4,67 +4,56 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any, cast
+from importlib import import_module
+from types import ModuleType
 
 from vllm.logger import init_logger
 
-from vllm_gr.platforms.protocol import ModelRunnerPatchHooks
 from vllm_gr.v1.worker.model_runner_common import (
-    is_worker_runner_patched as _is_worker_runner_patched,
-)
-from vllm_gr.v1.worker.model_runner_common import (
+    is_worker_runner_patched,
     make_patched_execute_model,
 )
 
 logger = init_logger(__name__)
 
-
-def is_worker_runner_patched(runner_class: type[Any]) -> bool:
-    """Return whether all shared and platform wrappers are installed."""
-    checker = cast(Callable[[type[Any]], bool], _is_worker_runner_patched)
-    return checker(runner_class)
+_GPU_PATCH_MODULE = "vllm_gr.v1.worker.gpu_model_runner_patch"
+_NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu_model_runner_patch"
 
 
-def _get_active_model_runner_hooks() -> ModelRunnerPatchHooks:
-    """Return ModelRunner hooks from the process-local active provider."""
-    from vllm_gr.platforms import get_active_backend
+def _active_platform_module_name() -> str:
+    """Return the patch module for the platform selected by vLLM."""
+    from vllm.platforms import current_platform
 
-    return get_active_backend().get_model_runner_hooks()
+    if str(current_platform.device_type).lower() == "npu":
+        return _NPU_PATCH_MODULE
+    return _GPU_PATCH_MODULE
 
 
-def discover_active_worker_runners() -> tuple[tuple[str, type[Any]], ...]:
+def _get_active_platform_module() -> ModuleType:
+    return import_module(_active_platform_module_name())
+
+
+def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
     """Discover ModelRunner targets for only the active platform."""
-    return _get_active_model_runner_hooks().discover_worker_runners()
+    return _get_active_platform_module().discover_worker_runners()
 
 
 def apply_worker_patches() -> None:
     """Install grouped-Beam hooks on active-platform ModelRunner targets."""
-    from vllm_gr.platforms import get_active_backend
-
-    backend = get_active_backend()
-    hooks = backend.get_model_runner_hooks()
+    platform_module = _get_active_platform_module()
     runners_to_patch = [
         (runner_name, runner_class)
-        for runner_name, runner_class in hooks.discover_worker_runners()
+        for runner_name, runner_class in platform_module.discover_worker_runners()
         if not is_worker_runner_patched(runner_class)
     ]
 
     for runner_name, runner_class in runners_to_patch:
-        execute_wrapper_factory = cast(
-            Callable[[Callable[..., Any]], Callable[..., Any]],
-            make_patched_execute_model,
-        )
-        runner_class.execute_model = execute_wrapper_factory(runner_class.execute_model)
-        runner_class._prepare_inputs = hooks.make_patched_prepare_inputs(
+        runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
+        runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )
-        runner_class._bookkeeping_sync = hooks.make_patched_bookkeeping_sync(
+        runner_class._bookkeeping_sync = platform_module.make_patched_bookkeeping_sync(
             runner_class._bookkeeping_sync
         )
         runner_class._patched_for_beam_pos_ids = True
-        logger.info(
-            "%s hooks patched successfully for backend %s.",
-            runner_name,
-            backend.device_type,
-        )
+        logger.info("%s hooks patched successfully.", runner_name)

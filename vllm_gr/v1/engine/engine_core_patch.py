@@ -177,13 +177,6 @@ def run_engine_core(
     # Set re-entry guard and apply patches
     _run_engine_core_active = True
     try:
-        # A spawn-based EngineCore reaches this wrapper before upstream
-        # EngineCore.__init__ loads general plugins. Establish this process's
-        # backend before the provider-driven ModelRunner plan is evaluated.
-        from vllm_gr.plugin import initialize_process_backend
-
-        initialize_process_backend()
-
         # Use the shared initialization mechanism with an EngineCore-only
         # plan. In a spawned child this repairs targets that became importable
         # only after the frontend initialized without importing API modules.

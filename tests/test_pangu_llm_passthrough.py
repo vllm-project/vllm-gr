@@ -53,18 +53,12 @@ class TestPanguPluginInitializeRuntime(unittest.TestCase):
     def test_initialize_runtime_does_not_raise(self):
         from vllm_gr import plugin
 
-        backend = mock.Mock(device_type="cuda")
         with (
-            mock.patch.object(
-                plugin,
-                "initialize_process_backend",
-                return_value=backend,
-            ),
+            mock.patch("vllm_gr._env_check.check_environment"),
             mock.patch("vllm_gr.patch.re_apply_patches", return_value=0),
             mock.patch("vllm_gr.patch.get_last_beam_patch_report", return_value=None),
         ):
             state = plugin.initialize_runtime()
-        self.assertEqual(state["backend"], "cuda")
         self.assertIn("patch_count", state)
         self.assertIn("patches", state)
 

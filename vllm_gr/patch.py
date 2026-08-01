@@ -15,6 +15,7 @@ from enum import Enum
 
 from vllm_gr import lmcache_patch
 from vllm_gr.ops import sliced_logits_patch
+from vllm_gr.v1 import ascend_compat
 
 logger = logging.getLogger("vllm_gr.patch")
 
@@ -203,23 +204,6 @@ def _validate_engine_core_entrypoint_patch() -> str | None:
     )
 
 
-def _validate_beam_attention_backend_registration() -> str | None:
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-    from vllm_gr.v1.attention.backends.beam_attn_registration import (
-        BEAM_ATTENTION_BACKEND_PATH,
-    )
-
-    try:
-        registered = AttentionBackendEnum.CUSTOM.get_path()
-    except ValueError:
-        registered = None
-    return _verified(
-        registered == BEAM_ATTENTION_BACKEND_PATH,
-        f"CUSTOM Attention backend is {registered!r}, expected {BEAM_ATTENTION_BACKEND_PATH!r}",
-    )
-
-
 def _validate_engine_core_request_patch() -> str | None:
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
@@ -254,16 +238,14 @@ def _validate_scheduler_patch() -> str | None:
 
 
 def _validate_model_runner_patch() -> str | None:
-    from vllm_gr.platforms import get_active_backend
     from vllm_gr.v1.worker.model_runner_patch import (
         discover_active_worker_runners,
         is_worker_runner_patched,
     )
 
-    backend = get_active_backend()
     runners = discover_active_worker_runners()
     if not runners:
-        return f"No supported ModelRunner is available for backend {backend.device_type!r}"
+        return "No supported active-platform ModelRunner is available"
 
     failures = [
         f"{runner_name} beam execution hooks are not installed"
@@ -376,12 +358,6 @@ def _engine_core_beam_patches() -> tuple[BeamPatch, ...]:
 
     return (
         patch(
-            "attention_backend",
-            "vllm_gr.v1.attention.backends.beam_attn_registration",
-            "register_beam_attention_backend",
-            _validate_beam_attention_backend_registration,
-        ),
-        patch(
             "engine_core_requests",
             "vllm_gr.v1.engine.engine_core_patch",
             "apply_engine_core_request_patches",
@@ -453,15 +429,11 @@ def initialize_required_beam_patches() -> BeamPatchReport:
 
 def initialize_engine_core_beam_patches() -> BeamPatchReport:
     """Install only capabilities required by an EngineCore process."""
-    from vllm_gr.platforms import get_active_backend
-
-    backend = get_active_backend()
-    backend.apply_runtime_patches(force=True)
     return _initialize_beam_patch_plan(_engine_core_beam_patches())
 
 
-def _apply_common_runtime_patches(force: bool = False) -> int:
-    """Apply hardware-neutral patches through the production initialization path.
+def _apply_gr_beam_patches(force: bool = False) -> int:
+    """Apply Beam patches through the single production initialization path.
 
     These patches are independent from the GR core type replacement patches
     and can be safely applied alongside them.
@@ -488,12 +460,13 @@ def _apply_common_runtime_patches(force: bool = False) -> int:
 
 def _apply_patches(force: bool = False) -> int:
     """Apply all runtime patches needed by vllm-gr."""
-    from vllm_gr.platforms import get_active_backend
-
-    backend = get_active_backend()
-    backend_count = backend.apply_runtime_patches(force=force)
-    common_count = _apply_common_runtime_patches(force=force)
-    return backend_count + common_count
+    ascend_attn_count = ascend_compat.apply_ascend_attention_backend_patch(force=force)
+    # Import/patch NPUWorker before the beam patch tries to access
+    # NPUModelRunner. vllm-ascend's worker module deliberately initializes
+    # vllm_ascend.ops first, avoiding an import-order cycle through device_op.
+    npu_worker_count = ascend_compat.patch_npu_worker_init_device()
+    beam_count = _apply_gr_beam_patches(force=force)
+    return ascend_attn_count + npu_worker_count + beam_count
 
 
 def re_apply_patches() -> int:

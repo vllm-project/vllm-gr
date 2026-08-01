@@ -13,28 +13,9 @@ is to apply the vLLM monkey patches needed by the OneRec beam-search path
 (catalog-constrained generation).
 """
 
-from __future__ import annotations
-
 import logging
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from vllm_gr.platforms.protocol import GRBackendProvider
 
 logger = logging.getLogger("vllm_gr.plugin")
-
-
-def initialize_process_backend() -> GRBackendProvider:
-    """Activate and validate the backend for the current process."""
-    from vllm_gr._env_check import configure_model_runner_default
-
-    configure_model_runner_default()
-
-    from vllm_gr.platforms import activate_current_backend
-
-    backend = activate_current_backend()
-    backend.check_environment()
-    return backend
 
 
 def initialize_runtime() -> dict[str, object]:
@@ -44,31 +25,26 @@ def initialize_runtime() -> dict[str, object]:
     this can be used both by the vLLM plugin loader and by explicit engine
     startup paths in the main process.
     """
-    backend = initialize_process_backend()
+    from vllm_gr._env_check import check_environment, configure_model_runner_default
+
+    configure_model_runner_default()
 
     from vllm_gr.patch import get_last_beam_patch_report, re_apply_patches
+
+    check_environment()
 
     patch_count = re_apply_patches()
 
     report = get_last_beam_patch_report()
     state: dict[str, object] = {
-        "backend": backend.device_type,
         "patch_count": patch_count,
         "patches": report.statuses() if report is not None else {},
     }
-    logger.debug(
-        "vllm-gr runtime initialized: backend=%s patches=%d",
-        backend.device_type,
-        patch_count,
-    )
+    logger.debug("vllm-gr runtime initialized: patches=%d", patch_count)
     return state
 
 
 def register() -> None:
     """Entry point used by vLLM's general plugin loader."""
     state = initialize_runtime()
-    logger.debug(
-        "vllm-gr plugin loaded (backend=%s, %s patches applied)",
-        state["backend"],
-        state["patch_count"],
-    )
+    logger.debug("vllm-gr plugin loaded (%s patches applied)", state["patch_count"])

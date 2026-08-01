@@ -51,7 +51,7 @@ aligned with it.
 | GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `scheduler_metadata.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
 | GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active GPU runner hooks are incomplete | `_validate_model_runner_patch`; GPU and dispatcher tests | GPU worker |
 | GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
-| GR-PATCH-013 | `v1/attention/backends/beam_attn_registration.py`, `beam_attn.py` | `register_beam_attention_backend` | EngineCore plan finds the process-local CUSTOM slot missing or incorrect | `_validate_beam_attention_backend_registration`; patch initialization and Beam Attention tests | EngineCore, worker |
+| GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
 
@@ -62,21 +62,14 @@ aligned with it.
 - Process roles: main process, EngineCore subprocess, worker subprocess
 - Platforms: GPU and NPU
 - Risk: High
-- Behavior:
-    - configures the supported ModelRunner default;
-    - activates the process-local backend provider selected by vLLM;
-    - validates the provider environment before importing or applying runtime patches;
-    - applies backend compatibility patches before the common GR patch plan.
-- Initialization paths:
-    - main and Worker processes use the general plugin entry point;
-    - a spawn-based EngineCore wrapper invokes the same process-backend initializer before its minimal patch plan, because upstream general plugin loading occurs later in EngineCore startup.
-- Process model: main, EngineCore, and Worker processes activate their own backend. An active backend is never inferred from another process.
+- Behavior: initializes the current process and applies the active GR runtime patches.
+- Main dependency: vLLM general plugins are loaded in every relevant process.
 - Removal condition: no removal is expected while vLLM-GR requires runtime patch installation. The entry point may be simplified when patch installation becomes more narrowly scoped.
 
 ### GR-PATCH-001 — CUSTOM Attention Selector Compatibility
 
 - Source: `vllm_gr/v1/ascend_compat.py`
-- Orchestration owner: built-in NPU provider in `vllm_gr/platforms/npu.py`
+- Orchestration: `vllm_gr/patch.py`
 - Target: `vllm.v1.attention.selector._cached_get_attn_backend`
 - Mutation: private cached-function replacement
 - Platform: primarily NPU
@@ -93,7 +86,7 @@ aligned with it.
 ### GR-PATCH-002 — NPUWorker Initialization Hook
 
 - Source: `vllm_gr/v1/ascend_compat.py`
-- Orchestration owner: built-in NPU provider in `vllm_gr/platforms/npu.py`
+- Orchestration: `vllm_gr/patch.py`
 - Target: `vllm_ascend.worker.worker.NPUWorker.init_device`
 - Mutation: lifecycle method wrapper
 - Platform: NPU
@@ -235,7 +228,6 @@ aligned with it.
 - Source: `vllm_gr/v1/worker/gpu_model_runner_patch.py`
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
-- Target selection: process-local active backend provider
 - Targets:
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
@@ -254,7 +246,6 @@ aligned with it.
 - Source: `vllm_gr/v1/worker/npu_model_runner_patch.py`
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
-- Target selection: process-local active backend provider
 - Targets:
     - `NPUModelRunner.execute_model`
     - `NPUModelRunner._prepare_inputs`
@@ -270,13 +261,10 @@ aligned with it.
 
 ### GR-PATCH-013 — CUSTOM Attention Backend Registration
 
-- Provider migration: deferred to S3; Beam Attention platform dispatch remains unchanged in S2.
-- Installer: `vllm_gr.v1.attention.backends.beam_attn_registration.register_beam_attention_backend`
-- Activation: the EngineCore patch plan verifies the process-local CUSTOM slot before model construction.
 - Mechanism: `register_backend(AttentionBackendEnum.CUSTOM)`
 - Mutation: supported process-global registry override
 - Risk: High
-- Behavior: explicitly and idempotently registers the GR Beam Attention backend in the official CUSTOM slot. Spawned EngineCore processes cannot rely on the frontend's module-import side effect because the registry is process-local.
+- Behavior: registers the GR Beam Attention backend in the official CUSTOM slot.
 - Ownership:
     - Beam Attention metadata and builder:
       `vllm_gr.v1.attention.backends.beam_attn_metadata`;
@@ -285,7 +273,6 @@ aligned with it.
     - NPU execution:
       `vllm_gr.v1.attention.backends.beam_attn_npu`;
     - backend registration and facade:
-      `vllm_gr.v1.attention.backends.beam_attn_registration` and
       `vllm_gr.v1.attention.backends.beam_attn`.
 - Compatibility facade:
     - `beam_attn` intentionally continues to export
