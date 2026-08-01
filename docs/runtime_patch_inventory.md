@@ -63,20 +63,24 @@ aligned with it.
 - Platforms: GPU and NPU
 - Risk: High
 - Behavior:
+    - configuration-time activation delegates platform defaults to `backend.configure_engine()` without running environment checks or patches;
     - configures the supported ModelRunner default;
     - activates the process-local backend provider selected by vLLM;
+    - registers the hardware-neutral CUSTOM Beam Attention backend in the process;
     - validates the provider environment before importing or applying runtime patches;
     - applies backend compatibility patches before the common GR patch plan.
 - Initialization paths:
     - main and Worker processes use the general plugin entry point;
     - a spawn-based EngineCore wrapper invokes the same process-backend initializer before its minimal patch plan, because upstream general plugin loading occurs later in EngineCore startup.
 - Process model: main, EngineCore, and Worker processes activate their own backend. An active backend is never inferred from another process.
+- Registration model: Core registers only CUDA. The NPU Provider is discovered through the `vllm_gr.platform_backends` entry point and is API-version checked before registration.
+- Lifecycle boundary: environment checks and accelerator-memory release are delegated to the active Provider; common entry points do not import Ascend checks or manipulate `torch.npu`.
 - Removal condition: no removal is expected while vLLM-GR requires runtime patch installation. The entry point may be simplified when patch installation becomes more narrowly scoped.
 
 ### GR-PATCH-001 — CUSTOM Attention Selector Compatibility
 
 - Source: `vllm_gr/v1/ascend_compat.py`
-- Orchestration owner: built-in NPU provider in `vllm_gr/platforms/npu.py`
+- Orchestration owner: external entry-point NPU provider in `vllm_gr/platforms/npu.py`
 - Target: `vllm.v1.attention.selector._cached_get_attn_backend`
 - Mutation: private cached-function replacement
 - Platform: primarily NPU
@@ -93,7 +97,7 @@ aligned with it.
 ### GR-PATCH-002 — NPUWorker Initialization Hook
 
 - Source: `vllm_gr/v1/ascend_compat.py`
-- Orchestration owner: built-in NPU provider in `vllm_gr/platforms/npu.py`
+- Orchestration owner: external entry-point NPU provider in `vllm_gr/platforms/npu.py`
 - Target: `vllm_ascend.worker.worker.NPUWorker.init_device`
 - Mutation: lifecycle method wrapper
 - Platform: NPU
@@ -270,22 +274,30 @@ aligned with it.
 
 ### GR-PATCH-013 — CUSTOM Attention Backend Registration
 
-- Provider migration: deferred to S3; Beam Attention platform dispatch remains unchanged in S2.
+- Provider migration: execution, capability dispatch, and concrete Metadata Builder selection route through the active Provider's `BeamAttentionHooks`.
 - Installer: `vllm_gr.v1.attention.backends.beam_attn_registration.register_beam_attention_backend`
-- Activation: the EngineCore patch plan verifies the process-local CUSTOM slot before model construction.
+- Activation: process backend initialization registers the process-local CUSTOM slot for main, EngineCore, and Worker roles; the EngineCore patch plan verifies and repairs it before model construction.
 - Mechanism: `register_backend(AttentionBackendEnum.CUSTOM)`
 - Mutation: supported process-global registry override
 - Risk: High
 - Behavior: explicitly and idempotently registers the GR Beam Attention backend in the official CUSTOM slot. Spawned EngineCore processes cannot rely on the frontend's module-import side effect because the registry is process-local.
+- Import behavior: importing `beam_attn` does not register CUSTOM or resolve a Provider. Process backend initialization registers CUSTOM explicitly before environment checks and runtime patches, and the EngineCore plan retains its verifier/repair step.
 - Ownership:
-    - Beam Attention metadata and builder:
+    - common Beam request segmentation, geometry, mappings, metadata fields,
+      and block-table updates:
       `vllm_gr.v1.attention.backends.beam_attn_metadata`;
-    - GPU execution:
+    - CUDA device tensors, FlashAttention schedule metadata, and CUDA Graph
+      policy:
+      `vllm_gr.v1.attention.backends.beam_attn_metadata_gpu`;
+    - NPU causal-mask lifecycle and CPU-list metadata behavior:
+      `vllm_gr.v1.attention.backends.beam_attn_metadata_npu`;
+    - GPU capability and execution hooks:
       `vllm_gr.v1.attention.backends.beam_attn_gpu`;
-    - NPU execution:
+    - NPU capability and execution hooks:
       `vllm_gr.v1.attention.backends.beam_attn_npu`;
-    - backend registration and facade:
-      `vllm_gr.v1.attention.backends.beam_attn_registration` and
+    - backend registration:
+      `vllm_gr.v1.attention.backends.beam_attn_registration`;
+    - compatibility facade:
       `vllm_gr.v1.attention.backends.beam_attn`.
 - Compatibility facade:
     - `beam_attn` intentionally continues to export

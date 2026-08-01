@@ -21,8 +21,11 @@ from typing import Any, Iterator, cast
 import torch
 
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
-from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-    BeamAttentionMetadataBuilder,
+from vllm_gr.v1.attention.backends.beam_attn_metadata_gpu import (
+    CUDABeamAttentionMetadataBuilder,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata_npu import (
+    NPUBeamAttentionMetadataBuilder,
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
@@ -268,7 +271,13 @@ def build_beam_attn_metadata(
 
     token = BEAM_DATA_VAR.set(beam_info)
     try:
-        builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
+        device_type = getattr(device, "type", str(device).partition(":")[0])
+        builder_cls = (
+            CUDABeamAttentionMetadataBuilder
+            if device_type == "cuda"
+            else NPUBeamAttentionMetadataBuilder
+        )
+        builder = builder_cls.__new__(builder_cls)
         builder.device = device
         builder.block_size = inputs.block_size
         builder.aot_schedule = False
@@ -278,9 +287,6 @@ def build_beam_attn_metadata(
         builder.max_num_splits = 0
         builder.num_heads_q = inputs.query.shape[1]
         builder.num_kv_heads = inputs.num_kv_heads
-        device_type = getattr(device, "type", str(device).partition(":")[0])
-        builder._is_cuda = device_type == "cuda"
-        builder._is_npu = device_type == "npu"
         if npu_causal_atten_mask is not None:
             # NPU cascade execution reads this for the causal STD/suffix calls.
             builder.npu_causal_atten_mask = npu_causal_atten_mask
@@ -306,6 +312,21 @@ def run_cascade_beam_attention(
     Shared by both device tests; only ``vllm_flash_attn_version``,
     ``logits_soft_cap`` and (NPU-only) ``npu_causal_atten_mask`` differ.
     """
+    from vllm_gr.platforms import activate_backend, register_backend
+    from vllm_gr.platforms.builtins import register_builtin_backends
+
+    device_type = getattr(device, "type", str(device).partition(":")[0])
+    register_builtin_backends()
+    if device_type == "npu":
+        # Core intentionally has no built-in NPU Provider. This NPU-specific
+        # hardware test supplies the same Provider object that the packaged
+        # entry point exposes, without requiring the source tree to be
+        # reinstalled before running tests.
+        from vllm_gr.platforms.npu import NPU_BACKEND
+
+        register_backend(NPU_BACKEND, source="test:external-npu")
+    activate_backend(device_type)
+
     output = torch.zeros_like(inputs.query)
     attn_metadata = build_beam_attn_metadata(
         inputs, device, npu_causal_atten_mask=npu_causal_atten_mask

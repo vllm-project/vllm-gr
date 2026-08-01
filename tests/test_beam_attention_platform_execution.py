@@ -7,13 +7,14 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest import mock
 
 import pytest
 import torch
+from vllm.platforms.interface import DeviceCapability
 
-from vllm_gr.v1.attention import backends
 from vllm_gr.v1.attention.backends import beam_attn
 
 
@@ -22,8 +23,13 @@ def test_facade_import_does_not_load_platform_execution_modules() -> None:
     code = """
 import sys
 
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+assert not AttentionBackendEnum.CUSTOM.is_overridden()
+
 import vllm_gr.v1.attention.backends.beam_attn
 
+assert not AttentionBackendEnum.CUSTOM.is_overridden()
 assert "vllm_gr.v1.attention.backends.beam_attn_gpu" not in sys.modules
 assert "vllm_gr.v1.attention.backends.beam_attn_npu" not in sys.modules
 """
@@ -36,37 +42,86 @@ assert "vllm_gr.v1.attention.backends.beam_attn_npu" not in sys.modules
     )
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
-    ("cuda_available", "npu_available", "expected"),
-    [
-        (True, False, "gpu"),
-        (False, True, "npu"),
-        (False, False, None),
-        (True, True, None),
-    ],
-)
-def test_platform_dispatch_selects_exactly_one_execution_module(
+def test_facade_resolves_attention_hooks_from_active_provider(
     monkeypatch: pytest.MonkeyPatch,
-    cuda_available: bool,
-    npu_available: bool,
-    expected: str | None,
 ) -> None:
-    gpu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_gpu")
-    npu_module = ModuleType("vllm_gr.v1.attention.backends.beam_attn_npu")
-    monkeypatch.setitem(sys.modules, gpu_module.__name__, gpu_module)
-    monkeypatch.setitem(sys.modules, npu_module.__name__, npu_module)
-    monkeypatch.setattr(backends, "beam_attn_gpu", gpu_module, raising=False)
-    monkeypatch.setattr(backends, "beam_attn_npu", npu_module, raising=False)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", cuda_available)
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", npu_available)
+    from vllm_gr import platforms
 
-    if expected is None:
-        with pytest.raises(RuntimeError, match="exactly one active CUDA or NPU"):
-            beam_attn._get_platform_execution_module()
-        return
+    hooks = object()
+    provider = SimpleNamespace(get_attention_hooks=lambda: hooks)
+    get_backend = mock.Mock(return_value=provider)
+    monkeypatch.setattr(platforms, "get_active_backend", get_backend)
 
-    selected = beam_attn._get_platform_execution_module()
-    assert selected is (gpu_module if expected == "gpu" else npu_module)
+    assert beam_attn._get_attention_hooks() is hooks
+    get_backend.assert_called_once_with()
+
+
+def test_impl_resolves_and_stores_attention_hooks_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hooks = SimpleNamespace(
+        get_flash_attn_version=lambda **kwargs: 3,
+        supports_batch_invariance=lambda: True,
+        supports_kv_cache_dtype=lambda dtype: True,
+    )
+    resolve = mock.Mock(return_value=hooks)
+    monkeypatch.setattr(beam_attn, "_get_attention_hooks", resolve)
+
+    impl = beam_attn.BeamAttentionImpl(
+        num_heads=2,
+        head_size=16,
+        scale=0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+
+    assert impl._attention_hooks is hooks
+    resolve.assert_called_once_with()
+
+
+def test_backend_capabilities_delegate_to_active_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder_cls = type("Builder", (), {})
+    capability = DeviceCapability(8, 0)
+    hooks = SimpleNamespace(
+        supports_batch_invariance=lambda: True,
+        supports_kv_cache_dtype=lambda dtype: dtype == "auto",
+        supports_sinks=lambda: False,
+        supports_compute_capability=lambda value: value == capability,
+        get_metadata_builder_cls=lambda: builder_cls,
+        get_kv_cache_shape=lambda *args: (2, *args[:4]),
+        get_kv_cache_stride_order=lambda include_layers=False: (
+            (2, 0, 1) if include_layers else (0, 1)
+        ),
+        validate_combination=lambda *args: "platform decision",
+    )
+    monkeypatch.setattr(beam_attn, "_get_attention_hooks", lambda: hooks)
+
+    backend = beam_attn.BeamAttentionBackend
+    assert backend.supports_batch_invariance() is True
+    assert backend.supports_kv_cache_dtype("auto") is True
+    assert backend.supports_kv_cache_dtype("fp8") is False
+    assert backend.supports_sink() is False
+    assert backend.supports_compute_capability(capability) is True
+    assert backend.get_builder_cls() is builder_cls
+    assert backend.get_kv_cache_shape(4, 16, 2, 128) == (2, 4, 16, 2, 128)
+    assert backend.get_kv_cache_stride_order(True) == (2, 0, 1)
+    assert (
+        backend.supports_combination(
+            128,
+            torch.float16,
+            "auto",
+            16,
+            False,
+            False,
+            False,
+            capability,
+        )
+        == "platform decision"
+    )
 
 
 @pytest.mark.parametrize("tuple_cache", [False, True])  # type: ignore[misc]
@@ -82,19 +137,31 @@ def test_forward_preserves_cache_and_attention_arguments(
     def cascade_attention(**kwargs: Any) -> None:
         calls["cascade"] = kwargs
 
-    execution = SimpleNamespace(
+    def split_kv_cache(kv_cache: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        if tuple_cache:
+            return cast(tuple[torch.Tensor, torch.Tensor], kv_cache)
+        key_cache, value_cache = kv_cache.unbind(0)
+        return key_cache, value_cache
+
+    def get_kv_scales(layer: Any) -> tuple[Any, Any]:
+        if tuple_cache:
+            return None, None
+        return layer._k_scale, layer._v_scale
+
+    hooks = SimpleNamespace(
+        split_kv_cache=split_kv_cache,
+        get_kv_scales=get_kv_scales,
         reshape_and_cache=reshape_and_cache,
         cascade_attention=cascade_attention,
     )
     monkeypatch.setattr(
         beam_attn,
-        "_get_platform_execution_module",
-        lambda: execution,
+        "_get_attention_hooks",
+        mock.Mock(side_effect=AssertionError("forward resolved the registry")),
     )
-    monkeypatch.setattr(beam_attn, "NPU_DEVICE", tuple_cache)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", not tuple_cache)
 
     impl = object.__new__(beam_attn.BeamAttentionImpl)
+    impl._attention_hooks = hooks
     impl.kv_sharing_target_layer_name = None
     impl.kv_cache_dtype = "auto"
     impl.sliding_window = (6, 0)

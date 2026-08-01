@@ -33,6 +33,15 @@ def initialize_process_backend() -> GRBackendProvider:
     from vllm_gr.platforms import activate_current_backend
 
     backend = activate_current_backend()
+
+    # CUSTOM Attention registration is process-local, just like backend
+    # activation. Register it explicitly for main, EngineCore, and Worker
+    # processes before any backend compatibility patch inspects that slot.
+    from vllm_gr.v1.attention.backends.beam_attn_registration import (
+        register_beam_attention_backend,
+    )
+
+    register_beam_attention_backend()
     backend.check_environment()
     return backend
 

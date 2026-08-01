@@ -13,6 +13,14 @@ from vllm_gr.config import GRAttentionBackend, GRConfig
 from vllm_gr.config.parser import ATTENTION_BACKEND_KEY, CATALOG_PATH_KEY
 
 
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _configured_test_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr import platforms
+
+    backend = SimpleNamespace(configure_engine=lambda config: None)
+    monkeypatch.setattr(platforms, "activate_current_backend", lambda: backend)
+
+
 def _vllm_config(additional_config: object | None = None) -> SimpleNamespace:
     return SimpleNamespace(additional_config={} if additional_config is None else additional_config)
 
@@ -168,6 +176,30 @@ def test_engine_config_entrypoint_writes_typed_catalog_config() -> None:
 
     assert GRConfig.from_vllm_config(result) == GRConfig(catalog_path="/models/catalog.json")
     assert result.additional_config["unrelated"] is True
+
+
+def test_engine_config_delegates_platform_policy_to_active_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr import platforms
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    backend = SimpleNamespace(configure_engine=mock.Mock())
+    monkeypatch.setattr(platforms, "activate_current_backend", lambda: backend)
+    engine_args = SimpleNamespace(
+        catalog_path=None,
+        attention_backend=None,
+        attention_config=None,
+    )
+
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+        return_value=vllm_config,
+    ):
+        create_engine_config(engine_args)
+
+    backend.configure_engine.assert_called_once_with(vllm_config)
 
 
 def test_engine_config_merges_existing_backend_with_cli_catalog() -> None:

@@ -6,12 +6,16 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import cast
 
-from .protocol import BeamAttentionExecution, ModelRunnerPatchHooks
+from .protocol import BACKEND_API_VERSION, BeamAttentionHooks, ModelRunnerPatchHooks
 
 
 @dataclass(frozen=True)
 class CUDABackendProvider:
+    api_version: int = BACKEND_API_VERSION
     device_type: str = "cuda"
+
+    def configure_engine(self, config: object) -> None:
+        del config
 
     def check_environment(self) -> dict[str, str]:
         from vllm.platforms import current_platform
@@ -23,7 +27,7 @@ class CUDABackendProvider:
 
         report = check_runtime_versions()
         report["platform"] = "cuda"
-        return report
+        return cast(dict[str, str], report)
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
         del force
@@ -35,11 +39,18 @@ class CUDABackendProvider:
             import_module("vllm_gr.v1.worker.gpu_model_runner_patch"),
         )
 
-    def get_attention_execution(self) -> BeamAttentionExecution:
+    def get_attention_hooks(self) -> BeamAttentionHooks:
         return cast(
-            BeamAttentionExecution,
+            BeamAttentionHooks,
             import_module("vllm_gr.v1.attention.backends.beam_attn_gpu"),
         )
+
+    def release_accelerator_memory(self) -> None:
+        import torch
+
+        from vllm_gr.utils.accelerator_memory import cleanup_torch_backend
+
+        cleanup_torch_backend(getattr(torch, "cuda", None), collect_ipc=True)
 
 
 CUDA_BACKEND = CUDABackendProvider()

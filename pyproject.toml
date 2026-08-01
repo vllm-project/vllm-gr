@@ -60,6 +60,9 @@ Issues = "https://github.com/JiusiServe/vllm-gr/issues"
 [project.entry-points."vllm.general_plugins"]
 vllm_gr = "vllm_gr.plugin:register"
 
+[project.entry-points."vllm_gr.platform_backends"]
+npu = "vllm_gr.platforms.npu:NPU_BACKEND"
+
 [project.scripts]
 vllm-gr = "vllm_gr.entrypoints.cli.main:main"
 

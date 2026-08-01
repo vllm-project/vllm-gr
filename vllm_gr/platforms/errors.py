@@ -11,6 +11,10 @@ class InvalidBackendProviderError(BackendRegistryError):
     pass
 
 
+class IncompatibleBackendAPIError(InvalidBackendProviderError):
+    pass
+
+
 class DuplicateBackendRegistrationError(BackendRegistryError):
     pass
 

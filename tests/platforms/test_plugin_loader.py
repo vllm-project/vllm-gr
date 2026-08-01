@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from vllm_gr.platforms import loader
+from vllm_gr.platforms import BACKEND_API_VERSION, loader
 from vllm_gr.platforms.builtins import register_builtin_backends
 from vllm_gr.platforms.errors import (
     DuplicateBackendRegistrationError,
@@ -27,7 +27,11 @@ from vllm_gr.platforms.registry import (
 
 @dataclass(frozen=True)
 class FakeProvider:
+    api_version: int = BACKEND_API_VERSION
     device_type: str = "fake"
+
+    def configure_engine(self, config: Any) -> None:
+        del config
 
     def check_environment(self) -> dict[str, str]:
         return {}
@@ -39,8 +43,11 @@ class FakeProvider:
     def get_model_runner_hooks(self) -> Any:
         return object()
 
-    def get_attention_execution(self) -> Any:
+    def get_attention_hooks(self) -> Any:
         return object()
+
+    def release_accelerator_memory(self) -> None:
+        pass
 
 
 @dataclass
@@ -85,6 +92,20 @@ def test_loads_external_provider_from_entry_point(
     assert resolve_backend("fake") is provider
     discover.assert_called_once_with(group=loader.ENTRYPOINT_GROUP)
     assert entry_point.load_count == 1
+
+
+def test_npu_provider_is_loaded_only_through_external_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.platforms.npu import NPU_BACKEND
+
+    register_builtin_backends()
+    _install_entry_points(monkeypatch, FakeEntryPoint("npu", NPU_BACKEND))
+
+    loader.load_backend_plugins()
+
+    assert resolve_backend("npu") is NPU_BACKEND
+    assert loader.activate_backend_by_device_type("npu") is NPU_BACKEND
 
 
 def test_entry_point_name_must_match_provider_device_type(
@@ -162,12 +183,14 @@ def test_entry_point_must_return_provider_object(
         loader.load_backend_plugins()
 
 
-def test_activate_current_backend_rejects_unknown_platform(
+@pytest.mark.parametrize("device_type", ["cpu", "npu"])  # type: ignore[misc]
+def test_activate_current_backend_rejects_backend_without_provider(
     monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
 ) -> None:
     vllm_module = ModuleType("vllm")
     platforms = ModuleType("vllm.platforms")
-    platforms.current_platform = SimpleNamespace(device_type="cpu")  # type: ignore[attr-defined]
+    platforms.current_platform = SimpleNamespace(device_type=device_type)  # type: ignore[attr-defined]
     vllm_module.platforms = platforms  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
@@ -177,5 +200,5 @@ def test_activate_current_backend_rejects_unknown_platform(
         loader.activate_current_backend()
 
     message = str(exc_info.value)
-    assert "requested='cpu'" in message
-    assert "available=('cuda', 'npu')" in message
+    assert f"requested='{device_type}'" in message
+    assert "available=('cuda',)" in message

@@ -61,8 +61,14 @@ def activate_current_backend() -> GRBackendProvider:
     """Register providers and activate vLLM's current canonical device type."""
     from vllm.platforms import current_platform
 
+    return activate_backend_by_device_type(str(current_platform.device_type))
+
+
+def activate_backend_by_device_type(device_type: str) -> GRBackendProvider:
+    """Load providers and activate an explicitly selected canonical device."""
+
     from .builtins import register_builtin_backends
 
     register_builtin_backends()
     load_backend_plugins()
-    return activate_backend(str(current_platform.device_type))
+    return activate_backend(device_type)

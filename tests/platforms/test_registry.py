@@ -9,11 +9,13 @@ from typing import Any
 
 import pytest
 
+from vllm_gr.platforms import BACKEND_API_VERSION
 from vllm_gr.platforms.cuda import CUDA_BACKEND
 from vllm_gr.platforms.errors import (
     BackendAlreadyActiveError,
     BackendNotActiveError,
     DuplicateBackendRegistrationError,
+    IncompatibleBackendAPIError,
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
@@ -28,7 +30,11 @@ from vllm_gr.platforms.registry import (
 
 @dataclass(frozen=True)
 class FakeProvider:
+    api_version: int = BACKEND_API_VERSION
     device_type: str = "fake"
+
+    def configure_engine(self, config: Any) -> None:
+        del config
 
     def check_environment(self) -> dict[str, str]:
         return {}
@@ -40,8 +46,11 @@ class FakeProvider:
     def get_model_runner_hooks(self) -> Any:
         return object()
 
-    def get_attention_execution(self) -> Any:
+    def get_attention_hooks(self) -> Any:
         return object()
+
+    def release_accelerator_memory(self) -> None:
+        pass
 
 
 def setup_function() -> None:
@@ -154,7 +163,7 @@ def test_provider_surface_validation_does_not_call_getters() -> None:
             calls.append("model-runner")
             return object()
 
-        def get_attention_execution(self) -> Any:
+        def get_attention_hooks(self) -> Any:
             calls.append("attention")
             return object()
 
@@ -168,7 +177,18 @@ def test_provider_class_and_missing_methods_are_rejected() -> None:
         register_backend(FakeProvider)
 
     class IncompleteProvider:
+        api_version = BACKEND_API_VERSION
         device_type = "incomplete"
 
     with pytest.raises(InvalidBackendProviderError, match="required callable"):
-        register_backend(IncompleteProvider())
+        incomplete = IncompleteProvider()
+        register_backend(incomplete)
+
+
+def test_incompatible_provider_api_version_is_rejected() -> None:
+    with pytest.raises(IncompatibleBackendAPIError) as exc_info:
+        register_backend(FakeProvider(api_version=BACKEND_API_VERSION + 1))
+
+    message = str(exc_info.value)
+    assert f"provider_api_version={BACKEND_API_VERSION + 1}" in message
+    assert f"core_api_version={BACKEND_API_VERSION}" in message

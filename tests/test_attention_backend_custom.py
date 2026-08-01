@@ -11,9 +11,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _configured_test_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr import platforms
+
+    backend = SimpleNamespace(configure_engine=lambda config: None)
+    monkeypatch.setattr(platforms, "activate_current_backend", lambda: backend)
 
 
 class TestCustomAttentionBackendMarker(unittest.TestCase):
@@ -138,68 +148,6 @@ class TestCustomBackendMarkerSerialization(unittest.TestCase):
         assert restored.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
 
 
-class TestNpuDefaultBlockSize(unittest.TestCase):
-    """Guard the vLLM 16 / vLLM-Ascend 128 default mismatch."""
-
-    @staticmethod
-    def _config(*, user_specified=False, is_hybrid=False):
-        return SimpleNamespace(
-            cache_config=SimpleNamespace(
-                block_size=16,
-                user_specified_block_size=user_specified,
-            ),
-            model_config=SimpleNamespace(is_hybrid=is_hybrid),
-        )
-
-    def test_npu_uses_128_when_block_size_was_not_explicit(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
-
-        config = self._config()
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
-
-        assert config.cache_config.block_size == 128
-
-    def test_npu_preserves_explicit_block_size(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
-
-        config = self._config(user_specified=True)
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
-
-        assert config.cache_config.block_size == 16
-
-    def test_npu_preserves_hybrid_model_block_size(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
-
-        config = self._config(is_hybrid=True)
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
-
-        assert config.cache_config.block_size == 16
-
-    def test_gpu_keeps_vllm_default(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
-
-        config = self._config()
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="cuda"),
-        ):
-            _apply_npu_default_block_size(config)
-
-        assert config.cache_config.block_size == 16
-
-
 class TestBeamAttentionVllmApiContract(unittest.TestCase):
     """Pin the vLLM 0.22 attention APIs used only on accelerator paths."""
 
@@ -219,9 +167,9 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
 
         import torch
 
-        import vllm_gr.v1.attention.backends.beam_attn_metadata as beam_attn_metadata
+        import vllm_gr.v1.attention.backends.beam_attn_metadata_gpu as beam_attn_metadata_gpu
 
-        builder = object.__new__(beam_attn_metadata.BeamAttentionMetadataBuilder)
+        builder = object.__new__(beam_attn_metadata_gpu.CUDABeamAttentionMetadataBuilder)
         builder.aot_schedule = True
         builder.cache_config = SimpleNamespace(cache_dtype="auto")
         builder.kv_cache_dtype = torch.bfloat16
@@ -232,7 +180,7 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         builder.aot_sliding_window = (-1, -1)
 
         with mock.patch.object(
-            beam_attn_metadata,
+            beam_attn_metadata_gpu,
             "get_scheduler_metadata",
             return_value={},
         ) as scheduler:

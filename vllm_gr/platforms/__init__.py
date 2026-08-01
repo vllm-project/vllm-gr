@@ -7,11 +7,12 @@ from .errors import (
     BackendNotActiveError,
     BackendRegistryError,
     DuplicateBackendRegistrationError,
+    IncompatibleBackendAPIError,
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
-from .loader import activate_current_backend
-from .protocol import GRBackendProvider
+from .loader import activate_backend_by_device_type, activate_current_backend
+from .protocol import BACKEND_API_VERSION, GRBackendProvider
 from .registry import (
     activate_backend,
     get_active_backend,
@@ -23,11 +24,14 @@ __all__ = [
     "BackendAlreadyActiveError",
     "BackendNotActiveError",
     "BackendRegistryError",
+    "BACKEND_API_VERSION",
     "DuplicateBackendRegistrationError",
     "GRBackendProvider",
+    "IncompatibleBackendAPIError",
     "InvalidBackendProviderError",
     "UnsupportedBackendError",
     "activate_backend",
+    "activate_backend_by_device_type",
     "activate_current_backend",
     "get_active_backend",
     "register_backend",

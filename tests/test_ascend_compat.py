@@ -21,6 +21,10 @@ def _install_selector_patch(
 ) -> tuple[Any, mock.Mock]:
     import vllm.v1.attention.selector as selector
 
+    from vllm_gr.v1.attention.backends.beam_attn_registration import (
+        register_beam_attention_backend,
+    )
+
     native_backend = object()
     native_selector = mock.Mock(return_value=native_backend)
     monkeypatch.setattr(selector, "_cached_get_attn_backend", native_selector)
@@ -35,6 +39,7 @@ def _install_selector_patch(
         False,
     )
 
+    register_beam_attention_backend()
     assert ascend_compat.apply_ascend_attention_backend_patch() == 1
     return native_backend, native_selector
 
