@@ -20,7 +20,7 @@ echo "  model: $MODEL_PATH"
 echo "  dataset: $DATASET_PATH"
 echo "  num_prompts: $NUM_PROMPTS"
 echo "  min_accuracy: $MIN_ACCURACY"
-echo "  block_size: ${PANGU1B_BLOCK_SIZE:-auto (128 on NPU)}"
+echo "  block_size: ${PANGU1B_BLOCK_SIZE:-vLLM default}"
 
 python examples/offline_inference/pangu1b/pangu_generate.py \
   --model "$MODEL_PATH" \

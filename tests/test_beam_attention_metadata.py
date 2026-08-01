@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,26 +12,22 @@ import pytest
 import torch
 
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-    BeamAttentionMetadata,
-    BeamAttentionMetadataBuilder,
+    BaseBeamAttentionMetadata,
+    BaseBeamAttentionMetadataBuilder,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata_gpu import (
+    CUDABeamAttentionMetadata,
+    CUDABeamAttentionMetadataBuilder,
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 
 
-def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
-    builder = object.__new__(BeamAttentionMetadataBuilder)
+def _make_builder(block_size: int = 2) -> BaseBeamAttentionMetadataBuilder:
+    builder = object.__new__(BaseBeamAttentionMetadataBuilder)
     builder.device = torch.device("cpu")
     builder.block_size = block_size
-    builder.aot_schedule = False
-    builder.aot_sliding_window = None
-    builder.use_full_cuda_graph = False
-    builder.max_cudagraph_size = None
-    builder.max_num_splits = 0
     builder.num_heads_q = 8
     builder.num_kv_heads = 2
-    builder._is_cuda = False
-    builder._is_npu = False
-    builder.npu_causal_atten_mask = None
     return builder
 
 
@@ -60,7 +57,7 @@ def _build_metadata(
     common: SimpleNamespace,
     req_ids: list[str],
     beam_data: dict[str, dict[str, Any]],
-) -> BeamAttentionMetadata:
+) -> BaseBeamAttentionMetadata:
     token = BEAM_DATA_VAR.set({"beam_data": beam_data, "req_ids": req_ids})
     try:
         return _make_builder().build(0, common)
@@ -194,7 +191,7 @@ def test_build_routes_standard_and_beam_metadata(
 def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:
     old_table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
     old_slots = torch.tensor([10, 11], dtype=torch.int64)
-    metadata = BeamAttentionMetadata(
+    metadata = BaseBeamAttentionMetadata(
         num_actual_tokens=2,
         max_query_len=1,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
@@ -220,3 +217,39 @@ def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:
     assert updated.slot_mapping is new_slots
     assert updated.std_block_table.tolist() == [[10, 11, 12]]
     assert updated.prefix_block_table.tolist() == [[7, 8]]
+
+
+def test_cuda_builder_creates_cuda_metadata() -> None:
+    common = _common_metadata([0, 2], [2], [[0, 1]])
+
+    cuda_builder = object.__new__(CUDABeamAttentionMetadataBuilder)
+    cuda_builder.device = torch.device("cpu")
+    cuda_builder.block_size = 2
+    cuda_builder.num_heads_q = 8
+    cuda_builder.num_kv_heads = 2
+    cuda_builder.aot_schedule = False
+    cuda_builder.aot_sliding_window = None
+    cuda_builder.use_full_cuda_graph = False
+    cuda_builder.max_cudagraph_size = None
+    cuda_builder.max_num_splits = 0
+
+    token = BEAM_DATA_VAR.set({"beam_data": {}, "req_ids": ["ordinary"]})
+    try:
+        cuda_metadata = cuda_builder.build(0, common)
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+    assert isinstance(cuda_metadata, CUDABeamAttentionMetadata)
+    assert cuda_metadata.std_cu_seqlens_q_device is not None
+
+
+def test_common_metadata_source_has_no_platform_branches() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "vllm_gr/v1/attention/backends/beam_attn_metadata.py"
+    ).read_text()
+    forbidden = (
+        "cuda",
+        "_is_cuda",
+        "VLLM_BATCH_INVARIANT",
+    )
+    assert all(term.lower() not in source.lower() for term in forbidden)

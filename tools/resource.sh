@@ -1,24 +1,8 @@
 
 # This script is meant to be sourced.
-# It provides utilities to allocate and manage local GPU or NPU resources.
-
-# Detect if we are in an NPU environment
-if command -v npu-smi &> /dev/null; then
-    npu_state=true
-else
-    npu_state=false
-fi
-
-if [ "$npu_state" = true ]; then
-    # Source NPU utilities. The path is relative to this script.
-    source "./tools/resource-npu.sh"
-fi
+# It provides utilities to allocate and manage local CUDA GPU resources.
 
 function is_available() {
-    if [ "$npu_state" = true ]; then
-        is_available_npu "$@"
-        return $?
-    fi
     local i=$1
     local mem_gpu=$2
 
@@ -45,11 +29,6 @@ function is_available() {
 }
 
 function get_gpu() {
-    if [ "$npu_state" = true ]; then
-        get_npu "$@"
-        return $?
-    fi
-
     local mem_gpu=${1:-16}
     local timeout_secs=${2:-0} # 0 means wait indefinitely
 
@@ -81,11 +60,6 @@ function get_gpu() {
 }
 
 function get_gpus() {
-    if [ "$npu_state" = true ]; then
-        get_npus "$@"
-        return $?
-    fi
-
     local num_gpus=${1:-1}
     local mem_gpu=${2:-16}
     local timeout_secs=${3:-0} # 0 means wait indefinitely
@@ -142,15 +116,10 @@ function lock_gpu() {
         echo "Invalid GPU ID: argument is empty" >&2
         return 1
     fi
-    if [ "$npu_state" = true ]; then
-        lock_pid=$(lock_npu "$@")
-        echo "READY" > "$ready_file"
-    else
-        local script_dir
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        python "$script_dir/lock_gpu.py" "$gpu_id" > "$ready_file" 2>/dev/null &
-        lock_pid=$!
-    fi
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    python "$script_dir/lock_gpu.py" "$gpu_id" > "$ready_file" 2>/dev/null &
+    lock_pid=$!
     echo "got process id: $lock_pid" >&2
     # Poll until we see 'READY' or the process dies (max ~10s).
     local ready=0
@@ -179,22 +148,12 @@ function lock_gpu() {
 # unlock_gpu <pid>
 # Kills the background process that is holding the GPU memory.
 function unlock_gpu() {
-    if [ "$npu_state" = true ]; then
-        unlock_npu "$@"
-        return $?
-    fi
-
     local pid=$1
     [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
 }
 
 function lock_gpus() {
     local gpus_list=$1
-    if [ "$npu_state" = true ]; then
-        lock_npus "$@"
-        return $?
-    fi
-
     local pids=""
     IFS=',' read -ra gpus <<< "$gpus_list"
     for gpu in "${gpus[@]}"; do
@@ -220,11 +179,6 @@ function lock_gpus() {
 
 function unlock_gpus() {
     local pids_list=$1
-    if [ "$npu_state" = true ]; then
-        unlock_npus "$@"
-        return $?
-    fi
-
     IFS=',' read -ra pids <<< "$pids_list"
     for pid in "${pids[@]}"; do
         unlock_gpu "$pid"

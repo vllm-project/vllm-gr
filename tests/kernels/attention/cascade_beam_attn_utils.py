@@ -1,36 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared test infrastructure for the cascade beam-attention correctness tests.
-
-Used by:
-  - test_cascade_beam_attn_gpu.py   (GPU, flash-attn reference kernel)
-  - test_cascade_beam_attn_npu.py   (NPU, pure-torch reference kernel)
-
-Keeps the device-agnostic input construction, the beam prefix/suffix gather
-(the same decomposition the real metadata builder performs, replayed here via
-``_compute_beam_bounds``), and the backend invocation plumbing in one place,
-so the two device-specific test files only contain what actually differs
-between them: the reference kernel's math and each device's parameter sweep.
-"""
+"""Shared infrastructure for CUDA cascade beam-attention correctness tests."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Iterator, cast
+from typing import Any, cast
 
 import torch
 
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
-from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-    BeamAttentionMetadataBuilder,
+from vllm_gr.v1.attention.backends.beam_attn_metadata_gpu import (
+    CUDABeamAttentionMetadataBuilder,
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]  # (query_heads, kv_heads); (4, 4) is MHA
 
-# (q_seq_len, kv_seq_len, suffix_kv_len) beam-decode scenarios common to both
-# device tests.
+# (q_seq_len, kv_seq_len, suffix_kv_len) beam-decode scenarios.
 CASES: list[tuple[int, int, int]] = [
     (8, 32, 8),  # Standard: prefix complete, beams decode full suffixes.
     (4, 64, 4),  # Large general case with a longer prefix.
@@ -40,12 +29,10 @@ CASES: list[tuple[int, int, int]] = [
     (4, 32, 7),  # Partial block-alignment: prime/unaligned lengths.
 ]
 
-# No shared prefix (shared_tokens_len == 0): pure beam decode. GPU-only --
-# NPU excludes it because CANN rejects the resulting empty block table.
+# No shared prefix (shared_tokens_len == 0): pure beam decode.
 NO_SHARED_PREFIX_CASE: tuple[int, int, int] = (8, 8, 8)
 
 GPU_CASES: list[tuple[int, int, int]] = [NO_SHARED_PREFIX_CASE, *CASES]
-NPU_CASES: list[tuple[int, int, int]] = CASES
 
 
 @dataclass
@@ -172,9 +159,7 @@ def iter_beam_segments(
     head-expanded) that beam attends to, and
     ``query[q_start : q_start + q_uncached]`` is the query slice it produces.
 
-    Both device references (flash-attn packing on GPU, per-beam causal
-    softmax on NPU) build on top of this same decomposition; only what they
-    do with each segment differs.
+    The flash-attn reference builds on top of this same decomposition.
     """
     seq_lens_cpu = inputs.seq_lens.cpu().tolist()
     q_ptr = 0
@@ -195,7 +180,7 @@ def iter_beam_segments(
             if chunk_budget <= 0:
                 break
 
-            b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+            b_uncached, b_suffix_len, _b_past_suffix, b_physical = _compute_beam_bounds(
                 b, prefix_len, b_cache_len, steps, chunk_budget
             )
             if b_uncached <= 0:
@@ -246,10 +231,8 @@ class MockCommonAttentionMetadata:
 def build_beam_attn_metadata(
     inputs: BeamAttnInputs,
     device: torch.device | str,
-    npu_causal_atten_mask: torch.Tensor | None = None,
 ) -> Any:
-    """Builds attn_metadata via BeamAttentionMetadataBuilder, wiring the
-    BEAM_DATA_VAR contextvar the same way both device tests need."""
+    """Build metadata while wiring the Beam context used by the real builder."""
     common_attn_metadata = MockCommonAttentionMetadata(inputs, device)
 
     beam_info: dict[str, Any] = {
@@ -268,22 +251,17 @@ def build_beam_attn_metadata(
 
     token = BEAM_DATA_VAR.set(beam_info)
     try:
-        builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
+        builder_cls = CUDABeamAttentionMetadataBuilder
+        builder = builder_cls.__new__(builder_cls)
         builder.device = device
         builder.block_size = inputs.block_size
+        builder.num_heads_q = inputs.query.shape[1]
+        builder.num_kv_heads = inputs.num_kv_heads
         builder.aot_schedule = False
         builder.aot_sliding_window = None
         builder.use_full_cuda_graph = False
         builder.max_cudagraph_size = None
         builder.max_num_splits = 0
-        builder.num_heads_q = inputs.query.shape[1]
-        builder.num_kv_heads = inputs.num_kv_heads
-        device_type = getattr(device, "type", str(device).partition(":")[0])
-        builder._is_cuda = device_type == "cuda"
-        builder._is_npu = device_type == "npu"
-        if npu_causal_atten_mask is not None:
-            # NPU cascade execution reads this for the causal STD/suffix calls.
-            builder.npu_causal_atten_mask = npu_causal_atten_mask
 
         return builder.build(
             common_prefix_len=inputs.shared_tokens_len,
@@ -299,17 +277,13 @@ def run_cascade_beam_attention(
     device: torch.device | str,
     vllm_flash_attn_version: int,
     logits_soft_cap: float | None = None,
-    npu_causal_atten_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Runs the real BeamAttentionImpl.cascade_attention backend under test.
 
-    Shared by both device tests; only ``vllm_flash_attn_version``,
-    ``logits_soft_cap`` and (NPU-only) ``npu_causal_atten_mask`` differ.
+    ``vllm_flash_attn_version`` and ``logits_soft_cap`` select CUDA behavior.
     """
     output = torch.zeros_like(inputs.query)
-    attn_metadata = build_beam_attn_metadata(
-        inputs, device, npu_causal_atten_mask=npu_causal_atten_mask
-    )
+    attn_metadata = build_beam_attn_metadata(inputs, device)
 
     impl = BeamAttentionImpl(
         num_heads=inputs.query.shape[1],

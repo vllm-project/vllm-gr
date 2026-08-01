@@ -4,8 +4,8 @@
 Setup script for vllm-gr with hardware-dependent installation.
 
 This setup.py implements platform-aware dependency routing so users can run
-`pip install vllm-gr` and automatically receive the correct platform-specific
-dependencies (CUDA/NPU/CPU) without requiring extras like `[gpu]`.
+`pip install vllm-gr` and automatically receive the correct source-specific
+dependencies without requiring extras like `[gpu]`.
 """
 
 import logging
@@ -21,6 +21,7 @@ logger = logging.getLogger("vllm_gr.setup")
 
 _VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
 VLLM_GR_BASE_VERSION = "0.22.1"
+REQUIREMENTS_DIR = Path(__file__).parent / "requirements"
 
 # Module-level cache so that detect_target_device() is evaluated exactly once
 # per setup.py invocation, avoiding duplicate log output and potential
@@ -29,14 +30,14 @@ _cached_device: str | None = None
 
 
 def warn_deprecated_extra_install() -> None:
-    """Warn when installing via deprecated [gpu] or [npu] extras."""
+    """Warn when installing via the deprecated GPU extra."""
     argv = " ".join(sys.argv).lower()
-    for extra in ("[gpu]", "[npu]", ".[gpu", ".[npu"):
+    for extra in ("[gpu]", ".[gpu"):
         if extra in argv:
             warnings.warn(
                 f"Installing vllm-gr via the deprecated extra {extra!r} is "
-                "supported for one transition release only. "
-                "Use `pip install -e .` instead — platform dependencies are "
+                "not the supported installation path. Use `pip install -e .` "
+                "instead — platform dependencies are "
                 "auto-selected by setup.py.",
                 DeprecationWarning,
                 stacklevel=2,
@@ -51,9 +52,9 @@ def detect_target_device() -> str:
     Priority order:
     1. VLLM_GR_TARGET_DEVICE environment variable (highest priority)
     2. READTHEDOCS=1 -> cpu
-    3. Torch backend detection (cuda, npu)
+    3. Torch accelerator detection
     4. No torch -> default cuda (consistent with vllm-omni)
-    5. Torch present but no GPU/NPU backend -> cpu
+    5. Torch present but no supported accelerator -> cpu
 
     The result is cached after the first call.
     """
@@ -88,13 +89,13 @@ def detect_target_device() -> str:
         if hasattr(torch, "npu"):
             try:
                 if torch.npu.is_available():
-                    logger.info("Detected NPU backend from torch")
+                    logger.info("Detected alternate accelerator backend from torch")
                     _cached_device = "npu"
                     return _cached_device
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - backend probing must not abort setup
+                logger.debug("Alternate accelerator probe failed: %s", exc)
 
-        logger.info("No GPU/NPU backend detected in torch, defaulting to CPU")
+        logger.info("No supported accelerator detected in torch, defaulting to CPU")
         _cached_device = "cpu"
         return _cached_device
 
@@ -110,7 +111,6 @@ def get_vllm_gr_version() -> str:
 
     Version format examples:
         - 0.22.1 (cuda, no suffix)
-        - 0.22.1+npu
         - 0.22.1+cpu
 
     Environment variables:
@@ -145,8 +145,7 @@ def load_requirements(file_path: Path) -> list[str]:
     requirements: list[str] = []
 
     if not file_path.exists():
-        logger.warning("Requirements file not found: %s", file_path)
-        return requirements
+        raise RuntimeError(f"Requirements file not found: {file_path}")
 
     with open(file_path) as f:
         for line in f:
@@ -167,16 +166,23 @@ def get_install_requires() -> list[str]:
     warn_deprecated_extra_install()
 
     device = detect_target_device()
-    requirements_dir = Path(__file__).parent / "requirements"
-    requirements_file = requirements_dir / f"{device}.txt"
+    requirements_file = REQUIREMENTS_DIR / f"{device}.txt"
+
+    if not requirements_file.exists():
+        raise RuntimeError(
+            f"Detected target device {device!r}, but this source "
+            "distribution does not include that backend."
+        )
 
     logger.info("Loading requirements from: %s", requirements_file)
     requirements = load_requirements(requirements_file)
 
     if not requirements:
-        logger.warning("No requirements loaded for device '%s'", device)
-    else:
-        logger.info("Loaded %d requirements for %s", len(requirements), device)
+        raise RuntimeError(
+            f"Detected target device {device!r}, but its requirements file "
+            "does not define any install dependencies."
+        )
+    logger.info("Loaded %d requirements for %s", len(requirements), device)
 
     return requirements
 

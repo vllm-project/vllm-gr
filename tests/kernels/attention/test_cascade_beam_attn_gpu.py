@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from collections.abc import Iterator
+
 import pytest
 import torch
 from vllm.utils.torch_utils import set_random_seed
@@ -36,6 +38,20 @@ except ImportError:
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16, 32]
 DTYPES = [torch.float16, torch.bfloat16]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def activate_cuda_backend() -> Iterator[None]:
+    """Mirror runtime backend activation for direct kernel tests."""
+    from vllm_gr.platforms import activate_backend, register_backend
+    from vllm_gr.platforms.cuda import CUDA_BACKEND
+    from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
+
+    _reset_backend_registry_for_tests()
+    register_backend(CUDA_BACKEND, source="test:cascade-beam-attn-gpu")
+    activate_backend("cuda")
+    yield
+    _reset_backend_registry_for_tests()
 
 
 def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:

@@ -45,21 +45,6 @@ recall_32_th=0.04
 elapsed_time_online_th=15
 elapsed_time_offline_th=20
 device="gpu"
-#if exist npu-smi tune some threshold
-if command -v npu-smi &> /dev/null; then
-   device="npu"
-   board_id=$(python -c "import acl;print(acl.get_soc_name())" 2>/dev/null || echo "unknown")
-   echo "identify $board_id"
-   case $board_id in
-    "Ascend910_9362" )
-      p99_ttft_th=280
-      elapsed_time_online_th=20
-      elapsed_time_offline_th=25
-       ;;
-    * )
-    echo "using default thresholds for $board_id" ;;
-  esac
-fi
 
 
 validate_metric() {

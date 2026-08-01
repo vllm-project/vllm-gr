@@ -17,8 +17,8 @@ try:
 except ImportError:
     from vllm.sampling_params import BeamSearchParams
 
-if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is_available()):
-    pytest.skip("GPU/NPU is not available", allow_module_level=True)
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is not available", allow_module_level=True)
 
 
 def _load_prompt_text() -> str:
@@ -75,8 +75,6 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
 
 def _run_offline_gr_beam_search_target(loops: int) -> None:
     device = torch.cuda
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        device = torch.npu
     before_gpu = device.memory_allocated()
     before_host = psutil.Process().memory_info().rss
     _run_offline_beam_search(loops, use_patch=True)

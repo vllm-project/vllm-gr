@@ -29,7 +29,7 @@ classifiers = [
 ]
 
 # Platform runtimes are selected automatically via setup.py + requirements/.
-# See docs/install_simplification_plan.md for the installation model.
+# See docs/platform_backend_contract.md for the installation model.
 
 [project.optional-dependencies]
 dev = [
@@ -43,13 +43,10 @@ dev = [
     "mypy",
     "psutil",
 ]
-# DEPRECATED: use `pip install -e .` — platform deps come from setup.py
-# Kept for one transition release so legacy `.[gpu]` installs still receive
-# the GPU-only GR dependencies even if setup.py metadata routing is bypassed.
+# Deprecated compatibility aliases. Use `pip install -e .`; setup.py selects
+# the platform dependencies.
 gpu = [
 ]
-# DEPRECATED: use `pip install -e .` — platform deps come from setup.py
-npu = []
 
 [project.urls]
 Homepage = "https://github.com/JiusiServe/vllm-gr"
@@ -59,6 +56,9 @@ Issues = "https://github.com/JiusiServe/vllm-gr/issues"
 
 [project.entry-points."vllm.general_plugins"]
 vllm_gr = "vllm_gr.plugin:register"
+
+[project.entry-points."vllm_gr.platform_backends"]
+cuda = "vllm_gr.platforms.cuda:CUDA_BACKEND"
 
 [project.scripts]
 vllm-gr = "vllm_gr.entrypoints.cli.main:main"

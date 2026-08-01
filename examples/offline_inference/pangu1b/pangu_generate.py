@@ -38,15 +38,6 @@ _DEFAULT_DATASET = _REPO_ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.
 _ANSWER_RE = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
 
-def _is_npu_platform() -> bool:
-    """Return whether vLLM selected the Ascend platform."""
-    try:
-        from vllm.platforms import current_platform
-    except Exception:
-        return False
-    return getattr(current_platform, "device_type", None) == "npu"
-
-
 def _pangu_engine_kwargs(block_size: int | None = None) -> dict[str, Any]:
     """Recommended vLLM engine flags for openPangu Embedded 1B."""
     kwargs: dict[str, Any] = {
@@ -57,12 +48,6 @@ def _pangu_engine_kwargs(block_size: int | None = None) -> dict[str, Any]:
         "enable_chunked_prefill": False,
         "enable_prefix_caching": False,
     }
-    # vLLM defaults to block_size=16. vLLM-Ascend's native attention
-    # backends require a kernel block size of 128, but its platform hook only
-    # promotes the default when chunked prefill or prefix caching is enabled.
-    # Pangu intentionally disables both, so select the compatible value here.
-    if block_size is None and _is_npu_platform():
-        block_size = 128
     if block_size is not None:
         kwargs["block_size"] = block_size
         logger.info("Using Pangu KV cache block size %d", block_size)
@@ -232,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         default=(
             int(os.environ["PANGU1B_BLOCK_SIZE"]) if os.environ.get("PANGU1B_BLOCK_SIZE") else None
         ),
-        help="KV cache block size; defaults to 128 on Ascend NPU",
+        help="Optional KV cache block size",
     )
     parser.add_argument(
         "--min-accuracy",

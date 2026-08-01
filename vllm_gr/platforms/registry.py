@@ -13,13 +13,15 @@ from .errors import (
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
-from .protocol import GRBackendProvider
+from .protocol import BACKEND_API_VERSION, GRBackendProvider
 
 _REQUIRED_PROVIDER_METHODS = (
+    "configure_engine",
     "check_environment",
+    "release_accelerator_memory",
     "apply_runtime_patches",
     "get_model_runner_hooks",
-    "get_attention_execution",
+    "get_attention_hooks",
 )
 
 _BACKENDS: dict[str, GRBackendProvider] = {}
@@ -77,6 +79,14 @@ def _validate_backend_provider(provider: Any, *, source: str) -> str:
         raise InvalidBackendProviderError(
             f"{exc}; source={source!r}; {_registry_context(requested=device_type)}"
         ) from exc
+
+    api_version = getattr(provider, "api_version", None)
+    if type(api_version) is not int or api_version != BACKEND_API_VERSION:
+        raise InvalidBackendProviderError(
+            "Backend provider API version is incompatible; "
+            f"expected={BACKEND_API_VERSION!r}; found={api_version!r}; "
+            f"source={source!r}; {_registry_context(requested=normalized)}"
+        )
 
     missing = tuple(
         method_name

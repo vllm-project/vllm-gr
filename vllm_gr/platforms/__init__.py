@@ -10,7 +10,7 @@ from .errors import (
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
-from .loader import activate_current_backend
+from .loader import activate_current_backend, load_backend_plugin
 from .protocol import GRBackendProvider
 from .registry import (
     activate_backend,
@@ -30,6 +30,7 @@ __all__ = [
     "activate_backend",
     "activate_current_backend",
     "get_active_backend",
+    "load_backend_plugin",
     "register_backend",
     "resolve_backend",
 ]

@@ -36,7 +36,7 @@ def merge_tnd_attention_outputs(
 
     Expected input dimensions:
         out1, out2: [T, N, D]  (Token, NumHead, HeadDim)
-        lse1, lse2: [T, N, 1]  (output of _npu_normalize_lse)
+        lse1, lse2: [T, N, 1] normalized log-sum-exp values
     """
     # LSE is [T, N, 1], matching out1/out2 layout [T, N, D]
 

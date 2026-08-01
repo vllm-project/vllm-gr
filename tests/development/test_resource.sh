@@ -4,18 +4,11 @@
 # This script verifies GPU allocation and locking mechanisms.
 set -euo pipefail
 mem_th=18
-if command -v npu-smi &> /dev/null; then
-  mem_th=3000
-fi
 # Check for required system dependencies
 if command -v nvidia-smi &> /dev/null; then
     GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader | tail -n 1 || echo 0)
-elif command -v npu-smi &> /dev/null; then
-    # Use npu-smi to count the number of NPUs by counting the number of entries
-    # Each NPU entry starts with a line containing a number and the card name
-    GPU_COUNT=$(npu-smi info 2>/dev/null | grep "^| [0-9]" | awk '{print $2}' | sort -u | wc -l)
 else
-    echo "SKIP: No supported accelerator (GPU/NPU) found to test."
+    echo "SKIP: No CUDA accelerator found to test."
     exit 0
 fi
 

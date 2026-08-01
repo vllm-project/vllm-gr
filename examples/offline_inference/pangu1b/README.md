@@ -22,17 +22,6 @@ python examples/offline_inference/pangu1b/pangu_generate.py \
     --num-prompts 8
 ```
 
-On Ascend NPU, the example automatically uses KV cache block size 128, as
-required by the native vLLM-Ascend attention backend. It can be overridden
-when validating another backend:
-
-```bash
-PANGU1B_BLOCK_SIZE=128 \
-python examples/offline_inference/pangu1b/pangu_generate.py \
-    --model "$PANGU1B_MODEL_PATH" \
-    --num-prompts 8
-```
-
 ## Online serving
 
 Start a local OpenAI-compatible server:
@@ -46,8 +35,6 @@ vllm-gr serve "$PANGU1B_MODEL_PATH" \
     --no-enable-chunked-prefill \
     --no-enable-prefix-caching
 ```
-
-Add `--block-size 128` to the serving command when running on Ascend NPU.
 
 Then send a chat completion request:
 

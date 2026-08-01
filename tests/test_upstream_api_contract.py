@@ -5,11 +5,8 @@
 
 from __future__ import annotations
 
-import importlib.util
 import inspect
 from collections.abc import Callable, Sequence
-
-import pytest
 
 
 def _assert_parameter_prefix(
@@ -85,35 +82,3 @@ def test_vllm_serving_and_client_patch_contract() -> None:
     assert callable(SyncMPClient._send_input)
     assert callable(SyncMPClient.add_request)
     assert callable(InprocClient.add_request)
-
-
-def test_vllm_ascend_model_runner_patch_contract() -> None:
-    if importlib.util.find_spec("vllm_ascend") is None:
-        pytest.skip("vllm-ascend is not installed")
-
-    # Import through the worker entry point so vllm-ascend initializes its ops
-    # package before loading model_runner_v1. A direct model_runner_v1 import
-    # can otherwise enter the device_op/ops circular-import path.
-    from vllm_ascend.worker.worker import NPUModelRunner, NPUWorker
-
-    _assert_parameter_prefix(NPUWorker.init_device, ("self",))
-    _assert_parameter_prefix(
-        NPUModelRunner.execute_model,
-        ("self", "scheduler_output", "intermediate_tensors"),
-    )
-    _assert_parameter_prefix(
-        NPUModelRunner._prepare_inputs,
-        ("self", "scheduler_output", "num_scheduled_tokens"),
-    )
-    _assert_parameter_prefix(
-        NPUModelRunner._bookkeeping_sync,
-        (
-            "self",
-            "scheduler_output",
-            "sampler_output",
-            "logits",
-            "hidden_states",
-            "num_scheduled_tokens",
-            "spec_decode_metadata",
-        ),
-    )

@@ -102,7 +102,7 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
 
 def discover_worker_runners() -> tuple[tuple[str, type], ...]:
-    """Discover the upstream GPU ModelRunner without importing NPU runtime."""
+    """Discover the upstream GPU ModelRunner."""
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     except ImportError as exc:

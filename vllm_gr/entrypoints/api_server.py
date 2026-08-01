@@ -23,7 +23,6 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     """Launch the OpenAI-compatible API server.
 
     Defers entirely to ``vllm.entrypoints.openai.api_server.run_server``; the
-    vLLM general plugin loads the vllm-gr beam-search / NPU patches before
-    this runs.
+    vLLM general plugin loads the vllm-gr beam-search patches before this runs.
     """
     await openai_api_server.run_server(args, **uvicorn_kwargs)

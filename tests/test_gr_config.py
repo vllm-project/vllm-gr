@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +12,22 @@ import pytest
 
 from vllm_gr.config import GRAttentionBackend, GRConfig
 from vllm_gr.config.parser import ATTENTION_BACKEND_KEY, CATALOG_PATH_KEY
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _activate_cuda_provider_for_engine_config_tests() -> Iterator[None]:
+    from vllm_gr.platforms.cuda import CUDA_BACKEND
+    from vllm_gr.platforms.registry import (
+        _reset_backend_registry_for_tests,
+        activate_backend,
+        register_backend,
+    )
+
+    _reset_backend_registry_for_tests()
+    register_backend(CUDA_BACKEND, source="test:cuda")
+    activate_backend("cuda")
+    yield
+    _reset_backend_registry_for_tests()
 
 
 def _vllm_config(additional_config: object | None = None) -> SimpleNamespace:
@@ -170,6 +187,29 @@ def test_engine_config_entrypoint_writes_typed_catalog_config() -> None:
     assert result.additional_config["unrelated"] is True
 
 
+def test_engine_config_delegates_platform_configuration() -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    backend = mock.Mock()
+    engine_args = SimpleNamespace(
+        catalog_path=None,
+        attention_backend=None,
+        attention_config=None,
+    )
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch("vllm_gr.platforms.get_active_backend", return_value=backend),
+    ):
+        result = create_engine_config(engine_args)
+
+    assert result is vllm_config
+    backend.configure_engine.assert_called_once_with(vllm_config)
+
+
 def test_engine_config_merges_existing_backend_with_cli_catalog() -> None:
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
@@ -319,16 +359,3 @@ def test_engine_config_rejects_invalid_raw_gr_value_without_cli_override() -> No
         pytest.raises(ValueError, match="unsupported.*attention_backend"),
     ):
         create_engine_config(engine_args)
-
-
-def test_attention_selector_config_reader_propagates_validation_errors() -> None:
-    from vllm_gr.v1.ascend_compat import _get_current_gr_attention_backend
-
-    with (
-        mock.patch(
-            "vllm.config.get_current_vllm_config_or_none",
-            return_value=_vllm_config({ATTENTION_BACKEND_KEY: "INVALID"}),
-        ),
-        pytest.raises(ValueError, match="unsupported.*attention_backend"),
-    ):
-        _get_current_gr_attention_backend()

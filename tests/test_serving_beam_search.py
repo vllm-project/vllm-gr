@@ -30,8 +30,8 @@ from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingM
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 
-if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is_available()):
-    pytest.skip("GPU/NPU is not available", allow_module_level=True)
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is not available", allow_module_level=True)
 
 
 async def beam_search_test(loops: int) -> None:
@@ -122,8 +122,6 @@ def _run_gr_beam_search_target(loops: int) -> None:
 
     async def run_test() -> None:
         device = torch.cuda
-        if hasattr(torch, "npu") and torch.npu.is_available():
-            device = torch.npu
         await beam_search_test(loops)
         device.synchronize()
         before_gpu_mem: int = device.memory_allocated()

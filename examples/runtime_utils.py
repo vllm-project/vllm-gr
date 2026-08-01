@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Shared helpers for cross-platform example scripts."""
+"""Shared helpers for example scripts."""
 
 from __future__ import annotations
 
@@ -36,11 +36,11 @@ def add_runtime_args(
         )
     parser.add_argument(
         "--expect-device",
-        choices=["gpu", "npu", "cpu"],
+        choices=["gpu", "cpu"],
         default=None,
         help=(
             "Optional assertion for the active runtime backend. "
-            "Use this to verify the example really ran on GPU or NPU."
+            "Use this to verify the example ran on the expected device."
         ),
     )
     return parser

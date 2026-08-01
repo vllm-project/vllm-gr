@@ -74,16 +74,19 @@ _PATCH_WIRING_TEST_HOOKS = SimpleNamespace(
     make_patched_bookkeeping_sync=lambda original: original,
 )
 _PATCH_WIRING_TEST_BACKEND = SimpleNamespace(
+    api_version=1,
     device_type="patch-wiring-test",
+    configure_engine=lambda config: None,
     check_environment=lambda: {},
+    release_accelerator_memory=lambda: None,
     apply_runtime_patches=lambda *, force=False: 0,
     get_model_runner_hooks=lambda: _PATCH_WIRING_TEST_HOOKS,
-    get_attention_execution=lambda: SimpleNamespace(),
+    get_attention_hooks=lambda: SimpleNamespace(),
 )
 
 
 def _activate_patch_wiring_test_backend() -> None:
-    """Satisfy the S2 process-provider contract without hardware imports."""
+    """Activate a test provider without importing hardware modules."""
     from vllm_gr.platforms import (
         BackendNotActiveError,
         activate_backend,

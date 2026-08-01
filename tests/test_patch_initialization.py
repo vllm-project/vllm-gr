@@ -377,11 +377,9 @@ def test_plugin_exposes_simple_per_patch_status(
 
     configure = mock.Mock(side_effect=lambda: events.append("configure"))
     activate = mock.Mock(side_effect=activate_backend)
-    global_check = mock.Mock()
     reapply = mock.Mock(side_effect=apply_patches)
 
     monkeypatch.setattr(env_check, "configure_model_runner_default", configure)
-    monkeypatch.setattr(env_check, "check_environment", global_check)
     monkeypatch.setattr(platforms, "activate_current_backend", activate)
     monkeypatch.setattr(runtime_patch, "re_apply_patches", reapply)
     monkeypatch.setattr(
@@ -393,7 +391,6 @@ def test_plugin_exposes_simple_per_patch_status(
     state = plugin.initialize_runtime()
 
     reapply.assert_called_once_with()
-    global_check.assert_not_called()
     assert events == ["configure", "activate", "check_environment", "patch"]
     assert state == {
         "backend": "cuda",

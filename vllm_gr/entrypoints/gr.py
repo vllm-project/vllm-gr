@@ -48,7 +48,6 @@ from vllm_gr.logprobs import (
 )
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.utils.catalog import Catalog
-from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 if TYPE_CHECKING:
@@ -822,7 +821,9 @@ class GRLLM(LLM):
             self.llm_engine = None
 
         gc.collect()
-        release_accelerator_memory()
+        from vllm_gr.platforms import get_active_backend
+
+        get_active_backend().release_accelerator_memory()
         logger.info("GRLLM shutdown complete")
 
     def __enter__(self):

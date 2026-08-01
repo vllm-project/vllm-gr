@@ -7,7 +7,7 @@ Top-level ``import vllm_gr`` is intentionally lightweight:
 
 - it does not apply monkey patches
 - it does not register models/configs
-- it does not require NPU-specific dependencies
+- it does not import accelerator-specific runtime modules
 
 Runtime initialization is performed explicitly by
 ``vllm_gr.plugin.initialize_runtime()`` and by the vLLM general plugin entry

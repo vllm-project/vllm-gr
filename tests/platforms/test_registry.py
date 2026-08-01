@@ -17,6 +17,7 @@ from vllm_gr.platforms.errors import (
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
+from vllm_gr.platforms.protocol import BACKEND_API_VERSION
 from vllm_gr.platforms.registry import (
     _reset_backend_registry_for_tests,
     activate_backend,
@@ -28,10 +29,17 @@ from vllm_gr.platforms.registry import (
 
 @dataclass(frozen=True)
 class FakeProvider:
+    api_version: int = BACKEND_API_VERSION
     device_type: str = "fake"
+
+    def configure_engine(self, config: Any) -> None:
+        del config
 
     def check_environment(self) -> dict[str, str]:
         return {}
+
+    def release_accelerator_memory(self) -> None:
+        pass
 
     def apply_runtime_patches(self, *, force: bool = False) -> int:
         del force
@@ -40,7 +48,7 @@ class FakeProvider:
     def get_model_runner_hooks(self) -> Any:
         return object()
 
-    def get_attention_execution(self) -> Any:
+    def get_attention_hooks(self) -> Any:
         return object()
 
 
@@ -112,19 +120,19 @@ def test_activation_and_repeated_activation_are_idempotent() -> None:
 
 
 def test_active_backend_cannot_switch_in_same_process() -> None:
-    npu = FakeProvider(device_type="npu")
-    register_backend(CUDA_BACKEND, source="builtin:cuda")
-    register_backend(npu, source="builtin:npu")
+    other = FakeProvider(device_type="other")
+    register_backend(CUDA_BACKEND, source="test:cuda")
+    register_backend(other, source="test:other")
     activate_backend("cuda")
 
     with pytest.raises(BackendAlreadyActiveError) as exc_info:
-        activate_backend("npu")
+        activate_backend("other")
 
     message = str(exc_info.value)
-    assert "requested='npu'" in message
+    assert "requested='other'" in message
     assert "active='cuda'" in message
-    assert "active_source='builtin:cuda'" in message
-    assert "requested_source='builtin:npu'" in message
+    assert "active_source='test:cuda'" in message
+    assert "requested_source='test:other'" in message
 
 
 def test_empty_device_types_are_rejected() -> None:
@@ -154,7 +162,7 @@ def test_provider_surface_validation_does_not_call_getters() -> None:
             calls.append("model-runner")
             return object()
 
-        def get_attention_execution(self) -> Any:
+        def get_attention_hooks(self) -> Any:
             calls.append("attention")
             return object()
 
@@ -168,7 +176,22 @@ def test_provider_class_and_missing_methods_are_rejected() -> None:
         register_backend(FakeProvider)
 
     class IncompleteProvider:
+        api_version = BACKEND_API_VERSION
         device_type = "incomplete"
 
     with pytest.raises(InvalidBackendProviderError, match="required callable"):
         register_backend(IncompleteProvider())
+
+
+@pytest.mark.parametrize("api_version", [None, True, 0, BACKEND_API_VERSION + 1])  # type: ignore[misc]
+def test_incompatible_provider_api_versions_are_rejected(api_version: object) -> None:
+    provider = FakeProvider()
+    object.__setattr__(provider, "api_version", api_version)
+
+    with pytest.raises(InvalidBackendProviderError) as exc_info:
+        register_backend(provider, source="test:incompatible")
+
+    message = str(exc_info.value)
+    assert f"expected={BACKEND_API_VERSION!r}" in message
+    assert f"found={api_version!r}" in message
+    assert "source='test:incompatible'" in message

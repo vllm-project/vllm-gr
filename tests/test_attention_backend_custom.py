@@ -26,6 +26,23 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
 
         patch_add_cli_args()
 
+    def setUp(self):
+        from vllm_gr.platforms.cuda import CUDA_BACKEND
+        from vllm_gr.platforms.registry import (
+            _reset_backend_registry_for_tests,
+            activate_backend,
+            register_backend,
+        )
+
+        _reset_backend_registry_for_tests()
+        register_backend(CUDA_BACKEND, source="test:cuda")
+        activate_backend("cuda")
+
+    def tearDown(self):
+        from vllm_gr.platforms.registry import _reset_backend_registry_for_tests
+
+        _reset_backend_registry_for_tests()
+
     def _make_fake_config(self, backend=None, marker=None):
         """Build a lightweight VllmConfig-like object for mocking."""
         from vllm.config import AttentionConfig, VllmConfig
@@ -138,8 +155,8 @@ class TestCustomBackendMarkerSerialization(unittest.TestCase):
         assert restored.additional_config.get("vllm_gr_attention_backend") == "CUSTOM"
 
 
-class TestNpuDefaultBlockSize(unittest.TestCase):
-    """Guard the vLLM 16 / vLLM-Ascend 128 default mismatch."""
+class TestCudaBackendConfiguration(unittest.TestCase):
+    """Guard the CUDA provider's no-op configuration contract."""
 
     @staticmethod
     def _config(*, user_specified=False, is_hybrid=False):
@@ -151,51 +168,11 @@ class TestNpuDefaultBlockSize(unittest.TestCase):
             model_config=SimpleNamespace(is_hybrid=is_hybrid),
         )
 
-    def test_npu_uses_128_when_block_size_was_not_explicit(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
+    def test_cuda_keeps_vllm_default(self):
+        from vllm_gr.platforms.cuda import CUDA_BACKEND
 
         config = self._config()
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
-
-        assert config.cache_config.block_size == 128
-
-    def test_npu_preserves_explicit_block_size(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
-
-        config = self._config(user_specified=True)
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
-
-        assert config.cache_config.block_size == 16
-
-    def test_npu_preserves_hybrid_model_block_size(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
-
-        config = self._config(is_hybrid=True)
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="npu"),
-        ):
-            _apply_npu_default_block_size(config)
-
-        assert config.cache_config.block_size == 16
-
-    def test_gpu_keeps_vllm_default(self):
-        from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
-
-        config = self._config()
-        with mock.patch(
-            "vllm.platforms.current_platform",
-            SimpleNamespace(device_type="cuda"),
-        ):
-            _apply_npu_default_block_size(config)
+        CUDA_BACKEND.configure_engine(config)
 
         assert config.cache_config.block_size == 16
 
@@ -219,9 +196,9 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
 
         import torch
 
-        import vllm_gr.v1.attention.backends.beam_attn_metadata as beam_attn_metadata
+        from vllm_gr.v1.attention.backends import beam_attn_metadata_gpu
 
-        builder = object.__new__(beam_attn_metadata.BeamAttentionMetadataBuilder)
+        builder = object.__new__(beam_attn_metadata_gpu.CUDABeamAttentionMetadataBuilder)
         builder.aot_schedule = True
         builder.cache_config = SimpleNamespace(cache_dtype="auto")
         builder.kv_cache_dtype = torch.bfloat16
@@ -232,7 +209,7 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         builder.aot_sliding_window = (-1, -1)
 
         with mock.patch.object(
-            beam_attn_metadata,
+            beam_attn_metadata_gpu,
             "get_scheduler_metadata",
             return_value={},
         ) as scheduler:

@@ -29,11 +29,7 @@ done
 ./tests/development/test_resource.sh
 # test pre-commit
 source "./tools/resource.sh"
-if [ "${npu_state:-}" == "true" ]; then
-    mem_th=3000
-else
-    mem_th=18
-fi
+mem_th=18
 
 idle_gpu=$(get_gpu $mem_th)
 rc=$?
@@ -48,26 +44,12 @@ if [ -n "${CONDA_PREFIX:-}" ]; then
 fi
 
 echo "running on device $idle_gpu"
-if [ "${npu_state:-false}" == "true" ]; then
-    PYTORCH_NPU_ALLOW_FORK=true \
-    VLLM_WORKER_MULTIPROC_METHOD="spawn" \
-    TORCH_MULTIPROCESSING_METHOD="spawn" \
-    ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
-    bash tools/pre_commit/run_tests.sh
-else
-    NODEENV_SSL_NO_VERIFY=1 \
-    CUDA_VISIBLE_DEVICES=$idle_gpu \
-    pre-commit run --all-files
-fi
+NODEENV_SSL_NO_VERIFY=1 \
+CUDA_VISIBLE_DEVICES=$idle_gpu \
+pre-commit run --all-files
 
 if [[ "$RUN_WHEEL" == "true" ]]; then
-    if [[ "${npu_state:-false}" == "true" ]]; then
-        VLLM_GR_TARGET_DEVICE=npu \
-        ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
-        ./tools/run_wheel_smoke_test.sh --python python3
-    else
-        VLLM_GR_TARGET_DEVICE=cuda \
-        CUDA_VISIBLE_DEVICES=$idle_gpu \
-        ./tools/run_wheel_smoke_test.sh --python python3
-    fi
+    VLLM_GR_TARGET_DEVICE=cuda \
+    CUDA_VISIBLE_DEVICES=$idle_gpu \
+    ./tools/run_wheel_smoke_test.sh --python python3
 fi

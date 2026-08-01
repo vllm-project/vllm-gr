@@ -6,7 +6,7 @@
 """System test: Pangu 1B online serving via ``vllm-gr serve``.
 
 Requires:
-- vLLM + GPU/NPU runtime
+- vLLM + CUDA runtime
 - ``PANGU1B_MODEL_PATH`` or ``PANGU_MODEL_PATH`` with weights
 
 Skip when the model path is unavailable (CI without weights).
@@ -80,14 +80,6 @@ def _build_serve_cmd(model_path: str, port: int) -> list[str]:
         "--no-enable-prefix-caching",
     ]
     block_size = os.environ.get("PANGU1B_BLOCK_SIZE")
-    if block_size is None:
-        try:
-            from vllm.platforms import current_platform
-        except Exception:
-            pass
-        else:
-            if getattr(current_platform, "device_type", None) == "npu":
-                block_size = "128"
     if block_size is not None:
         cmd.extend(["--block-size", block_size])
     return cmd
@@ -316,17 +308,6 @@ class TestPangu1bOnlineUnitHooks(unittest.TestCase):
             cmd = _build_serve_cmd("/tmp/pangu", 18080)
 
         self.assertEqual(cmd[cmd.index("--block-size") + 1], "64")
-
-    def test_serve_command_builder_defaults_to_128_on_npu(self) -> None:
-        fake_platform = mock.Mock(device_type="npu")
-        with (
-            mock.patch.dict(os.environ, {}, clear=False),
-            mock.patch("vllm.platforms.current_platform", fake_platform),
-        ):
-            os.environ.pop("PANGU1B_BLOCK_SIZE", None)
-            cmd = _build_serve_cmd("/tmp/pangu", 18080)
-
-        self.assertEqual(cmd[cmd.index("--block-size") + 1], "128")
 
     def test_default_dataset_exists(self) -> None:
         self.assertTrue(DEFAULT_DATASET.is_file())

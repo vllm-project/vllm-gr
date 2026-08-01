@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 
-def test_platform_package_and_builtins_do_not_load_hardware_modules() -> None:
+def test_platform_package_does_not_load_provider_or_hardware_modules() -> None:
     project_root = Path(__file__).resolve().parents[2]
     code = """
 import sys
@@ -20,31 +20,10 @@ import vllm_gr.platforms
 
 for module_name in (
     "torch",
-    "torch_npu",
     "vllm",
-    "vllm_ascend",
+    "vllm_gr.platforms.cuda",
     "vllm_gr.v1.worker.gpu_model_runner_patch",
-    "vllm_gr.v1.worker.npu_model_runner_patch",
     "vllm_gr.v1.attention.backends.beam_attn_gpu",
-    "vllm_gr.v1.attention.backends.beam_attn_npu",
-    "vllm_gr.v1.ascend_compat",
-):
-    assert module_name not in set(sys.modules) - baseline_modules, module_name
-
-from vllm_gr.platforms.builtins import register_builtin_backends
-
-register_builtin_backends()
-
-for module_name in (
-    "torch",
-    "torch_npu",
-    "vllm",
-    "vllm_ascend",
-    "vllm_gr.v1.worker.gpu_model_runner_patch",
-    "vllm_gr.v1.worker.npu_model_runner_patch",
-    "vllm_gr.v1.attention.backends.beam_attn_gpu",
-    "vllm_gr.v1.attention.backends.beam_attn_npu",
-    "vllm_gr.v1.ascend_compat",
 ):
     assert module_name not in set(sys.modules) - baseline_modules, module_name
 """
@@ -58,40 +37,21 @@ for module_name in (
     )
 
 
-def test_cuda_runtime_orchestration_does_not_load_npu_modules() -> None:
+def test_cuda_runtime_orchestration_uses_cuda_provider() -> None:
     project_root = Path(__file__).resolve().parents[2]
     code = """
-import sys
-
-# Establish the native runtime baseline first. On an NPU host, importing
-# PyTorch or vLLM may legitimately initialize torch_npu or vllm_ascend even
-# though the vllm-gr CUDA provider has not imported an NPU implementation.
 import torch
 import vllm.logger
 
-runtime_baseline = set(sys.modules)
+from vllm_gr.platforms import activate_backend, get_active_backend, register_backend
+from vllm_gr.platforms.cuda import CUDA_BACKEND
 
-from vllm_gr.platforms import activate_backend
-from vllm_gr.platforms.builtins import register_builtin_backends
-
-register_builtin_backends()
+register_backend(CUDA_BACKEND, source="test:cuda")
 activate_backend("cuda")
 
 import vllm_gr.patch
 import vllm_gr.v1.worker.model_runner_patch
-
-for module_name in (
-    "torch_npu",
-    "vllm_ascend",
-):
-    assert module_name not in set(sys.modules) - runtime_baseline, module_name
-
-for module_name in (
-    "vllm_gr.v1.ascend_compat",
-    "vllm_gr.v1.worker.npu_model_runner_patch",
-    "vllm_gr.v1.attention.backends.beam_attn_npu",
-):
-    assert module_name not in sys.modules, module_name
+assert get_active_backend().device_type == "cuda"
 """
 
     subprocess.run(
@@ -109,10 +69,10 @@ def test_backend_activation_is_process_local() -> None:
 import subprocess
 import sys
 
-from vllm_gr.platforms import activate_backend, get_active_backend
-from vllm_gr.platforms.builtins import register_builtin_backends
+from vllm_gr.platforms import activate_backend, get_active_backend, register_backend
+from vllm_gr.platforms.cuda import CUDA_BACKEND
 
-register_builtin_backends()
+register_backend(CUDA_BACKEND, source="test:cuda")
 activate_backend("cuda")
 
 child_code = '''
@@ -143,12 +103,35 @@ sys.modules["vllm.platforms"] = platforms_module
 
 import vllm_gr.platforms.loader as backend_loader
 
-backend_loader._PLUGINS_LOADED = True
+class CUDAEntryPoint:
+    name = "cuda"
+    value = "vllm_gr.platforms.cuda:CUDA_BACKEND"
+    dist = None
+
+    @staticmethod
+    def load():
+        from vllm_gr.platforms.cuda import CUDA_BACKEND
+        return CUDA_BACKEND
+
+backend_loader.entry_points = lambda *, group: (CUDAEntryPoint(),)
 assert activate_current_backend().device_type == "cuda"
 assert get_active_backend().device_type == "cuda"
 
+from vllm_gr.platforms import register_backend
+
+other_backend = SimpleNamespace(
+    api_version=1,
+    device_type="other",
+    configure_engine=lambda config: None,
+    check_environment=lambda: {},
+    release_accelerator_memory=lambda: None,
+    apply_runtime_patches=lambda *, force=False: 0,
+    get_model_runner_hooks=lambda: object(),
+    get_attention_hooks=lambda: object(),
+)
+register_backend(other_backend, source="test:other")
 try:
-    activate_backend("npu")
+    activate_backend("other")
 except BackendAlreadyActiveError:
     pass
 else:

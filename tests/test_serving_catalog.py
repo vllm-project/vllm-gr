@@ -28,8 +28,8 @@ from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingModels
 from vllm.inputs import TokensPrompt
 
-if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is_available()):
-    pytest.skip("GPU/NPU is not available", allow_module_level=True)
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is not available", allow_module_level=True)
 
 
 def _build_catalog_data() -> list[list[str]]:

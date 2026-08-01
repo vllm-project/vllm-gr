@@ -6,7 +6,7 @@
 
 vLLM-based Generative Recommender Inference Engine
 
-This repository focuses on vLLM-based generative recommendation inference, including the OneRec beam-search / catalog-constrained generation pipeline, the Pangu LLM passthrough path, example scripts, test suites, and GPU / NPU runtime adaptation code.
+This repository focuses on vLLM-based generative recommendation inference, including the OneRec beam-search / catalog-constrained generation pipeline, the Pangu LLM passthrough path, example scripts, test suites, and CUDA runtime integration.
 
 ## Current Scope
 
@@ -14,21 +14,19 @@ The current implementation targets inference scenarios and does not aim for full
 
 ## Repository Contents
 
-- `vllm_gr/` — GRLLM (offline beam search), beam-search/catalog patches, NPU runtime utils, ops
+- `vllm_gr/` — GRLLM (offline beam search), beam-search/catalog patches, and CUDA runtime integration
 - `examples/` — OneRec beam-search and Pangu LLM passthrough offline examples
 - `tools/` — unified test runner and local development utilities
 - `scripts/` — wheel-build and device lifecycle helpers used by CI
 - `tests/` — unit, contract, and Pangu system tests
-- `requirements/` — platform dependency lists (auto-selected by `setup.py` as `cuda` / `npu` / `cpu`)
+- `requirements/` — dependency lists selected by `setup.py` for CUDA or documentation builds
 
 ## Installation
 
-**Install vLLM 0.22.1 first (and vLLM-Ascend 0.22.1rc1 on NPU), then
-`pip install vllm-gr`.** This release targets that API pair only. Platform
-dependencies are auto-detected by `setup.py` — no `[gpu]` / `[npu]` extras
-needed.
+**Install vLLM 0.22.1 first, then `pip install vllm-gr`.** This release targets
+that API version. CUDA dependencies are auto-detected by `setup.py`.
 
-For detailed instructions, see [quickstart](docs/quickstart.md) or [quick start ascend](docs/quickstart-ascend.md).
+For detailed instructions, see the [quickstart](docs/quickstart.md).
 
 ## Unified self-validation
 

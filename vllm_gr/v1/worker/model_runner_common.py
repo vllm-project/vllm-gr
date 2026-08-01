@@ -25,16 +25,8 @@ def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optiona
     gpu_positions = None
     cpu_positions = None
     if hasattr(runner, "positions") and runner.positions is not None:
-        if isinstance(runner.positions, torch.Tensor):
-            # vLLM-Ascend 0.22 uses a plain device tensor in PCP paths.
-            gpu_positions = runner.positions
-        else:
-            gpu_positions = getattr(runner.positions, "gpu", None)
-            cpu_positions = getattr(runner.positions, "cpu", None)
-    if cpu_positions is None:
-        # vLLM-Ascend 0.22 keeps a dedicated pinned host buffer even when
-        # ``positions`` itself is a plain device tensor.
-        cpu_positions = getattr(runner, "_positions_cpu_buf", None)
+        gpu_positions = getattr(runner.positions, "gpu", None)
+        cpu_positions = getattr(runner.positions, "cpu", None)
     return gpu_positions, cpu_positions
 
 
@@ -308,11 +300,6 @@ class InputBatchProxy:
             return BeamReqIdsProxy(obj.req_ids, req_map)
         elif name == "num_tokens_no_spec":
             return Mock1DArray(obj.num_tokens_no_spec, idx_map)
-        elif name == "num_tokens":
-            # NPU's _bookkeeping_sync writeback loop also updates num_tokens
-            # (the GPU path does not). Map it to the logical batch slot like
-            # num_tokens_no_spec. Inert when never accessed (e.g. GPU).
-            return Mock1DArray(obj.num_tokens, idx_map)
         elif name == "token_ids_cpu":
             return Mock2DArray(obj.token_ids_cpu, idx_map)
         elif name == "is_token_ids":
@@ -333,9 +320,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
     Device-neutral. Overwrites per-beam RoPE position ids (Job B), builds the
     per-beam ``logits_indices`` list, installs an ``InputBatchProxy`` on
     ``runner.input_batch`` and stashes ``scheduler_output._gr_request_row_configs``
-    (Job C). Job A (populating ``beam_info["req_ids"]``) is left to the caller
-    because its ordering relative to the original ``_prepare_inputs`` differs
-    between GPU and NPU.
+    (Job C). Job A (populating ``beam_info["req_ids"]``) is left to the caller.
 
     Assumes ``scheduler_output.beam_data`` is non-empty (caller checks).
 
@@ -556,10 +541,7 @@ def _beam_collapse_bookkeeping(
 
 
 def make_patched_execute_model(_orig_execute_model):
-    """Wrap execute_model to publish beam-request context for the run.
-
-    Shared by GPU and NPU runners.
-    """
+    """Wrap execute_model to publish beam-request context for the run."""
     if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
         return _orig_execute_model
 

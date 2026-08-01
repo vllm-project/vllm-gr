@@ -9,10 +9,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
-    AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
@@ -22,26 +20,8 @@ from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 
-def get_scheduler_metadata(*args, **kwargs):
-    from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
-
-    if not is_flash_attn_varlen_func_available():
-        raise RuntimeError("BeamAttentionMetadataBuilder requires FlashAttention scheduler support")
-    from vllm.v1.attention.backends.fa_utils import (
-        get_scheduler_metadata as _get_scheduler_metadata,
-    )
-
-    return _get_scheduler_metadata(*args, **kwargs)
-
-
-def _get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
-    if kv_cache_dtype in ("fp8", "fp8_e4m3"):
-        return torch.float8_e4m3fn
-    raise ValueError(f"Unrecognized FP8 dtype: {kv_cache_dtype}")
-
-
 @dataclass
-class BeamAttentionMetadata:
+class BaseBeamAttentionMetadata:
     num_actual_tokens: int
     max_query_len: int
     query_start_loc: torch.Tensor
@@ -50,12 +30,9 @@ class BeamAttentionMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     causal: bool = True
-    npu_causal_atten_mask: torch.Tensor | None = None
 
     # Standard Requests batch routing
     std_indices: torch.Tensor | None = None
-    std_cu_seqlens_q_device: torch.Tensor | None = None
-    std_seqlens_kv_device: torch.Tensor | None = None
     std_max_q_len: int = 0
     std_max_seq_len: int = 0
     std_block_table: torch.Tensor | None = None
@@ -66,8 +43,6 @@ class BeamAttentionMetadata:
 
     # Shared prefix context arrays
     prefix_indices: torch.Tensor | None = None
-    prefix_cu_seqlens_q_device: torch.Tensor | None = None
-    prefix_seqlens_kv_device: torch.Tensor | None = None
     prefix_max_q_len: int = 0
     prefix_max_seq_len: int = 0
     prefix_block_table: torch.Tensor | None = None
@@ -77,9 +52,6 @@ class BeamAttentionMetadata:
     prefix_cu_seqlens_kv_cpu: list | None = None
 
     # Unique suffix split-gather channels
-    suffix_cu_seqlens_q_device: torch.Tensor | None = None
-    suffix_cu_seqlens_k_device: torch.Tensor | None = None
-    suffix_seqlens_kv_device: torch.Tensor | None = None
     suffix_max_q_len: int = 0
     suffix_max_seq_len: int = 0
     suffix_total_tokens: int = 0
@@ -97,16 +69,13 @@ class BeamAttentionMetadata:
     num_std_indices: int = 0
     num_prefix_indices: int = 0
 
-    scheduler_metadata: dict | None = None
-    prefix_scheduler_metadata: dict | None = None
-    max_num_splits: int = 0
     block_size: int = 16
     num_heads: int = 0
     num_kv_heads: int = 0
 
 
-class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+class BaseBeamAttentionMetadataBuilder(AttentionMetadataBuilder[BaseBeamAttentionMetadata]):
+    metadata_cls: type[BaseBeamAttentionMetadata] = BaseBeamAttentionMetadata
     supports_update_block_table: bool = True
 
     def __init__(
@@ -117,99 +86,65 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        device_type = getattr(device, "type", str(device).partition(":")[0])
-        self._is_cuda = device_type == "cuda"
-        self._is_npu = device_type == "npu"
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
-        self.compilation_config = vllm_config.compilation_config
 
         self.num_heads_q = self.model_config.get_num_attention_heads(self.parallel_config)
         self.num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
         self.kv_cache_dtype = kv_cache_spec.dtype
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
-        self.max_num_splits = 0
-        self.aot_schedule = False
+        self._init_backend_state(vllm_config)
 
-        self.use_full_cuda_graph = self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
+    def _init_backend_state(self, vllm_config: VllmConfig) -> None:
+        del vllm_config
 
-        if self.use_full_cuda_graph and self.aot_schedule:
-            self.scheduler_metadata = torch.zeros(
-                vllm_config.scheduler_config.max_num_seqs + 1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if hasattr(vllm_config, "attention_config") and hasattr(
-                vllm_config.attention_config, "flash_attn_max_num_splits_for_cuda_graph"
-            ):
-                self.max_num_splits = (
-                    vllm_config.attention_config.flash_attn_max_num_splits_for_cuda_graph
-                )
-
-        self.aot_sliding_window: tuple[int, int] | None = None
-
-        if self._is_npu:
-            self.npu_causal_atten_mask = (
-                torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(self.device)
-            )
-        else:
-            self.npu_causal_atten_mask = None
-
-    def _update_aot_schedule(self, fast_build: bool):
-        self.aot_schedule = self.aot_schedule and not fast_build
-        if self.aot_sliding_window is None:
-            self.aot_sliding_window = (-1, -1)
+    def _update_backend_state(self, fast_build: bool) -> None:
+        del fast_build
 
     def _get_max_num_splits(self, num_actual_tokens: int) -> int:
-        max_num_splits = 0
-        if (
-            self.use_full_cuda_graph
-            and self.max_cudagraph_size is not None
-            and num_actual_tokens <= self.max_cudagraph_size
-        ):
-            max_num_splits = self.max_num_splits
+        del num_actual_tokens
+        return 0
 
-        if self._is_cuda and envs.VLLM_BATCH_INVARIANT:
-            max_num_splits = 1
-        return max_num_splits
-
-    def _get_schedule(
+    def _create_std_backend_metadata(
         self,
-        batch_size: int,
-        cu_query_lens: torch.Tensor,
-        max_query_len: int,
-        seqlens: torch.Tensor,
-        max_seq_len: int,
-        causal: bool,
+        std_cu_seqlens_q_cpu: list[int],
+        std_seqlens_kv_cpu: list[int],
+        device: torch.device,
+    ) -> dict[str, object]:
+        del std_cu_seqlens_q_cpu, std_seqlens_kv_cpu, device
+        return {}
+
+    def _create_beam_backend_metadata(
+        self,
+        *,
+        prefix_cu_seqlens_q_cpu: list[int],
+        prefix_seqlens_kv_cpu: list[int],
+        suffix_cu_seqlens_q_cpu: list[int],
+        suffix_cu_seqlens_kv_cpu: list[int],
+        suffix_seqlens_kv_cpu: list[int],
+        prefix_max_q_len: int,
+        prefix_max_seq_len: int,
         max_num_splits: int,
-    ) -> dict | None:
-        if not self.aot_schedule:
-            return None
-
-        cache_dtype = self.cache_config.cache_dtype
-        if cache_dtype.startswith("fp8"):
-            qkv_dtype = _get_fp8_dtype_for_flashattn(cache_dtype)
-        else:
-            qkv_dtype = self.kv_cache_dtype
-
-        return get_scheduler_metadata(
-            batch_size=batch_size,
-            max_seqlen_q=max_query_len,
-            max_seqlen_k=max_seq_len,
-            num_heads_q=self.num_heads_q,
-            num_heads_kv=self.num_kv_heads,
-            headdim=self.headdim,
-            cache_seqlens=seqlens,
-            qkv_dtype=qkv_dtype,
-            cu_seqlens_q=cu_query_lens,
-            page_size=self.block_size,
-            causal=causal,
-            window_size=self.aot_sliding_window,
-            num_splits=max_num_splits,
+        device: torch.device,
+    ) -> dict[str, object]:
+        del (
+            prefix_cu_seqlens_q_cpu,
+            prefix_seqlens_kv_cpu,
+            suffix_cu_seqlens_q_cpu,
+            suffix_cu_seqlens_kv_cpu,
+            suffix_seqlens_kv_cpu,
+            prefix_max_q_len,
+            prefix_max_seq_len,
+            max_num_splits,
+            device,
         )
+        return {}
+
+    def _extra_metadata(self, max_num_splits: int) -> dict[str, object]:
+        del max_num_splits
+        return {}
 
     def _segment_requests(
         self,
@@ -361,7 +296,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 if chunk_budget <= 0:
                     break
 
-                b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+                b_uncached, b_suffix_len, _b_past_suffix, _b_physical = _compute_beam_bounds(
                     b, prefix_len, b_cache_len, steps, chunk_budget
                 )
 
@@ -432,34 +367,31 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         device,
     ):
         if std_seqlens_q_cpu:
-            std_indices_tensor = torch.tensor(std_indices, dtype=torch.long, device=device)
             std_max_q_len = max(std_seqlens_q_cpu)
             std_max_seq_len = max(std_seqlens_kv_cpu)
             num_std_blocks = (std_max_seq_len + self.block_size - 1) // self.block_size
-            std_block_table = common_attn_metadata.block_table_tensor[
-                std_req_idxs, :num_std_blocks
-            ].contiguous()
-
-            if self._is_cuda:
-                std_cu_seqlens_q_device = torch.tensor(
-                    [0] + std_cu_seqlens_q_cpu, dtype=torch.int32, device=device
+            metadata: dict[str, object] = {
+                "std_indices": torch.tensor(std_indices, dtype=torch.long, device=device),
+                "std_max_q_len": std_max_q_len,
+                "std_max_seq_len": std_max_seq_len,
+                "std_block_table": common_attn_metadata.block_table_tensor[
+                    std_req_idxs, :num_std_blocks
+                ].contiguous(),
+            }
+            metadata.update(
+                self._create_std_backend_metadata(
+                    std_cu_seqlens_q_cpu,
+                    std_seqlens_kv_cpu,
+                    device,
                 )
-                std_seqlens_kv_device = torch.tensor(
-                    std_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-            else:  # NPU
-                std_cu_seqlens_q_device = None
-                std_seqlens_kv_device = None
-
-            return (
-                std_indices_tensor,
-                std_cu_seqlens_q_device,
-                std_seqlens_kv_device,
-                std_max_q_len,
-                std_max_seq_len,
-                std_block_table,
             )
-        return None, None, None, 0, 0, None
+            return metadata
+        return {
+            "std_indices": None,
+            "std_max_q_len": 0,
+            "std_max_seq_len": 0,
+            "std_block_table": None,
+        }
 
     def _create_beam_tensors(
         self,
@@ -501,75 +433,49 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 suffix_total_tokens = 0
                 suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
 
-            if self._is_cuda:
-                prefix_seqlens_kv_device = torch.tensor(
-                    prefix_seqlens_kv_cpu, dtype=torch.int32, device=device
+            metadata: dict[str, object] = {
+                "prefix_indices": prefix_indices_tensor,
+                "prefix_max_seq_len": prefix_max_seq_len,
+                "prefix_max_q_len": prefix_max_q_len,
+                "prefix_block_table": prefix_block_table,
+                "suffix_slot_mapping_out": suffix_slot_mapping_out,
+                "suffix_max_seq_len": suffix_max_seq_len,
+                "suffix_total_tokens": suffix_total_tokens,
+                "suffix_max_q_len": suffix_max_q_len,
+            }
+            metadata.update(
+                self._create_beam_backend_metadata(
+                    prefix_cu_seqlens_q_cpu=prefix_cu_seqlens_q_cpu,
+                    prefix_seqlens_kv_cpu=prefix_seqlens_kv_cpu,
+                    suffix_cu_seqlens_q_cpu=suffix_cu_seqlens_q_cpu,
+                    suffix_cu_seqlens_kv_cpu=suffix_cu_seqlens_kv_cpu,
+                    suffix_seqlens_kv_cpu=suffix_seqlens_kv_cpu,
+                    prefix_max_q_len=prefix_max_q_len,
+                    prefix_max_seq_len=prefix_max_seq_len,
+                    max_num_splits=max_num_splits,
+                    device=device,
                 )
-                prefix_cu_seqlens_q_device = torch.tensor(
-                    [0] + prefix_cu_seqlens_q_cpu, dtype=torch.int32, device=device
-                )
-
-                suffix_seqlens_kv_device = torch.tensor(
-                    suffix_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-                suffix_cu_seqlens_q_device = torch.tensor(
-                    [0] + suffix_cu_seqlens_q_cpu, dtype=torch.int32, device=device
-                )
-                suffix_cu_seqlens_k_device = torch.tensor(
-                    [0] + suffix_cu_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-            else:  # NPU
-                prefix_seqlens_kv_device = None
-                prefix_cu_seqlens_q_device = None
-                suffix_seqlens_kv_device = None
-                suffix_cu_seqlens_q_device = None
-                suffix_cu_seqlens_k_device = None
-
-            prefix_scheduler_metadata = self._get_schedule(
-                batch_size=len(prefix_seqlens_q_cpu),
-                cu_query_lens=prefix_cu_seqlens_q_device,
-                max_query_len=prefix_max_q_len,
-                seqlens=prefix_seqlens_kv_device,
-                max_seq_len=prefix_max_seq_len,
-                causal=False,
-                max_num_splits=max_num_splits,
             )
+            return metadata
         else:
-            # Full structured initializations for profiling warm-up model passes
-            prefix_indices_tensor = prefix_seqlens_kv_device = prefix_cu_seqlens_q_device = (
-                prefix_block_table
-            ) = None
-            prefix_max_q_len = prefix_max_seq_len = 0
-            suffix_cu_seqlens_q_device = suffix_cu_seqlens_k_device = suffix_seqlens_kv_device = (
-                suffix_slot_mapping_out
-            ) = None
-            suffix_max_q_len = suffix_max_seq_len = suffix_total_tokens = 0
-            prefix_scheduler_metadata = None
-
-        return (
-            prefix_indices_tensor,
-            prefix_seqlens_kv_device,
-            prefix_max_seq_len,
-            prefix_cu_seqlens_q_device,
-            prefix_max_q_len,
-            prefix_block_table,
-            suffix_seqlens_kv_device,
-            suffix_slot_mapping_out,
-            suffix_max_seq_len,
-            suffix_total_tokens,
-            suffix_cu_seqlens_q_device,
-            suffix_cu_seqlens_k_device,
-            suffix_max_q_len,
-            prefix_scheduler_metadata,
-        )
+            return {
+                "prefix_indices": None,
+                "prefix_max_seq_len": 0,
+                "prefix_max_q_len": 0,
+                "prefix_block_table": None,
+                "suffix_slot_mapping_out": None,
+                "suffix_max_seq_len": 0,
+                "suffix_total_tokens": 0,
+                "suffix_max_q_len": 0,
+            }
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> BeamAttentionMetadata:
-        self._update_aot_schedule(fast_build)
+    ) -> BaseBeamAttentionMetadata:
+        self._update_backend_state(fast_build)
         max_num_splits = self._get_max_num_splits(common_attn_metadata.num_actual_tokens)
         device = self.device
         block_size = self.block_size
@@ -624,14 +530,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             common_attn_metadata,
         )
 
-        (
-            std_indices_tensor,
-            std_cu_seqlens_q_device,
-            std_seqlens_kv_device,
-            std_max_q_len,
-            std_max_seq_len,
-            std_block_table,
-        ) = self._create_std_tensors(
+        std_metadata = self._create_std_tensors(
             std_indices,
             std_seqlens_q_cpu,
             std_cu_seqlens_q_cpu,
@@ -641,22 +540,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             device,
         )
 
-        (
-            prefix_indices_tensor,
-            prefix_seqlens_kv_device,
-            prefix_max_seq_len,
-            prefix_cu_seqlens_q_device,
-            prefix_max_q_len,
-            prefix_block_table,
-            suffix_seqlens_kv_device,
-            suffix_slot_mapping_out,
-            suffix_max_seq_len,
-            suffix_total_tokens,
-            suffix_cu_seqlens_q_device,
-            suffix_cu_seqlens_k_device,
-            suffix_max_q_len,
-            prefix_scheduler_metadata,
-        ) = self._create_beam_tensors(
+        beam_metadata = self._create_beam_tensors(
             common_attn_metadata,
             prefix_indices,
             prefix_seqlens_q_cpu,
@@ -673,66 +557,47 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             max_num_splits,
         )
 
-        meta = BeamAttentionMetadata(
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            max_query_len=common_attn_metadata.max_query_len,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            causal=common_attn_metadata.causal,
-            npu_causal_atten_mask=getattr(self, "npu_causal_atten_mask", None),
-            std_indices=std_indices_tensor,
-            std_cu_seqlens_q_device=std_cu_seqlens_q_device,
-            std_seqlens_kv_device=std_seqlens_kv_device,
-            std_max_q_len=std_max_q_len,
-            std_max_seq_len=std_max_seq_len,
-            std_block_table=std_block_table,
-            std_seqlens_q_cpu=std_seqlens_q_cpu,
-            std_cu_seqlens_q_cpu=std_cu_seqlens_q_cpu,
-            std_seqlens_kv_cpu=std_seqlens_kv_cpu,
-            std_cu_seqlens_kv_cpu=std_cu_seqlens_kv_cpu,
-            std_req_idxs_cpu=std_req_idxs,
-            prefix_req_idxs_cpu=prefix_req_idxs_cpu,
-            max_prefix_blocks_count=max_prefix_blocks_count,
-            prefix_indices=prefix_indices_tensor,
-            prefix_cu_seqlens_q_device=prefix_cu_seqlens_q_device,
-            prefix_seqlens_kv_device=prefix_seqlens_kv_device,
-            prefix_max_q_len=prefix_max_q_len,
-            prefix_max_seq_len=prefix_max_seq_len,
-            prefix_block_table=prefix_block_table,
-            prefix_seqlens_q_cpu=prefix_seqlens_q_cpu,
-            prefix_cu_seqlens_q_cpu=prefix_cu_seqlens_q_cpu,
-            prefix_seqlens_kv_cpu=prefix_seqlens_kv_cpu,
-            prefix_cu_seqlens_kv_cpu=prefix_cu_seqlens_kv_cpu,
-            prefix_scheduler_metadata=prefix_scheduler_metadata,
-            suffix_cu_seqlens_q_device=suffix_cu_seqlens_q_device,
-            suffix_cu_seqlens_k_device=suffix_cu_seqlens_k_device,
-            suffix_seqlens_kv_device=suffix_seqlens_kv_device,
-            suffix_max_q_len=suffix_max_q_len,
-            suffix_max_seq_len=suffix_max_seq_len,
-            suffix_total_tokens=suffix_total_tokens,
-            suffix_slot_mapping_out=suffix_slot_mapping_out,
-            suffix_seqlens_q_cpu=suffix_seqlens_q_cpu,
-            suffix_cu_seqlens_q_cpu=suffix_cu_seqlens_q_cpu,
-            suffix_seqlens_kv_cpu=suffix_seqlens_kv_cpu,
-            suffix_cu_seqlens_kv_cpu=suffix_cu_seqlens_kv_cpu,
-            num_std_indices=len(std_indices) if std_indices else 0,
-            num_prefix_indices=len(prefix_indices) if prefix_indices else 0,
-            max_num_splits=max_num_splits,
-            block_size=block_size,
-            num_heads=self.num_heads_q,
-            num_kv_heads=self.num_kv_heads,
-        )
-        return meta
+        metadata_values: dict[str, object] = {
+            "num_actual_tokens": common_attn_metadata.num_actual_tokens,
+            "max_query_len": common_attn_metadata.max_query_len,
+            "query_start_loc": common_attn_metadata.query_start_loc,
+            "max_seq_len": common_attn_metadata.max_seq_len,
+            "seq_lens": common_attn_metadata.seq_lens,
+            "block_table": common_attn_metadata.block_table_tensor,
+            "slot_mapping": common_attn_metadata.slot_mapping,
+            "causal": common_attn_metadata.causal,
+            "std_seqlens_q_cpu": std_seqlens_q_cpu,
+            "std_cu_seqlens_q_cpu": std_cu_seqlens_q_cpu,
+            "std_seqlens_kv_cpu": std_seqlens_kv_cpu,
+            "std_cu_seqlens_kv_cpu": std_cu_seqlens_kv_cpu,
+            "std_req_idxs_cpu": std_req_idxs,
+            "prefix_req_idxs_cpu": prefix_req_idxs_cpu,
+            "max_prefix_blocks_count": max_prefix_blocks_count,
+            "prefix_seqlens_q_cpu": prefix_seqlens_q_cpu,
+            "prefix_cu_seqlens_q_cpu": prefix_cu_seqlens_q_cpu,
+            "prefix_seqlens_kv_cpu": prefix_seqlens_kv_cpu,
+            "prefix_cu_seqlens_kv_cpu": prefix_cu_seqlens_kv_cpu,
+            "suffix_seqlens_q_cpu": suffix_seqlens_q_cpu,
+            "suffix_cu_seqlens_q_cpu": suffix_cu_seqlens_q_cpu,
+            "suffix_seqlens_kv_cpu": suffix_seqlens_kv_cpu,
+            "suffix_cu_seqlens_kv_cpu": suffix_cu_seqlens_kv_cpu,
+            "num_std_indices": len(std_indices) if std_indices else 0,
+            "num_prefix_indices": len(prefix_indices) if prefix_indices else 0,
+            "block_size": block_size,
+            "num_heads": self.num_heads_q,
+            "num_kv_heads": self.num_kv_heads,
+        }
+        metadata_values.update(std_metadata)
+        metadata_values.update(beam_metadata)
+        metadata_values.update(self._extra_metadata(max_num_splits))
+        return self.metadata_cls(**metadata_values)
 
     def update_block_table(
         self,
-        metadata: BeamAttentionMetadata,
+        metadata: BaseBeamAttentionMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> BeamAttentionMetadata:
+    ) -> BaseBeamAttentionMetadata:
         new_metadata = copy.copy(metadata)
         new_metadata.block_table = blk_table
         new_metadata.slot_mapping = slot_mapping

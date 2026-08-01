@@ -1,5 +1,5 @@
 # vllm-gr shared requirements (all platforms).
-# vllm / torch / vllm-ascend are provided by the base environment.
+# vllm / torch are provided by the base environment.
 
 msgspec
 pandas>=3.0.0
