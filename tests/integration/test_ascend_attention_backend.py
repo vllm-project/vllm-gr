@@ -40,18 +40,15 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
     from vllm_ascend.utils import register_ascend_customop
 
     from vllm_gr._env_check import check_ascend_environment
-    from vllm_gr.platforms.npu import NPU_BACKEND
+    from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
     from vllm_gr.v1 import ascend_compat
     from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
-    from vllm_gr.v1.attention.backends.beam_attn_registration import (
-        register_beam_attention_backend,
-    )
 
     check_ascend_environment(require_npu_platform=True)
 
     config = VllmConfig(attention_config=AttentionConfig())
     config.attention_config.backend = None
-    NPU_BACKEND.configure_engine(config)
+    _apply_npu_default_block_size(config)
 
     # AscendWorker.init_device() registers Ascend ops before model/backend use.
     # This test has no real model_config, so use the registration entry point's
@@ -64,9 +61,7 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
         return_value=False,
     ):
         register_ascend_customop()
-    register_beam_attention_backend()
-    assert ascend_compat.apply_ascend_attention_backend_patch(force=True) == 1
-    assert ascend_compat._ASCEND_ORIGINAL_CACHED_GET_ATTN is not None
+    ascend_compat.apply_ascend_attention_backend_patch(force=True)
     ascend_compat._ASCEND_ORIGINAL_CACHED_GET_ATTN.cache_clear()
 
     selector_config = AttentionSelectorConfig(

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,20 +11,26 @@ import pytest
 import torch
 
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-    BaseBeamAttentionMetadataBuilder,
     BeamAttentionMetadata,
+    BeamAttentionMetadataBuilder,
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 
 
-def _make_builder(block_size: int = 2) -> BaseBeamAttentionMetadataBuilder:
-    builder = object.__new__(BaseBeamAttentionMetadataBuilder)
+def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
+    builder = object.__new__(BeamAttentionMetadataBuilder)
     builder.device = torch.device("cpu")
     builder.block_size = block_size
     builder.aot_schedule = False
     builder.aot_sliding_window = None
+    builder.use_full_cuda_graph = False
+    builder.max_cudagraph_size = None
+    builder.max_num_splits = 0
     builder.num_heads_q = 8
     builder.num_kv_heads = 2
+    builder._is_cuda = False
+    builder._is_npu = False
+    builder.npu_causal_atten_mask = None
     return builder
 
 
@@ -215,24 +220,3 @@ def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:
     assert updated.slot_mapping is new_slots
     assert updated.std_block_table.tolist() == [[10, 11, 12]]
     assert updated.prefix_block_table.tolist() == [[7, 8]]
-
-
-def test_platform_metadata_fields_are_owned_by_concrete_builders() -> None:
-    from vllm_gr.v1.attention.backends.beam_attn_metadata_gpu import (
-        CUDABeamAttentionMetadata,
-        CUDABeamAttentionMetadataBuilder,
-    )
-    from vllm_gr.v1.attention.backends.beam_attn_metadata_npu import (
-        NPUBeamAttentionMetadata,
-        NPUBeamAttentionMetadataBuilder,
-    )
-
-    common_fields = {field.name for field in fields(BeamAttentionMetadata)}
-    assert "npu_causal_atten_mask" not in common_fields
-    assert "prefix_scheduler_metadata" not in common_fields
-    assert "npu_causal_atten_mask" in {field.name for field in fields(NPUBeamAttentionMetadata)}
-    assert "prefix_scheduler_metadata" in {
-        field.name for field in fields(CUDABeamAttentionMetadata)
-    }
-    assert issubclass(CUDABeamAttentionMetadataBuilder, BaseBeamAttentionMetadataBuilder)
-    assert issubclass(NPUBeamAttentionMetadataBuilder, BaseBeamAttentionMetadataBuilder)

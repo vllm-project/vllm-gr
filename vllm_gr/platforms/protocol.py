@@ -7,8 +7,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
-BACKEND_API_VERSION = 1
-
 
 class ModelRunnerPatchHooks(Protocol):
     """Platform-specific hooks used to patch vLLM ModelRunner classes."""
@@ -26,8 +24,8 @@ class ModelRunnerPatchHooks(Protocol):
     ) -> Callable[..., Any]: ...
 
 
-class BeamAttentionHooks(Protocol):
-    """Platform-specific Beam Attention capabilities and execution hooks."""
+class BeamAttentionExecution(Protocol):
+    """Platform-specific Beam Attention execution primitives."""
 
     def is_available(self) -> bool: ...
 
@@ -39,44 +37,6 @@ class BeamAttentionHooks(Protocol):
     ) -> int | None: ...
 
     def supports_sinks(self) -> bool: ...
-
-    def supports_batch_invariance(self) -> bool: ...
-
-    def supports_kv_cache_dtype(self, kv_cache_dtype: Any) -> bool: ...
-
-    def supports_compute_capability(self, capability: Any) -> bool: ...
-
-    def validate_combination(
-        self,
-        head_size: int,
-        dtype: Any,
-        kv_cache_dtype: Any,
-        block_size: int | None,
-        use_mla: bool,
-        has_sink: bool,
-        use_sparse: bool,
-        device_capability: Any,
-    ) -> str | None: ...
-
-    def get_kv_cache_shape(
-        self,
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]: ...
-
-    def get_kv_cache_stride_order(
-        self,
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]: ...
-
-    def split_kv_cache(self, kv_cache: Any) -> tuple[Any, Any]: ...
-
-    def get_kv_scales(self, layer: Any) -> tuple[Any, Any]: ...
-
-    def get_fp8_dtype(self, kv_cache_dtype: str) -> Any: ...
 
     def reshape_and_cache(
         self,
@@ -105,19 +65,12 @@ class BeamAttentionHooks(Protocol):
         alibi_slopes: Any = None,
     ) -> None: ...
 
-    def get_metadata_builder_cls(self) -> type[Any]: ...
-
 
 class GRBackendProvider(Protocol):
     """Process-local provider for one canonical vLLM device type."""
 
     @property
-    def api_version(self) -> int: ...
-
-    @property
     def device_type(self) -> str: ...
-
-    def configure_engine(self, config: Any) -> None: ...
 
     def check_environment(self) -> dict[str, str]: ...
 
@@ -125,6 +78,4 @@ class GRBackendProvider(Protocol):
 
     def get_model_runner_hooks(self) -> ModelRunnerPatchHooks: ...
 
-    def get_attention_hooks(self) -> BeamAttentionHooks: ...
-
-    def release_accelerator_memory(self) -> None: ...
+    def get_attention_execution(self) -> BeamAttentionExecution: ...

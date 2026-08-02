@@ -80,16 +80,18 @@ activate_backend("cuda")
 import vllm_gr.patch
 import vllm_gr.v1.worker.model_runner_patch
 
-new_modules = set(sys.modules) - runtime_baseline
 for module_name in (
     "torch_npu",
     "vllm_ascend",
+):
+    assert module_name not in set(sys.modules) - runtime_baseline, module_name
+
+for module_name in (
     "vllm_gr.v1.ascend_compat",
     "vllm_gr.v1.worker.npu_model_runner_patch",
     "vllm_gr.v1.attention.backends.beam_attn_npu",
-    "vllm_gr.platforms.npu",
 ):
-    assert module_name not in new_modules, module_name
+    assert module_name not in sys.modules, module_name
 """
 
     subprocess.run(
@@ -118,8 +120,8 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 from vllm_gr.platforms import (
+    BackendAlreadyActiveError,
     BackendNotActiveError,
-    UnsupportedBackendError,
     activate_backend,
     activate_current_backend,
     get_active_backend,
@@ -147,7 +149,7 @@ assert get_active_backend().device_type == "cuda"
 
 try:
     activate_backend("npu")
-except UnsupportedBackendError:
+except BackendAlreadyActiveError:
     pass
 else:
     raise AssertionError("child switched active backend")

@@ -358,7 +358,6 @@ def test_plugin_exposes_simple_per_patch_status(
     platforms = import_module("vllm_gr.platforms")
     plugin = import_module("vllm_gr.plugin")
     runtime_patch = import_module("vllm_gr.patch")
-    registration = import_module("vllm_gr.v1.attention.backends.beam_attn_registration")
 
     events: list[str] = []
     report = BeamPatchReport((BeamPatchResult("flat_logprobs", BeamPatchStatus.APPLIED),))
@@ -378,18 +377,12 @@ def test_plugin_exposes_simple_per_patch_status(
 
     configure = mock.Mock(side_effect=lambda: events.append("configure"))
     activate = mock.Mock(side_effect=activate_backend)
-    register_attention = mock.Mock(side_effect=lambda: events.append("register_attention"))
     global_check = mock.Mock()
     reapply = mock.Mock(side_effect=apply_patches)
 
     monkeypatch.setattr(env_check, "configure_model_runner_default", configure)
     monkeypatch.setattr(env_check, "check_environment", global_check)
     monkeypatch.setattr(platforms, "activate_current_backend", activate)
-    monkeypatch.setattr(
-        registration,
-        "register_beam_attention_backend",
-        register_attention,
-    )
     monkeypatch.setattr(runtime_patch, "re_apply_patches", reapply)
     monkeypatch.setattr(
         runtime_patch,
@@ -401,13 +394,7 @@ def test_plugin_exposes_simple_per_patch_status(
 
     reapply.assert_called_once_with()
     global_check.assert_not_called()
-    assert events == [
-        "configure",
-        "activate",
-        "register_attention",
-        "check_environment",
-        "patch",
-    ]
+    assert events == ["configure", "activate", "check_environment", "patch"]
     assert state == {
         "backend": "cuda",
         "patch_count": 1,

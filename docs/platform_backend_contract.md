@@ -5,8 +5,12 @@
 The platform backend boundary separates hardware-neutral vLLM-GR runtime
 orchestration from CUDA- and NPU-specific implementations. A backend provider
 binds an exact canonical vLLM `device_type` to ModelRunner patch hooks,
-Beam Attention capability and execution hooks, environment validation, and any
+Beam Attention execution primitives, environment validation, and any
 platform-specific compatibility patches.
+
+This first-stage contract is additive infrastructure. The production runtime
+continues to use its existing dispatch paths until the later integration
+stages switch them to the provider APIs.
 
 ## Lifecycle and process model
 
@@ -18,10 +22,9 @@ The intended startup sequence is:
 1. Register built-in providers.
 2. Load external providers from Python entry points.
 3. Resolve and activate the provider for `vllm.platforms.current_platform`.
-4. Register the hardware-neutral CUSTOM Beam Attention backend in the process.
-5. Validate the active provider's environment.
-6. Apply the provider's runtime compatibility patches.
-7. Apply hardware-neutral vLLM-GR runtime patches.
+4. Validate the active provider's environment.
+5. Apply the provider's runtime compatibility patches.
+6. Apply hardware-neutral vLLM-GR runtime patches.
 
 Provider resolution and activation must happen before any runtime patch that
 needs platform-specific behavior. Activation does not itself run environment
@@ -39,15 +42,11 @@ they are migrated to the provider boundary.
 
 ## Provider contract
 
-A provider declares the core API version, one canonical `device_type`, and
-the complete lifecycle surface:
+A provider exposes one canonical `device_type` and four methods:
 
 ```python
 class GRBackendProvider(Protocol):
-    api_version: int
     device_type: str
-
-    def configure_engine(self, config: Any) -> None: ...
 
     def check_environment(self) -> dict[str, str]: ...
 
@@ -59,16 +58,13 @@ class GRBackendProvider(Protocol):
 
     def get_model_runner_hooks(self) -> ModelRunnerPatchHooks: ...
 
-    def get_attention_hooks(self) -> BeamAttentionHooks: ...
-
-    def release_accelerator_memory(self) -> None: ...
+    def get_attention_execution(self) -> BeamAttentionExecution: ...
 ```
 
-Core currently defines `BACKEND_API_VERSION = 1`. Registration validates the
-exact API version, `device_type`, and the presence of every callable method.
-It must not invoke the methods. An incompatible version is an explicit error,
-not a CUDA fallback. This preserves lazy imports and allows CUDA and NPU
-providers to coexist in the registry without loading both hardware runtimes.
+Registration validates only `device_type` and the presence of the four
+callable methods. It must not invoke the methods. This preserves lazy imports
+and allows CUDA and NPU providers to coexist in the registry without loading
+both hardware runtimes.
 
 Provider objects are registered directly. Entry points must not expose a
 provider class or an arbitrary factory.
@@ -82,12 +78,10 @@ time.
 
 Hardware-dependent imports belong inside:
 
-- `configure_engine()`;
 - `check_environment()`;
 - `apply_runtime_patches()`;
 - `get_model_runner_hooks()`;
-- `get_attention_hooks()`;
-- `release_accelerator_memory()`.
+- `get_attention_execution()`.
 
 Importing `vllm_gr.platforms` or registering the built-in providers therefore
 has no hardware import side effects and does not mutate the registry unless
@@ -112,45 +106,24 @@ class ModelRunnerPatchHooks(Protocol):
 logic owned by `model_runner_common.py` and remains part of the neutral patch
 orchestrator.
 
-## Beam Attention hooks
+## Beam Attention execution
 
-Platform Attention hooks own both capability policy and execution:
+Platform Attention execution provides:
 
 - `is_available()`;
 - `get_flash_attn_version()`;
-- `supports_batch_invariance()`;
-- `supports_kv_cache_dtype()`;
 - `supports_sinks()`;
-- `supports_compute_capability()`;
-- `validate_combination()`;
-- `get_kv_cache_shape()`;
-- `get_kv_cache_stride_order()`;
-- `split_kv_cache()`;
-- `get_kv_scales()`;
-- `get_fp8_dtype()`;
 - `reshape_and_cache()`;
-- `cascade_attention()`;
-- `get_metadata_builder_cls()`.
+- `cascade_attention()`.
 
 The complete call signatures are defined by
-`vllm_gr.platforms.protocol.BeamAttentionHooks`. The current
+`vllm_gr.platforms.protocol.BeamAttentionExecution`. The current
 `beam_attn_gpu.py` and `beam_attn_npu.py` modules satisfy the contract directly;
 providers return those modules rather than copying or wrapping their kernels.
 
-`beam_attn.py` resolves hooks lazily. Each `BeamAttentionImpl` stores one hook
-object during construction, and its `forward()` hot path never reads the
-provider registry. Backend class methods resolve the active hooks lazily.
-Common Beam segmentation, geometry, mappings, and block-table updates live in
-`beam_attn_metadata.py`. CUDA scheduling/device tensors and the NPU causal-mask
-lifecycle live in their respective `beam_attn_metadata_gpu.py` and
-`beam_attn_metadata_npu.py` builders. The concrete builder is selected through
-the hook contract.
-
-Importing the facade neither activates a provider nor imports CUDA/NPU
-execution modules. It also does not register the CUSTOM backend. CUSTOM
-registration is the hardware-neutral responsibility of
-the process initializer through `beam_attn_registration.py`; the explicit
-EngineCore patch plan retains a verifier and repair step.
+Metadata construction, KV memory management, and the shared execute-model
+wrapper are deliberately outside this contract until their owning migration
+stages define stable boundaries.
 
 ## External provider entry points
 
@@ -158,7 +131,7 @@ External packages register provider objects in this entry-point group:
 
 ```toml
 [project.entry-points."vllm_gr.platform_backends"]
-npu = "vllm_gr.platforms.npu:NPU_BACKEND"
+npu = "vllm_gr_npu.provider:NPU_BACKEND"
 ```
 
 The entry-point name must exactly equal `provider.device_type`. Providers are
@@ -170,27 +143,24 @@ Plugin discovery validates the complete batch before committing registrations,
 so a failing entry point does not leave an earlier provider partially
 registered.
 
-Core registers only CUDA as a built-in. The current distribution exposes its
-NPU provider through this entry point, matching the loading behavior of the
-future separately distributed package.
-
-## Current provider mappings
+## Current built-in mappings
 
 | Provider method | CUDA mapping | NPU mapping |
 | --- | --- | --- |
-| `api_version` | `BACKEND_API_VERSION` | `BACKEND_API_VERSION` |
 | `device_type` | `cuda` | `npu` |
-| `configure_engine()` | No-op | Ascend block-size default, preserving explicit and hybrid-model values |
 | `check_environment()` | Validate current CUDA platform, then `check_runtime_versions()` | `check_ascend_environment(require_npu_platform=True)` |
 | `apply_runtime_patches()` | No-op | Ascend Attention selector patch, then NPUWorker initialization hook; return the summed patch count |
 | `get_model_runner_hooks()` | `gpu_model_runner_patch` | `npu_model_runner_patch` |
-| `get_attention_hooks()` | `beam_attn_gpu` | `beam_attn_npu` |
-| `release_accelerator_memory()` | Release CUDA cache and IPC state | Release NPU cache state |
+| `get_attention_execution()` | `beam_attn_gpu` | `beam_attn_npu` |
 
-## NPU provider detachability regression
+The NPU provider is built in during the initial migration so the contract is
+exercised against all current Ascend requirements. A later stage may move it
+to a separately distributed package.
 
-Regression coverage removes or injects the external `npu` entry point and
-exercises the same contract:
+## Regression after removing the built-in NPU provider
+
+When the built-in NPU provider is removed, regression coverage must install or
+inject an external `npu` entry point and rerun the same contract tests:
 
 1. Importing and registering core built-ins still loads no NPU modules.
 2. The external `npu` provider resolves and activates for the canonical NPU
@@ -198,8 +168,7 @@ exercises the same contract:
 3. Its environment check delegates to the complete Ascend validation.
 4. Its selector patch runs before the NPUWorker hook and patch counts are
    summed.
-5. Its getters lazily return the NPU ModelRunner and Attention hook modules,
-   including the NPU Metadata Builder.
-6. Configuration and shutdown delegate to the Provider.
-7. An NPU process without the external package fails with an explicit
+5. Its getters lazily return the NPU ModelRunner and Attention execution
+   modules.
+6. An NPU process without the external package fails with an explicit
    unsupported-backend error and never falls back to CUDA.

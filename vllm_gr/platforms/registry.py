@@ -10,19 +10,16 @@ from .errors import (
     BackendAlreadyActiveError,
     BackendNotActiveError,
     DuplicateBackendRegistrationError,
-    IncompatibleBackendAPIError,
     InvalidBackendProviderError,
     UnsupportedBackendError,
 )
-from .protocol import BACKEND_API_VERSION, GRBackendProvider
+from .protocol import GRBackendProvider
 
 _REQUIRED_PROVIDER_METHODS = (
-    "configure_engine",
     "check_environment",
     "apply_runtime_patches",
     "get_model_runner_hooks",
-    "get_attention_hooks",
-    "release_accelerator_memory",
+    "get_attention_execution",
 )
 
 _BACKENDS: dict[str, GRBackendProvider] = {}
@@ -65,15 +62,6 @@ def _validate_backend_provider(provider: Any, *, source: str) -> str:
         raise InvalidBackendProviderError(
             "Backend entry must be a provider object, not a class; "
             f"source={source!r}; {_registry_context()}"
-        )
-
-    api_version = getattr(provider, "api_version", None)
-    if type(api_version) is not int or api_version != BACKEND_API_VERSION:
-        raise IncompatibleBackendAPIError(
-            "Backend provider API version is incompatible; "
-            f"provider_api_version={api_version!r}; "
-            f"core_api_version={BACKEND_API_VERSION!r}; source={source!r}; "
-            f"{_registry_context()}"
         )
 
     device_type = getattr(provider, "device_type", None)
@@ -186,16 +174,9 @@ def get_active_backend() -> GRBackendProvider:
 
 
 def _reset_backend_registry_for_tests() -> None:
-    """Clear process-local backend discovery state for isolated tests."""
+    """Clear process-local backend state for isolated tests."""
     global _ACTIVE_BACKEND
 
     _BACKENDS.clear()
     _BACKEND_SOURCES.clear()
     _ACTIVE_BACKEND = None
-
-    # Registry contents and the loader's completion marker form one logical
-    # state. Leaving the marker set after clearing registrations makes the
-    # next activation skip entry-point discovery and exposes only built-ins.
-    from . import loader
-
-    loader._PLUGINS_LOADED = False

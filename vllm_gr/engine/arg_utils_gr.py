@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import json
+import logging
 from collections.abc import Mapping
 from typing import Final
 
@@ -13,6 +14,7 @@ from vllm_gr.config import GRAttentionBackend, GRConfig
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
 origin_from_cli_args = EngineArgs.from_cli_args.__func__
+logger = logging.getLogger("vllm_gr.engine.arg_utils_gr")
 _NESTED_ATTENTION_BACKEND_EXPLICIT_ATTR: Final = "_vllm_gr_nested_attention_backend_explicit"
 
 
@@ -118,11 +120,43 @@ def _explicit_gr_attention_backend(
     return False, None
 
 
+def _apply_npu_default_block_size(config) -> None:
+    """Use an Ascend-compatible default without overriding user intent.
+
+    vLLM 0.22 resolves an unspecified block size to 16 before the Ascend
+    platform hook runs. vLLM-Ascend 0.22.1rc1 keeps that value when both
+    chunked prefill and prefix caching are disabled, although its standard
+    attention backends require a kernel block size of 128.
+    """
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return
+    if getattr(current_platform, "device_type", None) != "npu":
+        return
+
+    cache_config = getattr(config, "cache_config", None)
+    model_config = getattr(config, "model_config", None)
+    if cache_config is None:
+        return
+    if getattr(cache_config, "user_specified_block_size", False):
+        return
+    # Hybrid attention/state models have model-specific cache sizing rules in
+    # vLLM-Ascend and must not be forced onto the dense-attention default.
+    if model_config is not None and getattr(model_config, "is_hybrid", False):
+        return
+    if cache_config.block_size != 128:
+        logger.info(
+            "Using Ascend-compatible default KV cache block size 128 "
+            "(vLLM resolved the unspecified value to %s).",
+            cache_config.block_size,
+        )
+        cache_config.block_size = 128
+
+
 def create_engine_config(self, usage_context=None, headless=False):
     config = origin_create_engine_config(self, usage_context, headless)
-    from vllm_gr.platforms import activate_current_backend
-
-    activate_current_backend().configure_engine(config)
+    _apply_npu_default_block_size(config)
     # Parse unconditionally so invalid raw vllm_gr_* options fail before
     # the EngineConfig is returned and before runtime execution begins.
     existing_gr_config = GRConfig.from_vllm_config(config)

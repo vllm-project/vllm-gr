@@ -5,14 +5,10 @@ verified_baseline:
   vllm_ascend: "0.22.1rc1"
 
 backend_provider:
-  api_version: 1
   protocol: vllm_gr.platforms.protocol.GRBackendProvider
   registry: vllm_gr.platforms.registry
   activation: vllm_gr.platforms.loader.activate_current_backend
   process_local: true
-  builtin_backends: [cuda]
-  external_entry_points:
-    npu: vllm_gr.platforms.npu:NPU_BACKEND
 
 patches:
   - id: GR-PATCH-000
@@ -199,8 +195,8 @@ patches:
   - id: GR-PATCH-013
     owner: vllm_gr/v1/attention/backends/beam_attn_registration.py and beam_attn.py
     installer: vllm_gr.v1.attention.backends.beam_attn_registration.register_beam_attention_backend
-    activation: process backend initialization registers CUSTOM explicitly; the EngineCore patch plan verifies and repairs the slot
-    provider_migration: attention-hooks-and-metadata-builders-routed-through-provider
+    activation: the EngineCore patch plan detects that the process-local CUSTOM slot does not resolve to BeamAttentionBackend
+    provider_migration: deferred-to-s3
     validator_or_test:
       - vllm_gr.patch._validate_beam_attention_backend_registration
       - tests/test_patch_initialization.py::test_engine_core_plan_registers_custom_attention_backend
@@ -212,14 +208,10 @@ patches:
     risk: high
     contract: custom-attention-registry
     ownership:
-      common_metadata: vllm_gr.v1.attention.backends.beam_attn_metadata
-      cuda_metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata_gpu
-      npu_metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata_npu
-      gpu_hooks: vllm_gr.v1.attention.backends.beam_attn_gpu
-      npu_hooks: vllm_gr.v1.attention.backends.beam_attn_npu
-      backend_registration: vllm_gr.v1.attention.backends.beam_attn_registration
-      compatibility_facade: vllm_gr.v1.attention.backends.beam_attn
-      import_time_registration: false
+      metadata_builder: vllm_gr.v1.attention.backends.beam_attn_metadata
+      gpu_execution: vllm_gr.v1.attention.backends.beam_attn_gpu
+      npu_execution: vllm_gr.v1.attention.backends.beam_attn_npu
+      backend_registration_and_facade: vllm_gr.v1.attention.backends.beam_attn
       compatibility_exports:
         - BeamAttentionMetadata
         - BeamAttentionMetadataBuilder
