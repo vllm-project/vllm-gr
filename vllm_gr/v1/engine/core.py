@@ -49,12 +49,36 @@ def _cache_beam_request(self, request) -> None:
     """Cache Request state for later beam forking.
 
     Thread-safe: uses beam_cache_lock to prevent data races.
+
+    When the prompt length is not a multiple of the KV-cache block size,
+    the last partial block would normally remain unhashed and therefore
+    uncacheable.  We temporarily extend ``request._all_token_ids`` in-place
+    to the next block boundary so that ``update_block_hashes()`` (which reads
+    via ConstantList wrapper ``request.all_token_ids``) sees a complete last
+    block and produces its hash.  We then revert ``request._all_token_ids``
+    in-place so prefill execution runs strictly on original tokens.
     """
     _ensure_beam_state(self)
+
+    # Make a clean, un-mutatable copy of the original prompt token IDs
+    raw_token_ids = list(request._all_token_ids)
+    block_hasher = getattr(self, "request_block_hasher", None)
+    block_size = getattr(self.vllm_config.cache_config, "block_size", 16)
+    pad_len = (-len(raw_token_ids)) % block_size
+
+    if pad_len > 0 and block_hasher is not None:
+        # Extend in-place so ConstantList (request.all_token_ids) sees full block
+        request._all_token_ids.extend([0] * pad_len)
+        request._block_hasher = block_hasher
+        request.update_block_hashes()
+        # Remove pad tokens in-place before prefill execution
+        del request._all_token_ids[len(raw_token_ids):]
+
     with self.beam_cache_lock:
         self.beam_cache[request.request_id] = {
-            "all_token_ids": list(request._all_token_ids),
+            "all_token_ids": list(raw_token_ids),
             "block_hashes": list(request.block_hashes),
+            "num_pad_tokens": pad_len,
             "eos_token_id": request.sampling_params.eos_token_id
             if request.sampling_params is not None
             else None,
