@@ -33,9 +33,6 @@ class BeamSearchParams(
 
     begin_token: str | None = None
     end_token: str | None = None
-    # Per-level expansion widths for hierarchical SID models. Keeping this
-    # optional preserves the existing OneRec call contract.
-    branch_factors: tuple[int, int, int] | None = None
     # Controls behavior when a beam has no valid catalog token in the model's
     # top-K logprobs (all logprobs filtered to -inf).
     # "fill": fill logprob slots with valid catalog tokens at low score.
