@@ -49,6 +49,14 @@ refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark related test 
 - Please refer to [offline inference](examples/offline_inference/beam_search/README.md) for offline beam search example.
 - Please refer to [online inference](examples/online_serving/beam_search/README.md) for online inference example.
 
+### RECIF checkpoint conversion
+
+The original RECIF `_model_rank0.pt` and `external_rank0.pt` files are training
+artifacts and are not converted during inference. Convert them once with
+`tools/convert_recif_checkpoint.py`, then pass the generated Hugging Face
+checkpoint directory to offline inference or serving. See the
+[beam-search example](examples/offline_inference/beam_search/README.md#recif).
+
 ## Uninstall
 
 ```bash

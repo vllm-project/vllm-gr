@@ -25,7 +25,6 @@ import numpy as np
 from tqdm.auto import tqdm
 from vllm.entrypoints.generate.beam_search.utils import (
     BeamSearchInstance,
-    BeamSearchOutput,
     BeamSearchSequence,
 )
 from vllm.entrypoints.llm import LLM
@@ -42,10 +41,14 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
-from vllm_gr.logger import init_logger
-from vllm_gr.logprobs import (
-    reconstruct_beam_logprobs,
+from vllm_gr.beam_search_step import apply_beam_search_step
+from vllm_gr.entrypoints.beam_search_config import (
+    BeamSearchStep,
+    build_beam_search_steps,
+    select_best_beams,
 )
+from vllm_gr.logger import init_logger
+from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.utils.catalog import Catalog
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
@@ -71,6 +74,23 @@ ForkInfo = list[tuple[int, int]]
 def _create_tokens_prompt_from_beam(beam: "BeamSearchSequence") -> "TokensPrompt":
     """Create a TokensPrompt payload from a BeamSearchSequence."""
     return beam.get_prompt()
+
+
+def _build_step_sampling_params(
+    step: BeamSearchStep,
+    temperature: float,
+) -> SamplingParams:
+    """Create the identical per-level sampling policy for both backends."""
+
+    return SamplingParams(
+        logprobs=step.expand_width,
+        max_tokens=1,
+        temperature=temperature,
+        skip_clone=True,
+        detokenize=False,
+        flat_logprobs=True,
+        allowed_token_ids=step.allowed_token_ids,
+    )
 
 
 def _beam_request_cleanup(llm_engine, session_id: str, final_ids: list[str]) -> None:
@@ -99,9 +119,8 @@ def _prepare_beam_step_requests(
     instances_batch: list["BeamSearchInstance"],
     token: int,
     prompt_start: int,
-    tokenizer,
     beam_search_params: "SamplingParams",
-    sid_end_token_id: int | None,
+    eos_token_id: int | None,
     instance_prefill_id: dict[int, str],
     instance_prev_beam_internal_ids: dict[int, list[str]],
     instance_fork_info: dict[int, ForkInfo],
@@ -144,9 +163,6 @@ def _prepare_beam_step_requests(
             # One grouped-beam execution is one logical upstream request.
             # Beam width travels separately in BeamRequestStepUpdate.
             decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params)
-            eos_token_id = (
-                sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
-            )
             decode_sampling_params.update_from_generation_config({}, eos_token_id)
 
             # Register beam output
@@ -177,9 +193,7 @@ def _prepare_beam_step_requests(
                 prefix_len=prefix_len,
                 beam_width=W,
                 sampling_params=decode_sampling_params,
-                eos_token_id=sid_end_token_id
-                if sid_end_token_id is not None
-                else tokenizer.eos_token_id,
+                eos_token_id=eos_token_id,
                 lora_request=instance.beams[0].lora_request,
             )
             llm_engine.engine_core.beam_request_step_update(update)
@@ -329,15 +343,13 @@ def _parse_step_logprobs(
 def _custom_beam_search_batch(
     llm_engine,
     instances_batch: list[BeamSearchInstance],
-    token_iter,
+    steps: Sequence[BeamSearchStep],
     prompt_start: int,
-    tokenizer,
-    beam_width: int,
-    beam_search_params: SamplingParams,
-    sid_end_token_id: int | None,
+    temperature: float,
+    eos_token_id: int | None,
     ignore_eos: bool,
     initial_logprobs: "FlatLogprobs",
-    logprobs_num: int,
+    use_tqdm: bool,
     catalog: Optional[Any] = None,
     catalog_strategy: str = "fill",
 ) -> None:
@@ -348,7 +360,15 @@ def _custom_beam_search_batch(
     instance_prefix_len: dict[int, int] = {}
     instance_completed_sessions: set[int] = set()
 
-    for token in token_iter:
+    step_iter: Any = enumerate(steps)
+    if use_tqdm:
+        step_iter = enumerate(tqdm(steps, desc="Beam search", unit="token", unit_scale=False))
+        logger.warning(
+            "The progress bar shows the upper bound on token steps and may "
+            "finish early due to stopping conditions."
+        )
+
+    for token, step in step_iter:
         # Check if all instances are done
         all_done = True
         for instance in instances_batch:
@@ -358,15 +378,16 @@ def _custom_beam_search_batch(
         if all_done:
             break
 
+        beam_search_params = _build_step_sampling_params(step, temperature)
+
         # Step 1: Prepare and update requests
         engine_core_requests = _prepare_beam_step_requests(
             llm_engine=llm_engine,
             instances_batch=instances_batch,
             token=token,
             prompt_start=prompt_start,
-            tokenizer=tokenizer,
             beam_search_params=beam_search_params,
-            sid_end_token_id=sid_end_token_id,
+            eos_token_id=eos_token_id,
             instance_prefill_id=instance_prefill_id,
             instance_prev_beam_internal_ids=instance_prev_beam_internal_ids,
             instance_fork_info=instance_fork_info,
@@ -408,7 +429,7 @@ def _custom_beam_search_batch(
                     result=result,
                     instance=instance,
                     token=token,
-                    logprobs_num=logprobs_num,
+                    logprobs_num=step.expand_width,
                     fork_info_j=instance_fork_info.get(j),
                     catalog=catalog,
                     catalog_strategy=catalog_strategy,
@@ -428,21 +449,21 @@ def _custom_beam_search_batch(
             all_beams_token_id = np.array(all_beams_token_id)
             all_beams_logprob = np.array(all_beams_logprob)
             all_beams_beam_idx_arr = np.array(all_beams_beam_idx, dtype=np.intp)
-            if not ignore_eos:
+            if not ignore_eos and eos_token_id is not None:
                 eos_beams, all_beams_logprob = complete_eos_candidates(
                     parents=instance.beams,
                     token_ids=all_beams_token_id,
                     scores=all_beams_logprob,
                     beam_idx=all_beams_beam_idx_arr,
                     beam_flat_cache=beam_flat_cache,
-                    stop_token_ids={tokenizer.eos_token_id},
+                    stop_token_ids={eos_token_id},
                     initial_logprobs=initial_logprobs,
                     include_eos_token=True,
                     inherit_lora_request=True,
                 )
                 instance.completed.extend(eos_beams)
 
-            topn_idx = select_top_indices(all_beams_logprob, beam_width, catalog_strategy)
+            topn_idx = select_top_indices(all_beams_logprob, step.keep_width, catalog_strategy)
             new_beams, fork_info = materialize_selected_beams(
                 parents=instance.beams,
                 selected_indices=topn_idx,
@@ -464,6 +485,73 @@ def _custom_beam_search_batch(
                 instance_prev_beam_internal_ids[j],
             )
             instance_completed_sessions.add(j)
+
+
+def _run_beam_search_steps(
+    llm: "GRLLM",
+    instances_batch: list[BeamSearchInstance],
+    steps: Sequence[BeamSearchStep],
+    *,
+    temperature: float,
+    initial_logprobs: "FlatLogprobs",
+    eos_token_id: int | None,
+    ignore_eos: bool,
+    catalog: Any | None,
+    catalog_strategy: str,
+    use_tqdm: bool,
+) -> None:
+    """Run the shared expand, score and prune loop through ``LLM.generate``."""
+
+    import itertools
+
+    step_iter: Any = steps
+    if use_tqdm:
+        step_iter = tqdm(steps, desc="Beam search", unit="token", unit_scale=False)
+        logger.warning(
+            "The progress bar shows the upper bound on token steps and may "
+            "finish early due to stopping conditions."
+        )
+
+    for step in step_iter:
+        all_beams: list[BeamSearchSequence] = list(
+            sum((instance.beams for instance in instances_batch), [])
+        )
+        if not all_beams:
+            break
+        positions = [0] + list(
+            itertools.accumulate(len(instance.beams) for instance in instances_batch)
+        )
+        instance_ranges = list(zip(positions[:-1], positions[1:]))
+
+        sampling_params = _build_step_sampling_params(step, temperature)
+        prompts_batch, lora_req_batch = zip(
+            *[(_create_tokens_prompt_from_beam(beam), beam.lora_request) for beam in all_beams]
+        )
+        output = llm.generate(
+            prompts_batch,
+            sampling_params=sampling_params,
+            use_tqdm=False,
+            lora_request=lora_req_batch,
+        )
+
+        for (start, end), instance in zip(instance_ranges, instances_batch):
+            parents = all_beams[start:end]
+            allowed = None
+            if catalog is not None:
+                allowed = [catalog.valid(beam.tokens[instance.prompt_len :]) for beam in parents]
+            transition = apply_beam_search_step(
+                parents,
+                output[start:end],
+                step,
+                initial_logprobs,
+                allowed_token_ids_by_parent=allowed,
+                stop_token_ids=(
+                    {eos_token_id} if eos_token_id is not None and not ignore_eos else None
+                ),
+                catalog_strategy=catalog_strategy,
+            )
+            instance.beams = transition.active
+            instance.completed.extend(transition.completed)
 
 
 class GRLLM(LLM):
@@ -512,65 +600,101 @@ class GRLLM(LLM):
         Generate sequences using beam search.
 
         Args:
-            prompts: A list of prompts. Each prompt can be a string or a list
-                of token IDs.
+            prompts: Standard vLLM text or token-ID prompts. Model-specific
+                semantic inputs must be converted by the caller.
             params: The beam search parameters.
             lora_request: LoRA request to use for generation, if any.
             use_tqdm: Whether to use tqdm to display the progress bar.
             concurrency_limit: The maximum number of concurrent requests.
                 If None, the number of concurrent requests is unlimited.
         """
-        # Lazy imports for beam search dependencies
-        import itertools
-
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?
         logger.debug("Called beam_search")
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         temperature = params.temperature
-        ignore_eos = params.ignore_eos
-        begin_token = params.begin_token if hasattr(params, "begin_token") else None
-        end_token = params.end_token if hasattr(params, "end_token") else None
+        begin_token = getattr(params, "begin_token", None)
+        end_token = getattr(params, "end_token", None)
         catalog_strategy = getattr(params, "catalog_strategy", "fill")
 
-        tokenizer = self.get_tokenizer()
+        model_config = self.llm_engine.model_config
+        tokenizer = None
+        if not getattr(model_config, "skip_tokenizer_init", False):
+            tokenizer = self.get_tokenizer()
+
+        if tokenizer is None and (begin_token is not None or end_token is not None):
+            raise ValueError("begin_token and end_token require an initialized tokenizer")
+
         sid_begin_token_id: int | None = None
-        if begin_token is not None:
+        if begin_token is not None and tokenizer is not None:
             sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
             if sid_begin_token_id is None or sid_begin_token_id == -1:
                 logger.warning(
-                    f"begin_token must be a valid token in the tokenizer vocabulary, got token {begin_token}"
+                    "begin_token must be a valid token in the tokenizer "
+                    f"vocabulary, got token {begin_token}"
                 )
                 sid_begin_token_id = None
+
         sid_end_token_id: int | None = None
-        if end_token is not None:
+        if end_token is not None and tokenizer is not None:
             sid_end_token_id = tokenizer.convert_tokens_to_ids(end_token)
             if sid_end_token_id is None or sid_end_token_id == -1:
                 logger.warning(
-                    f"end_token must be a valid token in the tokenizer vocabulary, got token {end_token}"
+                    "end_token must be a valid token in the tokenizer "
+                    f"vocabulary, got token {end_token}"
                 )
                 sid_end_token_id = None
 
+        engine_inputs = []
+        generated_starts: list[int] = []
+        decode_prompt_ends: list[int] = []
+        for prompt in self._preprocess_cmpl(prompts):
+            if prompt["type"] == "embeds":
+                raise NotImplementedError("Embedding prompt not supported for beam search")
+            engine_prompt = copy.deepcopy(prompt)
+            decoder_prompt = (
+                engine_prompt
+                if engine_prompt["type"] != "enc_dec"
+                else engine_prompt["decoder_prompt"]
+            )
+            prompt_token_ids = decoder_prompt["prompt_token_ids"]
+            generated_starts.append(len(prompt_token_ids))
+            if sid_begin_token_id is not None:
+                prompt_token_ids = list(prompt_token_ids)
+                prompt_token_ids.append(sid_begin_token_id)
+                decoder_prompt["prompt_token_ids"] = prompt_token_ids
+            decode_prompt_ends.append(len(prompt_token_ids))
+            engine_inputs.append(engine_prompt)
+
+        pre_calc = int(sid_begin_token_id is not None) + int(sid_end_token_id is not None)
+        if max_tokens < pre_calc:
+            logger.warning(
+                "max_tokens is less than the number of tokens to be "
+                "pre-calculated. Setting max_tokens to the number of "
+                "pre-calculated tokens."
+            )
+            max_tokens = pre_calc
+
+        architectures = getattr(model_config, "architectures", None) or []
+        steps = build_beam_search_steps(
+            architectures,
+            max_tokens - pre_calc,
+            beam_width,
+        )
+        ignore_eos = params.ignore_eos
+        catalog = self.catalog
+
         if use_tqdm and concurrency_limit is not None:
             logger.warning(
-                "Progress bar is not supported when using concurrency_limit. Disabling progress bar."
+                "Progress bar is not supported when using concurrency_limit. "
+                "Disabling progress bar."
             )
             use_tqdm = False
 
         if concurrency_limit is None:
             concurrency_limit = len(prompts)
 
-        logprobs_num = beam_width
-        # generate beam_width candidates at each step
-        beam_search_params = SamplingParams(
-            logprobs=logprobs_num,
-            max_tokens=1,
-            temperature=temperature,
-            skip_clone=True,  # Internal beam search, safe to skip clone
-            detokenize=False,
-            flat_logprobs=True,
-        )
         # NOTE: FlatLogprobs intentionally passed where BeamSearchSequence
         # expects list[dict[int, Logprob]].  Intermediate logprobs are never
         # read as dicts; the final beam.logprobs is replaced during
@@ -582,27 +706,8 @@ class GRLLM(LLM):
             initial_logprobs.append_fast([sid_begin_token_id], [0.0], [None], [None])
 
         instances: list[BeamSearchInstance] = []
-        engine_inputs = self._preprocess_cmpl(prompts)
         lora_requests = self._lora_request_to_seq(lora_request, len(engine_inputs))
-
-        for lora_req, prompt in zip(lora_requests, engine_inputs):
-            if prompt["type"] == "embeds":
-                raise NotImplementedError("Embedding prompt not supported for beam search")
-
-            engine_prompt = copy.deepcopy(prompt)
-            decoder_prompt = (
-                engine_prompt
-                if engine_prompt["type"] != "enc_dec"
-                else engine_prompt["decoder_prompt"]
-            )
-            prompt_tokens = decoder_prompt["prompt_token_ids"]
-
-            if sid_begin_token_id is not None or sid_end_token_id is not None:
-                prompt_tokens = list(prompt_tokens)
-                if sid_begin_token_id is not None:
-                    prompt_tokens.append(sid_begin_token_id)
-                decoder_prompt["prompt_token_ids"] = prompt_tokens
-
+        for index, (lora_req, engine_prompt) in enumerate(zip(lora_requests, engine_inputs)):
             instance = BeamSearchInstance(
                 engine_prompt,
                 lora_request=lora_req,
@@ -614,27 +719,9 @@ class GRLLM(LLM):
             # dynamic attrs will break — upstream the fields if that happens.
             instance.beams[0]._lp_parent = None
             instance.beams[0]._lp_step_data = None
-            instance.prompt_len = (
-                len(prompt_tokens) - 1 if sid_begin_token_id is not None else len(prompt_tokens)
-            )
+            instance.prompt_len = generated_starts[index]
             instances.append(instance)
 
-        # Cache decoded prompt text and token length for each instance to optimize final decoding
-        cached_prompts = []
-        for instance in instances:
-            prompt_tokens = instance.beams[0].tokens
-            prompt_text = tokenizer.decode(prompt_tokens)
-            cached_prompts.append({"text": prompt_text, "len": len(prompt_tokens)})
-
-        pre_calc = 0 if sid_begin_token_id is None else 1
-        if sid_end_token_id is not None:
-            pre_calc += 1
-        if max_tokens - pre_calc < 0:
-            logger.warning(
-                "max_tokens is less than the number of tokens to be pre-calculated. "
-                "Setting max_tokens to the number of pre-calculated tokens."
-            )
-            max_tokens = pre_calc
         vllm_config = getattr(self.llm_engine, "vllm_config", None)
         attention_backend = None
         if vllm_config is not None and hasattr(vllm_config, "attention_config"):
@@ -643,171 +730,63 @@ class GRLLM(LLM):
             "CUSTOM" in str(attention_backend).upper()
             or getattr(attention_backend, "name", "").upper() == "CUSTOM"
         )
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        eos_token_id = getattr(hf_text_config, "eos_token_id", None)
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_id = eos_token_id[0] if eos_token_id else None
+        if sid_end_token_id is not None:
+            eos_token_id = sid_end_token_id
         for prompt_start in range(0, len(prompts), concurrency_limit):
             instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
-
-            token_iter = range(max_tokens - pre_calc)
-            if use_tqdm:
-                token_iter = tqdm(token_iter, desc="Beam search", unit="token", unit_scale=False)
-                logger.warning(
-                    "The progress bar shows the upper bound on token steps and "
-                    "may finish early due to stopping conditions. It does not "
-                    "reflect instance-level progress."
-                )
             if use_custom_attn:
                 _custom_beam_search_batch(
                     llm_engine=self.llm_engine,
                     instances_batch=instances_batch,
-                    token_iter=token_iter,
+                    steps=steps,
                     prompt_start=prompt_start,
-                    tokenizer=tokenizer,
-                    beam_width=beam_width,
-                    beam_search_params=beam_search_params,
-                    sid_end_token_id=sid_end_token_id,
+                    temperature=temperature,
+                    eos_token_id=eos_token_id,
                     ignore_eos=ignore_eos,
                     initial_logprobs=initial_logprobs,
-                    logprobs_num=logprobs_num,
-                    catalog=self.catalog,
+                    use_tqdm=use_tqdm,
+                    catalog=catalog,
                     catalog_strategy=catalog_strategy,
                 )
             else:
-                for _ in token_iter:
-                    all_beams: list[BeamSearchSequence] = list(
-                        sum((instance.beams for instance in instances_batch), [])
-                    )
-                    pos = [0] + list(
-                        itertools.accumulate(len(instance.beams) for instance in instances_batch)
-                    )
-                    instance_start_and_end: list[tuple[int, int]] = list(zip(pos[:-1], pos[1:]))
+                _run_beam_search_steps(
+                    self,
+                    instances_batch,
+                    steps,
+                    temperature=temperature,
+                    initial_logprobs=initial_logprobs,
+                    eos_token_id=eos_token_id,
+                    ignore_eos=ignore_eos,
+                    catalog=catalog,
+                    catalog_strategy=catalog_strategy,
+                    use_tqdm=use_tqdm,
+                )
 
-                    if len(all_beams) == 0:
-                        break
-
-                    # create corresponding batch entries for prompt & optional lora
-                    prompts_batch, lora_req_batch = zip(
-                        *[
-                            (_create_tokens_prompt_from_beam(beam), beam.lora_request)
-                            for beam in all_beams
-                        ]
-                    )
-
-                    # only runs for one step
-                    # we don't need to use tqdm here
-                    output = self.generate(
-                        prompts_batch,
-                        sampling_params=beam_search_params,
-                        use_tqdm=False,
-                        lora_request=lora_req_batch,
-                    )
-
-                    # Validate generated tokens using catalog if available
-                    valid_tokens_sets = []
-                    has_catalog = getattr(self, "catalog", None) is not None
-                    if has_catalog:
-                        for instance in instances_batch:
-                            prompt_len = instance.prompt_len
-                            for beam in instance.beams:
-                                generated_tokens = beam.tokens[prompt_len:]
-                                valid_tokens_sets.append(self.catalog.valid(generated_tokens))
-
-                    for (start, end), instance in zip(instance_start_and_end, instances_batch):
-                        # Gather all logprobs and cumulative scores for this instance
-                        all_beams_token_id = []
-                        all_beams_logprob = []
-                        # Explicit beam index for each entry in all_beams_token_id/logprob.
-                        # Replaces idx // logprobs_num so that null-strategy beams (empty lists)
-                        # don't shift the mapping for subsequent beams.
-                        all_beams_beam_idx: list[int] = []
-                        beam_flat_cache: list[tuple | None] = []
-                        beam_outputs = output[start:end]  # outputs for this instance's beams
-
-                        for i, (current_beam, result) in enumerate(
-                            zip(all_beams[start:end], beam_outputs)
-                        ):
-                            if result.outputs[0].logprobs is not None:
-                                flat = result.outputs[0].logprobs
-                                token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
-                                    extract_and_dedup_flat_logprobs(flat, logprobs_num)
-                                )
-                                if has_catalog:
-                                    valid_tokens_set = valid_tokens_sets[start + i]
-                                    logprobs_pos = mask_candidate_logprobs(
-                                        token_ids_pos,
-                                        logprobs_pos,
-                                        valid_tokens_set,
-                                    )
-                                beam_flat_cache.append(
-                                    (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)
-                                )
-                                all_beams_token_id.extend(token_ids_pos)
-                                all_beams_logprob.extend(
-                                    current_beam.cum_logprob + lp for lp in logprobs_pos
-                                )
-                                all_beams_beam_idx.extend([i] * len(token_ids_pos))
-                            else:
-                                raise ValueError(
-                                    "Beam search generation expected non-empty logprobs "
-                                    "for each beam, but received 'None'. Please ensure "
-                                    "that sampling parameters are configured to return "
-                                    "logprobs when using beam search."
-                                )
-
-                        # Convert to numpy for efficient processing
-                        all_beams_token_id = np.array(all_beams_token_id)
-                        all_beams_logprob = np.array(all_beams_logprob)
-                        all_beams_beam_idx_arr = np.array(all_beams_beam_idx, dtype=np.intp)
-                        # Handle EOS tokens
-                        if not ignore_eos:
-                            eos_beams, all_beams_logprob = complete_eos_candidates(
-                                parents=all_beams[start:end],
-                                token_ids=all_beams_token_id,
-                                scores=all_beams_logprob,
-                                beam_idx=all_beams_beam_idx_arr,
-                                beam_flat_cache=beam_flat_cache,
-                                stop_token_ids={tokenizer.eos_token_id},
-                                initial_logprobs=initial_logprobs,
-                                include_eos_token=True,
-                                inherit_lora_request=True,
-                            )
-                            instance.completed.extend(eos_beams)
-
-                        # Select top beams
-                        topn_idx = select_top_indices(
-                            all_beams_logprob, beam_width, catalog_strategy
-                        )
-                        new_beams, _ = materialize_selected_beams(
-                            parents=all_beams[start:end],
-                            selected_indices=topn_idx,
-                            token_ids=all_beams_token_id,
-                            scores=all_beams_logprob,
-                            beam_idx=all_beams_beam_idx_arr,
-                            beam_flat_cache=beam_flat_cache,
-                            initial_logprobs=initial_logprobs,
-                        )
-                        instance.beams = new_beams
+        from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
 
         outputs = []
-        for idx, instance in enumerate(instances):
-            # Append sid_end_token_id only to active beams (not EOS-completed
-            # beams that already terminated naturally).
+        for index, instance in enumerate(instances):
             if sid_end_token_id is not None:
                 for beam in instance.beams:
                     beam.tokens.append(sid_end_token_id)
-            # Move remaining active beams into the completed list.
-            instance.completed.extend(instance.beams)
-            sorted_completed = sorted(instance.completed, key=lambda x: x.cum_logprob, reverse=True)
-            best_beams = sorted_completed[:beam_width]
-
-            prompt_cache = cached_prompts[idx]
-            prompt_text = prompt_cache["text"]
-            prompt_len = prompt_cache["len"]
-            # Reconstruct FlatLogprobs from parent pointers for the best beams.
+            best_beams = select_best_beams(instance, beam_width)
+            prompt_text = None
+            if tokenizer is not None and best_beams:
+                prompt_text = tokenizer.decode(best_beams[0].tokens[: decode_prompt_ends[index]])
             for beam in best_beams:
-                reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
-                gen_tokens = beam.tokens[prompt_len:]
-                beam.text = prompt_text + tokenizer.decode(gen_tokens)
+                reconstruct_beam_logprobs(
+                    beam,
+                    initial_logprobs,
+                    sid_end_token_id,
+                )
+                if tokenizer is not None and prompt_text is not None:
+                    generated_text = tokenizer.decode(beam.tokens[decode_prompt_ends[index] :])
+                    beam.text = prompt_text + generated_text
             outputs.append(BeamSearchOutput(sequences=best_beams))
-
         return outputs
 
     def shutdown(self) -> None:

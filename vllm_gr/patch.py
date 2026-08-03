@@ -99,6 +99,15 @@ def _validate_openai_beam_search_patch() -> str | None:
     )
 
 
+def _validate_recif_completion_handler_patch() -> str | None:
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+
+    return _verified(
+        getattr(OpenAIServingCompletion._create_completion, "_vllm_gr_recif", False),
+        "RECIF completion handler dispatch is not installed",
+    )
+
+
 def _validate_chat_sampling_patch() -> str | None:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 
@@ -287,7 +296,7 @@ def _validate_batch_and_fork_patch() -> str | None:
 
 
 def _required_beam_patches() -> tuple[BeamPatch, ...]:
-    """Return the six concrete Beam responsibilities used in production."""
+    """Return the concrete Beam responsibilities used in production."""
 
     def patch(
         name: str,
@@ -313,6 +322,12 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
             "vllm_gr.entrypoints.openai.beam_search_patch",
             "patch_beam_search",
             _validate_openai_beam_search_patch,
+        ),
+        patch(
+            "recif_completion_handler",
+            "vllm_gr.entrypoints.recif.completion_handler",
+            "patch_recif_completion_handler",
+            _validate_recif_completion_handler_patch,
         ),
         patch(
             "chat_sampling_conversion",
