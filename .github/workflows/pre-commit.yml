@@ -149,17 +149,6 @@ jobs:
           bash ./tests/system/run_pangu1b_acc_and_verify.sh
           bash ./tests/system/run_pangu1b_online_and_verify.sh
 
-      - name: Install RECIF dependencies
-        run: |
-          uv pip install -r requirements/recif.txt
-
-      - name: Run RECIF beam-search verification
-        env:
-          RECIF_MODEL_PATH: ${{ vars.RECIF_MODEL_PATH }}
-        run: |
-          bash ./tests/system/run_recif_beam_search_and_verify.sh
-          bash ./tests/system/run_recif_online_and_verify.sh
-
       - name: Check Clear Device
         run: |
           bash ./scripts/check_vllm_on_device.sh

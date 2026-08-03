@@ -38,15 +38,3 @@ python offline_beam_search.py --model OpenOneRec/OneRec-1.7B --compare latency
 Vanilla vLLM with BW=128 took 4.882346 seconds
 vLLM-gr with BW=128 took 0.627150 seconds
 ```
-
-## RECIF
-
-RECIF uses `GRLLM` with `BeamSearchModel.RECIF` and the common
-`GRLLM.beam_search()` entry point:
-
-```bash
-python offline_recif_beam_search.py \
-    --model /path/to/recif-checkpoint \
-    --history 598080194427,628177754964,755993681678 \
-    --beam 64
-```
