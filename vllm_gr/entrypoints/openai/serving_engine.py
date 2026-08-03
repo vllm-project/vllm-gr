@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import time
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, Sequence
 
 import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
@@ -24,6 +24,7 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
+from vllm_gr.beam_search_step import apply_beam_search_step
 from vllm_gr.constraints import BeamConstraintCoordinator, ParentCandidateBuilder
 from vllm_gr.constraints.models import CandidateLayout
 from vllm_gr.constraints.strategies import (
@@ -32,6 +33,7 @@ from vllm_gr.constraints.strategies import (
     validate_constraint_generation_limits,
     validate_constraint_table_protocol,
 )
+from vllm_gr.entrypoints.beam_search_config import BeamSearchStep
 from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
@@ -279,6 +281,95 @@ async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
         )
     except Exception as e:
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
+
+
+async def run_beam_search_steps_async(
+    engine_client,
+    active: Sequence[BeamSearchSequence],
+    steps: Sequence[BeamSearchStep],
+    initial_logprobs: FlatLogprobs,
+    request_id: str,
+    *,
+    trace_headers=None,
+    priority: int = 0,
+    data_parallel_rank: int | None = None,
+) -> list[BeamSearchSequence]:
+    """Execute a model-owned step policy with async grouped-beam KV reuse."""
+
+    current = list(active)
+    use_beam_request = hasattr(engine_client, "beam_request_step_update")
+    previous_ids: list[str] = []
+    fork_info: list[tuple[int, int]] | None = None
+    session_id: str | None = None
+    prefix_len = len(current[0].tokens) if current else 0
+
+    try:
+        for level, step in enumerate(steps):
+            if not current:
+                break
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                temperature=0.0,
+                logprobs=step.expand_width,
+                allowed_token_ids=step.allowed_token_ids,
+                detokenize=False,
+                flat_logprobs=True,
+            )
+            level_request_id = f"{request_id}-level-{level}"
+            grouped_output = use_beam_request and fork_info is not None
+            if grouped_output:
+                assert session_id is not None
+                outputs, previous_ids = await _beam_request_step(
+                    engine_client,
+                    session_id=session_id,
+                    fork_info=fork_info,
+                    prev_beam_internal_ids=previous_ids,
+                    all_beams=current,
+                    request_id_batch=level_request_id,
+                    beam_search_params=sampling_params,
+                    eos_token_id=None,
+                    lora_request=current[0].lora_request,
+                    trace_headers=trace_headers,
+                    prefix_len=prefix_len,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                )
+            else:
+                outputs, new_ids = await _add_batch_step(
+                    engine_client,
+                    tuple(beam.get_prompt() for beam in current),
+                    tuple(beam.lora_request for beam in current),
+                    level_request_id,
+                    sampling_params,
+                    use_beam_request,
+                    trace_headers,
+                    priority,
+                    data_parallel_rank,
+                )
+                if new_ids:
+                    previous_ids = new_ids
+                    session_id = session_id or new_ids[0]
+
+            if any(output.outputs[0].finish_reason == "error" for output in outputs):
+                raise RuntimeError("Beam-search engine step failed")
+            transition = apply_beam_search_step(
+                current,
+                outputs,
+                step,
+                initial_logprobs,
+                grouped_output=grouped_output,
+            )
+            current = transition.active
+            fork_info = transition.fork_info
+        return current
+    finally:
+        if use_beam_request and session_id is not None and previous_ids:
+            await _beam_request_cleanup(
+                engine_client,
+                session_id,
+                previous_ids,
+                data_parallel_rank,
+            )
 
 
 async def beam_search(

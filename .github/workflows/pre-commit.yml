@@ -251,6 +251,37 @@ jobs:
         with:
           extra_args: --all-files
 
+      - name: Ensure RECIF converted checkpoint cache
+        env:
+          RECIF_MODEL_PATH: /data/datasets/recif_beam_search/checkpoint
+        run: |
+          set -euo pipefail
+          CACHED_HF="${RECIF_MODEL_PATH}_hf"
+          if [[ -f "$CACHED_HF/config.json" && -f "$CACHED_HF/model.safetensors" ]]; then
+            echo "Found cached RECIF HF checkpoint: $CACHED_HF"
+            exit 0
+          fi
+          echo "Cached RECIF HF checkpoint not found; converting to $CACHED_HF ..."
+          if python ./tools/convert_recif_checkpoint.py \
+              --input "$RECIF_MODEL_PATH" \
+              --output "$CACHED_HF"; then
+            echo "RECIF checkpoint converted and cached at $CACHED_HF"
+          else
+            rc=$?
+            if [[ $rc -eq 3 ]]; then
+              echo "Error: insufficient disk space to write $CACHED_HF. Free up space, or convert once on a filesystem with enough room so the result is cached for later runs." >&2
+            else
+              echo "Error: RECIF checkpoint conversion failed (exit code $rc)." >&2
+            fi
+            exit 1
+          fi
+
+      - name: Run RECIF performance and accuracy gate
+        env:
+          RECIF_MODEL_PATH: /data/datasets/recif_beam_search/checkpoint
+        run: |
+          bash ./tests/system/run_recif_perf_gate.sh
+
       - name: Check clear device
         if: always()
         run: bash ./scripts/check_vllm_on_device.sh

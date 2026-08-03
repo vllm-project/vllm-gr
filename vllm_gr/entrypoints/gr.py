@@ -156,7 +156,9 @@ def _prepare_beam_step_requests(
             # Beam width travels separately in BeamRequestStepUpdate.
             decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params)
             eos_token_id = (
-                sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
+                sid_end_token_id
+                if sid_end_token_id is not None
+                else (tokenizer.eos_token_id if tokenizer is not None else None)
             )
             decode_sampling_params.update_from_generation_config({}, eos_token_id)
 
@@ -195,7 +197,7 @@ def _prepare_beam_step_requests(
                 sampling_params=decode_sampling_params,
                 eos_token_id=sid_end_token_id
                 if sid_end_token_id is not None
-                else tokenizer.eos_token_id,
+                else (tokenizer.eos_token_id if tokenizer is not None else None),
                 lora_request=instance.beams[0].lora_request,
                 parent_beam_indices=parent_beam_indices,
                 max_decode_steps=max_decode_steps,
@@ -592,7 +594,7 @@ def _custom_beam_search_batch(
                     scores=all_beams_logprob,
                     beam_idx=all_beams_beam_idx_arr,
                     beam_flat_cache=beam_flat_cache,
-                    stop_token_ids={tokenizer.eos_token_id},
+                    stop_token_ids=({tokenizer.eos_token_id} if tokenizer is not None else set()),
                     initial_logprobs=initial_logprobs,
                     include_eos_token=True,
                     inherit_lora_request=True,
@@ -824,7 +826,13 @@ class GRLLM(LLM):
         end_token = params.end_token if hasattr(params, "end_token") else None
         catalog_strategy = getattr(params, "catalog_strategy", None)
 
-        tokenizer = self.get_tokenizer()
+        model_config = self.llm_engine.model_config
+        tokenizer = None
+        if not getattr(model_config, "skip_tokenizer_init", False):
+            tokenizer = self.get_tokenizer()
+        if tokenizer is None and (begin_token is not None or end_token is not None):
+            raise ValueError("begin_token and end_token require an initialized tokenizer")
+
         sid_begin_token_id: int | None = None
         if begin_token is not None:
             sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
@@ -913,7 +921,7 @@ class GRLLM(LLM):
         cached_prompts = []
         for instance in instances:
             prompt_tokens = instance.beams[0].tokens
-            prompt_text = tokenizer.decode(prompt_tokens)
+            prompt_text = tokenizer.decode(prompt_tokens) if tokenizer is not None else ""
             cached_prompts.append({"text": prompt_text, "len": len(prompt_tokens)})
 
         pre_calc = 0 if sid_begin_token_id is None else 1
@@ -1083,7 +1091,9 @@ class GRLLM(LLM):
                                 scores=all_beams_logprob,
                                 beam_idx=all_beams_beam_idx_arr,
                                 beam_flat_cache=beam_flat_cache,
-                                stop_token_ids={tokenizer.eos_token_id},
+                                stop_token_ids=(
+                                    {tokenizer.eos_token_id} if tokenizer is not None else set()
+                                ),
                                 initial_logprobs=initial_logprobs,
                                 include_eos_token=True,
                                 inherit_lora_request=True,
@@ -1124,7 +1134,9 @@ class GRLLM(LLM):
             for beam in best_beams:
                 reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
                 gen_tokens = beam.tokens[prompt_len:]
-                beam.text = prompt_text + tokenizer.decode(gen_tokens)
+                beam.text = prompt_text + (
+                    tokenizer.decode(gen_tokens) if tokenizer is not None else ""
+                )
             outputs.append(BeamSearchOutput(sequences=best_beams))
 
         return outputs
