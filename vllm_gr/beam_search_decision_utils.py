@@ -117,32 +117,28 @@ def complete_eos_candidates(
     scores: np.ndarray,
     beam_idx: np.ndarray,
     beam_flat_cache: Sequence[BeamCandidateCache | None],
-    candidates_per_parent: int,
-    eos_token_id: int,
+    stop_token_ids: Collection[int],
     initial_logprobs: FlatLogprobs,
     include_eos_token: bool,
     inherit_lora_request: bool,
 ) -> tuple[list[BeamSearchSequence], np.ndarray]:
-    """Materialize EOS candidates and mask their scores on a copy."""
+    """Materialize stop-token candidates and mask their scores on a copy."""
 
     eos_beams: list[BeamSearchSequence] = []
-    eos_indices = find_eos_indices(token_ids, eos_token_id)
+    eos_indices = np.where(np.isin(token_ids, tuple(stop_token_ids)))[0]
     for candidate_index in eos_indices:
-        parent_index = beam_idx[candidate_index]
+        parent_index = int(beam_idx[candidate_index])
         parent = parents[parent_index]
         cached = beam_flat_cache[parent_index]
         assert cached is not None
+        stop_token_id = int(token_ids[candidate_index])
         eos_beam = BeamSearchSequence(
             orig_prompt=parent.orig_prompt,
-            tokens=(
-                parent.tokens + [int(token_ids[candidate_index])]
-                if include_eos_token
-                else parent.tokens
-            ),
+            tokens=(parent.tokens + [stop_token_id] if include_eos_token else parent.tokens),
             logprobs=initial_logprobs,
             cum_logprob=float(scores[candidate_index]),
             finish_reason="stop",
-            stop_reason=eos_token_id,
+            stop_reason=stop_token_id,
             lora_request=parent.lora_request if inherit_lora_request else None,
         )
         eos_beam._lp_parent = parent
@@ -165,7 +161,7 @@ def select_top_indices(
         finite_idx = np.where(finite_mask)[0]
         if finite_idx.size == 0:
             # No valid candidates left — stop generating for this instance
-            return []
+            return np.empty(0, dtype=np.intp)
         if finite_idx.size > beam_width:
             # argpartition requires kth < arr.size, so only call it when
             # there are strictly more candidates than we need to keep.
@@ -185,8 +181,8 @@ def materialize_selected_beams(
     selected_indices: Sequence[int],
     token_ids: np.ndarray,
     scores: np.ndarray,
+    beam_idx: np.ndarray,
     beam_flat_cache: Sequence[BeamCandidateCache | None],
-    candidates_per_parent: int,
     initial_logprobs: FlatLogprobs,
 ) -> tuple[list[BeamSearchSequence], ForkInfo]:
     """Build selected child beams and their grouped-request fork mapping."""
@@ -194,7 +190,7 @@ def materialize_selected_beams(
     new_beams: list[BeamSearchSequence] = []
     fork_info: ForkInfo = []
     for candidate_index in selected_indices:
-        parent_index = candidate_index // candidates_per_parent
+        parent_index = int(beam_idx[candidate_index])
         parent = parents[parent_index]
         token_id = int(token_ids[candidate_index])
         cached = beam_flat_cache[parent_index]

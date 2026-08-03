@@ -29,6 +29,15 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR  # noqa: F401
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds  # noqa: F401
 
+__all__ = [
+    "BEAM_DATA_VAR",
+    "BeamAttentionBackend",
+    "BeamAttentionImpl",
+    "BeamAttentionMetadata",
+    "BeamAttentionMetadataBuilder",
+    "_compute_beam_bounds",
+]
+
 logger = init_logger(__name__)
 NPU_DEVICE = is_npu_available()
 CUDA_DEVICE = is_cuda_available()

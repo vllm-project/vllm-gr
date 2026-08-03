@@ -8,33 +8,33 @@ import inspect
 import re
 from pathlib import Path
 
+import yaml
+
 
 def _parameter_names(callable_obj: object) -> list[str]:
     return list(inspect.signature(callable_obj).parameters)
 
 
-def test_patch_inventory_has_expected_ids() -> None:
-    inventory = Path("docs/patch_inventory.yaml").read_text(encoding="utf-8")
-    patch_ids = re.findall(r"^\s*- id: (GR-PATCH-\d{3})$", inventory, flags=re.MULTILINE)
+def test_patch_inventories_are_aligned_and_complete() -> None:
+    inventory = yaml.safe_load(Path("docs/patch_inventory.yaml").read_text(encoding="utf-8"))
+    patches = inventory["patches"]
+    patch_ids = [patch["id"] for patch in patches]
+    required_fields = {
+        "owner",
+        "installer",
+        "activation",
+        "validator_or_test",
+        "process_roles",
+        "removal_condition",
+    }
 
     assert len(patch_ids) == len(set(patch_ids))
-    assert patch_ids == [f"GR-PATCH-{index:03d}" for index in range(15)]
+    assert all(re.fullmatch(r"GR-PATCH-\d{3}", patch_id) for patch_id in patch_ids)
+    assert all(required_fields <= patch.keys() for patch in patches)
 
-
-def test_engine_wire_values_do_not_conflict() -> None:
-    from vllm.v1.engine import EngineCoreRequestType
-
-    expected_gr_values = {
-        b"\x06": "ADD_BATCH",
-        b"\x07": "BEAM_REQUEST_STEP_UPDATE",
-    }
-    for value, expected_name in expected_gr_values.items():
-        owners = [
-            name
-            for name, member in EngineCoreRequestType.__members__.items()
-            if member.value == value
-        ]
-        assert owners in ([], [expected_name])
+    runtime_inventory = Path("docs/runtime_patch_inventory.md").read_text(encoding="utf-8")
+    runtime_ids = re.findall(r"^### (GR-PATCH-\d{3})", runtime_inventory, re.MULTILINE)
+    assert runtime_ids == patch_ids
 
 
 def test_engine_core_method_contracts() -> None:

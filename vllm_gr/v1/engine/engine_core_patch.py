@@ -11,23 +11,6 @@ from vllm.logger import init_logger
 
 from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
-from vllm_gr.v1.worker.model_runner_common import BeamReqIdsProxy  # noqa: F401
-from vllm_gr.v1.worker.model_runner_common import Mock1DArray  # noqa: F401
-from vllm_gr.v1.worker.model_runner_common import Mock2DArray  # noqa: F401
-from vllm_gr.v1.worker.model_runner_common import _get_positions_buffers  # noqa: F401
-from vllm_gr.v1.worker.model_runner_common import _remux_logprobs_tensors  # noqa: F401
-from vllm_gr.v1.worker.model_runner_common import _write_position_segments  # noqa: F401
-from vllm_gr.v1.worker.model_runner_common import (  # noqa: F401
-    _WORKER_BOOKKEEPING_PATCH_MARKER,
-    _WORKER_EXECUTE_PATCH_MARKER,
-    _WORKER_PREPARE_PATCH_MARKER,
-    InputBatchProxy,
-    _beam_collapse_bookkeeping,
-    _beam_remap_inputs,
-    _process_beam_decode_request,
-    is_worker_runner_patched,
-    make_patched_execute_model,
-)
 
 logger = init_logger(__name__)
 

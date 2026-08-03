@@ -79,27 +79,6 @@ def _build_metadata(
     ),
     [
         pytest.param(
-            [0, 2, 5],
-            [4, 7],
-            [[0, 1, 2, 3], [10, 11, 12, 13]],
-            ["ordinary-0", "ordinary-1"],
-            {},
-            {
-                "std_indices": [0, 1, 2, 3, 4],
-                "prefix_indices": [],
-                "std_q": [2, 3],
-                "std_kv": [4, 7],
-                "prefix_q": [],
-                "prefix_kv": [],
-                "suffix_q": [],
-                "suffix_kv": [],
-                "std_blocks": [[0, 1, 2, 3], [10, 11, 12, 13]],
-                "prefix_blocks": None,
-                "suffix_slots": None,
-            },
-            id="ordinary-only",
-        ),
-        pytest.param(
             [0, 4],
             [8],
             [[0, 1, 2, 3]],

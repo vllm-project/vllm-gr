@@ -20,12 +20,12 @@ from typing import Any, Iterator, cast
 
 import torch
 
-from vllm_gr.v1.attention.backends.beam_attn import (
-    BEAM_DATA_VAR,
-    BeamAttentionImpl,
+from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
-    _compute_beam_bounds,
 )
+from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]  # (query_heads, kv_heads); (4, 4) is MHA
 

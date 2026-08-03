@@ -32,6 +32,29 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 
 ## Runtime Patch Inventory
 
+The machine-readable counterpart is `docs/patch_inventory.yaml`. Owner,
+installer, activation, validation, and process-role entries below must remain
+aligned with it.
+
+| ID | Owner | Installer | Activation | Validator or test | Process role |
+| --- | --- | --- | --- | --- | --- |
+| GR-PATCH-000 | `vllm_gr/plugin.py` | `vllm_gr.plugin.register` | vLLM general-plugin loading | `test_plugin_exposes_simple_per_patch_status` | main, EngineCore, worker |
+| GR-PATCH-001 | `vllm_gr/v1/ascend_compat.py` | `apply_ascend_attention_backend_patch` | CUSTOM is registered and overridden | `_validate` behavior in `test_ascend_compat.py`; Ascend integration test | EngineCore, worker |
+| GR-PATCH-002 | `vllm_gr/v1/ascend_compat.py` | `patch_npu_worker_init_device` | active NPU platform, first installation | `test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract` | worker |
+| GR-PATCH-003 | `vllm_gr/logprobs.py` | `logprobs_patch.patch_flat_logprobs` | required frontend plan finds the method absent | `_validate_flat_logprobs_patch`; patch initialization tests | offline frontend, API server |
+| GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; serving lifecycle tests | API server |
+| GR-PATCH-005 | `vllm_gr/engine/arg_utils_gr.py` | `patch_add_cli_args` | required frontend plan finds GR EngineArgs methods absent | `_validate_engine_args_patch`; attention backend configuration tests | main, API server |
+| GR-PATCH-006 | `entrypoints/openai/serving_models.py` | `patch_OpenAIServingModels_init` | required frontend plan finds the constructor absent | `_validate_serving_models_patch`; serving Catalog tests | API server |
+| GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds grouped client methods incomplete | `_validate_batch_and_fork_patch`; BeamRequest and DP tests | API server |
+| GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
+| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; BeamRequest tests | EngineCore |
+| GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `scheduler_metadata.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
+| GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active GPU runner hooks are incomplete | `_validate_model_runner_patch`; GPU and dispatcher tests | GPU worker |
+| GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
+| GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
+| GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
+| GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
+
 ### GR-PATCH-000 — Runtime Plugin Activation
 
 - Source: `vllm_gr/plugin.py`
@@ -251,6 +274,11 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
       `vllm_gr.v1.attention.backends.beam_attn_npu`;
     - backend registration and facade:
       `vllm_gr.v1.attention.backends.beam_attn`.
+- Compatibility facade:
+    - `beam_attn` intentionally continues to export
+      `BeamAttentionMetadata`, `BeamAttentionMetadataBuilder`,
+      `BEAM_DATA_VAR`, and `_compute_beam_bounds`;
+    - new internal code should import those symbols from their owner modules.
 - Ownership risk:
     - CUSTOM is one shared process-global slot;
     - later registration may replace an earlier owner;
@@ -259,6 +287,9 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 
 ### GR-PATCH-014 — LMCache Integration Override
 
+- Source: `vllm_gr/3rd_party/lmcache/integration/vllm/vllm_v1_adapter.py`
+- Installer: `vllm_gr/lmcache_patch.py`
+- Orchestration: `vllm_gr/patch.py`
 - Targets:
     - `RequestTracker.from_new_request`
     - `ReqMeta.from_request_tracker`
@@ -270,6 +301,20 @@ The vLLM-Ascend release branch is movable, so compatibility conclusions must ret
 - Activation: optional; enabled only when the LMCache integration is requested.
 - Dependencies include tracker lifecycle, connector parent state, connector metadata requests, slot mappings, and load/save semantics.
 - Removal condition: LMCache exposes the required grouped Beam metadata and lifecycle extension points directly.
+
+### GR-PATCH-015 — Sliced Vocabulary Projection
+
+- Source: `vllm_gr/ops/sliced_logits.py`
+- Installer: `vllm_gr/ops/sliced_logits_patch.py`
+- Orchestration: `vllm_gr/patch.py`
+- Targets:
+    - `LogitsProcessor.__init__`
+    - `LogitsProcessor._get_logits`
+    - `Sampler.gather_logprobs`
+- Risk: Medium
+- Activation: hooks are installed during runtime initialization; sliced projection is
+  used only when a valid vocabulary slice is configured.
+- Removal condition: vLLM exposes stable output-projection and logprob-width extension points.
 
 ## Benchmark-only Runtime Mutations
 
@@ -296,6 +341,8 @@ SchedulerOutput._gr_request_row_configs
 Runner._current_beam_data
 Runner._current_beam_info
 Runner._beam_logprobs_cache
+BeamSearchSequence._lp_parent
+BeamSearchSequence._lp_step_data
 ```
 
 ### Configuration keys
