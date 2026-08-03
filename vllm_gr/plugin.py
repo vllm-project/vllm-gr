@@ -8,9 +8,9 @@ vLLM calls ``load_general_plugins()`` in every process (main, EngineCore subproc
 Worker subprocess), which discovers and executes this entry point.
 
 This module is the formal runtime initialization boundary for vllm-gr.
-After removing the GR adapter / recommend runtime, its only responsibility
-is to apply the vLLM monkey patches needed by the OneRec beam-search path
-(catalog-constrained generation).
+After removing the GR adapter / recommend runtime, its responsibilities are
+to apply the vLLM monkey patches needed by beam search and register the RECIF
+model and online endpoint.
 """
 
 import logging
@@ -46,6 +46,9 @@ def initialize_runtime() -> dict[str, object]:
     check_environment()
 
     patch_count = re_apply_patches()
+    from vllm_gr.entrypoints.recif import patch_recif_api_router
+
+    patch_recif_api_router()
     _register_models()
 
     report = get_last_beam_patch_report()

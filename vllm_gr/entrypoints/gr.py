@@ -45,6 +45,7 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
+from vllm_gr.beam_search_step import apply_beam_search_step
 from vllm_gr.logger import init_logger
 from vllm_gr.models.model_adapter import create_model_adapter
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
@@ -525,75 +526,29 @@ def _run_beam_search_steps(
             lora_request=lora_req_batch,
         )
 
-        valid_tokens_sets = []
-        if catalog is not None:
-            for instance in instances_batch:
-                for beam in instance.beams:
-                    generated_tokens = beam.tokens[instance.prompt_len :]
-                    valid_tokens_sets.append(catalog.valid(generated_tokens))
-
         for (start, end), instance in zip(instance_ranges, instances_batch):
-            all_token_ids = []
-            all_logprobs = []
-            all_beam_indices: list[int] = []
-            beam_flat_cache: list[tuple | None] = []
-            for index, (current_beam, result) in enumerate(
-                zip(all_beams[start:end], output[start:end])
-            ):
-                flat = result.outputs[0].logprobs
-                if flat is None:
-                    raise ValueError(
-                        "Beam search expected non-empty logprobs for every beam"
-                    )
-                token_ids, logprobs, ranks, decoded = (
-                    extract_and_dedup_flat_logprobs(flat, step.expand_width)
-                )
-                if catalog is not None:
-                    valid_tokens = valid_tokens_sets[start + index]
-                    logprobs = mask_candidate_logprobs(
-                        token_ids,
-                        logprobs,
-                        valid_tokens,
-                    )
-                beam_flat_cache.append((token_ids, logprobs, ranks, decoded))
-                all_token_ids.extend(token_ids)
-                all_logprobs.extend(
-                    current_beam.cum_logprob + value for value in logprobs
-                )
-                all_beam_indices.extend([index] * len(token_ids))
-
-            token_ids_array = np.array(all_token_ids)
-            logprobs_array = np.array(all_logprobs)
-            beam_indices_array = np.array(all_beam_indices, dtype=np.intp)
-            if eos_token_id is not None and not ignore_eos:
-                eos_beams, logprobs_array = complete_eos_candidates(
-                    parents=all_beams[start:end],
-                    token_ids=token_ids_array,
-                    scores=logprobs_array,
-                    beam_idx=beam_indices_array,
-                    beam_flat_cache=beam_flat_cache,
-                    stop_token_ids={eos_token_id},
-                    initial_logprobs=initial_logprobs,
-                    include_eos_token=True,
-                    inherit_lora_request=True,
-                )
-                instance.completed.extend(eos_beams)
-
-            top_indices = select_top_indices(
-                logprobs_array,
-                step.keep_width,
-                catalog_strategy,
+            parents = all_beams[start:end]
+            allowed = None
+            if catalog is not None:
+                allowed = [
+                    catalog.valid(beam.tokens[instance.prompt_len :])
+                    for beam in parents
+                ]
+            transition = apply_beam_search_step(
+                parents,
+                output[start:end],
+                step,
+                initial_logprobs,
+                allowed_token_ids_by_parent=allowed,
+                stop_token_ids=(
+                    {eos_token_id}
+                    if eos_token_id is not None and not ignore_eos
+                    else None
+                ),
+                catalog_strategy=catalog_strategy,
             )
-            new_beams, _ = materialize_selected_beams(
-                parents=all_beams[start:end],
-                selected_indices=top_indices,
-                token_ids=token_ids_array,
-                scores=logprobs_array,
-                beam_idx=beam_indices_array,
-                beam_flat_cache=beam_flat_cache,
-                initial_logprobs=initial_logprobs,
-            )
-            instance.beams = new_beams
+            instance.beams = transition.active
+            instance.completed.extend(transition.completed)
 
 
 class GRLLM(LLM):
@@ -660,7 +615,7 @@ class GRLLM(LLM):
         temperature = params.temperature
         catalog_strategy = getattr(params, "catalog_strategy", "fill")
 
-        adapted = self.model_adapter.adapt_beam_search_request(
+        adapted = self.model_adapter.build_beam_search_inputs(
             self,
             prompts,
             params,
@@ -783,7 +738,7 @@ class GRLLM(LLM):
                     use_tqdm=use_tqdm,
                 )
 
-        return self.model_adapter.finalize_beam_search_outputs(
+        return self.model_adapter.build_beam_search_outputs(
             instances,
             prepared,
             initial_logprobs,

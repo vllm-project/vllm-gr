@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 
 
 @dataclass
-class AdaptedBeamSearchRequest:
+class CommonBeamSearchInputs:
     """Model-specific inputs and policies consumed by the shared search."""
 
     inputs: PreparedBeamInputs
@@ -38,16 +38,16 @@ class ModelAdapter(ABC):
     supports_custom_attention = True
 
     @abstractmethod
-    def adapt_beam_search_request(
+    def build_beam_search_inputs(
         self,
         llm: "GRLLM",
         prompts: list[Any],
         params: Any,
-    ) -> AdaptedBeamSearchRequest:
+    ) -> CommonBeamSearchInputs:
         """Prepare model inputs and per-step search policies."""
 
     @abstractmethod
-    def finalize_beam_search_outputs(
+    def build_beam_search_outputs(
         self,
         instances: list[Any],
         prepared: PreparedBeamInputs,
@@ -58,12 +58,12 @@ class ModelAdapter(ABC):
 
 
 class OneRecModelAdapter(ModelAdapter):
-    def adapt_beam_search_request(
+    def build_beam_search_inputs(
         self,
         llm: "GRLLM",
         prompts: list[Any],
         params: Any,
-    ) -> AdaptedBeamSearchRequest:
+    ) -> CommonBeamSearchInputs:
         from vllm_gr.models.one_rec import (
             build_beam_search_steps,
             prepare_beam_search_inputs,
@@ -80,7 +80,7 @@ class OneRecModelAdapter(ModelAdapter):
                 "tokens; using the pre-calculated token count"
             )
             max_tokens = pre_calculated
-        return AdaptedBeamSearchRequest(
+        return CommonBeamSearchInputs(
             inputs=prepared,
             steps=build_beam_search_steps(
                 max_tokens - pre_calculated,
@@ -90,7 +90,7 @@ class OneRecModelAdapter(ModelAdapter):
             catalog=llm.catalog,
         )
 
-    def finalize_beam_search_outputs(
+    def build_beam_search_outputs(
         self,
         instances: list[Any],
         prepared: PreparedBeamInputs,
@@ -110,25 +110,25 @@ class OneRecModelAdapter(ModelAdapter):
 class RecifModelAdapter(ModelAdapter):
     supports_custom_attention = False
 
-    def adapt_beam_search_request(
+    def build_beam_search_inputs(
         self,
         llm: "GRLLM",
         prompts: list[Any],
         params: Any,
-    ) -> AdaptedBeamSearchRequest:
+    ) -> CommonBeamSearchInputs:
         from vllm_gr.models.recif import (
             build_beam_search_steps,
             prepare_beam_search_inputs,
         )
 
-        return AdaptedBeamSearchRequest(
+        return CommonBeamSearchInputs(
             inputs=prepare_beam_search_inputs(llm, prompts),
             steps=build_beam_search_steps(params),
             ignore_eos=True,
             catalog=None,
         )
 
-    def finalize_beam_search_outputs(
+    def build_beam_search_outputs(
         self,
         instances: list[Any],
         prepared: PreparedBeamInputs,
@@ -153,7 +153,7 @@ def create_model_adapter(model: BeamSearchModel | str) -> ModelAdapter:
 
 
 __all__ = [
-    "AdaptedBeamSearchRequest",
+    "CommonBeamSearchInputs",
     "ModelAdapter",
     "OneRecModelAdapter",
     "RecifModelAdapter",
