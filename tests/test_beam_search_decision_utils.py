@@ -13,8 +13,10 @@ from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_segment,
     mask_candidate_logprobs,
     materialize_selected_beams,
+    resolve_catalog_node,
     select_top_indices,
 )
+from vllm_gr.utils.catalog import Catalog
 
 CandidateCache = tuple[
     list[int],
@@ -205,3 +207,162 @@ def test_materialize_selected_beams_uses_explicit_nonuniform_parent_mapping() ->
     assert [beam._lp_parent for beam in new_beams] == [parents[2], parents[0]]
     assert [beam._lp_step_data for beam in new_beams] == [cache[2], cache[0]]
     assert fork_info == [(2, 32), (0, 11)]
+
+
+# ---------------------------------------------------------------------------
+# O(1) catalog prefix-node propagation (_catalog_node)
+# ---------------------------------------------------------------------------
+
+
+def _catalog_trie() -> dict:
+    """Build a small trie mirroring tests/test_catalog.py's structure.
+
+    [1,2,3,4], [1,2,3,5], [8,9].  Each node maps token_id -> child dict, and
+    terminal nodes carry the Catalog._TERMINAL_MARKER sentinel.
+    """
+    return {
+        1: {
+            2: {
+                3: {
+                    4: {Catalog._TERMINAL_MARKER: True},
+                    5: {Catalog._TERMINAL_MARKER: True},
+                }
+            }
+        },
+        8: {9: {Catalog._TERMINAL_MARKER: True}},
+    }
+
+
+def test_catalog_node_propagates_to_selected_beams() -> None:
+    """fork: new beam's _catalog_node follows the token via O(1) get()."""
+    root = _catalog_trie()
+    parent = _beam([1])
+    # a beam whose tokens end at [1] carries the node AFTER consuming '1',
+    # i.e. root[1] — the set of valid next-token children.
+    parent._catalog_node = root[1]
+    cache = [_candidate_cache([2, 3], [-0.1, -0.2])]
+
+    new_beams, _ = materialize_selected_beams(
+        parents=[parent],
+        selected_indices=np.asarray([0, 1], dtype=np.intp),
+        token_ids=np.asarray([2, 3]),
+        scores=np.asarray([-0.1, -0.2]),
+        beam_idx=np.asarray([0, 0], dtype=np.intp),
+        beam_flat_cache=cache,
+        initial_logprobs=FlatLogprobs(),
+    )
+
+    # child [1,2] -> node {3: {...}}; child [1,3] -> node {} (not a valid prefix)
+    assert new_beams[0]._catalog_node == {
+        3: {4: {Catalog._TERMINAL_MARKER: True}, 5: {Catalog._TERMINAL_MARKER: True}}
+    }
+    assert new_beams[1]._catalog_node == {}
+    assert parent._catalog_node is root[1]  # parent untouched
+
+
+def test_catalog_node_propagates_to_eos_beams() -> None:
+    """EOS beam: _catalog_node follows the token just like a normal fork."""
+    root = _catalog_trie()
+    parent = _beam([1])
+    parent._catalog_node = root[1]
+    cache = [_candidate_cache([2], [-0.1])]
+
+    completed, _ = complete_eos_candidates(
+        parents=[parent],
+        token_ids=np.asarray([2]),
+        scores=np.asarray([-0.1]),
+        beam_idx=np.asarray([0], dtype=np.intp),
+        beam_flat_cache=cache,
+        stop_token_ids={2},
+        initial_logprobs=FlatLogprobs(),
+        include_eos_token=True,
+        inherit_lora_request=False,
+    )
+
+    assert completed[0]._catalog_node == {
+        3: {4: {Catalog._TERMINAL_MARKER: True}, 5: {Catalog._TERMINAL_MARKER: True}}
+    }
+    assert parent._catalog_node is root[1]  # parent untouched
+
+
+def test_catalog_node_missing_parent_uses_empty_node() -> None:
+    """A parent without _catalog_node yields None (caller falls back to valid())."""
+    parent = _beam([1])
+    cache = [_candidate_cache([2], [-0.1])]
+
+    new_beams, _ = materialize_selected_beams(
+        parents=[parent],
+        selected_indices=np.asarray([0], dtype=np.intp),
+        token_ids=np.asarray([2]),
+        scores=np.asarray([-0.1]),
+        beam_idx=np.asarray([0], dtype=np.intp),
+        beam_flat_cache=cache,
+        initial_logprobs=FlatLogprobs(),
+    )
+
+    assert new_beams[0]._catalog_node is None
+    assert getattr(new_beams[0], "_catalog_node", None) is None
+
+
+def test_mask_candidate_logprobs_accepts_trie_node_dict() -> None:
+    """dict node passed directly (no set() allocation) behaves like the set."""
+    node = {2: {}, 5: {}}
+    result = mask_candidate_logprobs([1, 2, 3, 5], [-0.1, -0.2, -0.3, -0.4], node)
+
+    assert result == [-float("inf"), -0.2, -float("inf"), -0.4]
+
+
+def test_catalog_node_invalid_token_lands_on_empty_node() -> None:
+    """Forking on a token absent from the node yields {} (beam dead-ends)."""
+    root = _catalog_trie()
+    parent = _beam([8])
+    parent._catalog_node = root[8]
+    cache = [_candidate_cache([99], [-0.1])]
+
+    new_beams, _ = materialize_selected_beams(
+        parents=[parent],
+        selected_indices=np.asarray([0], dtype=np.intp),
+        token_ids=np.asarray([99]),
+        scores=np.asarray([-0.1]),
+        beam_idx=np.asarray([0], dtype=np.intp),
+        beam_flat_cache=cache,
+        initial_logprobs=FlatLogprobs(),
+    )
+
+    assert new_beams[0]._catalog_node == {}
+
+
+def test_resolve_catalog_node_uses_cached_node_without_fallback() -> None:
+    """Optimized path: a beam with a cached node never calls catalog.valid()."""
+    from unittest import mock
+
+    from vllm_gr.utils.catalog import Catalog
+
+    catalog = mock.MagicMock(spec=Catalog)
+    catalog.valid.return_value = {99}
+
+    parent = _beam([1, 2])
+    parent._catalog_node = {3: {Catalog._TERMINAL_MARKER: True}, 5: {}}
+
+    node = resolve_catalog_node(parent, catalog, prompt_len=2)
+
+    assert node is parent._catalog_node
+    catalog.valid.assert_not_called()
+
+
+def test_resolve_catalog_node_falls_back_to_valid_when_node_missing() -> None:
+    """Fallback: a beam without _catalog_node triggers the full re-traversal."""
+    from unittest import mock
+
+    from vllm_gr.utils.catalog import Catalog
+
+    catalog = mock.MagicMock(spec=Catalog)
+    catalog.valid.return_value = {99}
+
+    parent = _beam([1, 2])
+    # NOTE: no _catalog_node attached on purpose
+
+    node = resolve_catalog_node(parent, catalog, prompt_len=2)
+
+    assert node == {99}
+    catalog.valid.assert_called_once_with(parent.tokens[2:])
