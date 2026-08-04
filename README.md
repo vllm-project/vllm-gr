@@ -16,7 +16,8 @@ The current implementation targets inference scenarios and does not aim for full
 
 - `vllm_gr/` — GRLLM (offline beam search), beam-search/catalog patches, NPU runtime utils, ops
 - `examples/` — OneRec beam-search and Pangu LLM passthrough offline examples
-- `scripts/` — unified test runner
+- `tools/` — unified test runner and local development utilities
+- `scripts/` — wheel-build and device lifecycle helpers used by CI
 - `tests/` — unit, contract, and Pangu system tests
 - `requirements/` — platform dependency lists (auto-selected by `setup.py` as `cuda` / `npu` / `cpu`)
 
@@ -31,11 +32,15 @@ For detailed instructions, see [quickstart](docs/quickstart.md) or [quick start 
 
 ## Unified self-validation
 
-Recommended command (this is subset of what PR gate runs):
+Recommended local validation command:
 
 ```bash
-tools/run_tests.sh
+./tools/run_test.sh
 ```
+
+The runner acquires an available accelerator and executes the repository's
+pre-commit and test gates. See [Development Utils Manual](docs/tools/README.md)
+for environment and model-cache options.
 
 refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark related test cases.
 

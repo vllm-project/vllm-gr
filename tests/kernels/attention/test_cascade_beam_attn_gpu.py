@@ -80,7 +80,7 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
         softcap=inputs.soft_cap,
         fa_version=inputs.fa_version,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return output
 
 
@@ -151,6 +151,6 @@ def test_beam_cascade(
         vllm_flash_attn_version=inputs.fa_version,
         logits_soft_cap=inputs.soft_cap,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     # Compare the results.
     torch.testing.assert_close(output, ref_output, atol=1e-3, rtol=1e-5)

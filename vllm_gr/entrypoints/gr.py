@@ -435,8 +435,7 @@ def _custom_beam_search_batch(
                     scores=all_beams_logprob,
                     beam_idx=all_beams_beam_idx_arr,
                     beam_flat_cache=beam_flat_cache,
-                    candidates_per_parent=logprobs_num,
-                    eos_token_id=tokenizer.eos_token_id,
+                    stop_token_ids={tokenizer.eos_token_id},
                     initial_logprobs=initial_logprobs,
                     include_eos_token=True,
                     inherit_lora_request=True,
@@ -449,8 +448,8 @@ def _custom_beam_search_batch(
                 selected_indices=topn_idx,
                 token_ids=all_beams_token_id,
                 scores=all_beams_logprob,
+                beam_idx=all_beams_beam_idx_arr,
                 beam_flat_cache=beam_flat_cache,
-                candidates_per_parent=logprobs_num,
                 initial_logprobs=initial_logprobs,
             )
             instance.beams = new_beams
@@ -765,8 +764,7 @@ class GRLLM(LLM):
                                 scores=all_beams_logprob,
                                 beam_idx=all_beams_beam_idx_arr,
                                 beam_flat_cache=beam_flat_cache,
-                                candidates_per_parent=logprobs_num,
-                                eos_token_id=tokenizer.eos_token_id,
+                                stop_token_ids={tokenizer.eos_token_id},
                                 initial_logprobs=initial_logprobs,
                                 include_eos_token=True,
                                 inherit_lora_request=True,
@@ -782,8 +780,8 @@ class GRLLM(LLM):
                             selected_indices=topn_idx,
                             token_ids=all_beams_token_id,
                             scores=all_beams_logprob,
+                            beam_idx=all_beams_beam_idx_arr,
                             beam_flat_cache=beam_flat_cache,
-                            candidates_per_parent=logprobs_num,
                             initial_logprobs=initial_logprobs,
                         )
                         instance.beams = new_beams

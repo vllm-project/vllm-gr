@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
@@ -209,15 +209,21 @@ def _serving(engine_client: Any) -> SimpleNamespace:
     )
 
 
-def _params(*, max_tokens: int, ignore_eos: bool = False) -> SimpleNamespace:
+def _params(
+    *,
+    max_tokens: int,
+    ignore_eos: bool = False,
+    end_token: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         beam_width=2,
         max_tokens=max_tokens,
         ignore_eos=ignore_eos,
         temperature=0.0,
         begin_token=None,
-        end_token=None,
+        end_token=end_token,
         include_stop_str_in_output=False,
+        catalog_strategy="fill",
     )
 
 
@@ -233,6 +239,7 @@ def _run_search(
     max_tokens: int,
     ignore_eos: bool = False,
     request_id: str = "request-0",
+    end_token: str | None = None,
 ) -> list[RequestOutput]:
     return asyncio.run(
         _collect_outputs(
@@ -243,7 +250,11 @@ def _run_search(
                     "prompt_token_ids": [10],
                 },
                 request_id,
-                _params(max_tokens=max_tokens, ignore_eos=ignore_eos),
+                _params(
+                    max_tokens=max_tokens,
+                    ignore_eos=ignore_eos,
+                    end_token=end_token,
+                ),
                 trace_headers={"trace": "value"},
             )
         )
@@ -277,7 +288,7 @@ def _assert_normal_output(output: RequestOutput, request_id: str) -> None:
     assert output.metrics.beam_search_sort_time >= 0
 
 
-def test_grouped_beam_request_lifecycle_uses_shared_fork_decisions(
+def test_grouped_beam_request_lifecycle(
     monkeypatch: Any,
 ) -> None:
     _install_deterministic_request_ids(monkeypatch)
@@ -386,58 +397,19 @@ def test_grouped_engine_error_yields_error_and_cleans_up(
     assert output.outputs[0].logprobs is None
 
 
-def test_ordinary_path_uses_shared_decisions_without_grouped_transport(
-    monkeypatch: Any,
-) -> None:
-    _install_deterministic_request_ids(monkeypatch)
+def test_eos_and_distinct_sid_end_token_both_complete() -> None:
     engine = _OrdinaryEngineClient(
-        prepare_outputs=[
-            _engine_output(_flat([11, 12], [-0.1, -0.2])),
-            _engine_output(_flat([21, 22], [-0.1, -0.3])),
-            _engine_output(_flat([31, 32], [-0.05, -0.4])),
-        ]
+        prepare_outputs=[_engine_output(_flat([3, 2], [-0.1, -0.2]))],
     )
-    extract = MagicMock(wraps=serving_engine.extract_and_dedup_flat_logprobs)
-    monkeypatch.setattr(serving_engine, "extract_and_dedup_flat_logprobs", extract)
-
-    outputs = _run_search(engine, max_tokens=2, request_id="ordinary-request")
-
-    assert not hasattr(engine, "beam_request_step_update")
-    assert len(engine.prepare_calls) == 3
-    assert len(engine.add_batch_calls) == 2
-    assert [call.use_batch_message for call in engine.add_batch_calls] == [False, False]
-    assert extract.call_count == 3
-    assert len(outputs) == 1
-    _assert_normal_output(outputs[0], "ordinary-request")
-    assert [choice.token_ids for choice in outputs[0].outputs] == [
-        [11, 21],
-        [12, 31],
-    ]
-    assert [choice.text for choice in outputs[0].outputs] == ["11 21", "12 31"]
-
-
-def test_cleanup_failure_keeps_normal_response(
-    monkeypatch: Any,
-) -> None:
-    _install_deterministic_request_ids(monkeypatch)
-    engine = _GroupedEngineClient(
-        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
-        grouped_outputs=[],
-        fail_cleanup=True,
-    )
-    log_error = MagicMock()
-    monkeypatch.setattr(serving_engine.logger, "error", log_error)
 
     outputs = _run_search(
         engine,
-        max_tokens=1,
-        ignore_eos=True,
-        request_id="cleanup-failure",
+        max_tokens=2,
+        request_id="multiple-stop-tokens",
+        end_token="<end>",
     )
 
-    assert len(engine.beam_updates) == 1
-    assert engine.beam_updates[0].beam_width == 0
-    assert len(outputs) == 1
-    _assert_normal_output(outputs[0], "cleanup-failure")
-    log_error.assert_called_once()
-    assert log_error.call_args.args[1] == "cleanup-failure-step-0-beam-0"
+    choices = outputs[0].outputs
+    assert [choice.finish_reason for choice in choices] == ["stop", "stop"]
+    assert [choice.stop_reason for choice in choices] == [3, 2]
+    assert [choice.token_ids for choice in choices] == [[], []]

@@ -8,8 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm_gr.beam_search_decision_utils import extract_and_dedup_segment
-from vllm_gr.logprobs import extract_and_dedup_flat_logprobs
+from vllm_gr.beam_search_decision_utils import (
+    extract_and_dedup_flat_logprobs,
+    extract_and_dedup_segment,
+)
 from vllm_gr.ops.sliced_logits import (
     compute_sliced_logits,
     get_rank_vocab_bounds,

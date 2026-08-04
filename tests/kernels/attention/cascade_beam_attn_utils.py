@@ -20,12 +20,12 @@ from typing import Any, Iterator, cast
 
 import torch
 
-from vllm_gr.v1.attention.backends.beam_attn import (
-    BEAM_DATA_VAR,
-    BeamAttentionImpl,
+from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
-    _compute_beam_bounds,
 )
+from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]  # (query_heads, kv_heads); (4, 4) is MHA
 
@@ -278,8 +278,11 @@ def build_beam_attn_metadata(
         builder.max_num_splits = 0
         builder.num_heads_q = inputs.query.shape[1]
         builder.num_kv_heads = inputs.num_kv_heads
+        device_type = getattr(device, "type", str(device).partition(":")[0])
+        builder._is_cuda = device_type == "cuda"
+        builder._is_npu = device_type == "npu"
         if npu_causal_atten_mask is not None:
-            # cascade_attention_npu reads this for the causal STD/suffix calls.
+            # NPU cascade execution reads this for the causal STD/suffix calls.
             builder.npu_causal_atten_mask = npu_causal_atten_mask
 
         return builder.build(

@@ -63,7 +63,9 @@ def _cache_beam_request(self, request) -> None:
     # Make a clean, un-mutatable copy of the original prompt token IDs
     raw_token_ids = list(request._all_token_ids)
     block_hasher = getattr(self, "request_block_hasher", None)
-    block_size = getattr(self.vllm_config.cache_config, "block_size", 16)
+    vllm_config = getattr(self, "vllm_config", None)
+    cache_config = getattr(vllm_config, "cache_config", None) if vllm_config else None
+    block_size = getattr(cache_config, "block_size", 16) if cache_config else 16
     pad_len = (-len(raw_token_ids)) % block_size
 
     if pad_len > 0 and block_hasher is not None:

@@ -84,16 +84,16 @@ def benchmark_one(
     with torch.inference_mode():
         for _ in range(warmup_iters):
             run_once()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        start_event = torch.Event(enable_timing=True)
+        end_event = torch.Event(enable_timing=True)
 
         start_event.record()
         for _ in range(iter_num):
             run_once()
         end_event.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
     elapsed_time_ms = float(start_event.elapsed_time(end_event) / iter_num)
     print(

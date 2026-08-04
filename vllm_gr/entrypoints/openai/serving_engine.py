@@ -15,8 +15,14 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 
-from vllm_gr.beam_search_decision_utils import extract_and_dedup_segment
-from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
+from vllm_gr.beam_search_decision_utils import (
+    complete_eos_candidates,
+    extract_and_dedup_flat_logprobs,
+    extract_and_dedup_segment,
+    materialize_selected_beams,
+    select_top_indices,
+)
+from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
@@ -553,66 +559,37 @@ async def beam_search(
         all_beams_beam_idx_arr = np.array(all_beams_beam_idx, dtype=np.intp)
 
         if not ignore_eos:
-            eos_mask = all_beams_token_id == eos_token_id
-            if sid_end_token_id is not None and sid_end_token_id != eos_token_id:
-                eos_mask |= all_beams_token_id == sid_end_token_id
-            eos_idx = np.where(eos_mask)[0]
-            for idx in eos_idx:
-                parent_beam = all_beams[all_beams_beam_idx_arr[idx]]
-                cached = beam_flat_cache[all_beams_beam_idx_arr[idx]]
-                assert cached is not None
-                stop_token_id = int(all_beams_token_id[idx])
-                eos_beam = BeamSearchSequence(
-                    orig_prompt=parent_beam.orig_prompt,
-                    tokens=parent_beam.tokens + [stop_token_id]
-                    if include_stop_str_in_output
-                    else parent_beam.tokens,
-                    logprobs=initial_logprobs,
-                    cum_logprob=float(all_beams_logprob[idx]),
-                    finish_reason="stop",
-                    stop_reason=stop_token_id,
-                )
-                eos_beam._lp_parent = parent_beam
-                eos_beam._lp_step_data = cached
-                completed.append(eos_beam)
-            all_beams_logprob[eos_idx] = -np.inf
+            stop_token_ids = {eos_token_id}
+            if sid_end_token_id is not None:
+                stop_token_ids.add(sid_end_token_id)
+            eos_beams, all_beams_logprob = complete_eos_candidates(
+                parents=all_beams,
+                token_ids=all_beams_token_id,
+                scores=all_beams_logprob,
+                beam_idx=all_beams_beam_idx_arr,
+                beam_flat_cache=beam_flat_cache,
+                stop_token_ids=stop_token_ids,
+                initial_logprobs=initial_logprobs,
+                include_eos_token=include_stop_str_in_output,
+                inherit_lora_request=False,
+            )
+            completed.extend(eos_beams)
 
         # Processing non-EOS tokens
-        new_beams = []
-        selected_fork_info = []
-        if catalog_strategy == "null":
-            finite_mask = np.isfinite(all_beams_logprob)
-            finite_idx = np.where(finite_mask)[0]
-            if finite_idx.size == 0:
-                all_beams = []
-                break
-            if finite_idx.size > beam_width:
-                topn_idx = finite_idx[
-                    np.argpartition(-all_beams_logprob[finite_idx], beam_width)[:beam_width]
-                ]
-            else:
-                topn_idx = finite_idx
-        elif all_beams_logprob.size > beam_width:
-            topn_idx = np.argpartition(np.negative(all_beams_logprob), beam_width)[:beam_width]
-        else:
-            topn_idx = np.arange(all_beams_logprob.size)
-
-        for idx in topn_idx:
-            parent_beam = all_beams[all_beams_beam_idx_arr[idx]]
-            token_id = int(all_beams_token_id[idx])
-            cached = beam_flat_cache[all_beams_beam_idx_arr[idx]]
-            assert cached is not None
-            new_beam = BeamSearchSequence(
-                orig_prompt=parent_beam.orig_prompt,
-                tokens=parent_beam.tokens + [token_id],
-                logprobs=initial_logprobs,
-                lora_request=parent_beam.lora_request,
-                cum_logprob=float(all_beams_logprob[idx]),
-            )
-            new_beam._lp_parent = parent_beam
-            new_beam._lp_step_data = cached
-            new_beams.append(new_beam)
-            selected_fork_info.append((int(all_beams_beam_idx_arr[idx]), token_id))
+        topn_idx = select_top_indices(
+            all_beams_logprob,
+            beam_width,
+            catalog_strategy,
+        )
+        new_beams, selected_fork_info = materialize_selected_beams(
+            parents=all_beams,
+            selected_indices=topn_idx,
+            token_ids=all_beams_token_id,
+            scores=all_beams_logprob,
+            beam_idx=all_beams_beam_idx_arr,
+            beam_flat_cache=beam_flat_cache,
+            initial_logprobs=initial_logprobs,
+        )
 
         # Build fork_info for next iteration's BEAM_FORK.
         if use_beam_request:

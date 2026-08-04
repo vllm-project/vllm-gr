@@ -39,9 +39,9 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
     from vllm.v1.attention.selector import AttentionSelectorConfig
     from vllm_ascend.utils import register_ascend_customop
 
-    import vllm_gr.patch as gr_patch
     from vllm_gr._env_check import check_ascend_environment
     from vllm_gr.engine.arg_utils_gr import _apply_npu_default_block_size
+    from vllm_gr.v1 import ascend_compat
     from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
 
     check_ascend_environment(require_npu_platform=True)
@@ -61,8 +61,8 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
         return_value=False,
     ):
         register_ascend_customop()
-    gr_patch._apply_ascend_attention_backend_patch(force=True)
-    gr_patch._ASCEND_ORIGINAL_CACHED_GET_ATTN.cache_clear()
+    ascend_compat.apply_ascend_attention_backend_patch(force=True)
+    ascend_compat._ASCEND_ORIGINAL_CACHED_GET_ATTN.cache_clear()
 
     selector_config = AttentionSelectorConfig(
         head_size=64,

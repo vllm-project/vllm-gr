@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import msgspec
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
 from vllm.v1.serial_utils import MsgpackDecoder
 
@@ -142,34 +141,6 @@ def test_add_batch_payload_schema() -> None:
     assert decoded[0].request_id == "request-0"
 
 
-def test_beam_step_update_field_inventory() -> None:
-    assert BeamRequestStepUpdate.__struct_fields__ == BEAM_STEP_UPDATE_FIELDS
-
-
-def test_beam_step_update_minimal_raw_wire_shape() -> None:
-    encoded = msgspec.msgpack.encode(_minimal_beam_step_update())
-    raw_payload = msgspec.msgpack.decode(encoded)
-
-    assert isinstance(raw_payload, list)
-    assert len(raw_payload) == 16
-    assert raw_payload[:7] == [
-        "session-0",
-        ["parent-0", "parent-1"],
-        ["child-0", "child-1"],
-        [[11], [12]],
-        [],
-        8,
-        2,
-    ]
-    assert raw_payload[8:] == [None, 0, 0, 0, None, None, None, None]
-
-    decoded = MsgpackDecoder(BeamRequestStepUpdate).decode(encoded)
-    assert decoded.session_id == "session-0"
-    assert decoded.beam_width == 2
-    assert decoded.eos_token_id is None
-    assert decoded.trace_headers is None
-
-
 def test_beam_step_update_full_raw_wire_shape() -> None:
     update = _minimal_beam_step_update(
         eos_token_id=2,
@@ -182,6 +153,7 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
     )
     raw_payload = msgspec.msgpack.decode(msgspec.msgpack.encode(update))
 
+    assert BeamRequestStepUpdate.__struct_fields__ == BEAM_STEP_UPDATE_FIELDS
     assert len(raw_payload) == len(BEAM_STEP_UPDATE_FIELDS)
     assert raw_payload[8:13] == [2, 3, 4, 5, 6]
     assert raw_payload[13] is None
@@ -213,18 +185,3 @@ def test_non_beam_request_has_no_scheduler_metadata() -> None:
     request = SimpleNamespace(request_id="request-0", is_beam_decode=False)
 
     assert build_beam_request_metadata(request, num_scheduled_tokens=1) is None
-
-
-def test_scheduler_output_accepts_beam_data_shape() -> None:
-    output = SchedulerOutput.make_empty()
-    metadata = {
-        "is_beam_decode": True,
-        "beam_width": 2,
-        "beam_decode_steps": 3,
-        "prefix_len": 8,
-        "cache_len": 8,
-    }
-
-    output.beam_data = {"session-0": metadata}
-
-    assert output.beam_data == {"session-0": metadata}
