@@ -67,8 +67,9 @@ def _cache_beam_request(self, request) -> None:
     pad_len = (-len(raw_token_ids)) % block_size
 
     if pad_len > 0 and block_hasher is not None:
-        # Extend in-place so ConstantList (request.all_token_ids) sees full block
-        request._all_token_ids.extend([0] * pad_len)
+        # Extend in-place with sentinel token ID (-1) so ConstantList (request.all_token_ids)
+        # sees a full block without risk of collision with real prompt tokens ending in 0.
+        request._all_token_ids.extend([-1] * pad_len)
         request._block_hasher = block_hasher
         request.update_block_hashes()
         # Remove pad tokens in-place before prefill execution
