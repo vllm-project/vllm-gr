@@ -28,7 +28,7 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
 
 ### 2. Online, API Server Mode (Production-like)
 
-Run the server and client separately for a production‑style setup.
+Run the server and client separately for a production-style setup.
 
 #### Terminal 1 — Start the vLLM API server
 

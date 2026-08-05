@@ -15,7 +15,7 @@ In standard LLM serving, if two users send prompts with a shared 2,000-token doc
 * **Cross-Instance Sharing:** Allows multiple vLLM processes to share the same KV cache. If Instance A computes a prefix, Instance B can retrieve it from the shared pool instead of re-computing it.
 * **Hierarchical Storage:** Automatically manages KV cache across a hierarchy of storage layers:
     * **Local CPU RAM:** For ultra-fast local access.
-    * **Peer-to-Peer (P2P):** Instances can fetch cache blocks directly from each other’s CPU RAM.
+    * **Peer-to-Peer (P2P):** Instances can fetch cache blocks directly from each other's CPU RAM.
     * **Remote Storage:** Persistent storage in systems like Redis, S3, or shared filesystems for "warm starts" even after a server reboot.
 * **Semantic Chunking:** Unlike simple prefix caching that requires an exact match from the start of the string, LMCache can handle shared content appearing at different positions or within different contexts.
 * **Extreme Performance:** It utilizes low-level optimizations like **NIXL** (NVIDIA Inference Xfer Library) and zero-copy memory transfers to ensure that fetching a cached block is significantly faster than recomputing it on a GPU.
