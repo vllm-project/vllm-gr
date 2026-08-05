@@ -174,3 +174,126 @@ def test_catalog_multiple_items_long_shared_prefix(mock_tokenizer: MagicMock) ->
     finally:
         if os.path.exists(catalog_path):
             os.remove(catalog_path)
+
+
+def _apply(node, catalog: Catalog, strategy: str) -> tuple:
+    """Thin wrapper around apply_catalog_filter for the parity checks below."""
+    return catalog.apply_catalog_filter(
+        token_ids_pos=[1, 2, 3, 4],
+        logprobs_pos=[-0.1, -0.2, -0.3, -0.4],
+        ranks_pos=[1, 2, 3, 4],
+        decoded_pos=["a", "b", "c", "d"],
+        valid_tokens_node=node,
+        catalog_strategy=strategy,
+    )
+
+
+def test_apply_catalog_filter_dict_matches_set_null_strategy(mock_tokenizer: MagicMock) -> None:
+    """dict node (with marker) behaves identically to the equivalent set under "null"."""
+    catalog = Catalog(mock_tokenizer)
+    node = {2: {}, 4: {}, Catalog._TERMINAL_MARKER: True}
+
+    dict_result = _apply(node, catalog, "null")
+    set_result = _apply({2, 4}, catalog, "null")
+
+    assert dict_result == set_result
+    assert dict_result[0] == [1, 2, 3, 4]
+    assert dict_result[1] == [-float("inf"), -0.2, -float("inf"), -0.4]
+
+
+def test_apply_catalog_filter_dict_matches_set_fill_strategy(mock_tokenizer: MagicMock) -> None:
+    """dict node (with marker) behaves identically to the equivalent set under "fill"."""
+    catalog = Catalog(mock_tokenizer)
+    node = {2: {}, 4: {}, Catalog._TERMINAL_MARKER: True}
+
+    dict_result = _apply(node, catalog, "fill")
+    set_result = _apply({2, 4}, catalog, "fill")
+
+    assert dict_result == set_result
+    # Invalid slots 1 and 3 are filled with the sorted valid tokens 2, 4.
+    assert dict_result[0] == [2, 2, 4, 4]
+    assert all(lp < 0 for lp in dict_result[1])
+
+
+def test_apply_catalog_filter_ignores_terminal_marker_in_dict(mock_tokenizer: MagicMock) -> None:
+    """The _TERMINAL_MARKER string key must never surface as a fillable token."""
+    catalog = Catalog(mock_tokenizer)
+
+    # Node whose only child is the terminal marker (a completed sequence).
+    terminal_only = {Catalog._TERMINAL_MARKER: True}
+    result = _apply(terminal_only, catalog, "fill")
+
+    # No valid next token -> beam is a dead end, eliminated entirely.
+    assert result[0] == []
+    assert result[1] == []
+
+    # Mixed node: marker present alongside valid int keys -> marker is excluded.
+    # _apply inputs are token_ids=[1,2,3,4], ranks=[1,2,3,4], decoded=[a,b,c,d].
+    mixed = {2: {}, Catalog._TERMINAL_MARKER: True}
+    result = _apply(mixed, catalog, "fill")
+    assert result[0] == [2, 2, 2, 2]
+    # Only the fill-injected slots (invalid 1, 3, 4) get ranks/decoded reset;
+    # the in-window valid token 2 keeps its original metadata.
+    assert result[2] == [None, 2, None, None]
+    assert result[3] == [None, "b", None, None]
+
+
+def test_apply_catalog_filter_empty_node_matches_empty_set(mock_tokenizer: MagicMock) -> None:
+    """An empty dict node (dead-end beam) is eliminated exactly like an empty set."""
+    catalog = Catalog(mock_tokenizer)
+
+    dict_result = _apply({}, catalog, "null")
+    set_result = _apply(set(), catalog, "null")
+
+    assert dict_result == set_result
+    assert dict_result[0] == []
+    assert dict_result[1] == []
+
+
+def test_fill_injects_catalog_tokens_when_valid_set_is_smaller_than_window(
+    mock_tokenizer: MagicMock,
+) -> None:
+    """'fill' semantics: valid tokens not present in the top-K window are injected.
+
+    This is the exact offline-path parity guarantee: under "fill" a beam whose
+    candidate window has fewer valid catalog tokens than slots keeps generating
+    with catalog-valid tokens rather than dead-ending (as plain masking would).
+    """
+    catalog = Catalog(mock_tokenizer)
+
+    # One valid continuation (5); the window holds 4 slots.
+    result = catalog.apply_catalog_filter(
+        token_ids_pos=[1, 2, 3, 4],
+        logprobs_pos=[-0.1, -0.2, -0.3, -0.4],
+        ranks_pos=[1, 2, 3, 4],
+        decoded_pos=["a", "b", "c", "d"],
+        valid_tokens_node={5: {}, Catalog._TERMINAL_MARKER: True},
+        catalog_strategy="fill",
+    )
+
+    # Every slot is replaced by the single valid token 5 (with fill scores).
+    assert result[0] == [5, 5, 5, 5]
+    # With a single valid token the injected score is identical across slots
+    # (fill_used % n_valid == 0); descending scores only apply with n_valid > 1.
+    assert result[1] == [-10000.0, -10000.0, -10000.0, -10000.0]
+    assert result[2] == [None, None, None, None]  # fill-injected ranks reset
+
+
+def test_fill_preserves_geometry_when_valid_token_in_window(
+    mock_tokenizer: MagicMock,
+) -> None:
+    """'fill' keeps an in-window valid token at its original logprob."""
+    catalog = Catalog(mock_tokenizer)
+
+    result = catalog.apply_catalog_filter(
+        token_ids_pos=[1, 2, 3, 4],
+        logprobs_pos=[-0.1, -0.2, -0.3, -0.4],
+        ranks_pos=[1, 2, 3, 4],
+        decoded_pos=["a", "b", "c", "d"],
+        valid_tokens_node={2: {}, 4: {}},
+        catalog_strategy="fill",
+    )
+
+    assert result[0] == [2, 2, 4, 4]
+    assert result[1][1] == -0.2  # token 2 kept its original logprob
+    assert result[1][3] == -0.4  # token 4 kept its original logprob

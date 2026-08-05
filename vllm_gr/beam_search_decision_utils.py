@@ -45,6 +45,24 @@ def mask_candidate_logprobs(
     ]
 
 
+def resolve_catalog_node(
+    beam: Any,
+    catalog: Any,
+    prompt_len: int,
+) -> dict | set[int]:
+    """Return a beam's cached trie node, falling back to a full re-traversal.
+
+    The O(1) ``_catalog_node`` prefix cache on the beam state is preferred; it
+    is only absent for beams that predate the cache (e.g. materialized before
+    ``_catalog_node`` was introduced).  For those, ``catalog.valid()`` walks the
+    trie from the root over the beam's generated tokens.
+    """
+    node = getattr(beam, "_catalog_node", None)
+    if node is not None:
+        return node
+    return catalog.valid(beam.tokens[prompt_len:])
+
+
 def extract_and_dedup_segment(
     raw_token_ids: Sequence[int],
     raw_logprobs: Sequence[float],
@@ -143,6 +161,12 @@ def complete_eos_candidates(
         )
         eos_beam._lp_parent = parent
         eos_beam._lp_step_data = cached
+        _parent_node = getattr(parent, "_catalog_node", None)
+        eos_beam._catalog_node = (
+            _parent_node.get(int(token_ids[candidate_index]), {})
+            if _parent_node is not None
+            else None
+        )
         eos_beams.append(eos_beam)
 
     masked_scores = scores.copy()
@@ -204,6 +228,10 @@ def materialize_selected_beams(
         )
         new_beam._lp_parent = parent
         new_beam._lp_step_data = cached
+        _parent_node = getattr(parent, "_catalog_node", None)
+        new_beam._catalog_node = (
+            _parent_node.get(token_id, {}) if _parent_node is not None else None
+        )
         new_beams.append(new_beam)
         fork_info.append((parent_index, token_id))
 
