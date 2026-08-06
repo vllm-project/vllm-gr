@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
+from vllm_gr.profiling import profile
 
 BeamCandidateCache = tuple[
     Sequence[int],
@@ -45,6 +46,25 @@ def mask_candidate_logprobs(
     ]
 
 
+def resolve_catalog_node(
+    beam: Any,
+    catalog: Any,
+    prompt_len: int,
+) -> dict | set[int]:
+    """Return a beam's cached trie node, falling back to a full re-traversal.
+
+    The O(1) ``_catalog_node`` prefix cache on the beam state is preferred; it
+    is only absent for beams that predate the cache (e.g. materialized before
+    ``_catalog_node`` was introduced).  For those, ``catalog.valid()`` walks the
+    trie from the root over the beam's generated tokens.
+    """
+    with profile("resolve_catalog_node"):
+        node = getattr(beam, "_catalog_node", None)
+        if node is not None:
+            return node
+        return catalog.valid(beam.tokens[prompt_len:])
+
+
 def extract_and_dedup_segment(
     raw_token_ids: Sequence[int],
     raw_logprobs: Sequence[float],
@@ -61,29 +81,30 @@ def extract_and_dedup_segment(
 ]:
     """Extract one candidate block using the legacy sampled-token rule."""
 
-    token_ids_pos = raw_token_ids[start_offset:end_offset]
-    logprobs_pos = raw_logprobs[start_offset:end_offset]
-    ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
-    decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
+    with profile("extract_and_dedup_segment"):
+        token_ids_pos = raw_token_ids[start_offset:end_offset]
+        logprobs_pos = raw_logprobs[start_offset:end_offset]
+        ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
+        decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
 
-    if len(token_ids_pos) > logprobs_num:
-        if any(token_ids_pos[0] == token_ids_pos[j] for j in range(1, logprobs_num + 1)):
-            selected = slice(1, logprobs_num + 1)
-        else:
-            selected = slice(logprobs_num)
-        token_ids_pos = token_ids_pos[selected]
-        logprobs_pos = logprobs_pos[selected]
-        ranks_pos = ranks_pos[selected] if ranks_pos is not None else None
-        decoded_pos = decoded_pos[selected] if decoded_pos is not None else None
+        if len(token_ids_pos) > logprobs_num:
+            if any(token_ids_pos[0] == token_ids_pos[j] for j in range(1, logprobs_num + 1)):
+                selected = slice(1, logprobs_num + 1)
+            else:
+                selected = slice(logprobs_num)
+            token_ids_pos = token_ids_pos[selected]
+            logprobs_pos = logprobs_pos[selected]
+            ranks_pos = ranks_pos[selected] if ranks_pos is not None else None
+            decoded_pos = decoded_pos[selected] if decoded_pos is not None else None
 
-    if is_vocab_slice_enabled():
-        offset, slice_size, _ = get_vocab_slice_config()
-        if offset is not None and slice_size is not None and slice_size > 0:
-            token_ids_pos = [
-                tid + offset if 0 <= tid < slice_size else tid for tid in token_ids_pos
-            ]
+        if is_vocab_slice_enabled():
+            offset, slice_size, _ = get_vocab_slice_config()
+            if offset is not None and slice_size is not None and slice_size > 0:
+                token_ids_pos = [
+                    tid + offset if 0 <= tid < slice_size else tid for tid in token_ids_pos
+                ]
 
-    return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
+        return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
 
 
 def extract_and_dedup_flat_logprobs(flat: Any, logprobs_num: int):
@@ -124,55 +145,63 @@ def complete_eos_candidates(
 ) -> tuple[list[BeamSearchSequence], np.ndarray]:
     """Materialize stop-token candidates and mask their scores on a copy."""
 
-    eos_beams: list[BeamSearchSequence] = []
-    eos_indices = np.where(np.isin(token_ids, tuple(stop_token_ids)))[0]
-    for candidate_index in eos_indices:
-        parent_index = int(beam_idx[candidate_index])
-        parent = parents[parent_index]
-        cached = beam_flat_cache[parent_index]
-        assert cached is not None
-        stop_token_id = int(token_ids[candidate_index])
-        eos_beam = BeamSearchSequence(
-            orig_prompt=parent.orig_prompt,
-            tokens=(parent.tokens + [stop_token_id] if include_eos_token else parent.tokens),
-            logprobs=initial_logprobs,
-            cum_logprob=float(scores[candidate_index]),
-            finish_reason="stop",
-            stop_reason=stop_token_id,
-            lora_request=parent.lora_request if inherit_lora_request else None,
-        )
-        eos_beam._lp_parent = parent
-        eos_beam._lp_step_data = cached
-        eos_beams.append(eos_beam)
+    with profile("complete_eos_candidates"):
+        eos_beams: list[BeamSearchSequence] = []
+        eos_indices = np.where(np.isin(token_ids, tuple(stop_token_ids)))[0]
+        for candidate_index in eos_indices:
+            parent_index = int(beam_idx[candidate_index])
+            parent = parents[parent_index]
+            cached = beam_flat_cache[parent_index]
+            assert cached is not None
+            stop_token_id = int(token_ids[candidate_index])
+            eos_beam = BeamSearchSequence(
+                orig_prompt=parent.orig_prompt,
+                tokens=(parent.tokens + [stop_token_id] if include_eos_token else parent.tokens),
+                logprobs=initial_logprobs,
+                cum_logprob=float(scores[candidate_index]),
+                finish_reason="stop",
+                stop_reason=stop_token_id,
+                lora_request=parent.lora_request if inherit_lora_request else None,
+            )
+            eos_beam._lp_parent = parent
+            eos_beam._lp_step_data = cached
+            _parent_node = getattr(parent, "_catalog_node", None)
+            eos_beam._catalog_node = (
+                _parent_node.get(int(token_ids[candidate_index]), {})
+                if _parent_node is not None
+                else None
+            )
+            eos_beams.append(eos_beam)
 
-    masked_scores = scores.copy()
-    masked_scores[eos_indices] = -np.inf
-    return eos_beams, masked_scores
+        masked_scores = scores.copy()
+        masked_scores[eos_indices] = -np.inf
+        return eos_beams, masked_scores
 
 
 def select_top_indices(
     scores: np.ndarray, beam_width: int, catalog_strategy: str = "fill"
 ) -> np.ndarray:
     """Return top candidate indices with the legacy ``argpartition`` order."""
-    # For "null" strategy: only pick from finite (valid catalog) entries so that
-    # -inf slots from catalog-filtered tokens are never selected.
-    if catalog_strategy == "null":
-        finite_mask = np.isfinite(scores)
-        finite_idx = np.where(finite_mask)[0]
-        if finite_idx.size == 0:
-            # No valid candidates left — stop generating for this instance
-            return np.empty(0, dtype=np.intp)
-        if finite_idx.size > beam_width:
-            # argpartition requires kth < arr.size, so only call it when
-            # there are strictly more candidates than we need to keep.
-            topn_idx = finite_idx[np.argpartition(-scores[finite_idx], beam_width)[:beam_width]]
+    with profile("select_top_indices"):
+        # For "null" strategy: only pick from finite (valid catalog) entries so
+        # that -inf slots from catalog-filtered tokens are never selected.
+        if catalog_strategy == "null":
+            finite_mask = np.isfinite(scores)
+            finite_idx = np.where(finite_mask)[0]
+            if finite_idx.size == 0:
+                # No valid candidates left — stop generating for this instance
+                return np.empty(0, dtype=np.intp)
+            if finite_idx.size > beam_width:
+                # argpartition requires kth < arr.size, so only call it when
+                # there are strictly more candidates than we need to keep.
+                topn_idx = finite_idx[np.argpartition(-scores[finite_idx], beam_width)[:beam_width]]
+            else:
+                topn_idx = finite_idx  # at most beam_width finite entries; take all
+        elif scores.size > beam_width:
+            topn_idx = np.argpartition(np.negative(scores), beam_width)[:beam_width]
         else:
-            topn_idx = finite_idx  # at most beam_width finite entries; take all
-    elif scores.size > beam_width:
-        topn_idx = np.argpartition(np.negative(scores), beam_width)[:beam_width]
-    else:
-        topn_idx = np.arange(scores.size)
-    return topn_idx
+            topn_idx = np.arange(scores.size)
+        return topn_idx
 
 
 def materialize_selected_beams(
@@ -187,24 +216,29 @@ def materialize_selected_beams(
 ) -> tuple[list[BeamSearchSequence], ForkInfo]:
     """Build selected child beams and their grouped-request fork mapping."""
 
-    new_beams: list[BeamSearchSequence] = []
-    fork_info: ForkInfo = []
-    for candidate_index in selected_indices:
-        parent_index = int(beam_idx[candidate_index])
-        parent = parents[parent_index]
-        token_id = int(token_ids[candidate_index])
-        cached = beam_flat_cache[parent_index]
-        assert cached is not None
-        new_beam = BeamSearchSequence(
-            orig_prompt=parent.orig_prompt,
-            tokens=parent.tokens + [token_id],
-            logprobs=initial_logprobs,
-            lora_request=parent.lora_request,
-            cum_logprob=float(scores[candidate_index]),
-        )
-        new_beam._lp_parent = parent
-        new_beam._lp_step_data = cached
-        new_beams.append(new_beam)
-        fork_info.append((parent_index, token_id))
+    with profile("materialize_selected_beams"):
+        new_beams: list[BeamSearchSequence] = []
+        fork_info: ForkInfo = []
+        for candidate_index in selected_indices:
+            parent_index = int(beam_idx[candidate_index])
+            parent = parents[parent_index]
+            token_id = int(token_ids[candidate_index])
+            cached = beam_flat_cache[parent_index]
+            assert cached is not None
+            new_beam = BeamSearchSequence(
+                orig_prompt=parent.orig_prompt,
+                tokens=parent.tokens + [token_id],
+                logprobs=initial_logprobs,
+                lora_request=parent.lora_request,
+                cum_logprob=float(scores[candidate_index]),
+            )
+            new_beam._lp_parent = parent
+            new_beam._lp_step_data = cached
+            _parent_node = getattr(parent, "_catalog_node", None)
+            new_beam._catalog_node = (
+                _parent_node.get(token_id, {}) if _parent_node is not None else None
+            )
+            new_beams.append(new_beam)
+            fork_info.append((parent_index, token_id))
 
-    return new_beams, fork_info
+        return new_beams, fork_info

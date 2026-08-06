@@ -20,9 +20,11 @@ from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
     materialize_selected_beams,
+    resolve_catalog_node,
     select_top_indices,
 )
 from vllm_gr.logprobs import reconstruct_beam_logprobs
+from vllm_gr.profiling import profile, profiled_async_generator
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
@@ -193,6 +195,7 @@ async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
 
 
+@profiled_async_generator
 async def beam_search(
     self,
     prompt: EngineInput,
@@ -310,6 +313,16 @@ async def beam_search(
     # upstream the fields if that happens.
     all_beams[0]._lp_parent = None
     all_beams[0]._lp_step_data = None
+    # Catalog prefix node: initialize to the trie root so each beam tracks
+    # its position in the catalog trie via O(1) parent-offset propagation
+    # rather than O(t) re-traversal at every step.
+    if self.models.catalog is not None:
+        initial_node = self.models.catalog.trie
+        if sid_begin_token_id is not None:
+            initial_node = initial_node.get(sid_begin_token_id, {})
+        all_beams[0]._catalog_node = initial_node
+    else:
+        all_beams[0]._catalog_node = None
     completed = []
 
     beam_search_start: int = time.perf_counter()
@@ -358,60 +371,57 @@ async def beam_search(
             num_generation_tokens += len(all_beams)
         request_id_batch = f"{request_id}-{random_uuid()}"
 
-        # Launch catalog filtering in parallel with the engine step.
-        catalog_task = None
+        # Read each beam's catalog trie node directly.  With O(1) prefix-node
+        # caching on the beam state, spawning a thread pool for sub-microsecond
+        # dict reads is pure overhead (GIL-bound), so the nodes are read
+        # synchronously instead.  Beams without a cached node fall back to a
+        # full re-traversal via catalog.valid().
+        valid_nodes = None
         if self.models.catalog is not None:
-
-            def get_valid_tokens_set(beam) -> set[int]:
-                generated_tokens = beam.tokens[len(prompt_token_ids) :]
-                return self.models.catalog.valid(generated_tokens)
-
-            async def _run_catalog(coros):
-                return list(await asyncio.gather(*coros))
-
-            catalog_task = asyncio.create_task(
-                _run_catalog([asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams])
-            )
+            valid_nodes = [
+                resolve_catalog_node(beam, self.models.catalog, len(prompt_token_ids))
+                for beam in all_beams
+            ]
 
         gen_start = time.perf_counter()
 
         # Execute Engine Step Pass
         if use_beam_request and fork_info is not None:
-            output, prev_beam_internal_ids = await _beam_request_step(
-                self.engine_client,
-                session_id=prefill_id,
-                fork_info=fork_info,
-                prev_beam_internal_ids=prev_beam_internal_ids,
-                all_beams=all_beams,
-                request_id_batch=request_id_batch,
-                beam_search_params=beam_search_params,
-                eos_token_id=eos_token_id,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                prefix_len=len(initial_tokens),
-                priority=priority,
-                data_parallel_rank=rank,
-            )
+            with profile("engine_step_wait"):
+                output, prev_beam_internal_ids = await _beam_request_step(
+                    self.engine_client,
+                    session_id=prefill_id,
+                    fork_info=fork_info,
+                    prev_beam_internal_ids=prev_beam_internal_ids,
+                    all_beams=all_beams,
+                    request_id_batch=request_id_batch,
+                    beam_search_params=beam_search_params,
+                    eos_token_id=eos_token_id,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    prefix_len=len(initial_tokens),
+                    priority=priority,
+                    data_parallel_rank=rank,
+                )
         else:
-            output, new_ids = await _add_batch_step(
-                self.engine_client,
-                prompts_batch,
-                lora_req_batch,
-                request_id_batch,
-                beam_search_params,
-                use_beam_request,
-                trace_headers,
-                priority=priority,
-                data_parallel_rank=rank,
-            )
+            with profile("engine_step_wait"):
+                output, new_ids = await _add_batch_step(
+                    self.engine_client,
+                    prompts_batch,
+                    lora_req_batch,
+                    request_id_batch,
+                    beam_search_params,
+                    use_beam_request,
+                    trace_headers,
+                    priority=priority,
+                    data_parallel_rank=rank,
+                )
             if new_ids:
                 prev_beam_internal_ids = new_ids
                 if prefill_id is None:
                     prefill_id = new_ids[0]
 
-        valid_tokens_sets = None
-        if catalog_task is not None:
-            valid_tokens_sets = await catalog_task
+        valid_tokens_sets = valid_nodes
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         # Store all new tokens generated by beam

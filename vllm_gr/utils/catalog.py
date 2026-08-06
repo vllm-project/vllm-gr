@@ -9,6 +9,7 @@ from typing import Any
 from vllm.tokenizers import TokenizerLike
 
 from vllm_gr.logger import init_logger
+from vllm_gr.profiling import profile, profiled
 
 logger = init_logger(__name__)
 
@@ -122,13 +123,14 @@ class Catalog:
                 return set()
         return {k for k in node if k != self._TERMINAL_MARKER}
 
+    @profiled("apply_catalog_filter")
     def apply_catalog_filter(
         self,
         token_ids_pos: list[int],
         logprobs_pos: list[float],
         ranks_pos: list[int | None] | None,
         decoded_pos: list[str | None] | None,
-        valid_tokens_set: set[int],
+        valid_tokens_node: dict[int | str, Any] | set[int] | None,
         catalog_strategy: str,
     ) -> tuple[list[int], list[float], list[int | None] | None, list[str | None] | None]:
         """Apply catalog constraint to a single beam's candidate window.
@@ -142,8 +144,11 @@ class Catalog:
                          token_ids_pos.
             ranks_pos: Optional per-token ranking metadata (or None if not tracked).
             decoded_pos: Optional per-token decoded string metadata (or None if not tracked).
-            valid_tokens_set: Set of token IDs that are valid continuations per the
-                             catalog constraint. Empty set means beam is invalid.
+            valid_tokens_node: Trie node dict (child keys) or set of token IDs that are
+                             valid continuations per the catalog constraint.  Dict form
+                             allows the caller to pass the cached trie node directly and
+                             avoids materializing a set() per beam per step.  An empty
+                             dict/set means the beam is invalid.
             catalog_strategy: Either "fill" or "null":
                 - "fill": Keep catalog-valid entries with their original logprobs;
                          replace invalid entries with a catalog-valid token and
@@ -160,7 +165,7 @@ class Catalog:
             - ranks is None iff input ranks_pos was None
             - decoded is None iff input decoded_pos was None
         """
-        if not valid_tokens_set:
+        if not valid_tokens_node:
             return (
                 [],
                 [],
@@ -174,7 +179,7 @@ class Catalog:
             filtered_lps = logprobs_pos[:]
             all_inf = True
             for i in range(n):
-                if token_ids_pos[i] not in valid_tokens_set:
+                if token_ids_pos[i] not in valid_tokens_node:
                     filtered_lps[i] = -float("inf")
                 else:
                     all_inf = False
@@ -187,26 +192,44 @@ class Catalog:
                 )
             return filtered_tids, filtered_lps, ranks_pos, decoded_pos
 
-        valid_list = sorted(valid_tokens_set)
+        # For "fill" strategy, extract only valid-token keys from the node dict.
+        # The trie node may contain the _TERMINAL_MARKER string key, which
+        # must be excluded — sorted(valid_tokens_node) would raise TypeError
+        # on mixed str/int keys, and a terminal-only node has no valid next
+        # token to fill with.  Excluding by marker name rather than isinstance
+        # handles numpy integer keys seamlessly.
+        with profile("apply_catalog_filter.fill.sorted"):
+            if isinstance(valid_tokens_node, dict):
+                valid_list = sorted(k for k in valid_tokens_node if k != self._TERMINAL_MARKER)
+            else:
+                valid_list = sorted(valid_tokens_node)
         n_valid = len(valid_list)
-        n = len(token_ids_pos)
-        new_tids = token_ids_pos[:]
-        new_lps = logprobs_pos[:]
-        new_ranks: list | None = None
-        new_decoded: list | None = None
-        if ranks_pos is not None:
-            new_ranks = [ranks_pos[i] if i < len(ranks_pos) else None for i in range(n)]
-        if decoded_pos is not None:
-            new_decoded = [decoded_pos[i] if i < len(decoded_pos) else None for i in range(n)]
-        fill_used = 0
-        for j, tid in enumerate(token_ids_pos):
-            if tid not in valid_tokens_set:
-                ft = valid_list[fill_used % n_valid]
-                new_tids[j] = ft
-                new_lps[j] = -10000.0 - (fill_used % n_valid) * 0.1
-                fill_used += 1
-                if new_ranks is not None:
-                    new_ranks[j] = None
-                if new_decoded is not None:
-                    new_decoded[j] = None
-        return new_tids, new_lps, new_ranks, new_decoded
+        if n_valid == 0:
+            return (
+                [],
+                [],
+                ([] if ranks_pos is not None else None),
+                ([] if decoded_pos is not None else None),
+            )
+        with profile("apply_catalog_filter.fill.loop"):
+            n = len(token_ids_pos)
+            new_tids = token_ids_pos[:]
+            new_lps = logprobs_pos[:]
+            new_ranks: list | None = None
+            new_decoded: list | None = None
+            if ranks_pos is not None:
+                new_ranks = [ranks_pos[i] if i < len(ranks_pos) else None for i in range(n)]
+            if decoded_pos is not None:
+                new_decoded = [decoded_pos[i] if i < len(decoded_pos) else None for i in range(n)]
+            fill_used = 0
+            for j, tid in enumerate(token_ids_pos):
+                if tid not in valid_tokens_node:
+                    ft = valid_list[fill_used % n_valid]
+                    new_tids[j] = ft
+                    new_lps[j] = -10000.0 - (fill_used % n_valid) * 0.1
+                    fill_used += 1
+                    if new_ranks is not None:
+                        new_ranks[j] = None
+                    if new_decoded is not None:
+                        new_decoded[j] = None
+            return new_tids, new_lps, new_ranks, new_decoded

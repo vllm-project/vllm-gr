@@ -38,14 +38,15 @@ from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
-    mask_candidate_logprobs,
     materialize_selected_beams,
+    resolve_catalog_node,
     select_top_indices,
 )
 from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     reconstruct_beam_logprobs,
 )
+from vllm_gr.profiling import profile, profiled_sync
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.utils.catalog import Catalog
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
@@ -292,12 +293,14 @@ def _parse_step_logprobs(
                 logprobs_num,
             )
             if catalog is not None:
-                generated_tokens = current_beam.tokens[instance.prompt_len :]
-                valid_tokens_set = catalog.valid(generated_tokens)
-                logprobs_pos = mask_candidate_logprobs(
+                valid_node = resolve_catalog_node(current_beam, catalog, instance.prompt_len)
+                token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = catalog.apply_catalog_filter(
                     token_ids_pos,
                     logprobs_pos,
-                    valid_tokens_set,
+                    ranks_pos,
+                    decoded_pos,
+                    valid_node,
+                    catalog_strategy,
                 )
 
             beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
@@ -310,12 +313,14 @@ def _parse_step_logprobs(
         )
         if catalog is not None:
             current_beam = instance.beams[0]
-            generated_tokens = current_beam.tokens[instance.prompt_len :]
-            valid_tokens_set = catalog.valid(generated_tokens)
-            logprobs_pos = mask_candidate_logprobs(
+            valid_node = resolve_catalog_node(current_beam, catalog, instance.prompt_len)
+            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = catalog.apply_catalog_filter(
                 token_ids_pos,
                 logprobs_pos,
-                valid_tokens_set,
+                ranks_pos,
+                decoded_pos,
+                valid_node,
+                catalog_strategy,
             )
 
         beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
@@ -500,6 +505,7 @@ class GRLLM(LLM):
             self.catalog = Catalog(self.get_tokenizer())
             self.catalog.load(catalog_path)
 
+    @profiled_sync
     def beam_search(
         self,
         prompts: list[Union["TokensPrompt", "TextPrompt"]],
@@ -614,6 +620,18 @@ class GRLLM(LLM):
             # dynamic attrs will break — upstream the fields if that happens.
             instance.beams[0]._lp_parent = None
             instance.beams[0]._lp_step_data = None
+            # Catalog prefix node: initialize to the trie root so each beam
+            # tracks its position in the catalog trie via O(1) parent-offset
+            # propagation rather than O(t) re-traversal at every step.
+            # The begin token (if configured) has already been appended to
+            # instance.beams[0].tokens above, so step into its child node.
+            if self.catalog is not None:
+                initial_node = self.catalog.trie
+                if sid_begin_token_id is not None:
+                    initial_node = initial_node.get(sid_begin_token_id, {})
+                instance.beams[0]._catalog_node = initial_node
+            else:
+                instance.beams[0]._catalog_node = None
             instance.prompt_len = (
                 len(prompt_tokens) - 1 if sid_begin_token_id is not None else len(prompt_tokens)
             )
@@ -693,22 +711,27 @@ class GRLLM(LLM):
 
                     # only runs for one step
                     # we don't need to use tqdm here
-                    output = self.generate(
-                        prompts_batch,
-                        sampling_params=beam_search_params,
-                        use_tqdm=False,
-                        lora_request=lora_req_batch,
-                    )
+                    with profile("engine_step_wait"):
+                        output = self.generate(
+                            prompts_batch,
+                            sampling_params=beam_search_params,
+                            use_tqdm=False,
+                            lora_request=lora_req_batch,
+                        )
 
-                    # Validate generated tokens using catalog if available
+                    # Validate generated tokens using catalog if available.
+                    # Prefer each beam's O(1) cached trie node; fall back to a
+                    # full re-traversal only when the node was never attached
+                    # (e.g. beams materialized before _catalog_node existed).
                     valid_tokens_sets = []
                     has_catalog = getattr(self, "catalog", None) is not None
                     if has_catalog:
                         for instance in instances_batch:
                             prompt_len = instance.prompt_len
                             for beam in instance.beams:
-                                generated_tokens = beam.tokens[prompt_len:]
-                                valid_tokens_sets.append(self.catalog.valid(generated_tokens))
+                                valid_tokens_sets.append(
+                                    resolve_catalog_node(beam, self.catalog, prompt_len)
+                                )
 
                     for (start, end), instance in zip(instance_start_and_end, instances_batch):
                         # Gather all logprobs and cumulative scores for this instance
@@ -730,11 +753,16 @@ class GRLLM(LLM):
                                     extract_and_dedup_flat_logprobs(flat, logprobs_num)
                                 )
                                 if has_catalog:
-                                    valid_tokens_set = valid_tokens_sets[start + i]
-                                    logprobs_pos = mask_candidate_logprobs(
-                                        token_ids_pos,
-                                        logprobs_pos,
-                                        valid_tokens_set,
+                                    valid_node = valid_tokens_sets[start + i]
+                                    token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                                        self.catalog.apply_catalog_filter(
+                                            token_ids_pos,
+                                            logprobs_pos,
+                                            ranks_pos,
+                                            decoded_pos,
+                                            valid_node,
+                                            catalog_strategy,
+                                        )
                                     )
                                 beam_flat_cache.append(
                                     (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)
