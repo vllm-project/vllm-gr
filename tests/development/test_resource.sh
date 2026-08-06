@@ -39,9 +39,13 @@ echo "PASSED (Got GPU ID: $GPU_ID)"
 
 # 2. Test lock_gpu & unlock_gpu
 echo -n "Testing lock_gpu on GPU $GPU_ID... "
+set +e
 LOCK_PID=$(lock_gpu "$GPU_ID")
-if [ -z "$LOCK_PID" ]; then
-    echo "FAILED (lock_gpu did not return a PID. Check for missing EGL/GL dependencies in Python)"
+rc=$?
+set -e
+
+if [ $rc -ne 0 ] || [ -z "$LOCK_PID" ]; then
+    echo "FAILED (lock_gpu did not return a PID. Check for missing EGL/GL/CUDA dependencies in Python)"
     exit 1
 fi
 
@@ -87,8 +91,12 @@ echo "PASSED (Got GPU IDs: $GPU_IDS)"
 
 # 4. Test lock_gpus & unlock_gpus
 echo -n "Testing lock_gpus on GPUs '$GPU_IDS'... "
+set +e
 LOCK_PIDS=$(lock_gpus "$GPU_IDS")
-if [ -z "$LOCK_PIDS" ]; then
+rc=$?
+set -e
+
+if [ $rc -ne 0 ] || [ -z "$LOCK_PIDS" ]; then
     echo "FAILED (lock_gpus did not return PIDs)"
     exit 1
 fi

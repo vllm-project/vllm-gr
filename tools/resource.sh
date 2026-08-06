@@ -64,7 +64,7 @@ function get_gpu() {
         for (( i=0; i<gpu_count; i++ ))
         do
             if is_available "$i" "$mem_gpu"; then
-                echo $i
+                echo "$i"
                 return 0
             fi
         done
@@ -151,7 +151,6 @@ function lock_gpu() {
         python "$script_dir/lock_gpu.py" "$gpu_id" > "$ready_file" 2>/dev/null &
         lock_pid=$!
     fi
-    echo "got process id: $lock_pid" >&2
     # Poll until we see 'READY' or the process dies (max ~10s).
     local ready=0
     for (( i=0; i<40; i++ )); do

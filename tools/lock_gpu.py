@@ -7,14 +7,45 @@ import sys
 import time
 
 
+def _lock_gpu_cuda(gpu_id: int, mem_to_alloc_mb: int) -> bool:
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+        if cuda.cuInit(0) != 0:
+            return False
+        dev = ctypes.c_int()
+        if cuda.cuDeviceGet(ctypes.byref(dev), gpu_id) != 0:
+            return False
+        ctx = ctypes.c_void_p()
+        if cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev.value) != 0:
+            return False
+        dptr = ctypes.c_uint64()
+        size_bytes = mem_to_alloc_mb * 1024 * 1024
+        if cuda.cuMemAlloc_v2(ctypes.byref(dptr), size_bytes) != 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def lock_gpu(gpu_id: int, mem_to_alloc_mb: int):
+    # First try CUDA driver API (most robust on headless GPU nodes)
+    if _lock_gpu_cuda(gpu_id, mem_to_alloc_mb):
+        print("READY", flush=True)
+        time.sleep(31536000)
+        return
+
+    # Fallback to EGL implementation
     try:
         if "__EGL_VENDOR_LIBRARY_FILENAMES" not in os.environ:
             standard_vendor_files = [
                 "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
                 "/etc/glvnd/egl_vendor.d/10_nvidia.json",
             ]
-            if not any(os.path.exists(f) for f in standard_vendor_files):
+            for vendor_file in standard_vendor_files:
+                if os.path.exists(vendor_file):
+                    os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] = vendor_file
+                    break
+            else:
                 cfg_path = "/tmp/10_nvidia_auto.json"
                 if not os.path.exists(cfg_path):
                     try:
@@ -104,9 +135,6 @@ def lock_gpu(gpu_id: int, mem_to_alloc_mb: int):
         if not surface:
             raise Exception("eglCreatePbufferSurface failed")
 
-        # Indicate we're ready before making current (and potentially blocking)
-        print("READY", flush=True)
-
         if egl.eglMakeCurrent(display, surface, surface, ctx) == 0:
             raise Exception("eglMakeCurrent failed")
 
@@ -122,6 +150,9 @@ def lock_gpu(gpu_id: int, mem_to_alloc_mb: int):
         ]
         size = ctypes.c_size_t(mem_to_alloc_mb * 1024 * 1024)
         gl.glBufferData(0x8892, size, None, 0x88E4)  # GL_STATIC_DRAW
+
+        # Indicate we're ready after allocation succeeds
+        print("READY", flush=True)
 
         time.sleep(31536000)  # Sleep for a year, waiting to be killed.
     except Exception as e:

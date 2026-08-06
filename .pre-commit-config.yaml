@@ -183,6 +183,12 @@ repos:
       language: python
       types: [python]
 
+    - id: check-characters
+      name: Check valid characters in files
+      entry: python tools/pre_commit/check_english.py
+      language: python
+
+
     - id: run-tests
       name: Run all tests
       entry: bash tools/pre_commit/run_tests.sh

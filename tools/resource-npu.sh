@@ -64,7 +64,7 @@ function get_npu() {
         for (( i=0; i<total; i++ ))
         do
             if is_available_npu "$i" "$mem_npu"; then
-                echo $i
+                echo "$i"
                 return 0
             fi
         done
