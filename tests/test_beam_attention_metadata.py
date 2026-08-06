@@ -241,4 +241,3 @@ def test_build_chunked_prefill_and_multistep_beam_metadata() -> None:
     assert metadata is not None
     assert metadata.suffix_slot_mapping_out is not None
     assert metadata.suffix_slot_mapping_out.shape[0] == len(metadata.suffix_seqlens_kv_cpu) * 2
-

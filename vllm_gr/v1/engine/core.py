@@ -60,7 +60,7 @@ def _cache_beam_request(self, request) -> None:
     """
     _ensure_beam_state(self)
 
-    # Make a clean, un-mutatable copy of the original prompt token IDs
+    # Make a clean, un-mutable copy of the original prompt token IDs
     raw_token_ids = list(request._all_token_ids)
     block_hasher = getattr(self, "request_block_hasher", None)
     vllm_config = getattr(self, "vllm_config", None)
@@ -75,7 +75,7 @@ def _cache_beam_request(self, request) -> None:
         request._block_hasher = block_hasher
         request.update_block_hashes()
         # Remove pad tokens in-place before prefill execution
-        del request._all_token_ids[len(raw_token_ids):]
+        del request._all_token_ids[len(raw_token_ids) :]
 
     with self.beam_cache_lock:
         self.beam_cache[request.request_id] = {

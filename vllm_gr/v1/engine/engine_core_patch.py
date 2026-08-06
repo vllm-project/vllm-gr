@@ -229,10 +229,15 @@ def apply_scheduler_patch():
                 # Only pad on the FINAL prefill chunk when the prompt tail is reached
                 num_prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
                 if num_computed_tokens >= num_prompt_tokens:
-                    chunk_padded_target = (num_computed_tokens + block_size - 1) // block_size * block_size
+                    chunk_padded_target = (
+                        (num_computed_tokens + block_size - 1) // block_size * block_size
+                    )
                     num_hashes = len(request.block_hashes)
                     padded_target = min(chunk_padded_target, num_hashes * block_size)
-                    if num_computed_tokens < padded_target and num_computed_tokens % block_size != 0:
+                    if (
+                        num_computed_tokens < padded_target
+                        and num_computed_tokens % block_size != 0
+                    ):
                         num_computed_tokens = padded_target
             return _original_cache_blocks(request, num_computed_tokens)
 

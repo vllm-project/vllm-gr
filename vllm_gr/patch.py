@@ -68,7 +68,6 @@ class BeamPatchInitializationError(RuntimeError):
 _LAST_BEAM_PATCH_REPORT: BeamPatchReport | None = None
 
 
-
 def _call_patch(module_name: str, function_name: str) -> None:
     module = importlib.import_module(module_name)
     getattr(module, function_name)()
