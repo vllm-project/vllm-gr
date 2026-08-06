@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
+import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
     EngineCoreRequestType,
@@ -522,6 +523,14 @@ class TestBeamCache:
         assert entry["all_token_ids"] == [9, 9, 9]
         assert entry["block_hashes"] == [0xAA, 0xBB]
         assert entry["num_prompt_tokens"] == 3
+
+    def test_cache_beam_request_cleans_up_sentinels_on_exception(self) -> None:
+        eng = _make_engine_self(block_hasher=MagicMock())
+        req = _make_mock_request(request_id="r0", token_ids=[1, 2, 3])
+        req.update_block_hashes = MagicMock(side_effect=RuntimeError("Hasher failure"))
+        with pytest.raises(RuntimeError, match="Hasher failure"):
+            _cache_beam_request(eng, req)
+        assert req._all_token_ids == [1, 2, 3]
 
     def test_handle_creates_single_add_request(self) -> None:
         eng = _make_engine_self(beam_cache={"session-0": _session_entry()})

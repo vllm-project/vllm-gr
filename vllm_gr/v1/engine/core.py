@@ -73,9 +73,11 @@ def _cache_beam_request(self, request) -> None:
         # sees a full block without risk of collision with real prompt tokens ending in 0.
         request._all_token_ids.extend([-1] * pad_len)
         request._block_hasher = block_hasher
-        request.update_block_hashes()
-        # Remove pad tokens in-place before prefill execution
-        del request._all_token_ids[len(raw_token_ids) :]
+        try:
+            request.update_block_hashes()
+        finally:
+            # Remove pad tokens in-place before prefill execution
+            del request._all_token_ids[len(raw_token_ids) :]
 
     with self.beam_cache_lock:
         self.beam_cache[request.request_id] = {
