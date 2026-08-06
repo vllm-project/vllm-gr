@@ -96,8 +96,6 @@ def cascade_attention(
     vllm_flash_attn_version: int,
     s_aux: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
-    key: torch.Tensor | None = None,
-    value: torch.Tensor | None = None,
 ) -> None:
     if attn_metadata.std_indices is not None:
         if attn_metadata.prefix_indices is None:

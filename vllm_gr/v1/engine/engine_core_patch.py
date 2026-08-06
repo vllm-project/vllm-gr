@@ -213,10 +213,11 @@ def apply_scheduler_patch():
             if req and getattr(req, "is_beam_decode", False):
                 pl = getattr(req, "prefix_len", 0)
                 if tn > pl:
-                    # Ceiling division: include the last partial block
+                    # Truncate cached computed blocks to match prefix_len
                     num_blocks = (pl + block_size - 1) // block_size
                     sliced_blocks = tuple(group[:num_blocks] for group in bn.blocks)
-                    return self.kv_cache_manager.create_kv_cache_blocks(sliced_blocks), pl
+                    bn.blocks = sliced_blocks
+                    return bn, pl
             return bn, tn
 
         def patch_cache_blocks(request, num_computed_tokens):

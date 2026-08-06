@@ -26,16 +26,12 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
     _get_fp8_dtype_for_flashattn,
 )
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR  # noqa: F401
-from vllm_gr.v1.beam.geometry import _compute_beam_bounds  # noqa: F401
 
 __all__ = [
-    "BEAM_DATA_VAR",
     "BeamAttentionBackend",
     "BeamAttentionImpl",
     "BeamAttentionMetadata",
     "BeamAttentionMetadataBuilder",
-    "_compute_beam_bounds",
 ]
 
 logger = init_logger(__name__)
@@ -137,8 +133,6 @@ class BeamAttentionImpl(AttentionImpl):
         vllm_flash_attn_version: int,
         s_aux: torch.Tensor | None = None,
         alibi_slopes: torch.Tensor | None = None,
-        key: torch.Tensor | None = None,
-        value: torch.Tensor | None = None,
     ) -> None:
         platform_execution = _get_platform_execution_module()
         platform_execution.cascade_attention(
@@ -224,8 +218,6 @@ class BeamAttentionImpl(AttentionImpl):
             vllm_flash_attn_version=self.vllm_flash_attn_version,
             s_aux=self.sinks,
             alibi_slopes=self.alibi_slopes,
-            key=key,
-            value=value,
         )
 
         return output
