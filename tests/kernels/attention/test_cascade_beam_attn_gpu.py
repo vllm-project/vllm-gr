@@ -152,5 +152,87 @@ def test_beam_cascade(
         logits_soft_cap=inputs.soft_cap,
     )
     torch.accelerator.synchronize()
-    # Compare the results.
     torch.testing.assert_close(output, ref_output, atol=1e-3, rtol=1e-5)
+
+
+@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore[misc]
+@torch.inference_mode()  # type: ignore[misc]
+def test_preallocated_buffers_reuse(fa_version: int, device: str = "cuda") -> None:
+    if not is_fa_version_supported(fa_version):
+        pytest.skip(fa_version_unsupported_reason(fa_version))
+
+    inputs = prepare_inputs(
+        batch_size=2,
+        beam_width=16,
+        num_heads=16,
+        num_kv_heads=4,
+        head_size=128,
+        q_seq_len=1,
+        kv_seq_len=16,
+        block_size=16,
+        dtype=torch.float16,
+        soft_cap=0.0,
+        fa_version=fa_version,
+        suffix_kv_len=4,
+        device=device,
+    )
+
+    from cascade_beam_attn_utils import build_beam_attn_metadata
+
+    attn_metadata = build_beam_attn_metadata(inputs, device)
+
+    from vllm_gr.v1.attention.backends.beam_attn_gpu import cascade_attention
+
+    output_l0 = torch.empty_like(inputs.query)
+    output_l1 = torch.empty_like(inputs.query)
+
+    # Initial state: preallocated buffers are None
+    assert attn_metadata.prefix_out is None
+    assert attn_metadata.suffix_out is None
+    assert attn_metadata.suffix_k is None
+    assert attn_metadata.suffix_v is None
+
+    # Layer 0 forward pass
+    cascade_attention(
+        output=output_l0,
+        query=inputs.query,
+        key_cache=inputs.key_cache,
+        value_cache=inputs.value_cache,
+        attn_metadata=attn_metadata,
+        sliding_window_size=(-1, -1),
+        scale=inputs.scale,
+        logits_soft_cap=inputs.soft_cap,
+        vllm_flash_attn_version=fa_version,
+    )
+
+    prefix_out_l0 = attn_metadata.prefix_out
+    suffix_out_l0 = attn_metadata.suffix_out
+    suffix_k_l0 = attn_metadata.suffix_k
+    suffix_v_l0 = attn_metadata.suffix_v
+
+    assert prefix_out_l0 is not None
+    assert suffix_out_l0 is not None
+    assert suffix_k_l0 is not None
+    assert suffix_v_l0 is not None
+
+    # Layer 1 forward pass (reuses same attn_metadata)
+    cascade_attention(
+        output=output_l1,
+        query=inputs.query,
+        key_cache=inputs.key_cache,
+        value_cache=inputs.value_cache,
+        attn_metadata=attn_metadata,
+        sliding_window_size=(-1, -1),
+        scale=inputs.scale,
+        logits_soft_cap=inputs.soft_cap,
+        vllm_flash_attn_version=fa_version,
+    )
+
+    # Verify identity reuse (no reallocations occurred)
+    assert attn_metadata.prefix_out is prefix_out_l0
+    assert attn_metadata.suffix_out is suffix_out_l0
+    assert attn_metadata.suffix_k is suffix_k_l0
+    assert attn_metadata.suffix_v is suffix_v_l0
+
+    torch.testing.assert_close(output_l0, output_l1)
+

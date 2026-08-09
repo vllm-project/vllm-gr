@@ -241,3 +241,33 @@ def test_build_chunked_prefill_and_multistep_beam_metadata() -> None:
     assert metadata is not None
     assert metadata.suffix_slot_mapping_out is not None
     assert metadata.suffix_slot_mapping_out.shape[0] == len(metadata.suffix_seqlens_kv_cpu) * 2
+
+
+def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
+    # Scenario matching the crash: Req 0 (beam decode 32 tokens), Req 1 (multistep beam decode 1 token), Req 2 (ordinary 67 tokens)
+    query_starts = [0, 32, 33, 100]
+    seq_lens = [5191, 3810, 67]
+    block_table = [[i for i in range(2500)] for _ in range(3)]
+    req_ids = ["req0", "req1", "req2"]
+    beam_data = {
+        "req0": {
+            "is_beam_decode": True,
+            "prefix_len": 5159,
+            "beam_width": 32,
+            "beam_decode_steps": 1,
+            "cache_len": 5159,
+        },
+        "req1": {
+            "is_beam_decode": True,
+            "prefix_len": 3747,
+            "beam_width": 32,
+            "beam_decode_steps": 2,
+            "cache_len": 3810,
+        },
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    metadata = _build_metadata(common, req_ids, beam_data)
+    assert metadata is not None
+    assert metadata.suffix_slot_mapping_out is not None
+    assert metadata.suffix_slot_mapping_out.shape[0] == 32 * 1 + 1 * 2  # 32 for req0 + 2 for req1
+

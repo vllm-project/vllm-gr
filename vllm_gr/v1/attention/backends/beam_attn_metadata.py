@@ -104,6 +104,12 @@ class BeamAttentionMetadata:
     num_heads: int = 0
     num_kv_heads: int = 0
 
+    # Preallocated cache / output tensors (lazy allocated per step across layers)
+    suffix_k: torch.Tensor | None = None
+    suffix_v: torch.Tensor | None = None
+    prefix_out: torch.Tensor | None = None
+    suffix_out: torch.Tensor | None = None
+
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
@@ -365,7 +371,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     b, prefix_len, b_cache_len, steps, chunk_budget
                 )
 
-                full_mapping = np.arange(out_slot, out_slot + b_suffix_len, dtype=np.int32)
+                if b_past_suffix > 0:
+                    if prefix_len >= b_cache_len:
+                        b_suffix_start = b_cache_len
+                    else:
+                        b_suffix_start = prefix_len + b_physical * steps
+                    for i in range(b_past_suffix):
+                        beam_suffix_slot_mapping_out_list.append(("past", req_idx, b_suffix_start + i))
+
+                for i in range(b_uncached):
+                    beam_suffix_slot_mapping_out_list.append(("current", q_curr + i))
 
                 # Invariant: Merge adjacent beams that share the exact same prefix length
                 # into a single prefix group to parallelize key/value lookup during attention.
@@ -374,7 +389,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 else:
                     prefix_groups.append([q_curr, b_uncached, b_prefix_len])
 
-                beam_suffix_slot_mapping_out_list.extend(full_mapping)
                 suffix_seqlens_q_cpu.append(b_uncached)
                 suffix_seqlens_kv_cpu.append(b_suffix_len)
 
@@ -491,17 +505,35 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
             if suffix_slot_mapping_out_list:
                 suffix_total_tokens = len(suffix_slot_mapping_out_list)
-                num_prefix = len(prefix_indices)
-                if num_prefix > 0:
-                    suffix_map_tensor = torch.tensor(
-                        suffix_slot_mapping_out_list, dtype=torch.long, device=device
-                    ).clamp_(0, num_prefix - 1)
-                    global_chunk_token_indices = prefix_indices_tensor[suffix_map_tensor]
+                has_past = any(
+                    isinstance(item, tuple) and item[0] == "past"
+                    for item in suffix_slot_mapping_out_list
+                )
+                if not has_past:
+                    q_indices = [
+                        item[1] if isinstance(item, tuple) else item
+                        for item in suffix_slot_mapping_out_list
+                    ]
+                    suffix_map_tensor = torch.tensor(q_indices, dtype=torch.long, device=device)
                     suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
-                        global_chunk_token_indices
+                        suffix_map_tensor
                     ].to(dtype=torch.int32)
                 else:
-                    suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
+                    slots = []
+                    block_table = common_attn_metadata.block_table_tensor
+                    slot_mapping = common_attn_metadata.slot_mapping
+                    block_size = self.block_size
+                    for item in suffix_slot_mapping_out_list:
+                        if isinstance(item, tuple) and item[0] == "past":
+                            _, req_idx, t_past = item
+                            b_idx = t_past // block_size
+                            b_off = t_past % block_size
+                            block_id = block_table[req_idx, b_idx].item()
+                            slots.append(block_id * block_size + b_off)
+                        else:
+                            q_idx = item[1] if isinstance(item, tuple) else item
+                            slots.append(slot_mapping[q_idx].item())
+                    suffix_slot_mapping_out = torch.tensor(slots, dtype=torch.int32, device=device)
             else:
                 suffix_total_tokens = 0
                 suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
