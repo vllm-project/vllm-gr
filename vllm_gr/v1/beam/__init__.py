@@ -2,3 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Platform-independent Beam runtime primitives."""
+
+from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
+
+__all__ = ["BeamAttentionPool"]
