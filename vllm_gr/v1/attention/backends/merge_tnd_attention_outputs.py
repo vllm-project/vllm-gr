@@ -30,13 +30,15 @@ def extract_suffix_kv_pytorch(
     v_flat = v_cache.view(-1, num_heads, head_dim)
 
     # 2. Vectorized gather: Selects all matching token rows across all heads/dimensions
-    if out_k is not None and out_v is not None:
+    if out_k is not None:
         out_k.copy_(k_flat[slot_mapping_out])
-        out_v.copy_(v_flat[slot_mapping_out])
-        return out_k, out_v
+    else:
+        out_k = k_flat[slot_mapping_out]
 
-    out_k = k_flat[slot_mapping_out]
-    out_v = v_flat[slot_mapping_out]
+    if out_v is not None:
+        out_v.copy_(v_flat[slot_mapping_out])
+    else:
+        out_v = v_flat[slot_mapping_out]
 
     return out_k, out_v
 

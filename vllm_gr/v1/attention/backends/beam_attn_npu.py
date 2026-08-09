@@ -113,28 +113,10 @@ def cascade_attention(
             sparse_mode=0,
         )
 
-        num_kv_heads = key_cache.shape[2]
-        head_dim = key_cache.shape[3]
-        suffix_kv_shape = (attn_metadata.suffix_total_tokens, num_kv_heads, head_dim)
-        if (
-            attn_metadata.suffix_k is None
-            or attn_metadata.suffix_k.shape != suffix_kv_shape
-            or attn_metadata.suffix_k.dtype != key_cache.dtype
-            or attn_metadata.suffix_k.device != key_cache.device
-        ):
-            suffix_kv = torch.empty(
-                (2, attn_metadata.suffix_total_tokens, num_kv_heads, head_dim),
-                dtype=key_cache.dtype,
-                device=key_cache.device,
-            )
-            attn_metadata.suffix_k, attn_metadata.suffix_v = suffix_kv[0], suffix_kv[1]
-
         contig_k, contig_v = extract_suffix_kv_pytorch(
             key_cache,
             value_cache,
             attn_metadata.suffix_slot_mapping_out,
-            out_k=attn_metadata.suffix_k,
-            out_v=attn_metadata.suffix_v,
         )
 
         suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(

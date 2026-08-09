@@ -104,12 +104,6 @@ class BeamAttentionMetadata:
     num_heads: int = 0
     num_kv_heads: int = 0
 
-    # Preallocated cache / output tensors (lazy allocated per step across layers)
-    suffix_k: torch.Tensor | None = None
-    suffix_v: torch.Tensor | None = None
-    prefix_out: torch.Tensor | None = None
-    suffix_out: torch.Tensor | None = None
-
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH

@@ -129,14 +129,6 @@ def cascade_attention(
         else:
             beam_query = query[attn_metadata.prefix_indices]
 
-        if (
-            attn_metadata.prefix_out is None
-            or attn_metadata.prefix_out.shape != beam_query.shape
-            or attn_metadata.prefix_out.dtype != beam_query.dtype
-            or attn_metadata.prefix_out.device != beam_query.device
-        ):
-            attn_metadata.prefix_out = torch.empty_like(beam_query)
-
         prefix_out, prefix_lse = flash_attn_varlen_func(
             q=beam_query,
             k=key_cache,
@@ -156,24 +148,7 @@ def cascade_attention(
             scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
             num_splits=attn_metadata.max_num_splits,
             s_aux=s_aux,
-            out=attn_metadata.prefix_out,
         )
-
-        num_kv_heads = key_cache.shape[2]
-        head_dim = key_cache.shape[3]
-        suffix_kv_shape = (attn_metadata.suffix_total_tokens, num_kv_heads, head_dim)
-        if (
-            attn_metadata.suffix_k is None
-            or attn_metadata.suffix_k.shape != suffix_kv_shape
-            or attn_metadata.suffix_k.dtype != key_cache.dtype
-            or attn_metadata.suffix_k.device != key_cache.device
-        ):
-            suffix_kv = torch.empty(
-                (2, attn_metadata.suffix_total_tokens, num_kv_heads, head_dim),
-                dtype=key_cache.dtype,
-                device=key_cache.device,
-            )
-            attn_metadata.suffix_k, attn_metadata.suffix_v = suffix_kv[0], suffix_kv[1]
 
         contig_k, contig_v = extract_suffix_kv(
             key_cache,
@@ -181,17 +156,7 @@ def cascade_attention(
             attn_metadata.suffix_slot_mapping_out,
             attn_metadata.suffix_total_tokens,
             attn_metadata.block_size,
-            out_k=attn_metadata.suffix_k,
-            out_v=attn_metadata.suffix_v,
         )
-
-        if (
-            attn_metadata.suffix_out is None
-            or attn_metadata.suffix_out.shape != beam_query.shape
-            or attn_metadata.suffix_out.dtype != beam_query.dtype
-            or attn_metadata.suffix_out.device != beam_query.device
-        ):
-            attn_metadata.suffix_out = torch.empty_like(beam_query)
 
         suffix_out, suffix_lse = flash_attn_varlen_func(
             q=beam_query,
@@ -210,7 +175,6 @@ def cascade_attention(
             softcap=logits_soft_cap,
             return_softmax_lse=True,
             fa_version=vllm_flash_attn_version,
-            out=attn_metadata.suffix_out,
         )
         group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
         if (
