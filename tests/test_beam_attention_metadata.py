@@ -270,4 +270,3 @@ def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
     assert metadata is not None
     assert metadata.suffix_slot_mapping_out is not None
     assert metadata.suffix_slot_mapping_out.shape[0] == 32 * 1 + 1 * 2  # 32 for req0 + 2 for req1
-

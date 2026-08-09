@@ -377,7 +377,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     else:
                         b_suffix_start = prefix_len + b_physical * steps
                     for i in range(b_past_suffix):
-                        beam_suffix_slot_mapping_out_list.append(("past", req_idx, b_suffix_start + i))
+                        beam_suffix_slot_mapping_out_list.append(
+                            ("past", req_idx, b_suffix_start + i)
+                        )
 
                 for i in range(b_uncached):
                     beam_suffix_slot_mapping_out_list.append(("current", q_curr + i))

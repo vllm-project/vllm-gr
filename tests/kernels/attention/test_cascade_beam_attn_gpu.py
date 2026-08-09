@@ -235,4 +235,3 @@ def test_preallocated_buffers_reuse(fa_version: int, device: str = "cuda") -> No
     assert attn_metadata.suffix_v is suffix_v_l0
 
     torch.testing.assert_close(output_l0, output_l1)
-
