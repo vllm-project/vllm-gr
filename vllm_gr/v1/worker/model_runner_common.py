@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +15,7 @@ from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 logger = init_logger(__name__)
+
 
 _WORKER_EXECUTE_PATCH_MARKER = "_vllm_gr_beam_execute_patch"
 _WORKER_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_patch"
@@ -288,6 +290,7 @@ class InputBatchProxy:
             if s_meta is None or logits_map is None:
                 return s_meta
 
+            s_meta = copy.copy(s_meta)
             orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
             for attr in [
                 "temperature",
@@ -297,11 +300,13 @@ class InputBatchProxy:
                 "frequency_penalties",
                 "presence_penalties",
                 "repetition_penalties",
+                "allowed_token_ids_mask",
+                "prompt_token_ids",
             ]:
                 val = getattr(s_meta, attr, None)
                 if isinstance(val, torch.Tensor) and val.numel() > 0:
                     if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
-                        object.__setattr__(s_meta, attr, val[logits_map])
+                        setattr(s_meta, attr, val[logits_map])
             return s_meta
 
         elif name == "req_ids":
