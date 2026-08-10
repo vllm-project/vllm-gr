@@ -443,7 +443,6 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
     if sliced_logits_patch.apply_sliced_logits_patch():
         patch_count += 1
-
     try:
         if lmcache_patch.is_lmcache_adapter_requested() and lmcache_patch.apply_lmcache_adapter():
             patch_count += 1

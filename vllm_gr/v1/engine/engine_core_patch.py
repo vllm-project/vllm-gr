@@ -193,6 +193,25 @@ def run_engine_core(
         _run_engine_core_active = False
 
 
+def make_patch_get_computed_blocks(
+    original_get_computed_blocks, create_kv_cache_blocks, block_size
+):
+    """Helper to create patched get_computed_blocks function for beam decode requests."""
+
+    def patch_get_computed_blocks(req):
+        bn, tn = original_get_computed_blocks(req)
+        if req and getattr(req, "is_beam_decode", False):
+            pl = getattr(req, "prefix_len", 0)
+            if tn > pl:
+                # Truncate cached computed blocks to match prefix_len
+                num_blocks = (pl + block_size - 1) // block_size
+                sliced_blocks = tuple(group[:num_blocks] for group in bn.blocks)
+                return create_kv_cache_blocks(sliced_blocks), pl
+        return bn, tn
+
+    return patch_get_computed_blocks
+
+
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -205,18 +224,39 @@ def apply_scheduler_patch():
     @wraps(_original_schedule)
     def patched_schedule(self):
         _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
+        _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
         block_size = self.cache_config.block_size
 
-        def patch_get_computed_blocks(req):
-            bn, tn = _original_get_computed_blocks(req)
-            if req and getattr(req, "is_beam_decode", False):
-                pl = getattr(req, "prefix_len", 0) // block_size * block_size
-                if tn > pl:
-                    sliced_blocks = tuple(group[: pl // block_size] for group in bn.blocks)
-                    return self.kv_cache_manager.create_kv_cache_blocks(sliced_blocks), pl
-            return bn, tn
+        patch_get_computed_blocks = make_patch_get_computed_blocks(
+            _original_get_computed_blocks,
+            self.kv_cache_manager.create_kv_cache_blocks,
+            block_size,
+        )
+
+        def patch_cache_blocks(request, num_computed_tokens):
+            if (
+                request
+                and not getattr(request, "is_beam_decode", False)
+                and hasattr(request, "block_hashes")
+                and request.block_hashes
+            ):
+                # Only pad on the FINAL prefill chunk when the prompt tail is reached
+                num_prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
+                if num_computed_tokens >= num_prompt_tokens:
+                    chunk_padded_target = (
+                        (num_computed_tokens + block_size - 1) // block_size * block_size
+                    )
+                    num_hashes = len(request.block_hashes)
+                    padded_target = min(chunk_padded_target, num_hashes * block_size)
+                    if (
+                        num_computed_tokens < padded_target
+                        and num_computed_tokens % block_size != 0
+                    ):
+                        num_computed_tokens = padded_target
+            return _original_cache_blocks(request, num_computed_tokens)
 
         self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
+        self.kv_cache_manager.coordinator.cache_blocks = patch_cache_blocks
         try:
             output = _original_schedule(self)
 
@@ -233,6 +273,7 @@ def apply_scheduler_patch():
             return output
         finally:
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
+            self.kv_cache_manager.coordinator.cache_blocks = _original_cache_blocks
 
     Scheduler.schedule = patched_schedule
     setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)

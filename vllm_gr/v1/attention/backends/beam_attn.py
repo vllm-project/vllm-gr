@@ -27,16 +27,12 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
     _get_fp8_dtype_for_flashattn,
 )
-from vllm_gr.v1.beam.context import BEAM_DATA_VAR  # noqa: F401
-from vllm_gr.v1.beam.geometry import _compute_beam_bounds  # noqa: F401
 
 __all__ = [
-    "BEAM_DATA_VAR",
     "BeamAttentionBackend",
     "BeamAttentionImpl",
     "BeamAttentionMetadata",
     "BeamAttentionMetadataBuilder",
-    "_compute_beam_bounds",
 ]
 
 logger = init_logger(__name__)
