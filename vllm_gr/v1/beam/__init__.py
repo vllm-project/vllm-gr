@@ -4,5 +4,6 @@
 """Platform-independent Beam runtime primitives."""
 
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
+from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
-__all__ = ["BeamAttentionPool"]
+__all__ = ["BeamAttentionPool", "BeamSearchSession"]

@@ -119,4 +119,24 @@ def cache_unshared_kv_torch(
     return x_key_block, x_value_block
 
 
-__all__ = ["cache_unshared_kv_torch"]
+def cache_unshared_kv(
+    x_key_block: torch.Tensor,
+    x_value_block: torch.Tensor,
+    curr_key: torch.Tensor,
+    curr_value: torch.Tensor,
+    block_table: torch.Tensor,
+    decode_step: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cache current K/V through the backend-neutral public entry point."""
+
+    return cache_unshared_kv_torch(
+        x_key_block,
+        x_value_block,
+        curr_key,
+        curr_value,
+        block_table,
+        decode_step,
+    )
+
+
+__all__ = ["cache_unshared_kv", "cache_unshared_kv_torch"]
