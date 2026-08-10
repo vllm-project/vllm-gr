@@ -491,12 +491,17 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
             if suffix_slot_mapping_out_list:
                 suffix_total_tokens = len(suffix_slot_mapping_out_list)
-                global_chunk_token_indices = [
-                    prefix_indices[idx] for idx in suffix_slot_mapping_out_list
-                ]
-                suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
-                    global_chunk_token_indices
-                ].to(dtype=torch.int32, device=device)
+                num_prefix = len(prefix_indices)
+                if num_prefix > 0:
+                    suffix_map_tensor = torch.tensor(
+                        suffix_slot_mapping_out_list, dtype=torch.long, device=device
+                    ).clamp_(0, num_prefix - 1)
+                    global_chunk_token_indices = prefix_indices_tensor[suffix_map_tensor]
+                    suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
+                        global_chunk_token_indices
+                    ].to(dtype=torch.int32)
+                else:
+                    suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
             else:
                 suffix_total_tokens = 0
                 suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
