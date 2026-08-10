@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
+from vllm_gr.ops import cache_unshared_kv
 from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
@@ -153,6 +154,164 @@ class BeamAttentionImpl(AttentionImpl):
             alibi_slopes=alibi_slopes,
         )
 
+    @staticmethod
+    def cascade_attention_incremental(
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: BeamAttentionMetadata,
+        unshared_key: torch.Tensor,
+        unshared_value: torch.Tensor,
+        suffix_k_buf: torch.Tensor,
+        suffix_v_buf: torch.Tensor,
+        sliding_window_size: list[int] | tuple[int, int] | None,
+        scale: float,
+        logits_soft_cap: float,
+        vllm_flash_attn_version: int,
+        s_aux: torch.Tensor | None = None,
+        alibi_slopes: torch.Tensor | None = None,
+    ) -> None:
+        """Delegate fixed-address incremental cascade execution by platform."""
+
+        platform_execution = _get_platform_execution_module()
+        platform_execution.cascade_attention_incremental(
+            output=output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            attn_metadata=attn_metadata,
+            unshared_key=unshared_key,
+            unshared_value=unshared_value,
+            suffix_k_buf=suffix_k_buf,
+            suffix_v_buf=suffix_v_buf,
+            sliding_window_size=sliding_window_size,
+            scale=scale,
+            logits_soft_cap=logits_soft_cap,
+            vllm_flash_attn_version=vllm_flash_attn_version,
+            s_aux=s_aux,
+            alibi_slopes=alibi_slopes,
+        )
+
+    def _forward_incremental(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: BeamAttentionMetadata,
+        output: torch.Tensor,
+        platform_execution: ModuleType,
+    ) -> torch.Tensor:
+        """Execute the CUDA-only Pool-backed incremental attention path."""
+
+        if not CUDA_DEVICE or NPU_DEVICE:
+            raise NotImplementedError("Incremental Beam Attention is currently CUDA-only")
+        if self.kv_sharing_target_layer_name is not None:
+            raise NotImplementedError("Incremental Beam Attention does not support KV sharing")
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            raise NotImplementedError("Incremental Beam Attention does not support quantized KV")
+        if key is None or value is None:
+            raise ValueError("incremental Beam Attention requires current key and value tensors")
+
+        session = attn_metadata.beam_session
+        if session is None:
+            raise RuntimeError("incremental Beam Attention metadata is missing beam_session")
+        if not session.is_active:
+            raise RuntimeError("incremental Beam Attention requires an active beam_session")
+
+        beam_width = attn_metadata.incremental_beam_width
+        suffix_kv_len = attn_metadata.incremental_suffix_kv_len
+        if beam_width != session.beam_width:
+            raise ValueError("metadata beam width does not match beam_session")
+        if suffix_kv_len != session.current_step + 1:
+            raise ValueError("metadata suffix length does not match beam_session.current_step")
+        if attn_metadata.prefix_max_seq_len != session.prefix_len:
+            raise ValueError("metadata prefix length does not match beam_session")
+        if attn_metadata.suffix_total_tokens != beam_width * suffix_kv_len:
+            raise ValueError("metadata suffix_total_tokens does not match the active suffix")
+
+        layer_name = getattr(layer, "layer_name", None)
+        if not isinstance(layer_name, str) or not layer_name:
+            raise ValueError("incremental Beam Attention requires layer.layer_name")
+        pool = session.pool_for_layer(layer_name)
+        active_key = pool.active_key(beam_width)
+        active_value = pool.active_value(beam_width)
+        if suffix_kv_len > active_key.shape[3]:
+            raise ValueError("incremental suffix length exceeds the current layer Pool")
+
+        if key.ndim != 3 or value.shape != key.shape:
+            raise ValueError("current key/value must have shape [tokens, num_heads, head_dim]")
+        expected_tail = active_key.shape[2], active_key.shape[4]
+        if key.shape[0] < beam_width or key.shape[1:] != expected_tail:
+            raise ValueError(
+                f"current key/value must contain {beam_width} active rows with shape "
+                f"{expected_tail}"
+            )
+        for name, tensor in (
+            ("value", value),
+            ("query", query),
+            ("output", output),
+            ("key_cache", key_cache),
+            ("value_cache", value_cache),
+            ("suffix_k_buf", session.suffix_k_buf),
+            ("suffix_v_buf", session.suffix_v_buf),
+        ):
+            if tensor.device != active_key.device:
+                raise ValueError(f"{name} must be on {active_key.device}, got {tensor.device}")
+            if tensor.dtype != active_key.dtype:
+                raise TypeError(f"{name} must have the same dtype as the active Pool")
+        expected_buffer_tail = active_key.shape[2], active_key.shape[4]
+        for name, buffer in (
+            ("suffix_k_buf", session.suffix_k_buf),
+            ("suffix_v_buf", session.suffix_v_buf),
+        ):
+            if buffer.ndim != 3 or buffer.shape[1:] != expected_buffer_tail:
+                raise ValueError(f"{name} shape does not match the current layer Pool")
+            if buffer.shape[0] < beam_width * suffix_kv_len:
+                raise ValueError(f"{name} does not have enough active suffix capacity")
+            if not buffer.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+        if key.device != active_key.device:
+            raise ValueError(f"key must be on {active_key.device}, got {key.device}")
+        if key.dtype != active_key.dtype:
+            raise TypeError("key must have the same dtype as the active Pool")
+        if output.shape[0] < beam_width or query.shape[0] < beam_width:
+            raise ValueError("query and output must contain every active beam row")
+
+        curr_key = key[:beam_width]
+        curr_value = value[:beam_width]
+        cache_unshared_kv(
+            active_key,
+            active_value,
+            curr_key,
+            curr_value,
+            session.block_table_buf,
+            session.decode_step_buf,
+        )
+
+        sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
+        platform_execution.cascade_attention_incremental(
+            output=output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            attn_metadata=attn_metadata,
+            unshared_key=pool.unshared_key,
+            unshared_value=pool.unshared_value,
+            suffix_k_buf=session.suffix_k_buf,
+            suffix_v_buf=session.suffix_v_buf,
+            sliding_window_size=sliding_window_size,
+            scale=self.scale,
+            logits_soft_cap=self.logits_soft_cap,
+            vllm_flash_attn_version=self.vllm_flash_attn_version,
+            s_aux=self.sinks,
+            alibi_slopes=self.alibi_slopes,
+        )
+        return output
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -184,6 +343,19 @@ class BeamAttentionImpl(AttentionImpl):
             key_cache, value_cache = kv_cache[0], kv_cache[1]
         else:
             key_cache, value_cache = kv_cache.unbind(0)
+
+        if getattr(attn_metadata, "is_incremental_decode", False):
+            return self._forward_incremental(
+                layer,
+                query,
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                output,
+                platform_execution,
+            )
 
         if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
             if NPU_DEVICE:

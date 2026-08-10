@@ -146,3 +146,10 @@ def cascade_attention(
             output[: attn_metadata.num_prefix_indices] = out
         else:
             output[attn_metadata.prefix_indices] = out
+
+
+def cascade_attention_incremental(*args: object, **kwargs: object) -> None:
+    """Reject the CUDA-only incremental Pool path on NPU."""
+
+    del args, kwargs
+    raise NotImplementedError("Incremental Beam Attention is currently supported only on CUDA")
