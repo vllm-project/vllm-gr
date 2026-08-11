@@ -272,6 +272,30 @@ class Mock2DArray:
             raise e
 
 
+def _remap_object_request_fields(target_obj: Any, orig_req_len: int, logits_map: List[int]) -> None:
+    """Remap PyTorch tensors, dicts, and lists on target_obj from original batch layout to logits_map."""
+    attrs = getattr(target_obj, "__dict__", {})
+    for attr_name, val in list(attrs.items()):
+        if attr_name.startswith("_"):
+            continue
+
+        if isinstance(val, torch.Tensor) and val.ndim > 0 and val.numel() > 0:
+            if val.shape[0] == orig_req_len:
+                setattr(target_obj, attr_name, val[logits_map])
+        elif isinstance(val, dict) and val:
+            new_dict = {
+                new_idx: val[old_idx]
+                for new_idx, old_idx in enumerate(logits_map)
+                if old_idx in val
+            }
+            setattr(target_obj, attr_name, new_dict)
+        elif isinstance(val, (list, tuple)) and len(val) == orig_req_len:
+            new_seq = [val[old_idx] for old_idx in logits_map]
+            if isinstance(val, tuple):
+                new_seq = tuple(new_seq)
+            setattr(target_obj, attr_name, new_seq)
+
+
 class InputBatchProxy:
     def __init__(self, obj, req_map, idx_map, logits_map):
         object.__setattr__(self, "_obj", obj)
@@ -297,35 +321,21 @@ class InputBatchProxy:
             )
 
             if not is_identity:
-                # Dynamically iterate over all s_meta attributes to automatically
-                # support any new fields added in future vLLM releases.
-                attrs = getattr(s_meta, "__dict__", {})
-                for attr_name, val in list(attrs.items()):
-                    if attr_name.startswith("_"):
-                        continue
+                # 1. Remap all direct sampling_metadata attributes
+                _remap_object_request_fields(s_meta, orig_req_len, logits_map)
 
-                    # 1. Remap PyTorch Tensors indexed by request
-                    if isinstance(val, torch.Tensor) and val.numel() > 0:
-                        if val.shape[0] == orig_req_len:
-                            setattr(s_meta, attr_name, val[logits_map])
-
-                    # 2. Remap Dictionary attributes mapping request index -> data
-                    # (e.g. generators, bad_words_token_ids, logprob_token_ids, etc.)
-                    elif isinstance(val, dict) and val:
-                        new_dict = {
-                            new_idx: val[old_idx]
-                            for new_idx, old_idx in enumerate(logits_map)
-                            if old_idx in val
-                        }
-                        setattr(s_meta, attr_name, new_dict)
-
-                    # 3. Remap List/Tuple attributes indexed by request
-                    # (e.g. output_token_ids, spec_token_ids, etc.)
-                    elif isinstance(val, (list, tuple)) and len(val) == orig_req_len:
-                        new_seq = [val[old_idx] for old_idx in logits_map]
-                        if isinstance(val, tuple):
-                            new_seq = tuple(new_seq)
-                        setattr(s_meta, attr_name, new_seq)
+                # 2. Remap inner LogitsProcessors (if present)
+                if hasattr(s_meta, "logitsprocs") and s_meta.logitsprocs is not None:
+                    s_meta.logitsprocs = copy.copy(s_meta.logitsprocs)
+                    for lp_list_name in ["argmax_invariant", "non_argmax_invariant"]:
+                        lp_list = getattr(s_meta.logitsprocs, lp_list_name, None)
+                        if isinstance(lp_list, list):
+                            new_lps = []
+                            for lp in lp_list:
+                                lp_copy = copy.copy(lp)
+                                _remap_object_request_fields(lp_copy, orig_req_len, logits_map)
+                                new_lps.append(lp_copy)
+                            setattr(s_meta.logitsprocs, lp_list_name, new_lps)
 
             return s_meta
 

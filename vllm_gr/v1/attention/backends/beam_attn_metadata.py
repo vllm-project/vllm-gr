@@ -335,7 +335,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         max_prefix_len = max(beam_prefix_lens) if beam_prefix_lens else 0
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
-        out_slot = 0
         for req_idx, prefix_len, w, steps, cache_len, q_offset in zip(
             beam_req_idxs,
             beam_prefix_lens,
@@ -392,7 +391,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 b_cache_len += b_uncached
                 q_curr += b_uncached
                 chunk_budget -= b_uncached
-                out_slot += b_uncached
                 b_prefix_len = min(b_cache_len, prefix_len)
 
             # Loop 2: Record grouped prefix indexing lists for the attention kernel

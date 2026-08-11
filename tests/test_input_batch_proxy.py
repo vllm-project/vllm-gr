@@ -151,3 +151,38 @@ def test_input_batch_proxy_equal_length_non_identity_remap() -> None:
     # Both beam rows MUST receive request 0's output_token_ids
     p_outs: List[List[int]] = getattr(p_meta, "output_token_ids")
     assert p_outs == [[10, 11], [10, 11]]
+
+
+def test_input_batch_proxy_remaps_logitsprocs() -> None:
+    class DummyLogitsProcessor:
+        def __init__(self) -> None:
+            self.req_biases = torch.tensor([1.0, 2.0, 3.0])
+            self.req_masks = {0: [10], 2: [30]}
+
+    class DummyLogitsProcessorsHolder:
+        def __init__(self, lps: List[Any]) -> None:
+            self.argmax_invariant = lps
+            self.non_argmax_invariant: List[Any] = []
+
+    req_ids = ["req_0", "req_1", "req_2"]
+    s_meta = DummySamplingMetadata(torch.tensor([0.1, 0.2, 0.3]))
+    lp = DummyLogitsProcessor()
+    setattr(s_meta, "logitsprocs", DummyLogitsProcessorsHolder([lp]))
+
+    input_batch = DummyInputBatch(req_ids, s_meta)
+
+    # logits_map=[2, 0]
+    proxy = InputBatchProxy(
+        obj=input_batch,
+        req_map=req_ids,
+        idx_map=[0, 1, 2],
+        logits_map=[2, 0],
+    )
+
+    p_meta = proxy.sampling_metadata
+    assert p_meta is not s_meta
+    assert p_meta.logitsprocs is not getattr(s_meta, "logitsprocs")
+
+    remapped_lp = p_meta.logitsprocs.argmax_invariant[0]
+    assert torch.allclose(remapped_lp.req_biases, torch.tensor([3.0, 1.0]))
+    assert remapped_lp.req_masks == {0: [30], 1: [10]}
