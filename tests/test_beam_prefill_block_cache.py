@@ -194,3 +194,7 @@ def test_preprocess_add_request_preserves_block_hashes() -> None:
 
     assert processed_req.block_hashes == [0xAAAA, 0xBBBB]
     assert processed_req.is_beam_decode is True
+
+
+
+

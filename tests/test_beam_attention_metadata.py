@@ -240,7 +240,9 @@ def test_build_chunked_prefill_and_multistep_beam_metadata() -> None:
     metadata = _build_metadata(common, req_ids, beam_data)
     assert metadata is not None
     assert metadata.suffix_slot_mapping_out is not None
-    assert metadata.suffix_slot_mapping_out.shape[0] == len(metadata.suffix_seqlens_kv_cpu) * 2
+    # Assert exact expected physical slot sequence:
+    # slot 4 for cached-past token at offset 4 + slots [100, 101, 102] for current query tokens
+    assert metadata.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
 
 
 def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
@@ -269,4 +271,8 @@ def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
     metadata = _build_metadata(common, req_ids, beam_data)
     assert metadata is not None
     assert metadata.suffix_slot_mapping_out is not None
-    assert metadata.suffix_slot_mapping_out.shape[0] == 32 * 1 + 1 * 2  # 32 for req0 + 2 for req1
+    # Assert exact expected physical slot sequence for multi-req chunked prefill:
+    # slots 100..131 for req0 (32 query tokens) + slot 3809 for req1 cached-past token + slot 132 for req1 query token
+    expected_slots = list(range(100, 132)) + [3809, 132]
+    assert metadata.suffix_slot_mapping_out.tolist() == expected_slots
+
