@@ -62,26 +62,36 @@ def _cache_beam_request(self, request) -> None:
 
     # Make a clean, un-mutable copy of the original prompt token IDs
     raw_token_ids = list(request._all_token_ids)
+    full_block_hashes = list(request.block_hashes)
     block_hasher = getattr(self, "request_block_hasher", None)
     vllm_config = getattr(self, "vllm_config", None)
     cache_config = getattr(vllm_config, "cache_config", None) if vllm_config else None
     block_size = getattr(cache_config, "block_size", 16) if cache_config else 16
     pad_len = (-len(raw_token_ids)) % block_size
 
+    partial_block_hash = None
     if pad_len > 0 and block_hasher is not None:
-        # Extend in-place with sentinel token ID (-1) so ConstantList (request.all_token_ids)
-        # sees a full block without risk of collision with real prompt tokens ending in 0.
+        # Extend in-place with sentinel token ID (-1) to avoid collision with real prompt tokens.
+        # Set cache_salt to request.request_id so block_hasher hashes the full string request ID
+        # directly into the partial tail block hash pipeline, guaranteeing 0% cross-request collision.
+        orig_salt = request.cache_salt
         request._all_token_ids.extend([-1] * pad_len)
+        request.cache_salt = request.request_id
         request._block_hasher = block_hasher
         try:
             request.update_block_hashes()
+            if len(request.block_hashes) > len(full_block_hashes):
+                partial_block_hash = request.block_hashes[-1]
         finally:
+            request.cache_salt = orig_salt
             # Remove pad tokens in-place before prefill execution
             del request._all_token_ids[len(raw_token_ids) :]
 
     with self.beam_cache_lock:
         self.beam_cache[request.request_id] = {
             "all_token_ids": list(raw_token_ids),
+            "full_block_hashes": full_block_hashes,
+            "partial_block_hash": partial_block_hash,
             "block_hashes": list(request.block_hashes),
             "num_pad_tokens": pad_len,
             "eos_token_id": request.sampling_params.eos_token_id

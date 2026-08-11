@@ -275,4 +275,3 @@ def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
     # slots 100..131 for req0 (32 query tokens) + slot 3809 for req1 cached-past token + slot 132 for req1 query token
     expected_slots = list(range(100, 132)) + [3809, 132]
     assert metadata.suffix_slot_mapping_out.tolist() == expected_slots
-

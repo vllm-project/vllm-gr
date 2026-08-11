@@ -193,6 +193,25 @@ def run_engine_core(
         _run_engine_core_active = False
 
 
+def make_patch_get_computed_blocks(
+    original_get_computed_blocks, create_kv_cache_blocks, block_size
+):
+    """Helper to create patched get_computed_blocks function for beam decode requests."""
+
+    def patch_get_computed_blocks(req):
+        bn, tn = original_get_computed_blocks(req)
+        if req and getattr(req, "is_beam_decode", False):
+            pl = getattr(req, "prefix_len", 0)
+            if tn > pl:
+                # Truncate cached computed blocks to match prefix_len
+                num_blocks = (pl + block_size - 1) // block_size
+                sliced_blocks = tuple(group[:num_blocks] for group in bn.blocks)
+                return create_kv_cache_blocks(sliced_blocks), pl
+        return bn, tn
+
+    return patch_get_computed_blocks
+
+
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -208,16 +227,11 @@ def apply_scheduler_patch():
         _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
         block_size = self.cache_config.block_size
 
-        def patch_get_computed_blocks(req):
-            bn, tn = _original_get_computed_blocks(req)
-            if req and getattr(req, "is_beam_decode", False):
-                pl = getattr(req, "prefix_len", 0)
-                if tn > pl:
-                    # Truncate cached computed blocks to match prefix_len
-                    num_blocks = (pl + block_size - 1) // block_size
-                    sliced_blocks = tuple(group[:num_blocks] for group in bn.blocks)
-                    return self.kv_cache_manager.create_kv_cache_blocks(sliced_blocks), pl
-            return bn, tn
+        patch_get_computed_blocks = make_patch_get_computed_blocks(
+            _original_get_computed_blocks,
+            self.kv_cache_manager.create_kv_cache_blocks,
+            block_size,
+        )
 
         def patch_cache_blocks(request, num_computed_tokens):
             if (

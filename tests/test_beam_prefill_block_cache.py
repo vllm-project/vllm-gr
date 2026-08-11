@@ -47,7 +47,11 @@ def test_cache_beam_request_computes_padded_block_hash() -> None:
         prompt_is_token_ids=True,
         num_prompt_tokens=25,
     )
-    req.update_block_hashes = lambda: req.block_hashes.extend(mock_hasher(req))
+
+    def _update_hashes() -> None:
+        req.block_hashes.extend(mock_hasher(req))
+
+    req.update_block_hashes = _update_hashes
 
     _cache_beam_request(engine, req)
 
@@ -85,6 +89,9 @@ def test_patch_get_computed_blocks_returns_unaligned_prefix_len() -> None:
         result_holder["blocks_out"] = blocks_out
         return SimpleNamespace(num_scheduled_tokens={})
 
+    def _create_blocks(b: Any) -> SimpleNamespace:
+        return SimpleNamespace(blocks=b)
+
     orig_sched_fn = Scheduler.schedule
     try:
         Scheduler.schedule = mock_schedule
@@ -94,7 +101,7 @@ def test_patch_get_computed_blocks_returns_unaligned_prefix_len() -> None:
         mock_inst.cache_config = SimpleNamespace(block_size=block_size)
         mock_inst.kv_cache_manager = SimpleNamespace(
             get_computed_blocks=MagicMock(return_value=(bn, 32)),
-            create_kv_cache_blocks=lambda b: SimpleNamespace(blocks=b),
+            create_kv_cache_blocks=_create_blocks,
             coordinator=SimpleNamespace(cache_blocks=MagicMock()),
         )
         mock_inst.requests = {}
@@ -142,6 +149,9 @@ def test_patch_cache_blocks_extends_tokens_for_padded_hashes() -> None:
         self.kv_cache_manager.coordinator.cache_blocks(req, 25)
         return SimpleNamespace(num_scheduled_tokens={})
 
+    def _create_blocks(b: Any) -> SimpleNamespace:
+        return SimpleNamespace(blocks=b)
+
     orig_sched_fn = Scheduler.schedule
     try:
         Scheduler.schedule = mock_schedule
@@ -151,6 +161,7 @@ def test_patch_cache_blocks_extends_tokens_for_padded_hashes() -> None:
         mock_inst.cache_config = SimpleNamespace(block_size=block_size)
         mock_inst.kv_cache_manager = SimpleNamespace(
             get_computed_blocks=MagicMock(return_value=(SimpleNamespace(blocks=()), 0)),
+            create_kv_cache_blocks=_create_blocks,
             cache_blocks=mock_orig_cache_blocks,
             coordinator=coord,
         )
@@ -194,7 +205,3 @@ def test_preprocess_add_request_preserves_block_hashes() -> None:
 
     assert processed_req.block_hashes == [0xAAAA, 0xBBBB]
     assert processed_req.is_beam_decode is True
-
-
-
-

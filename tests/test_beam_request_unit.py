@@ -532,6 +532,115 @@ class TestBeamCache:
             _cache_beam_request(eng, req)
         assert req._all_token_ids == [1, 2, 3]
 
+    def test_cache_beam_request_unique_partial_block_hash_for_concurrent_requests(self) -> None:
+        """Verify two concurrent requests sharing the exact same unaligned prompt
+        receive identical full block hashes but distinct/unique partial tail block hashes."""
+        block_hasher = MagicMock()
+
+        def side_effect_update_hashes(req):
+            req.block_hashes.append(hash((tuple(req._all_token_ids), req.cache_salt)))
+
+        eng = _make_engine_self(block_hasher=block_hasher)
+        prompt_tokens = list(range(1, 26))
+
+        req_A = _make_mock_request(
+            request_id="req_A", token_ids=list(prompt_tokens), block_hashes=[0x1111]
+        )
+        req_A.update_block_hashes = lambda: side_effect_update_hashes(req_A)
+
+        req_B = _make_mock_request(
+            request_id="req_B", token_ids=list(prompt_tokens), block_hashes=[0x1111]
+        )
+        req_B.update_block_hashes = lambda: side_effect_update_hashes(req_B)
+
+        _cache_beam_request(eng, req_A)
+        _cache_beam_request(eng, req_B)
+
+        entry_A = eng.beam_cache["req_A"]
+        entry_B = eng.beam_cache["req_B"]
+
+        assert entry_A["full_block_hashes"] == [0x1111]
+        assert entry_B["full_block_hashes"] == [0x1111]
+
+        assert entry_A["partial_block_hash"] is not None
+        assert entry_B["partial_block_hash"] is not None
+        assert entry_A["partial_block_hash"] != entry_B["partial_block_hash"]
+
+    def test_beam_request_hash_chain_divergence_when_beam_tokens_differ(self) -> None:
+        """Verify that beam requests seed block_hashes with session block_hashes (including partial block hash),
+        allowing prefix cache lookup to hit 100% of prompt tokens (including unaligned tail)."""
+        session_entry = {
+            "all_token_ids": list(range(1, 26)),
+            "full_block_hashes": [0x1111],
+            "block_hashes": [0x1111, 0x9999],
+            "lora_request": None,
+            "cache_salt": None,
+            "mm_features": None,
+            "prompt_embeds": None,
+            "prompt_is_token_ids": True,
+            "eos_token_id": None,
+        }
+        eng = _make_engine_self(beam_cache={"session-0": session_entry})
+        update = _make_beam_update(session_id="session-0")
+
+        _handle_beam_request_step_update(eng, update)
+
+        item = eng.input_queue.get_nowait()
+        req = item[1][0]
+        assert req.block_hashes == [0x1111, 0x9999]
+
+    def test_beam_request_all_prompt_tokens_matched_from_cache_without_tail_recomputation(
+        self,
+    ) -> None:
+        """Verify that beam requests hit 100% of prompt tokens in prefix cache (including unaligned tail tokens),
+        asserting zero partial tail recomputation."""
+        prompt_tokens = list(range(1, 26))
+        full_hash = 0x1111
+        partial_hash = 0x9999
+        session_entry = {
+            "all_token_ids": prompt_tokens,
+            "full_block_hashes": [full_hash],
+            "block_hashes": [full_hash, partial_hash],
+            "lora_request": None,
+            "cache_salt": None,
+            "mm_features": None,
+            "prompt_embeds": None,
+            "prompt_is_token_ids": True,
+            "eos_token_id": None,
+        }
+        eng = _make_engine_self(beam_cache={"session-0": session_entry})
+        update = _make_beam_update(session_id="session-0")
+        update.prefix_len = 25
+
+        _handle_beam_request_step_update(eng, update)
+        item = eng.input_queue.get_nowait()
+        req = item[1][0]
+
+        # Verify req receives both block hashes [full_hash, partial_hash]
+        assert req.block_hashes == [full_hash, partial_hash]
+
+        # Use the real production patch_get_computed_blocks builder from engine_core_patch
+        from vllm_gr.v1.engine.engine_core_patch import make_patch_get_computed_blocks
+
+        mock_blocks = MagicMock()
+        mock_blocks.blocks = (["block_0", "block_1"],)
+
+        orig_get_computed_blocks = MagicMock(return_value=(mock_blocks, 32))
+
+        def create_kv_cache_blocks(blocks):
+            return blocks
+
+        patch_get_computed_blocks = make_patch_get_computed_blocks(
+            orig_get_computed_blocks, create_kv_cache_blocks, block_size=16
+        )
+
+        # Call the real production patch_get_computed_blocks method
+        sliced_blocks, computed_tokens = patch_get_computed_blocks(req)
+
+        # Assert all 25 prompt tokens are matched from cache using real production code
+        assert computed_tokens == 25
+        assert sliced_blocks == (["block_0", "block_1"],)
+
     def test_handle_creates_single_add_request(self) -> None:
         eng = _make_engine_self(beam_cache={"session-0": _session_entry()})
         update = _make_beam_update(session_id="session-0")
