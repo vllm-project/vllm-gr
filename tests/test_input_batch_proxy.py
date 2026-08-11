@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit test to verify InputBatchProxy sampling_metadata immutability."""
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -67,3 +67,87 @@ def test_input_batch_proxy_does_not_mutate_underlying_sampling_metadata() -> Non
     )
     proxied_s_meta_full = proxy_full.sampling_metadata
     assert proxied_s_meta_full.temperature.shape[0] == 100
+
+
+def test_input_batch_proxy_remaps_non_tensor_and_penalty_state() -> None:
+    req_ids = ["req_0", "req_1", "req_2"]
+    gen1 = torch.Generator().manual_seed(42)
+
+    s_meta = DummySamplingMetadata(torch.tensor([0.5, 0.7, 0.9]))
+    setattr(s_meta, "generators", {1: gen1})
+    setattr(s_meta, "output_token_ids", [[10, 11], [20, 21], [30, 31]])
+    setattr(s_meta, "bad_words_token_ids", {1: [[100, 101]]})
+    s_meta.frequency_penalties = torch.tensor([0.1, 0.2, 0.3])
+
+    input_batch = DummyInputBatch(req_ids, s_meta)
+
+    # Project row 1 to row 0
+    logits_map = [1]
+    proxy = InputBatchProxy(
+        obj=input_batch,
+        req_map=req_ids,
+        idx_map=[0, 1, 2],
+        logits_map=logits_map,
+    )
+
+    p_meta = proxy.sampling_metadata
+    assert p_meta is not s_meta
+
+    # Check generator remapped key 1 -> 0
+    p_gens: Dict[int, Any] = getattr(p_meta, "generators")
+    assert 0 in p_gens
+    assert p_gens[0] is gen1
+    assert 1 not in p_gens
+
+    # Check output_token_ids sliced
+    p_outs: List[List[int]] = getattr(p_meta, "output_token_ids")
+    assert p_outs == [[20, 21]]
+
+    # Check bad_words_token_ids remapped key 1 -> 0
+    p_bads: Dict[int, List[List[int]]] = getattr(p_meta, "bad_words_token_ids")
+    assert p_bads == {0: [[100, 101]]}
+
+    # Check frequency_penalties sliced
+    assert p_meta.frequency_penalties is not None
+    assert torch.allclose(p_meta.frequency_penalties, torch.tensor([0.2]))
+
+    # Check original input_batch.sampling_metadata unchanged
+    assert getattr(s_meta, "generators") == {1: gen1}
+    assert getattr(s_meta, "output_token_ids") == [[10, 11], [20, 21], [30, 31]]
+    assert getattr(s_meta, "bad_words_token_ids") == {1: [[100, 101]]}
+
+
+def test_input_batch_proxy_equal_length_non_identity_remap() -> None:
+    # Scenario: 2 logical requests, but logits_map=[0, 0] (length 2, equal to orig_req_len, but non-identity!)
+    req_ids = ["req_0", "req_1"]
+    gen0 = torch.Generator().manual_seed(100)
+    gen1 = torch.Generator().manual_seed(200)
+
+    s_meta = DummySamplingMetadata(torch.tensor([0.5, 0.9]))
+    setattr(s_meta, "generators", {0: gen0, 1: gen1})
+    setattr(s_meta, "output_token_ids", [[10, 11], [20, 21]])
+
+    input_batch = DummyInputBatch(req_ids, s_meta)
+
+    # logits_map=[0, 0] has length 2 (same as orig_req_len=2), but is non-identity
+    logits_map = [0, 0]
+    proxy = InputBatchProxy(
+        obj=input_batch,
+        req_map=req_ids,
+        idx_map=[0, 1],
+        logits_map=logits_map,
+    )
+
+    p_meta = proxy.sampling_metadata
+    assert p_meta is not s_meta
+
+    # Both beam rows MUST receive request 0's temperature (0.5), NOT request 1's temperature (0.9)
+    assert torch.allclose(p_meta.temperature, torch.tensor([0.5, 0.5]))
+
+    # Both beam rows MUST receive request 0's generator
+    p_gens: Dict[int, Any] = getattr(p_meta, "generators")
+    assert p_gens == {0: gen0, 1: gen0}
+
+    # Both beam rows MUST receive request 0's output_token_ids
+    p_outs: List[List[int]] = getattr(p_meta, "output_token_ids")
+    assert p_outs == [[10, 11], [10, 11]]

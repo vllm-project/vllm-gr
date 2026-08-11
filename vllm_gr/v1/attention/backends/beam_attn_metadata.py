@@ -515,21 +515,50 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                         suffix_map_tensor
                     ].to(dtype=torch.int32)
                 else:
-                    slots = []
                     block_table = common_attn_metadata.block_table_tensor
                     slot_mapping = common_attn_metadata.slot_mapping
                     block_size = self.block_size
-                    for item in suffix_slot_mapping_out_list:
+
+                    past_indices = []
+                    past_req_idxs = []
+                    past_b_idxs = []
+                    past_b_offs = []
+
+                    curr_indices = []
+                    curr_q_idxs = []
+
+                    for idx, item in enumerate(suffix_slot_mapping_out_list):
                         if isinstance(item, tuple) and item[0] == "past":
                             _, req_idx, t_past = item
-                            b_idx = t_past // block_size
-                            b_off = t_past % block_size
-                            block_id = block_table[req_idx, b_idx].item()
-                            slots.append(block_id * block_size + b_off)
+                            past_indices.append(idx)
+                            past_req_idxs.append(req_idx)
+                            past_b_idxs.append(t_past // block_size)
+                            past_b_offs.append(t_past % block_size)
                         else:
                             q_idx = item[1] if isinstance(item, tuple) else item
-                            slots.append(slot_mapping[q_idx].item())
-                    suffix_slot_mapping_out = torch.tensor(slots, dtype=torch.int32, device=device)
+                            curr_indices.append(idx)
+                            curr_q_idxs.append(q_idx)
+
+                    suffix_slot_mapping_out = torch.empty(
+                        suffix_total_tokens, dtype=torch.int32, device=device
+                    )
+
+                    if past_indices:
+                        p_idx_t = torch.tensor(past_indices, dtype=torch.long, device=device)
+                        p_req_t = torch.tensor(past_req_idxs, dtype=torch.long, device=device)
+                        p_bidx_t = torch.tensor(past_b_idxs, dtype=torch.long, device=device)
+                        p_boff_t = torch.tensor(past_b_offs, dtype=torch.int32, device=device)
+
+                        past_block_ids = block_table[p_req_t, p_bidx_t].to(dtype=torch.int32)
+                        past_slots = past_block_ids * block_size + p_boff_t
+                        suffix_slot_mapping_out[p_idx_t] = past_slots
+
+                    if curr_indices:
+                        c_idx_t = torch.tensor(curr_indices, dtype=torch.long, device=device)
+                        c_qidx_t = torch.tensor(curr_q_idxs, dtype=torch.long, device=device)
+
+                        curr_slots = slot_mapping[c_qidx_t].to(dtype=torch.int32)
+                        suffix_slot_mapping_out[c_idx_t] = curr_slots
             else:
                 suffix_total_tokens = 0
                 suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)

@@ -292,21 +292,41 @@ class InputBatchProxy:
 
             s_meta = copy.copy(s_meta)
             orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
-            for attr in [
-                "temperature",
-                "top_p",
-                "top_k",
-                "min_p",
-                "frequency_penalties",
-                "presence_penalties",
-                "repetition_penalties",
-                "allowed_token_ids_mask",
-                "prompt_token_ids",
-            ]:
-                val = getattr(s_meta, attr, None)
-                if isinstance(val, torch.Tensor) and val.numel() > 0:
-                    if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
-                        setattr(s_meta, attr, val[logits_map])
+            is_identity = len(logits_map) == orig_req_len and all(
+                i == idx for i, idx in enumerate(logits_map)
+            )
+
+            if not is_identity:
+                # Dynamically iterate over all s_meta attributes to automatically
+                # support any new fields added in future vLLM releases.
+                attrs = getattr(s_meta, "__dict__", {})
+                for attr_name, val in list(attrs.items()):
+                    if attr_name.startswith("_"):
+                        continue
+
+                    # 1. Remap PyTorch Tensors indexed by request
+                    if isinstance(val, torch.Tensor) and val.numel() > 0:
+                        if val.shape[0] == orig_req_len:
+                            setattr(s_meta, attr_name, val[logits_map])
+
+                    # 2. Remap Dictionary attributes mapping request index -> data
+                    # (e.g. generators, bad_words_token_ids, logprob_token_ids, etc.)
+                    elif isinstance(val, dict) and val:
+                        new_dict = {
+                            new_idx: val[old_idx]
+                            for new_idx, old_idx in enumerate(logits_map)
+                            if old_idx in val
+                        }
+                        setattr(s_meta, attr_name, new_dict)
+
+                    # 3. Remap List/Tuple attributes indexed by request
+                    # (e.g. output_token_ids, spec_token_ids, etc.)
+                    elif isinstance(val, (list, tuple)) and len(val) == orig_req_len:
+                        new_seq = [val[old_idx] for old_idx in logits_map]
+                        if isinstance(val, tuple):
+                            new_seq = tuple(new_seq)
+                        setattr(s_meta, attr_name, new_seq)
+
             return s_meta
 
         elif name == "req_ids":
