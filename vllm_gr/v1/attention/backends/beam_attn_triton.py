@@ -115,10 +115,11 @@ def extract_suffix_kv(
     # Calculate next power of 2 for Triton compiler stability
     block_size_d = 1 << (head_dim - 1).bit_length()
 
-    out_kv = torch.empty(
-        (2, total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype
-    )
-    out_k, out_v = out_kv[0], out_kv[1]
+    if out_k is None or out_v is None:
+        out_kv = torch.empty(
+            (2, total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype
+        )
+        out_k, out_v = out_kv[0], out_kv[1]
 
     grid = (total_tokens, nheads)
     paged_kv_to_contig_suffix_kernel[grid](

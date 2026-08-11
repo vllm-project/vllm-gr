@@ -283,12 +283,14 @@ def _remap_object_request_fields(target_obj: Any, orig_req_len: int, logits_map:
             if val.shape[0] == orig_req_len:
                 setattr(target_obj, attr_name, val[logits_map])
         elif isinstance(val, dict) and val:
-            new_dict = {
-                new_idx: val[old_idx]
-                for new_idx, old_idx in enumerate(logits_map)
-                if old_idx in val
-            }
-            setattr(target_obj, attr_name, new_dict)
+            has_int_req_keys = any(isinstance(k, int) and 0 <= k < orig_req_len for k in val.keys())
+            if has_int_req_keys:
+                new_dict = {
+                    new_idx: val[old_idx]
+                    for new_idx, old_idx in enumerate(logits_map)
+                    if old_idx in val
+                }
+                setattr(target_obj, attr_name, new_dict)
         elif isinstance(val, (list, tuple)) and len(val) == orig_req_len:
             new_seq = [val[old_idx] for old_idx in logits_map]
             if isinstance(val, tuple):
