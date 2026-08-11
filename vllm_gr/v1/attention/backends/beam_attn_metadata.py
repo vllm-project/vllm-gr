@@ -89,6 +89,10 @@ class BeamAttentionMetadata:
     suffix_seqlens_kv_cpu: list | None = None
     suffix_cu_seqlens_kv_cpu: list | None = None
 
+    # Unified logical descriptors for update_block_table suffix refreshes
+    suffix_source_indices: torch.Tensor | None = None
+    suffix_offsets: torch.Tensor | None = None
+
     # Slicing variables for block table updates
     std_req_idxs_cpu: list | None = None
     prefix_req_idxs_cpu: list | None = None
@@ -499,67 +503,41 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
             if suffix_slot_mapping_out_list:
                 suffix_total_tokens = len(suffix_slot_mapping_out_list)
-                has_past = any(
-                    isinstance(item, tuple) and item[0] == "past"
-                    for item in suffix_slot_mapping_out_list
-                )
-                if not has_past:
-                    q_indices = [
-                        item[1] if isinstance(item, tuple) else item
-                        for item in suffix_slot_mapping_out_list
+                num_tokens = common_attn_metadata.slot_mapping.shape[0]
+                max_blocks = common_attn_metadata.block_table_tensor.shape[1]
+                block_size = self.block_size
+
+                src_indices = []
+                offsets = []
+                for item in suffix_slot_mapping_out_list:
+                    if isinstance(item, tuple) and item[0] == "past":
+                        _, req_idx, t_past = item
+                        b_idx = t_past // block_size
+                        b_off = t_past % block_size
+                        src_indices.append(num_tokens + req_idx * max_blocks + b_idx)
+                        offsets.append(b_off)
+                    else:
+                        q_idx = item[1] if isinstance(item, tuple) else item
+                        src_indices.append(q_idx)
+                        offsets.append(0)
+
+                suffix_source_indices = torch.tensor(src_indices, dtype=torch.long, device=device)
+                suffix_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+                flat_sources = torch.cat(
+                    [
+                        common_attn_metadata.slot_mapping.to(torch.int32),
+                        (common_attn_metadata.block_table_tensor * block_size)
+                        .view(-1)
+                        .to(torch.int32),
                     ]
-                    suffix_map_tensor = torch.tensor(q_indices, dtype=torch.long, device=device)
-                    suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
-                        suffix_map_tensor
-                    ].to(dtype=torch.int32)
-                else:
-                    block_table = common_attn_metadata.block_table_tensor
-                    slot_mapping = common_attn_metadata.slot_mapping
-                    block_size = self.block_size
-
-                    past_indices = []
-                    past_req_idxs = []
-                    past_b_idxs = []
-                    past_b_offs = []
-
-                    curr_indices = []
-                    curr_q_idxs = []
-
-                    for idx, item in enumerate(suffix_slot_mapping_out_list):
-                        if isinstance(item, tuple) and item[0] == "past":
-                            _, req_idx, t_past = item
-                            past_indices.append(idx)
-                            past_req_idxs.append(req_idx)
-                            past_b_idxs.append(t_past // block_size)
-                            past_b_offs.append(t_past % block_size)
-                        else:
-                            q_idx = item[1] if isinstance(item, tuple) else item
-                            curr_indices.append(idx)
-                            curr_q_idxs.append(q_idx)
-
-                    suffix_slot_mapping_out = torch.empty(
-                        suffix_total_tokens, dtype=torch.int32, device=device
-                    )
-
-                    if past_indices:
-                        p_idx_t = torch.tensor(past_indices, dtype=torch.long, device=device)
-                        p_req_t = torch.tensor(past_req_idxs, dtype=torch.long, device=device)
-                        p_bidx_t = torch.tensor(past_b_idxs, dtype=torch.long, device=device)
-                        p_boff_t = torch.tensor(past_b_offs, dtype=torch.int32, device=device)
-
-                        past_block_ids = block_table[p_req_t, p_bidx_t].to(dtype=torch.int32)
-                        past_slots = past_block_ids * block_size + p_boff_t
-                        suffix_slot_mapping_out[p_idx_t] = past_slots
-
-                    if curr_indices:
-                        c_idx_t = torch.tensor(curr_indices, dtype=torch.long, device=device)
-                        c_qidx_t = torch.tensor(curr_q_idxs, dtype=torch.long, device=device)
-
-                        curr_slots = slot_mapping[c_qidx_t].to(dtype=torch.int32)
-                        suffix_slot_mapping_out[c_idx_t] = curr_slots
+                )
+                suffix_slot_mapping_out = flat_sources[suffix_source_indices] + suffix_offsets
             else:
                 suffix_total_tokens = 0
                 suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
+                suffix_source_indices = None
+                suffix_offsets = None
 
             if self._is_cuda:
                 prefix_seqlens_kv_device = torch.tensor(
@@ -603,6 +581,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_device = suffix_cu_seqlens_k_device = suffix_seqlens_kv_device = (
                 suffix_slot_mapping_out
             ) = None
+            suffix_source_indices = suffix_offsets = None
             suffix_max_q_len = suffix_max_seq_len = suffix_total_tokens = 0
             prefix_scheduler_metadata = None
 
@@ -621,6 +600,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_k_device,
             suffix_max_q_len,
             prefix_scheduler_metadata,
+            suffix_source_indices,
+            suffix_offsets,
         )
 
     def build(
@@ -716,6 +697,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_k_device,
             suffix_max_q_len,
             prefix_scheduler_metadata,
+            suffix_source_indices,
+            suffix_offsets,
         ) = self._create_beam_tensors(
             common_attn_metadata,
             prefix_indices,
@@ -778,6 +761,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_cpu=suffix_cu_seqlens_q_cpu,
             suffix_seqlens_kv_cpu=suffix_seqlens_kv_cpu,
             suffix_cu_seqlens_kv_cpu=suffix_cu_seqlens_kv_cpu,
+            suffix_source_indices=suffix_source_indices,
+            suffix_offsets=suffix_offsets,
             num_std_indices=len(std_indices) if std_indices else 0,
             num_prefix_indices=len(prefix_indices) if prefix_indices else 0,
             max_num_splits=max_num_splits,
@@ -803,5 +788,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             new_metadata.prefix_block_table = blk_table[
                 metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count
             ].contiguous()
+
+        if metadata.suffix_source_indices is not None:
+            flat_sources = torch.cat(
+                [
+                    slot_mapping.to(torch.int32),
+                    (blk_table * metadata.block_size).view(-1).to(torch.int32),
+                ]
+            )
+            new_metadata.suffix_slot_mapping_out = (
+                flat_sources[metadata.suffix_source_indices] + metadata.suffix_offsets
+            )
 
         return new_metadata

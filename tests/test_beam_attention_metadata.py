@@ -275,3 +275,37 @@ def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
     # slots 100..131 for req0 (32 query tokens) + slot 3809 for req1 cached-past token + slot 132 for req1 query token
     expected_slots = list(range(100, 132)) + [3809, 132]
     assert metadata.suffix_slot_mapping_out.tolist() == expected_slots
+
+
+def test_update_block_table_refreshes_suffix_slots() -> None:
+    query_starts = [0, 4]
+    seq_lens = [8]
+    block_table = [[0, 1, 2, 3]]
+    req_ids = ["beam_chunked"]
+    beam_data = {
+        "beam_chunked": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "beam_width": 2,
+            "beam_decode_steps": 2,
+            "cache_len": 5,
+        }
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    builder = _make_builder()
+    metadata = _build_metadata(common, req_ids, beam_data)
+    assert metadata is not None
+    assert metadata.suffix_slot_mapping_out is not None
+    # Original physical slots: past slot at offset 4 (block 0 -> 4) + current query slots 100, 101, 102
+    assert metadata.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
+
+    # Update block table (block 0 becomes block 10) and slot mapping (0,1,2 becomes 500,501,502)
+    new_table = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+    new_slots = torch.tensor([500, 501, 502, 503], dtype=torch.int64)
+
+    updated = builder.update_block_table(metadata, new_table, new_slots)
+
+    # Past slot offset 4 uses block 4 // 2 = 2 -> block ID 12 -> 12 * 2 + (4 % 2) = 24
+    # Current query slots index positions 0, 1, 2 in new_slots -> 500, 501, 502
+    assert updated.suffix_slot_mapping_out is not None
+    assert updated.suffix_slot_mapping_out.tolist() == [24, 500, 501, 502]
