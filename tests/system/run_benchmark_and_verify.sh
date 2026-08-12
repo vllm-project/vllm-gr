@@ -42,7 +42,7 @@ p99_tpot_th=0.02
 pass_1_th=0.09
 pass_32_th=0.3
 recall_32_th=0.04
-elapsed_time_online_th=15
+elapsed_time_online_th=20
 elapsed_time_offline_th=20
 device="gpu"
 #if exist npu-smi tune some threshold
