@@ -146,3 +146,8 @@ def cascade_attention(
             output[: attn_metadata.num_prefix_indices] = out
         else:
             output[attn_metadata.prefix_indices] = out
+
+
+def update_graph_params(*args: object, **kwargs: object) -> None:
+    """NPU graph parameter update callback for ACL Graph compilation."""
+    pass

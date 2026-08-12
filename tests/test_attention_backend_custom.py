@@ -213,6 +213,15 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         assert "sinks" in parameters
         assert "running_sinks" not in parameters
 
+    def test_impl_has_update_graph_params_classmethod(self):
+        """BeamAttentionImpl must expose update_graph_params for Ascend ACL Graph mode."""
+        from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+
+        assert hasattr(BeamAttentionImpl, "update_graph_params")
+        assert callable(getattr(BeamAttentionImpl, "update_graph_params"))
+        # Should be invocable on the class directly without raising
+        BeamAttentionImpl.update_graph_params()
+
     def test_fa3_scheduler_uses_num_heads_kv_keyword(self):
         """FA3 requires the scheduler keyword ``num_heads_kv``."""
         from types import SimpleNamespace
