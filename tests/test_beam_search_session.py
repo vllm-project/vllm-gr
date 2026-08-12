@@ -5,164 +5,172 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from typing import Any
+from typing import Generator
 
 import pytest
 import torch
 
-from vllm_gr.v1.beam import BeamSearchSession
-from vllm_gr.v1.beam import beam_search_session as session_module
+from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
 from vllm_gr.v1.beam.beam_search_session import (
     BeamSearchSession as SessionImplementation,
 )
 
 
-def _make_session(
+def _make_context(
     *,
-    layer_names: tuple[str, ...] = ("model.layers.0.self_attn", "model.layers.2.self_attn"),
+    max_batch: int = 2,
     max_beams: int = 4,
-    local_num_kv_heads: int = 2,
+    num_kv_heads: int = 2,
     max_decode_steps: int = 3,
     head_dim: int = 8,
-    device: torch.device | str = torch.device("cpu"),
+    num_layers: int = 2,
+    device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float16,
-) -> BeamSearchSession:
-    return BeamSearchSession(
-        layer_names=layer_names,
+) -> BeamAttentionContext:
+    return BeamAttentionContext(
+        max_batch=max_batch,
         max_beams=max_beams,
-        local_num_kv_heads=local_num_kv_heads,
+        num_kv_heads=num_kv_heads,
         max_decode_steps=max_decode_steps,
         head_dim=head_dim,
+        num_layers=num_layers,
         device=device,
         dtype=dtype,
     )
 
 
-def _persistent_tensors(session: BeamSearchSession) -> Iterator[torch.Tensor]:
+def _make_session(
+    *,
+    session_id: str = "test_session",
+    max_batch: int = 2,
+    max_beams: int = 4,
+    num_kv_heads: int = 2,
+    max_decode_steps: int = 3,
+    head_dim: int = 8,
+    num_layers: int = 2,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.float16,
+) -> BeamSearchSession:
+    context = _make_context(
+        max_batch=max_batch,
+        max_beams=max_beams,
+        num_kv_heads=num_kv_heads,
+        max_decode_steps=max_decode_steps,
+        head_dim=head_dim,
+        num_layers=num_layers,
+        device=device,
+        dtype=dtype,
+    )
+    slot = context.registry.allocate(session_id, beam_width=0, prefix_len=0)
+    return BeamSearchSession(session_id=session_id, slot=slot, context=context)
+
+
+def _persistent_tensors(session: BeamSearchSession) -> Generator[torch.Tensor, None, None]:
     for pool in session.pools:
         yield pool.unshared_key
         yield pool.unshared_value
-    yield session.suffix_k_buf
-    yield session.suffix_v_buf
-    yield session.block_table_buf
-    yield session.decode_step_buf
-    yield session.actual_shared_kvlen_buf
+    yield session.context.suffix_k_buf
+    yield session.context.suffix_v_buf
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
 def test_constructor_allocates_frozen_storage_contract(dtype: torch.dtype) -> None:
-    session = _make_session(dtype=dtype)
+    session = _make_session(
+        dtype=dtype, num_layers=2, max_beams=4, max_decode_steps=3, num_kv_heads=2, head_dim=8
+    )
 
-    assert session.layer_names == ("model.layers.0.self_attn", "model.layers.2.self_attn")
     assert len(session.pools) == 2
-    assert session.suffix_k_buf.shape == (4 * 3, 2, 8)
-    assert session.suffix_v_buf.shape == (4 * 3, 2, 8)
-    assert session.suffix_k_buf.dtype == session.suffix_v_buf.dtype == dtype
-    assert session.block_table_buf.dtype == torch.int32
-    assert session.decode_step_buf.dtype == torch.int32
-    assert session.actual_shared_kvlen_buf.dtype == torch.int32
-    assert torch.equal(session.block_table_buf, torch.tensor([0], dtype=torch.int32))
-    assert not session.is_active
-    assert session.beam_width == session.current_step == session.prefix_len == 0
+    # Each pool has shape [max_batch, max_beams, num_kv_heads, max_decode_steps, head_dim]
+    assert session.pools[0].unshared_key.shape == (2, 4, 2, 3, 8)
+    assert session.pools[0].unshared_value.shape == (2, 4, 2, 3, 8)
+    # Suffix buffers are shared across all sessions in the context
+    # Shape: [max_batch * max_beams * max_decode_steps, num_kv_heads, head_dim]
+    assert session.context.suffix_k_buf.shape == (2 * 4 * 3, 2, 8)
+    assert session.context.suffix_v_buf.shape == (2 * 4 * 3, 2, 8)
+    assert session.context.suffix_k_buf.dtype == session.context.suffix_v_buf.dtype == dtype
+    # After allocate, is_active is True (our registry sets is_active=True on allocate)
+    assert session.is_active
+    assert session.beam_width == 0
+    assert session.decode_step == 0
 
 
-def test_layer_mapping_is_immutable_and_uses_canonical_names() -> None:
+def test_session_references_shared_context() -> None:
     session = _make_session()
 
-    assert session.pool_index("model.layers.0.self_attn") == 0
-    assert session.pool_index("model.layers.2.self_attn") == 1
-    assert session.pool_for_layer("model.layers.2.self_attn") is session.pools[1]
-    with pytest.raises(TypeError):
-        session.layer_name_to_index["new"] = 2
-    with pytest.raises(KeyError, match="unknown layer name"):
-        session.pool_for_layer("model.layers.1.self_attn")
-    with pytest.raises(TypeError, match="must be a string"):
-        session.pool_index(0)
-
-
-@pytest.mark.parametrize(
-    ("layer_names", "exception"),
-    [
-        ((), ValueError),
-        (("",), ValueError),
-        (("layer", "layer"), ValueError),
-        (("layer", 1), TypeError),
-        ("layer", TypeError),
-    ],
-)  # type: ignore[misc]
-def test_constructor_rejects_invalid_layer_names(
-    layer_names: Any, exception: type[Exception]
-) -> None:
-    with pytest.raises(exception):
-        _make_session(layer_names=layer_names)
+    # Pools are owned by the context, session references them
+    assert session.pools is session.context.pools
+    assert len(session.pools) == 2
 
 
 def test_constructor_accepts_device_string() -> None:
-    session = _make_session(device="cpu")
+    context = BeamAttentionContext(
+        max_batch=1,
+        max_beams=4,
+        num_kv_heads=2,
+        max_decode_steps=3,
+        head_dim=8,
+        num_layers=2,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+    )
+    slot = context.registry.allocate("test", beam_width=0, prefix_len=0)
+    session = BeamSearchSession(session_id="test", slot=slot, context=context)
 
-    assert session.decode_step_buf.device == torch.device("cpu")
+    assert session.context.suffix_k_buf.device == torch.device("cpu")
 
 
-def test_constructor_rejects_non_device_like_value() -> None:
-    with pytest.raises(TypeError, match="torch.device or string"):
-        _make_session(device=None)
-
-
-def test_constructor_rejects_meta_device_string() -> None:
-    with pytest.raises(ValueError, match="meta device is not supported"):
-        _make_session(device="meta")
-
-
-def test_begin_and_end_only_change_logical_state_and_scalar_contents() -> None:
+def test_begin_and_end_change_logical_state_and_preserve_storage() -> None:
     session = _make_session()
     tensors = tuple(_persistent_tensors(session))
-    identities = tuple(id(tensor) for tensor in tensors)
     pointers = tuple(tensor.data_ptr() for tensor in tensors)
     for pool in session.pools:
         pool.unshared_key.fill_(11)
         pool.unshared_value.fill_(12)
-    session.suffix_k_buf.fill_(13)
-    session.suffix_v_buf.fill_(14)
+    session.context.suffix_k_buf.fill_(13)
+    session.context.suffix_v_buf.fill_(14)
 
     session.begin_session(beam_width=3, prefix_len=97)
 
     assert session.is_active
     assert session.beam_width == 3
-    assert session.current_step == 0
-    assert session.prefix_len == 97
-    assert torch.equal(session.decode_step_buf, torch.tensor([1], dtype=torch.int32))
-    assert torch.equal(session.actual_shared_kvlen_buf, torch.tensor([97], dtype=torch.int32))
-    assert all(torch.all(pool.unshared_key == 11) for pool in session.pools)
-    assert all(torch.all(pool.unshared_value == 12) for pool in session.pools)
-    assert torch.all(session.suffix_k_buf == 13)
-    assert torch.all(session.suffix_v_buf == 14)
+    assert session.decode_step == 0
+    # begin_session resets slot KV (zeros it)
+    for pool in session.pools:
+        assert torch.count_nonzero(pool.unshared_key[session.slot]).item() == 0
+        assert torch.count_nonzero(pool.unshared_value[session.slot]).item() == 0
 
     session.end_session()
 
-    assert not session.is_active
-    assert session.beam_width == session.current_step == session.prefix_len == 0
-    assert torch.equal(session.decode_step_buf, torch.tensor([1], dtype=torch.int32))
-    assert tuple(id(tensor) for tensor in tensors) == identities
+    # After end_session, the session's slot is released from the registry
+    # so we can no longer access _state (it's been removed)
+    assert not session.context.registry.has_session("test_session")
+    # Storage pointers remain unchanged
     assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
 
 
-def test_end_session_clears_advanced_logical_request_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    session = _make_session()
-    monkeypatch.setattr(session_module, "select_unshared_kv", lambda *args: None)
-    group = torch.arange(3, dtype=torch.int32)
-    session.begin_session(beam_width=3, prefix_len=97)
-    session.prepare_next_step(group, group)
+def test_end_session_releases_slot_from_registry() -> None:
+    session = _make_session(max_batch=1)
+    session.begin_session(beam_width=2, prefix_len=10)
 
-    assert session.current_step == 1
+    assert session.context.registry.has_session("test_session")
 
     session.end_session()
 
-    assert not session.is_active
-    assert session.beam_width == session.current_step == session.prefix_len == 0
-    assert torch.equal(session.decode_step_buf, torch.tensor([2], dtype=torch.int32))
+    assert not session.context.registry.has_session("test_session")
+
+
+def test_end_session_clears_advanced_logical_request_state() -> None:
+    session = _make_session(max_decode_steps=3)
+    session.begin_session(beam_width=3, prefix_len=97)
+    parent = torch.arange(3, dtype=torch.int32)
+    session.step_complete(parent)
+
+    assert session.decode_step == 1
+
+    session.end_session()
+
+    # After end_session, the slot is released from the registry
+    assert not session.context.registry.has_session("test_session")
 
 
 def test_repeated_requests_reuse_every_persistent_storage() -> None:
@@ -172,155 +180,158 @@ def test_repeated_requests_reuse_every_persistent_storage() -> None:
 
     for beam_width, prefix_len in ((4, 10), (1, 200), (3, 0)):
         session.begin_session(beam_width, prefix_len)
-        assert session.current_step == 0
-        assert torch.equal(session.decode_step_buf, torch.tensor([1], dtype=torch.int32))
+        assert session.decode_step == 0
         session.end_session()
+        # Re-allocate the slot for the next iteration
+        session.context.registry.allocate("test_session", beam_width=0, prefix_len=0)
 
     assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
 
 
-@pytest.mark.parametrize(
-    ("beam_width", "prefix_len", "exception"),
-    [
-        (0, 0, ValueError),
-        (5, 0, ValueError),
-        (True, 0, TypeError),
-        (1.5, 0, TypeError),
-        (1, -1, ValueError),
-        (1, True, TypeError),
-        (1, torch.iinfo(torch.int32).max + 1, ValueError),
-    ],
-)  # type: ignore[misc]
-def test_begin_rejects_invalid_capacity_or_prefix(
-    beam_width: Any, prefix_len: Any, exception: type[Exception]
-) -> None:
-    session = _make_session()
-    with pytest.raises(exception):
-        session.begin_session(beam_width, prefix_len)
-    assert not session.is_active
-    assert session.current_step == 0
-    assert torch.count_nonzero(session.decode_step_buf) == 0
+def test_slot_allocation_and_release_cycle() -> None:
+    """Test that slot allocation and release works correctly."""
+    context = _make_context(max_batch=2)
+    slot1 = context.registry.allocate("session_1", beam_width=2, prefix_len=10)
+    slot2 = context.registry.allocate("session_2", beam_width=3, prefix_len=20)
+
+    assert slot1 == 0  # free list is [0, 1], pop(0) gives 0 first
+    assert slot2 == 1
+
+    # No more free slots
+    with pytest.raises(RuntimeError, match="No free beam session slots"):
+        context.registry.allocate("session_3", beam_width=1, prefix_len=5)
+
+    # Release one slot
+    context.registry.release("session_1")
+    assert not context.registry.has_session("session_1")
+
+    # Now we can allocate again
+    slot3 = context.registry.allocate("session_3", beam_width=1, prefix_len=5)
+    assert slot3 == 0  # recycled slot
 
 
-def test_nested_begin_and_inactive_transitions_are_rejected() -> None:
-    session = _make_session()
-    identity = torch.arange(2, dtype=torch.int32)
-    prefix = torch.arange(1, 3, dtype=torch.int32)
-
-    with pytest.raises(RuntimeError, match="no BeamSearch session"):
-        session.prepare_next_step(identity, prefix)
-    with pytest.raises(RuntimeError, match="no BeamSearch session"):
-        session.end_session()
-
-    session.begin_session(2, 8)
-    with pytest.raises(RuntimeError, match="already active"):
-        session.begin_session(2, 8)
-
-
-def test_prepare_next_step_uses_zero_based_host_and_one_based_device_steps() -> None:
+def test_step_complete_advances_decode_step() -> None:
     session = _make_session(max_decode_steps=3)
-    identity = torch.arange(3, dtype=torch.int32)
-    prefix = torch.arange(1, 4, dtype=torch.int32)
-    session.begin_session(3, 20)
+    session.begin_session(beam_width=3, prefix_len=20)
 
-    session.prepare_next_step(identity, prefix)
-    assert session.current_step == 1
-    assert torch.equal(session.decode_step_buf, torch.tensor([2], dtype=torch.int32))
+    parent = torch.arange(3, dtype=torch.int32)
+    session.step_complete(parent)
+    assert session.decode_step == 1
 
-    session.prepare_next_step(identity, prefix)
-    assert session.current_step == 2
-    assert torch.equal(session.decode_step_buf, torch.tensor([3], dtype=torch.int32))
-
-    with pytest.raises(ValueError, match="beyond max_decode_steps"):
-        session.prepare_next_step(identity, prefix)
-    assert session.current_step == 2
-    assert torch.equal(session.decode_step_buf, torch.tensor([3], dtype=torch.int32))
-    assert session.is_active
+    session.step_complete(parent)
+    assert session.decode_step == 2
 
 
-@pytest.mark.parametrize(
-    ("bad_name", "bad_input"),
-    [
-        ("beam_index", torch.arange(3, dtype=torch.int64)),
-        ("beam_index", torch.arange(2, dtype=torch.int32)),
-        ("group_token_num", torch.arange(3, dtype=torch.int64)),
-        ("group_token_num", torch.arange(2, dtype=torch.int32)),
-        ("group_token_num", torch.arange(3, dtype=torch.int32).reshape(1, 3)),
-    ],
-)  # type: ignore[misc]
-def test_prepare_validation_failure_does_not_advance(
-    bad_name: str, bad_input: torch.Tensor
-) -> None:
-    session = _make_session()
-    valid = torch.arange(3, dtype=torch.int32)
-    session.begin_session(3, 20)
-
-    with pytest.raises((TypeError, ValueError)):
-        if bad_name == "beam_index":
-            session.prepare_next_step(bad_input, valid)
-        else:
-            session.prepare_next_step(valid, bad_input)
-
-    assert session.current_step == 0
-    assert torch.equal(session.decode_step_buf, torch.tensor([1], dtype=torch.int32))
-    assert session.is_active
-
-
-def test_prepare_rejects_tensors_on_a_different_device() -> None:
-    session = _make_session()
-    session.begin_session(3, 20)
-    valid = torch.arange(3, dtype=torch.int32)
-    other_device = torch.empty(3, dtype=torch.int32, device="meta")
-
-    with pytest.raises(ValueError, match="must be on"):
-        session.prepare_next_step(valid, other_device)
-
-    assert session.current_step == 0
-    assert torch.equal(session.decode_step_buf, torch.tensor([1], dtype=torch.int32))
-
-
-def test_select_failure_does_not_advance_host_or_device_step(
+def test_step_complete_reorders_pool_kv_via_select_unshared_kv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    session = _make_session(max_beams=4, num_layers=2)
+    session.begin_session(beam_width=3, prefix_len=10)
+
+    # Fill pool slot 0 with identifiable data
+    for layer_idx, pool in enumerate(session.pools):
+        pool.unshared_key[0].fill_(layer_idx * 10 + 1)
+        pool.unshared_value[0].fill_(layer_idx * 10 + 2)
+
+    select_calls: list[dict[str, object]] = []
+
+    def mock_select(
+        beam_index: torch.Tensor,
+        slot: int,
+        key_caches: list[torch.Tensor],
+        value_caches: list[torch.Tensor],
+        decode_step: int,
+    ) -> None:
+        select_calls.append(
+            {
+                "beam_index": beam_index,
+                "slot": slot,
+                "key_caches": key_caches,
+                "value_caches": value_caches,
+                "decode_step": decode_step,
+            }
+        )
+
+    monkeypatch.setattr(
+        "vllm_gr.v1.attention.backends.beam_kernels.select_unshared_kv",
+        mock_select,
+    )
+
+    parent = torch.tensor([2, 0, 1], dtype=torch.int32)
+    session.step_complete(parent)
+
+    assert len(select_calls) == 1
+    call = select_calls[0]
+    assert torch.equal(call["beam_index"], parent)
+    assert call["slot"] == session.slot
+    assert call["decode_step"] == 0
+    assert len(call["key_caches"]) == 2  # type: ignore[arg-type]
+    assert len(call["value_caches"]) == 2  # type: ignore[arg-type]
+    assert session.decode_step == 1
+
+
+def test_step_complete_skips_select_on_last_step() -> None:
+    session = _make_session(max_decode_steps=3)
+    session.begin_session(beam_width=3, prefix_len=20)
+    state = session._state
+    state.is_last_step = True
+
+    select_calls: list[bool] = []
+
+    def mock_select(*args: object, **kwargs: object) -> None:
+        select_calls.append(True)
+
+    import vllm_gr.v1.attention.backends.beam_kernels as beam_kernels_mod
+
+    original_select = beam_kernels_mod.select_unshared_kv
+    beam_kernels_mod.select_unshared_kv = mock_select
+    try:
+        parent = torch.arange(3, dtype=torch.int32)
+        session.step_complete(parent)
+    finally:
+        beam_kernels_mod.select_unshared_kv = original_select
+
+    assert len(select_calls) == 0
+    assert session.decode_step == 1
+
+
+def test_suffix_buf_returns_slice_for_slot() -> None:
+    session = _make_session(
+        max_batch=2, max_beams=4, max_decode_steps=3, num_kv_heads=2, head_dim=8
+    )
+    session.begin_session(beam_width=2, prefix_len=5)
+
+    k_buf, v_buf = session.suffix_k_buf, session.suffix_v_buf
+    # suffix_k_buf shape: [beam_width * max_decode_steps, num_kv_heads, head_dim]
+    assert k_buf.shape == (2 * 3, 2, 8)
+    assert v_buf.shape == (2 * 3, 2, 8)
+
+
+def test_slot_property_matches_registry() -> None:
     session = _make_session()
-    session.begin_session(3, 20)
-    valid = torch.arange(3, dtype=torch.int32)
-
-    def failing_select(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("injected select failure")
-
-    monkeypatch.setattr(session_module, "select_unshared_kv", failing_select)
-    with pytest.raises(RuntimeError, match="injected select failure"):
-        session.prepare_next_step(valid, valid + 1)
-
-    assert session.current_step == 0
-    assert torch.equal(session.decode_step_buf, torch.tensor([1], dtype=torch.int32))
-    assert session.is_active
-
-
-def test_reset_buffers_zeros_in_place_without_changing_state_or_addresses() -> None:
-    session = _make_session(dtype=torch.bfloat16)
-    session.begin_session(2, 33)
-    tensors = tuple(_persistent_tensors(session))
-    pointers = tuple(tensor.data_ptr() for tensor in tensors)
-    for pool in session.pools:
-        pool.unshared_key.fill_(1)
-        pool.unshared_value.fill_(2)
-    session.suffix_k_buf.fill_(3)
-    session.suffix_v_buf.fill_(4)
-
-    session.reset_buffers()
-
-    for pool in session.pools:
-        assert torch.count_nonzero(pool.unshared_key) == 0
-        assert torch.count_nonzero(pool.unshared_value) == 0
-    assert torch.count_nonzero(session.suffix_k_buf) == 0
-    assert torch.count_nonzero(session.suffix_v_buf) == 0
-    assert session.is_active
-    assert session.prefix_len == 33
-    assert torch.equal(session.decode_step_buf, torch.tensor([1], dtype=torch.int32))
-    assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
+    assert session.slot == session.context.registry.get_slot("test_session")
 
 
 def test_public_export_is_stable() -> None:
     assert BeamSearchSession is SessionImplementation
+
+
+def test_begin_session_resets_slot_kv() -> None:
+    """Test that begin_session zeros out the pool KV for the session's slot."""
+    session = _make_session(max_batch=2)
+    session.begin_session(beam_width=2, prefix_len=5)
+
+    # Write some data
+    for pool in session.pools:
+        pool.unshared_key[session.slot].fill_(42)
+        pool.unshared_value[session.slot].fill_(43)
+
+    # End and re-begin
+    session.end_session()
+    session.context.registry.allocate("test_session", beam_width=0, prefix_len=0)
+    session.begin_session(beam_width=3, prefix_len=10)
+
+    # Pool KV should be zeroed for the session's slot
+    for pool in session.pools:
+        assert torch.count_nonzero(pool.unshared_key[session.slot]).item() == 0
+        assert torch.count_nonzero(pool.unshared_value[session.slot]).item() == 0

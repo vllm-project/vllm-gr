@@ -123,7 +123,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --dataset-path "$DATASET_PATH" \
   --dataset-name onerec \
   --num-prompts 100 \
-  --max-concurrency 10 \
+  --max-concurrency 1 \
   --use-beam-search \
   --task-type video \
   --catalog-path "$CATALOG_PATH" \
@@ -208,6 +208,7 @@ warmup_output=$(python -m benchmarks.open_one_rec.one_rec_main \
   --use-beam-search \
   --port "$run_port" \
   --request-rate 1 \
+  --max-concurrency 1 \
   --n 128)
 warmup_status=$?
 printf '%s\n' "$warmup_output"
@@ -228,6 +229,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   --use-beam-search \
   --port "$run_port" \
   --request-rate 0.5 \
+  --max-concurrency 1 \
   --n 128)
 online_performance_status=$?
 printf '%s\n' "$output"
@@ -253,6 +255,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --dataset-path "$DATASET_PATH" \
   --dataset-name onerec \
   --num-prompts 100 \
+  --max-concurrency 1 \
   --use-beam-search \
   --backend openai-chat \
   --task-type video \

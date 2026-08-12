@@ -55,7 +55,10 @@ def _cache_beam_request(self, request) -> None:
     uncacheable.  We temporarily extend ``request._all_token_ids`` in-place
     to the next block boundary so that ``update_block_hashes()`` (which reads
     via ConstantList wrapper ``request.all_token_ids``) sees a complete last
-    block and produces its hash.  We then revert ``request._all_token_ids``
+    block and produces its hash.  ``patch_cache_blocks`` (see
+    engine_core_patch.py) later caches that padded block after prefill, so
+    the beam-decode request can prefix-cache-hit the remainder block and
+    inherit its KV from the paged cache.  We then revert ``request._all_token_ids``
     in-place so prefill execution runs strictly on original tokens.
     """
     _ensure_beam_state(self)
@@ -118,6 +121,20 @@ def _handle_beam_request_step_update(self, update) -> None:
     if beam_width == 0:
         with self.beam_cache_lock:
             self.beam_cache.pop(session_id, None)
+
+        # Record the teardown signal on the Scheduler so that
+        # patched_schedule can propagate it to the worker via
+        # SchedulerOutput.beam_finished_session_ids.  This is the
+        # authoritative "beam search finished" signal — it is sent by the
+        # beam search loop (GRLLM offline / OpenAI serving) via
+        # _beam_request_cleanup(beam_width=0), and is distinct from
+        # finished_req_ids which fires on every decode step (because each
+        # step's Request reaches num_computed_tokens >= num_tokens).
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None:
+            if not hasattr(scheduler, "_beam_finished_session_ids"):
+                scheduler._beam_finished_session_ids = []
+            scheduler._beam_finished_session_ids.append(session_id)
 
         # We MUST abort the running beam-request session_id itself!
         self.aborts_queue.put_nowait(session_id)
@@ -191,11 +208,27 @@ def _handle_beam_request_step_update(self, update) -> None:
         update.sampling_params.update_from_generation_config({}, eos_token_id)
 
     # Pack the shared prefill and all beam suffixes into a single contiguous Beam Request
-    beam_token_ids = list(prefill_tokens)
+    # In incremental decode mode, only send the new token for each beam
+    # (not all previous tokens — those are already in the KV pool)
+    # decode_step is 0-indexed: first decode step = 0, second = 1, etc.
     decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
     assert all(len(t) == decode_steps for t in update.beam_tokens)
+    beam_decode_step = decode_steps - 1 if decode_steps > 0 else 0
+
+    # For incremental decode, only send the new token per beam
+    # (prefix KV is in paged cache, previous decode KV is in pool)
+    # But we need to include the prefix tokens in prompt_token_ids so the
+    # scheduler can correctly compute the number of already-computed tokens.
+    # The key insight: the scheduler will skip prefix tokens (because
+    # get_computed_blocks returns prefix_len), and only schedule the
+    # new beam tokens.
+    beam_token_ids = list(prefill_tokens)
     for gen_tokens in update.beam_tokens:
-        beam_token_ids.extend(gen_tokens)
+        if decode_steps > 0:
+            # Incremental path: only take the last token (the new one for this step)
+            beam_token_ids.append(gen_tokens[-1])
+        else:
+            beam_token_ids.extend(gen_tokens)
 
     req = Request(
         request_id=session_id,  # Single request ID representing all beams
@@ -224,8 +257,13 @@ def _handle_beam_request_step_update(self, update) -> None:
     req.is_beam = True
     req.beam_width = beam_width
     req.is_beam_decode = True  # Flag indicating it's the decode stage
-    req.beam_decode_steps = decode_steps
+    req.beam_decode_steps = decode_steps  # total decode steps so far
+    req.beam_decode_step = beam_decode_step  # current decode step (0-indexed)
     req.prefix_len = update.prefix_len
+    # Store parent beam indices for incremental decode KV reordering
+    req.parent_beam_indices = update.parent_beam_indices
+    # Store max decode steps for KV pool pre-allocation
+    req.max_decode_steps = update.max_decode_steps
 
     self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, update.current_wave)))
 

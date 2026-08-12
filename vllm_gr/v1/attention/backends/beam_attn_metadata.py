@@ -19,7 +19,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
@@ -106,13 +105,18 @@ class BeamAttentionMetadata:
     num_heads: int = 0
     num_kv_heads: int = 0
 
-    # Incremental decode is opt-in. These scalar fields describe the active
-    # region of the fixed-address per-layer Pool without changing the legacy
-    # suffix-gather metadata contract.
-    is_incremental_decode: bool = False
-    incremental_beam_width: int = 0
-    incremental_suffix_kv_len: int = 0
-    beam_session: BeamSearchSession | None = None
+    # --- Incremental decode fields ---
+    # When is_beam_decode is True and beam_session is available,
+    # the attention forward uses the incremental decode path.
+    is_beam_decode: bool = False
+    beam_session: Any = None  # BeamSearchSession reference
+    # DEPRECATED: beam_layer_idx is no longer the primary pool resolution
+    # mechanism.  Prefer passing ``beam_pool`` directly as an explicit
+    # parameter to ``cascade_attention``.  This field is kept only for
+    # backward compatibility with callers that have not yet migrated.
+    beam_layer_idx: int = 0
+    beam_pool_slots: list = None  # Per beam-request slot index (for max_batch>1)
+    incremental_suffix_kv_len: int = 0  # decode_step + 1
 
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
@@ -228,6 +232,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         beam_data: dict,
         q_starts: list,
         seq_lens_cpu_list: list[int],
+        beam_session=None,
     ):
         std_reqs = []
         beam_req_idxs = []
@@ -236,6 +241,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         beam_decode_steps = []
         beam_cache_lens = []
         beam_q_start_offsets = []
+        beam_decode_step_list = []  # incremental decode step
+        beam_pool_slots = []  # per beam-request slot index
 
         for i in range(num_reqs):
             req_id = req_ids[i] if i < len(req_ids) else None
@@ -260,6 +267,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 beam_decode_steps.append(mdata["beam_decode_steps"])
                 beam_cache_lens.append(cache_len)
                 beam_q_start_offsets.append(q_offset)
+                beam_decode_step_list.append(mdata.get("decode_step", 0))
+
+                # Get pool slot for this request from the session registry
+                pool_slot = 0  # default for max_batch=1
+                if beam_session is not None and req_id is not None:
+                    try:
+                        pool_slot = beam_session.context.registry.get_slot(req_id)
+                    except KeyError:
+                        pass  # session not yet registered, use default
+                beam_pool_slots.append(pool_slot)
             else:
                 kv_len = seq_lens_cpu_list[i]
                 std_reqs.append((i, q_len, kv_len))
@@ -272,6 +289,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             beam_decode_steps,
             beam_cache_lens,
             beam_q_start_offsets,
+            beam_decode_step_list,
+            beam_pool_slots,
         )
 
     def _build_std_mappings(self, std_reqs: list, q_starts: list):
@@ -315,6 +334,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         beam_q_start_offsets,
         q_starts,
         common_attn_metadata,
+        is_incremental: bool = False,
+        beam_decode_step_list: list | None = None,
     ):
         """Builds attention mapping metadata for all active beams in a batch.
 
@@ -322,14 +343,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         each request into prefix (shared history) and suffix (beam-specific lookahead)
         computations.
 
-        Key Invariants:
-        1. Query Length Partitioning: A request's total query length `q_len` represents
-           the `chunk_budget`. We process lookahead for each beam `b` up to width `w`.
-           Each beam consumes `b_uncached` query tokens, decrementing `chunk_budget`
-           until it reaches 0.
-        2. Prefix Grouping: Since multiple beams within a request may share the same
-           prefix length, they are grouped in `prefix_groups` to run attention
-           queries in parallel, maximizing hardware occupancy.
+        When is_incremental=True (incremental decode path), each beam contributes
+        1 query token and decode_step+1 suffix KV tokens. The suffix slot mapping
+        is not needed (pool slice is used instead of gather).
         """
         # Prefix attention tracking lists
         beam_prefix_indices = []
@@ -346,13 +362,15 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
         out_slot = 0
-        for req_idx, prefix_len, w, steps, cache_len, q_offset in zip(
-            beam_req_idxs,
-            beam_prefix_lens,
-            beam_widths,
-            beam_decode_steps,
-            beam_cache_lens,
-            beam_q_start_offsets,
+        for idx, (req_idx, prefix_len, w, steps, cache_len, q_offset) in enumerate(
+            zip(
+                beam_req_idxs,
+                beam_prefix_lens,
+                beam_widths,
+                beam_decode_steps,
+                beam_cache_lens,
+                beam_q_start_offsets,
+            )
         ):
             q_start = q_starts[req_idx] + q_offset
             q_end = q_starts[req_idx + 1]
@@ -360,6 +378,30 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             if w == 0 or steps == 0 or q_len <= 0:
                 continue
 
+            # --- Incremental decode path ---
+            if is_incremental and beam_decode_step_list is not None:
+                decode_step = beam_decode_step_list[idx]
+                # Each beam: 1 query token, decode_step+1 suffix KV tokens
+                # Prefix: all beams share the same prefix_len
+                for b in range(w):
+                    suffix_seqlens_q_cpu.append(1)
+                    suffix_seqlens_kv_cpu.append(decode_step + 1)
+
+                # All beams share the same prefix group
+                beam_prefix_indices.extend(range(q_start, q_start + w))
+                prefix_seqlens_q_cpu.append(w)  # total query tokens for prefix
+                # Remainder-block analysis (PREFIX_REMAINDER_BLOCK_ANALYSIS.md):
+                # the trailing partial-block tokens belong to the prefix
+                # (shared KV), NOT to the suffix. Their KV is written to the
+                # paged cache during prefill, and prefix FA reads exactly
+                # prefix_len KV via seqused_k, so FA ignores the remainder-block
+                # padding automatically. Using the exact prefix_len (not the
+                # block-aligned length) preserves those trailing prefix tokens.
+                prefix_seqlens_kv_cpu.append(prefix_len)
+                prefix_req_idxs_cpu.append(req_idx)
+                continue
+
+            # --- Standard (recompute) path ---
             q_curr = q_start
             chunk_budget = q_len
             prefix_groups = []  # Elements: [group_q_start, group_q_len, group_cache_len]
@@ -578,155 +620,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_scheduler_metadata,
         )
 
-    @staticmethod
-    def _require_incremental_int(name: str, value: Any, *, positive: bool = False) -> int:
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"{name} must be an int, got {type(value).__name__}")
-        if positive and value <= 0:
-            raise ValueError(f"{name} must be greater than zero, got {value}")
-        if not positive and value < 0:
-            raise ValueError(f"{name} must be non-negative, got {value}")
-        return value
-
-    def _build_incremental_metadata(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        request_metadata: dict[str, Any],
-        beam_session: BeamSearchSession | None,
-        max_num_splits: int,
-    ) -> BeamAttentionMetadata:
-        """Build the CUDA-only, one-token-per-beam incremental metadata."""
-
-        if not self._is_cuda:
-            raise NotImplementedError("Incremental Beam Attention is currently CUDA-only")
-        if beam_session is None:
-            raise RuntimeError("incremental Beam Attention requires a worker-local beam_session")
-        if not isinstance(beam_session, BeamSearchSession):
-            raise TypeError("beam_session must be a BeamSearchSession")
-        if not beam_session.is_active:
-            raise RuntimeError("incremental Beam Attention requires an active beam_session")
-        if common_attn_metadata.num_reqs != 1:
-            raise ValueError("incremental Beam Attention currently supports one logical request")
-
-        beam_width = self._require_incremental_int(
-            "beam_width", request_metadata.get("beam_width"), positive=True
-        )
-        decode_step = self._require_incremental_int(
-            "decode_step", request_metadata.get("decode_step")
-        )
-        prefix_len = self._require_incremental_int("prefix_len", request_metadata.get("prefix_len"))
-        cache_len = self._require_incremental_int("cache_len", request_metadata.get("cache_len"))
-        if beam_width != beam_session.beam_width:
-            raise ValueError("scheduler beam_width does not match the active beam_session")
-        if decode_step != beam_session.current_step:
-            raise ValueError("scheduler decode_step does not match beam_session.current_step")
-        if prefix_len != beam_session.prefix_len:
-            raise ValueError("scheduler prefix_len does not match beam_session.prefix_len")
-        if cache_len != prefix_len:
-            raise ValueError("incremental Beam Attention requires cache_len == prefix_len")
-        if prefix_len == 0:
-            raise ValueError("incremental Beam Attention currently requires a non-empty prefix")
-        if common_attn_metadata.num_actual_tokens != beam_width:
-            raise ValueError("incremental Beam Attention requires one query token per beam")
-
-        q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
-        if q_starts != [0, beam_width]:
-            raise ValueError("incremental query rows must be one contiguous logical request")
-
-        suffix_kv_len = beam_session.current_step + 1
-        pool = beam_session.pools[0]
-        max_decode_steps = pool.unshared_key.shape[3]
-        if suffix_kv_len > max_decode_steps:
-            raise ValueError("incremental suffix length exceeds Pool capacity")
-        if beam_width * suffix_kv_len > beam_session.suffix_k_buf.shape[0]:
-            raise ValueError("incremental suffix length exceeds fixed Buffer capacity")
-
-        device = self.device
-        prefix_indices = torch.arange(beam_width, dtype=torch.long, device=device)
-        prefix_cu_seqlens_q_device = torch.tensor([0, beam_width], dtype=torch.int32, device=device)
-        prefix_seqlens_kv_device = beam_session.actual_shared_kvlen_buf
-        max_prefix_blocks_count = (prefix_len + self.block_size - 1) // self.block_size
-        if common_attn_metadata.block_table_tensor.shape[1] < max_prefix_blocks_count:
-            raise ValueError("block table does not cover the complete shared prefix")
-        prefix_block_table = common_attn_metadata.block_table_tensor[
-            :1, :max_prefix_blocks_count
-        ].contiguous()
-
-        suffix_cu_seqlens_q_device = torch.arange(beam_width + 1, dtype=torch.int32, device=device)
-        suffix_cu_seqlens_k_device = torch.arange(
-            0,
-            (beam_width + 1) * suffix_kv_len,
-            suffix_kv_len,
-            dtype=torch.int32,
-            device=device,
-        )
-        suffix_seqlens_kv_device = torch.full(
-            (beam_width,), suffix_kv_len, dtype=torch.int32, device=device
-        )
-        prefix_scheduler_metadata = self._get_schedule(
-            batch_size=1,
-            cu_query_lens=prefix_cu_seqlens_q_device,
-            max_query_len=beam_width,
-            seqlens=prefix_seqlens_kv_device,
-            max_seq_len=prefix_len,
-            causal=False,
-            max_num_splits=max_num_splits,
-        )
-
-        suffix_cu_cpu = list(range(1, beam_width + 1))
-        suffix_kv_cu_cpu = [suffix_kv_len * index for index in range(1, beam_width + 1)]
-        return BeamAttentionMetadata(
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            max_query_len=common_attn_metadata.max_query_len,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
-            causal=common_attn_metadata.causal,
-            npu_causal_atten_mask=getattr(self, "npu_causal_atten_mask", None),
-            std_indices=None,
-            std_seqlens_q_cpu=[],
-            std_cu_seqlens_q_cpu=None,
-            std_seqlens_kv_cpu=[],
-            std_cu_seqlens_kv_cpu=None,
-            std_req_idxs_cpu=[],
-            prefix_req_idxs_cpu=[0],
-            max_prefix_blocks_count=max_prefix_blocks_count,
-            prefix_indices=prefix_indices,
-            prefix_cu_seqlens_q_device=prefix_cu_seqlens_q_device,
-            prefix_seqlens_kv_device=prefix_seqlens_kv_device,
-            prefix_max_q_len=beam_width,
-            prefix_max_seq_len=prefix_len,
-            prefix_block_table=prefix_block_table,
-            prefix_seqlens_q_cpu=[beam_width],
-            prefix_cu_seqlens_q_cpu=[beam_width],
-            prefix_seqlens_kv_cpu=[prefix_len],
-            prefix_cu_seqlens_kv_cpu=[prefix_len],
-            prefix_scheduler_metadata=prefix_scheduler_metadata,
-            suffix_cu_seqlens_q_device=suffix_cu_seqlens_q_device,
-            suffix_cu_seqlens_k_device=suffix_cu_seqlens_k_device,
-            suffix_seqlens_kv_device=suffix_seqlens_kv_device,
-            suffix_max_q_len=1,
-            suffix_max_seq_len=suffix_kv_len,
-            suffix_total_tokens=beam_width * suffix_kv_len,
-            suffix_slot_mapping_out=None,
-            suffix_seqlens_q_cpu=[1] * beam_width,
-            suffix_cu_seqlens_q_cpu=suffix_cu_cpu,
-            suffix_seqlens_kv_cpu=[suffix_kv_len] * beam_width,
-            suffix_cu_seqlens_kv_cpu=suffix_kv_cu_cpu,
-            num_std_indices=0,
-            num_prefix_indices=beam_width,
-            max_num_splits=max_num_splits,
-            block_size=self.block_size,
-            num_heads=self.num_heads_q,
-            num_kv_heads=self.num_kv_heads,
-            is_incremental_decode=True,
-            incremental_beam_width=beam_width,
-            incremental_suffix_kv_len=suffix_kv_len,
-            beam_session=beam_session,
-        )
-
     def build(
         self,
         common_prefix_len: int,
@@ -742,27 +635,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         beam_data = beam_info["beam_data"] if beam_info else {}
         req_ids = beam_info["req_ids"] if beam_info else []
 
-        active_request_metadata = [
-            beam_data.get(req_ids[index], {}) for index in range(min(num_reqs, len(req_ids)))
-        ]
-        incremental_requests = [
-            metadata
-            for metadata in active_request_metadata
-            if metadata.get("is_incremental_decode", False)
-        ]
-        if incremental_requests:
-            if len(incremental_requests) != 1 or num_reqs != 1:
-                raise ValueError("incremental Beam Attention cannot be mixed with other requests")
-            beam_session = beam_info.get("beam_session") if beam_info else None
-            return self._build_incremental_metadata(
-                common_attn_metadata,
-                incremental_requests[0],
-                beam_session,
-                max_num_splits,
-            )
-
         q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
         seq_lens_cpu_list = common_attn_metadata.seq_lens.cpu().tolist()
+
+        # Get beam_session early so _segment_requests can use it for slot lookup
+        beam_session = beam_info.get("beam_session") if beam_info else None
 
         (
             std_reqs,
@@ -772,7 +649,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             beam_decode_steps,
             beam_cache_lens,
             beam_q_start_offsets,
-        ) = self._segment_requests(num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list)
+            beam_decode_step_list,
+            beam_pool_slots,
+        ) = self._segment_requests(
+            num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list, beam_session
+        )
 
         (
             std_indices,
@@ -782,6 +663,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_cu_seqlens_q_cpu,
             std_cu_seqlens_kv_cpu,
         ) = self._build_std_mappings(std_reqs, q_starts)
+
+        # Check if we have an active beam session for incremental decode
+        is_incremental = (
+            beam_session is not None and beam_session.is_active and len(beam_decode_step_list) > 0
+        )
 
         (
             prefix_indices,
@@ -805,6 +691,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             beam_q_start_offsets,
             q_starts,
             common_attn_metadata,
+            is_incremental=is_incremental,
+            beam_decode_step_list=beam_decode_step_list,
         )
 
         (
@@ -855,6 +743,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             device,
             max_num_splits,
         )
+
+        # Determine incremental decode metadata
+        incremental_suffix_kv_len = 0
+        if is_incremental and beam_decode_step_list:
+            # In incremental decode, suffix KV length = decode_step + 1
+            incremental_suffix_kv_len = beam_decode_step_list[0] + 1
 
         meta = BeamAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -907,6 +801,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             block_size=block_size,
             num_heads=self.num_heads_q,
             num_kv_heads=self.num_kv_heads,
+            # Incremental decode fields
+            is_beam_decode=is_incremental,
+            beam_session=beam_session,
+            beam_pool_slots=beam_pool_slots,
+            incremental_suffix_kv_len=incremental_suffix_kv_len,
         )
         return meta
 

@@ -106,6 +106,7 @@ def _prepare_beam_step_requests(
     instance_fork_info: dict[int, ForkInfo],
     instance_prefix_len: dict[int, int],
     instance_completed_sessions: set[int],
+    max_decode_steps: int = 0,
 ) -> list["EngineCoreRequest"]:
     """Prepare EngineCoreRequest items for active instances at this step."""
     engine_core_requests = []
@@ -167,6 +168,11 @@ def _prepare_beam_step_requests(
                 pid for pid in instance_prev_beam_internal_ids[j] if pid not in used_parents
             ]
 
+            # Collect numeric parent beam indices for incremental decode
+            parent_beam_indices = []
+            for new_idx, (parent_beam_idx, tok) in enumerate(fork_info_j):
+                parent_beam_indices.append(parent_beam_idx)
+
             update = BeamRequestStepUpdate(
                 session_id=session_id,
                 parent_beam_ids=parent_beam_ids,
@@ -180,6 +186,8 @@ def _prepare_beam_step_requests(
                 if sid_end_token_id is not None
                 else tokenizer.eos_token_id,
                 lora_request=instance.beams[0].lora_request,
+                parent_beam_indices=parent_beam_indices,
+                max_decode_steps=max_decode_steps,
             )
             llm_engine.engine_core.beam_request_step_update(update)
 
@@ -370,6 +378,7 @@ def _custom_beam_search_batch(
     catalog: Optional[Any] = None,
     catalog_strategy: str = "fill",
     constraint_coordinator: BeamConstraintCoordinator | None = None,
+    max_decode_steps: int = 0,
 ) -> None:
     """Run beam search in batch mode for custom attention backend."""
     instance_prefill_id: dict[int, str] = {}
@@ -402,6 +411,7 @@ def _custom_beam_search_batch(
             instance_fork_info=instance_fork_info,
             instance_prefix_len=instance_prefix_len,
             instance_completed_sessions=instance_completed_sessions,
+            max_decode_steps=max_decode_steps,
         )
 
         if engine_core_requests:
@@ -711,6 +721,7 @@ class GRLLM(LLM):
                     catalog=self.catalog,
                     catalog_strategy=catalog_strategy,
                     constraint_coordinator=self.constraint_coordinator,
+                    max_decode_steps=max_tokens - pre_calc,
                 )
             else:
                 for _ in token_iter:

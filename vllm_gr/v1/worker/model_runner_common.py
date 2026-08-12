@@ -79,21 +79,44 @@ def _process_beam_decode_request(
     gpu_pos: Optional[torch.Tensor],
     cpu_pos: Optional[torch.Tensor],
     new_logits_indices: List[int],
+    is_incremental: bool = False,
 ) -> Tuple[int, int, int, List[int]]:
-    """Traces allocation arrays and mutates position buffers for a speculative request."""
+    """Traces allocation arrays and mutates position buffers for a speculative request.
+
+    When is_incremental=True, each beam inputs 1 token with position_id = prefix_len + decode_step.
+    """
     prefix_len = mdata["prefix_len"]
     beam_width = mdata["beam_width"]
     decode_steps = mdata["beam_decode_steps"]
     cache_len = mdata["cache_len"]
     active_beam_ids = []  # Track structural beam locations
 
+    # --- Incremental decode path ---
+    if is_incremental:
+        decode_step = mdata.get("decode_step", 0)
+        seg_starts: List[int] = []
+        seg_lens: List[int] = []
+
+        for b in range(beam_width):
+            # Each beam: 1 token, position = prefix_len + decode_step
+            seg_starts.append(prefix_len + decode_step)
+            seg_lens.append(1)
+            new_logits_indices.append(token_offset + b)
+            active_beam_ids.append(b)
+
+        # Batched position-id write
+        _write_position_segments(token_offset, seg_starts, seg_lens, gpu_pos, cpu_pos)
+
+        return beam_width, beam_width, token_offset + beam_width, active_beam_ids
+
+    # --- Standard (recompute) path ---
     chunk_budget = seq_len
     curr_offset = token_offset
     valid_rows_for_req = 0
     logits_row_cnt = 0
     b_cache_len = cache_len
-    seg_starts: List[int] = []
-    seg_lens: List[int] = []
+    seg_starts = []
+    seg_lens = []
     for b in range(beam_width):
         if chunk_budget <= 0:
             break
@@ -365,6 +388,8 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
 
         mdata = beam_data.get(req_id)
         if mdata and mdata.get("is_beam_decode", False):
+            # Check if incremental decode is active
+            is_incremental = "decode_step" in mdata
             beams_count, beams_count_with_logits, next_offset, active_beam_ids = (
                 _process_beam_decode_request(
                     mdata,
@@ -373,6 +398,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
                     gpu_positions,
                     cpu_positions,
                     new_logits_indices,
+                    is_incremental=is_incremental,
                 )
             )
             row_to_req_id.extend([req_id] * beams_count)
@@ -555,6 +581,185 @@ def _beam_collapse_bookkeeping(
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
 
 
+def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) -> Optional[Any]:
+    """Get or create per-request BeamSearchSession for incremental decode.
+
+    Manages per-request sessions via runner._beam_sessions dict, keyed by
+    session_id (== req_id).  Each session references a shared
+    BeamAttentionContext (runner._beam_context) which owns the pools and
+    the BeamSessionRegistry.
+
+    Session lifecycle:
+    - Creation: on the first beam decode step (decode_step=0) for a req_id.
+    - Step progression: step_complete (select_unshared_kv + advance) on
+      subsequent steps.
+    - Teardown: the authoritative signal is
+      ``SchedulerOutput.beam_finished_session_ids``, populated by
+      ``patched_schedule`` from
+      ``Scheduler._beam_finished_session_ids`` which is written by
+      ``_handle_beam_request_step_update`` when it receives a
+      ``BeamRequestStepUpdate(beam_width=0)`` — the beam search loop's
+      explicit "generation finished" message.  This is distinct from
+      ``finished_req_ids`` which fires on every decode step.
+    - Fallback: if allocate fails and the registry is full, stale sessions
+      (whose req_ids are no longer in beam_data) are released as a safety
+      net for unexpected abort/error paths.
+    """
+    runner._beam_sessions = getattr(runner, "_beam_sessions", {})
+
+    # 1. Clean up finished sessions (beam_width=0 teardown signal)
+    finished_ids = getattr(scheduler_output, "beam_finished_session_ids", [])
+    for sid in finished_ids:
+        session = runner._beam_sessions.pop(sid, None)
+        if session is not None:
+            session.end_session()
+
+    # 2. Check if we have any beam decode requests with decode_step
+    has_incremental = any(
+        mdata.get("is_beam_decode", False) and "decode_step" in mdata
+        for mdata in beam_data.values()
+    )
+    if not has_incremental:
+        return None
+
+    # 3. Ensure worker-level context exists (lazy creation)
+    if not hasattr(runner, "_beam_context"):
+        # Get model config for pool dimensions
+        model_config = getattr(runner, "model_config", None)
+        if model_config is None:
+            vllm_config = getattr(runner, "vllm_config", None)
+            if vllm_config is not None:
+                model_config = vllm_config.model_config
+
+        if model_config is None:
+            logger.warning("Cannot create BeamAttentionContext: model_config not available")
+            return None
+
+        parallel_config = getattr(runner, "parallel_config", None)
+        if parallel_config is None:
+            vllm_config = getattr(runner, "vllm_config", None)
+            if vllm_config is not None:
+                parallel_config = vllm_config.parallel_config
+
+        if parallel_config is None:
+            logger.warning("Cannot create BeamAttentionContext: parallel_config not available")
+            return None
+
+        num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        head_dim = model_config.get_head_size()
+        num_layers = model_config.get_num_layers(parallel_config)
+        device = runner.device if hasattr(runner, "device") else torch.device("cuda")
+
+        # Determine max_batch: the maximum number of concurrent beam search sessions.
+        # This is NOT the scheduler's max_num_seqs (which includes all request types).
+        # For now, hardcode to 1 for max_batch=1 testing.  Future: read from
+        # beam-specific config or dynamically size the pool.
+        max_batch = 1
+
+        # Determine max_beams and max_decode_steps from the first beam request
+        # These will be used for pool pre-allocation.  In the future, we may
+        # need to support heterogeneous beam widths across requests.
+        first_mdata = None
+        for md in beam_data.values():
+            if md.get("is_beam_decode", False) and "decode_step" in md:
+                first_mdata = md
+                break
+
+        max_beams = first_mdata["beam_width"] if first_mdata else 128
+        max_decode_steps = first_mdata.get("max_decode_steps", 0) if first_mdata else 0
+        if max_decode_steps <= 0 and first_mdata is not None:
+            max_decode_steps = max(first_mdata.get("beam_decode_steps", 0), 64)
+        if max_decode_steps <= 0:
+            max_decode_steps = 64
+
+        from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+
+        runner._beam_context = BeamAttentionContext(
+            max_batch=max_batch,
+            max_beams=max_beams,
+            num_kv_heads=num_kv_heads,
+            max_decode_steps=max_decode_steps,
+            head_dim=head_dim,
+            num_layers=num_layers,
+            device=device,
+        )
+
+    # 4. Per-request session management
+    active_session = None
+
+    for req_id, mdata in beam_data.items():
+        if not mdata.get("is_beam_decode") or "decode_step" not in mdata:
+            continue
+
+        session = runner._beam_sessions.get(req_id)
+        mdata_step = mdata.get("decode_step", 0)
+
+        if session is not None:
+            # Existing session: step_complete or reset
+            if mdata_step == 0:
+                # First decode step of a request: full reset.
+                # There is no previous beam decision yet, so select_unshared_kv
+                # must not run, and decode KV must be written to pool slice 0.
+                # (parent_beam_indices is non-None even on the first step, so it
+                # cannot be used to distinguish the first step — decode_step can.)
+                session.begin_session(mdata["beam_width"], mdata["prefix_len"])
+            else:
+                # Subsequent decode steps: apply the previous step's beam decision.
+                # step_complete (select_unshared_kv + advance_step) must run BEFORE
+                # the new KV is written, using the current decode_step to select
+                # the KV range to reorder.
+                parent_beam_ids = mdata.get("parent_beam_ids")
+                max_decode_steps = mdata.get("max_decode_steps", 0)
+                if max_decode_steps <= 0:
+                    max_decode_steps = max(mdata.get("beam_decode_steps", 0), 64)
+
+                is_last_step = mdata_step >= max_decode_steps - 1
+                state = session._state
+                state.is_last_step = is_last_step
+
+                if parent_beam_ids is not None and not is_last_step:
+                    parent = torch.tensor(parent_beam_ids, dtype=torch.int32, device=runner.device)
+                    session.step_complete(parent)
+                else:
+                    # Last step or no parent: just advance decode_step
+                    state.decode_step += 1
+        else:
+            # New session
+            from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+
+            try:
+                slot = runner._beam_context.registry.allocate(
+                    req_id, mdata["beam_width"], mdata["prefix_len"]
+                )
+            except RuntimeError:
+                # Fallback: release stale sessions whose req_ids are no
+                # longer in beam_data.  This handles unexpected abort/error
+                # paths where the beam_width=0 cleanup signal never arrived.
+                # The primary teardown path is beam_finished_session_ids
+                # (set by _handle_beam_request_step_update on beam_width=0).
+                active_req_ids = set(beam_data.keys())
+                stale_ids = [
+                    sid for sid in list(runner._beam_sessions.keys()) if sid not in active_req_ids
+                ]
+                for sid in stale_ids:
+                    old_session = runner._beam_sessions.pop(sid)
+                    old_session.end_session()
+                # Retry allocation after cleanup
+                slot = runner._beam_context.registry.allocate(
+                    req_id, mdata["beam_width"], mdata["prefix_len"]
+                )
+            session = BeamSearchSession(session_id=req_id, slot=slot, context=runner._beam_context)
+            session.begin_session(mdata["beam_width"], mdata["prefix_len"])
+            # Set initial decode_step from scheduler
+            session._state.decode_step = mdata_step
+            runner._beam_sessions[req_id] = session
+
+        if active_session is None:
+            active_session = session
+
+    return active_session
+
+
 def make_patched_execute_model(_orig_execute_model):
     """Wrap execute_model to publish beam-request context for the run.
 
@@ -567,6 +772,12 @@ def make_patched_execute_model(_orig_execute_model):
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
         self._current_beam_data = getattr(scheduler_output, "beam_data", {})
         beam_info = {"beam_data": self._current_beam_data, "req_ids": []}
+
+        # Manage BeamSearchSession for incremental decode
+        beam_session = _get_or_create_beam_session(self, self._current_beam_data, scheduler_output)
+        if beam_session is not None:
+            beam_info["beam_session"] = beam_session
+
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info
         try:
