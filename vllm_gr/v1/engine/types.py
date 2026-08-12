@@ -42,3 +42,7 @@ class BeamRequestStepUpdate(
     lora_request: LoRARequest | None = None
     cache_salt: str | None = None
     trace_headers: Mapping[str, str] | None = None
+    # Numeric parent beam indices for incremental decode KV reordering
+    parent_beam_indices: list[int] | None = None
+    # Maximum number of decode steps for KV pool pre-allocation
+    max_decode_steps: int = 0

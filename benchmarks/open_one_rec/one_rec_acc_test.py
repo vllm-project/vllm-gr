@@ -90,7 +90,12 @@ class MockRequestOutput:
 
 
 def run_api_inference(
-    prompts: List[str], model: str, api_url: str, api_key: str, gen_config: Dict[str, Any]
+    prompts: List[str],
+    model: str,
+    api_url: str,
+    api_key: str,
+    gen_config: Dict[str, Any],
+    max_concurrency: int | None = None,
 ) -> List[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
@@ -140,9 +145,12 @@ def run_api_inference(
             logger.error(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
 
-    # Run in parallel
+    # Run in parallel. The BeamAttentionPool is max_batch=1: only one beam
+    # session may be active at a time, so cap workers at max_concurrency
+    # (callers running beam-search accuracy tests pass --max-concurrency 1).
+    worker_limit = max_concurrency if max_concurrency is not None else 16
     logger.info(f"Sending {len(prompts)} requests to {api_url}...")
-    with ThreadPoolExecutor(max_workers=min(len(prompts), 16)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(prompts), worker_limit)) as executor:
         results = list(executor.map(_send_request, prompts))
 
     return results
@@ -273,7 +281,14 @@ def main():
     if args.endpoint:
         gen_start = time.perf_counter()
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
-        outputs = run_api_inference(prompts, args.model, api_url, args.api_key, gen_config)
+        outputs = run_api_inference(
+            prompts,
+            args.model,
+            api_url,
+            args.api_key,
+            gen_config,
+            max_concurrency=args.max_concurrency,
+        )
         gen_end = time.perf_counter()
     else:
         params = BeamSearchParams(

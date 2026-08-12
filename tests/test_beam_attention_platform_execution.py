@@ -15,7 +15,6 @@ import torch
 
 from vllm_gr.v1.attention import backends
 from vllm_gr.v1.attention.backends import beam_attn
-from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
 
 def test_facade_import_does_not_load_platform_execution_modules() -> None:
@@ -118,7 +117,7 @@ def test_forward_preserves_cache_and_attention_arguments(
     query = torch.empty(1)
     output = torch.empty(1)
     slot_mapping = torch.tensor([0])
-    metadata = SimpleNamespace(slot_mapping=slot_mapping)
+    metadata = SimpleNamespace(slot_mapping=slot_mapping, is_beam_decode=False, beam_session=None)
     k_scale = torch.tensor(1.0)
     v_scale = torch.tensor(2.0)
     layer = (
@@ -160,90 +159,53 @@ def test_forward_preserves_cache_and_attention_arguments(
     assert cascade_args["alibi_slopes"] is impl.alibi_slopes
 
 
-def test_incremental_cascade_facade_delegates_all_arguments(
+def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: dict[str, Any] = {}
+    """Test that the incremental beam decode path uses beam_pool and
+    skips reshape_and_cache for the paged KV cache."""
+    from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
 
-    def cascade_attention_incremental(**kwargs: Any) -> None:
-        calls.update(kwargs)
-
-    execution = SimpleNamespace(cascade_attention_incremental=cascade_attention_incremental)
-    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
-
-    tensors = [torch.empty(1) for _ in range(9)]
-    metadata = SimpleNamespace(is_incremental_decode=True)
-    beam_attn.BeamAttentionImpl.cascade_attention_incremental(
-        output=tensors[0],
-        query=tensors[1],
-        key_cache=tensors[2],
-        value_cache=tensors[3],
-        attn_metadata=metadata,
-        unshared_key=tensors[4],
-        unshared_value=tensors[5],
-        suffix_k_buf=tensors[6],
-        suffix_v_buf=tensors[7],
-        sliding_window_size=(-1, 0),
-        scale=0.25,
-        logits_soft_cap=3.0,
-        vllm_flash_attn_version=3,
-        s_aux=tensors[8],
-        alibi_slopes=None,
-    )
-
-    assert calls["output"] is tensors[0]
-    assert calls["query"] is tensors[1]
-    assert calls["key_cache"] is tensors[2]
-    assert calls["value_cache"] is tensors[3]
-    assert calls["attn_metadata"] is metadata
-    assert calls["unshared_key"] is tensors[4]
-    assert calls["unshared_value"] is tensors[5]
-    assert calls["suffix_k_buf"] is tensors[6]
-    assert calls["suffix_v_buf"] is tensors[7]
-    assert calls["sliding_window_size"] == (-1, 0)
-    assert calls["scale"] == 0.25
-    assert calls["logits_soft_cap"] == 3.0
-    assert calls["vllm_flash_attn_version"] == 3
-    assert calls["s_aux"] is tensors[8]
-    assert calls["alibi_slopes"] is None
-
-
-def test_forward_incremental_writes_pool_and_skips_paged_cache(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     calls: dict[str, Any] = {}
 
     def unexpected_reshape(*args: Any) -> None:
         raise AssertionError("incremental forward must not write the Paged KV Cache")
 
-    def cascade_attention_incremental(**kwargs: Any) -> None:
+    def cascade_attention(**kwargs: Any) -> None:
         calls.update(kwargs)
 
     execution = SimpleNamespace(
         reshape_and_cache=unexpected_reshape,
-        cascade_attention_incremental=cascade_attention_incremental,
+        cascade_attention=cascade_attention,
     )
     monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
     monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
 
-    session = BeamSearchSession(
-        layer_names=("layer",),
+    # Create a session using our 3-layer architecture
+    context = BeamAttentionContext(
+        max_batch=1,
         max_beams=4,
-        local_num_kv_heads=2,
+        num_kv_heads=2,
         max_decode_steps=3,
         head_dim=8,
+        num_layers=1,
         device=torch.device("cpu"),
         dtype=torch.float16,
     )
+    slot = context.registry.allocate("test", beam_width=0, prefix_len=0)
+    session = BeamSearchSession(session_id="test", slot=slot, context=context)
     session.begin_session(beam_width=2, prefix_len=5)
+
     metadata = SimpleNamespace(
-        is_incremental_decode=True,
+        is_beam_decode=True,
         beam_session=session,
+        is_incremental_decode=True,
         incremental_beam_width=2,
         incremental_suffix_kv_len=1,
         prefix_max_seq_len=5,
         suffix_total_tokens=2,
+        prefix_indices=torch.arange(2),
     )
 
     impl = object.__new__(beam_attn.BeamAttentionImpl)
@@ -263,8 +225,13 @@ def test_forward_incremental_writes_pool_and_skips_paged_cache(
     key_cache = torch.empty(1, 1, 2, 8, dtype=torch.float16)
     value_cache = torch.empty_like(key_cache)
 
+    pool = session.pools[0]
+    layer = SimpleNamespace(
+        layer_name="model.layers.0.self_attn", _k_scale=None, _v_scale=None, _beam_pool=pool
+    )
+
     returned = impl.forward(
-        layer=SimpleNamespace(layer_name="layer", _k_scale=None, _v_scale=None),
+        layer=layer,
         query=query,
         key=key,
         value=value,
@@ -273,11 +240,55 @@ def test_forward_incremental_writes_pool_and_skips_paged_cache(
         output=output,
     )
 
-    pool = session.pool_for_layer("layer")
     assert returned is output
+    # Verify that cascade_attention was called with beam_pool
+    assert "beam_pool" in calls
+    assert calls["beam_pool"] is pool
+    # Verify pool KV was written by cache_unshared_kv
     torch.testing.assert_close(pool.unshared_key[0, :2, :, 0, :], key)
     torch.testing.assert_close(pool.unshared_value[0, :2, :, 0, :], value)
-    assert calls["unshared_key"] is pool.unshared_key
-    assert calls["unshared_value"] is pool.unshared_value
-    assert calls["suffix_k_buf"] is session.suffix_k_buf
-    assert calls["suffix_v_buf"] is session.suffix_v_buf
+
+
+def test_cascade_attention_static_method_delegates_to_platform() -> None:
+    """Test that BeamAttentionImpl.cascade_attention forwards all arguments
+    to the platform execution module's cascade_attention."""
+    calls: dict[str, Any] = {}
+
+    def cascade_attention(**kwargs: Any) -> None:
+        calls.update(kwargs)
+
+    execution = SimpleNamespace(cascade_attention=cascade_attention)
+    from unittest.mock import patch
+
+    with patch.object(beam_attn, "_get_platform_execution_module", return_value=execution):
+        tensors = [torch.empty(1) for _ in range(9)]
+        metadata = SimpleNamespace(is_beam_decode=True)
+        pool = SimpleNamespace()
+
+        beam_attn.BeamAttentionImpl.cascade_attention(
+            output=tensors[0],
+            query=tensors[1],
+            key_cache=tensors[2],
+            value_cache=tensors[3],
+            attn_metadata=metadata,
+            sliding_window_size=(-1, 0),
+            scale=0.25,
+            logits_soft_cap=3.0,
+            vllm_flash_attn_version=3,
+            s_aux=tensors[8],
+            alibi_slopes=None,
+            beam_pool=pool,
+        )
+
+    assert calls["output"] is tensors[0]
+    assert calls["query"] is tensors[1]
+    assert calls["key_cache"] is tensors[2]
+    assert calls["value_cache"] is tensors[3]
+    assert calls["attn_metadata"] is metadata
+    assert calls["sliding_window_size"] == (-1, 0)
+    assert calls["scale"] == 0.25
+    assert calls["logits_soft_cap"] == 3.0
+    assert calls["vllm_flash_attn_version"] == 3
+    assert calls["s_aux"] is tensors[8]
+    assert calls["alibi_slopes"] is None
+    assert calls["beam_pool"] is pool

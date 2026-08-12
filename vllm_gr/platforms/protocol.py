@@ -63,6 +63,7 @@ class BeamAttentionExecution(Protocol):
         vllm_flash_attn_version: int,
         s_aux: Any = None,
         alibi_slopes: Any = None,
+        beam_pool: Any = None,  # Per-layer pool (GPU incremental decode only)
     ) -> None: ...
 
 

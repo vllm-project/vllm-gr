@@ -65,6 +65,7 @@ def cascade_attention(
     vllm_flash_attn_version: int,
     s_aux: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
+    beam_pool: object = None,  # Per-layer pool, passed explicitly by forward()
 ) -> None:
     if attn_metadata.std_indices is not None:
         if attn_metadata.prefix_indices is None:
@@ -113,29 +114,82 @@ def cascade_attention(
             sparse_mode=0,
         )
 
-        contig_k, contig_v = extract_suffix_kv_pytorch(
-            key_cache,
-            value_cache,
-            attn_metadata.suffix_slot_mapping_out,
-        )
+        # --- Incremental decode path: read suffix KV from pool slice ---
+        beam_session = getattr(attn_metadata, "beam_session", None)
+        is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
 
-        suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-            beam_query,
-            contig_k,
-            contig_v,
-            num_query_heads=attn_metadata.num_heads,
-            num_key_value_heads=attn_metadata.num_kv_heads,
-            actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
-            actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
-            softmax_scale=scale,
-            atten_mask=attn_metadata.npu_causal_atten_mask,
-            block_table=None,
-            block_size=0,
-            sparse_mode=3,
-            inner_precise=0,
-            input_layout="TND",
-            return_softmax_lse=True,
-        )
+        if is_beam_decode and beam_session is not None and beam_session.is_active:
+            # Incremental decode: read suffix KV from pool slice
+            # instead of extract_suffix_kv_pytorch from paged cache.
+            # Prefer the explicitly-passed beam_pool; fall back to metadata
+            # for backward compatibility with callers that still set
+            # beam_layer_idx on the metadata.
+            if beam_pool is not None:
+                pool = beam_pool
+            else:
+                layer_idx = getattr(attn_metadata, "beam_layer_idx", 0)
+                pool = beam_session.pools[layer_idx]
+            step = beam_session.decode_step  # host int, no .item()
+            slot = beam_session.slot
+            H = pool.num_kv_heads
+            D = pool.head_dim
+            W = beam_session.beam_width
+
+            # Read pool slice: [W, H, step+1, D]
+            pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
+            pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
+
+            # Copy to pre-allocated fixed buffer (avoiding new allocation)
+            # Reshape: [W, H, step+1, D] -> [W*(step+1), H, D]
+            total_kv = W * (step + 1)
+            suffix_k_buf = beam_session.suffix_k_buf
+            suffix_v_buf = beam_session.suffix_v_buf
+            suffix_k_buf[:total_kv] = pool_k.permute(0, 2, 1, 3).reshape(-1, H, D)
+            suffix_v_buf[:total_kv] = pool_v.permute(0, 2, 1, 3).reshape(-1, H, D)
+
+            suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                beam_query,
+                suffix_k_buf[:total_kv],
+                suffix_v_buf[:total_kv],
+                num_query_heads=attn_metadata.num_heads,
+                num_key_value_heads=attn_metadata.num_kv_heads,
+                actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
+                actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
+                softmax_scale=scale,
+                atten_mask=attn_metadata.npu_causal_atten_mask,
+                block_table=None,
+                block_size=0,
+                sparse_mode=3,
+                inner_precise=0,
+                input_layout="TND",
+                return_softmax_lse=True,
+            )
+        else:
+            # Standard (recompute) path: extract_suffix_kv from paged cache
+            contig_k, contig_v = extract_suffix_kv_pytorch(
+                key_cache,
+                value_cache,
+                attn_metadata.suffix_slot_mapping_out,
+            )
+
+            suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                beam_query,
+                contig_k,
+                contig_v,
+                num_query_heads=attn_metadata.num_heads,
+                num_key_value_heads=attn_metadata.num_kv_heads,
+                actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
+                actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
+                softmax_scale=scale,
+                atten_mask=attn_metadata.npu_causal_atten_mask,
+                block_table=None,
+                block_size=0,
+                sparse_mode=3,
+                inner_precise=0,
+                input_layout="TND",
+                return_softmax_lse=True,
+            )
+
         out, _ = merge_tnd_attention_outputs(
             prefix_out,
             prefix_lse,
@@ -146,10 +200,3 @@ def cascade_attention(
             output[: attn_metadata.num_prefix_indices] = out
         else:
             output[attn_metadata.prefix_indices] = out
-
-
-def cascade_attention_incremental(*args: object, **kwargs: object) -> None:
-    """Reject the CUDA-only incremental Pool path on NPU."""
-
-    del args, kwargs
-    raise NotImplementedError("Incremental Beam Attention is currently supported only on CUDA")

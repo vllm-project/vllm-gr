@@ -203,7 +203,17 @@ def make_patch_get_computed_blocks(
         if req and getattr(req, "is_beam_decode", False):
             pl = getattr(req, "prefix_len", 0)
             if tn > pl:
-                # Truncate cached computed blocks to match prefix_len
+                # In incremental decode, the FULL prefix (including the trailing
+                # partial block) is treated as computed: the paged cache holds
+                # all prefix KV written during prefill, and prefix attention
+                # reads it with seqused_k = prefix_len (exact), so FA ignores
+                # the remainder-block padding. When the remainder block was
+                # padded at prefill time (see patch_cache_blocks), the cache
+                # hit reaches the next block boundary (tn = ceil(pl/16)*16);
+                # we truncate the computed blocks to only the prefix blocks
+                # and return pl (exact) so the scheduler schedules only the
+                # new beam tokens instead of re-scheduling the trailing
+                # partial-block tokens every step.
                 num_blocks = (pl + block_size - 1) // block_size
                 sliced_blocks = tuple(group[:num_blocks] for group in bn.blocks)
                 return create_kv_cache_blocks(sliced_blocks), pl
@@ -234,13 +244,17 @@ def apply_scheduler_patch():
         )
 
         def patch_cache_blocks(request, num_computed_tokens):
+            # Extend the num_computed_tokens passed to cache_blocks to the next
+            # block boundary on the FINAL prefill chunk, so the trailing partial
+            # block (whose hash exists thanks to the padding in _cache_beam_request)
+            # is actually cached. Without this, vLLM would only cache full blocks
+            # and the beam-decode request could not prefix-cache-hit the remainder.
             if (
                 request
                 and not getattr(request, "is_beam_decode", False)
                 and hasattr(request, "block_hashes")
                 and request.block_hashes
             ):
-                # Only pad on the FINAL prefill chunk when the prompt tail is reached
                 num_prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
                 if num_computed_tokens >= num_prompt_tokens:
                     chunk_padded_target = (
@@ -269,7 +283,23 @@ def apply_scheduler_patch():
                         metadata = build_beam_request_metadata(req, num_scheduled_tokens)
                         if metadata is not None:
                             beam_data[req_id] = metadata
+
+            # Propagate the authoritative beam-session teardown signal.
+            #
+            # _handle_beam_request_step_update writes session_ids to
+            # self._beam_finished_session_ids when it receives a
+            # BeamRequestStepUpdate with beam_width=0 — the beam search
+            # loop's explicit "generation finished" message.  This is
+            # distinct from finished_req_ids, which fires on every decode
+            # step (each step's Request reaches num_computed_tokens >=
+            # num_tokens and is freed).  Using finished_req_ids would
+            # destroy and recreate the session every step, losing the
+            # incremental KV pool.
+            beam_finished_session_ids = list(getattr(self, "_beam_finished_session_ids", []))
+            self._beam_finished_session_ids = []  # consume after reading
+
             output.beam_data = beam_data
+            output.beam_finished_session_ids = beam_finished_session_ids
             return output
         finally:
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks

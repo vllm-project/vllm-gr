@@ -107,11 +107,13 @@ async def _beam_request_step(
     prefix_len: int,
     priority=0,
     data_parallel_rank: int | None = None,
+    max_decode_steps: int = 0,
 ):
     """BEAM_REQUEST path: single logical message update for all active branches."""
     parent_beam_ids = []
     child_beam_ids = []
     beam_tokens = []
+    parent_beam_indices = []
     beam_width = len(fork_info)
 
     # Map the current generation step's routing array
@@ -120,6 +122,7 @@ async def _beam_request_step(
         child_id = f"{request_id_batch}-beam-{new_idx}"
         parent_beam_ids.append(parent_id)
         child_beam_ids.append(child_id)
+        parent_beam_indices.append(parent_beam_idx)
 
         full_tokens = all_beams[new_idx].tokens
         beam_tokens.append(full_tokens[prefix_len:])
@@ -160,6 +163,8 @@ async def _beam_request_step(
             trace_headers=trace_headers,
             data_parallel_rank=data_parallel_rank,
             priority=priority,
+            parent_beam_indices=parent_beam_indices,
+            max_decode_steps=max_decode_steps,
         )
     )
 
@@ -398,6 +403,7 @@ async def beam_search(
                 prefix_len=len(initial_tokens),
                 priority=priority,
                 data_parallel_rank=rank,
+                max_decode_steps=max_tokens - pre_calc,
             )
         else:
             output, new_ids = await _add_batch_step(

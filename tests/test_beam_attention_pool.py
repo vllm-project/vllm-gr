@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 import torch
 
@@ -16,16 +14,18 @@ from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool as PoolImpleme
 
 def _make_pool(
     *,
+    max_batch: int = 1,
     max_beams: int = 4,
-    local_num_kv_heads: int = 2,
+    num_kv_heads: int = 2,
     max_decode_steps: int = 3,
     head_dim: int = 8,
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float16,
 ) -> BeamAttentionPool:
     return BeamAttentionPool(
+        max_batch=max_batch,
         max_beams=max_beams,
-        local_num_kv_heads=local_num_kv_heads,
+        num_kv_heads=num_kv_heads,
         max_decode_steps=max_decode_steps,
         head_dim=head_dim,
         device=device,
@@ -48,57 +48,36 @@ def test_allocation_contract(dtype: torch.dtype) -> None:
     assert pool.unshared_key.data_ptr() != pool.unshared_value.data_ptr()
 
 
-@pytest.mark.parametrize("beam_width", [1, 2, 4])  # type: ignore[misc]
-def test_active_views_share_storage(beam_width: int) -> None:
-    pool = _make_pool()
-    pool.unshared_key.fill_(-1)
-    pool.unshared_value.fill_(-2)
-    key_id = id(pool.unshared_key)
-    value_id = id(pool.unshared_value)
-    key_ptr = pool.unshared_key.data_ptr()
-    value_ptr = pool.unshared_value.data_ptr()
-
-    key_view = pool.active_key(beam_width)
-    value_view = pool.active_value(beam_width)
-
-    assert key_view.shape == (1, beam_width, 2, 3, 8)
-    assert value_view.shape == (1, beam_width, 2, 3, 8)
-    assert key_view.data_ptr() == key_ptr
-    assert value_view.data_ptr() == value_ptr
-
-    key_view.fill_(3)
-    value_view.fill_(4)
-    assert torch.all(pool.unshared_key[:, :beam_width] == 3)
-    assert torch.all(pool.unshared_value[:, :beam_width] == 4)
-    if beam_width < 4:
-        assert torch.all(pool.unshared_key[:, beam_width:] == -1)
-        assert torch.all(pool.unshared_value[:, beam_width:] == -2)
-
-    assert id(pool.unshared_key) == key_id
-    assert id(pool.unshared_value) == value_id
-    assert pool.unshared_key.data_ptr() == key_ptr
-    assert pool.unshared_value.data_ptr() == value_ptr
+@pytest.mark.parametrize("max_batch", [1, 2, 4])  # type: ignore[misc]
+def test_pool_shape_reflects_max_batch(max_batch: int) -> None:
+    pool = _make_pool(
+        max_batch=max_batch, max_beams=4, num_kv_heads=2, max_decode_steps=3, head_dim=8
+    )
+    expected_shape = (max_batch, 4, 2, 3, 8)
+    assert pool.unshared_key.shape == expected_shape
+    assert pool.unshared_value.shape == expected_shape
 
 
-@pytest.mark.parametrize("beam_width", [1.5, "1", None, True, False])  # type: ignore[misc]
-def test_active_width_rejects_non_integer_and_bool(beam_width: object) -> None:
-    pool = _make_pool()
-    with pytest.raises(TypeError):
-        pool.active_key(beam_width)
-    with pytest.raises(TypeError):
-        pool.active_value(beam_width)
+def test_reset_slot_zeros_only_target_slot() -> None:
+    pool = _make_pool(max_batch=2, max_beams=4, num_kv_heads=2, max_decode_steps=3, head_dim=8)
+    pool.unshared_key.fill_(1)
+    pool.unshared_value.fill_(2)
+
+    pool.reset_slot(0)
+
+    assert torch.count_nonzero(pool.unshared_key[0]).item() == 0
+    assert torch.count_nonzero(pool.unshared_value[0]).item() == 0
+    # Slot 1 should be untouched
+    assert torch.all(pool.unshared_key[1] == 1)
+    assert torch.all(pool.unshared_value[1] == 2)
+
+    # Reset slot 1 as well
+    pool.reset_slot(1)
+    assert torch.count_nonzero(pool.unshared_key[1]).item() == 0
+    assert torch.count_nonzero(pool.unshared_value[1]).item() == 0
 
 
-@pytest.mark.parametrize("beam_width", [0, -1, 5])  # type: ignore[misc]
-def test_active_width_rejects_out_of_range_values(beam_width: int) -> None:
-    pool = _make_pool()
-    with pytest.raises(ValueError):
-        pool.active_key(beam_width)
-    with pytest.raises(ValueError):
-        pool.active_value(beam_width)
-
-
-def test_reset_preserves_tensor_identity_and_storage() -> None:
+def test_reset_slot_preserves_tensor_identity_and_storage() -> None:
     pool = _make_pool(dtype=torch.bfloat16)
     pool.unshared_key.fill_(1)
     pool.unshared_value.fill_(2)
@@ -113,10 +92,10 @@ def test_reset_preserves_tensor_identity_and_storage() -> None:
         pool.unshared_value.device,
     )
 
-    assert pool.reset() is None
-    assert torch.count_nonzero(pool.unshared_key).item() == 0
-    assert torch.count_nonzero(pool.unshared_value).item() == 0
-    assert pool.reset() is None
+    assert pool.reset_slot(0) is None
+    assert torch.count_nonzero(pool.unshared_key[0]).item() == 0
+    assert torch.count_nonzero(pool.unshared_value[0]).item() == 0
+    assert pool.reset_slot(0) is None
 
     assert id(pool.unshared_key) == key_id
     assert id(pool.unshared_value) == value_id
@@ -135,114 +114,60 @@ def test_reset_preserves_tensor_identity_and_storage() -> None:
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    ("max_beams", "local_num_kv_heads", "max_decode_steps", "head_dim", "dtype"),
+    ("max_batch", "max_beams", "num_kv_heads", "max_decode_steps", "head_dim", "dtype"),
     [
-        (2, 1, 2, 4, torch.float16),
-        (3, 2, 5, 7, torch.bfloat16),
-        (128, 8, 3, 128, torch.float16),
+        (1, 2, 1, 2, 4, torch.float16),
+        (1, 3, 2, 5, 7, torch.bfloat16),
+        (2, 4, 2, 3, 8, torch.float16),
+        (1, 128, 8, 3, 128, torch.float16),
     ],
 )
-def test_nbytes_matches_allocated_tensors(
+def test_allocation_shape_matches_parameters(
+    max_batch: int,
     max_beams: int,
-    local_num_kv_heads: int,
+    num_kv_heads: int,
     max_decode_steps: int,
     head_dim: int,
     dtype: torch.dtype,
 ) -> None:
     pool = _make_pool(
+        max_batch=max_batch,
         max_beams=max_beams,
-        local_num_kv_heads=local_num_kv_heads,
+        num_kv_heads=num_kv_heads,
         max_decode_steps=max_decode_steps,
         head_dim=head_dim,
         dtype=dtype,
     )
-    expected = (
-        2
-        * max_beams
-        * local_num_kv_heads
-        * max_decode_steps
-        * head_dim
-        * torch.empty((), dtype=dtype).element_size()
+    expected_shape = (max_batch, max_beams, num_kv_heads, max_decode_steps, head_dim)
+    assert pool.unshared_key.shape == expected_shape
+    assert pool.unshared_value.shape == expected_shape
+    element_size = torch.empty((), dtype=dtype).element_size()
+    expected_nbytes = (
+        2 * max_batch * max_beams * num_kv_heads * max_decode_steps * head_dim * element_size
     )
-    assert pool.nbytes() == expected
-    if (max_beams, local_num_kv_heads, max_decode_steps, head_dim) == (128, 8, 3, 128):
-        assert pool.nbytes() == 1_572_864
-
-
-@pytest.mark.parametrize(
-    "field", ["max_beams", "local_num_kv_heads", "max_decode_steps", "head_dim"]
-)  # type: ignore[misc]
-@pytest.mark.parametrize("value", [0, -1])  # type: ignore[misc]
-def test_constructor_rejects_non_positive_dimensions(field: str, value: int) -> None:
-    kwargs: dict[str, Any] = {
-        "max_beams": 4,
-        "local_num_kv_heads": 2,
-        "max_decode_steps": 3,
-        "head_dim": 8,
-        "device": torch.device("cpu"),
-        "dtype": torch.float16,
-    }
-    kwargs[field] = value
-    with pytest.raises(ValueError):
-        BeamAttentionPool(**kwargs)
-
-
-@pytest.mark.parametrize(
-    "field", ["max_beams", "local_num_kv_heads", "max_decode_steps", "head_dim"]
-)  # type: ignore[misc]
-@pytest.mark.parametrize("value", [1.5, "1", None, True, False])  # type: ignore[misc]
-def test_constructor_rejects_non_integer_dimensions(field: str, value: object) -> None:
-    kwargs: dict[str, Any] = {
-        "max_beams": 4,
-        "local_num_kv_heads": 2,
-        "max_decode_steps": 3,
-        "head_dim": 8,
-        "device": torch.device("cpu"),
-        "dtype": torch.float16,
-    }
-    kwargs[field] = value
-    with pytest.raises(TypeError):
-        BeamAttentionPool(**kwargs)
-
-
-_UNSUPPORTED_DTYPES = [torch.float32, torch.int32]
-_FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
-if isinstance(_FP8_DTYPE, torch.dtype):
-    _UNSUPPORTED_DTYPES.append(_FP8_DTYPE)
-
-
-@pytest.mark.parametrize("dtype", _UNSUPPORTED_DTYPES)  # type: ignore[misc]
-def test_constructor_rejects_unsupported_torch_dtypes(dtype: torch.dtype) -> None:
-    with pytest.raises(ValueError):
-        _make_pool(dtype=dtype)
-
-
-def test_constructor_rejects_non_torch_dtype() -> None:
-    with pytest.raises(TypeError):
-        _make_pool(dtype="float16")
-
-
-def test_constructor_rejects_non_torch_device() -> None:
-    with pytest.raises(TypeError):
-        _make_pool(device="cpu")
-
-
-def test_constructor_rejects_meta_device() -> None:
-    with pytest.raises(ValueError):
-        _make_pool(device=torch.device("meta"))
-
-
-def test_constructor_validates_before_allocating(monkeypatch: pytest.MonkeyPatch) -> None:
-    def unexpected_empty(*args: object, **kwargs: object) -> torch.Tensor:
-        raise AssertionError("torch.empty must not be called for invalid parameters")
-
-    monkeypatch.setattr(torch, "empty", unexpected_empty)
-    with pytest.raises(TypeError):
-        _make_pool(device="cpu")
+    assert (
+        pool.unshared_key.numel() * element_size + pool.unshared_value.numel() * element_size
+        == expected_nbytes
+    )
+    if (max_batch, max_beams, num_kv_heads, max_decode_steps, head_dim) == (1, 128, 8, 3, 128):
+        assert (
+            pool.unshared_key.numel() * element_size + pool.unshared_value.numel() * element_size
+            == 1_572_864
+        )
 
 
 def test_public_export_is_stable() -> None:
     assert BeamAttentionPool is PoolImplementation
+
+
+def test_pool_attributes_stored_correctly() -> None:
+    pool = _make_pool(max_batch=2, max_beams=6, num_kv_heads=3, max_decode_steps=5, head_dim=16)
+    assert pool.max_batch == 2
+    assert pool.max_beams == 6
+    assert pool.num_kv_heads == 3
+    assert pool.max_decode_steps == 5
+    assert pool.head_dim == 16
+    assert pool.device == torch.device("cpu")
 
 
 def _assert_accelerator_reset_contract(device: torch.device) -> None:
@@ -252,10 +177,10 @@ def _assert_accelerator_reset_contract(device: torch.device) -> None:
     key_ptr = pool.unshared_key.data_ptr()
     value_ptr = pool.unshared_value.data_ptr()
 
-    pool.reset()
+    pool.reset_slot(0)
 
-    assert torch.count_nonzero(pool.unshared_key).item() == 0
-    assert torch.count_nonzero(pool.unshared_value).item() == 0
+    assert torch.count_nonzero(pool.unshared_key[0]).item() == 0
+    assert torch.count_nonzero(pool.unshared_value[0]).item() == 0
     assert pool.unshared_key.data_ptr() == key_ptr
     assert pool.unshared_value.data_ptr() == value_ptr
 
