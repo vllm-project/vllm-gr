@@ -6,7 +6,17 @@ on:
     branches: [main, decode_graph]
   issue_comment:
     types: [created]
-  workflow_dispatch: # for manual trigger
+  workflow_dispatch:
+    inputs:
+      gate_profile:
+        description: Benchmark gate profile
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - main
+          - decode_graph
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
@@ -14,6 +24,7 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   pre-commit:
@@ -33,6 +44,49 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Select benchmark gate profile
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_URL: ${{ github.event.issue.pull_request.url }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          REF_NAME: ${{ github.ref_name }}
+          MANUAL_PROFILE: ${{ inputs.gate_profile || 'auto' }}
+        run: |
+          if [[ "$MANUAL_PROFILE" != "auto" ]]; then
+            gate_profile="$MANUAL_PROFILE"
+          elif [[ "$EVENT_NAME" == "pull_request" ]]; then
+            gate_profile="$PR_BASE_REF"
+          elif [[ "$EVENT_NAME" == "issue_comment" ]]; then
+            gate_profile="$(
+              curl --fail --silent --show-error \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "$PR_URL" |
+                python -c 'import json, sys; print(json.load(sys.stdin)["base"]["ref"])'
+            )"
+          else
+            gate_profile="$REF_NAME"
+          fi
+
+          case "$gate_profile" in
+            main|decode_graph)
+              ;;
+            *)
+              echo "Unsupported benchmark gate profile: $gate_profile"
+              exit 1
+              ;;
+          esac
+
+          echo "BENCHMARK_GATE_PROFILE=$gate_profile" >> "$GITHUB_ENV"
+
+          {
+            echo "### Benchmark gate"
+            echo ""
+            echo "Profile: \`$gate_profile\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: astral-sh/setup-uv@v1
 

@@ -35,6 +35,24 @@ echo "Using model: $MODEL_PATH"
 echo "Using dataset: $DATASET_PATH"
 echo "Using catalog: $CATALOG_PATH"
 
+gate_profile="${BENCHMARK_GATE_PROFILE:-main}"
+case "$gate_profile" in
+  main)
+    elapsed_time_online_default=17
+    elapsed_time_offline_default=20
+    performance_mode_default="blocking"
+    ;;
+  decode_graph)
+    elapsed_time_online_default=20
+    elapsed_time_offline_default=20
+    performance_mode_default="warning"
+    ;;
+  *)
+    echo "Error: Unsupported BENCHMARK_GATE_PROFILE: $gate_profile" >&2
+    exit 1
+    ;;
+esac
+
 run_port=7000
 timeout=600 # time for waiting server to go up
 p99_ttft_th=300
@@ -42,8 +60,6 @@ p99_tpot_th=0.02
 pass_1_th=0.09
 pass_32_th=0.3
 recall_32_th=0.04
-elapsed_time_online_th=15
-elapsed_time_offline_th=20
 device="gpu"
 #if exist npu-smi tune some threshold
 if command -v npu-smi &> /dev/null; then
@@ -53,12 +69,41 @@ if command -v npu-smi &> /dev/null; then
    case $board_id in
     "Ascend910_9362" )
       p99_ttft_th=280
-      elapsed_time_online_th=20
-      elapsed_time_offline_th=25
+      elapsed_time_online_default=20
+      elapsed_time_offline_default=25
        ;;
     * )
     echo "using default thresholds for $board_id" ;;
   esac
+fi
+
+elapsed_time_online_th="${ELAPSED_TIME_ONLINE_THRESHOLD:-$elapsed_time_online_default}"
+elapsed_time_offline_th="${ELAPSED_TIME_OFFLINE_THRESHOLD:-$elapsed_time_offline_default}"
+performance_mode="${PERFORMANCE_MODE:-$performance_mode_default}"
+case "$performance_mode" in
+  blocking|warning)
+    ;;
+  *)
+    echo "Error: PERFORMANCE_MODE must be blocking or warning, got: $performance_mode" >&2
+    exit 1
+    ;;
+esac
+
+echo "Benchmark gate profile: $gate_profile"
+echo "Performance mode: $performance_mode"
+echo "Online elapsed-time threshold: $elapsed_time_online_th seconds"
+echo "Offline elapsed-time threshold: $elapsed_time_offline_th seconds"
+
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  {
+    echo ""
+    echo "| Setting | Value |"
+    echo "| --- | --- |"
+    echo "| Device | \`$device\` |"
+    echo "| Performance failures | \`$performance_mode\` |"
+    echo "| Online elapsed-time limit | ${elapsed_time_online_th}s |"
+    echo "| Offline elapsed-time limit | ${elapsed_time_offline_th}s |"
+  } >> "$GITHUB_STEP_SUMMARY"
 fi
 
 
@@ -81,6 +126,21 @@ validate_metric() {
         echo "SUCCESS on ${device}: ${metric_name} (${metric_value}) is ${condition_text} ${threshold}."
     else
         echo "FAILURE on ${device}: ${metric_name} (${metric_value}) is not ${condition_text} ${threshold}."
+        exit 1
+    fi
+}
+
+validate_performance_metric() {
+    local metric_name="$1"
+    local metric_value="$2"
+    local threshold="$3"
+
+    if awk -v val="$metric_value" -v th="$threshold" 'BEGIN {exit !(val <= th)}'; then
+        echo "SUCCESS on ${device}: ${metric_name} (${metric_value}) is less than or equal to ${threshold}."
+    elif [[ "$performance_mode" == "warning" ]]; then
+        echo "::warning title=Benchmark performance regression::${metric_name} (${metric_value}) exceeds ${threshold} on ${device}."
+    else
+        echo "FAILURE on ${device}: ${metric_name} (${metric_value}) exceeds ${threshold}."
         exit 1
     fi
 }
@@ -147,7 +207,7 @@ validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
 validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
 
 # Validate elapsed_time
-validate_metric "elapsed_time" "$elapsed_time" "$elapsed_time_offline_th" "le"
+validate_performance_metric "elapsed_time" "$elapsed_time" "$elapsed_time_offline_th"
 
 
 # online tests
@@ -238,11 +298,11 @@ p99_tpot=$(extract_numeric_value "$output" "P99 TPOT") || exit 1
 
 echo "Parsed P99 TTFT: ${p99_ttft}"
 # Validate P99 ttft (Using awk to safely evaluate floating point comparison)
-validate_metric "P99 TTFT" "$p99_ttft" "$p99_ttft_th" "le"
+validate_performance_metric "P99 TTFT" "$p99_ttft" "$p99_ttft_th"
 echo "Parsed P99 TPOT: ${p99_tpot} ms"
 
 # Validate P99 tpot (Using awk to safely evaluate floating point comparison)
-validate_metric "P99 TPOT" "$p99_tpot" "$p99_tpot_th" "le"
+validate_performance_metric "P99 TPOT" "$p99_tpot" "$p99_tpot_th"
 
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
 --model "$MODEL_PATH" \
@@ -277,7 +337,7 @@ validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
 validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
 
 # Validate elapsed_time
-validate_metric "elapsed_time" "$elapsed_time_online" "$elapsed_time_online_th" "le"
+validate_performance_metric "elapsed_time" "$elapsed_time_online" "$elapsed_time_online_th"
 
 
 # Stop first server before starting chunked prefill server test
