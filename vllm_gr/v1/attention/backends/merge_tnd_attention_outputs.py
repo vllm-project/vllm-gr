@@ -4,7 +4,13 @@
 import torch
 
 
-def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping_out):
+def extract_suffix_kv_pytorch(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping_out: torch.Tensor,
+    out_k: torch.Tensor | None = None,
+    out_v: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Pure PyTorch equivalent of the paged_kv_to_contig_suffix_kernel.
     Replaces indirect pointer math with vectorized advanced indexing.
@@ -13,6 +19,8 @@ def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping_out):
         k_cache: Tensor of shape [num_blocks, block_size, num_heads, head_dim]
         v_cache: Tensor of shape [num_blocks, block_size, num_heads, head_dim]
         slot_mapping_out: Indices indicating which slots to extract
+        out_k: Optional pre-allocated output key tensor
+        out_v: Optional pre-allocated output value tensor
     """
 
     # 1. Collapse paged blocks [num_blocks, block_size, heads, dim]
@@ -22,8 +30,15 @@ def extract_suffix_kv_pytorch(k_cache, v_cache, slot_mapping_out):
     v_flat = v_cache.view(-1, num_heads, head_dim)
 
     # 2. Vectorized gather: Selects all matching token rows across all heads/dimensions
-    out_k = k_flat[slot_mapping_out]
-    out_v = v_flat[slot_mapping_out]
+    if out_k is not None:
+        out_k.copy_(k_flat[slot_mapping_out])
+    else:
+        out_k = k_flat[slot_mapping_out]
+
+    if out_v is not None:
+        out_v.copy_(v_flat[slot_mapping_out])
+    else:
+        out_v = v_flat[slot_mapping_out]
 
     return out_k, out_v
 

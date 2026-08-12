@@ -84,6 +84,8 @@ def extract_suffix_kv(
     slot_mapping_out: torch.Tensor,
     out_token_num: int,
     block_size: int = 16,
+    out_k: torch.Tensor | None = None,
+    out_v: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract suffix key and value caches from the paged block KV cache.
 
@@ -98,6 +100,8 @@ def extract_suffix_kv(
             that map suffix tokens to their corresponding physical slots in the cache.
         out_token_num: Number of output/suffix tokens to extract.
         block_size: Block size of the vLLM cache page (default: 16).
+        out_k: Optional pre-allocated output key tensor of shape [out_token_num, num_heads, head_dim].
+        out_v: Optional pre-allocated output value tensor of shape [out_token_num, num_heads, head_dim].
 
     Returns:
         A tuple (out_k, out_v) of contiguous tensors, each of shape
@@ -111,10 +115,11 @@ def extract_suffix_kv(
     # Calculate next power of 2 for Triton compiler stability
     block_size_d = 1 << (head_dim - 1).bit_length()
 
-    out_kv = torch.empty(
-        (2, total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype
-    )
-    out_k, out_v = out_kv[0], out_kv[1]
+    if out_k is None or out_v is None:
+        out_kv = torch.empty(
+            (2, total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype
+        )
+        out_k, out_v = out_kv[0], out_kv[1]
 
     grid = (total_tokens, nheads)
     paged_kv_to_contig_suffix_kernel[grid](

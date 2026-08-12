@@ -3,6 +3,7 @@
 """Beam-Consecutive Suffix Gather Attention Backend."""
 
 from types import ModuleType
+from typing import Any
 
 import torch
 import vllm.envs as envs
@@ -119,6 +120,16 @@ class BeamAttentionImpl(AttentionImpl):
             )
         self.supports_quant_query_input = True
         self.use_cascade = True
+
+    @classmethod
+    def update_graph_params(cls, *args: Any, **kwargs: Any) -> None:
+        """Update ACL graph parameters for NPU graph compilation mode.
+
+        Delegates to platform execution if supported, or acts as a safe no-op.
+        """
+        platform_execution = _get_platform_execution_module()
+        if hasattr(platform_execution, "update_graph_params"):
+            platform_execution.update_graph_params(*args, **kwargs)
 
     @staticmethod
     def cascade_attention(

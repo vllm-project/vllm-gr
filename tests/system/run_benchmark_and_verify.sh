@@ -154,7 +154,17 @@ validate_metric "elapsed_time" "$elapsed_time" "$elapsed_time_offline_th" "le"
 
 
 # Ensure we clean up the background server process if the script exits early
-trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; sleep 2; pkill -P "$SERVER_PID" 2>/dev/null || true; fi' EXIT
+stop_server() {
+    if [ -n "${SERVER_PID:-}" ]; then
+        echo "Stopping server PID $SERVER_PID..."
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
+        sleep 3
+    fi
+}
+
+trap stop_server EXIT
 
 vllm-gr serve \
     --port $run_port \
@@ -270,5 +280,97 @@ validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
 validate_metric "elapsed_time" "$elapsed_time_online" "$elapsed_time_online_th" "le"
 
 
+# Stop first server before starting chunked prefill server test
+stop_server
+
+
+# Online test 2: Chunked Prefill Server (--max_num_seqs 100 --max_num_batched_tokens 100)
+echo "Starting chunked prefill server test (--max_num_seqs 100 --max_num_batched_tokens 100)..."
+
+vllm-gr serve \
+    --port $run_port \
+    --seed 123 \
+    --default-chat-template-kwargs '{"enable_thinking": false}' \
+    --max-logprobs 512 \
+    --max_num_seqs 100 \
+    --max_num_batched_tokens 100 \
+    --scheduling-policy priority \
+    --catalog-path "$CATALOG_PATH" \
+    --attention-backend CUSTOM \
+    "$MODEL_PATH" &
+
+SERVER_PID=$!
+
+echo "Waiting for chunked prefill server to be ready on port $run_port..."
+if ! timeout $timeout bash -c "
+  until curl -s http://localhost:${run_port}/v1/models > /dev/null; do
+    sleep 2
+  done
+"; then
+  echo "Chunked prefill server failed to start within the timeout limit of $timeout seconds."
+  exit 1
+fi
+echo "Chunked prefill server ready!"
+
+# Run 1: Cold KV Cache (first execution)
+echo "Running Run 1 (Cold KV Cache)..."
+output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+--model "$MODEL_PATH" \
+--dataset-path "$DATASET_PATH" \
+--dataset-name  onerec \
+--num-prompts 100 \
+--use-beam-search \
+--backend openai-chat \
+--task-type video \
+--endpoint /v1/chat/completions \
+--port $run_port \
+--n 128)
+
+echo "$output"
+pass_1_r1=$(extract_numeric_value "$output" "pass@1") || exit 1
+pass_32_r1=$(extract_numeric_value "$output" "pass@32") || exit 1
+recall_32_r1=$(extract_numeric_value "$output" "recall@32") || exit 1
+elapsed_time_r1=$(extract_numeric_value "$output" "elapsed_time") || exit 1
+
+echo "Run 1 (Cold Cache) - Parsed pass@1: $pass_1_r1"
+echo "Run 1 (Cold Cache) - Parsed pass@32: $pass_32_r1"
+echo "Run 1 (Cold Cache) - Parsed recall@32: $recall_32_r1"
+echo "Run 1 (Cold Cache) - Parsed elapsed_time: $elapsed_time_r1"
+
+validate_metric "Chunked Prefill Run 1 pass@1" "$pass_1_r1" "$pass_1_th" "ge"
+validate_metric "Chunked Prefill Run 1 pass@32" "$pass_32_r1" "$pass_32_th" "ge"
+validate_metric "Chunked Prefill Run 1 recall@32" "$recall_32_r1" "$recall_32_th" "ge"
+
+
+# Run 2: Warm KV Cache (second execution)
+echo "Running Run 2 (Warm KV Cache)..."
+output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+--model "$MODEL_PATH" \
+--dataset-path "$DATASET_PATH" \
+--dataset-name  onerec \
+--num-prompts 100 \
+--use-beam-search \
+--backend openai-chat \
+--task-type video \
+--endpoint /v1/chat/completions \
+--port $run_port \
+--n 128)
+
+echo "$output"
+pass_1_r2=$(extract_numeric_value "$output" "pass@1") || exit 1
+pass_32_r2=$(extract_numeric_value "$output" "pass@32") || exit 1
+recall_32_r2=$(extract_numeric_value "$output" "recall@32") || exit 1
+elapsed_time_r2=$(extract_numeric_value "$output" "elapsed_time") || exit 1
+
+echo "Run 2 (Warm Cache) - Parsed pass@1: $pass_1_r2"
+echo "Run 2 (Warm Cache) - Parsed pass@32: $pass_32_r2"
+echo "Run 2 (Warm Cache) - Parsed recall@32: $recall_32_r2"
+echo "Run 2 (Warm Cache) - Parsed elapsed_time: $elapsed_time_r2"
+
+validate_metric "Chunked Prefill Run 2 pass@1" "$pass_1_r2" "$pass_1_th" "ge"
+validate_metric "Chunked Prefill Run 2 pass@32" "$pass_32_r2" "$pass_32_th" "ge"
+validate_metric "Chunked Prefill Run 2 recall@32" "$recall_32_r2" "$recall_32_th" "ge"
+
+stop_server
 
 exit 0

@@ -335,7 +335,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         max_prefix_len = max(beam_prefix_lens) if beam_prefix_lens else 0
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
-        out_slot = 0
         for req_idx, prefix_len, w, steps, cache_len, q_offset in zip(
             beam_req_idxs,
             beam_prefix_lens,
@@ -365,7 +364,18 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     b, prefix_len, b_cache_len, steps, chunk_budget
                 )
 
-                full_mapping = np.arange(out_slot, out_slot + b_suffix_len, dtype=np.int32)
+                if b_past_suffix > 0:
+                    if prefix_len >= b_cache_len:
+                        b_suffix_start = b_cache_len
+                    else:
+                        b_suffix_start = prefix_len + b_physical * steps
+                    for i in range(b_past_suffix):
+                        beam_suffix_slot_mapping_out_list.append(
+                            ("past", req_idx, b_suffix_start + i)
+                        )
+
+                for i in range(b_uncached):
+                    beam_suffix_slot_mapping_out_list.append(("current", q_curr + i))
 
                 # Invariant: Merge adjacent beams that share the exact same prefix length
                 # into a single prefix group to parallelize key/value lookup during attention.
@@ -374,7 +384,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 else:
                     prefix_groups.append([q_curr, b_uncached, b_prefix_len])
 
-                beam_suffix_slot_mapping_out_list.extend(full_mapping)
                 suffix_seqlens_q_cpu.append(b_uncached)
                 suffix_seqlens_kv_cpu.append(b_suffix_len)
 
@@ -382,7 +391,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 b_cache_len += b_uncached
                 q_curr += b_uncached
                 chunk_budget -= b_uncached
-                out_slot += b_uncached
                 b_prefix_len = min(b_cache_len, prefix_len)
 
             # Loop 2: Record grouped prefix indexing lists for the attention kernel
@@ -491,17 +499,64 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
             if suffix_slot_mapping_out_list:
                 suffix_total_tokens = len(suffix_slot_mapping_out_list)
-                num_prefix = len(prefix_indices)
-                if num_prefix > 0:
-                    suffix_map_tensor = torch.tensor(
-                        suffix_slot_mapping_out_list, dtype=torch.long, device=device
-                    ).clamp_(0, num_prefix - 1)
-                    global_chunk_token_indices = prefix_indices_tensor[suffix_map_tensor]
+                has_past = any(
+                    isinstance(item, tuple) and item[0] == "past"
+                    for item in suffix_slot_mapping_out_list
+                )
+                if not has_past:
+                    q_indices = [
+                        item[1] if isinstance(item, tuple) else item
+                        for item in suffix_slot_mapping_out_list
+                    ]
+                    suffix_map_tensor = torch.tensor(q_indices, dtype=torch.long, device=device)
                     suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
-                        global_chunk_token_indices
+                        suffix_map_tensor
                     ].to(dtype=torch.int32)
                 else:
-                    suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
+                    block_table = common_attn_metadata.block_table_tensor
+                    slot_mapping = common_attn_metadata.slot_mapping
+                    block_size = self.block_size
+
+                    past_indices = []
+                    past_req_idxs = []
+                    past_b_idxs = []
+                    past_b_offs = []
+
+                    curr_indices = []
+                    curr_q_idxs = []
+
+                    for idx, item in enumerate(suffix_slot_mapping_out_list):
+                        if isinstance(item, tuple) and item[0] == "past":
+                            _, req_idx, t_past = item
+                            past_indices.append(idx)
+                            past_req_idxs.append(req_idx)
+                            past_b_idxs.append(t_past // block_size)
+                            past_b_offs.append(t_past % block_size)
+                        else:
+                            q_idx = item[1] if isinstance(item, tuple) else item
+                            curr_indices.append(idx)
+                            curr_q_idxs.append(q_idx)
+
+                    suffix_slot_mapping_out = torch.empty(
+                        suffix_total_tokens, dtype=torch.int32, device=device
+                    )
+
+                    if past_indices:
+                        p_idx_t = torch.tensor(past_indices, dtype=torch.long, device=device)
+                        p_req_t = torch.tensor(past_req_idxs, dtype=torch.long, device=device)
+                        p_bidx_t = torch.tensor(past_b_idxs, dtype=torch.long, device=device)
+                        p_boff_t = torch.tensor(past_b_offs, dtype=torch.int32, device=device)
+
+                        past_block_ids = block_table[p_req_t, p_bidx_t].to(dtype=torch.int32)
+                        past_slots = past_block_ids * block_size + p_boff_t
+                        suffix_slot_mapping_out[p_idx_t] = past_slots
+
+                    if curr_indices:
+                        c_idx_t = torch.tensor(curr_indices, dtype=torch.long, device=device)
+                        c_qidx_t = torch.tensor(curr_q_idxs, dtype=torch.long, device=device)
+
+                        curr_slots = slot_mapping[c_qidx_t].to(dtype=torch.int32)
+                        suffix_slot_mapping_out[c_idx_t] = curr_slots
             else:
                 suffix_total_tokens = 0
                 suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)

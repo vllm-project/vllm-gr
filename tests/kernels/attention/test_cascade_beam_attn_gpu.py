@@ -152,5 +152,4 @@ def test_beam_cascade(
         logits_soft_cap=inputs.soft_cap,
     )
     torch.accelerator.synchronize()
-    # Compare the results.
     torch.testing.assert_close(output, ref_output, atol=1e-3, rtol=1e-5)

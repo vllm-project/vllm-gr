@@ -220,3 +220,58 @@ def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:
     assert updated.slot_mapping is new_slots
     assert updated.std_block_table.tolist() == [[10, 11, 12]]
     assert updated.prefix_block_table.tolist() == [[7, 8]]
+
+
+def test_build_chunked_prefill_and_multistep_beam_metadata() -> None:
+    query_starts = [0, 4]
+    seq_lens = [8]
+    block_table = [[0, 1, 2, 3]]
+    req_ids = ["beam_chunked"]
+    beam_data = {
+        "beam_chunked": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "beam_width": 2,
+            "beam_decode_steps": 2,
+            "cache_len": 5,
+        }
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    metadata = _build_metadata(common, req_ids, beam_data)
+    assert metadata is not None
+    assert metadata.suffix_slot_mapping_out is not None
+    # Assert exact expected physical slot sequence:
+    # slot 4 for cached-past token at offset 4 + slots [100, 101, 102] for current query tokens
+    assert metadata.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
+
+
+def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
+    # Scenario matching the crash: Req 0 (beam decode 32 tokens), Req 1 (multistep beam decode 1 token), Req 2 (ordinary 67 tokens)
+    query_starts = [0, 32, 33, 100]
+    seq_lens = [5191, 3810, 67]
+    block_table = [[i for i in range(2500)] for _ in range(3)]
+    req_ids = ["req0", "req1", "req2"]
+    beam_data = {
+        "req0": {
+            "is_beam_decode": True,
+            "prefix_len": 5159,
+            "beam_width": 32,
+            "beam_decode_steps": 1,
+            "cache_len": 5159,
+        },
+        "req1": {
+            "is_beam_decode": True,
+            "prefix_len": 3747,
+            "beam_width": 32,
+            "beam_decode_steps": 2,
+            "cache_len": 3810,
+        },
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    metadata = _build_metadata(common, req_ids, beam_data)
+    assert metadata is not None
+    assert metadata.suffix_slot_mapping_out is not None
+    # Assert exact expected physical slot sequence for multi-req chunked prefill:
+    # slots 100..131 for req0 (32 query tokens) + slot 3809 for req1 cached-past token + slot 132 for req1 query token
+    expected_slots = list(range(100, 132)) + [3809, 132]
+    assert metadata.suffix_slot_mapping_out.tolist() == expected_slots

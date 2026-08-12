@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +15,7 @@ from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 logger = init_logger(__name__)
+
 
 _WORKER_EXECUTE_PATCH_MARKER = "_vllm_gr_beam_execute_patch"
 _WORKER_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_patch"
@@ -270,6 +272,32 @@ class Mock2DArray:
             raise e
 
 
+def _remap_object_request_fields(target_obj: Any, orig_req_len: int, logits_map: List[int]) -> None:
+    """Remap PyTorch tensors, dicts, and lists on target_obj from original batch layout to logits_map."""
+    attrs = getattr(target_obj, "__dict__", {})
+    for attr_name, val in list(attrs.items()):
+        if attr_name.startswith("_"):
+            continue
+
+        if isinstance(val, torch.Tensor) and val.ndim > 0 and val.numel() > 0:
+            if val.shape[0] == orig_req_len:
+                setattr(target_obj, attr_name, val[logits_map])
+        elif isinstance(val, dict) and val:
+            has_int_req_keys = any(isinstance(k, int) and 0 <= k < orig_req_len for k in val.keys())
+            if has_int_req_keys:
+                new_dict = {
+                    new_idx: val[old_idx]
+                    for new_idx, old_idx in enumerate(logits_map)
+                    if old_idx in val
+                }
+                setattr(target_obj, attr_name, new_dict)
+        elif isinstance(val, (list, tuple)) and len(val) == orig_req_len:
+            new_seq = [val[old_idx] for old_idx in logits_map]
+            if isinstance(val, tuple):
+                new_seq = tuple(new_seq)
+            setattr(target_obj, attr_name, new_seq)
+
+
 class InputBatchProxy:
     def __init__(self, obj, req_map, idx_map, logits_map):
         object.__setattr__(self, "_obj", obj)
@@ -288,20 +316,29 @@ class InputBatchProxy:
             if s_meta is None or logits_map is None:
                 return s_meta
 
+            s_meta = copy.copy(s_meta)
             orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
-            for attr in [
-                "temperature",
-                "top_p",
-                "top_k",
-                "min_p",
-                "frequency_penalties",
-                "presence_penalties",
-                "repetition_penalties",
-            ]:
-                val = getattr(s_meta, attr, None)
-                if isinstance(val, torch.Tensor) and val.numel() > 0:
-                    if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
-                        object.__setattr__(s_meta, attr, val[logits_map])
+            is_identity = len(logits_map) == orig_req_len and all(
+                i == idx for i, idx in enumerate(logits_map)
+            )
+
+            if not is_identity:
+                # 1. Remap all direct sampling_metadata attributes
+                _remap_object_request_fields(s_meta, orig_req_len, logits_map)
+
+                # 2. Remap inner LogitsProcessors (if present)
+                if hasattr(s_meta, "logitsprocs") and s_meta.logitsprocs is not None:
+                    s_meta.logitsprocs = copy.copy(s_meta.logitsprocs)
+                    for lp_list_name in ["argmax_invariant", "non_argmax_invariant"]:
+                        lp_list = getattr(s_meta.logitsprocs, lp_list_name, None)
+                        if isinstance(lp_list, list):
+                            new_lps = []
+                            for lp in lp_list:
+                                lp_copy = copy.copy(lp)
+                                _remap_object_request_fields(lp_copy, orig_req_len, logits_map)
+                                new_lps.append(lp_copy)
+                            setattr(s_meta.logitsprocs, lp_list_name, new_lps)
+
             return s_meta
 
         elif name == "req_ids":
