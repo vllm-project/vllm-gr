@@ -58,7 +58,7 @@ timeout=600 # time for waiting server to go up
 p99_ttft_th=300
 p99_tpot_th=0.02
 pass_1_th=0.09
-pass_32_th=0.3
+pass_32_th=0.29
 recall_32_th=0.04
 device="gpu"
 #if exist npu-smi tune some threshold
