@@ -2,6 +2,12 @@ name: Pre-commit and Benchmark
 on:
   pull_request:
     branches: [main, decode_graph]
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - converted_to_draft
   push:
     branches: [main, decode_graph]
   issue_comment:
@@ -9,8 +15,13 @@ on:
   workflow_dispatch: # for manual trigger
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'issue_comment' }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event.pull_request.number ||
+      github.event.issue.number ||
+      github.ref
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -18,8 +29,13 @@ permissions:
 jobs:
   pre-commit:
     if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request && contains(github.event.comment.body, '/retest'))
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '/retest'))
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
