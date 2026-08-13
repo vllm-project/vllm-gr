@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - decode_graph
+      - develop
+      - 'develop/**'
     paths-ignore:
       - 'docs/**'
       - 'examples/**'
@@ -19,6 +21,14 @@ on:
     branches:
       - main
       - decode_graph
+      - develop
+      - 'develop/**'
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - converted_to_draft
     paths-ignore:
       - 'docs/**'
       - 'examples/**'
@@ -31,8 +41,18 @@ on:
       - 'LICENSE'
   workflow_dispatch:
 
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event.pull_request.number || github.ref
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     strategy:
       matrix:

@@ -1,92 +1,162 @@
 name: Pre-commit and Benchmark
+
+# Keep this metadata protocol in sync with retest-router.yml. Including the
+# run ID avoids accidental collisions with titles from legacy workflow runs.
+run-name: >-
+  ${{ github.event_name == 'pull_request' &&
+      format('ci-meta:v1;run={0};pr={1};base={2};base_sha={3};merge_sha={4}',
+             github.run_id,
+             github.event.pull_request.number,
+             github.event.pull_request.base.ref,
+             github.event.pull_request.base.sha,
+             github.sha) ||
+      format('{0}:{1}@{2}', github.event_name, github.ref_name, github.sha) }}
+
 on:
   pull_request:
-    branches: [main, decode_graph]
+    branches:
+      - main
+      - decode_graph
+      - develop
+      - 'develop/**'
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - converted_to_draft
   push:
-    branches: [main, decode_graph]
-  issue_comment:
-    types: [created]
+    branches:
+      - main
+      - decode_graph
+      - develop
+      - 'develop/**'
   workflow_dispatch:
-    inputs:
-      gate_profile:
-        description: Benchmark gate profile
-        required: true
-        default: auto
-        type: choice
-        options:
-          - auto
-          - main
-          - decode_graph
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'issue_comment' }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event.pull_request.number || github.ref
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   pre-commit:
     if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request && contains(github.event.comment.body, '/retest'))
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name != 'issue_comment'
-
-      - uses: actions/checkout@v4
-        if: github.event_name == 'issue_comment'
-        with:
-          ref: refs/pull/${{ github.event.issue.number }}/merge
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Select benchmark gate profile
+      - name: Fetch target branch benchmark policy
+        id: benchmark-policy
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_URL: ${{ github.event.issue.pull_request.url }}
-          PR_BASE_REF: ${{ github.base_ref }}
-          REF_NAME: ${{ github.ref_name }}
-          MANUAL_PROFILE: ${{ inputs.gate_profile || 'auto' }}
-        run: |
-          if [[ "$MANUAL_PROFILE" != "auto" ]]; then
-            gate_profile="$MANUAL_PROFILE"
-          elif [[ "$EVENT_NAME" == "pull_request" ]]; then
-            gate_profile="$PR_BASE_REF"
-          elif [[ "$EVENT_NAME" == "issue_comment" ]]; then
-            gate_profile="$(
-              curl --fail --silent --show-error \
-                --header "Authorization: Bearer $GH_TOKEN" \
-                --header "Accept: application/vnd.github+json" \
-                --header "X-GitHub-Api-Version: 2022-11-28" \
-                "$PR_URL" |
-                python -c 'import json, sys; print(json.load(sys.stdin)["base"]["ref"])'
-            )"
-          else
-            gate_profile="$REF_NAME"
-          fi
+          POLICY_REF: >-
+            ${{ github.event.pull_request.base.sha || github.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const ref = process.env.POLICY_REF;
+            const policyRepoPath = '.github/benchmark-gate.yaml';
+            const resolverRepoPath =
+              'tools/ci/resolve_benchmark_policy.py';
+            const outputPath = path.join(
+              process.env.RUNNER_TEMP,
+              'benchmark-gate.yaml',
+            );
+            const resolverOutputPath = path.join(
+              process.env.RUNNER_TEMP,
+              'resolve-benchmark-policy.py',
+            );
 
-          case "$gate_profile" in
-            main|decode_graph)
-              ;;
-            *)
-              echo "Unsupported benchmark gate profile: $gate_profile"
-              exit 1
-              ;;
-          esac
+            const fetchFile = async (repoPath, fileRef = ref) => {
+              try {
+                const response = await github.rest.repos.getContent({
+                  owner,
+                  repo,
+                  path: repoPath,
+                  ref: fileRef,
+                });
+                if (Array.isArray(response.data) ||
+                    response.data.type !== 'file' ||
+                    !response.data.content) {
+                  throw new Error(
+                    `${repoPath}@${fileRef} is not a readable file`,
+                  );
+                }
+                return Buffer.from(
+                  response.data.content,
+                  response.data.encoding,
+                ).toString('utf8');
+              } catch (error) {
+                if (error.status === 404) {
+                  return null;
+                }
+                throw error;
+              }
+            };
 
-          echo "BENCHMARK_GATE_PROFILE=$gate_profile" >> "$GITHUB_ENV"
+            const policy = await fetchFile(policyRepoPath);
+            let resolver = await fetchFile(resolverRepoPath);
+            let resolverRef = ref;
+            if (resolver === null && policy !== null) {
+              const defaultBranch =
+                context.payload.repository.default_branch;
+              const {data: defaultBranchData} =
+                await github.rest.repos.getBranch({
+                  owner,
+                  repo,
+                  branch: defaultBranch,
+                });
+              resolverRef = defaultBranchData.commit.sha;
+              resolver = await fetchFile(resolverRepoPath, resolverRef);
+            }
+            let bootstrap = false;
+            if (policy === null) {
+              if (context.eventName === 'pull_request' &&
+                  resolver === null) {
+                bootstrap = true;
+              } else {
+                throw new Error(
+                  `Required benchmark policy ${policyRepoPath} is missing ` +
+                  `from ${ref}`,
+                );
+              }
+            } else {
+              fs.writeFileSync(outputPath, policy, {encoding: 'utf8'});
+            }
+            if (resolver !== null) {
+              fs.writeFileSync(
+                resolverOutputPath,
+                resolver,
+                {encoding: 'utf8'},
+              );
+            }
 
-          {
-            echo "### Benchmark gate"
-            echo ""
-            echo "Profile: \`$gate_profile\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+            core.setOutput('bootstrap', String(bootstrap));
+            core.setOutput('path', outputPath);
+            core.setOutput('ref', ref);
+            core.setOutput(
+              'resolver-path',
+              resolver === null ? resolverRepoPath : resolverOutputPath,
+            );
+            core.setOutput('resolver-ref', resolverRef);
+            core.setOutput(
+              'migration-resolver',
+              String(resolver === null),
+            );
 
       - uses: astral-sh/setup-uv@v1
 
@@ -134,6 +204,45 @@ jobs:
         run: |
           python -c 'import importlib.metadata as m; version = m.version("vllm").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM 0.22.1, found {version}"'
           python -c 'import importlib.metadata as m; version = m.version("vllm-gr").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM-GR 0.22.1, found {version}"'
+
+      - name: Resolve benchmark gate policy
+        env:
+          BOOTSTRAP_POLICY: ${{ steps.benchmark-policy.outputs.bootstrap }}
+          POLICY_FILE: ${{ steps.benchmark-policy.outputs.path }}
+          POLICY_REF: ${{ steps.benchmark-policy.outputs.ref }}
+          POLICY_RESOLVER: ${{ steps.benchmark-policy.outputs.resolver-path }}
+          POLICY_RESOLVER_REF: ${{ steps.benchmark-policy.outputs.resolver-ref }}
+          MIGRATION_RESOLVER: ${{ steps.benchmark-policy.outputs.migration-resolver }}
+        run: |
+          device="gpu"
+          board_id="unknown"
+          if command -v npu-smi > /dev/null 2>&1; then
+            device="npu"
+            board_id="$(
+              python -c 'import acl; print(acl.get_soc_name())' \
+                2>/dev/null || echo unknown
+            )"
+          fi
+
+          args=(
+            --device "$device"
+            --board-id "$board_id"
+            --source-ref "$POLICY_REF"
+            --github-env "$GITHUB_ENV"
+            --github-step-summary "$GITHUB_STEP_SUMMARY"
+          )
+          if [[ "$BOOTSTRAP_POLICY" == "true" ]]; then
+            args+=(--bootstrap-strict)
+          else
+            args+=(--policy-file "$POLICY_FILE")
+          fi
+
+          if [[ "$MIGRATION_RESOLVER" == "true" ]]; then
+            echo "Using the checked-out resolver for one-time policy migration."
+          else
+            echo "Using benchmark policy resolver from $POLICY_RESOLVER_REF."
+          fi
+          python "$POLICY_RESOLVER" "${args[@]}"
 
       - name: Kill Process on device
         run: |

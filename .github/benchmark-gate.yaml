@@ -1,0 +1,29 @@
+version: 1
+name: stable
+
+thresholds:
+  accuracy:
+    pass_at_1_min: 0.09
+    pass_at_32_min: 0.29
+    recall_at_32_min: 0.04
+
+  performance:
+    online_elapsed_seconds_max: 17
+    offline_elapsed_seconds_max: 20
+    p99_ttft_max: 300
+    p99_tpot_max: 0.02
+
+failure_modes:
+  accuracy: blocking
+  performance: blocking
+  online_non_accuracy: blocking
+
+device_overrides:
+  npu:
+    boards:
+      Ascend910_9362:
+        thresholds:
+          performance:
+            p99_ttft_max: 280
+            online_elapsed_seconds_max: 20
+            offline_elapsed_seconds_max: 25

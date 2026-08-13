@@ -1,0 +1,282 @@
+name: Retest Router
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  rerun:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/retest'
+    concurrency:
+      group: retest-router-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rerun original pull request workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = context.issue.number;
+            const commenter = context.payload.comment.user.login;
+            if (context.payload.comment.body !== '/retest') {
+              core.notice('Ignoring non-exact /retest command');
+              return;
+            }
+            const activeStatuses = new Set([
+              'queued',
+              'in_progress',
+              'waiting',
+              'pending',
+              'requested',
+            ]);
+            const sleep = (milliseconds) =>
+              new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+            const {data: access} =
+              await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username: commenter,
+              });
+
+            if (!['write', 'maintain', 'admin'].includes(access.permission)) {
+              throw new Error(
+                `@${commenter} does not have permission to rerun CI`,
+              );
+            }
+
+            const getCurrentPull = async () => {
+              let currentPull;
+              for (let attempt = 0; attempt < 4; attempt += 1) {
+                const response = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: pullNumber,
+                });
+                currentPull = response.data;
+
+                if (currentPull.state !== 'open' || currentPull.merged ||
+                    currentPull.mergeable !== null || attempt === 3) {
+                  return currentPull;
+                }
+                await sleep(1000);
+              }
+            };
+            const assertPullIsEligible = (currentPull) => {
+              if (currentPull.state !== 'open' || currentPull.merged) {
+                throw new Error(
+                  `Only open, unmerged pull requests can rerun CI; ` +
+                  `PR #${pullNumber} is ${currentPull.state}`,
+                );
+              }
+
+              if (currentPull.draft) {
+                throw new Error(
+                  `Draft pull requests cannot rerun CI; mark PR ` +
+                  `#${pullNumber} ready first`,
+                );
+              }
+
+              if (!currentPull.head.repo) {
+                throw new Error(
+                  `The head repository for PR #${pullNumber} is unavailable`,
+                );
+              }
+
+              if (currentPull.mergeable !== true ||
+                  !currentPull.merge_commit_sha) {
+                throw new Error(
+                  `PR #${pullNumber} has no current merge snapshot; resolve ` +
+                  `merge conflicts or wait for GitHub to finish computing it`,
+                );
+              }
+            };
+            const assertBaseIsCurrent = async (currentPull) => {
+              const {data: baseBranch} = await github.rest.repos.getBranch({
+                owner,
+                repo,
+                branch: currentPull.base.ref,
+              });
+              if (baseBranch.commit.sha !== currentPull.base.sha) {
+                throw new Error(
+                  `The base branch advanced for PR #${pullNumber}; update ` +
+                  `the branch and wait for a new pull_request gate`,
+                );
+              }
+            };
+
+            const pull = await getCurrentPull();
+            assertPullIsEligible(pull);
+            await assertBaseIsCurrent(pull);
+
+            const headSha = pull.head.sha;
+            const baseSha = pull.base.sha;
+            const mergeSha = pull.merge_commit_sha;
+
+            const {data: mergeCommit} = await github.rest.repos.getCommit({
+              owner,
+              repo,
+              ref: mergeSha,
+            });
+            const mergeParents = new Set(
+              mergeCommit.parents.map((parent) => parent.sha),
+            );
+            if (!mergeParents.has(baseSha) || !mergeParents.has(headSha)) {
+              throw new Error(
+                `GitHub returned a stale merge snapshot for PR ` +
+                `#${pullNumber}; update the branch and push a new commit`,
+              );
+            }
+
+            const workflowRuns = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner,
+                repo,
+                workflow_id: 'pre-commit.yml',
+                event: 'pull_request',
+                head_sha: headSha,
+                per_page: 100,
+              },
+              (response) => response.data.workflow_runs,
+            );
+
+            const metadataPrefix = (runId) =>
+              `ci-meta:v1;run=${runId};pr=${pullNumber};`;
+            const expectedRunName = (runId) =>
+              `${metadataPrefix(runId)}base=${pull.base.ref};` +
+              `base_sha=${baseSha};merge_sha=${mergeSha}`;
+            const matchesInitialSnapshot = (currentPull) =>
+              currentPull.head.repo.id === pull.head.repo.id &&
+              currentPull.head.ref === pull.head.ref &&
+              currentPull.head.sha === headSha &&
+              currentPull.base.ref === pull.base.ref &&
+              currentPull.base.sha === baseSha &&
+              currentPull.merge_commit_sha === mergeSha;
+
+            const identifiableRuns = workflowRuns
+              .filter((run) =>
+                run.head_sha === headSha &&
+                run.head_branch === pull.head.ref &&
+                run.head_repository?.id === pull.head.repo.id &&
+                run.event === 'pull_request' &&
+                run.display_title?.startsWith(metadataPrefix(run.id)),
+              );
+            const snapshotRuns = identifiableRuns
+              .filter((run) =>
+                run.display_title === expectedRunName(run.id),
+              );
+            const matchingRuns = snapshotRuns
+              .filter((run) => run.conclusion !== 'skipped')
+              .sort((left, right) =>
+                Date.parse(right.created_at) - Date.parse(left.created_at) ||
+                right.id - left.id,
+              );
+            const run = matchingRuns[0];
+
+            if (!run) {
+              if (snapshotRuns.length > 0) {
+                throw new Error(
+                  `Only skipped pre-commit runs exist for the current ` +
+                  `snapshot of PR #${pullNumber}; wait for its Ready gate`,
+                );
+              }
+
+              if (identifiableRuns.length > 0) {
+                throw new Error(
+                  `The base or merge snapshot changed for PR ` +
+                  `#${pullNumber}; update the branch and push a new commit ` +
+                  `before using /retest`,
+                );
+              }
+
+              throw new Error(
+                `No safely identifiable pull_request pre-commit run exists ` +
+                `for PR #${pullNumber} at ${headSha}; the target branch ` +
+                `workflow must emit ci-meta:v1 metadata before /retest can ` +
+                `be used`,
+              );
+            }
+
+            if (activeStatuses.has(run.status)) {
+              core.notice(
+                `Run ${run.id} is already active with status ${run.status}`,
+              );
+              return;
+            }
+
+            if (run.status !== 'completed') {
+              throw new Error(
+                `Run ${run.id} cannot be rerun from status ${run.status}`,
+              );
+            }
+
+            const latestPull = await getCurrentPull();
+            assertPullIsEligible(latestPull);
+            if (!matchesInitialSnapshot(latestPull)) {
+              throw new Error(
+                `PR #${pullNumber} changed while routing /retest; retry only ` +
+                `after its new pull_request gate has started`,
+              );
+            }
+            await assertBaseIsCurrent(latestPull);
+
+            const getRun = async () => {
+              const response = await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: run.id,
+              });
+              return response.data;
+            };
+            const rerunStarted = (candidate) =>
+              activeStatuses.has(candidate.status) ||
+              candidate.run_attempt > run.run_attempt;
+
+            try {
+              await github.rest.actions.reRunWorkflow({
+                owner,
+                repo,
+                run_id: run.id,
+              });
+            } catch (error) {
+              if (error.status !== 409) {
+                throw error;
+              }
+
+              const currentRun = await getRun();
+              if (!rerunStarted(currentRun)) {
+                throw error;
+              }
+              core.notice(
+                `Run ${run.id} was already rerun by another request`,
+              );
+              return;
+            }
+
+            for (let attempt = 0; attempt < 15; attempt += 1) {
+              await sleep(1000);
+              const currentRun = await getRun();
+              if (rerunStarted(currentRun)) {
+                core.notice(
+                  `Rerunning pull_request run ${run.id} for PR ` +
+                  `#${pullNumber} at ${headSha} against ` +
+                  `${pull.base.ref}@${baseSha}`,
+                );
+                return;
+              }
+            }
+
+            core.warning(
+              `GitHub accepted rerun ${run.id}, but its status has not ` +
+              `updated yet`,
+            );
