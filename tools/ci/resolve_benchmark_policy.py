@@ -14,7 +14,7 @@ from typing import Any, TextIO, cast
 
 import yaml
 
-SCHEMA_VERSION = 1
+SUPPORTED_SCHEMA_VERSIONS = {1, 2}
 FAILURE_MODES = {"blocking", "warning"}
 ACCURACY_KEYS = (
     "pass_at_1_min",
@@ -27,14 +27,23 @@ PERFORMANCE_KEYS = (
     "p99_ttft_max",
     "p99_tpot_max",
 )
-FAILURE_MODE_KEYS = (
-    "accuracy",
-    "performance",
-    "online_non_accuracy",
+PERFORMANCE_MODE_KEYS = (
+    "p99_ttft",
+    "p99_tpot",
+    "online_elapsed_seconds",
+    "offline_elapsed_seconds",
+)
+PANGU_THRESHOLD_KEYS = (
+    "offline_accuracy_min",
+    "online_accuracy_min",
+)
+PANGU_FAILURE_MODE_KEYS = (
+    "offline_accuracy",
+    "online_accuracy",
 )
 
 STRICT_BOOTSTRAP_POLICY: dict[str, Any] = {
-    "version": SCHEMA_VERSION,
+    "version": 2,
     "name": "stable-bootstrap",
     "thresholds": {
         "accuracy": {
@@ -51,8 +60,31 @@ STRICT_BOOTSTRAP_POLICY: dict[str, Any] = {
     },
     "failure_modes": {
         "accuracy": "blocking",
-        "performance": "blocking",
+        "performance": {
+            "p99_ttft": "blocking",
+            "p99_tpot": "blocking",
+            "online_elapsed_seconds": "blocking",
+            "offline_elapsed_seconds": "blocking",
+        },
         "online_non_accuracy": "blocking",
+    },
+    "pangu1b": {
+        "thresholds": {
+            "offline_accuracy_min": 1.0,
+            "online_accuracy_min": 1.0,
+        },
+        "failure_modes": {
+            "offline_accuracy": "blocking",
+            "online_accuracy": "blocking",
+        },
+        "device_overrides": {
+            "npu": {
+                "thresholds": {
+                    "offline_accuracy_min": 0.875,
+                    "online_accuracy_min": 0.875,
+                }
+            }
+        },
     },
     "device_overrides": {
         "npu": {
@@ -102,6 +134,14 @@ def _number(value: object, path: str) -> float | int:
     return value
 
 
+def _failure_mode(value: object, path: str, *, blocking_only: bool = False) -> str:
+    if value not in FAILURE_MODES:
+        raise PolicyError(f"{path} must be blocking or warning, got {value!r}")
+    if blocking_only and value != "blocking":
+        raise PolicyError(f"{path} must be blocking because execution failures cannot be advisory")
+    return cast(str, value)
+
+
 def _validate_threshold_group(
     value: object,
     keys: tuple[str, ...],
@@ -147,27 +187,112 @@ def _validate_thresholds(value: object, path: str, *, partial: bool = False) -> 
     return validated
 
 
+def _validate_failure_modes(value: object, version: int) -> dict[str, Any]:
+    modes = _mapping(value, "policy.failure_modes")
+    _require_exact_keys(
+        modes,
+        {"accuracy", "performance", "online_non_accuracy"},
+        "policy.failure_modes",
+    )
+    accuracy = _failure_mode(modes["accuracy"], "policy.failure_modes.accuracy")
+    online_non_accuracy = _failure_mode(
+        modes["online_non_accuracy"],
+        "policy.failure_modes.online_non_accuracy",
+        blocking_only=version == 2,
+    )
+    if version == 1:
+        performance: str | dict[str, str] = _failure_mode(
+            modes["performance"], "policy.failure_modes.performance"
+        )
+    else:
+        raw_performance = _mapping(modes["performance"], "policy.failure_modes.performance")
+        _require_exact_keys(
+            raw_performance,
+            set(PERFORMANCE_MODE_KEYS),
+            "policy.failure_modes.performance",
+        )
+        performance = {
+            key: _failure_mode(raw_performance[key], f"policy.failure_modes.performance.{key}")
+            for key in PERFORMANCE_MODE_KEYS
+        }
+    return {
+        "accuracy": accuracy,
+        "performance": performance,
+        "online_non_accuracy": online_non_accuracy,
+    }
+
+
+def _validate_pangu(value: object) -> dict[str, Any]:
+    pangu = _mapping(value, "policy.pangu1b")
+    required = {"thresholds", "failure_modes"}
+    allowed = required | {"device_overrides"}
+    missing = sorted(required - set(pangu))
+    extra = sorted(set(pangu) - allowed)
+    if missing:
+        raise PolicyError("policy.pangu1b is missing required keys: " + ", ".join(missing))
+    if extra:
+        raise PolicyError("policy.pangu1b has unsupported keys: " + ", ".join(extra))
+    thresholds = _validate_threshold_group(
+        pangu["thresholds"], PANGU_THRESHOLD_KEYS, "policy.pangu1b.thresholds"
+    )
+    modes = _mapping(pangu["failure_modes"], "policy.pangu1b.failure_modes")
+    _require_exact_keys(modes, set(PANGU_FAILURE_MODE_KEYS), "policy.pangu1b.failure_modes")
+    device_overrides = _mapping(
+        pangu.get("device_overrides", {}), "policy.pangu1b.device_overrides"
+    )
+    extra_devices = sorted(set(device_overrides) - {"gpu", "npu"})
+    if extra_devices:
+        raise PolicyError(
+            "policy.pangu1b.device_overrides has unsupported devices: " + ", ".join(extra_devices)
+        )
+    validated_overrides: dict[str, Any] = {}
+    for device, raw_override in device_overrides.items():
+        override = _mapping(raw_override, f"policy.pangu1b.device_overrides.{device}")
+        _require_exact_keys(
+            override,
+            {"thresholds"},
+            f"policy.pangu1b.device_overrides.{device}",
+        )
+        validated_overrides[device] = {
+            "thresholds": _validate_threshold_group(
+                override["thresholds"],
+                PANGU_THRESHOLD_KEYS,
+                f"policy.pangu1b.device_overrides.{device}.thresholds",
+                partial=True,
+            )
+        }
+
+    return {
+        "thresholds": thresholds,
+        "failure_modes": {
+            key: _failure_mode(modes[key], f"policy.pangu1b.failure_modes.{key}")
+            for key in PANGU_FAILURE_MODE_KEYS
+        },
+        "device_overrides": validated_overrides,
+    }
+
+
 def _validate_policy(raw_policy: object) -> dict[str, Any]:
     policy = _mapping(raw_policy, "policy")
-    _require_exact_keys(
-        policy,
-        {"version", "name", "thresholds", "failure_modes", "device_overrides"},
-        "policy",
-    )
+    version = policy.get("version")
+    if isinstance(version, bool) or version not in SUPPORTED_SCHEMA_VERSIONS:
+        supported = ", ".join(str(item) for item in sorted(SUPPORTED_SCHEMA_VERSIONS))
+        raise PolicyError(f"policy.version must be one of {supported}, got {version!r}")
+    version = cast(int, version)
 
-    if isinstance(policy["version"], bool) or policy["version"] != SCHEMA_VERSION:
-        raise PolicyError(f"policy.version must be {SCHEMA_VERSION}, got {policy['version']!r}")
+    required = {"version", "name", "thresholds", "failure_modes", "device_overrides"}
+    allowed = required | ({"pangu1b"} if version == 2 else set())
+    missing = sorted(required - set(policy))
+    extra = sorted(set(policy) - allowed)
+    if missing:
+        raise PolicyError(f"policy is missing required keys: {', '.join(missing)}")
+    if extra:
+        raise PolicyError(f"policy has unsupported keys: {', '.join(extra)}")
     if not isinstance(policy["name"], str) or not policy["name"].strip():
         raise PolicyError("policy.name must be a non-empty string")
 
     thresholds = _validate_thresholds(policy["thresholds"], "policy.thresholds")
-    failure_modes = _mapping(policy["failure_modes"], "policy.failure_modes")
-    _require_exact_keys(failure_modes, set(FAILURE_MODE_KEYS), "policy.failure_modes")
-    for key, mode in failure_modes.items():
-        if mode not in FAILURE_MODES:
-            raise PolicyError(
-                f"policy.failure_modes.{key} must be blocking or warning, got {mode!r}"
-            )
+    failure_modes = _validate_failure_modes(policy["failure_modes"], version)
 
     overrides = _mapping(policy["device_overrides"], "policy.device_overrides")
     extra_devices = sorted(set(overrides) - {"gpu", "npu"})
@@ -204,13 +329,16 @@ def _validate_policy(raw_policy: object) -> dict[str, Any]:
             }
         validated_overrides[device] = {"boards": validated_boards}
 
-    return {
-        "version": SCHEMA_VERSION,
+    validated_policy = {
+        "version": version,
         "name": policy["name"].strip(),
         "thresholds": thresholds,
-        "failure_modes": dict(failure_modes),
+        "failure_modes": failure_modes,
         "device_overrides": validated_overrides,
     }
+    if "pangu1b" in policy:
+        validated_policy["pangu1b"] = _validate_pangu(policy["pangu1b"])
+    return validated_policy
 
 
 def load_policy(path: Path) -> dict[str, Any]:
@@ -232,19 +360,28 @@ def resolve_policy(policy: dict[str, Any], device: str, board_id: str) -> dict[s
     thresholds = deepcopy(validated["thresholds"])
     board_override = validated["device_overrides"].get(device, {}).get("boards", {}).get(board_id)
     if board_override:
-        for group, values in board_override["thresholds"].items():
-            thresholds[group].update(values)
+        for group, override_values in board_override["thresholds"].items():
+            thresholds[group].update(override_values)
 
     accuracy = thresholds["accuracy"]
     performance = thresholds["performance"]
     failure_modes = validated["failure_modes"]
-    return {
+    if validated["version"] == 1:
+        performance_modes = dict.fromkeys(PERFORMANCE_MODE_KEYS, failure_modes["performance"])
+    else:
+        performance_modes = failure_modes["performance"]
+
+    values: dict[str, str] = {
         "BENCHMARK_POLICY_NAME": validated["name"],
         "BENCHMARK_DEVICE": device,
         "BENCHMARK_BOARD_ID": board_id,
         "ACCURACY_FAILURE_MODE": failure_modes["accuracy"],
-        "PERFORMANCE_FAILURE_MODE": failure_modes["performance"],
-        "ONLINE_NON_ACCURACY_FAILURE_MODE": failure_modes["online_non_accuracy"],
+        # Kept for old benchmark scripts and old base resolvers.
+        "ONLINE_NON_ACCURACY_FAILURE_MODE": "blocking",
+        "P99_TTFT_FAILURE_MODE": performance_modes["p99_ttft"],
+        "P99_TPOT_FAILURE_MODE": performance_modes["p99_tpot"],
+        "ONLINE_ELAPSED_FAILURE_MODE": performance_modes["online_elapsed_seconds"],
+        "OFFLINE_ELAPSED_FAILURE_MODE": performance_modes["offline_elapsed_seconds"],
         "PASS_AT_1_THRESHOLD": str(accuracy["pass_at_1_min"]),
         "PASS_AT_32_THRESHOLD": str(accuracy["pass_at_32_min"]),
         "RECALL_AT_32_THRESHOLD": str(accuracy["recall_at_32_min"]),
@@ -253,6 +390,28 @@ def resolve_policy(policy: dict[str, Any], device: str, board_id: str) -> dict[s
         "P99_TTFT_THRESHOLD": str(performance["p99_ttft_max"]),
         "P99_TPOT_THRESHOLD": str(performance["p99_tpot_max"]),
     }
+    if validated["version"] == 1:
+        values["PERFORMANCE_FAILURE_MODE"] = failure_modes["performance"]
+
+    pangu = validated.get("pangu1b")
+    if pangu is None:
+        pangu = _validate_pangu(STRICT_BOOTSTRAP_POLICY["pangu1b"])
+        values["PANGU1B_POLICY_SOURCE"] = "strict-bootstrap"
+    else:
+        pangu = deepcopy(pangu)
+        values["PANGU1B_POLICY_SOURCE"] = "policy"
+    pangu_override = pangu["device_overrides"].get(device)
+    if pangu_override:
+        pangu["thresholds"].update(pangu_override["thresholds"])
+    values.update(
+        {
+            "PANGU1B_OFFLINE_ACCURACY_THRESHOLD": str(pangu["thresholds"]["offline_accuracy_min"]),
+            "PANGU1B_ONLINE_ACCURACY_THRESHOLD": str(pangu["thresholds"]["online_accuracy_min"]),
+            "PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE": pangu["failure_modes"]["offline_accuracy"],
+            "PANGU1B_ONLINE_ACCURACY_FAILURE_MODE": pangu["failure_modes"]["online_accuracy"],
+        }
+    )
+    return values
 
 
 def write_github_env(values: dict[str, str], stream: TextIO) -> None:
@@ -269,7 +428,7 @@ def write_summary(values: dict[str, str], source_ref: str, bootstrap: bool, stre
     if bootstrap:
         stream.write(
             "> [!WARNING]\n"
-            "> The target base predates branch-owned benchmark policies. "
+            "> The target base predates the policy runtime. "
             "Using the one-time strict bootstrap policy.\n\n"
         )
     stream.write(f"Source ref: `{source_ref}`\n\n")
@@ -278,8 +437,11 @@ def write_summary(values: dict[str, str], source_ref: str, bootstrap: bool, stre
         ("Device", values["BENCHMARK_DEVICE"]),
         ("Board", values["BENCHMARK_BOARD_ID"]),
         ("Accuracy failures", values["ACCURACY_FAILURE_MODE"]),
-        ("Performance failures", values["PERFORMANCE_FAILURE_MODE"]),
-        ("Online non-accuracy failures", values["ONLINE_NON_ACCURACY_FAILURE_MODE"]),
+        ("P99 TTFT failures", values["P99_TTFT_FAILURE_MODE"]),
+        ("P99 TPOT failures", values["P99_TPOT_FAILURE_MODE"]),
+        ("Online elapsed failures", values["ONLINE_ELAPSED_FAILURE_MODE"]),
+        ("Offline elapsed failures", values["OFFLINE_ELAPSED_FAILURE_MODE"]),
+        ("Execution failures", "blocking"),
         ("pass@1 minimum", values["PASS_AT_1_THRESHOLD"]),
         ("pass@32 minimum", values["PASS_AT_32_THRESHOLD"]),
         ("recall@32 minimum", values["RECALL_AT_32_THRESHOLD"]),
@@ -287,6 +449,9 @@ def write_summary(values: dict[str, str], source_ref: str, bootstrap: bool, stre
         ("Offline elapsed maximum", values["ELAPSED_TIME_OFFLINE_THRESHOLD"] + "s"),
         ("P99 TTFT maximum", values["P99_TTFT_THRESHOLD"]),
         ("P99 TPOT maximum", values["P99_TPOT_THRESHOLD"]),
+        ("Pangu policy source", values["PANGU1B_POLICY_SOURCE"]),
+        ("Pangu offline accuracy minimum", values["PANGU1B_OFFLINE_ACCURACY_THRESHOLD"]),
+        ("Pangu online accuracy minimum", values["PANGU1B_ONLINE_ACCURACY_THRESHOLD"]),
     )
     stream.write("| Setting | Effective value |\n| --- | --- |\n")
     stream.writelines(f"| {label} | `{value}` |\n" for label, value in rows)
@@ -297,11 +462,12 @@ def _parse_args() -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--policy-file", type=Path)
     source.add_argument("--bootstrap-strict", action="store_true")
-    parser.add_argument("--device", required=True, choices=("gpu", "npu"))
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--device", choices=("gpu", "npu"))
     parser.add_argument("--board-id", default="unknown")
-    parser.add_argument("--source-ref", required=True)
-    parser.add_argument("--github-env", required=True, type=Path)
-    parser.add_argument("--github-step-summary", required=True, type=Path)
+    parser.add_argument("--source-ref")
+    parser.add_argument("--github-env", type=Path)
+    parser.add_argument("--github-step-summary", type=Path)
     return parser.parse_args()
 
 
@@ -312,7 +478,22 @@ def main() -> int:
         if args.bootstrap_strict
         else load_policy(args.policy_file)
     )
+    if args.validate_only:
+        print(f"Benchmark policy '{policy['name']}' is valid (v{policy['version']}).")
+        return 0
+    required = {
+        "--device": args.device,
+        "--source-ref": args.source_ref,
+        "--github-env": args.github_env,
+        "--github-step-summary": args.github_step_summary,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise PolicyError("resolution requires " + ", ".join(missing))
+
     values = resolve_policy(policy, args.device, args.board_id)
+    if args.bootstrap_strict:
+        values["PANGU1B_POLICY_SOURCE"] = "strict-bootstrap"
     with args.github_env.open("a", encoding="utf-8") as env_stream:
         write_github_env(values, env_stream)
     with args.github_step_summary.open("a", encoding="utf-8") as summary_stream:

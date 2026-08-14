@@ -1,4 +1,4 @@
-version: 1
+version: 2
 name: stable
 
 thresholds:
@@ -15,8 +15,25 @@ thresholds:
 
 failure_modes:
   accuracy: blocking
-  performance: blocking
+  performance:
+    p99_ttft: blocking
+    p99_tpot: blocking
+    online_elapsed_seconds: blocking
+    offline_elapsed_seconds: blocking
   online_non_accuracy: blocking
+
+pangu1b:
+  thresholds:
+    offline_accuracy_min: 1.00
+    online_accuracy_min: 1.00
+  failure_modes:
+    offline_accuracy: blocking
+    online_accuracy: blocking
+  device_overrides:
+    npu:
+      thresholds:
+        offline_accuracy_min: 0.875
+        online_accuracy_min: 0.875
 
 device_overrides:
   npu:

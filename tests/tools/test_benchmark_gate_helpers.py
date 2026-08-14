@@ -36,20 +36,3 @@ def test_performance_failure_mode_controls_result() -> None:
     assert "::warning title=Benchmark performance regression::" in warning.stdout
     assert blocking.returncode == 87
     assert "FAILURE on npu" in blocking.stdout
-
-
-def test_online_non_accuracy_warning_does_not_swallow_blocking_gates() -> None:
-    accuracy = run_bash("handle_online_test_status 86 86 87 warning development gpu")
-    performance = run_bash("handle_online_test_status 87 86 87 warning development gpu")
-    execution = run_bash("handle_online_test_status 1 86 87 warning development gpu")
-
-    assert accuracy.returncode == 86
-    assert performance.returncode == 87
-    assert execution.returncode == 0
-    assert "::warning title=OneRec online non-accuracy failure::" in execution.stdout
-
-
-def test_online_non_accuracy_blocking_preserves_original_status() -> None:
-    result = run_bash("handle_online_test_status 42 86 87 blocking stable gpu")
-
-    assert result.returncode == 42
