@@ -28,7 +28,10 @@ from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
-DEFAULT_MIN_ACCURACY = os.environ.get("PANGU1B_MIN_ACCURACY", "0.5")
+DEFAULT_MIN_ACCURACY = os.environ.get(
+    "PANGU1B_OFFLINE_ACCURACY_THRESHOLD",
+    os.environ.get("PANGU1B_MIN_ACCURACY", "0.5"),
+)
 PANGU_EXAMPLE = ROOT / "examples" / "offline_inference" / "pangu1b" / "pangu_generate.py"
 
 

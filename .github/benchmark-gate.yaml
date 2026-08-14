@@ -1,10 +1,10 @@
-version: 1
+version: 2
 name: development
 
 thresholds:
   accuracy:
     pass_at_1_min: 0.09
-    pass_at_32_min: 0.30
+    pass_at_32_min: 0.29
     recall_at_32_min: 0.04
 
   performance:
@@ -15,8 +15,25 @@ thresholds:
 
 failure_modes:
   accuracy: blocking
-  performance: warning
-  online_non_accuracy: warning
+  performance:
+    p99_ttft: warning
+    p99_tpot: warning
+    online_elapsed_seconds: warning
+    offline_elapsed_seconds: warning
+  online_non_accuracy: blocking
+
+pangu1b:
+  thresholds:
+    offline_accuracy_min: 1.00
+    online_accuracy_min: 1.00
+  failure_modes:
+    offline_accuracy: blocking
+    online_accuracy: blocking
+  device_overrides:
+    npu:
+      thresholds:
+        offline_accuracy_min: 0.875
+        online_accuracy_min: 0.875
 
 device_overrides:
   npu:

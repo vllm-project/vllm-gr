@@ -1,5 +1,11 @@
 #!/bin/bash
 
+set -uo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/ci/benchmark_gate_helpers.sh
+source "$SCRIPT_DIR/../../tools/ci/benchmark_gate_helpers.sh"
+
 MODEL_PATH="${VLLM_GR_TEST_MODEL:-OpenOneRec/OneRec-1.7B}"
 
 if [[ -n "${VLLM_GR_TEST_MODEL:-}" ]]; then
@@ -13,262 +19,266 @@ if [[ -n "${VLLM_GR_TEST_MODEL:-}" ]]; then
   fi
 fi
 
-if [[ -z "${DATASET_PATH:-}" ]]; then
-  echo "Error: DATASET_PATH must point to the local OpenOneRec benchmark data." >&2
+if [[ -z "${DATASET_PATH:-}" || ! -d "$DATASET_PATH" ]]; then
+  echo "Error: DATASET_PATH must point to local OpenOneRec benchmark data." >&2
   exit 1
 fi
-if [[ ! -d "$DATASET_PATH" ]]; then
-  echo "Error: DATASET_PATH is not a directory: $DATASET_PATH" >&2
-  exit 1
-fi
-
-if [[ -z "${CATALOG_PATH:-}" ]]; then
+if [[ -z "${CATALOG_PATH:-}" || ! -f "$CATALOG_PATH" ]]; then
   echo "Error: CATALOG_PATH must point to the local video catalog JSON." >&2
   exit 1
 fi
-if [[ ! -f "$CATALOG_PATH" ]]; then
-  echo "Error: CATALOG_PATH is not a file: $CATALOG_PATH" >&2
-  exit 1
-fi
+
+required_policy_variables=(
+  BENCHMARK_POLICY_NAME
+  BENCHMARK_DEVICE
+  ACCURACY_FAILURE_MODE
+  PASS_AT_1_THRESHOLD
+  PASS_AT_32_THRESHOLD
+  RECALL_AT_32_THRESHOLD
+  ELAPSED_TIME_ONLINE_THRESHOLD
+  ELAPSED_TIME_OFFLINE_THRESHOLD
+  P99_TTFT_THRESHOLD
+  P99_TPOT_THRESHOLD
+)
+for variable_name in "${required_policy_variables[@]}"; do
+  if [[ -z "${!variable_name:-}" ]]; then
+    echo "Error: $variable_name must be set by the benchmark policy resolver." >&2
+    exit 1
+  fi
+done
+
+p99_ttft_failure_mode="${P99_TTFT_FAILURE_MODE:-${PERFORMANCE_FAILURE_MODE:-}}"
+p99_tpot_failure_mode="${P99_TPOT_FAILURE_MODE:-${PERFORMANCE_FAILURE_MODE:-}}"
+online_elapsed_failure_mode="${ONLINE_ELAPSED_FAILURE_MODE:-${PERFORMANCE_FAILURE_MODE:-}}"
+offline_elapsed_failure_mode="${OFFLINE_ELAPSED_FAILURE_MODE:-${PERFORMANCE_FAILURE_MODE:-}}"
+for mode_name in \
+  ACCURACY_FAILURE_MODE \
+  p99_ttft_failure_mode \
+  p99_tpot_failure_mode \
+  online_elapsed_failure_mode \
+  offline_elapsed_failure_mode; do
+  mode_value="${!mode_name:-}"
+  if [[ -z "$mode_value" ]]; then
+    echo "Error: $mode_name is missing and no v1 performance fallback is available." >&2
+    exit 1
+  fi
+  validate_failure_mode "$mode_name" "$mode_value" || exit $?
+done
+
+run_port="${VLLM_GR_BENCHMARK_PORT:-7000}"
+server_timeout="${VLLM_GR_BENCHMARK_SERVE_TIMEOUT:-600}"
+policy_name="$BENCHMARK_POLICY_NAME"
+device="$BENCHMARK_DEVICE"
+pass_1_th="$PASS_AT_1_THRESHOLD"
+pass_32_th="$PASS_AT_32_THRESHOLD"
+recall_32_th="$RECALL_AT_32_THRESHOLD"
+elapsed_time_online_th="$ELAPSED_TIME_ONLINE_THRESHOLD"
+elapsed_time_offline_th="$ELAPSED_TIME_OFFLINE_THRESHOLD"
+p99_ttft_th="$P99_TTFT_THRESHOLD"
+p99_tpot_th="$P99_TPOT_THRESHOLD"
 
 echo "Using model: $MODEL_PATH"
 echo "Using dataset: $DATASET_PATH"
 echo "Using catalog: $CATALOG_PATH"
+echo "Benchmark policy: $policy_name"
+echo "Device: $device"
+echo "Accuracy failures: $ACCURACY_FAILURE_MODE"
+echo "P99 TTFT failures: $p99_ttft_failure_mode"
+echo "P99 TPOT failures: $p99_tpot_failure_mode"
+echo "Online elapsed failures: $online_elapsed_failure_mode"
+echo "Offline elapsed failures: $offline_elapsed_failure_mode"
+echo "Execution, transport, timeout, and parsing failures: blocking"
 
-run_port=7000
-timeout=600 # time for waiting server to go up
-p99_ttft_th=300
-p99_tpot_th=0.02
-pass_1_th=0.09
-pass_32_th=0.3
-recall_32_th=0.04
-elapsed_time_online_th=20
-elapsed_time_offline_th=20
-device="gpu"
-#if exist npu-smi tune some threshold
-if command -v npu-smi &> /dev/null; then
-   device="npu"
-   board_id=$(python -c "import acl;print(acl.get_soc_name())" 2>/dev/null || echo "unknown")
-   echo "identify $board_id"
-   case $board_id in
-    "Ascend910_9362" )
-      p99_ttft_th=280
-      elapsed_time_online_th=20
-      elapsed_time_offline_th=25
-       ;;
-    * )
-    echo "using default thresholds for $board_id" ;;
-  esac
-fi
-
-
-validate_metric() {
-    local metric_name="$1"
-    local metric_value="$2"
-    local threshold="$3"
-    local comparison_op="$4" # "le" or "ge"
-
-    local awk_script
-    if [[ "$comparison_op" == "ge" ]]; then
-        awk_script='BEGIN {exit !(val >= th)}'
-        condition_text="greater than or equal to"
-    else
-        awk_script='BEGIN {exit !(val <= th)}'
-        condition_text="less than or equal to"
-    fi
-
-    if awk -v val="$metric_value" -v th="$threshold" "$awk_script"; then
-        echo "SUCCESS on ${device}: ${metric_name} (${metric_value}) is ${condition_text} ${threshold}."
-    else
-        echo "FAILURE on ${device}: ${metric_name} (${metric_value}) is not ${condition_text} ${threshold}."
-        exit 1
-    fi
-}
-
-# Function to extract numeric value based on string key from multi-line input
 extract_numeric_value() {
     local input_lines="$1"
     local string_key="$2"
+    local matched_line
+    local value
 
-    # Use grep to find the line containing the string key
-    local matched_line=$(echo "$input_lines" | grep -m 1 "$string_key")
-
-    if [[ -n "$matched_line" ]]; then
-        # Use regex to extract the numeric value from the matched line
-        local value=$(echo "$matched_line" | grep -oP "$string_key.*:\s*\K[0-9.]+")
-        if [[ -z "$value" ]]; then
-            echo "Error: Key $string_key not found, or formatting did not match" >&2
-            return  1
-        else
-            echo "$value"
-        fi
-    else
-      echo "key $string_key not found" >&2
+    matched_line=$(printf '%s\n' "$input_lines" | grep -F -m 1 -- "$string_key")
+    if [[ -z "$matched_line" ]]; then
+      echo "Error: key $string_key not found" >&2
       return 1
     fi
+    value=$(
+      printf '%s\n' "$matched_line" |
+        grep -oE '[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?' |
+        tail -n 1
+    )
+    if [[ -z "$value" ]]; then
+      echo "Error: key $string_key did not contain a numeric value" >&2
+      return 1
+    fi
+    if ! awk -v val="$value" 'BEGIN {exit !(val >= 0)}'; then
+      echo "Error: key $string_key contained an invalid negative value: $value" >&2
+      return 1
+    fi
+    printf '%s\n' "$value"
 }
-echo "offline test"
 
-output=$( python -m benchmarks.open_one_rec.one_rec_acc_test \
---gr \
---model "$MODEL_PATH" \
---dataset-path "$DATASET_PATH" \
---dataset-name  onerec \
---num-prompts 100 \
---max-concurrency 10 \
---use-beam-search \
---task-type video \
---catalog-path "$CATALOG_PATH" \
---backend CUSTOM \
---n 128 )
-
-
-echo "$output"
+echo "Running OneRec offline benchmark"
+output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+  --gr \
+  --model "$MODEL_PATH" \
+  --dataset-path "$DATASET_PATH" \
+  --dataset-name onerec \
+  --num-prompts 100 \
+  --max-concurrency 10 \
+  --use-beam-search \
+  --task-type video \
+  --catalog-path "$CATALOG_PATH" \
+  --backend CUSTOM \
+  --n 128)
+offline_status=$?
+printf '%s\n' "$output"
+if [[ "$offline_status" -ne 0 ]]; then
+  echo "OneRec offline benchmark execution failed with exit code $offline_status." >&2
+  exit "$offline_status"
+fi
 
 pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
 pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
 recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
 elapsed_time=$(extract_numeric_value "$output" "elapsed_time") || exit 1
 
+validate_accuracy_metric "offline pass@1" "$pass_1" "$pass_1_th" \
+  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+validate_accuracy_metric "offline pass@32" "$pass_32" "$pass_32_th" \
+  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+validate_accuracy_metric "offline recall@32" "$recall_32" "$recall_32_th" \
+  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+validate_performance_metric "offline elapsed_time" "$elapsed_time" \
+  "$elapsed_time_offline_th" "$offline_elapsed_failure_mode" "$device" 89 || exit $?
 
-echo "Parsed pass@1: $pass_1"
-echo "Parsed pass@32: $pass_32"
-echo "Parsed recall@32: $recall_32"
-echo "Parsed elapsed_time: $elapsed_time"
+SERVER_PID=""
+stop_server() {
+  if [[ -n "${SERVER_PID:-}" ]]; then
+    echo "Stopping OneRec server PID $SERVER_PID..."
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+  fi
+}
+trap stop_server EXIT
 
-
-# Validate pass@1
-validate_metric "pass@1" "$pass_1" "$pass_1_th" "ge"
-
-# Validate pass@32
-validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
-
-# Validate recall@32
-validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
-
-# Validate elapsed_time
-validate_metric "elapsed_time" "$elapsed_time" "$elapsed_time_offline_th" "le"
-
-
-# online tests
-
-
-# Ensure we clean up the background server process if the script exits early
-trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; sleep 2; pkill -P "$SERVER_PID" 2>/dev/null || true; fi' EXIT
-
-vllm-gr serve \
-    --port $run_port \
-    --seed 123 \
-    --default-chat-template-kwargs '{"enable_thinking": false}' \
-    --max-logprobs 512 \
-    --max_num_seqs 2048 \
-    --max_num_batched_tokens 16384 \
-    --scheduling-policy priority \
-    --catalog-path "$CATALOG_PATH" \
-    --attention-backend CUSTOM \
-    "$MODEL_PATH" &
-
-SERVER_PID=$!
-
-echo "Waiting for server to be ready on port $run_port..."
-# Check health/models endpoint until it responds
-if ! timeout $timeout bash -c "
-  until curl -s http://localhost:${run_port}/v1/models > /dev/null; do
+wait_for_server() {
+  local deadline=$((SECONDS + server_timeout))
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      wait "$SERVER_PID" 2>/dev/null
+      local server_status=$?
+      echo "OneRec server exited before readiness (exit=$server_status)." >&2
+      return 1
+    fi
+    if curl --fail --silent --show-error \
+      "http://127.0.0.1:${run_port}/v1/models" > /dev/null 2>&1; then
+      return 0
+    fi
     sleep 2
   done
-"; then
-  echo "Server failed to start within the timeout limit of $timeout seconds."
-  exit 1
-fi
-echo "Server is ready! Running benchmark..."
+  echo "OneRec server did not become ready within ${server_timeout}s." >&2
+  return 1
+}
 
-# warmup
-output=$(python -m benchmarks.open_one_rec.one_rec_main \
+echo "Starting OneRec online server"
+vllm-gr serve \
+  --port "$run_port" \
+  --seed 123 \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --max-logprobs 512 \
+  --max_num_seqs 2048 \
+  --max_num_batched_tokens 16384 \
+  --scheduling-policy priority \
+  --catalog-path "$CATALOG_PATH" \
+  --attention-backend CUSTOM \
+  "$MODEL_PATH" &
+SERVER_PID=$!
+
+wait_for_server || exit 1
+echo "OneRec server is ready; running warmup."
+warmup_output=$(python -m benchmarks.open_one_rec.one_rec_main \
   bench serve \
   --endpoint /v1/chat/completions \
-  --backend openai-chat  \
-  --model "$MODEL_PATH"  \
+  --backend openai-chat \
+  --model "$MODEL_PATH" \
   --dataset-name onerec \
   --dataset-path "$DATASET_PATH" \
-  --task-type video  \
+  --task-type video \
   --num-prompts 5 \
   --use-beam-search \
-  --port $run_port \
+  --port "$run_port" \
   --request-rate 1 \
   --n 128)
-
+warmup_status=$?
+printf '%s\n' "$warmup_output"
+if [[ "$warmup_status" -ne 0 ]]; then
+  echo "OneRec online warmup failed with exit code $warmup_status." >&2
+  exit "$warmup_status"
+fi
 
 output=$(python -m benchmarks.open_one_rec.one_rec_main \
   bench serve \
   --endpoint /v1/chat/completions \
-  --backend openai-chat  \
-  --model "$MODEL_PATH"  \
+  --backend openai-chat \
+  --model "$MODEL_PATH" \
   --dataset-name onerec \
   --dataset-path "$DATASET_PATH" \
-  --task-type video  \
+  --task-type video \
   --num-prompts 10 \
   --use-beam-search \
-  --port $run_port \
+  --port "$run_port" \
   --request-rate 0.5 \
   --n 128)
-
-echo "$output"
-
-# Extract P99 TTFT
-
-
-failed=$(extract_numeric_value "$output" "Failed requests")
-if [[ "$failed" -ne 0 ]]; then
-    echo "FAILURE: There were $failed failed requests."
-    exit 1
+online_performance_status=$?
+printf '%s\n' "$output"
+if [[ "$online_performance_status" -ne 0 ]]; then
+  echo "OneRec online performance run failed with exit code $online_performance_status." >&2
+  exit "$online_performance_status"
 fi
 
+failed=$(extract_numeric_value "$output" "Failed requests") || exit 1
+if ! awk -v val="$failed" 'BEGIN {exit !(val == 0)}'; then
+  echo "FAILURE: There were $failed failed requests." >&2
+  exit 1
+fi
 p99_ttft=$(extract_numeric_value "$output" "P99 TTFT") || exit 1
 p99_tpot=$(extract_numeric_value "$output" "P99 TPOT") || exit 1
-
-echo "Parsed P99 TTFT: ${p99_ttft}"
-# Validate P99 ttft (Using awk to safely evaluate floating point comparison)
-validate_metric "P99 TTFT" "$p99_ttft" "$p99_ttft_th" "le"
-echo "Parsed P99 TPOT: ${p99_tpot} ms"
-
-# Validate P99 tpot (Using awk to safely evaluate floating point comparison)
-validate_metric "P99 TPOT" "$p99_tpot" "$p99_tpot_th" "le"
+validate_performance_metric "P99 TTFT" "$p99_ttft" "$p99_ttft_th" \
+  "$p99_ttft_failure_mode" "$device" 87 || exit $?
+validate_performance_metric "P99 TPOT" "$p99_tpot" "$p99_tpot_th" \
+  "$p99_tpot_failure_mode" "$device" 88 || exit $?
 
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
---model "$MODEL_PATH" \
---dataset-path "$DATASET_PATH" \
---dataset-name  onerec \
---num-prompts 100 \
---use-beam-search \
---backend openai-chat \
---task-type video \
---endpoint /v1/chat/completions \
---port $run_port \
---n 128)
+  --model "$MODEL_PATH" \
+  --dataset-path "$DATASET_PATH" \
+  --dataset-name onerec \
+  --num-prompts 100 \
+  --use-beam-search \
+  --backend openai-chat \
+  --task-type video \
+  --endpoint /v1/chat/completions \
+  --port "$run_port" \
+  --n 128)
+online_accuracy_status=$?
+printf '%s\n' "$output"
+if [[ "$online_accuracy_status" -ne 0 ]]; then
+  echo "OneRec online accuracy run failed with exit code $online_accuracy_status." >&2
+  exit "$online_accuracy_status"
+fi
 
-echo "$output"
 pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
 pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
 recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
 elapsed_time_online=$(extract_numeric_value "$output" "elapsed_time") || exit 1
+validate_accuracy_metric "online pass@1" "$pass_1" "$pass_1_th" \
+  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+validate_accuracy_metric "online pass@32" "$pass_32" "$pass_32_th" \
+  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+validate_accuracy_metric "online recall@32" "$recall_32" "$recall_32_th" \
+  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+validate_performance_metric "online elapsed_time" "$elapsed_time_online" \
+  "$elapsed_time_online_th" "$online_elapsed_failure_mode" "$device" 89 || exit $?
 
-echo "Parsed pass@1: $pass_1"
-echo "Parsed pass@32: $pass_32"
-echo "Parsed recall@32: $recall_32"
-echo "Parsed elapsed_time: $elapsed_time_online"
-
-# Validate pass@1
-validate_metric "pass@1" "$pass_1" "$pass_1_th" "ge"
-
-# Validate pass@32
-validate_metric "pass@32" "$pass_32" "$pass_32_th" "ge"
-
-# Validate recall@32
-validate_metric "recall@32" "$recall_32" "$recall_32_th" "ge"
-
-# Validate elapsed_time
-validate_metric "elapsed_time" "$elapsed_time_online" "$elapsed_time_online_th" "le"
-
-
-
+stop_server
+trap - EXIT
 exit 0
