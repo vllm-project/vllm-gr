@@ -20,6 +20,7 @@ _REQUIRED_PROVIDER_METHODS = (
     "apply_runtime_patches",
     "get_model_runner_hooks",
     "get_attention_execution",
+    "create_constrained_topk_execution",
 )
 
 _BACKENDS: dict[str, GRBackendProvider] = {}

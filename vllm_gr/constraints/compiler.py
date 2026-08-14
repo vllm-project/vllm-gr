@@ -92,6 +92,105 @@ class ConstraintTableResource:
         object.__setattr__(self, "digest", compute_resource_digest(self))
 
 
+# Fields whose ndarrays travel over the wire as (bytes, dtype, shape).
+_ARRAY_FIELDS = (
+    "first_token_ids",
+    "prefix1_offsets",
+    "prefix1_values",
+    "prefix1_pair_keys",
+    "prefix2_value_offsets",
+    "prefix2_values",
+)
+
+
+def to_wire(resource: ConstraintTableResource) -> dict:
+    """Serialize a resource to a wire-safe dict.
+
+    vLLM v1 RPC decodes utility/collective payloads with an *untyped*
+    ``MsgpackDecoder``, so a pickled dataclass would arrive as a plain ``dict``
+    with numpy arrays as nested lists.  This payload uses only base types
+    (``bytes``, ``int``, ``str``) so it survives the msgpack round trip exactly.
+
+    Returns a dict with keys: ``array_fields`` (name -> {"data", "dtype",
+    "shape"}), ``max_prefix1_degree``, ``max_prefix2_degree``, ``vocab_size``,
+    ``digest``.
+    """
+    array_fields = {}
+    for name in _ARRAY_FIELDS:
+        array = getattr(resource, name)
+        array_fields[name] = {
+            "data": np.ascontiguousarray(array).tobytes(),
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
+        }
+    return {
+        "array_fields": array_fields,
+        "max_prefix1_degree": resource.max_prefix1_degree,
+        "max_prefix2_degree": resource.max_prefix2_degree,
+        "vocab_size": resource.vocab_size,
+        "digest": resource.digest,
+    }
+
+
+def from_wire(payload: dict) -> ConstraintTableResource:
+    """Rebuild a resource from a :func:`to_wire` payload.
+
+    The reconstructed resource re-freezes its arrays (pickle/msgpack would
+    otherwise make them writable) and recomputes the digest.  The digest in the
+    payload is verified against the recomputed value so corruption is caught.
+
+    Raises:
+        ValueError: if ``payload`` is malformed or its digest does not match
+            the recomputed digest.
+    """
+    try:
+        array_fields = payload["array_fields"]
+        max_prefix1_degree = int(payload["max_prefix1_degree"])
+        max_prefix2_degree = int(payload["max_prefix2_degree"])
+        vocab_size = int(payload["vocab_size"])
+        wire_digest = payload["digest"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"malformed constraint table wire payload: {exc}") from exc
+
+    arrays = {}
+    for name in _ARRAY_FIELDS:
+        try:
+            field = array_fields[name]
+            data = field["data"]
+            dtype = np.dtype(field["dtype"])
+            shape = tuple(field["shape"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"malformed wire payload for array {name!r}: {exc}") from exc
+        if isinstance(data, bytes):
+            arr = np.frombuffer(data, dtype=dtype).reshape(shape)
+        else:
+            arr = np.asarray(data, dtype=dtype).reshape(shape)
+        arrays[name] = arr
+
+    resource = ConstraintTableResource(
+        first_token_ids=arrays["first_token_ids"],
+        prefix1_offsets=arrays["prefix1_offsets"],
+        prefix1_values=arrays["prefix1_values"],
+        prefix1_pair_keys=arrays["prefix1_pair_keys"],
+        prefix2_value_offsets=arrays["prefix2_value_offsets"],
+        prefix2_values=arrays["prefix2_values"],
+        max_prefix1_degree=max_prefix1_degree,
+        max_prefix2_degree=max_prefix2_degree,
+        vocab_size=vocab_size,
+        digest=wire_digest,
+    )
+    # Validate the full table contract (dtypes, CSR, pair-key ordering, token
+    # range, degree consistency) and verify the digest covers everything the
+    # operator depends on.
+    validate_resource_tables(resource)
+    if resource.digest != wire_digest:
+        raise ValueError(
+            f"constraint table wire payload digest mismatch: expected "
+            f"{wire_digest}, recomputed {resource.digest}"
+        )
+    return resource
+
+
 def compute_resource_digest(resource: ConstraintTableResource) -> str:
     """Stable content digest over tables, degrees, vocab_size, and format version.
 
@@ -139,8 +238,8 @@ def derive_degrees(
 def validate_resource_tables(resource: ConstraintTableResource) -> None:
     """Validate the full table contract of a resource.
 
-    Run by the compiler after building a resource so an invalid table layout is
-    rejected before it reaches any operator.  Checks:
+    Shared by the compiler (after build) and ``from_wire`` (after rebuild) so a
+    wire payload cannot smuggle in an invalid table layout.  Checks:
 
     - dtype contract: five int32 tables, one int64 pair-key table;
     - CSR offset monotonicity / bounds;

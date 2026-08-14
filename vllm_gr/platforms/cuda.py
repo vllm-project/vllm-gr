@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Thin CUDA provider with lazy hardware-specific imports."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from importlib import import_module
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from .protocol import BeamAttentionExecution, ModelRunnerPatchHooks
+
+if TYPE_CHECKING:
+    import torch
+
+    from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
 
 @dataclass(frozen=True)
@@ -40,6 +47,20 @@ class CUDABackendProvider:
             BeamAttentionExecution,
             import_module("vllm_gr.v1.attention.backends.beam_attn_gpu"),
         )
+
+    def create_constrained_topk_execution(
+        self,
+        *,
+        device: str | torch.device | None = None,
+    ) -> "ConstrainedTopKExecution | None":
+        """Return ``None``: CUDA has no production Constraint Table execution.
+
+        Deliberately returns ``None`` (not a Torch fallback) so a ModelRunner
+        integration must fail explicitly when constraint tables are requested
+        on CUDA, never silently degrade.
+        """
+        del device
+        return None
 
 
 CUDA_BACKEND = CUDABackendProvider()

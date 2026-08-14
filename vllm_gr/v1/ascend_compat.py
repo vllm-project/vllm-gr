@@ -96,6 +96,27 @@ def apply_ascend_attention_backend_patch(force: bool = False) -> int:
     return 1
 
 
+def _try_import_npu_worker() -> Any | None:
+    """Import the v1 NPUWorker class from vllm-ascend.
+
+    Current vllm-ascend defines ``NPUWorker`` in ``worker.worker_v1``; older
+    builds exposed it from ``worker.worker``.  Try both, returning ``None``
+    when neither is importable.
+    """
+    for module_path in (
+        "vllm_ascend.worker.worker_v1",
+        "vllm_ascend.worker.worker",
+    ):
+        try:
+            module = __import__(module_path, fromlist=["NPUWorker"])
+            worker_cls = getattr(module, "NPUWorker", None)
+            if worker_cls is not None:
+                return worker_cls
+        except (ImportError, AttributeError):
+            continue
+    return None
+
+
 def patch_npu_worker_init_device() -> int:
     """Run vllm-gr patch installation before NPUWorker device initialization."""
     global _NPU_WORKER_PATCH_APPLIED
@@ -103,16 +124,15 @@ def patch_npu_worker_init_device() -> int:
     if not is_npu_platform() or _NPU_WORKER_PATCH_APPLIED:
         return 0
 
-    try:
-        from vllm_ascend.worker.worker import NPUWorker
-    except ImportError as exc:
+    # The v1 NPUWorker lives in worker_v1 in current vllm-ascend; older builds
+    # expose it from worker.  Try the v1 path first, then fall back.
+    NPUWorker = _try_import_npu_worker()
+    if NPUWorker is None:
         logger.warning(
-            "Failed to import vllm_ascend.worker.worker.NPUWorker; the "
-            "vllm-gr delayed NPU patch retry hook was not installed for this "
-            "attempt. ImportError: %s",
-            exc,
+            "Failed to import NPUWorker from vllm_ascend.worker.worker_v1 or "
+            "vllm_ascend.worker.worker; the vllm-gr delayed NPU patch retry "
+            "hook was not installed for this attempt."
         )
-        logger.debug("NPUWorker import traceback", exc_info=True)
         return 0
 
     original_init_device = NPUWorker.init_device
@@ -121,6 +141,11 @@ def patch_npu_worker_init_device() -> int:
         from vllm_gr.patch import re_apply_patches
 
         re_apply_patches()
+        # Mount set_gr_constraint_resources so the driver can inject constraint
+        # tables via EngineCore.collective_rpc after init_device returns.
+        from vllm_gr.constraints.worker_inject import install_worker_resource_hook
+
+        install_worker_resource_hook(type(self))
         return original_init_device(self)
 
     NPUWorker.init_device = _patched_init_device

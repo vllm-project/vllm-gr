@@ -14,6 +14,8 @@ from vllm_gr.constraints.compiler import (
     MAX_TOP_K,
     ConstraintTableCompiler,
     ConstraintTableResource,
+    from_wire,
+    to_wire,
     validate_resource_tables,
 )
 from vllm_gr.constraints.json_compiler import compile_relations_json
@@ -470,3 +472,55 @@ def test_rejects_colliding_s_c_token_ids() -> None:
     document = compile_relations_json([["1", "2", "10"], ["1", "2", "11"]])
     with pytest.raises(ValueError, match="maps distinct constraint tokens to ID 10"):
         ConstraintTableCompiler(tokenizer, 100).compile(document)
+
+
+def test_wire_rejects_degree_shrink(tokenizer: MagicMock) -> None:
+    """Shrinking max_prefix1_degree in a wire payload must be rejected."""
+    resource = _build_multi_degree(tokenizer)
+    assert resource.max_prefix1_degree > 1  # guard: catalog has real degree
+
+    wire = to_wire(resource)
+    wire["max_prefix1_degree"] = 1
+    with pytest.raises(ValueError, match="does not match derived degree|digest mismatch"):
+        from_wire(wire)
+
+
+def test_wire_rejects_empty_first_token_ids(tokenizer: MagicMock) -> None:
+    """An empty first_token_ids must not bypass the cross-table consistency check.
+
+    Regression: the validator compared first_token_ids against active CSR
+    buckets only when first.size was non-empty, so an empty array slipped
+    through even though offsets still had positive-degree buckets.
+    """
+    resource = _build_multi_degree(tokenizer)
+    assert resource.first_token_ids.size > 0  # guard
+
+    wire = to_wire(resource)
+    # Replace first_token_ids with an empty int32 array.
+    wire["array_fields"]["first_token_ids"] = {
+        "data": b"",
+        "dtype": "int32",
+        "shape": [0],
+    }
+    with pytest.raises(ValueError, match="exactly match"):
+        from_wire(wire)
+
+
+def test_wire_rejects_2d_prefix2_values(tokenizer: MagicMock) -> None:
+    """A [N,1] reshape of prefix2_values must not bypass the 1-D ABI check.
+
+    The wire digest covers dtype+shape, so reshaping changes the digest and the
+    validator's ndim check rejects it regardless.
+    """
+    resource = _build_multi_degree(tokenizer)
+    assert resource.prefix2_values.ndim == 1  # guard
+
+    wire = to_wire(resource)
+    n = resource.prefix2_values.shape[0]
+    wire["array_fields"]["prefix2_values"] = {
+        "data": np.ascontiguousarray(resource.prefix2_values).tobytes(),
+        "dtype": "int32",
+        "shape": [n, 1],
+    }
+    with pytest.raises(ValueError, match="1-D"):
+        from_wire(wire)

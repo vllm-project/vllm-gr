@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Thin NPU provider with lazy Ascend-specific imports."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from importlib import import_module
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from .protocol import BeamAttentionExecution, ModelRunnerPatchHooks
+
+if TYPE_CHECKING:
+    import torch
+
+    from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
 
 
 @dataclass(frozen=True)
@@ -38,6 +45,21 @@ class NPUBackendProvider:
             BeamAttentionExecution,
             import_module("vllm_gr.v1.attention.backends.beam_attn_npu"),
         )
+
+    def create_constrained_topk_execution(
+        self,
+        *,
+        device: str | torch.device | None = None,
+    ) -> "NPUConstrainedTopKExecution":
+        """Create a fresh NPU constrained top-k execution adapter.
+
+        The adapter is stateful (holds loaded tables + digest), so a new
+        instance is created per call; the ModelRunner owns it for one
+        lifetime and creates another after a reset.
+        """
+        from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
+
+        return NPUConstrainedTopKExecution(device=device)
 
 
 NPU_BACKEND = NPUBackendProvider()

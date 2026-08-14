@@ -5,7 +5,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    import torch
+
+    from vllm_gr.constraints.execution import ConstrainedTopKExecution
 
 
 class ModelRunnerPatchHooks(Protocol):
@@ -79,3 +84,9 @@ class GRBackendProvider(Protocol):
     def get_model_runner_hooks(self) -> ModelRunnerPatchHooks: ...
 
     def get_attention_execution(self) -> BeamAttentionExecution: ...
+
+    def create_constrained_topk_execution(
+        self,
+        *,
+        device: str | torch.device | None = None,
+    ) -> "ConstrainedTopKExecution | None": ...

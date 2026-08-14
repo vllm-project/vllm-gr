@@ -42,7 +42,7 @@ they are migrated to the provider boundary.
 
 ## Provider contract
 
-A provider exposes one canonical `device_type` and four methods:
+A provider exposes one canonical `device_type` and five methods:
 
 ```python
 class GRBackendProvider(Protocol):
@@ -59,9 +59,15 @@ class GRBackendProvider(Protocol):
     def get_model_runner_hooks(self) -> ModelRunnerPatchHooks: ...
 
     def get_attention_execution(self) -> BeamAttentionExecution: ...
+
+    def create_constrained_topk_execution(
+        self,
+        *,
+        device: str | torch.device | None = None,
+    ) -> "ConstrainedTopKExecution | None": ...
 ```
 
-Registration validates only `device_type` and the presence of the four
+Registration validates only `device_type` and the presence of the five
 callable methods. It must not invoke the methods. This preserves lazy imports
 and allows CUDA and NPU providers to coexist in the registry without loading
 both hardware runtimes.
@@ -81,7 +87,8 @@ Hardware-dependent imports belong inside:
 - `check_environment()`;
 - `apply_runtime_patches()`;
 - `get_model_runner_hooks()`;
-- `get_attention_execution()`.
+- `get_attention_execution()`;
+- `create_constrained_topk_execution()`.
 
 Importing `vllm_gr.platforms` or registering the built-in providers therefore
 has no hardware import side effects and does not mutate the registry unless
@@ -152,6 +159,7 @@ registered.
 | `apply_runtime_patches()` | No-op | Ascend Attention selector patch, then NPUWorker initialization hook; return the summed patch count |
 | `get_model_runner_hooks()` | `gpu_model_runner_patch` | `npu_model_runner_patch` |
 | `get_attention_execution()` | `beam_attn_gpu` | `beam_attn_npu` |
+| `create_constrained_topk_execution()` | `None` — CUDA has no production Constraint Table execution; explicit unsupported | Lazy-loads a fresh `NPUConstrainedTopKExecution(device=device)` |
 
 The NPU provider is built in during the initial migration so the contract is
 exercised against all current Ascend requirements. A later stage may move it

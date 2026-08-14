@@ -42,6 +42,10 @@ class FakeProvider:
     def get_attention_execution(self) -> Any:
         return object()
 
+    def create_constrained_topk_execution(self, *, device: Any = None) -> None:
+        del device
+        return None
+
 
 @dataclass
 class FakeEntryPoint:
