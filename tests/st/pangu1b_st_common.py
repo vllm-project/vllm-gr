@@ -44,10 +44,15 @@ def has_vllm() -> bool:
 
 
 def require_pangu_st_runtime() -> None:
-    """Skip the current test at runtime when prerequisites are missing."""
+    """Require Pangu prerequisites, failing instead of skipping in strict CI."""
     import unittest
 
+    strict = os.environ.get("PANGU1B_REQUIRE_RUNTIME", "") == "1"
     if not has_vllm():
+        if strict:
+            raise RuntimeError(SKIP_VLLM)
         raise unittest.SkipTest(SKIP_VLLM)
     if not model_available():
+        if strict:
+            raise RuntimeError(SKIP_MODEL)
         raise unittest.SkipTest(SKIP_MODEL)

@@ -1,34 +1,197 @@
 name: Pre-commit and Benchmark
+
+# Keep this metadata protocol in sync with the default-branch retest router.
+run-name: >-
+  ${{ github.event_name == 'pull_request' &&
+      format('ci-meta:v1;run={0};pr={1};base={2};base_sha={3};merge_sha={4}',
+             github.run_id,
+             github.event.pull_request.number,
+             github.event.pull_request.base.ref,
+             github.event.pull_request.base.sha,
+             github.sha) ||
+      format('{0}:{1}@{2}', github.event_name, github.ref_name, github.sha) }}
+
 on:
   pull_request:
     branches: [main, decode_graph]
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - converted_to_draft
   push:
     branches: [main, decode_graph]
-  issue_comment:
-    types: [created]
-  workflow_dispatch: # for manual trigger
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'issue_comment' }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event.pull_request.number || github.ref
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  pre-commit:
+  benchmark-policy:
+    name: Resolve benchmark policy
     if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request && contains(github.event.comment.body, '/retest'))
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false
+    # Resolve device overrides on the same runner class used by the gates.
+    runs-on: self-hosted
+    outputs:
+      policy-json: ${{ steps.normalize-policy.outputs.policy-json }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install policy parser dependency
+        run: python -m pip install 'PyYAML>=6.0'
+
+      - name: Lint checked-out candidate policy
+        run: >-
+          python tools/ci/resolve_benchmark_policy.py
+          --policy-file .github/benchmark-gate.yaml
+          --validate-only
+
+      - name: Fetch target branch benchmark policy runtime
+        id: benchmark-policy
+        uses: actions/github-script@v7
+        env:
+          POLICY_REF: >-
+            ${{ github.event.pull_request.base.sha || github.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const ref = process.env.POLICY_REF;
+            const policyRepoPath = '.github/benchmark-gate.yaml';
+            const resolverRepoPath =
+              'tools/ci/resolve_benchmark_policy.py';
+            const policyPath = path.join(
+              process.env.RUNNER_TEMP,
+              'benchmark-gate-base.yaml',
+            );
+            const resolverPath = path.join(
+              process.env.RUNNER_TEMP,
+              'resolve-benchmark-policy-base.py',
+            );
+
+            const fetchFile = async (repoPath) => {
+              try {
+                const response = await github.rest.repos.getContent({
+                  owner,
+                  repo,
+                  path: repoPath,
+                  ref,
+                });
+                if (Array.isArray(response.data) ||
+                    response.data.type !== 'file' ||
+                    !response.data.content) {
+                  throw new Error(
+                    `${repoPath}@${ref} is not a readable file`,
+                  );
+                }
+                return Buffer.from(
+                  response.data.content,
+                  response.data.encoding,
+                ).toString('utf8');
+              } catch (error) {
+                if (error.status === 404) {
+                  return null;
+                }
+                throw error;
+              }
+            };
+
+            const policy = await fetchFile(policyRepoPath);
+            const resolver = await fetchFile(resolverRepoPath);
+            const bootstrap = resolver === null;
+            if (bootstrap && context.eventName !== 'pull_request') {
+              throw new Error(
+                `Required policy resolver ${resolverRepoPath} is missing ` +
+                `from ${ref}`,
+              );
+            }
+            if (!bootstrap && policy === null) {
+              throw new Error(
+                `Required benchmark policy ${policyRepoPath} is missing ` +
+                `from ${ref}`,
+              );
+            }
+            if (policy !== null) {
+              fs.writeFileSync(policyPath, policy, {encoding: 'utf8'});
+            }
+            if (resolver !== null) {
+              fs.writeFileSync(
+                resolverPath,
+                resolver,
+                {encoding: 'utf8'},
+              );
+            }
+
+            core.setOutput('bootstrap', String(bootstrap));
+            core.setOutput('policy-path', policyPath);
+            core.setOutput('ref', ref);
+            core.setOutput(
+              'resolver-path',
+              bootstrap ? resolverRepoPath : resolverPath,
+            );
+
+      - name: Resolve base-owned benchmark policy
+        env:
+          BOOTSTRAP_POLICY: ${{ steps.benchmark-policy.outputs.bootstrap }}
+          POLICY_FILE: ${{ steps.benchmark-policy.outputs.policy-path }}
+          POLICY_REF: ${{ steps.benchmark-policy.outputs.ref }}
+          POLICY_RESOLVER: ${{ steps.benchmark-policy.outputs.resolver-path }}
+        run: |
+          device="gpu"
+          board_id="unknown"
+          if command -v npu-smi > /dev/null 2>&1; then
+            device="npu"
+            board_id="$(
+              python -c 'import acl; print(acl.get_soc_name())' \
+                2>/dev/null || echo unknown
+            )"
+          fi
+
+          args=(
+            --device "$device"
+            --board-id "$board_id"
+            --source-ref "$POLICY_REF"
+            --github-env "$RUNNER_TEMP/resolved-benchmark-policy.env"
+            --github-step-summary "$GITHUB_STEP_SUMMARY"
+          )
+          if [[ "$BOOTSTRAP_POLICY" == "true" ]]; then
+            echo "Base resolver is absent; using the strict migration bootstrap."
+            args+=(--bootstrap-strict)
+          else
+            args+=(--policy-file "$POLICY_FILE")
+          fi
+          python "$POLICY_RESOLVER" "${args[@]}"
+
+      - name: Normalize v1/v2 policy outputs
+        id: normalize-policy
+        run: >-
+          python tools/ci/normalize_benchmark_policy_env.py
+          --env-file "$RUNNER_TEMP/resolved-benchmark-policy.env"
+          --github-output "$GITHUB_OUTPUT"
+
+  pre-commit:
+    name: Pre-commit
+    needs: benchmark-policy
+    if: needs.benchmark-policy.result == 'success'
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name != 'issue_comment'
-
-      - uses: actions/checkout@v4
-        if: github.event_name == 'issue_comment'
-        with:
-          ref: refs/pull/${{ github.event.issue.number }}/merge
 
       - uses: actions/setup-python@v5
         with:
@@ -46,24 +209,24 @@ jobs:
 
       - name: Create virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: |
-            uv venv --seed .venv
+        run: uv venv --seed .venv
 
       - name: Set up virtual environment
         run: |
-            echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
 
       - name: Check for single commit
-        if: github.event_name == 'pull_request'  &&  github.event.pull_request.commits != 1
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.commits != 1
         run: |
-          echo "Error: The PR has ${{ github.event.pull_request.commits }} commits. Please squash them into a single commit."
+          echo "Error: The PR has ${{ github.event.pull_request.commits }} commits. Please squash it into one commit."
           exit 1
 
-      - name: Install base environment (vllm)
+      - name: Install base environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: |
-          uv pip install vllm==0.22.1
+        run: uv pip install vllm==0.22.1
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -71,7 +234,7 @@ jobs:
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
 
-      - name: Install vllm-gr (editable refresh)
+      - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
@@ -81,13 +244,74 @@ jobs:
           python -c 'import importlib.metadata as m; version = m.version("vllm").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM 0.22.1, found {version}"'
           python -c 'import importlib.metadata as m; version = m.version("vllm-gr").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM-GR 0.22.1, found {version}"'
 
-      - name: Kill Process on device
-        run: |
-          bash ./scripts/kill_vllm_on_device.sh
+      - name: Kill stale process on device
+        run: bash ./scripts/kill_vllm_on_device.sh
 
       - uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files
+
+      - name: Check clear device
+        if: always()
+        run: bash ./scripts/check_vllm_on_device.sh
+
+  decode-benchmark:
+    name: Decode benchmark
+    needs: [benchmark-policy, pre-commit]
+    if: >-
+      needs.benchmark-policy.result == 'success' &&
+      needs.pre-commit.result == 'success'
+    runs-on: self-hosted
+    env:
+      BENCHMARK_POLICY_NAME: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_POLICY_NAME }}
+      BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
+      ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ACCURACY_FAILURE_MODE }}
+      P99_TTFT_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TTFT_FAILURE_MODE }}
+      P99_TPOT_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_FAILURE_MODE }}
+      ONLINE_ELAPSED_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ONLINE_ELAPSED_FAILURE_MODE }}
+      OFFLINE_ELAPSED_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).OFFLINE_ELAPSED_FAILURE_MODE }}
+      PASS_AT_1_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PASS_AT_1_THRESHOLD }}
+      PASS_AT_32_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PASS_AT_32_THRESHOLD }}
+      RECALL_AT_32_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).RECALL_AT_32_THRESHOLD }}
+      ELAPSED_TIME_ONLINE_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ELAPSED_TIME_ONLINE_THRESHOLD }}
+      ELAPSED_TIME_OFFLINE_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ELAPSED_TIME_OFFLINE_THRESHOLD }}
+      P99_TTFT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TTFT_THRESHOLD }}
+      P99_TPOT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_THRESHOLD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v1
+
+      - name: Restore virtual environment
+        uses: corca-ai/local-cache@v2
+        id: cache-venv
+        with:
+          path: .venv
+          base: /data/actions/cache
+          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+
+      - name: Require cached virtual environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "The pre-commit environment cache is unexpectedly unavailable." >&2
+          exit 1
+
+      - name: Set up virtual environment
+        run: |
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
+
+      - name: Refresh editable installation
+        run: |
+          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+          uv pip install -e ".[dev]"
+
+      - name: Kill stale process on device
+        run: bash ./scripts/kill_vllm_on_device.sh
 
       - name: Cache OpenOneRec dataset
         uses: corca-ai/local-cache@v2
@@ -102,16 +326,18 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          if [ -z "$HF_TOKEN" ]; then
-            echo "Error: HF_TOKEN secret is not set. The OpenOneRec dataset is gated and requires a Hugging Face token."
+          if [[ -z "$HF_TOKEN" ]]; then
+            echo "HF_TOKEN is required for the gated OpenOneRec dataset." >&2
             exit 1
           fi
           uv tool install hf
           mkdir -p OpenOneRec
-          hf download OpenOneRec/OpenOneRec-RecIF --token "$HF_TOKEN" --local-dir ./OpenOneRec --repo-type=dataset
+          hf download OpenOneRec/OpenOneRec-RecIF \
+            --token "$HF_TOKEN" \
+            --local-dir ./OpenOneRec \
+            --repo-type=dataset
 
-
-      - name: Build Catalog
+      - name: Build catalog
         run: |
           mkdir -p generated_data
           python ./benchmarks/open_one_rec/tools/create_task_catalog.py \
@@ -119,12 +345,62 @@ jobs:
             -d ./OpenOneRec/benchmark_data \
             -o generated_data/video_catalog.json
 
-      - name: Execute benchmark test and verify KPI
+      - name: Execute decode benchmark gates
         env:
           DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
+        run: ./tests/system/run_benchmark_and_verify.sh
+
+      - name: Check clear device
+        if: always()
+        run: bash ./scripts/check_vllm_on_device.sh
+
+  pangu-offline:
+    name: Pangu offline accuracy
+    needs: [benchmark-policy, pre-commit, decode-benchmark]
+    if: >-
+      always() &&
+      needs.benchmark-policy.result == 'success' &&
+      needs.pre-commit.result == 'success'
+    runs-on: self-hosted
+    env:
+      BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
+      PANGU1B_OFFLINE_ACCURACY_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_OFFLINE_ACCURACY_THRESHOLD }}
+      PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE }}
+      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v1
+
+      - name: Restore virtual environment
+        uses: corca-ai/local-cache@v2
+        id: cache-venv
+        with:
+          path: .venv
+          base: /data/actions/cache
+          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+
+      - name: Require cached virtual environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: exit 1
+
+      - name: Set up virtual environment
         run: |
-          ./tests/system/run_benchmark_and_verify.sh
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
+
+      - name: Refresh editable installation
+        run: |
+          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+          uv pip install -e ".[dev]"
+
+      - name: Kill stale process on device
+        run: bash ./scripts/kill_vllm_on_device.sh
 
       - name: Cache Pangu 1B model
         uses: corca-ai/local-cache@v2
@@ -138,17 +414,120 @@ jobs:
         if: steps.cache-pangu1b.outputs.cache-hit != 'true'
         run: |
           pip install modelscope
-          modelscope download --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
-            --local_dir ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
+          modelscope download \
+            --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
+            --local_dir "$PANGU1B_MODEL_PATH"
 
-      - name: Run Pangu 1B accuracy and verification
+      - name: Run Pangu offline accuracy gate
+        run: ./tests/system/run_pangu1b_acc_and_verify.sh
+
+      - name: Check clear device
+        if: always()
+        run: bash ./scripts/check_vllm_on_device.sh
+
+  pangu-online:
+    name: Pangu online accuracy and API contract
+    needs: [benchmark-policy, pre-commit, decode-benchmark, pangu-offline]
+    if: >-
+      always() &&
+      needs.benchmark-policy.result == 'success' &&
+      needs.pre-commit.result == 'success'
+    runs-on: self-hosted
+    env:
+      BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
+      PANGU1B_ONLINE_ACCURACY_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_ONLINE_ACCURACY_THRESHOLD }}
+      PANGU1B_ONLINE_ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_ONLINE_ACCURACY_FAILURE_MODE }}
+      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v1
+
+      - name: Restore virtual environment
+        uses: corca-ai/local-cache@v2
+        id: cache-venv
+        with:
+          path: .venv
+          base: /data/actions/cache
+          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+
+      - name: Require cached virtual environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: exit 1
+
+      - name: Set up virtual environment
+        run: |
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
+
+      - name: Refresh editable installation
+        run: |
+          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+          uv pip install -e ".[dev]"
+
+      - name: Kill stale process on device
+        run: bash ./scripts/kill_vllm_on_device.sh
+
+      - name: Cache Pangu 1B model
+        uses: corca-ai/local-cache@v2
+        id: cache-pangu1b
+        with:
+          path: openPangu-Embedded-1B-V1.1
+          base: /data/actions/cache
+          key: pangu1b-model-${{ runner.os }}
+
+      - name: Download Pangu 1B model
+        if: steps.cache-pangu1b.outputs.cache-hit != 'true'
+        run: |
+          pip install modelscope
+          modelscope download \
+            --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
+            --local_dir "$PANGU1B_MODEL_PATH"
+
+      - name: Run Pangu online accuracy and API contract gate
+        run: ./tests/system/run_pangu1b_online_and_verify.sh
+
+      - name: Check clear device
+        if: always()
+        run: bash ./scripts/check_vllm_on_device.sh
+
+  benchmark-blocking:
+    name: Benchmark blocking gate
+    needs:
+      - benchmark-policy
+      - pre-commit
+      - decode-benchmark
+      - pangu-offline
+      - pangu-online
+    if: >-
+      always() &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every blocking check to pass
         env:
-          PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
-          PANGU1B_MIN_ACCURACY: 1.00
+          POLICY_RESULT: ${{ needs.benchmark-policy.result }}
+          PRE_COMMIT_RESULT: ${{ needs.pre-commit.result }}
+          DECODE_RESULT: ${{ needs.decode-benchmark.result }}
+          PANGU_OFFLINE_RESULT: ${{ needs.pangu-offline.result }}
+          PANGU_ONLINE_RESULT: ${{ needs.pangu-online.result }}
         run: |
-          bash ./tests/system/run_pangu1b_acc_and_verify.sh
-          bash ./tests/system/run_pangu1b_online_and_verify.sh
-
-      - name: Check Clear Device
-        run: |
-          bash ./scripts/check_vllm_on_device.sh
+          failed=0
+          for result_name in \
+            POLICY_RESULT \
+            PRE_COMMIT_RESULT \
+            DECODE_RESULT \
+            PANGU_OFFLINE_RESULT \
+            PANGU_ONLINE_RESULT; do
+            result="${!result_name}"
+            echo "$result_name=$result"
+            if [[ "$result" != "success" ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"

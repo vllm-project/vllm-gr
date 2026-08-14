@@ -49,6 +49,27 @@ fi
 
 echo "running on device $idle_gpu"
 if [ "${npu_state:-false}" == "true" ]; then
+    # Beam-related NPU tests depend on xllm-ops. Ensure the custom operator
+    # library is available before entering the pre-commit/test gate. The
+    # installer is a no-op on non-NPU hosts and skips work when already ready.
+    echo "ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-}"
+    run_test_workdir="$(pwd)"
+    ASCEND_RT_VISIBLE_DEVICES=$idle_gpu \
+    bash tools/install_xllm_ops.sh
+
+    CUSTOM_XLLM_VENDORS_ROOT="${ASCEND_TOOLKIT_HOME}/opp/vendors"
+    CUSTOM_XLLM_MATH_ROOT="${CUSTOM_XLLM_VENDORS_ROOT}/custom_xllm_math"
+    CUSTOM_XLLM_MATH_SET_ENV=$(find "${CUSTOM_XLLM_MATH_ROOT}" -name set_env.bash -print -quit)
+    test -n "${CUSTOM_XLLM_MATH_SET_ENV}" || {
+        echo "set_env.bash not found under ${CUSTOM_XLLM_MATH_ROOT}"
+        exit 1
+    }
+    echo "Found set_env.bash at ${CUSTOM_XLLM_MATH_SET_ENV}"
+    CUSTOM_XLLM_MATH_LIB="${CUSTOM_XLLM_MATH_ROOT}/op_api/lib"
+    export LD_LIBRARY_PATH="${CUSTOM_XLLM_MATH_LIB}:${LD_LIBRARY_PATH}"
+    source "${CUSTOM_XLLM_MATH_ROOT}/bin/set_env.bash"
+    cd "${run_test_workdir}"
+
     PYTORCH_NPU_ALLOW_FORK=true \
     VLLM_WORKER_MULTIPROC_METHOD="spawn" \
     TORCH_MULTIPROCESSING_METHOD="spawn" \

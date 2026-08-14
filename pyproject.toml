@@ -42,6 +42,7 @@ dev = [
     "ruff",
     "mypy",
     "psutil",
+    "PyYAML>=6.0",
 ]
 # DEPRECATED: use `pip install -e .` — platform deps come from setup.py
 # Kept for one transition release so legacy `.[gpu]` installs still receive

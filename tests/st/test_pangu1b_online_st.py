@@ -15,6 +15,7 @@ Skip when the model path is unavailable (CI without weights).
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import socket
 import subprocess
@@ -40,7 +41,12 @@ SERVED_MODEL_NAME = os.environ.get("PANGU1B_SERVED_MODEL_NAME", "pangu1b-st")
 
 def _get_min_accuracy() -> float:
     """Read the online accuracy threshold as a numeric value."""
-    return float(os.environ.get("PANGU1B_MIN_ACCURACY", "0.5"))
+    return float(
+        os.environ.get(
+            "PANGU1B_ONLINE_ACCURACY_THRESHOLD",
+            os.environ.get("PANGU1B_MIN_ACCURACY", "0.5"),
+        )
+    )
 
 
 DEFAULT_MIN_ACCURACY = _get_min_accuracy()
@@ -285,7 +291,21 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
                 correct += 1
 
         accuracy = correct / len(records)
-        self.assertGreaterEqual(accuracy, DEFAULT_MIN_ACCURACY)
+        result_path = os.environ.get("PANGU1B_ONLINE_RESULT_JSON")
+        if result_path:
+            Path(result_path).write_text(
+                json.dumps(
+                    {
+                        "accuracy": accuracy,
+                        "correct": correct,
+                        "num_samples": len(records),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        if os.environ.get("PANGU1B_MEASURE_ONLY", "") != "1":
+            self.assertGreaterEqual(accuracy, DEFAULT_MIN_ACCURACY)
 
 
 class TestPangu1bOnlineUnitHooks(unittest.TestCase):
@@ -301,7 +321,7 @@ class TestPangu1bOnlineUnitHooks(unittest.TestCase):
     def test_min_accuracy_environment_value_is_float(self) -> None:
         with mock.patch.dict(
             os.environ,
-            {"PANGU1B_MIN_ACCURACY": "0.75"},
+            {"PANGU1B_ONLINE_ACCURACY_THRESHOLD": "0.75"},
         ):
             threshold = _get_min_accuracy()
 

@@ -84,7 +84,31 @@ Return to vllm-gr folder for next steps.
 
 See the [vllm-ascend v0.22.1rc1 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.22.1rc1).
 
-5. **Install vllm-gr**
+5. **Install xllm-ops**
+
+```bash
+# Clone the xllm-ops repository
+git clone https://github.com/xLLM-AI/xllm-ops.git
+
+# Prepare the xllm-ops build
+cd xllm-ops
+git submodule init
+git submodule update
+
+# Load the CANN environment
+source "${ASCEND_TOOLKIT_HOME}/set_env.sh"
+
+# Build xllm-ops
+bash build.sh
+
+# Install the xllm-ops library
+cd test/python_test
+bash build_and_run.sh
+```
+
+Return to the vllm-gr directory before continuing.
+
+6. **Install vllm-gr**
 
 ```bash
 VLLM_GR_TARGET_DEVICE=npu pip install -e . --no-build-isolation
@@ -103,7 +127,7 @@ python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); pri
 python -m pip check
 ```
 
-6. **Verify installation**
+7. **Verify installation**
 
 ```bash
 python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
