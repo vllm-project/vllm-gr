@@ -275,3 +275,220 @@ def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
     # slots 100..131 for req0 (32 query tokens) + slot 3809 for req1 cached-past token + slot 132 for req1 query token
     expected_slots = list(range(100, 132)) + [3809, 132]
     assert metadata.suffix_slot_mapping_out.tolist() == expected_slots
+
+
+def test_update_block_table_refreshes_suffix_slots() -> None:
+    query_starts = [0, 4]
+    seq_lens = [8]
+    block_table = [[0, 1, 2, 3]]
+    req_ids = ["beam_chunked"]
+    beam_data = {
+        "beam_chunked": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "beam_width": 2,
+            "beam_decode_steps": 2,
+            "cache_len": 5,
+        }
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    builder = _make_builder()
+    metadata = _build_metadata(common, req_ids, beam_data)
+    assert metadata is not None
+    assert metadata.suffix_slot_mapping_out is not None
+    # Original physical slots: past slot at offset 4 (block 0 -> 4) + current query slots 100, 101, 102
+    assert metadata.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
+
+    # Update block table (block 0 becomes block 10) and slot mapping (0,1,2 becomes 500,501,502)
+    new_table = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+    new_slots = torch.tensor([500, 501, 502, 503], dtype=torch.int64)
+
+    updated = builder.update_block_table(metadata, new_table, new_slots)
+
+    # Past slot offset 4 uses block 4 // 2 = 2 -> block ID 12 -> 12 * 2 + (4 % 2) = 24
+    # Current query slots index positions 0, 1, 2 in new_slots -> 500, 501, 502
+    assert updated.suffix_slot_mapping_out is not None
+    assert updated.suffix_slot_mapping_out.tolist() == [24, 500, 501, 502]
+
+
+def test_update_block_table_multireq_nonzero_row_suffix() -> None:
+    # 2 requests: req0 (std decode), req1 (beam decode with past suffix)
+    query_starts = [0, 2, 6]
+    seq_lens = [4, 8]
+    block_table = [
+        [0, 1, 2, 3],
+        [10, 11, 12, 13],
+    ]
+    req_ids = ["req0", "req1_beam"]
+    beam_data = {
+        "req1_beam": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "beam_width": 2,
+            "beam_decode_steps": 2,
+            "cache_len": 5,
+        }
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    builder = _make_builder()
+    metadata = _build_metadata(common, req_ids, beam_data)
+    assert metadata is not None
+    assert metadata.suffix_slot_mapping_out is not None
+    # req1 past suffix at offset 4 uses req1 row (row 1), block 4 // 2 = 2 -> block ID 12 -> slot 12 * 2 + 0 = 24
+    # req1 query slots in common.slot_mapping at indices 2, 3, 4 -> 102, 103, 104
+    assert metadata.suffix_slot_mapping_out.tolist() == [24, 102, 103, 104]
+
+    # Update with distinct new block IDs for row 0 vs row 1
+    new_table = torch.tensor(
+        [
+            [100, 101, 102, 103],
+            [200, 201, 202, 203],
+        ],
+        dtype=torch.int32,
+    )
+    new_slots = torch.tensor([500, 501, 502, 503, 504, 505], dtype=torch.int64)
+
+    updated = builder.update_block_table(metadata, new_table, new_slots)
+    assert updated.suffix_slot_mapping_out is not None
+    # req1 past suffix at offset 4 uses updated row 1, block 2 -> block ID 202 -> slot 202 * 2 + 0 = 404
+    # req1 query slots in new_slots at indices 2, 3, 4 -> 502, 503, 504
+    assert updated.suffix_slot_mapping_out.tolist() == [404, 502, 503, 504]
+
+
+def test_update_block_table_current_only_suffix() -> None:
+    # Suffix containing only current query tokens (no past suffix)
+    query_starts = [0, 3]
+    seq_lens = [6]
+    block_table = [[0, 1, 2]]
+    req_ids = ["req_curr_suffix"]
+    beam_data = {
+        "req_curr_suffix": {
+            "is_beam_decode": True,
+            "prefix_len": 0,
+            "beam_width": 3,
+            "beam_decode_steps": 1,
+            "cache_len": 0,
+        }
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    builder = _make_builder()
+    metadata = _build_metadata(common, req_ids, beam_data)
+    assert metadata is not None
+    assert metadata.suffix_slot_mapping_out is not None
+    assert metadata.suffix_slot_mapping_out.tolist() == [100, 101, 102]
+
+    # Update slot mapping
+    new_table = torch.tensor([[10, 11, 12]], dtype=torch.int32)
+    new_slots = torch.tensor([900, 901, 902], dtype=torch.int64)
+
+    updated = builder.update_block_table(metadata, new_table, new_slots)
+    assert updated.suffix_slot_mapping_out is not None
+    assert updated.suffix_slot_mapping_out.tolist() == [900, 901, 902]
+
+
+def test_update_block_table_repeated_updates_immutability() -> None:
+    query_starts = [0, 4]
+    seq_lens = [8]
+    block_table = [[0, 1, 2, 3]]
+    req_ids = ["beam_req"]
+    beam_data = {
+        "beam_req": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "beam_width": 2,
+            "beam_decode_steps": 2,
+            "cache_len": 5,
+        }
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    builder = _make_builder()
+    meta0 = _build_metadata(common, req_ids, beam_data)
+    assert meta0 is not None
+    assert meta0.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
+
+    # Update 1
+    table1 = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+    slots1 = torch.tensor([500, 501, 502, 503], dtype=torch.int64)
+    meta1 = builder.update_block_table(meta0, table1, slots1)
+
+    # Update 2 from meta1
+    table2 = torch.tensor([[30, 31, 32, 33]], dtype=torch.int32)
+    slots2 = torch.tensor([700, 701, 702, 703], dtype=torch.int64)
+    meta2 = builder.update_block_table(meta1, table2, slots2)
+
+    # Prove meta0 remains unchanged
+    assert meta0.block_table.tolist() == [[0, 1, 2, 3]]
+    assert meta0.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
+
+    # Prove meta1 remains unchanged
+    assert meta1.block_table.tolist() == [[10, 11, 12, 13]]
+    assert meta1.suffix_slot_mapping_out.tolist() == [24, 500, 501, 502]
+
+    # Prove meta2 reflects update 2
+    assert meta2.block_table.tolist() == [[30, 31, 32, 33]]
+    assert meta2.suffix_slot_mapping_out.tolist() == [64, 700, 701, 702]
+
+
+def test_update_block_table_two_kv_cache_group_reuse() -> None:
+    query_starts = [0, 4]
+    seq_lens = [8]
+    block_table_group0 = [[1, 2, 3, 4]]
+    req_ids = ["group_beam"]
+    beam_data = {
+        "group_beam": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "beam_width": 2,
+            "beam_decode_steps": 2,
+            "cache_len": 5,
+        }
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table_group0)
+    builder = _make_builder()
+
+    # KV Cache Group 0 build
+    meta_group0 = _build_metadata(common, req_ids, beam_data)
+    assert meta_group0 is not None
+
+    # KV Cache Group 1 table and slot mapping reuse
+    block_table_group1 = torch.tensor([[50, 51, 52, 53]], dtype=torch.int32)
+    slots_group1 = torch.tensor([800, 801, 802, 803], dtype=torch.int64)
+    meta_group1 = builder.update_block_table(meta_group0, block_table_group1, slots_group1)
+
+    # Both share underlying scheduling descriptors
+    assert meta_group1.prefix_indices is meta_group0.prefix_indices
+    assert meta_group1.suffix_past_coords is meta_group0.suffix_past_coords
+
+    # Each holds its own physical block tables & suffix slot mappings
+    assert meta_group0.suffix_slot_mapping_out.tolist() == [6, 100, 101, 102]
+    assert meta_group1.suffix_slot_mapping_out.tolist() == [104, 800, 801, 802]
+
+
+def test_update_block_table_ubatching_rejection() -> None:
+    query_starts = [0, 2, 6]
+    seq_lens = [4, 8]
+    block_table = [
+        [0, 1, 2, 3],
+        [10, 11, 12, 13],
+    ]
+    req_ids = ["req0", "req1_beam"]
+    beam_data = {
+        "req1_beam": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "beam_width": 2,
+            "beam_decode_steps": 2,
+            "cache_len": 5,
+        }
+    }
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    builder = _make_builder()
+    metadata = _build_metadata(common, req_ids, beam_data)
+    assert metadata is not None
+
+    # Pass sliced micro-batch table (e.g., ubatching splitting the batch to 1 request)
+    microbatch_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+    microbatch_slots = torch.tensor([100, 101], dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="Cannot update block table:"):
+        builder.update_block_table(metadata, microbatch_table, microbatch_slots)

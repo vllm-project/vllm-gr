@@ -89,6 +89,12 @@ class BeamAttentionMetadata:
     suffix_seqlens_kv_cpu: list | None = None
     suffix_cu_seqlens_kv_cpu: list | None = None
 
+    # Sparse logical descriptors for update_block_table suffix refreshes
+    suffix_past_coords: torch.Tensor | None = (
+        None  # [num_past, 4]: (out_idx, req_idx, b_idx, b_off)
+    )
+    suffix_curr_coords: torch.Tensor | None = None  # [num_curr, 2]: (out_idx, q_idx)
+
     # Slicing variables for block table updates
     std_req_idxs_cpu: list | None = None
     prefix_req_idxs_cpu: list | None = None
@@ -499,67 +505,46 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
             if suffix_slot_mapping_out_list:
                 suffix_total_tokens = len(suffix_slot_mapping_out_list)
-                has_past = any(
-                    isinstance(item, tuple) and item[0] == "past"
-                    for item in suffix_slot_mapping_out_list
+                block_size = self.block_size
+
+                past_coords_list = []
+                curr_coords_list = []
+
+                for idx, item in enumerate(suffix_slot_mapping_out_list):
+                    if isinstance(item, tuple) and item[0] == "past":
+                        _, req_idx, t_past = item
+                        past_coords_list.append(
+                            (idx, req_idx, t_past // block_size, t_past % block_size)
+                        )
+                    else:
+                        q_idx = item[1] if isinstance(item, tuple) else item
+                        curr_coords_list.append((idx, q_idx))
+
+                suffix_past_coords = (
+                    torch.tensor(past_coords_list, dtype=torch.long, device=device)
+                    if past_coords_list
+                    else None
                 )
-                if not has_past:
-                    q_indices = [
-                        item[1] if isinstance(item, tuple) else item
-                        for item in suffix_slot_mapping_out_list
-                    ]
-                    suffix_map_tensor = torch.tensor(q_indices, dtype=torch.long, device=device)
-                    suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
-                        suffix_map_tensor
-                    ].to(dtype=torch.int32)
-                else:
-                    block_table = common_attn_metadata.block_table_tensor
-                    slot_mapping = common_attn_metadata.slot_mapping
-                    block_size = self.block_size
+                suffix_curr_coords = (
+                    torch.tensor(curr_coords_list, dtype=torch.long, device=device)
+                    if curr_coords_list
+                    else None
+                )
 
-                    past_indices = []
-                    past_req_idxs = []
-                    past_b_idxs = []
-                    past_b_offs = []
-
-                    curr_indices = []
-                    curr_q_idxs = []
-
-                    for idx, item in enumerate(suffix_slot_mapping_out_list):
-                        if isinstance(item, tuple) and item[0] == "past":
-                            _, req_idx, t_past = item
-                            past_indices.append(idx)
-                            past_req_idxs.append(req_idx)
-                            past_b_idxs.append(t_past // block_size)
-                            past_b_offs.append(t_past % block_size)
-                        else:
-                            q_idx = item[1] if isinstance(item, tuple) else item
-                            curr_indices.append(idx)
-                            curr_q_idxs.append(q_idx)
-
-                    suffix_slot_mapping_out = torch.empty(
-                        suffix_total_tokens, dtype=torch.int32, device=device
-                    )
-
-                    if past_indices:
-                        p_idx_t = torch.tensor(past_indices, dtype=torch.long, device=device)
-                        p_req_t = torch.tensor(past_req_idxs, dtype=torch.long, device=device)
-                        p_bidx_t = torch.tensor(past_b_idxs, dtype=torch.long, device=device)
-                        p_boff_t = torch.tensor(past_b_offs, dtype=torch.int32, device=device)
-
-                        past_block_ids = block_table[p_req_t, p_bidx_t].to(dtype=torch.int32)
-                        past_slots = past_block_ids * block_size + p_boff_t
-                        suffix_slot_mapping_out[p_idx_t] = past_slots
-
-                    if curr_indices:
-                        c_idx_t = torch.tensor(curr_indices, dtype=torch.long, device=device)
-                        c_qidx_t = torch.tensor(curr_q_idxs, dtype=torch.long, device=device)
-
-                        curr_slots = slot_mapping[c_qidx_t].to(dtype=torch.int32)
-                        suffix_slot_mapping_out[c_idx_t] = curr_slots
+                suffix_slot_mapping_out = self._project_suffix_slot_mapping(
+                    common_attn_metadata.slot_mapping,
+                    common_attn_metadata.block_table_tensor,
+                    block_size,
+                    suffix_total_tokens,
+                    suffix_past_coords,
+                    suffix_curr_coords,
+                    device,
+                )
             else:
                 suffix_total_tokens = 0
                 suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
+                suffix_past_coords = None
+                suffix_curr_coords = None
 
             if self._is_cuda:
                 prefix_seqlens_kv_device = torch.tensor(
@@ -603,6 +588,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_device = suffix_cu_seqlens_k_device = suffix_seqlens_kv_device = (
                 suffix_slot_mapping_out
             ) = None
+            suffix_past_coords = suffix_curr_coords = None
             suffix_max_q_len = suffix_max_seq_len = suffix_total_tokens = 0
             prefix_scheduler_metadata = None
 
@@ -621,6 +607,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_k_device,
             suffix_max_q_len,
             prefix_scheduler_metadata,
+            suffix_past_coords,
+            suffix_curr_coords,
         )
 
     def build(
@@ -716,6 +704,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_k_device,
             suffix_max_q_len,
             prefix_scheduler_metadata,
+            suffix_past_coords,
+            suffix_curr_coords,
         ) = self._create_beam_tensors(
             common_attn_metadata,
             prefix_indices,
@@ -778,6 +768,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_cpu=suffix_cu_seqlens_q_cpu,
             suffix_seqlens_kv_cpu=suffix_seqlens_kv_cpu,
             suffix_cu_seqlens_kv_cpu=suffix_cu_seqlens_kv_cpu,
+            suffix_past_coords=suffix_past_coords,
+            suffix_curr_coords=suffix_curr_coords,
             num_std_indices=len(std_indices) if std_indices else 0,
             num_prefix_indices=len(prefix_indices) if prefix_indices else 0,
             max_num_splits=max_num_splits,
@@ -787,12 +779,109 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         )
         return meta
 
+    @staticmethod
+    def _project_suffix_slot_mapping(
+        slot_mapping: torch.Tensor,
+        block_table: torch.Tensor,
+        block_size: int,
+        suffix_total_tokens: int,
+        past_coords: torch.Tensor | None,
+        curr_coords: torch.Tensor | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Projects physical suffix slot mappings using sparse past and current token coordinates.
+
+        Memory & Compute Complexity: O(suffix_total_tokens)
+        Avoids materializing or concatenating full-capacity block tables.
+        """
+        if suffix_total_tokens == 0:
+            return torch.empty(0, dtype=torch.int32, device=device)
+
+        has_past = past_coords is not None and past_coords.numel() > 0
+        has_curr = curr_coords is not None and curr_coords.numel() > 0
+
+        # Fast path 1: Current tokens only (no past block table lookups)
+        if has_curr and not has_past:
+            curr_slots = slot_mapping[curr_coords[:, 1]].to(torch.int32)
+            if curr_coords.shape[0] == suffix_total_tokens and torch.equal(
+                curr_coords[:, 0], torch.arange(suffix_total_tokens, device=device)
+            ):
+                return curr_slots
+            out = torch.empty(suffix_total_tokens, dtype=torch.int32, device=device)
+            out[curr_coords[:, 0]] = curr_slots
+            return out
+
+        # Fast path 2: Past tokens only
+        if has_past and not has_curr:
+            past_blocks = block_table[past_coords[:, 1], past_coords[:, 2]].to(torch.int32)
+            past_slots = past_blocks * block_size + past_coords[:, 3].to(torch.int32)
+            if past_coords.shape[0] == suffix_total_tokens and torch.equal(
+                past_coords[:, 0], torch.arange(suffix_total_tokens, device=device)
+            ):
+                return past_slots
+            out = torch.empty(suffix_total_tokens, dtype=torch.int32, device=device)
+            out[past_coords[:, 0]] = past_slots
+            return out
+
+        # Mixed path: past and current tokens
+        out = torch.empty(suffix_total_tokens, dtype=torch.int32, device=device)
+        if has_past:
+            past_blocks = block_table[past_coords[:, 1], past_coords[:, 2]].to(torch.int32)
+            out[past_coords[:, 0]] = past_blocks * block_size + past_coords[:, 3].to(torch.int32)
+        if has_curr:
+            out[curr_coords[:, 0]] = slot_mapping[curr_coords[:, 1]].to(torch.int32)
+
+        return out
+
     def update_block_table(
         self,
         metadata: BeamAttentionMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> BeamAttentionMetadata:
+        # Validate full-table batch geometry contract for update_block_table
+        if metadata.std_req_idxs_cpu:
+            max_std_req = max(metadata.std_req_idxs_cpu)
+            if max_std_req >= blk_table.shape[0]:
+                raise ValueError(
+                    f"Cannot update block table: blk_table row count ({blk_table.shape[0]}) is "
+                    f"incompatible with std_req_idxs_cpu max index ({max_std_req}). "
+                    f"update_block_table requires full-table tensors with identical batch geometry "
+                    f"(ubatching/micro-batching with sliced block tables is not supported)."
+                )
+        if metadata.prefix_req_idxs_cpu:
+            max_prefix_req = max(metadata.prefix_req_idxs_cpu)
+            if max_prefix_req >= blk_table.shape[0]:
+                raise ValueError(
+                    f"Cannot update block table: blk_table row count ({blk_table.shape[0]}) is "
+                    f"incompatible with prefix_req_idxs_cpu max index ({max_prefix_req}). "
+                    f"update_block_table requires full-table tensors with identical batch geometry "
+                    f"(ubatching/micro-batching with sliced block tables is not supported)."
+                )
+        if metadata.suffix_past_coords is not None and metadata.suffix_past_coords.numel() > 0:
+            max_past_req = int(metadata.suffix_past_coords[:, 1].max().item())
+            if max_past_req >= blk_table.shape[0]:
+                raise ValueError(
+                    f"Cannot update block table: blk_table row count ({blk_table.shape[0]}) is "
+                    f"incompatible with suffix_past_coords max req_idx ({max_past_req}). "
+                    f"update_block_table requires full-table tensors with identical batch geometry "
+                    f"(ubatching/micro-batching with sliced block tables is not supported)."
+                )
+            max_past_blk = int(metadata.suffix_past_coords[:, 2].max().item())
+            if max_past_blk >= blk_table.shape[1]:
+                raise ValueError(
+                    f"Cannot update block table: blk_table max_blocks ({blk_table.shape[1]}) is "
+                    f"incompatible with suffix_past_coords max block_idx ({max_past_blk})."
+                )
+        if metadata.suffix_curr_coords is not None and metadata.suffix_curr_coords.numel() > 0:
+            max_q_idx = int(metadata.suffix_curr_coords[:, 1].max().item())
+            if max_q_idx >= slot_mapping.shape[0]:
+                raise ValueError(
+                    f"Cannot update block table: slot_mapping length ({slot_mapping.shape[0]}) is "
+                    f"incompatible with suffix_curr_coords max q_idx ({max_q_idx})."
+                )
+
         new_metadata = copy.copy(metadata)
         new_metadata.block_table = blk_table
         new_metadata.slot_mapping = slot_mapping
@@ -803,5 +892,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             new_metadata.prefix_block_table = blk_table[
                 metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count
             ].contiguous()
+
+        if metadata.suffix_total_tokens > 0:
+            new_metadata.suffix_slot_mapping_out = self._project_suffix_slot_mapping(
+                slot_mapping,
+                blk_table,
+                metadata.block_size,
+                metadata.suffix_total_tokens,
+                metadata.suffix_past_coords,
+                metadata.suffix_curr_coords,
+                blk_table.device,
+            )
 
         return new_metadata
