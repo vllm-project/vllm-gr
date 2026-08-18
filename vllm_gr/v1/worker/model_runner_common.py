@@ -682,6 +682,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
             head_dim=head_dim,
             num_layers=num_layers,
             device=device,
+            dtype=model_config.dtype,
         )
 
     # 4. Per-request session management

@@ -15,6 +15,17 @@ from __future__ import annotations
 
 import torch
 
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _validate_pool_dtype(dtype: torch.dtype) -> None:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"dtype must be a torch.dtype, got {type(dtype).__name__}")
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(
+            f"BeamAttentionPool dtype must be torch.float16 or torch.bfloat16, got {dtype}"
+        )
+
 
 class BeamAttentionPool:
     """Continuous decode KV storage pool (one per layer, one pair).
@@ -33,14 +44,17 @@ class BeamAttentionPool:
         max_decode_steps: int,
         head_dim: int,
         device: torch.device,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype,
     ):
+        _validate_pool_dtype(dtype)
+
         self.max_batch = max_batch
         self.max_beams = max_beams
         self.num_kv_heads = num_kv_heads
         self.max_decode_steps = max_decode_steps
         self.head_dim = head_dim
         self.device = device
+        self.dtype = dtype
 
         # 5-D contiguous tensor, fixed device address
         # [max_batch, max_beams, num_kv_heads, max_decode_steps, head_dim]

@@ -38,6 +38,8 @@ def test_allocation_contract(dtype: torch.dtype) -> None:
     pool = _make_pool(dtype=dtype)
     expected_shape = (1, 4, 2, 3, 8)
 
+    assert pool.dtype == dtype
+
     for tensor in (pool.unshared_key, pool.unshared_value):
         assert tensor.shape == expected_shape
         assert tensor.dtype == dtype
@@ -46,6 +48,20 @@ def test_allocation_contract(dtype: torch.dtype) -> None:
         assert not tensor.requires_grad
 
     assert pool.unshared_key.data_ptr() != pool.unshared_value.data_ptr()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int8])  # type: ignore[misc]
+def test_pool_rejects_non_activation_dtype(dtype: torch.dtype) -> None:
+    with pytest.raises(
+        ValueError,
+        match="dtype must be torch.float16 or torch.bfloat16",
+    ):
+        _make_pool(dtype=dtype)
+
+
+def test_pool_rejects_non_torch_dtype() -> None:
+    with pytest.raises(TypeError, match="dtype must be a torch.dtype"):
+        _make_pool(dtype="float16")
 
 
 @pytest.mark.parametrize("max_batch", [1, 2, 4])  # type: ignore[misc]

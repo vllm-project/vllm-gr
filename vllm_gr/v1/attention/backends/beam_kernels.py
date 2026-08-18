@@ -38,6 +38,22 @@ def cache_unshared_kv(
     When the beam count stays constant (the fixed-width case) ``W_cur`` equals
     the pool width and this is a full-width write.
     """
+    if unshared_key.dtype != unshared_value.dtype:
+        raise TypeError(
+            "Beam KV pool key/value dtype mismatch: "
+            f"key={unshared_key.dtype}, value={unshared_value.dtype}"
+        )
+    if curr_key.dtype != curr_value.dtype:
+        raise TypeError(
+            "Current attention key/value dtype mismatch: "
+            f"key={curr_key.dtype}, value={curr_value.dtype}"
+        )
+    if unshared_key.dtype != curr_key.dtype:
+        raise TypeError(
+            "Beam KV pool dtype must match the current attention K/V dtype: "
+            f"pool={unshared_key.dtype}, current={curr_key.dtype}"
+        )
+
     n = curr_key.shape[0]
     # Write into the pool's step slice for the given slot
     unshared_key[slot, :n, :, decode_step : decode_step + 1, :].copy_(

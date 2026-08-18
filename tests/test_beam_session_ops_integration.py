@@ -83,6 +83,60 @@ def test_beam_kernels_cache_writes_to_pool_slot(device: torch.device, dtype: tor
     assert torch.all(pool.unshared_value[0, 2:] == -2)
 
 
+def test_beam_kernels_cache_rejects_pool_activation_dtype_mismatch_before_write() -> None:
+    session = _make_session(
+        torch.device("cpu"),
+        torch.bfloat16,
+        num_layers=1,
+        max_beams=2,
+    )
+    session.begin_session(beam_width=2, prefix_len=5)
+    pool = session.pools[0]
+    pool.unshared_key.fill_(7)
+    pool.unshared_value.fill_(8)
+    original_key = pool.unshared_key.clone()
+    original_value = pool.unshared_value.clone()
+    current_key = torch.zeros((2, 2, 4), dtype=torch.float16)
+    current_value = torch.ones_like(current_key)
+
+    with pytest.raises(
+        TypeError,
+        match="pool dtype must match the current attention K/V dtype",
+    ):
+        cache_unshared_kv(
+            pool.unshared_key,
+            pool.unshared_value,
+            current_key,
+            current_value,
+            slot=session.slot,
+            decode_step=session.decode_step,
+        )
+
+    torch.testing.assert_close(pool.unshared_key, original_key, rtol=0, atol=0)
+    torch.testing.assert_close(pool.unshared_value, original_value, rtol=0, atol=0)
+
+
+def test_beam_kernels_cache_rejects_current_key_value_dtype_mismatch() -> None:
+    session = _make_session(
+        torch.device("cpu"),
+        torch.float16,
+        num_layers=1,
+        max_beams=2,
+    )
+    session.begin_session(beam_width=2, prefix_len=5)
+    pool = session.pools[0]
+
+    with pytest.raises(TypeError, match="Current attention key/value dtype mismatch"):
+        cache_unshared_kv(
+            pool.unshared_key,
+            pool.unshared_value,
+            torch.zeros((2, 2, 4), dtype=torch.float16),
+            torch.zeros((2, 2, 4), dtype=torch.bfloat16),
+            slot=session.slot,
+            decode_step=session.decode_step,
+        )
+
+
 @pytest.mark.parametrize("device", _devices())  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
 @pytest.mark.parametrize(

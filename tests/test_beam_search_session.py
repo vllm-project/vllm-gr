@@ -88,10 +88,19 @@ def test_constructor_allocates_frozen_storage_contract(dtype: torch.dtype) -> No
     assert session.context.suffix_k_buf.shape == (2 * 4 * 3, 2, 8)
     assert session.context.suffix_v_buf.shape == (2 * 4 * 3, 2, 8)
     assert session.context.suffix_k_buf.dtype == session.context.suffix_v_buf.dtype == dtype
+    assert session.context.dtype == dtype
     # After allocate, is_active is True (our registry sets is_active=True on allocate)
     assert session.is_active
     assert session.beam_width == 0
     assert session.decode_step == 0
+
+
+def test_context_rejects_unsupported_activation_dtype() -> None:
+    with pytest.raises(
+        ValueError,
+        match="dtype must be torch.float16 or torch.bfloat16",
+    ):
+        _make_context(dtype=torch.float32)
 
 
 def test_session_references_shared_context() -> None:

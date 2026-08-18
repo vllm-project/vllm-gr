@@ -221,3 +221,45 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
 
     assert runner._current_beam_data == {}
     assert runner._current_beam_info is None
+
+
+@pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
+def test_beam_context_pool_follows_model_activation_dtype(
+    model_dtype: torch.dtype,
+) -> None:
+    parallel_config = object()
+    model_config = SimpleNamespace(
+        dtype=model_dtype,
+        get_num_kv_heads=lambda config: 2,
+        get_head_size=lambda: 8,
+        get_num_layers=lambda config: 2,
+    )
+    runner = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=parallel_config,
+        device=torch.device("cpu"),
+        # A quantized paged prefix cache must not determine the suffix pool dtype.
+        cache_config=SimpleNamespace(cache_dtype="fp8"),
+    )
+    beam_data = {
+        "beam": {
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_decode_steps": 1,
+            "beam_width": 2,
+            "prefix_len": 4,
+            "max_decode_steps": 3,
+        }
+    }
+
+    session = common._get_or_create_beam_session(
+        runner,
+        beam_data,
+        SimpleNamespace(beam_finished_session_ids=[]),
+    )
+
+    assert session is not None
+    assert runner._beam_context.dtype == model_dtype
+    assert runner._beam_context.suffix_k_buf.dtype == model_dtype
+    assert runner._beam_context.suffix_v_buf.dtype == model_dtype
+    assert all(pool.dtype == model_dtype for pool in runner._beam_context.pools)

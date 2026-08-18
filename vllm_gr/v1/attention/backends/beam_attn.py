@@ -228,7 +228,9 @@ class BeamAttentionImpl(AttentionImpl):
                 beam_session.decode_step,
             )
 
-            # No fp8 conversion for pool tensors (pool is always bfloat16)
+            # The suffix pool stores unquantized model activations. Its dtype
+            # follows the current attention K/V, independently of a possibly
+            # FP8 paged prefix cache.
             sliding_window_size = (
                 list(self.sliding_window) if self.sliding_window is not None else None
             )

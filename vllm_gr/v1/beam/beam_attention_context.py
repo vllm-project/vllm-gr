@@ -17,7 +17,7 @@ from typing import List, Tuple
 
 import torch
 
-from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
+from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool, _validate_pool_dtype
 from vllm_gr.v1.beam.beam_session_registry import BeamSessionRegistry
 
 
@@ -45,13 +45,16 @@ class BeamAttentionContext:
         head_dim: int,
         num_layers: int,
         device: torch.device,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype,
     ):
+        _validate_pool_dtype(dtype)
+
         self.max_batch = max_batch
         self.max_beams = max_beams
         self.max_decode_steps = max_decode_steps
         self.num_layers = num_layers
         self.device = device
+        self.dtype = dtype
 
         # Per-request session registry
         self.registry = BeamSessionRegistry(max_batch)
