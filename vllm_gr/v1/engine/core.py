@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
+from copy import copy
 from typing import Any
 
 from vllm.logger import init_logger
@@ -24,10 +25,16 @@ _BEAM_STATE_INIT_LOCK = threading.Lock()
 
 def _ensure_beam_state(self) -> None:
     """Initialize per-engine beam state, including for late plugin loading."""
-    if (
-        getattr(self, "beam_cache", None) is not None
-        and getattr(self, "beam_cache_lock", None) is not None
-    ):
+    state_attributes = (
+        "beam_cache",
+        "beam_cache_lock",
+        "beam_controllers",
+        "beam_controller_contexts",
+        "beam_seen_session_ids",
+        "beam_cancelled_session_ids",
+        "beam_constraint_resources",
+    )
+    if all(getattr(self, name, None) is not None for name in state_attributes):
         return
 
     # General plugins may first load from inside EngineCore.__init__. In that
@@ -38,6 +45,315 @@ def _ensure_beam_state(self) -> None:
             self.beam_cache: dict[str, dict] = {}
         if getattr(self, "beam_cache_lock", None) is None:
             self.beam_cache_lock = threading.Lock()
+        if getattr(self, "beam_controllers", None) is None:
+            self.beam_controllers = {}
+        if getattr(self, "beam_controller_contexts", None) is None:
+            self.beam_controller_contexts = {}
+        if getattr(self, "beam_seen_session_ids", None) is None:
+            self.beam_seen_session_ids = set()
+        if getattr(self, "beam_cancelled_session_ids", None) is None:
+            self.beam_cancelled_session_ids = set()
+        if getattr(self, "beam_constraint_resources", None) is None:
+            from vllm_gr.constraints.trie_resource import (
+                BeamConstraintResourceRegistry,
+            )
+
+            self.beam_constraint_resources = BeamConstraintResourceRegistry()
+
+
+def _controller_failure_result(start, error: str) -> dict[str, Any]:
+    from vllm_gr.v1.beam.controller_types import BeamControllerFinalResult
+
+    return BeamControllerFinalResult(
+        beam_session_id=start.controller.beam_session_id,
+        external_request_id=start.controller.external_request_id,
+        beams=[],
+        metrics=None,
+        finish_reason="error",
+        error=error,
+    ).to_wire()
+
+
+def _put_controller_result(self, client_index: int, call_id: int, result: dict) -> None:
+    """Resolve the frontend's one long-lived beam submission future."""
+    from vllm.v1.engine import EngineCoreOutputs, UtilityOutput
+    from vllm.v1.serial_utils import UtilityResult
+
+    output = UtilityOutput(call_id=call_id, result=UtilityResult(result))
+    if not hasattr(self, "output_queue"):
+        raise RuntimeError("EngineCore beam controller output requires an output queue")
+    self.output_queue.put_nowait(
+        (
+            client_index,
+            EngineCoreOutputs(engine_index=getattr(self, "engine_index", 0), utility_output=output),
+        )
+    )
+
+
+def create_controller(self, start, request) -> Any:
+    """Create and admit one EngineCore-owned beam controller."""
+    from vllm_gr.config import BeamControlMode, GRConfig
+    from vllm_gr.constraints.trie_resource import trie_resource_from_wire
+    from vllm_gr.v1.beam.beam_search_controller import BeamSearchController
+
+    _ensure_beam_state(self)
+    session_id = start.controller.beam_session_id
+    if session_id in self.beam_seen_session_ids:
+        raise ValueError(f"duplicate beam_session_id {session_id!r}")
+    configured_mode = GRConfig.from_vllm_config(self.vllm_config).beam_control_mode
+    if configured_mode is not BeamControlMode.ENGINE_PER_STEP_REQUEST:
+        raise ValueError(
+            "EngineCore beam controller request rejected because configured "
+            f"beam_control_mode is {configured_mode.value!r}"
+        )
+    if request.request_id != session_id:
+        raise ValueError(
+            f"beam engine request id {request.request_id!r} does not match "
+            f"session id {session_id!r}"
+        )
+
+    if start.constraint_resource is not None:
+        resource = trie_resource_from_wire(start.constraint_resource)
+        self.beam_constraint_resources.ensure(resource)
+
+    constraint_resource = None
+    resource_id = start.controller.constraint_resource_id
+    if start.controller.constraint_backend == "trie" and resource_id is not None:
+        constraint_resource = self.beam_constraint_resources.require(resource_id)
+
+    controller = BeamSearchController.from_request(
+        start.controller,
+        constraint_resource=constraint_resource,
+    )
+    self.beam_seen_session_ids.add(session_id)
+    self.beam_controllers[session_id] = controller
+    self.beam_controller_contexts[session_id] = {
+        "client_index": start.client_index,
+        "call_id": start.call_id,
+        "current_wave": start.current_wave,
+        "sampling_params": request.sampling_params,
+        "eos_token_id": start.controller.eos_token_id,
+        "lora_request": request.lora_request,
+        "cache_salt": request.cache_salt,
+        "trace_headers": request.trace_headers,
+        "priority": request.priority,
+        "data_parallel_rank": start.data_parallel_rank,
+    }
+
+    try:
+        if not controller.requires_step:
+            _finish_controller(self, session_id)
+            return controller
+
+        self._cache_beam_request(request)
+        controller.mark_step_dispatched()
+        self.add_request(request, start.current_wave)
+    except Exception:
+        # Admission is transactional with respect to live controller state.
+        # Keep the session ID in ``seen`` so a failed start cannot be replayed
+        # as a different logical session.
+        remove_controller(self, session_id)
+        with self.beam_cache_lock:
+            self.beam_cache.pop(session_id, None)
+        raise
+    return controller
+
+
+def get_controller(self, session_id: str) -> Any:
+    _ensure_beam_state(self)
+    try:
+        return self.beam_controllers[session_id]
+    except KeyError as exc:
+        raise KeyError(f"unknown beam controller session {session_id!r}") from exc
+
+
+def consume_step_output(self, session_id: str, output) -> Any:
+    """Consume one raw EngineCore output and issue the next internal request."""
+    from vllm.v1.engine import FinishReason
+
+    from vllm_gr.v1.beam.controller_types import BeamControllerStepOutput
+    from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+
+    controller = get_controller(self, session_id)
+    old_internal_ids = list(controller.previous_internal_ids)
+    error = None
+    if output.finish_reason == FinishReason.ERROR:
+        error = "worker returned an error for beam execution"
+
+    token_ids: list[int] = []
+    logprobs: list[float] = []
+    ranks: list[int | None] | None = None
+    if output.new_logprobs is not None:
+        token_ids = output.new_logprobs.logprob_token_ids.reshape(-1).tolist()
+        logprobs = output.new_logprobs.logprobs.reshape(-1).tolist()
+        parent_count = max(1, len(controller.active_beams))
+        if len(token_ids) % parent_count == 0:
+            stride = len(token_ids) // parent_count
+            sampled_ranks = output.new_logprobs.sampled_token_ranks.reshape(-1).tolist()
+            ranks = []
+            for parent_index in range(parent_count):
+                sampled_rank = (
+                    int(sampled_ranks[parent_index])
+                    if parent_index < len(sampled_ranks)
+                    else (int(sampled_ranks[0]) if sampled_ranks else None)
+                )
+                ranks.extend([sampled_rank, *range(1, stride)])
+
+    decision = controller.consume_output(
+        BeamControllerStepOutput(
+            token_ids=token_ids,
+            logprobs=logprobs,
+            ranks=ranks,
+            decoded_tokens=[None] * len(token_ids),
+            error=error,
+        )
+    )
+    if decision.finished:
+        _finish_controller(self, session_id)
+        return decision
+
+    context = self.beam_controller_contexts[session_id]
+    used_parents = {old_internal_ids[parent_index] for parent_index in decision.parent_beam_indices}
+    pruned_ids = [
+        internal_id for internal_id in old_internal_ids if internal_id not in used_parents
+    ]
+    update = BeamRequestStepUpdate(
+        session_id=session_id,
+        parent_beam_ids=[
+            old_internal_ids[parent_index] for parent_index in decision.parent_beam_indices
+        ],
+        child_beam_ids=list(controller.previous_internal_ids),
+        beam_tokens=[[token_id] for token_id in decision.next_tokens],
+        pruned_ids=pruned_ids,
+        prefix_len=len(controller.initial_tokens),
+        beam_width=decision.active_width,
+        sampling_params=copy(context["sampling_params"]),
+        eos_token_id=context["eos_token_id"],
+        client_index=context["client_index"],
+        current_wave=context["current_wave"],
+        priority=context["priority"],
+        data_parallel_rank=context["data_parallel_rank"],
+        lora_request=context["lora_request"],
+        cache_salt=context["cache_salt"],
+        trace_headers=context["trace_headers"],
+        parent_beam_indices=decision.parent_beam_indices,
+        max_decode_steps=controller.total_execution_steps,
+        decode_step=decision.completed_step,
+        controller_owned=True,
+    )
+    controller.mark_step_dispatched()
+    self._handle_beam_request_step_update(update)
+    return decision
+
+
+def cancel_controller(self, session_id: str) -> bool:
+    """Cancel a controller; repeated cleanup is idempotent."""
+    _ensure_beam_state(self)
+    controller = self.beam_controllers.get(session_id)
+    if controller is None:
+        if session_id in self.beam_cancelled_session_ids:
+            return False
+        raise KeyError(f"unknown beam controller session {session_id!r}")
+    controller.cancel()
+    self.beam_cancelled_session_ids.add(session_id)
+    _finish_controller(self, session_id)
+    return True
+
+
+def finalize_controller(self, session_id: str) -> Any:
+    return get_controller(self, session_id).finalize()
+
+
+def remove_controller(self, session_id: str) -> bool:
+    _ensure_beam_state(self)
+    removed = self.beam_controllers.pop(session_id, None) is not None
+    self.beam_controller_contexts.pop(session_id, None)
+    return removed
+
+
+def _finish_controller(self, session_id: str) -> None:
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+
+    controller = get_controller(self, session_id)
+    context = self.beam_controller_contexts[session_id]
+    result = controller.finalize()
+
+    # Reuse the authoritative legacy teardown signal for Scheduler/Worker KV.
+    self._handle_beam_request_step_update(
+        BeamRequestStepUpdate(
+            session_id=session_id,
+            parent_beam_ids=[],
+            child_beam_ids=[],
+            beam_tokens=[],
+            pruned_ids=list(controller.previous_internal_ids),
+            prefix_len=0,
+            beam_width=0,
+            sampling_params=SamplingParams(),
+            client_index=context["client_index"],
+            current_wave=context["current_wave"],
+            data_parallel_rank=context["data_parallel_rank"],
+            controller_owned=True,
+        )
+    )
+    _put_controller_result(
+        self,
+        context["client_index"],
+        context["call_id"],
+        result.to_wire(),
+    )
+    remove_controller(self, session_id)
+
+
+def _fail_controller(self, session_id: str, error: str) -> None:
+    controller = get_controller(self, session_id)
+    controller._fail(error)
+    _finish_controller(self, session_id)
+
+
+def route_beam_controller_outputs(self, outputs):
+    """Consume controller step outputs and suppress them from the frontend."""
+    if not outputs:
+        return outputs
+    _ensure_beam_state(self)
+    for client_index, batch in list(outputs.items()):
+        remaining = []
+        consumed_ids: set[str] = set()
+        for output in batch.outputs:
+            session_id = output.request_id
+            if session_id in self.beam_controllers:
+                consumed_ids.add(session_id)
+                try:
+                    consume_step_output(self, session_id, output)
+                except Exception as exc:
+                    logger.exception("Beam controller %s failed while consuming output", session_id)
+                    if session_id in self.beam_controllers:
+                        _fail_controller(self, session_id, str(exc))
+                continue
+            if session_id in self.beam_seen_session_ids:
+                logger.error("Received output for removed beam controller session %s", session_id)
+                consumed_ids.add(session_id)
+                continue
+            remaining.append(output)
+        batch.outputs = remaining
+        if batch.finished_requests is not None and consumed_ids:
+            batch.finished_requests = set(batch.finished_requests) - consumed_ids
+    return outputs
+
+
+def clear_controllers(self) -> None:
+    """Best-effort idempotent EngineCore shutdown cleanup."""
+    _ensure_beam_state(self)
+    for session_id in list(self.beam_controllers):
+        try:
+            cancel_controller(self, session_id)
+        except Exception:
+            logger.exception("Failed to cancel beam controller %s during shutdown", session_id)
+            remove_controller(self, session_id)
+    self.beam_constraint_resources.clear()
+    self.beam_seen_session_ids.clear()
+    self.beam_cancelled_session_ids.clear()
 
 
 # ------------------------------------------------------------------------------------
@@ -149,6 +465,9 @@ def _handle_beam_request_step_update(self, update) -> None:
         or len(update.child_beam_ids) != beam_width
     ):
         logger.error("BEAM_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
+        if getattr(update, "controller_owned", False):
+            _fail_controller(self, session_id, "beam step update length mismatch")
+            return
         for child_id in update.child_beam_ids:
             self.output_queue.put_nowait(
                 (
@@ -174,6 +493,9 @@ def _handle_beam_request_step_update(self, update) -> None:
 
     if session_cached is None and beam_width > 0:
         logger.error("BEAM_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
+        if getattr(update, "controller_owned", False):
+            _fail_controller(self, session_id, "beam prefill cache entry is missing")
+            return
         for child_id in update.child_beam_ids:
             self.output_queue.put_nowait(
                 (
@@ -211,9 +533,22 @@ def _handle_beam_request_step_update(self, update) -> None:
     # In incremental decode mode, only send the new token for each beam
     # (not all previous tokens — those are already in the KV pool)
     # decode_step is 0-indexed: first decode step = 0, second = 1, etc.
-    decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
-    assert all(len(t) == decode_steps for t in update.beam_tokens)
-    beam_decode_step = decode_steps - 1 if decode_steps > 0 else 0
+    if update.decode_step is None:
+        decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
+        assert all(len(t) == decode_steps for t in update.beam_tokens)
+        beam_decode_step = decode_steps - 1 if decode_steps > 0 else 0
+    else:
+        beam_decode_step = update.decode_step
+        decode_steps = beam_decode_step + 1
+        if any(len(tokens) != 1 for tokens in update.beam_tokens):
+            if getattr(update, "controller_owned", False):
+                _fail_controller(
+                    self,
+                    session_id,
+                    "EngineCore-controlled beam updates must carry one token per beam",
+                )
+                return
+            raise ValueError("explicit beam decode_step requires one token per beam")
 
     # For incremental decode, only send the new token per beam
     # (prefix KV is in paged cache, previous decode KV is in pool)
@@ -265,7 +600,10 @@ def _handle_beam_request_step_update(self, update) -> None:
     # Store max decode steps for KV pool pre-allocation
     req.max_decode_steps = update.max_decode_steps
 
-    self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, update.current_wave)))
+    if hasattr(self, "input_queue"):
+        self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, update.current_wave)))
+    else:
+        self.add_request(req, update.current_wave)
 
     for abort_id in update.pruned_ids:
         self.aborts_queue.put_nowait(abort_id)
@@ -382,6 +720,27 @@ def process_input_sockets(
                     beam_update: BeamRequestStepUpdate = decoded_payload
                     self._handle_beam_request_step_update(beam_update)
                     continue
+
+                elif request_type == EngineCoreRequestType.BEAM_CONTROLLER_START:
+                    start = decoded_payload
+                    try:
+                        preprocessed = self.preprocess_add_request(start.engine_request)
+                    except Exception as exc:
+                        logger.exception(
+                            "Failed to preprocess beam controller session %s",
+                            start.controller.beam_session_id,
+                        )
+                        _put_controller_result(
+                            self,
+                            start.client_index,
+                            start.call_id,
+                            _controller_failure_result(start, str(exc)),
+                        )
+                        continue
+                    request = (start, preprocessed[0])
+
+                elif request_type == EngineCoreRequestType.BEAM_CONTROLLER_CANCEL:
+                    request = decoded_payload
 
                 else:
                     request = decoded_payload

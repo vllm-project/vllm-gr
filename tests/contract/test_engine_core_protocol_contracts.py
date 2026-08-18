@@ -17,6 +17,8 @@ from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.engine.wire import (
     ADD_BATCH_WIRE_VALUE,
+    BEAM_CONTROLLER_CANCEL_WIRE_VALUE,
+    BEAM_CONTROLLER_START_WIRE_VALUE,
     BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE,
     register_engine_core_request_types,
 )
@@ -33,6 +35,8 @@ UPSTREAM_REQUEST_WIRE_VALUES = {
 GR_REQUEST_WIRE_VALUES = {
     "ADD_BATCH": b"\x06",
     "BEAM_REQUEST_STEP_UPDATE": b"\x07",
+    "BEAM_CONTROLLER_START": b"\x08",
+    "BEAM_CONTROLLER_CANCEL": b"\x09",
 }
 
 ENGINE_CORE_REQUEST_FIELDS = (
@@ -77,6 +81,8 @@ BEAM_STEP_UPDATE_FIELDS = (
     "trace_headers",
     "parent_beam_indices",
     "max_decode_steps",
+    "decode_step",
+    "controller_owned",
 )
 
 
@@ -96,6 +102,8 @@ def _minimal_beam_step_update(**overrides: object) -> BeamRequestStepUpdate:
         "sampling_params": _sampling_params(),
         "parent_beam_indices": [0, 0],
         "max_decode_steps": 4,
+        "decode_step": 1,
+        "controller_owned": True,
     }
     values.update(overrides)
     return BeamRequestStepUpdate(**values)
@@ -104,6 +112,8 @@ def _minimal_beam_step_update(**overrides: object) -> BeamRequestStepUpdate:
 def test_engine_core_wire_value_inventory() -> None:
     assert ADD_BATCH_WIRE_VALUE == b"\x06"
     assert BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE == b"\x07"
+    assert BEAM_CONTROLLER_START_WIRE_VALUE == b"\x08"
+    assert BEAM_CONTROLLER_CANCEL_WIRE_VALUE == b"\x09"
     register_engine_core_request_types()
     register_engine_core_request_types()
 
@@ -162,7 +172,7 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
     assert raw_payload[8:13] == [2, 3, 4, 5, 6]
     assert raw_payload[13] is None
     assert raw_payload[14:16] == ["cache-salt", {"traceparent": "trace-0"}]
-    assert raw_payload[16:] == [[0, 0], 4]
+    assert raw_payload[16:] == [[0, 0], 4, 1, True]
 
 
 def test_scheduler_beam_metadata_shape() -> None:

@@ -145,6 +145,10 @@ def _validate_request_types_patch() -> str | None:
         getattr(getattr(EngineCoreRequestType, "ADD_BATCH", None), "value", None) == b"\x06"
         and getattr(getattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE", None), "value", None)
         == b"\x07"
+        and getattr(getattr(EngineCoreRequestType, "BEAM_CONTROLLER_START", None), "value", None)
+        == b"\x08"
+        and getattr(getattr(EngineCoreRequestType, "BEAM_CONTROLLER_CANCEL", None), "value", None)
+        == b"\x09"
     )
     return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
 
@@ -155,6 +159,8 @@ def _validate_engine_clients_patch() -> str | None:
     from vllm_gr.v1.engine.core_client import (
         add_requests_async,
         beam_request_step_update_async,
+        cancel_beam_controller_async,
+        run_beam_controller_async,
     )
     from vllm_gr.v1.engine.core_client_patch import (
         inproc_add_requests,
@@ -166,6 +172,8 @@ def _validate_engine_clients_patch() -> str | None:
     valid = (
         AsyncMPClient.add_requests_async is add_requests_async
         and AsyncMPClient.beam_request_step_update_async is beam_request_step_update_async
+        and AsyncMPClient.run_beam_controller_async is run_beam_controller_async
+        and AsyncMPClient.cancel_beam_controller_async is cancel_beam_controller_async
         and SyncMPClient.add_requests is sync_mp_add_requests
         and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
         and InprocClient.add_requests is inproc_add_requests
@@ -180,8 +188,10 @@ def _validate_async_llm_patch() -> str | None:
     from vllm_gr.v1.engine.async_llm import (
         _add_requests_batch_fn,
         beam_request_step_update_fn,
+        cancel_beam_controller_fn,
         prepare_request_fn,
         register_beam_output_fn,
+        run_beam_controller_fn,
     )
 
     valid = (
@@ -189,6 +199,8 @@ def _validate_async_llm_patch() -> str | None:
         and AsyncLLM._add_requests_batch is _add_requests_batch_fn
         and AsyncLLM.register_beam_output is register_beam_output_fn
         and AsyncLLM.beam_request_step_update is beam_request_step_update_fn
+        and AsyncLLM.run_beam_controller is run_beam_controller_fn
+        and AsyncLLM.cancel_beam_controller is cancel_beam_controller_fn
     )
     return _verified(valid, "AsyncLLM grouped-beam methods are not fully installed")
 

@@ -15,14 +15,22 @@ from vllm_gr.constraints.strategies import (
     TrieConstraintStrategy,
     create_constraint_strategy,
 )
+from vllm_gr.constraints.trie_resource import (
+    BeamConstraintResourceRegistry,
+    TrieConstraintCompiler,
+    TrieConstraintResource,
+)
 
 __all__ = [
     "BeamConstraintCoordinator",
+    "BeamConstraintResourceRegistry",
     "CandidateLayout",
     "ConstraintStrategy",
     "ConstraintTableStrategy",
     "ParentCandidateBatch",
     "ParentCandidateBuilder",
+    "TrieConstraintCompiler",
+    "TrieConstraintResource",
     "TrieConstraintStrategy",
     "create_constraint_strategy",
 ]

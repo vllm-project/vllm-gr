@@ -130,6 +130,7 @@ patches:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
       - tests/test_beam_request_unit.py
+      - tests/test_engine_core_beam_controller_registry.py
     process_roles: [engine_core]
     target: vllm.v1.engine.core.EngineCoreProc
     risk: critical

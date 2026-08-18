@@ -11,10 +11,17 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
 from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
 
+from vllm_gr.config.parser import BEAM_CONTROL_MODE_KEY
 from vllm_gr.entrypoints.openai import serving_engine
+from vllm_gr.v1.beam.controller_types import (
+    BeamControllerFinalBeam,
+    BeamControllerFinalResult,
+    BeamControllerMetrics,
+)
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 
@@ -199,6 +206,66 @@ class _GroupedEngineClient(_OrdinaryEngineClient):
         self.beam_updates.append(update)
         if self.fail_cleanup and update.beam_width == 0:
             raise RuntimeError("cleanup failed")
+
+
+class _EngineControlledClient:
+    def __init__(self) -> None:
+        self.vllm_config = SimpleNamespace(
+            additional_config={BEAM_CONTROL_MODE_KEY: "engine_per_step_request"},
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+        )
+        self.run_calls: list[SimpleNamespace] = []
+        self.cancel_calls: list[tuple[str, int | None]] = []
+
+    async def run_beam_controller(self, prompt: Any, sampling_params: Any, request: Any, **kwargs):
+        self.run_calls.append(
+            SimpleNamespace(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request=request,
+                kwargs=kwargs,
+            )
+        )
+        logprobs = _flat([11, 12], [-0.1, -0.2])
+        logprobs_wire = {
+            "start_indices": list(logprobs.start_indices),
+            "end_indices": list(logprobs.end_indices),
+            "token_ids": list(logprobs.token_ids),
+            "logprobs": list(logprobs.logprobs),
+            "ranks": list(logprobs.ranks),
+            "decoded_tokens": list(logprobs.decoded_tokens),
+        }
+        return BeamControllerFinalResult(
+            beam_session_id=request.beam_session_id,
+            external_request_id=request.external_request_id,
+            beams=[
+                BeamControllerFinalBeam(
+                    token_ids=[11],
+                    decode_token_ids=[11],
+                    cumulative_logprob=-0.1,
+                    logprobs=logprobs_wire,
+                    finish_reason="length",
+                    stop_reason=None,
+                )
+            ],
+            metrics=BeamControllerMetrics(
+                beam_search_overhead=0.01,
+                beam_search_prefill_time=0.02,
+                beam_search_decode_time=0.03,
+                beam_search_sort_time=0.001,
+                num_generation_tokens=1,
+                num_beams=2,
+            ),
+            finish_reason="completed",
+        ).to_wire()
+
+    async def cancel_beam_controller(
+        self,
+        beam_session_id: str,
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> None:
+        self.cancel_calls.append((beam_session_id, data_parallel_rank))
 
 
 def _serving(engine_client: Any) -> SimpleNamespace:
@@ -413,3 +480,37 @@ def test_eos_and_distinct_sid_end_token_both_complete() -> None:
     assert [choice.finish_reason for choice in choices] == ["stop", "stop"]
     assert [choice.stop_reason for choice in choices] == [3, 2]
     assert [choice.token_ids for choice in choices] == [[], []]
+
+
+def test_engine_control_mode_submits_one_logical_request(monkeypatch: Any) -> None:
+    monkeypatch.setattr(serving_engine, "random_uuid", lambda: "session-suffix")
+    engine = _EngineControlledClient()
+
+    outputs = _run_search(engine, max_tokens=3)
+
+    assert len(engine.run_calls) == 1
+    call = engine.run_calls[0]
+    assert call.request.beam_session_id == "request-0-beam-session-session-suffix"
+    assert call.request.external_request_id == "request-0"
+    assert call.request.prompt_token_ids == [10]
+    assert call.request.initial_tokens == [10]
+    assert call.request.beam_width == 2
+    assert call.request.max_tokens == 3
+    assert call.sampling_params.max_tokens == 1
+    assert len(outputs) == 1
+    assert outputs[0].outputs[0].text == "11"
+    assert outputs[0].outputs[0].token_ids == [11]
+
+
+def test_engine_control_mode_forwards_cancellation(monkeypatch: Any) -> None:
+    monkeypatch.setattr(serving_engine, "random_uuid", lambda: "cancelled")
+    engine = _EngineControlledClient()
+
+    async def cancel_during_run(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    engine.run_beam_controller = cancel_during_run
+    with pytest.raises(asyncio.CancelledError):
+        _run_search(engine, max_tokens=3, request_id="cancel-request")
+
+    assert engine.cancel_calls == [("cancel-request-beam-session-cancelled", None)]

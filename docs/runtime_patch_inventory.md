@@ -180,6 +180,8 @@ aligned with it.
 - Added values:
     - `ADD_BATCH = b"\x06"`
     - `BEAM_REQUEST_STEP_UPDATE = b"\x07"`
+    - `BEAM_CONTROLLER_START = b"\x08"`
+    - `BEAM_CONTROLLER_CANCEL = b"\x09"`
 - Risk: Critical
 - Current compatibility: upstream vLLM 0.22.1 uses values `0x00` through `0x05`.
 - Private dependencies:
@@ -197,7 +199,18 @@ aligned with it.
     - `EngineCoreProc.run_engine_core`
     - GR Beam request handlers
 - Risk: Critical
-- Behavior: integrates grouped Beam request processing into EngineCore.
+- Behavior: integrates grouped Beam request processing and the staged
+  EngineCore-owned `BeamSearchController` lifecycle into EngineCore. In
+  `engine_per_step_request` mode, Serving submits one controller start message;
+  EngineCore consumes each Worker result and internally reuses the grouped
+  per-step request path until it emits one terminal utility result.
+- Catalog boundary in this mode:
+    - Serving uses the tokenizer once to compile catalog token strings into an
+      immutable CSR Trie of token IDs;
+    - the initial controller message carries the Trie digest and serialized
+      resource, never the tokenizer or legacy `Catalog` object;
+    - EngineCore deduplicates resources by digest and each controller tracks
+      only integer Trie node state per active beam.
 - Compatibility-sensitive upstream behavior includes:
     - ZMQ socket construction;
     - READY and coordinator handshakes;

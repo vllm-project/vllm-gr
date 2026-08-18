@@ -9,7 +9,7 @@ from typing import Final
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
+from vllm_gr.config import BeamControlMode, ConstraintBackend, GRAttentionBackend, GRConfig
 
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
@@ -72,6 +72,13 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         default=None,
         help="Constraint implementation: trie (default) or constraint_table.",
     )
+    model_group.add_argument(
+        "--beam-control-mode",
+        type=str,
+        choices=[mode.value for mode in BeamControlMode],
+        default=None,
+        help="Beam control owner: serving (default) or engine_per_step_request.",
+    )
     return parser
 
 
@@ -85,6 +92,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.constraint_backend = None
     if hasattr(args, "constraint_backend"):
         engine_args.constraint_backend = args.constraint_backend
+    engine_args.beam_control_mode = getattr(args, "beam_control_mode", None)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -172,6 +180,7 @@ def create_engine_config(self, usage_context=None, headless=False):
     existing_gr_config = GRConfig.from_vllm_config(config)
     catalog_path = getattr(self, "catalog_path", None)
     constraint_backend = getattr(self, "constraint_backend", None)
+    beam_control_mode = getattr(self, "beam_control_mode", None)
     backend_is_explicit, backend_override = _explicit_gr_attention_backend(self)
 
     effective_catalog_path = (
@@ -181,6 +190,11 @@ def create_engine_config(self, usage_context=None, headless=False):
         ConstraintBackend(constraint_backend)
         if constraint_backend is not None
         else existing_gr_config.constraint_backend
+    )
+    effective_beam_control_mode = (
+        BeamControlMode(beam_control_mode)
+        if beam_control_mode is not None
+        else existing_gr_config.beam_control_mode
     )
     offset, slice_size = None, None
     if effective_catalog_path is not None:
@@ -204,6 +218,7 @@ def create_engine_config(self, usage_context=None, headless=False):
     effective_gr_config = GRConfig(
         catalog_path=effective_catalog_path,
         constraint_backend=effective_constraint_backend,
+        beam_control_mode=effective_beam_control_mode,
         attention_backend=(
             backend_override if backend_is_explicit else existing_gr_config.attention_backend
         ),

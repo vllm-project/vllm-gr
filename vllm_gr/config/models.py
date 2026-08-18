@@ -16,12 +16,18 @@ class ConstraintBackend(str, Enum):
     CONSTRAINT_TABLE = "constraint_table"
 
 
+class BeamControlMode(str, Enum):
+    SERVING = "serving"
+    ENGINE_PER_STEP_REQUEST = "engine_per_step_request"
+
+
 @dataclass(frozen=True)
 class GRConfig:
     """Validated vLLM-GR configuration reconstructed in each process."""
 
     catalog_path: str | None = None
     constraint_backend: ConstraintBackend = ConstraintBackend.TRIE
+    beam_control_mode: BeamControlMode = BeamControlMode.SERVING
     attention_backend: GRAttentionBackend | None = None
     vocab_offset: int | None = None
     vocab_slice_size: int | None = None
@@ -29,6 +35,7 @@ class GRConfig:
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
+            validate_beam_control_mode,
             validate_catalog_path,
             validate_constraint_backend,
             validate_vocab_offset,
@@ -40,6 +47,11 @@ class GRConfig:
             self,
             "constraint_backend",
             validate_constraint_backend(self.constraint_backend),
+        )
+        object.__setattr__(
+            self,
+            "beam_control_mode",
+            validate_beam_control_mode(self.beam_control_mode),
         )
         object.__setattr__(
             self,
@@ -61,6 +73,7 @@ class GRConfig:
         return (
             self.catalog_path is not None
             or self.constraint_backend is not ConstraintBackend.TRIE
+            or self.beam_control_mode is not BeamControlMode.SERVING
             or self.attention_backend is not None
             or self.vocab_offset is not None
             or self.vocab_slice_size is not None

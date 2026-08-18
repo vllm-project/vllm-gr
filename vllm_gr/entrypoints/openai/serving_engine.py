@@ -21,9 +21,14 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
+from vllm_gr.config import BeamControlMode, GRConfig
 from vllm_gr.constraints import BeamConstraintCoordinator, ParentCandidateBuilder
 from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.v1.beam.controller_types import (
+    BeamControllerFinalResult,
+    BeamControllerRequest,
+)
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
@@ -198,7 +203,7 @@ async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
 
 
-async def beam_search(
+async def _serving_controlled_beam_search(
     self,
     prompt: EngineInput,
     request_id: str,
@@ -697,3 +702,241 @@ async def beam_search(
     record_beam_search_metrics(metrics, engine="0", model_name=model_name)
 
     yield out
+
+
+def _flat_logprobs_from_wire(payload: dict) -> FlatLogprobs:
+    return FlatLogprobs(
+        start_indices=list(payload["start_indices"]),
+        end_indices=list(payload["end_indices"]),
+        token_ids=list(payload["token_ids"]),
+        logprobs=list(payload["logprobs"]),
+        ranks=list(payload["ranks"]),
+        decoded_tokens=list(payload["decoded_tokens"]),
+    )
+
+
+async def _engine_controlled_beam_search(
+    self,
+    prompt: EngineInput,
+    request_id: str,
+    params: BeamSearchParams,
+    lora_request: LoRARequest | None = None,
+    trace_headers: Mapping[str, str] | None = None,
+) -> AsyncGenerator[RequestOutput, None]:
+    """Thin Serving adapter for EngineCore-owned per-step beam control."""
+    if not hasattr(self.engine_client, "run_beam_controller"):
+        raise RuntimeError(
+            "beam_control_mode='engine_per_step_request' requires the "
+            "EngineCore beam controller client patch"
+        )
+    if params.beam_width <= 0:
+        raise VLLMValidationError(
+            "Beam width must be greater than 0",
+            parameter="beam_width",
+            value=params.beam_width,
+        )
+
+    tokenizer = self.input_processor.tokenizer
+    if tokenizer is None:
+        raise VLLMValidationError(
+            "You cannot use beam search when `skip_tokenizer_init=True`",
+            parameter="skip_tokenizer_init",
+            value=True,
+        )
+    if not isinstance(prompt, str) and prompt.get("type") == "enc_dec":
+        raise NotImplementedError
+
+    prompt_text = prompt if isinstance(prompt, str) else prompt.get("prompt")
+    if isinstance(prompt, str):
+        prompt_token_ids = list(tokenizer.encode(prompt))
+    else:
+        prompt_token_ids = list(prompt.get("prompt_token_ids", []))
+    prompt_length = len(prompt_token_ids)
+
+    eos_token_id = tokenizer.eos_token_id
+    begin_token_id = None
+    if params.begin_token is not None:
+        begin_token_id = tokenizer.convert_tokens_to_ids(params.begin_token)
+        if begin_token_id is None or begin_token_id == -1:
+            raise VLLMValidationError(
+                "begin_token must be a valid token in the tokenizer vocabulary",
+                parameter="begin_token",
+                value=params.begin_token,
+            )
+    end_token_id = None
+    if params.end_token is not None:
+        end_token_id = tokenizer.convert_tokens_to_ids(params.end_token)
+        if end_token_id is None or end_token_id == -1:
+            raise VLLMValidationError(
+                "end_token must be a valid token in the tokenizer vocabulary",
+                parameter="end_token",
+                value=params.end_token,
+            )
+
+    initial_tokens = list(prompt_token_ids)
+    if begin_token_id is not None:
+        initial_tokens.append(begin_token_id)
+    reserved = int(begin_token_id is not None) + int(end_token_id is not None)
+    if params.max_tokens < reserved:
+        raise VLLMValidationError(
+            f"max tokens should be not lower than {reserved} to accommodate "
+            "reserved begin/end tokens.",
+            parameter="max_tokens",
+            value=params.max_tokens,
+        )
+
+    priority = int(time.perf_counter() * 1_000_000)
+    rank = None
+    vllm_config = getattr(self.engine_client, "vllm_config", None)
+    if vllm_config is not None and vllm_config.parallel_config is not None:
+        data_parallel_size = vllm_config.parallel_config.data_parallel_size
+        if data_parallel_size is not None and data_parallel_size > 1:
+            rank = await _next_data_parallel_rank(data_parallel_size)
+
+    gr_config = GRConfig.from_vllm_config(vllm_config)
+    resource = getattr(self.models, "beam_constraint_resource", None)
+    resource_wire = getattr(self.models, "beam_constraint_resource_wire", None)
+    resource_id = getattr(resource, "digest", None)
+    beam_session_id = f"{request_id}-beam-session-{random_uuid()}"
+    controller_request = BeamControllerRequest(
+        beam_session_id=beam_session_id,
+        external_request_id=request_id,
+        beam_width=params.beam_width,
+        max_tokens=params.max_tokens,
+        prompt_token_ids=prompt_token_ids,
+        initial_tokens=initial_tokens,
+        prompt_length=prompt_length,
+        eos_token_id=eos_token_id,
+        temperature=params.temperature,
+        ignore_eos=params.ignore_eos,
+        include_stop_token=params.include_stop_str_in_output,
+        begin_token_id=begin_token_id,
+        end_token_id=end_token_id,
+        catalog_strategy=getattr(params, "catalog_strategy", "fill"),
+        constraint_backend=gr_config.constraint_backend.value,
+        constraint_resource_id=resource_id,
+        beam_control_mode=gr_config.beam_control_mode.value,
+    )
+    sampling_params = SamplingParams(
+        logprobs=params.beam_width,
+        max_tokens=1,
+        temperature=params.temperature,
+        detokenize=False,
+        flat_logprobs=True,
+    )
+    engine_prompt = tokens_input(initial_tokens, prompt=prompt_text)
+
+    try:
+        result_wire = await self.engine_client.run_beam_controller(
+            engine_prompt,
+            sampling_params,
+            controller_request,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=rank,
+            constraint_resource=resource_wire,
+        )
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(
+                self.engine_client.cancel_beam_controller(
+                    beam_session_id,
+                    data_parallel_rank=rank,
+                )
+            )
+        finally:
+            raise
+
+    result = BeamControllerFinalResult.from_wire(result_wire)
+    if result.beam_session_id != beam_session_id or result.external_request_id != request_id:
+        raise RuntimeError("EngineCore returned a beam controller result for a different session")
+    if result.error is not None:
+        yield RequestOutput(
+            request_id=request_id,
+            prompt=prompt_text,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="",
+                    token_ids=[],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="error",
+                )
+            ],
+            finished=True,
+            prompt_token_ids=prompt_token_ids,
+            prompt_logprobs=None,
+        )
+        return
+
+    metrics = None
+    if result.metrics is not None:
+        metrics = RequestStateStats(
+            beam_search_overhead=result.metrics.beam_search_overhead,
+            beam_search_prefill_time=result.metrics.beam_search_prefill_time,
+            beam_search_decode_time=result.metrics.beam_search_decode_time,
+            beam_search_sort_time=result.metrics.beam_search_sort_time,
+            num_generation_tokens=result.metrics.num_generation_tokens,
+            num_beams=result.metrics.num_beams,
+        )
+
+    output = RequestOutput(
+        request_id=request_id,
+        prompt=prompt_text,
+        outputs=[
+            CompletionOutput(
+                index=index,
+                text=tokenizer.decode(beam.decode_token_ids),
+                token_ids=beam.token_ids,
+                cumulative_logprob=beam.cumulative_logprob,
+                logprobs=_flat_logprobs_from_wire(beam.logprobs),
+                finish_reason=beam.finish_reason,
+                stop_reason=beam.stop_reason,
+            )
+            for index, beam in enumerate(result.beams)
+        ],
+        finished=True,
+        prompt_token_ids=prompt_token_ids,
+        prompt_logprobs=None,
+        metrics=metrics,
+    )
+
+    try:
+        model_name = self.models.model_name
+        if callable(model_name):
+            model_name = model_name()
+        model_name = str(model_name)
+    except Exception:
+        model_name = "unknown"
+    record_beam_search_metrics(metrics, engine="0", model_name=model_name)
+    yield output
+
+
+async def beam_search(
+    self,
+    prompt: EngineInput,
+    request_id: str,
+    params: BeamSearchParams,
+    lora_request: LoRARequest | None = None,
+    trace_headers: Mapping[str, str] | None = None,
+) -> AsyncGenerator[RequestOutput, None]:
+    """Dispatch to the staged Serving- or EngineCore-owned control loop."""
+    mode = GRConfig.from_vllm_config(
+        getattr(self.engine_client, "vllm_config", None)
+    ).beam_control_mode
+    implementation = (
+        _engine_controlled_beam_search
+        if mode is BeamControlMode.ENGINE_PER_STEP_REQUEST
+        else _serving_controlled_beam_search
+    )
+    async for output in implementation(
+        self,
+        prompt,
+        request_id,
+        params,
+        lora_request=lora_request,
+        trace_headers=trace_headers,
+    ):
+        yield output

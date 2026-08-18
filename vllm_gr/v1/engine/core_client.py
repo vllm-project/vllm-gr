@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+import uuid
+
 import msgspec
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.engine.types import (
+    BeamControllerCancelRequest,
+    BeamControllerStartRequest,
+    BeamRequestStepUpdate,
+)
 
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
@@ -80,3 +87,47 @@ async def beam_request_step_update_async(self, update: BeamRequestStepUpdate) ->
         await self.first_req_send_socket.send(req_msg)
     await to_await
     self._ensure_output_queue_task()
+
+
+async def run_beam_controller_async(
+    self,
+    start: BeamControllerStartRequest,
+) -> dict:
+    """Submit one logical beam session and await its terminal result."""
+    call_id = uuid.uuid1().int >> 64
+    start.call_id = call_id
+    start.client_index = self.client_index
+    start.engine_request.client_index = self.client_index
+    if hasattr(self, "current_wave"):
+        start.current_wave = self.current_wave
+        start.engine_request.current_wave = self.current_wave
+
+    future = asyncio.get_running_loop().create_future()
+    self.utility_results[call_id] = future
+
+    engine = None
+    if hasattr(self, "get_core_engine_for_request"):
+        engine = self.get_core_engine_for_request(start.engine_request)
+
+    to_await = self._send_input(EngineCoreRequestType.BEAM_CONTROLLER_START, start, engine)
+    if hasattr(self, "first_req_send_socket") and not self.engines_running:
+        req_msg = msgspec.msgpack.encode(("FIRST_REQ", engine))
+        await self.first_req_send_socket.send(req_msg)
+    await to_await
+    self._ensure_output_queue_task()
+    try:
+        return await future
+    finally:
+        if hasattr(self, "reqs_in_flight"):
+            self.reqs_in_flight.pop(start.engine_request.request_id, None)
+
+
+async def cancel_beam_controller_async(
+    self,
+    cancel: BeamControllerCancelRequest,
+) -> None:
+    cancel.client_index = self.client_index
+    engine = None
+    if hasattr(self, "core_engines") and cancel.data_parallel_rank is not None:
+        engine = self.core_engines[cancel.data_parallel_rank]
+    await self._send_input(EngineCoreRequestType.BEAM_CONTROLLER_CANCEL, cancel, engine)

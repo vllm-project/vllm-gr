@@ -3,7 +3,21 @@
 
 from __future__ import annotations
 
-from vllm_gr.config.models import ConstraintBackend, GRAttentionBackend
+from vllm_gr.config.models import BeamControlMode, ConstraintBackend, GRAttentionBackend
+
+
+def validate_beam_control_mode(value: object) -> BeamControlMode:
+    if isinstance(value, BeamControlMode):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("vllm-gr beam_control_mode must be a string")  # noqa: TRY004
+    try:
+        return BeamControlMode(value.lower())
+    except ValueError as exc:
+        supported = ", ".join(mode.value for mode in BeamControlMode)
+        raise ValueError(
+            f"unsupported vllm-gr beam_control_mode {value!r}; supported: {supported}"
+        ) from exc
 
 
 def validate_catalog_path(value: object) -> str | None:

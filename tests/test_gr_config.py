@@ -9,9 +9,10 @@ from unittest import mock
 
 import pytest
 
-from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
+from vllm_gr.config import BeamControlMode, ConstraintBackend, GRAttentionBackend, GRConfig
 from vllm_gr.config.parser import (
     ATTENTION_BACKEND_KEY,
+    BEAM_CONTROL_MODE_KEY,
     CATALOG_PATH_KEY,
     CONSTRAINT_BACKEND_KEY,
 )
@@ -71,6 +72,26 @@ def test_constraint_backend_round_trip_and_default_elision() -> None:
 
     GRConfig().write_to_vllm_config(vllm_config)
     assert CONSTRAINT_BACKEND_KEY not in vllm_config.additional_config
+
+
+def test_beam_control_mode_round_trip_and_default_elision() -> None:
+    config = GRConfig.from_vllm_config(
+        _vllm_config({BEAM_CONTROL_MODE_KEY: "engine_per_step_request"})
+    )
+    assert config.beam_control_mode is BeamControlMode.ENGINE_PER_STEP_REQUEST
+    assert config.enabled is True
+
+    vllm_config = _vllm_config()
+    config.write_to_vllm_config(vllm_config)
+    assert vllm_config.additional_config[BEAM_CONTROL_MODE_KEY] == ("engine_per_step_request")
+    GRConfig().write_to_vllm_config(vllm_config)
+    assert BEAM_CONTROL_MODE_KEY not in vllm_config.additional_config
+
+
+@pytest.mark.parametrize("value", [1, True, [], "engine"])
+def test_rejects_invalid_beam_control_mode(value: object) -> None:
+    with pytest.raises(ValueError, match="beam_control_mode"):
+        GRConfig.from_vllm_config(_vllm_config({BEAM_CONTROL_MODE_KEY: value}))
 
 
 @pytest.mark.parametrize("value", [1, True, [], "unknown"])  # type: ignore[misc]
@@ -204,6 +225,28 @@ def test_engine_config_entrypoint_writes_typed_catalog_config() -> None:
 
     assert GRConfig.from_vllm_config(result) == GRConfig(catalog_path="/models/catalog.json")
     assert result.additional_config["unrelated"] is True
+
+
+def test_engine_config_writes_beam_control_mode_override() -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    engine_args = SimpleNamespace(
+        catalog_path=None,
+        constraint_backend=None,
+        beam_control_mode="engine_per_step_request",
+        attention_backend=None,
+        attention_config=None,
+    )
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+        return_value=vllm_config,
+    ):
+        result = create_engine_config(engine_args)
+
+    assert GRConfig.from_vllm_config(result).beam_control_mode is (
+        BeamControlMode.ENGINE_PER_STEP_REQUEST
+    )
 
 
 def test_engine_config_writes_constraint_backend_override() -> None:

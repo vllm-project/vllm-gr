@@ -9,6 +9,7 @@ from typing import Final
 from vllm_gr.config.models import GRConfig
 from vllm_gr.config.validation import (
     validate_attention_backend,
+    validate_beam_control_mode,
     validate_catalog_path,
     validate_constraint_backend,
     validate_vocab_offset,
@@ -17,6 +18,7 @@ from vllm_gr.config.validation import (
 
 CATALOG_PATH_KEY: Final = "vllm_gr_catalog_path"
 CONSTRAINT_BACKEND_KEY: Final = "vllm_gr_constraint_backend"
+BEAM_CONTROL_MODE_KEY: Final = "vllm_gr_beam_control_mode"
 ATTENTION_BACKEND_KEY: Final = "vllm_gr_attention_backend"
 VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
 VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
@@ -25,6 +27,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
         CATALOG_PATH_KEY,
         CONSTRAINT_BACKEND_KEY,
+        BEAM_CONTROL_MODE_KEY,
         ATTENTION_BACKEND_KEY,
         VOCAB_OFFSET_KEY,
         VOCAB_SLICE_SIZE_KEY,
@@ -62,6 +65,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         constraint_backend=validate_constraint_backend(
             additional_config.get(CONSTRAINT_BACKEND_KEY, "trie")
         ),
+        beam_control_mode=validate_beam_control_mode(
+            additional_config.get(BEAM_CONTROL_MODE_KEY, "serving")
+        ),
         attention_backend=validate_attention_backend(additional_config.get(ATTENTION_BACKEND_KEY)),
         vocab_offset=validate_vocab_offset(additional_config.get(VOCAB_OFFSET_KEY)),
         vocab_slice_size=validate_vocab_slice_size(additional_config.get(VOCAB_SLICE_SIZE_KEY)),
@@ -76,6 +82,7 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
 
     catalog_path = validate_catalog_path(gr_config.catalog_path)
     constraint_backend = validate_constraint_backend(gr_config.constraint_backend)
+    beam_control_mode = validate_beam_control_mode(gr_config.beam_control_mode)
     attention_backend = validate_attention_backend(gr_config.attention_backend)
     vocab_offset = validate_vocab_offset(gr_config.vocab_offset)
     vocab_slice_size = validate_vocab_slice_size(gr_config.vocab_slice_size)
@@ -89,6 +96,11 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(CONSTRAINT_BACKEND_KEY, None)
     else:
         additional_config[CONSTRAINT_BACKEND_KEY] = constraint_backend.value
+
+    if beam_control_mode.value == "serving":
+        additional_config.pop(BEAM_CONTROL_MODE_KEY, None)
+    else:
+        additional_config[BEAM_CONTROL_MODE_KEY] = beam_control_mode.value
 
     if attention_backend is None:
         additional_config.pop(ATTENTION_BACKEND_KEY, None)

@@ -41,10 +41,8 @@ def compute_catalog_slice_config(
             for token_str, token_id in zip(seq, token_ids):
                 if token_id is not None and token_id != -1:
                     if not (isinstance(token_str, str) and token_str.startswith("<|sid_")):
-                        if token_id < min_tid:
-                            min_tid = token_id
-                        if token_id > max_tid:
-                            max_tid = token_id
+                        min_tid = min(min_tid, token_id)
+                        max_tid = max(max_tid, token_id)
 
         if min_tid != float("inf") and max_tid != -float("inf"):
             return int(min_tid), int(max_tid - min_tid + 1)
@@ -161,53 +159,13 @@ class Catalog:
             - ranks is None iff input ranks_pos was None
             - decoded is None iff input decoded_pos was None
         """
-        if not valid_tokens_set:
-            return (
-                [],
-                [],
-                ([] if ranks_pos is not None else None),
-                ([] if decoded_pos is not None else None),
-            )
+        from vllm_gr.constraints.candidate_filter import filter_candidates_by_token_ids
 
-        if catalog_strategy == "null":
-            n = len(logprobs_pos)
-            filtered_tids = token_ids_pos
-            filtered_lps = logprobs_pos[:]
-            all_inf = True
-            for i in range(n):
-                if token_ids_pos[i] not in valid_tokens_set:
-                    filtered_lps[i] = -float("inf")
-                else:
-                    all_inf = False
-            if all_inf:
-                return (
-                    [],
-                    [],
-                    ([] if ranks_pos is not None else None),
-                    ([] if decoded_pos is not None else None),
-                )
-            return filtered_tids, filtered_lps, ranks_pos, decoded_pos
-
-        valid_list = sorted(valid_tokens_set)
-        n_valid = len(valid_list)
-        n = len(token_ids_pos)
-        new_tids = token_ids_pos[:]
-        new_lps = logprobs_pos[:]
-        new_ranks: list | None = None
-        new_decoded: list | None = None
-        if ranks_pos is not None:
-            new_ranks = [ranks_pos[i] if i < len(ranks_pos) else None for i in range(n)]
-        if decoded_pos is not None:
-            new_decoded = [decoded_pos[i] if i < len(decoded_pos) else None for i in range(n)]
-        fill_used = 0
-        for j, tid in enumerate(token_ids_pos):
-            if tid not in valid_tokens_set:
-                ft = valid_list[fill_used % n_valid]
-                new_tids[j] = ft
-                new_lps[j] = -10000.0 - (fill_used % n_valid) * 0.1
-                fill_used += 1
-                if new_ranks is not None:
-                    new_ranks[j] = None
-                if new_decoded is not None:
-                    new_decoded[j] = None
-        return new_tids, new_lps, new_ranks, new_decoded
+        return filter_candidates_by_token_ids(
+            token_ids_pos,
+            logprobs_pos,
+            ranks_pos,
+            decoded_pos,
+            valid_tokens_set,
+            catalog_strategy,
+        )

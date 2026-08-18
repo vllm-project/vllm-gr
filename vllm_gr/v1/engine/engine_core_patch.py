@@ -16,6 +16,9 @@ logger = init_logger(__name__)
 
 _BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
 _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
+_CONTROLLER_STEP_PATCH_MARKER = "_vllm_gr_beam_controller_step_patch"
+_CONTROLLER_INPUT_PATCH_MARKER = "_vllm_gr_beam_controller_input_patch"
+_CONTROLLER_SHUTDOWN_PATCH_MARKER = "_vllm_gr_beam_controller_shutdown_patch"
 
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
@@ -42,6 +45,82 @@ def make_patched_engine_core_init(original_init):
     return patched_init
 
 
+def make_patched_controller_step(original_step):
+    if getattr(original_step, _CONTROLLER_STEP_PATCH_MARKER, False):
+        return original_step
+
+    @wraps(original_step)
+    def patched_step(self, *args, **kwargs):
+        outputs, model_executed = original_step(self, *args, **kwargs)
+        from vllm_gr.v1.engine.core import route_beam_controller_outputs
+
+        return route_beam_controller_outputs(self, outputs), model_executed
+
+    setattr(patched_step, _CONTROLLER_STEP_PATCH_MARKER, True)
+    return patched_step
+
+
+def make_patched_controller_input(original_handler):
+    if getattr(original_handler, _CONTROLLER_INPUT_PATCH_MARKER, False):
+        return original_handler
+
+    @wraps(original_handler)
+    def patched_handler(self, request_type, request):
+        from vllm.v1.engine import EngineCoreRequestType
+
+        from vllm_gr.v1.engine.core import (
+            _controller_failure_result,
+            _put_controller_result,
+            cancel_controller,
+            create_controller,
+        )
+
+        if request_type == EngineCoreRequestType.BEAM_CONTROLLER_START:
+            start, preprocessed_request = request
+            try:
+                create_controller(self, start, preprocessed_request)
+            except Exception as exc:
+                logger.exception(
+                    "Failed to create beam controller %s",
+                    start.controller.beam_session_id,
+                )
+                _put_controller_result(
+                    self,
+                    start.client_index,
+                    start.call_id,
+                    _controller_failure_result(start, str(exc)),
+                )
+            return
+        if request_type == EngineCoreRequestType.BEAM_CONTROLLER_CANCEL:
+            try:
+                cancel_controller(self, request.beam_session_id)
+            except KeyError:
+                logger.warning(
+                    "Ignoring cancellation for unknown beam controller %s",
+                    request.beam_session_id,
+                )
+            return
+        return original_handler(self, request_type, request)
+
+    setattr(patched_handler, _CONTROLLER_INPUT_PATCH_MARKER, True)
+    return patched_handler
+
+
+def make_patched_controller_shutdown(original_shutdown):
+    if getattr(original_shutdown, _CONTROLLER_SHUTDOWN_PATCH_MARKER, False):
+        return original_shutdown
+
+    @wraps(original_shutdown)
+    def patched_shutdown(self, *args, **kwargs):
+        from vllm_gr.v1.engine.core import clear_controllers
+
+        clear_controllers(self)
+        return original_shutdown(self, *args, **kwargs)
+
+    setattr(patched_shutdown, _CONTROLLER_SHUTDOWN_PATCH_MARKER, True)
+    return patched_shutdown
+
+
 # ---------------------------------------------------------------------------
 # Child-process patch applicator — called from patched run_engine_core
 # ---------------------------------------------------------------------------
@@ -54,7 +133,13 @@ def apply_engine_core_request_patches() -> None:
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
         _handle_beam_request_step_update,
+        cancel_controller,
+        consume_step_output,
+        create_controller,
+        finalize_controller,
+        get_controller,
         process_input_sockets,
+        remove_controller,
     )
 
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
@@ -71,6 +156,23 @@ def apply_engine_core_request_patches() -> None:
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
+
+    for engine_cls in (EngineCore, EngineCoreProc):
+        engine_cls.create_controller = create_controller
+        engine_cls.get_controller = get_controller
+        engine_cls.consume_step_output = consume_step_output
+        engine_cls.cancel_controller = cancel_controller
+        engine_cls.finalize_controller = finalize_controller
+        engine_cls.remove_controller = remove_controller
+
+    EngineCore.step = make_patched_controller_step(EngineCore.step)
+    EngineCore.step_with_batch_queue = make_patched_controller_step(
+        EngineCore.step_with_batch_queue
+    )
+    EngineCoreProc._handle_client_request = make_patched_controller_input(
+        EngineCoreProc._handle_client_request
+    )
+    EngineCore.shutdown = make_patched_controller_shutdown(EngineCore.shutdown)
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets

@@ -2,16 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
-from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.beam.controller_types import BeamControllerRequest
+from vllm_gr.v1.engine.types import (
+    BeamControllerCancelRequest,
+    BeamControllerStartRequest,
+    BeamRequestStepUpdate,
+)
 
 logger = init_logger(__name__)
 
-if TYPE_CHECKING:
-    pass
 
 # ---------------------------------------------------------------------------
 # AsyncLLM methods for ADD_BATCH / BEAM_REQUEST_STEP_UPDATE
@@ -161,3 +163,58 @@ def register_beam_output_fn(
 async def beam_request_step_update_fn(self, update: BeamRequestStepUpdate) -> None:
     """Send BEAM_REQUEST_STEP_UPDATE to EngineCore to grouped processing."""
     await self.engine_core.beam_request_step_update_async(update)
+
+
+async def run_beam_controller_fn(
+    self,
+    prompt,
+    sampling_params,
+    controller_request: BeamControllerRequest,
+    *,
+    lora_request=None,
+    trace_headers=None,
+    priority=0,
+    data_parallel_rank=None,
+    constraint_resource=None,
+):
+    """Prepare and submit one logical EngineCore-owned beam request."""
+    if self.errored:
+        from vllm.v1.engine.exceptions import EngineDeadError
+
+        raise EngineDeadError()
+
+    engine_request = self.input_processor.process_inputs(
+        controller_request.beam_session_id,
+        prompt,
+        sampling_params,
+        supported_tasks=await self.get_supported_tasks(),
+        lora_request=lora_request,
+        trace_headers=trace_headers,
+        priority=priority,
+        data_parallel_rank=data_parallel_rank,
+    )
+    # Controller sessions intentionally use one stable internal request ID
+    # across all per-step Scheduler Requests.
+    engine_request.external_req_id = controller_request.external_request_id
+    start = BeamControllerStartRequest(
+        controller=controller_request,
+        engine_request=engine_request,
+        call_id=0,
+        data_parallel_rank=data_parallel_rank,
+        constraint_resource=constraint_resource,
+    )
+    return await self.engine_core.run_beam_controller_async(start)
+
+
+async def cancel_beam_controller_fn(
+    self,
+    beam_session_id: str,
+    *,
+    data_parallel_rank: int | None = None,
+) -> None:
+    await self.engine_core.cancel_beam_controller_async(
+        BeamControllerCancelRequest(
+            beam_session_id=beam_session_id,
+            data_parallel_rank=data_parallel_rank,
+        )
+    )
