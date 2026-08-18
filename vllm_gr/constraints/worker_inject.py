@@ -77,17 +77,44 @@ def set_gr_constraint_resources(
     """
     from vllm_gr.constraints.compiler import from_wire
 
-    del self  # stateless per-process singleton; self is the worker instance
     resource = from_wire(payload)
     target = manager if manager is not None else get_worker_manager()
     already = target.current_digest == resource.digest
     target.ensure(resource)
+    # Fail at startup when the active runner cannot run the raw-logits hook
+    # (e.g. a vllm-ascend build without ``_sample``): a Constraint Table
+    # request must never silently sample unconstrained.  Inert when ``self``
+    # has no model_runner yet (unit tests / mocked workers).
+    _verify_runner_sample_hook(self)
     logger.info(
         "vllm-gr: worker constraint tables digest=%s cached=%s",
         resource.digest,
         not already,
     )
     return {"digest": resource.digest, "cached": not already}
+
+
+def _verify_runner_sample_hook(worker: Any) -> None:
+    """Raise when the worker's runner lacks the Constraint Table ``_sample`` hook.
+
+    Only meaningful once ``init_device`` has built ``model_runner`` (the driver
+    injects after that point); skipped otherwise so unit tests and mocked
+    workers keep working.
+    """
+    runner = getattr(worker, "model_runner", None)
+    if runner is None:
+        return
+    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+
+    sample = getattr(type(runner), "_sample", None)
+    if sample is None or not getattr(sample, _WORKER_SAMPLE_PATCH_MARKER, False):
+        raise RuntimeError(
+            "constraint tables require the vllm-gr raw-logits hook on the "
+            f"active runner {type(runner).__name__}, but its _sample is not "
+            "patched (this platform lacks the hook). Constraint Tables cannot "
+            "start on this worker; refusing to degrade to unconstrained "
+            "sampling."
+        )
 
 
 def install_worker_resource_hook(worker_cls: type) -> int:

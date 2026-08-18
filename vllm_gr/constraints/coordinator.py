@@ -8,7 +8,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vllm_gr.constraints.models import ParentCandidateBuilder
-from vllm_gr.constraints.strategies import TrieConstraintStrategy
+from vllm_gr.constraints.strategies import (
+    ConstraintTableStrategy,
+    TrieConstraintStrategy,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -30,6 +33,29 @@ class BeamConstraintCoordinator:
     @property
     def enabled(self) -> bool:
         return self.strategy is not None
+
+    def resolve_catalog_strategy(self, value: str | None) -> str | None:
+        """Resolve the frontend catalog-strategy for this coordinator's backend.
+
+        - Trie: ``None`` means the historical default ``"fill"``; an explicit
+          value passes through unchanged.
+        - Constraint Tables: candidate validity is enforced by the Worker's
+          raw-logits hook, so a frontend ``fill``/``null`` strategy is a
+          contradiction and is rejected loudly; ``None`` (the new default)
+          passes through.
+        - No strategy: the value passes through untouched.
+        """
+        if isinstance(self.strategy, ConstraintTableStrategy):
+            if value is not None:
+                raise ValueError(
+                    "catalog_strategy is not applicable to the constraint_table "
+                    f"backend; got {value!r} (candidate validity is enforced in "
+                    "the Worker)"
+                )
+            return None
+        if isinstance(self.strategy, TrieConstraintStrategy):
+            return "fill" if value is None else value
+        return value
 
     def valid_next_token_ids(self, generated_token_ids: Sequence[int]) -> set[int] | None:
         if self.strategy is None:

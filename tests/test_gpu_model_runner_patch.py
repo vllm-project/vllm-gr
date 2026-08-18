@@ -125,3 +125,33 @@ def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(
             sampler_output,
         )
     assert runner.input_batch is original_batch
+
+
+def test_gpu_sample_patch_runs_original_then_constraint_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_sample wrapper must sample first, then apply constrained rows."""
+    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+
+    events: list[str] = []
+    sample_output = object()
+
+    def original(self: Any, logits: Any, spec_decode_metadata: Any = None) -> Any:
+        assert logits == "logits"
+        events.append("sample")
+        return sample_output
+
+    def override(self: Any, logits: Any, sampler_output: Any) -> None:
+        assert self is runner
+        assert logits == "logits"
+        assert sampler_output is sample_output
+        events.append("override")
+
+    monkeypatch.setattr(gpu_patch, "apply_constrained_sample_override", override)
+    wrapped = gpu_patch.make_patched_sample_gpu(original)
+    assert getattr(wrapped, _WORKER_SAMPLE_PATCH_MARKER, False)
+    assert gpu_patch.make_patched_sample_gpu(wrapped) is wrapped
+
+    runner = SimpleNamespace()
+    assert wrapped(runner, "logits", "meta") is sample_output
+    assert events == ["sample", "override"]

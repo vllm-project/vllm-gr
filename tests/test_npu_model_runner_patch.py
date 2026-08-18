@@ -118,3 +118,33 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
             sampler_output,
         )
     assert runner.input_batch is original_batch
+
+
+def test_npu_sample_patch_is_signature_agnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NPU _sample wrapper tolerates a different metadata argument."""
+    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+
+    events: list[str] = []
+    sample_output = object()
+
+    def original(self: Any, logits: Any, extra: Any) -> Any:
+        assert extra == "extra"
+        events.append("sample")
+        return sample_output
+
+    def override(self: Any, logits: Any, sampler_output: Any) -> None:
+        assert self is runner
+        assert logits == "logits"
+        assert sampler_output is sample_output
+        events.append("override")
+
+    monkeypatch.setattr(npu_patch, "apply_constrained_sample_override", override)
+    wrapped = npu_patch.make_patched_sample_npu(original)
+    assert getattr(wrapped, _WORKER_SAMPLE_PATCH_MARKER, False)
+    assert npu_patch.make_patched_sample_npu(wrapped) is wrapped
+
+    runner = SimpleNamespace()
+    assert wrapped(runner, "logits", "extra") is sample_output
+    assert events == ["sample", "override"]

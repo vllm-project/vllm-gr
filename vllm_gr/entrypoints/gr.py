@@ -37,6 +37,8 @@ from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
+    extract_constrained_flat_logprobs,
+    extract_constrained_segment,
     materialize_selected_beams,
     select_top_indices,
 )
@@ -46,8 +48,15 @@ from vllm_gr.constraints import (
     ParentCandidateBuilder,
     create_constraint_strategy,
 )
-from vllm_gr.constraints.models import BeamCandidateCache
-from vllm_gr.constraints.strategies import TrieConstraintStrategy
+from vllm_gr.constraints.models import BeamCandidateCache, CandidateLayout
+from vllm_gr.constraints.startup import install_constraint_table
+from vllm_gr.constraints.strategies import (
+    ConstraintTableStrategy,
+    TrieConstraintStrategy,
+    validate_constraint_generation_limits,
+    validate_constraint_table_protocol,
+)
+from vllm_gr.engine.arg_utils_gr import engine_args_accepts_gr_values
 from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     reconstruct_beam_logprobs,
@@ -107,6 +116,7 @@ def _prepare_beam_step_requests(
     instance_prefix_len: dict[int, int],
     instance_completed_sessions: set[int],
     max_decode_steps: int = 0,
+    is_constrained: bool = False,
 ) -> list["EngineCoreRequest"]:
     """Prepare EngineCoreRequest items for active instances at this step."""
     engine_core_requests = []
@@ -188,6 +198,9 @@ def _prepare_beam_step_requests(
                 lora_request=instance.beams[0].lora_request,
                 parent_beam_indices=parent_beam_indices,
                 max_decode_steps=max_decode_steps,
+                # Constraint Tables: the Worker's raw-logits hook needs the
+                # step to run (1/2 for decode; 0 reserved for the prefill).
+                constraint_step=len(beam_tokens[0]) if is_constrained else 0,
             )
             llm_engine.engine_core.beam_request_step_update(update)
 
@@ -250,7 +263,7 @@ def _parse_step_logprobs(
     logprobs_num: int,
     fork_info_j: ForkInfo | None,
     catalog: Optional[Any] = None,
-    catalog_strategy: str = "fill",
+    catalog_strategy: str | None = None,
     constraint_coordinator: BeamConstraintCoordinator | None = None,
     return_arrays: bool = False,
 ) -> tuple[bool, Any, Any, Any, list[BeamCandidateCache]]:
@@ -275,7 +288,14 @@ def _parse_step_logprobs(
         return True, [], [], [], []
 
     coordinator = constraint_coordinator or BeamConstraintCoordinator.from_catalog(catalog)
-    candidate_builder = ParentCandidateBuilder()
+    # Constraint Tables generate candidates in the Worker; the flat segments
+    # are the operator's fixed-width rows (no sampled-token slot, no dedup).
+    is_constrained = isinstance(coordinator.strategy, ConstraintTableStrategy)
+    candidate_builder = ParentCandidateBuilder(
+        layout=(
+            CandidateLayout.CONSTRAINED_TOPK if is_constrained else CandidateLayout.STANDARD_SAMPLER
+        )
+    )
 
     flat = result.outputs[0].logprobs
     if flat is None:
@@ -297,17 +317,28 @@ def _parse_step_logprobs(
             start_offset = b_idx * stride_k
             end_offset = start_offset + stride_k
 
-            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_segment(
-                raw_token_ids,
-                raw_logprobs,
-                raw_ranks,
-                raw_decoded,
-                start_offset,
-                end_offset,
-                logprobs_num,
-            )
+            if is_constrained:
+                token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_constrained_segment(
+                    raw_token_ids,
+                    raw_logprobs,
+                    raw_ranks,
+                    raw_decoded,
+                    start_offset,
+                    end_offset,
+                    logprobs_num,
+                )
+            else:
+                token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_segment(
+                    raw_token_ids,
+                    raw_logprobs,
+                    raw_ranks,
+                    raw_decoded,
+                    start_offset,
+                    end_offset,
+                    logprobs_num,
+                )
             valid_token_ids = None
-            if coordinator.enabled:
+            if coordinator.enabled and not is_constrained:
                 generated_tokens = current_beam.tokens[instance.prompt_len :]
                 valid_token_ids = coordinator.valid_next_token_ids(generated_tokens)
 
@@ -323,11 +354,16 @@ def _parse_step_logprobs(
                 candidate_strategy=catalog_strategy,
             )
     else:
-        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_flat_logprobs(
-            flat, logprobs_num
-        )
+        if is_constrained:
+            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_constrained_flat_logprobs(
+                flat, logprobs_num
+            )
+        else:
+            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_flat_logprobs(
+                flat, logprobs_num
+            )
         valid_token_ids = None
-        if coordinator.enabled:
+        if coordinator.enabled and not is_constrained:
             current_beam = instance.beams[0]
             generated_tokens = current_beam.tokens[instance.prompt_len :]
             valid_token_ids = coordinator.valid_next_token_ids(generated_tokens)
@@ -376,7 +412,7 @@ def _custom_beam_search_batch(
     initial_logprobs: "FlatLogprobs",
     logprobs_num: int,
     catalog: Optional[Any] = None,
-    catalog_strategy: str = "fill",
+    catalog_strategy: str | None = None,
     constraint_coordinator: BeamConstraintCoordinator | None = None,
     max_decode_steps: int = 0,
 ) -> None:
@@ -386,6 +422,18 @@ def _custom_beam_search_batch(
     instance_fork_info: dict[int, ForkInfo] = {}
     instance_prefix_len: dict[int, int] = {}
     instance_completed_sessions: set[int] = set()
+
+    # Resolve the frontend catalog-strategy per backend (Trie: None → "fill";
+    # Constraint Tables: an explicit value is a contradiction and is rejected).
+    if constraint_coordinator is not None:
+        catalog_strategy = constraint_coordinator.resolve_catalog_strategy(catalog_strategy)
+
+    # Constraint Tables generate candidates in the Worker; the decode-step
+    # update must carry the constraint_step so the engine can route the raw
+    # logits through the constrained top-k operator.
+    _is_constrained = constraint_coordinator is not None and isinstance(
+        constraint_coordinator.strategy, ConstraintTableStrategy
+    )
 
     for token in token_iter:
         # Check if all instances are done
@@ -412,6 +460,7 @@ def _custom_beam_search_batch(
             instance_prefix_len=instance_prefix_len,
             instance_completed_sessions=instance_completed_sessions,
             max_decode_steps=max_decode_steps,
+            is_constrained=_is_constrained,
         )
 
         if engine_core_requests:
@@ -533,8 +582,35 @@ class GRLLM(LLM):
 
         self._shutdown_complete = False
 
+        # Thread the GR values into the EngineArgs that LLM.__init__ builds
+        # internally (EngineArgs(model=..., **kwargs)); the arg_utils_gr patch
+        # stashes them and create_engine_config writes them into VllmConfig so
+        # EngineCore can learn the constraint backend before any request runs.
+        # Without this, the offline Python API compiles/injects the tables but
+        # EngineCore never marks requests constraint_prefill/constrained and the
+        # Worker raw-logits hook would never run.
+        #
+        # Only constraint_table strictly requires the patch: the tables must
+        # reach VllmConfig so every worker can run the raw-logits hook.  A
+        # Trie catalog is handled entirely driver-side (TrieConstraintStrategy
+        # below), so ``catalog_path`` with the default backend must not demand
+        # the plugin — vLLM 0.22 loads general plugins lazily from inside
+        # EngineArgs.__init__, which has not run yet at this point.
+        gr_engine_args: dict[str, object] = {}
+        if engine_args_accepts_gr_values():
+            gr_engine_args["catalog_path"] = catalog_path
+            gr_engine_args["constraint_backend"] = constraint_backend
+        elif constraint_backend != ConstraintBackend.TRIE:
+            raise RuntimeError(
+                "vllm-gr runtime patches are not active: EngineArgs cannot "
+                "carry constraint_backend into VllmConfig. Ensure the vllm-gr "
+                "plugin is registered (vllm general_plugins) or call "
+                "vllm_gr.plugin.initialize_runtime() before constructing GRLLM "
+                "with constraint_backend='constraint_table'."
+            )
         super().__init__(
             model=model,
+            **gr_engine_args,
             **kwargs,
         )
 
@@ -550,6 +626,17 @@ class GRLLM(LLM):
             self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
             if isinstance(self.constraint_strategy, TrieConstraintStrategy):
                 self.catalog = self.constraint_strategy.catalog
+            elif isinstance(self.constraint_strategy, ConstraintTableStrategy):
+                # Constraint Tables compile on the driver and are broadcast to
+                # every worker before any beam-search step runs.  Failing here
+                # is a hard startup error — never a silent fall back to Trie.
+                resource = install_constraint_table(
+                    self.llm_engine,
+                    catalog_path=catalog_path,
+                    tokenizer=self.get_tokenizer(),
+                    vocab_size=self.llm_engine.model_config.vocab_size,
+                )
+                self.constraint_strategy.digest = resource.digest
 
     def beam_search(
         self,
@@ -583,7 +670,7 @@ class GRLLM(LLM):
         ignore_eos = params.ignore_eos
         begin_token = params.begin_token if hasattr(params, "begin_token") else None
         end_token = params.end_token if hasattr(params, "end_token") else None
-        catalog_strategy = getattr(params, "catalog_strategy", "fill")
+        catalog_strategy = getattr(params, "catalog_strategy", None)
 
         tokenizer = self.get_tokenizer()
         sid_begin_token_id: int | None = None
@@ -686,6 +773,13 @@ class GRLLM(LLM):
                 "Setting max_tokens to the number of pre-calculated tokens."
             )
             max_tokens = pre_calc
+        if isinstance(self.constraint_strategy, ConstraintTableStrategy):
+            # Constraint Tables are a fixed 3-level FSM; requesting more steps
+            # than the Worker can run is a hard error, never a silent fallback.
+            validate_constraint_generation_limits(
+                beam_width=beam_width,
+                max_generate_steps=max_tokens - pre_calc,
+            )
         vllm_config = getattr(self.llm_engine, "vllm_config", None)
         attention_backend = None
         if vllm_config is not None and hasattr(vllm_config, "attention_config"):
@@ -693,6 +787,16 @@ class GRLLM(LLM):
         use_custom_attn = attention_backend is not None and (
             "CUSTOM" in str(attention_backend).upper()
             or getattr(attention_backend, "name", "").upper() == "CUSTOM"
+        )
+        # Constraint Tables run in the Worker raw-logits hook, which is only
+        # installed on the CUSTOM-attention beam-request path.  The baseline
+        # generate() loop below cannot express constraint_step + beam_suffix,
+        # so fail fast rather than silently producing uncorrected samples.
+        validate_constraint_table_protocol(
+            is_constraint_table=isinstance(self.constraint_strategy, ConstraintTableStrategy),
+            beam_protocol_available=use_custom_attn,
+            required="the CUSTOM attention backend",
+            hint="Configure attention_config={'backend': 'CUSTOM'}.",
         )
         for prompt_start in range(0, len(prompts), concurrency_limit):
             instances_batch = instances[prompt_start : prompt_start + concurrency_limit]

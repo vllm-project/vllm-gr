@@ -9,9 +9,11 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.v1.worker.constraint_hook import apply_constrained_sample_override
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
+    _WORKER_SAMPLE_PATCH_MARKER,
     _beam_collapse_bookkeeping,
     _beam_remap_inputs,
 )
@@ -46,6 +48,27 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
+
+
+def make_patched_sample_gpu(_orig_sample):
+    """Wrap the GPU ``_sample`` to run Constraint Tables on raw logits.
+
+    The original sampling runs first (it maps the proxy sampling metadata and
+    produces the unconstrained sampler output); constrained rows are then
+    overwritten in place with ``rec_constrained_topk`` results (issue #246,
+    N3).  Pure-completion and Trie-beam steps short-circuit untouched.
+    """
+    if getattr(_orig_sample, _WORKER_SAMPLE_PATCH_MARKER, False):
+        return _orig_sample
+
+    @wraps(_orig_sample)
+    def patched_sample(self, logits, spec_decode_metadata=None):
+        sampler_output = _orig_sample(self, logits, spec_decode_metadata)
+        apply_constrained_sample_override(self, logits, sampler_output)
+        return sampler_output
+
+    setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
+    return patched_sample
 
 
 def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
@@ -119,3 +142,4 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
 
 make_patched_prepare_inputs = make_patched_prepare_inputs_gpu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_gpu
+make_patched_sample = make_patched_sample_gpu

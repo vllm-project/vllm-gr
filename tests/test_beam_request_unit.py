@@ -381,6 +381,7 @@ class TestTypesSerialization:
         assert decoded.lora_request is None
         assert decoded.cache_salt is None
         assert decoded.trace_headers is None
+        assert decoded.constraint_step == 0
 
     def test_empty_beam_tokens_survives_roundtrip(self) -> None:
         update = _make_beam_update(
@@ -398,6 +399,48 @@ class TestTypesSerialization:
         assert decoded.child_beam_ids == []
         assert decoded.pruned_ids == ["final-0"]
         assert decoded.beam_width == 0
+
+    def test_constraint_step_roundtrip_and_legacy_default(self) -> None:
+        # The new field is appended last with default 0; msgspec's array_like
+        # decoder fills a missing trailing field with the declared default, so
+        # legacy code streams (encoded without constraint_step) still decode.
+        update = _make_beam_update(beam_tokens=[[50], [60]], beam_width=2)
+        assert update.constraint_step == 0
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(update), type=BeamRequestStepUpdate)
+        assert decoded.constraint_step == 0
+
+        update.constraint_step = 2
+        decoded2 = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(update), type=BeamRequestStepUpdate
+        )
+        assert decoded2.constraint_step == 2
+
+        # Simulate a legacy stream: the positional array without the trailing
+        # constraint_step element.  msgspec fills the default 0.
+        legacy_array = [
+            update.session_id,
+            update.parent_beam_ids,
+            update.child_beam_ids,
+            update.beam_tokens,
+            update.pruned_ids,
+            update.prefix_len,
+            update.beam_width,
+            update.sampling_params,
+            update.eos_token_id,
+            update.client_index,
+            update.current_wave,
+            update.priority,
+            update.data_parallel_rank,
+            update.lora_request,
+            update.cache_salt,
+            update.trace_headers,
+            update.parent_beam_indices,
+            update.max_decode_steps,
+        ]
+        legacy = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(legacy_array), type=BeamRequestStepUpdate
+        )
+        assert legacy.constraint_step == 0
 
 
 # ===========================================================================
@@ -763,6 +806,73 @@ class TestBeamCache:
         assert rows_with_logits == 3
         assert active_beam_ids == [0, 1, 2]
         assert logits_indices == [0, 1, 2]
+
+    def test_cache_marks_constraint_prefill_and_beam_width(self) -> None:
+        eng = _make_engine_self()
+        req = _make_mock_request(request_id="r0")
+        req.sampling_params.logprobs = 4
+        with patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True):
+            _cache_beam_request(eng, req)
+
+        assert req.is_constraint_prefill is True
+        assert req.beam_width == 4
+
+        metadata = build_beam_request_metadata(req, num_scheduled_tokens=1)
+        assert metadata["is_constraint_prefill"] is True
+        assert metadata["is_constrained"] is True
+        assert metadata["constraint_step"] == 0
+        assert metadata["beam_width"] == 4
+        assert metadata["beam_suffix"] == []
+
+    def test_cache_marks_constraint_prefill_missing_beam_width_fails_metadata(self) -> None:
+        eng = _make_engine_self()
+        req = _make_mock_request(request_id="r0")
+        req.sampling_params.logprobs = None  # beam width is carried on logprobs
+        with patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True):
+            _cache_beam_request(eng, req)
+
+        assert req.is_constraint_prefill is True
+        assert req.beam_width is None
+        with pytest.raises(RuntimeError, match="beam_width"):
+            build_beam_request_metadata(req, num_scheduled_tokens=1)
+
+    def test_handle_sets_constraint_decode_metadata(self) -> None:
+        eng = _make_engine_self(beam_cache={"session-0": _session_entry()})
+        update = _make_beam_update(
+            beam_tokens=[[50], [60]],
+            beam_width=2,
+            parent_beam_ids=["old-0", "old-1"],
+            child_beam_ids=["new-0", "new-1"],
+        )
+        with (
+            patch("vllm.v1.request.Request") as MockReq,
+            patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True),
+        ):
+            mock_req = SimpleNamespace(block_hashes=[], num_computed_tokens=6)
+            MockReq.return_value = mock_req
+            _handle_beam_request_step_update(eng, update)
+
+        assert mock_req.is_constrained is True
+        assert mock_req.constraint_step == 1
+        assert mock_req.beam_suffix == [[50], [60]]
+        assert mock_req.is_constraint_prefill is False
+
+        metadata = build_beam_request_metadata(mock_req, num_scheduled_tokens=3)
+        assert metadata["is_constrained"] is True
+        assert metadata["constraint_step"] == 1
+        assert metadata["beam_suffix"] == [[50], [60]]
+
+    def test_handle_keeps_constraint_metadata_off_for_trie(self) -> None:
+        eng = _make_engine_self(beam_cache={"session-0": _session_entry()})
+        update = _make_beam_update(beam_tokens=[[50]], beam_width=1)
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = SimpleNamespace(block_hashes=[], num_computed_tokens=6)
+            MockReq.return_value = mock_req
+            _handle_beam_request_step_update(eng, update)
+
+        assert getattr(mock_req, "is_constrained", False) is False
+        metadata = build_beam_request_metadata(mock_req, num_scheduled_tokens=3)
+        assert "is_constrained" not in metadata
 
     def test_scheduler_rejects_missing_beam_width(self) -> None:
         req = SimpleNamespace(request_id="s0", is_beam_decode=True, num_computed_tokens=1)

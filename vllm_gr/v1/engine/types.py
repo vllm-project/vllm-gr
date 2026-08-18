@@ -46,3 +46,7 @@ class BeamRequestStepUpdate(
     parent_beam_indices: list[int] | None = None
     # Maximum number of decode steps for KV pool pre-allocation
     max_decode_steps: int = 0
+    # 0 = constrained prefill, 1/2 = constrained decode step for Constraint
+    # Tables (issue #246).  Default 0 also means "not a constrained decode", so
+    # omit_defaults keeps legacy code streams byte-identical.
+    constraint_step: int = 0

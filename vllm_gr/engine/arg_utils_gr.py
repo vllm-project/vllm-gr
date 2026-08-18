@@ -14,8 +14,33 @@ from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
 origin_from_cli_args = EngineArgs.from_cli_args.__func__
+origin_engine_args_init = EngineArgs.__init__
 logger = logging.getLogger("vllm_gr.engine.arg_utils_gr")
 _NESTED_ATTENTION_BACKEND_EXPLICIT_ATTR: Final = "_vllm_gr_nested_attention_backend_explicit"
+
+
+def _init_engine_args(
+    self: EngineArgs,
+    *args: object,
+    catalog_path: str | None = None,
+    constraint_backend: ConstraintBackend | str | None = None,
+    **kwargs: object,
+) -> None:
+    """Accept the vllm-gr engine args on the Python-API construction path.
+
+    The CLI path (``--catalog-path`` / ``--constraint-backend``) stashes these
+    values as attributes in :func:`from_cli_args` after construction.  The
+    offline ``GRLLM`` Python API builds its ``EngineArgs`` indirectly through
+    ``LLM.__init__`` -> ``EngineArgs(model=..., **kwargs)``, so it cannot reach
+    the instance to set the attributes afterwards.  Threading the two values as
+    ``**kwargs`` here stashes them identically, and the patched
+    :func:`create_engine_config` reads them exactly like the CLI path —
+    otherwise ``EngineCore`` would not learn that the backend is
+    ``constraint_table`` and would never run the constrained hooks.
+    """
+    origin_engine_args_init(self, *args, **kwargs)
+    self.catalog_path = catalog_path
+    self.constraint_backend = constraint_backend
 
 
 def _nested_attention_backend_is_explicit(value: object) -> bool:
@@ -227,7 +252,19 @@ def create_engine_config(self, usage_context=None, headless=False):
     return config
 
 
+def engine_args_accepts_gr_values() -> bool:
+    """Return whether :func:`patch_add_cli_args` is mounted.
+
+    The offline ``GRLLM`` Python API only threads ``catalog_path`` /
+    ``constraint_backend`` through ``LLM.__init__`` kwargs when this patch is
+    active; without it, ``EngineArgs.__init__`` would reject the extra keyword
+    arguments.
+    """
+    return EngineArgs.__init__ is _init_engine_args
+
+
 def patch_add_cli_args() -> None:
     EngineArgs.add_cli_args = add_cli_args
     EngineArgs.create_engine_config = create_engine_config
     EngineArgs.from_cli_args = classmethod(from_cli_args)
+    EngineArgs.__init__ = _init_engine_args

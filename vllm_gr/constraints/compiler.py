@@ -48,6 +48,11 @@ from vllm_gr.constraints.triples import ConstraintTriple, build_relations
 # Maximum number of candidates per beam accepted by the ACS operator.
 MAX_TOP_K = 256
 
+# Upper bound on the total device-table bytes a constraint resource may occupy.
+# Guards against a pathological catalog compiling into a multi-GiB resource that
+# would be broadcast to and duplicated on every worker.
+MAX_RESOURCE_BYTES = 512 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class ConstraintTableResource:
@@ -69,6 +74,30 @@ class ConstraintTableResource:
     max_prefix2_degree: int
     vocab_size: int
     digest: str = ""
+
+    # The six ndarrays whose bytes travel to the device tables.
+    _ARRAY_NAMES = (
+        "first_token_ids",
+        "prefix1_offsets",
+        "prefix1_values",
+        "prefix1_pair_keys",
+        "prefix2_value_offsets",
+        "prefix2_values",
+    )
+
+    @property
+    def total_elements(self) -> int:
+        """Total element count across the six device tables (read-only)."""
+        return sum(int(getattr(self, name).size) for name in self._ARRAY_NAMES)
+
+    @property
+    def total_bytes(self) -> int:
+        """Total byte footprint of the six device tables (read-only).
+
+        Read-only and independent of the array bytes, so it cannot affect the
+        content digest.
+        """
+        return sum(int(getattr(self, name).nbytes) for name in self._ARRAY_NAMES)
 
     def __post_init__(self) -> None:
         # Freeze every array over an immutable bytes buffer.  ``frozen=True``
@@ -361,6 +390,13 @@ def validate_resource_tables(resource: ConstraintTableResource) -> None:
             raise ValueError(
                 "prefix1_pair_keys must equal a_id * vocab_size + b_id for their owning CSR bucket"
             )
+
+    # Total resource size cap (covers the compiler path and from_wire).
+    if resource.total_bytes > MAX_RESOURCE_BYTES:
+        raise ValueError(
+            f"constraint table resource total_bytes {resource.total_bytes} exceeds "
+            f"the {MAX_RESOURCE_BYTES} byte limit; reduce the catalog size"
+        )
 
 
 class ConstraintTableCompiler:

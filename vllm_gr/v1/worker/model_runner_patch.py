@@ -55,5 +55,10 @@ def apply_worker_patches() -> None:
         runner_class._bookkeeping_sync = platform_module.make_patched_bookkeeping_sync(
             runner_class._bookkeeping_sync
         )
+        # Constraint Tables raw-logits hook: only where the runner exposes
+        # ``_sample`` (a vllm-ascend build may not).  A Constraint Table worker
+        # without the hook fails at injection (worker_inject), never here.
+        if hasattr(runner_class, "_sample"):
+            runner_class._sample = platform_module.make_patched_sample(runner_class._sample)
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)

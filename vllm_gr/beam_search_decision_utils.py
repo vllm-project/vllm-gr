@@ -19,6 +19,7 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
+from vllm_gr.constraints.execution import INVALID_LOGIT
 from vllm_gr.constraints.models import BeamCandidateCache
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 
@@ -99,6 +100,64 @@ def extract_and_dedup_flat_logprobs(flat: Any, logprobs_num: int):
     )
 
 
+def extract_constrained_segment(
+    raw_token_ids: Sequence[int],
+    raw_logprobs: Sequence[float],
+    raw_ranks: Sequence[int | None] | None,
+    raw_decoded: Sequence[str | None] | None,
+    start_offset: int,
+    end_offset: int,
+    logprobs_num: int,
+) -> tuple[
+    list[int],
+    list[float],
+    list[int | None] | None,
+    list[str | None] | None,
+]:
+    """Extract one constrained candidate block with padding filtering.
+
+    Constraint Tables (issue #246) overwrite the sampler output with the
+    constrained top-k operator's fixed-width ``W`` rows.  Padding slots carry
+    the finite ``INVALID_LOGIT`` (-1e20) sentinel — ``np.isfinite`` cannot
+    detect it, so the magnitude threshold ``> INVALID_LOGIT / 2`` is the only
+    reliable filter.  Remux padding is ``-inf``, which the same threshold
+    drops.  Unlike the standard-sampler path there is no sampled-token
+    duplicate to remove, so no dedup runs: candidates are kept in the
+    operator's descending order, at most ``logprobs_num`` per parent.
+    """
+    token_ids_pos = list(raw_token_ids[start_offset:end_offset])
+    logprobs_pos = list(raw_logprobs[start_offset:end_offset])
+    ranks_pos = list(raw_ranks[start_offset:end_offset]) if raw_ranks is not None else None
+    decoded_pos = list(raw_decoded[start_offset:end_offset]) if raw_decoded is not None else None
+
+    threshold = INVALID_LOGIT / 2
+    keep = [i for i, lp in enumerate(logprobs_pos) if lp > threshold][:logprobs_num]
+    token_ids_pos = [token_ids_pos[i] for i in keep]
+    logprobs_pos = [logprobs_pos[i] for i in keep]
+    if ranks_pos is not None:
+        ranks_pos = [ranks_pos[i] for i in keep]
+    if decoded_pos is not None:
+        decoded_pos = [decoded_pos[i] for i in keep]
+    return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
+
+
+def extract_constrained_flat_logprobs(flat: Any, logprobs_num: int):
+    """Extract constrained prefill logprobs from FlatLogprobs.
+
+    The constrained prefill produces a single wide flat segment (W valid
+    candidates followed by padding); no sampled-token dedup applies.
+    """
+    return extract_constrained_segment(
+        flat.token_ids,
+        flat.logprobs,
+        flat.ranks,
+        flat.decoded_tokens,
+        flat.start_indices[0],
+        flat.end_indices[0],
+        logprobs_num,
+    )
+
+
 def find_eos_indices(token_ids: np.ndarray, eos_token_id: int) -> np.ndarray:
     """Return EOS positions using the legacy NumPy comparison."""
 
@@ -146,11 +205,13 @@ def complete_eos_candidates(
 
 
 def select_top_indices(
-    scores: np.ndarray, beam_width: int, catalog_strategy: str = "fill"
+    scores: np.ndarray, beam_width: int, catalog_strategy: str | None = "fill"
 ) -> np.ndarray:
     """Return top candidate indices with the legacy ``argpartition`` order."""
     # For "null" strategy: only pick from finite (valid catalog) entries so that
-    # -inf slots from catalog-filtered tokens are never selected.
+    # -inf slots from catalog-filtered tokens are never selected.  None resolves
+    # to the default "fill" branch (the constrained extractor already removed
+    # its padding before selection).
     if catalog_strategy == "null":
         finite_mask = np.isfinite(scores)
         finite_idx = np.where(finite_mask)[0]

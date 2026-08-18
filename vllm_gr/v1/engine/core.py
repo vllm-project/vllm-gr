@@ -22,6 +22,23 @@ logger = init_logger(__name__)
 _BEAM_STATE_INIT_LOCK = threading.Lock()
 
 
+def _constraint_table_backend_active() -> bool:
+    """True when the process runs with ``constraint_backend=constraint_table``.
+
+    Reads the process-global vLLM config (same source as ``ascend_compat``) so
+    both the driver and the EngineCore process agree without passing the flag
+    around the request path.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    from vllm_gr.config import ConstraintBackend, GRConfig
+
+    return (
+        GRConfig.from_vllm_config(get_current_vllm_config_or_none()).constraint_backend
+        == ConstraintBackend.CONSTRAINT_TABLE
+    )
+
+
 def _ensure_beam_state(self) -> None:
     """Initialize per-engine beam state, including for late plugin loading."""
     if (
@@ -107,6 +124,17 @@ def _cache_beam_request(self, request) -> None:
             "prompt_is_token_ids": request.prompt_is_token_ids,
             "num_prompt_tokens": request.num_prompt_tokens,
         }
+
+    if _constraint_table_backend_active():
+        # Constraint Tables generate the step-0 candidates in the Worker from
+        # the raw prefill logits.  Only beam-session prefills reach this cache
+        # (ADD_BATCH), so any such request is the session's constrained prefill.
+        # The Worker derives top_k from beam_width, carried on the prefill's
+        # sampling params (logprobs == beam_width in the beam-search loop).
+        params = getattr(request, "sampling_params", None)
+        beam_width = getattr(params, "logprobs", None) if params is not None else None
+        request.is_constraint_prefill = True
+        request.beam_width = beam_width
 
 
 def _handle_beam_request_step_update(self, update) -> None:
@@ -264,6 +292,18 @@ def _handle_beam_request_step_update(self, update) -> None:
     req.parent_beam_indices = update.parent_beam_indices
     # Store max decode steps for KV pool pre-allocation
     req.max_decode_steps = update.max_decode_steps
+
+    if _constraint_table_backend_active():
+        # Constraint Table decode: the Worker runs the constrained top-k
+        # operator at raw-logits time.  constraint_step equals the number of
+        # generated tokens so far (1 or 2 under the 3-step cap); beam_suffix
+        # lets the Worker rebuild the sequence_group the operator reads.
+        # constraint_step 0 is reserved for the constrained prefill, so this
+        # decode request clears is_constraint_prefill.
+        req.is_constrained = True
+        req.constraint_step = update.constraint_step if update.constraint_step > 0 else decode_steps
+        req.beam_suffix = [list(t) for t in update.beam_tokens]
+        req.is_constraint_prefill = False
 
     self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, update.current_wave)))
 

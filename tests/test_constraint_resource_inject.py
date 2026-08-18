@@ -108,6 +108,39 @@ def test_set_gr_constraint_resources_rejects_different_digest(tokenizer: MagicMo
         set_gr_constraint_resources(object(), to_wire(resource_b), manager)
 
 
+def test_set_gr_constraint_resources_fails_when_runner_lacks_sample_hook(
+    tokenizer: MagicMock,
+) -> None:
+    """A Constraint Table worker without the raw-logits hook must fail startup."""
+    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+
+    resource = _build_resource(tokenizer)
+    wire = to_wire(resource)
+
+    class FakeWorker:
+        model_runner = object()  # a runner class without _sample
+
+    manager = ConstraintResourceManager()
+    with pytest.raises(RuntimeError, match="raw-logits hook"):
+        set_gr_constraint_resources(FakeWorker(), wire, manager)
+
+    class PatchedRunner:
+        pass
+
+    def patched_sample(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return object()
+
+    setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
+    setattr(PatchedRunner, "_sample", patched_sample)
+
+    class PatchedWorker:
+        model_runner = PatchedRunner()
+
+    manager = ConstraintResourceManager()
+    status = set_gr_constraint_resources(PatchedWorker(), wire, manager)
+    assert status["cached"] is True
+
+
 def test_install_worker_resource_hook_idempotent(tokenizer: MagicMock) -> None:
     class FakeWorker:
         pass

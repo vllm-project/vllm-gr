@@ -199,6 +199,9 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
             "beam_data": scheduler_output.beam_data,
             "req_ids": [],
         }
+        # The Constraint Tables _sample hook reads the scheduler output to find
+        # _gr_request_row_configs; it must be published for the whole run.
+        assert self._current_scheduler_output is scheduler_output
         if should_raise:
             raise ExpectedError
         return "result"

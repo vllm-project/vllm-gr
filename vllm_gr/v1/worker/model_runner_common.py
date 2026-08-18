@@ -18,6 +18,9 @@ logger = init_logger(__name__)
 _WORKER_EXECUTE_PATCH_MARKER = "_vllm_gr_beam_execute_patch"
 _WORKER_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_patch"
 _WORKER_BOOKKEEPING_PATCH_MARKER = "_vllm_gr_beam_bookkeeping_patch"
+# Optional: only installed when the runner exposes ``_sample`` (NPU builds may
+# not).  is_worker_runner_patched() deliberately does not require it.
+_WORKER_SAMPLE_PATCH_MARKER = "_vllm_gr_beam_sample_patch"
 
 
 def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -781,11 +784,18 @@ def make_patched_execute_model(_orig_execute_model):
 
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info
+        # Published for the optional Constraint Tables ``_sample`` hook
+        # (constraint_hook): it reads ``_gr_request_row_configs`` to locate the
+        # constrained logits rows.  Lives until bookkeeping, which runs inside
+        # ``_orig_execute_model``; cleaned here in ``finally`` to prevent a
+        # stale scheduler_output leaking into the next step.
+        self._current_scheduler_output = scheduler_output
         try:
             return _orig_execute_model(self, scheduler_output, *args, **kwargs)
         finally:
             self._current_beam_data = {}
             self._current_beam_info = None
+            self._current_scheduler_output = None
             BEAM_DATA_VAR.reset(token)
 
     setattr(patched_execute_model, _WORKER_EXECUTE_PATCH_MARKER, True)

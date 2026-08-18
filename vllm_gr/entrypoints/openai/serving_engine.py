@@ -18,10 +18,18 @@ from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
+    extract_constrained_flat_logprobs,
+    extract_constrained_segment,
     materialize_selected_beams,
     select_top_indices,
 )
 from vllm_gr.constraints import BeamConstraintCoordinator, ParentCandidateBuilder
+from vllm_gr.constraints.models import CandidateLayout
+from vllm_gr.constraints.strategies import (
+    ConstraintTableStrategy,
+    validate_constraint_generation_limits,
+    validate_constraint_table_protocol,
+)
 from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
@@ -108,6 +116,7 @@ async def _beam_request_step(
     priority=0,
     data_parallel_rank: int | None = None,
     max_decode_steps: int = 0,
+    is_constrained: bool = False,
 ):
     """BEAM_REQUEST path: single logical message update for all active branches."""
     parent_beam_ids = []
@@ -165,6 +174,9 @@ async def _beam_request_step(
             priority=priority,
             parent_beam_indices=parent_beam_indices,
             max_decode_steps=max_decode_steps,
+            # Constraint Tables: the Worker's raw-logits hook needs the step to
+            # run (1/2 for decode; 0 reserved for the constrained prefill).
+            constraint_step=len(beam_tokens[0]) if is_constrained else 0,
         )
     )
 
@@ -214,12 +226,39 @@ async def beam_search(
     temperature = params.temperature
     begin_token = params.begin_token
     end_token = params.end_token
-    catalog_strategy = getattr(params, "catalog_strategy", "fill")
+    catalog_strategy = getattr(params, "catalog_strategy", None)
     constraint_coordinator = getattr(self.models, "constraint_coordinator", None)
     if constraint_coordinator is None:
         constraint_coordinator = BeamConstraintCoordinator.from_catalog(
             getattr(self.models, "catalog", None)
         )
+
+    # Resolve the frontend catalog-strategy per backend (Trie: None → "fill";
+    # Constraint Tables: an explicit value is a contradiction and is rejected).
+    try:
+        catalog_strategy = constraint_coordinator.resolve_catalog_strategy(catalog_strategy)
+    except ValueError as exc:
+        raise VLLMValidationError(
+            str(exc),
+            parameter="catalog_strategy",
+            value=catalog_strategy,
+        ) from exc
+
+    # Constraint Tables generate candidates in the Worker; the decode-step
+    # update must carry the constraint_step so the engine can route the raw
+    # logits through the constrained top-k operator.
+    _is_constrained = constraint_coordinator is not None and isinstance(
+        constraint_coordinator.strategy, ConstraintTableStrategy
+    )
+
+    # Constraint Tables defer the collective-RPC broadcast to the first
+    # beam_search; ensure workers hold the tables before any constrained step.
+    # The method is mounted globally on OpenAIServingModels but only
+    # constraint-table instances initialize the constraint fields, so the
+    # ``_is_constrained`` gate keeps Trie / no-catalog requests on the fast path.
+    ensure_injected = getattr(self.models, "_ensure_constraint_tables_injected", None)
+    if _is_constrained and ensure_injected is not None:
+        await ensure_injected()
 
     # All beams from the same logical beam search will share the same priority value
     # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
@@ -334,8 +373,32 @@ async def beam_search(
             value=max_tokens,
         )
 
+    if _is_constrained:
+        # Constraint Tables are a fixed 3-level FSM; requesting more steps than
+        # the Worker can run is a hard error, never a silent fallback.
+        try:
+            validate_constraint_generation_limits(
+                beam_width=beam_width,
+                max_generate_steps=max_tokens - pre_calc,
+            )
+        except ValueError as exc:
+            raise VLLMValidationError(str(exc)) from exc
+
     # Check once if the engine supports batch submission / beam fork.
     use_beam_request = hasattr(self.engine_client, "beam_request_step_update")
+
+    # Constraint Tables generate candidates in the Worker from a beam-request
+    # session (step0 prefill via EngineCore ADD_BATCH cache hook, step1/2 decode
+    # via beam_request_step_update).  The _add_batch_step fallback cannot express
+    # constraint_step + beam_suffix, so a client without the beam protocol must
+    # fail fast — never silently degrade.
+    validate_constraint_table_protocol(
+        is_constraint_table=_is_constrained,
+        beam_protocol_available=use_beam_request,
+        required=(
+            "an engine client implementing beam_request_step_update (EngineCore beam sessions)"
+        ),
+    )
 
     prev_beam_internal_ids: list[str] = []
     fork_info: list[tuple[int, int]] | None = None
@@ -369,8 +432,11 @@ async def beam_search(
         request_id_batch = f"{request_id}-{random_uuid()}"
 
         # Launch catalog filtering in parallel with the engine step.
+        # Constraint Tables generate candidates in the Worker, so the Trie
+        # lookup must not run (ConstraintTableStrategy.valid_next_token_ids
+        # raises by contract).
         catalog_task = None
-        if constraint_coordinator.enabled:
+        if constraint_coordinator.enabled and not _is_constrained:
 
             def get_valid_tokens_set(beam) -> set[int]:
                 generated_tokens = beam.tokens[len(prompt_token_ids) :]
@@ -404,6 +470,7 @@ async def beam_search(
                 priority=priority,
                 data_parallel_rank=rank,
                 max_decode_steps=max_tokens - pre_calc,
+                is_constrained=_is_constrained,
             )
         else:
             output, new_ids = await _add_batch_step(
@@ -427,7 +494,13 @@ async def beam_search(
             valid_tokens_sets = await catalog_task
         if token > 0:
             generation_time += time.perf_counter() - gen_start
-        candidate_builder = ParentCandidateBuilder()
+        candidate_builder = ParentCandidateBuilder(
+            layout=(
+                CandidateLayout.CONSTRAINED_TOPK
+                if _is_constrained
+                else CandidateLayout.STANDARD_SAMPLER
+            )
+        )
 
         # -------------------------------------------------------------------------
         # STRIDE-AWARE METADATA EXTRACTION FOR GENERATED BEAMS
@@ -478,15 +551,30 @@ async def beam_search(
                     start_offset = b_idx * stride_k
                     end_offset = start_offset + stride_k
 
-                    token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_segment(
-                        raw_token_ids,
-                        raw_logprobs,
-                        raw_ranks,
-                        raw_decoded,
-                        start_offset,
-                        end_offset,
-                        logprobs_num,
-                    )
+                    if _is_constrained:
+                        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                            extract_constrained_segment(
+                                raw_token_ids,
+                                raw_logprobs,
+                                raw_ranks,
+                                raw_decoded,
+                                start_offset,
+                                end_offset,
+                                logprobs_num,
+                            )
+                        )
+                    else:
+                        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                            extract_and_dedup_segment(
+                                raw_token_ids,
+                                raw_logprobs,
+                                raw_ranks,
+                                raw_decoded,
+                                start_offset,
+                                end_offset,
+                                logprobs_num,
+                            )
+                        )
 
                     constraint_coordinator.add_parent_candidates(
                         candidate_builder,
@@ -497,7 +585,11 @@ async def beam_search(
                         ranks=ranks_pos,
                         decoded_tokens=decoded_pos,
                         valid_token_ids=(
-                            valid_tokens_sets[b_idx] if valid_tokens_sets is not None else None
+                            None
+                            if _is_constrained
+                            else valid_tokens_sets[b_idx]
+                            if valid_tokens_sets is not None
+                            else None
                         ),
                         candidate_strategy=catalog_strategy,
                     )
@@ -541,9 +633,14 @@ async def beam_search(
                 if result.outputs[0].logprobs is not None:
                     flat = result.outputs[0].logprobs
 
-                    token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
-                        extract_and_dedup_flat_logprobs(flat, logprobs_num)
-                    )
+                    if _is_constrained:
+                        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                            extract_constrained_flat_logprobs(flat, logprobs_num)
+                        )
+                    else:
+                        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                            extract_and_dedup_flat_logprobs(flat, logprobs_num)
+                        )
                     constraint_coordinator.add_parent_candidates(
                         candidate_builder,
                         parent_index=i,
@@ -553,7 +650,11 @@ async def beam_search(
                         ranks=ranks_pos,
                         decoded_tokens=decoded_pos,
                         valid_token_ids=(
-                            valid_tokens_sets[i] if valid_tokens_sets is not None else None
+                            None
+                            if _is_constrained
+                            else valid_tokens_sets[i]
+                            if valid_tokens_sets is not None
+                            else None
                         ),
                         candidate_strategy=catalog_strategy,
                     )

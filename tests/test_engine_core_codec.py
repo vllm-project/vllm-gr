@@ -101,3 +101,18 @@ def test_decode_beam_step_update_payload() -> None:
     assert isinstance(decoded, BeamRequestStepUpdate)
     assert decoded.session_id == "session-0"
     assert decoded.beam_width == 2
+    assert decoded.constraint_step == 0  # default round-trips
+
+
+def test_decode_beam_step_update_preserves_constraint_step() -> None:
+    decoders = build_engine_core_decoders(None)
+    update = _beam_step_update()
+    update.constraint_step = 2
+
+    decoded = decode_engine_core_payload(
+        decoders,
+        EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE,
+        _frames(update),
+    )
+
+    assert decoded.constraint_step == 2

@@ -9,9 +9,11 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.v1.worker.constraint_hook import apply_constrained_sample_override
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
+    _WORKER_SAMPLE_PATCH_MARKER,
     InputBatchProxy,
     _beam_collapse_bookkeeping,
     _beam_remap_inputs,
@@ -60,6 +62,28 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
+
+
+def make_patched_sample_npu(_orig_sample):
+    """Wrap the NPU ``_sample`` to run Constraint Tables on raw logits.
+
+    Installed only when the deployed vllm-ascend runner actually exposes
+    ``_sample`` (``apply_worker_patches`` guards with ``hasattr``); builds
+    without the hook fail at constraint-table injection instead of silently
+    sampling unconstrained.  Signature-agnostic pass-through so it tolerates
+    an Ascend ``_sample`` with a different metadata argument.
+    """
+    if getattr(_orig_sample, _WORKER_SAMPLE_PATCH_MARKER, False):
+        return _orig_sample
+
+    @wraps(_orig_sample)
+    def patched_sample(self, *args, **kwargs):
+        sampler_output = _orig_sample(self, *args, **kwargs)
+        apply_constrained_sample_override(self, args[0], sampler_output)
+        return sampler_output
+
+    setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
+    return patched_sample
 
 
 def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
@@ -136,3 +160,4 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
 
 make_patched_prepare_inputs = make_patched_prepare_inputs_npu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_npu
+make_patched_sample = make_patched_sample_npu
