@@ -183,6 +183,19 @@ async def run_beam_controller_fn(
 
         raise EngineDeadError()
 
+    resource_id = controller_request.constraint_resource_id
+    start_constraint_resource = constraint_resource
+    ensure_resource = getattr(self.engine_core, "ensure_beam_constraint_resource_async", None)
+    if resource_id is not None and constraint_resource is not None and ensure_resource:
+        await ensure_resource(
+            resource_id,
+            constraint_resource,
+            data_parallel_rank=data_parallel_rank,
+        )
+        # The hot Start path carries only the digest. Keeping the optional
+        # field in the schema preserves compatibility with older clients.
+        start_constraint_resource = None
+
     engine_request = self.input_processor.process_inputs(
         controller_request.beam_session_id,
         prompt,
@@ -201,9 +214,25 @@ async def run_beam_controller_fn(
         engine_request=engine_request,
         call_id=0,
         data_parallel_rank=data_parallel_rank,
-        constraint_resource=constraint_resource,
+        constraint_resource=start_constraint_resource,
     )
-    return await self.engine_core.run_beam_controller_async(start)
+    result = await self.engine_core.run_beam_controller_async(start)
+    if (
+        result.get("error_code") == "UNKNOWN_RESOURCE_ID"
+        and resource_id is not None
+        and constraint_resource is not None
+        and ensure_resource
+    ):
+        # The frontend cache can outlive an EngineCore generation. Invalidate
+        # it, register with the same rank, and retry this Start exactly once.
+        await ensure_resource(
+            resource_id,
+            constraint_resource,
+            data_parallel_rank=data_parallel_rank,
+            force=True,
+        )
+        result = await self.engine_core.run_beam_controller_async(start)
+    return result
 
 
 async def cancel_beam_controller_fn(

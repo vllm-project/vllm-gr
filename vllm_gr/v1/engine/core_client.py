@@ -10,6 +10,7 @@ from vllm.v1.engine import EngineCoreRequestType
 from vllm_gr.v1.engine.types import (
     BeamControllerCancelRequest,
     BeamControllerStartRequest,
+    BeamConstraintResourceRegisterRequest,
     BeamRequestStepUpdate,
 )
 
@@ -120,6 +121,102 @@ async def run_beam_controller_async(
     finally:
         if hasattr(self, "reqs_in_flight"):
             self.reqs_in_flight.pop(start.engine_request.request_id, None)
+
+
+async def ensure_beam_constraint_resource_async(
+    self,
+    resource_id: str,
+    constraint_resource: dict[str, object],
+    *,
+    data_parallel_rank: int | None = None,
+    force: bool = False,
+) -> dict:
+    """Register a resource once per EngineCore generation/rank/digest.
+
+    Concurrent callers share one registration task so a startup burst cannot
+    duplicate a large resource payload.
+    """
+    current_wave = int(getattr(self, "current_wave", 0))
+    key = (current_wave, data_parallel_rank, resource_id)
+    registered = getattr(self, "_beam_registered_constraint_resources", None)
+    if registered is None:
+        registered = set()
+        self._beam_registered_constraint_resources = registered
+    if force:
+        registered.discard(key)
+    if key in registered:
+        return {
+            "resource_id": resource_id,
+            "status": "already_registered",
+            "error_code": None,
+            "error": None,
+        }
+
+    tasks = getattr(self, "_beam_constraint_registration_tasks", None)
+    if tasks is None:
+        tasks = {}
+        self._beam_constraint_registration_tasks = tasks
+    task = tasks.get(key)
+    if task is None:
+
+        async def register() -> dict:
+            engine = None
+            core_engines = getattr(self, "core_engines", ())
+            if len(core_engines) > 1:
+                if data_parallel_rank is None:
+                    raise ValueError(
+                        "data_parallel_rank is required to register a resource "
+                        "with a data-parallel EngineCore"
+                    )
+                engine = core_engines[data_parallel_rank]
+            elif data_parallel_rank is not None and core_engines:
+                engine = core_engines[data_parallel_rank]
+
+            call_id = uuid.uuid1().int >> 64
+            request = BeamConstraintResourceRegisterRequest(
+                resource_id=resource_id,
+                constraint_resource=constraint_resource,
+                call_id=call_id,
+                client_index=self.client_index,
+                current_wave=current_wave,
+                data_parallel_rank=data_parallel_rank,
+            )
+            future = asyncio.get_running_loop().create_future()
+            self.utility_results[call_id] = future
+
+            try:
+                to_await = self._send_input(
+                    EngineCoreRequestType.BEAM_CONSTRAINT_RESOURCE_REGISTER,
+                    request,
+                    engine,
+                )
+                if hasattr(self, "first_req_send_socket") and not self.engines_running:
+                    req_msg = msgspec.msgpack.encode(("FIRST_REQ", engine))
+                    await self.first_req_send_socket.send(req_msg)
+                await to_await
+                self._ensure_output_queue_task()
+                result = await future
+            except BaseException:
+                pending = self.utility_results.pop(call_id, None)
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                raise
+            if result.get("error") is not None:
+                raise RuntimeError(
+                    f"EngineCore constraint resource registration failed: {result['error']}"
+                )
+            if result.get("resource_id") != resource_id:
+                raise RuntimeError("EngineCore acknowledged a different constraint resource")
+            registered.add(key)
+            return result
+
+        task = asyncio.create_task(register())
+        tasks[key] = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if task.done() and tasks.get(key) is task:
+            tasks.pop(key, None)
 
 
 async def cancel_beam_controller_async(

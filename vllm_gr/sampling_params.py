@@ -8,6 +8,8 @@ from vllm.sampling_params import (
     SamplingParams,
 )
 
+from vllm_gr.beam_output import BeamLogprobsMode, BeamOutputSpec
+
 
 def clone_beam_decode_sampling_params(params: SamplingParams) -> SamplingParams:
     """Clone sampling params for one logical grouped-beam request.
@@ -38,6 +40,18 @@ class BeamSearchParams(
     # "fill": fill logprob slots with valid catalog tokens at low score.
     # "null":   leave all logprobs as -inf; the beam is excluded from selection.
     catalog_strategy: str = "fill"
+    result_width: int | None = None
+    logprobs_mode: BeamLogprobsMode = "none"
+    top_logprobs: int = 0
+
+    @property
+    def output_spec(self) -> BeamOutputSpec:
+        result_width = self.beam_width if self.result_width is None else self.result_width
+        return BeamOutputSpec(
+            result_width=result_width,
+            logprobs_mode=self.logprobs_mode,
+            top_logprobs=self.top_logprobs,
+        )
 
     def __post_init__(self) -> None:
         if self.catalog_strategy not in ("fill", "null"):
@@ -46,3 +60,9 @@ class BeamSearchParams(
                 parameter="catalog_strategy",
                 value=self.catalog_strategy,
             )
+        try:
+            self.output_spec.validate(self.beam_width)
+        except ValueError as exc:
+            raise VLLMValidationError(
+                str(exc), parameter="beam_output_spec", value=self.output_spec
+            ) from exc

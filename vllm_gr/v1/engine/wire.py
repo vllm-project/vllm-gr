@@ -11,6 +11,7 @@ ADD_BATCH_WIRE_VALUE = b"\x06"
 BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE = b"\x07"
 BEAM_CONTROLLER_START_WIRE_VALUE = b"\x08"
 BEAM_CONTROLLER_CANCEL_WIRE_VALUE = b"\x09"
+BEAM_CONSTRAINT_RESOURCE_REGISTER_WIRE_VALUE = b"\x0a"
 
 
 def _add_enum_member(name: str, value: bytes) -> None:
@@ -91,3 +92,7 @@ def register_engine_core_request_types() -> None:
     )
     _add_enum_member("BEAM_CONTROLLER_START", BEAM_CONTROLLER_START_WIRE_VALUE)
     _add_enum_member("BEAM_CONTROLLER_CANCEL", BEAM_CONTROLLER_CANCEL_WIRE_VALUE)
+    _add_enum_member(
+        "BEAM_CONSTRAINT_RESOURCE_REGISTER",
+        BEAM_CONSTRAINT_RESOURCE_REGISTER_WIRE_VALUE,
+    )

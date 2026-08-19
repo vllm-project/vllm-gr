@@ -19,6 +19,7 @@ from vllm_gr.v1.engine.wire import (
     ADD_BATCH_WIRE_VALUE,
     BEAM_CONTROLLER_CANCEL_WIRE_VALUE,
     BEAM_CONTROLLER_START_WIRE_VALUE,
+    BEAM_CONSTRAINT_RESOURCE_REGISTER_WIRE_VALUE,
     BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE,
     register_engine_core_request_types,
 )
@@ -37,6 +38,7 @@ GR_REQUEST_WIRE_VALUES = {
     "BEAM_REQUEST_STEP_UPDATE": b"\x07",
     "BEAM_CONTROLLER_START": b"\x08",
     "BEAM_CONTROLLER_CANCEL": b"\x09",
+    "BEAM_CONSTRAINT_RESOURCE_REGISTER": b"\x0a",
 }
 
 ENGINE_CORE_REQUEST_FIELDS = (
@@ -114,6 +116,7 @@ def test_engine_core_wire_value_inventory() -> None:
     assert BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE == b"\x07"
     assert BEAM_CONTROLLER_START_WIRE_VALUE == b"\x08"
     assert BEAM_CONTROLLER_CANCEL_WIRE_VALUE == b"\x09"
+    assert BEAM_CONSTRAINT_RESOURCE_REGISTER_WIRE_VALUE == b"\x0a"
     register_engine_core_request_types()
     register_engine_core_request_types()
 

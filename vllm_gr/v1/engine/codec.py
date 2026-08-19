@@ -14,6 +14,7 @@ from vllm.v1.serial_utils import MsgpackDecoder
 from vllm_gr.v1.engine.types import (
     BeamControllerCancelRequest,
     BeamControllerStartRequest,
+    BeamConstraintResourceRegisterRequest,
     BeamRequestStepUpdate,
 )
 
@@ -25,6 +26,7 @@ class EngineCoreDecoders:
     beam_step_update: MsgpackDecoder
     beam_controller_start: MsgpackDecoder
     beam_controller_cancel: MsgpackDecoder
+    beam_constraint_resource_register: MsgpackDecoder
     generic: MsgpackDecoder
 
 
@@ -37,6 +39,9 @@ def build_engine_core_decoders(oob_tensor_provider: Any) -> EngineCoreDecoders:
         beam_step_update=MsgpackDecoder(BeamRequestStepUpdate, **decoder_kwargs),
         beam_controller_start=MsgpackDecoder(BeamControllerStartRequest, **decoder_kwargs),
         beam_controller_cancel=MsgpackDecoder(BeamControllerCancelRequest, **decoder_kwargs),
+        beam_constraint_resource_register=MsgpackDecoder(
+            BeamConstraintResourceRegisterRequest, **decoder_kwargs
+        ),
         generic=MsgpackDecoder(**decoder_kwargs),
     )
 
@@ -57,6 +62,8 @@ def decode_engine_core_payload(
         decoder = decoders.beam_controller_start
     elif request_type == EngineCoreRequestType.BEAM_CONTROLLER_CANCEL:
         decoder = decoders.beam_controller_cancel
+    elif request_type == EngineCoreRequestType.BEAM_CONSTRAINT_RESOURCE_REGISTER:
+        decoder = decoders.beam_constraint_resource_register
     else:
         decoder = decoders.generic
     return decoder.decode(data_frames)

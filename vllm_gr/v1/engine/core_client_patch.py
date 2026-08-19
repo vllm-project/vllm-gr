@@ -19,6 +19,7 @@ from vllm_gr.v1.engine.core_client import (
     add_requests_async,
     beam_request_step_update_async,
     cancel_beam_controller_async,
+    ensure_beam_constraint_resource_async,
     run_beam_controller_async,
 )
 
@@ -84,6 +85,7 @@ def apply_engine_client_patches() -> None:
     AsyncMPClient.beam_request_step_update_async = beam_request_step_update_async
     AsyncMPClient.run_beam_controller_async = run_beam_controller_async
     AsyncMPClient.cancel_beam_controller_async = cancel_beam_controller_async
+    AsyncMPClient.ensure_beam_constraint_resource_async = ensure_beam_constraint_resource_async
     SyncMPClient.add_requests = sync_mp_add_requests
     SyncMPClient.beam_request_step_update = sync_mp_beam_request_step_update
     InprocClient.add_requests = inproc_add_requests

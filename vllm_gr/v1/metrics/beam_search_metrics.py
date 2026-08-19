@@ -36,6 +36,10 @@ _beam_prefill_time_histogram = None
 _beam_decode_time_histogram = None
 _beam_sort_time_histogram = None
 _beams_per_request_histogram = None
+_beam_output_requests_total = None
+_beam_result_width_histogram = None
+_beam_result_shortfall_total = None
+_beam_result_reduction_requests_total = None
 
 
 def _initialize_metrics() -> None:
@@ -45,6 +49,8 @@ def _initialize_metrics() -> None:
     global _beam_requests_total, _total_beams_generated
     global _beam_prefill_time_histogram, _beam_decode_time_histogram
     global _beam_sort_time_histogram, _beams_per_request_histogram
+    global _beam_output_requests_total, _beam_result_width_histogram
+    global _beam_result_shortfall_total, _beam_result_reduction_requests_total
 
     if _metrics_initialized or not PROMETHEUS_AVAILABLE:
         return
@@ -101,6 +107,27 @@ def _initialize_metrics() -> None:
             "Distribution of number of beams per request",
             labelnames=["engine", "model_name"],
             buckets=(1, 2, 4, 8, 16, 32, 64, 128),
+        )
+        _beam_output_requests_total = Counter(
+            "vllm_gr_beam_output_requests_total",
+            "Beam requests by low-cardinality final logprobs mode",
+            labelnames=["engine", "model_name", "logprobs_mode"],
+        )
+        _beam_result_width_histogram = Histogram(
+            "vllm_gr_beam_result_width",
+            "Distribution of actual final Beam result counts",
+            labelnames=["engine", "model_name"],
+            buckets=(1, 2, 4, 8, 16, 32, 64, 128),
+        )
+        _beam_result_shortfall_total = Counter(
+            "vllm_gr_beam_result_shortfall_total",
+            "Beam requests returning fewer results than requested",
+            labelnames=["engine", "model_name"],
+        )
+        _beam_result_reduction_requests_total = Counter(
+            "vllm_gr_beam_result_reduction_requests_total",
+            "Beam requests whose requested result width is below beam width",
+            labelnames=["engine", "model_name"],
         )
     except ValueError:
         # Metrics already registered in this registry (multiprocessing scenario).
@@ -166,6 +193,35 @@ def record_beam_search_metrics(
                 _beams_per_request_histogram.labels(**labels).observe(num_beams)
     except Exception:
         # Silently ignore errors - don't break main flow
+        pass
+
+
+def record_beam_output_metrics(
+    output_spec: Any,
+    actual_width: int,
+    *,
+    beam_width: int,
+    engine: str = "0",
+    model_name: str = "unknown",
+) -> None:
+    """Record the frozen output contract without request/token labels."""
+    if not _metrics_initialized:
+        _initialize_metrics()
+    if not PROMETHEUS_AVAILABLE or _beam_output_requests_total is None:
+        return
+    labels = {"engine": engine, "model_name": model_name}
+    try:
+        _beam_output_requests_total.labels(**labels, logprobs_mode=output_spec.logprobs_mode).inc()
+        if _beam_result_width_histogram is not None:
+            _beam_result_width_histogram.labels(**labels).observe(actual_width)
+        if actual_width < output_spec.result_width and _beam_result_shortfall_total is not None:
+            _beam_result_shortfall_total.labels(**labels).inc()
+        if (
+            output_spec.result_width < beam_width
+            and _beam_result_reduction_requests_total is not None
+        ):
+            _beam_result_reduction_requests_total.labels(**labels).inc()
+    except Exception:
         pass
 
 

@@ -13,6 +13,10 @@ from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.outputs import LogprobsLists
 
 from vllm_gr.config.parser import BEAM_CONTROL_MODE_KEY
+from vllm_gr.constraints.trie_resource import (
+    TrieConstraintResource,
+    trie_resource_to_wire,
+)
 from vllm_gr.v1.beam.controller_types import BeamControllerRequest
 from vllm_gr.v1.engine.core import (
     _ensure_beam_state,
@@ -22,6 +26,7 @@ from vllm_gr.v1.engine.core import (
     create_controller,
     get_controller,
     remove_controller,
+    register_constraint_resource,
 )
 
 
@@ -77,6 +82,46 @@ def _request(session_id: str = "session-0"):
         trace_headers=None,
         priority=5,
     )
+
+
+def _resource() -> TrieConstraintResource:
+    return TrieConstraintResource(
+        node_offsets=np.asarray([0, 1, 1], dtype=np.int64),
+        edge_token_ids=np.asarray([7], dtype=np.int64),
+        edge_child_nodes=np.asarray([1], dtype=np.int64),
+        terminal_nodes=np.asarray([False, True], dtype=np.bool_),
+    )
+
+
+def test_constraint_resource_registration_checks_registry_before_payload() -> None:
+    engine = _Engine()
+    resource = _resource()
+    request = SimpleNamespace(
+        resource_id=resource.digest,
+        constraint_resource=trie_resource_to_wire(resource),
+    )
+
+    first = register_constraint_resource(engine, request)
+    assert first["status"] == "registered"
+    assert engine.beam_constraint_resources.require(resource.digest).digest == resource.digest
+
+    # A cache hit must not inspect or deserialize the payload.
+    request.constraint_resource = {"malformed": True}
+    second = register_constraint_resource(engine, request)
+    assert second["status"] == "already_registered"
+
+
+def test_constraint_resource_registration_rejects_id_mismatch() -> None:
+    engine = _Engine()
+    resource = _resource()
+    request = SimpleNamespace(
+        resource_id="a" * 64,
+        constraint_resource=trie_resource_to_wire(resource),
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        register_constraint_resource(engine, request)
+    assert len(engine.beam_constraint_resources) == 0
 
 
 def test_registry_rejects_duplicate_and_unknown_sessions() -> None:

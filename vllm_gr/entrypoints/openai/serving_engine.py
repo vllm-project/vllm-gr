@@ -21,22 +21,40 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
+from vllm_gr.beam_output import BeamOutputSpec
 from vllm_gr.config import BeamControlMode, GRConfig
 from vllm_gr.constraints import BeamConstraintCoordinator, ParentCandidateBuilder
-from vllm_gr.logprobs import reconstruct_beam_logprobs
+from vllm_gr.logprobs import project_flat_logprobs, reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.beam.controller_types import (
     BeamControllerFinalResult,
+    BeamControllerFinalResultLite,
     BeamControllerRequest,
 )
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
-from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
+from vllm_gr.v1.metrics.beam_search_metrics import (
+    record_beam_output_metrics,
+    record_beam_search_metrics,
+)
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
 
 _dp_rank_counter = 0
 _dp_rank_lock = asyncio.Lock()
+
+
+def _get_output_spec(params) -> BeamOutputSpec:
+    spec = getattr(params, "output_spec", None)
+    if spec is not None:
+        return spec
+    # Compatibility for callers constructing upstream BeamSearchParams-like
+    # objects without the new contract.
+    return BeamOutputSpec(
+        result_width=params.beam_width,
+        logprobs_mode="top_k",
+        top_logprobs=params.beam_width,
+    )
 
 
 # return rank for next beam search request in a round-robin manner across the data parallel ranks
@@ -641,21 +659,33 @@ async def _serving_controlled_beam_search(
     beam_search_sort_start = time.perf_counter()
     sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
     beam_search_sort_time = time.perf_counter() - beam_search_sort_start
-    best_beams = sorted_completed[:beam_width]
+    output_spec = _get_output_spec(params)
+    best_beams = sorted_completed[: output_spec.result_width]
 
     # Reconstruct full logprobs only for the final best beams by walking
     # the parent-pointer tree.  This replaces the O(beams * steps^2)
     # per-step copying with a single O(beams * steps) pass at the end.
-    for beam in best_beams:
-        reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
+    if output_spec.logprobs_mode != "none":
+        for beam in best_beams:
+            reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
+            completion_tokens = list(beam.tokens[tokenized_length:])
+            beam.logprobs = project_flat_logprobs(
+                beam.logprobs,
+                completion_tokens,
+                output_spec.logprobs_mode,
+                output_spec.top_logprobs,
+            )
 
-    for i, beam in enumerate(best_beams):
+    decode_batches = []
+    for beam in best_beams:
         tokens = (
             beam.tokens[tokenized_length:-1]
             if beam.tokens[-1] == eos_token_id and not ignore_eos
             else beam.tokens[tokenized_length:]
         )
-        beam.text = tokenizer.decode(tokens)
+        decode_batches.append(tokens)
+    for beam, text in zip(best_beams, _batch_decode_equivalent(tokenizer, decode_batches)):
+        beam.text = text
 
     beam_search_decode_time = time.perf_counter() - beam_search_start
     beam_search_prefill_time = beam_search_start - prefill_start
@@ -678,7 +708,7 @@ async def _serving_controlled_beam_search(
                 cumulative_logprob=beam.cum_logprob,
                 token_ids=beam.tokens[tokenized_length:],
                 index=i,
-                logprobs=beam.logprobs,
+                logprobs=(None if output_spec.logprobs_mode == "none" else beam.logprobs),
                 finish_reason=beam.finish_reason if beam.finish_reason is not None else "length",
                 stop_reason=beam.stop_reason,
             )
@@ -700,6 +730,13 @@ async def _serving_controlled_beam_search(
     except Exception:
         model_name = "unknown"
     record_beam_search_metrics(metrics, engine="0", model_name=model_name)
+    record_beam_output_metrics(
+        output_spec,
+        len(best_beams),
+        beam_width=params.beam_width,
+        engine="0",
+        model_name=model_name,
+    )
 
     yield out
 
@@ -713,6 +750,25 @@ def _flat_logprobs_from_wire(payload: dict) -> FlatLogprobs:
         ranks=list(payload["ranks"]),
         decoded_tokens=list(payload["decoded_tokens"]),
     )
+
+
+def _batch_decode_equivalent(tokenizer, token_batches: list[list[int]]) -> list[str]:
+    """Use batch decoding after a one-time tokenizer equivalence check."""
+    if not token_batches:
+        return []
+    cached = getattr(tokenizer, "_vllm_gr_batch_decode_equivalent", None)
+    if cached is False or not hasattr(tokenizer, "batch_decode"):
+        return [tokenizer.decode(tokens) for tokens in token_batches]
+    batch_texts = list(tokenizer.batch_decode(token_batches))
+    if cached is True:
+        return batch_texts
+    individual = [tokenizer.decode(tokens) for tokens in token_batches]
+    equivalent = batch_texts == individual
+    try:
+        setattr(tokenizer, "_vllm_gr_batch_decode_equivalent", equivalent)
+    except Exception:
+        pass
+    return batch_texts if equivalent else individual
 
 
 async def _engine_controlled_beam_search(
@@ -816,6 +872,7 @@ async def _engine_controlled_beam_search(
         constraint_backend=gr_config.constraint_backend.value,
         constraint_resource_id=resource_id,
         beam_control_mode=gr_config.beam_control_mode.value,
+        output_spec=_get_output_spec(params),
     )
     sampling_params = SamplingParams(
         logprobs=params.beam_width,
@@ -882,16 +939,26 @@ async def _engine_controlled_beam_search(
             num_beams=result.metrics.num_beams,
         )
 
+    token_id_batches = []
+    for beam in result.beams:
+        decode_tokens = getattr(beam, "decode_token_ids", None)
+        if decode_tokens is None:
+            decode_tokens = list(beam.token_ids)
+            if decode_tokens and decode_tokens[-1] == eos_token_id and not params.ignore_eos:
+                decode_tokens = decode_tokens[:-1]
+        token_id_batches.append(decode_tokens)
+    decoded_texts = _batch_decode_equivalent(tokenizer, token_id_batches)
+    lite_result = isinstance(result, BeamControllerFinalResultLite)
     output = RequestOutput(
         request_id=request_id,
         prompt=prompt_text,
         outputs=[
             CompletionOutput(
                 index=index,
-                text=tokenizer.decode(beam.decode_token_ids),
+                text=decoded_texts[index],
                 token_ids=beam.token_ids,
                 cumulative_logprob=beam.cumulative_logprob,
-                logprobs=_flat_logprobs_from_wire(beam.logprobs),
+                logprobs=(None if lite_result else _flat_logprobs_from_wire(beam.logprobs)),
                 finish_reason=beam.finish_reason,
                 stop_reason=beam.stop_reason,
             )
@@ -902,7 +969,6 @@ async def _engine_controlled_beam_search(
         prompt_logprobs=None,
         metrics=metrics,
     )
-
     try:
         model_name = self.models.model_name
         if callable(model_name):
@@ -911,6 +977,13 @@ async def _engine_controlled_beam_search(
     except Exception:
         model_name = "unknown"
     record_beam_search_metrics(metrics, engine="0", model_name=model_name)
+    record_beam_output_metrics(
+        _get_output_spec(params),
+        len(result.beams),
+        beam_width=params.beam_width,
+        engine="0",
+        model_name=model_name,
+    )
     yield output
 
 

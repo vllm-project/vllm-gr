@@ -228,6 +228,7 @@ tmp/
 # Profiling
 *.prof
 *.lprof
+.st_results/
 
 # setuptools-scm generated version file
 vllm_gr/_version.py

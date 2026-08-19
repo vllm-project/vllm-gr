@@ -73,6 +73,7 @@ def make_patched_controller_input(original_handler):
             _put_controller_result,
             cancel_controller,
             create_controller,
+            register_constraint_resource,
         )
 
         if request_type == EngineCoreRequestType.BEAM_CONTROLLER_START:
@@ -88,7 +89,16 @@ def make_patched_controller_input(original_handler):
                     self,
                     start.client_index,
                     start.call_id,
-                    _controller_failure_result(start, str(exc)),
+                    _controller_failure_result(
+                        start,
+                        str(exc),
+                        error_code=(
+                            "UNKNOWN_RESOURCE_ID"
+                            if isinstance(exc, KeyError)
+                            and start.controller.constraint_resource_id is not None
+                            else None
+                        ),
+                    ),
                 )
             return
         if request_type == EngineCoreRequestType.BEAM_CONTROLLER_CANCEL:
@@ -99,6 +109,27 @@ def make_patched_controller_input(original_handler):
                     "Ignoring cancellation for unknown beam controller %s",
                     request.beam_session_id,
                 )
+            return
+        if request_type == EngineCoreRequestType.BEAM_CONSTRAINT_RESOURCE_REGISTER:
+            try:
+                result = register_constraint_resource(self, request)
+            except Exception as exc:
+                logger.exception(
+                    "Failed to register beam constraint resource %s",
+                    request.resource_id,
+                )
+                result = {
+                    "resource_id": request.resource_id,
+                    "status": "error",
+                    "error_code": "RESOURCE_REGISTRATION_FAILED",
+                    "error": str(exc),
+                }
+            _put_controller_result(
+                self,
+                request.client_index,
+                request.call_id,
+                result,
+            )
             return
         return original_handler(self, request_type, request)
 

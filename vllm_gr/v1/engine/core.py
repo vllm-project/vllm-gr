@@ -61,16 +61,28 @@ def _ensure_beam_state(self) -> None:
             self.beam_constraint_resources = BeamConstraintResourceRegistry()
 
 
-def _controller_failure_result(start, error: str) -> dict[str, Any]:
-    from vllm_gr.v1.beam.controller_types import BeamControllerFinalResult
+def _controller_failure_result(
+    start, error: str, *, error_code: str | None = None
+) -> dict[str, Any]:
+    from vllm_gr.v1.beam.controller_types import (
+        BeamControllerFinalResult,
+        BeamControllerFinalResultLite,
+    )
 
-    return BeamControllerFinalResult(
+    result_type = (
+        BeamControllerFinalResultLite
+        if start.controller.output_spec is not None
+        and start.controller.output_spec.logprobs_mode == "none"
+        else BeamControllerFinalResult
+    )
+    return result_type(
         beam_session_id=start.controller.beam_session_id,
         external_request_id=start.controller.external_request_id,
         beams=[],
         metrics=None,
         finish_reason="error",
         error=error,
+        error_code=error_code,
     ).to_wire()
 
 
@@ -88,6 +100,41 @@ def _put_controller_result(self, client_index: int, call_id: int, result: dict) 
             EngineCoreOutputs(engine_index=getattr(self, "engine_index", 0), utility_output=output),
         )
     )
+
+
+def register_constraint_resource(self, request) -> dict:
+    """Validate and register one Trie resource, with an O(1) cache hit path."""
+    from vllm_gr.constraints.trie_resource import trie_resource_from_wire
+
+    _ensure_beam_state(self)
+    resource_id = request.resource_id
+    if not isinstance(resource_id, str) or len(resource_id) != 64:
+        raise ValueError("Trie resource ID must be a SHA-256 hex digest")
+    try:
+        int(resource_id, 16)
+    except ValueError as exc:
+        raise ValueError("Trie resource ID must be a SHA-256 hex digest") from exc
+
+    # This check deliberately precedes from_wire(): a duplicate registration
+    # must not deserialize, copy, validate, or hash the large payload again.
+    if resource_id in self.beam_constraint_resources:
+        return {
+            "resource_id": resource_id,
+            "status": "already_registered",
+            "error_code": None,
+            "error": None,
+        }
+
+    resource = trie_resource_from_wire(request.constraint_resource)
+    if resource.digest != resource_id:
+        raise ValueError("Trie resource ID does not match payload digest")
+    self.beam_constraint_resources.ensure(resource)
+    return {
+        "resource_id": resource_id,
+        "status": "registered",
+        "error_code": None,
+        "error": None,
+    }
 
 
 def create_controller(self, start, request) -> Any:
@@ -112,7 +159,12 @@ def create_controller(self, start, request) -> Any:
             f"session id {session_id!r}"
         )
 
-    if start.constraint_resource is not None:
+    # Backward-compatible fallback for old clients. New clients register the
+    # resource separately and Start carries only constraint_resource_id.
+    if (
+        start.constraint_resource is not None
+        and start.controller.constraint_resource_id not in self.beam_constraint_resources
+    ):
         resource = trie_resource_from_wire(start.constraint_resource)
         self.beam_constraint_resources.ensure(resource)
 
@@ -740,6 +792,9 @@ def process_input_sockets(
                     request = (start, preprocessed[0])
 
                 elif request_type == EngineCoreRequestType.BEAM_CONTROLLER_CANCEL:
+                    request = decoded_payload
+
+                elif request_type == EngineCoreRequestType.BEAM_CONSTRAINT_RESOURCE_REGISTER:
                     request = decoded_payload
 
                 else:

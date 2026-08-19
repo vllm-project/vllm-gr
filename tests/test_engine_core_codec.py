@@ -20,6 +20,7 @@ from vllm_gr.v1.engine.codec import (
 from vllm_gr.v1.engine.types import (
     BeamControllerCancelRequest,
     BeamControllerStartRequest,
+    BeamConstraintResourceRegisterRequest,
     BeamRequestStepUpdate,
 )
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
@@ -73,6 +74,7 @@ def test_build_engine_core_decoders_shares_oob_tensor_provider() -> None:
     assert decoders.beam_step_update.oob_tensor_provider is provider
     assert decoders.beam_controller_start.oob_tensor_provider is provider
     assert decoders.beam_controller_cancel.oob_tensor_provider is provider
+    assert decoders.beam_constraint_resource_register.oob_tensor_provider is provider
     assert decoders.generic.oob_tensor_provider is provider
 
 
@@ -151,3 +153,29 @@ def test_decode_beam_controller_start_and_cancel_payloads() -> None:
     )
     assert isinstance(decoded_cancel, BeamControllerCancelRequest)
     assert decoded_cancel.beam_session_id == "session-0"
+
+
+def test_decode_beam_constraint_resource_register_payload() -> None:
+    decoders = build_engine_core_decoders(None)
+    request = BeamConstraintResourceRegisterRequest(
+        resource_id="a" * 64,
+        constraint_resource={"digest": "a" * 64},
+        call_id=19,
+        client_index=2,
+        current_wave=3,
+        data_parallel_rank=1,
+    )
+
+    decoded = decode_engine_core_payload(
+        decoders,
+        EngineCoreRequestType.BEAM_CONSTRAINT_RESOURCE_REGISTER,
+        _frames(request),
+    )
+
+    assert isinstance(decoded, BeamConstraintResourceRegisterRequest)
+    assert decoded.resource_id == "a" * 64
+    assert decoded.constraint_resource == request.constraint_resource
+    assert decoded.call_id == 19
+    assert decoded.client_index == 2
+    assert decoded.current_wave == 3
+    assert decoded.data_parallel_rank == 1

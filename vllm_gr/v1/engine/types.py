@@ -81,3 +81,19 @@ class BeamControllerCancelRequest(
     beam_session_id: str
     client_index: int = 0
     data_parallel_rank: int | None = None
+
+
+class BeamConstraintResourceRegisterRequest(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):
+    """Register one immutable constraint resource with an EngineCore."""
+
+    resource_id: str
+    constraint_resource: dict[str, object]
+    call_id: int = 0
+    client_index: int = 0
+    current_wave: int = 0
+    data_parallel_rank: int | None = None

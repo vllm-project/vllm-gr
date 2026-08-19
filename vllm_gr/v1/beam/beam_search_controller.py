@@ -22,11 +22,14 @@ from vllm_gr.beam_search_decision_utils import (
 from vllm_gr.constraints.candidate_filter import filter_candidates_by_token_ids
 from vllm_gr.constraints.models import ParentCandidateBuilder
 from vllm_gr.constraints.trie_resource import TrieConstraintResource
-from vllm_gr.logprobs import reconstruct_beam_logprobs
+from vllm_gr.logprobs import project_flat_logprobs, reconstruct_beam_logprobs
+from vllm_gr.beam_output import BeamOutputSpec
 from vllm_gr.v1.beam.controller_types import (
     BeamControllerDecision,
     BeamControllerFinalBeam,
+    BeamControllerFinalBeamLite,
     BeamControllerFinalResult,
+    BeamControllerFinalResultLite,
     BeamControllerMetrics,
     BeamControllerRequest,
     BeamControllerStepOutput,
@@ -122,7 +125,7 @@ class BeamSearchController:
         self._terminal_at: float | None = None
         self._sort_time = 0.0
         self._error: str | None = None
-        self._final_result: BeamControllerFinalResult | None = None
+        self._final_result: BeamControllerFinalResult | BeamControllerFinalResultLite | None = None
         self.state = BeamControllerState.RUNNING
 
         initial_logprobs = FlatLogprobs()
@@ -277,7 +280,6 @@ class BeamSearchController:
             beam_flat_cache=candidate_batch.parent_cache,
             initial_logprobs=self.initial_logprobs,
         )
-
         new_constraint_states: list[int | None] = []
         if self.constraint_resource is not None:
             for parent_index, token_id in fork_info:
@@ -298,7 +300,6 @@ class BeamSearchController:
             f"{self.beam_session_id}-step-{self.current_step}-beam-{index}"
             for index in range(len(new_beams))
         ]
-
         if not new_beams:
             self._complete("constraint")
             return self._terminal_decision(completed_step)
@@ -325,13 +326,19 @@ class BeamSearchController:
         self.state = BeamControllerState.CANCELLED
         self._terminal_at = time.perf_counter()
 
-    def finalize(self) -> BeamControllerFinalResult:
+    def finalize(self) -> BeamControllerFinalResult | BeamControllerFinalResultLite:
         if self._final_result is not None:
             return self._final_result
         if self.state is BeamControllerState.RUNNING:
             raise RuntimeError("cannot finalize a running beam controller")
         if self.state is BeamControllerState.CANCELLED:
-            result = BeamControllerFinalResult(
+            result_type = (
+                BeamControllerFinalResultLite
+                if self.request.output_spec is not None
+                and self.request.output_spec.logprobs_mode == "none"
+                else BeamControllerFinalResult
+            )
+            result = result_type(
                 beam_session_id=self.beam_session_id,
                 external_request_id=self.request.external_request_id,
                 beams=[],
@@ -343,7 +350,13 @@ class BeamSearchController:
             self.state = BeamControllerState.FINALIZED
             return result
         if self.state is BeamControllerState.ERROR:
-            result = BeamControllerFinalResult(
+            result_type = (
+                BeamControllerFinalResultLite
+                if self.request.output_spec is not None
+                and self.request.output_spec.logprobs_mode == "none"
+                else BeamControllerFinalResult
+            )
+            result = result_type(
                 beam_session_id=self.beam_session_id,
                 external_request_id=self.request.external_request_id,
                 beams=[],
@@ -361,16 +374,44 @@ class BeamSearchController:
             key=lambda beam: beam.cum_logprob,
             reverse=True,
         )
-        best_beams = sorted_completed[: self.beam_width]
+        output_spec = self.request.output_spec
+        legacy_full_output = output_spec is None
+        if output_spec is None:
+            output_spec = BeamOutputSpec(
+                result_width=self.beam_width,
+                logprobs_mode="top_k",
+                top_logprobs=self.beam_width,
+            )
+        output_spec.validate(self.beam_width)
+        best_beams = sorted_completed[: output_spec.result_width]
         self._sort_time = time.perf_counter() - sort_start
+        lite_beams: list[BeamControllerFinalBeamLite] = []
         final_beams: list[BeamControllerFinalBeam] = []
         for beam in best_beams:
+            completion_tokens = list(beam.tokens[self.request.prompt_length :])
+            if output_spec.logprobs_mode == "none":
+                lite_beams.append(
+                    BeamControllerFinalBeamLite(
+                        token_ids=completion_tokens,
+                        cumulative_logprob=float(beam.cum_logprob),
+                        finish_reason=beam.finish_reason or "length",
+                        stop_reason=beam.stop_reason,
+                    )
+                )
+                continue
             reconstruct_beam_logprobs(
                 beam,
                 self.initial_logprobs,
                 self.request.end_token_id,
             )
-            completion_tokens = list(beam.tokens[self.request.prompt_length :])
+            output_logprobs = beam.logprobs
+            if not legacy_full_output:
+                output_logprobs = project_flat_logprobs(
+                    output_logprobs,
+                    completion_tokens,
+                    output_spec.logprobs_mode,
+                    output_spec.top_logprobs,
+                )
             decode_tokens = completion_tokens
             if (
                 completion_tokens
@@ -383,7 +424,7 @@ class BeamSearchController:
                     token_ids=completion_tokens,
                     decode_token_ids=decode_tokens,
                     cumulative_logprob=float(beam.cum_logprob),
-                    logprobs=_flat_to_wire(beam.logprobs),
+                    logprobs=_flat_to_wire(output_logprobs),
                     finish_reason=beam.finish_reason or "length",
                     stop_reason=beam.stop_reason,
                 )
@@ -402,13 +443,22 @@ class BeamSearchController:
             num_generation_tokens=self.num_generation_tokens,
             num_beams=self.beam_width,
         )
-        result = BeamControllerFinalResult(
-            beam_session_id=self.beam_session_id,
-            external_request_id=self.request.external_request_id,
-            beams=final_beams,
-            metrics=metrics,
-            finish_reason="completed",
-        )
+        if output_spec.logprobs_mode == "none":
+            result = BeamControllerFinalResultLite(
+                beam_session_id=self.beam_session_id,
+                external_request_id=self.request.external_request_id,
+                beams=lite_beams,
+                metrics=metrics,
+                finish_reason="completed",
+            )
+        else:
+            result = BeamControllerFinalResult(
+                beam_session_id=self.beam_session_id,
+                external_request_id=self.request.external_request_id,
+                beams=final_beams,
+                metrics=metrics,
+                finish_reason="completed",
+            )
         self._final_result = result
         self.state = BeamControllerState.FINALIZED
         return result

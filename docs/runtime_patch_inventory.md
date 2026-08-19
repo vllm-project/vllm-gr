@@ -182,6 +182,7 @@ aligned with it.
     - `BEAM_REQUEST_STEP_UPDATE = b"\x07"`
     - `BEAM_CONTROLLER_START = b"\x08"`
     - `BEAM_CONTROLLER_CANCEL = b"\x09"`
+    - `BEAM_CONSTRAINT_RESOURCE_REGISTER = b"\x0a"`
 - Risk: Critical
 - Current compatibility: upstream vLLM 0.22.1 uses values `0x00` through `0x05`.
 - Private dependencies:

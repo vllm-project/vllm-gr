@@ -168,11 +168,20 @@ def validate_trie_resource(resource: TrieConstraintResource) -> None:
             resource.edge_child_nodes >= len(resource.terminal_nodes)
         ):
             raise ValueError("Trie child node IDs are out of range")
-    for node_id in range(len(resource.terminal_nodes)):
-        start = int(resource.node_offsets[node_id])
-        end = int(resource.node_offsets[node_id + 1])
-        tokens = resource.edge_token_ids[start:end]
-        if len(tokens) > 1 and np.any(np.diff(tokens) <= 0):
+    # Compare adjacent edge tokens in one vectorized pass, excluding pairs
+    # that straddle a node boundary. The former per-node Python loop dominates
+    # registration time for production tries with hundreds of thousands of
+    # nodes, including the many nodes with zero or one outgoing edge.
+    if edge_count > 1:
+        comparable = np.ones(edge_count - 1, dtype=np.bool_)
+        boundaries = resource.node_offsets[1:-1]
+        boundaries = boundaries[(boundaries > 0) & (boundaries < edge_count)]
+        if len(boundaries):
+            comparable[np.unique(boundaries) - 1] = False
+        invalid = comparable & (resource.edge_token_ids[1:] <= resource.edge_token_ids[:-1])
+        if np.any(invalid):
+            edge_index = int(np.flatnonzero(invalid)[0])
+            node_id = int(np.searchsorted(resource.node_offsets, edge_index, side="right") - 1)
             raise ValueError(f"Trie edges for node {node_id} must be sorted and unique")
 
 

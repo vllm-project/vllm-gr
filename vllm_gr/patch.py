@@ -149,6 +149,12 @@ def _validate_request_types_patch() -> str | None:
         == b"\x08"
         and getattr(getattr(EngineCoreRequestType, "BEAM_CONTROLLER_CANCEL", None), "value", None)
         == b"\x09"
+        and getattr(
+            getattr(EngineCoreRequestType, "BEAM_CONSTRAINT_RESOURCE_REGISTER", None),
+            "value",
+            None,
+        )
+        == b"\x0a"
     )
     return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
 
@@ -160,6 +166,7 @@ def _validate_engine_clients_patch() -> str | None:
         add_requests_async,
         beam_request_step_update_async,
         cancel_beam_controller_async,
+        ensure_beam_constraint_resource_async,
         run_beam_controller_async,
     )
     from vllm_gr.v1.engine.core_client_patch import (
@@ -174,6 +181,8 @@ def _validate_engine_clients_patch() -> str | None:
         and AsyncMPClient.beam_request_step_update_async is beam_request_step_update_async
         and AsyncMPClient.run_beam_controller_async is run_beam_controller_async
         and AsyncMPClient.cancel_beam_controller_async is cancel_beam_controller_async
+        and AsyncMPClient.ensure_beam_constraint_resource_async
+        is ensure_beam_constraint_resource_async
         and SyncMPClient.add_requests is sync_mp_add_requests
         and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
         and InprocClient.add_requests is inproc_add_requests

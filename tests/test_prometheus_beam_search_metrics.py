@@ -20,8 +20,10 @@ import pytest
 from vllm_gr.v1.metrics.beam_search_metrics import (
     _initialize_metrics,
     get_beam_search_metrics_text,
+    record_beam_output_metrics,
     record_beam_search_metrics,
 )
+from vllm_gr.beam_output import BeamOutputSpec
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
 
@@ -54,6 +56,30 @@ def _reset_prometheus_state(monkeypatch):
     _mod._beam_decode_time_histogram = None
     _mod._beam_sort_time_histogram = None
     _mod._beams_per_request_histogram = None
+    _mod._beam_output_requests_total = None
+    _mod._beam_result_width_histogram = None
+    _mod._beam_result_shortfall_total = None
+    _mod._beam_result_reduction_requests_total = None
+
+
+def test_output_contract_metrics_are_low_cardinality():
+    if not PROMETHEUS_AVAILABLE:
+        pytest.skip("prometheus_client not installed")
+    record_beam_output_metrics(
+        BeamOutputSpec(128, "none", 0),
+        120,
+        beam_width=256,
+        engine="0",
+        model_name="test_model",
+    )
+    text = get_beam_search_metrics_text()
+    assert 'logprobs_mode="none"' in text
+    assert "vllm_gr_beam_result_width" in text
+    assert "vllm_gr_beam_result_shortfall_total" in text
+    assert "vllm_gr_beam_result_reduction_requests_total" in text
+    assert "token" not in "\n".join(
+        line for line in text.splitlines() if line.startswith("vllm_gr_beam_output")
+    )
 
 
 class TestRecordBeamSearchMetrics:
