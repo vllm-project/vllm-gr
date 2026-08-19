@@ -39,7 +39,11 @@ def init_gr(
     gr_config = GRConfig.from_vllm_config(vllm_config)
     if gr_config.catalog_path:
         if (
-            gr_config.beam_control_mode is BeamControlMode.ENGINE_PER_STEP_REQUEST
+            gr_config.beam_control_mode
+            in (
+                BeamControlMode.ENGINE_PER_STEP_REQUEST,
+                BeamControlMode.ENGINE_PERSISTENT_REQUEST,
+            )
             and gr_config.constraint_backend is ConstraintBackend.TRIE
         ):
             # Serving performs the tokenizer-dependent compilation once, then

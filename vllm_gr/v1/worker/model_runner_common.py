@@ -665,12 +665,16 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 first_mdata = md
                 break
 
-        max_beams = first_mdata["beam_width"] if first_mdata else 128
+        # PR2 supports one persistent Beam session at a time. Allocate the
+        # documented width envelope up front so a drained W=1 session cannot
+        # leave a context too small for the next W=128 session.
+        max_beams = max(128, first_mdata["beam_width"] if first_mdata else 128)
         max_decode_steps = first_mdata.get("max_decode_steps", 0) if first_mdata else 0
-        if max_decode_steps <= 0 and first_mdata is not None:
-            max_decode_steps = max(first_mdata.get("beam_decode_steps", 0), 64)
-        if max_decode_steps <= 0:
-            max_decode_steps = 64
+        max_decode_steps = max(
+            64,
+            max_decode_steps,
+            first_mdata.get("beam_decode_steps", 0) if first_mdata else 0,
+        )
 
         from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 
@@ -693,6 +697,16 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
 
         session = runner._beam_sessions.get(req_id)
         mdata_step = mdata.get("decode_step", 0)
+        if mdata["beam_width"] > runner._beam_context.max_beams:
+            raise RuntimeError(
+                "Beam width exceeds the initialized Worker pool capacity: "
+                f"{mdata['beam_width']} > {runner._beam_context.max_beams}"
+            )
+        if mdata.get("max_decode_steps", 0) > runner._beam_context.max_decode_steps:
+            raise RuntimeError(
+                "Beam decode length exceeds the initialized Worker pool capacity: "
+                f"{mdata['max_decode_steps']} > {runner._beam_context.max_decode_steps}"
+            )
 
         if session is not None:
             # Existing session: step_complete or reset

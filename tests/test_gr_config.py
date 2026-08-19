@@ -88,6 +88,17 @@ def test_beam_control_mode_round_trip_and_default_elision() -> None:
     assert BEAM_CONTROL_MODE_KEY not in vllm_config.additional_config
 
 
+def test_persistent_beam_control_mode_round_trip() -> None:
+    config = GRConfig.from_vllm_config(
+        _vllm_config({BEAM_CONTROL_MODE_KEY: "engine_persistent_request"})
+    )
+    assert config.beam_control_mode is BeamControlMode.ENGINE_PERSISTENT_REQUEST
+
+    vllm_config = _vllm_config()
+    config.write_to_vllm_config(vllm_config)
+    assert vllm_config.additional_config[BEAM_CONTROL_MODE_KEY] == ("engine_persistent_request")
+
+
 @pytest.mark.parametrize("value", [1, True, [], "engine"])
 def test_rejects_invalid_beam_control_mode(value: object) -> None:
     with pytest.raises(ValueError, match="beam_control_mode"):

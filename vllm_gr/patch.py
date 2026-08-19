@@ -250,11 +250,31 @@ def _validate_engine_core_request_patch() -> str | None:
 def _validate_scheduler_patch() -> str | None:
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    from vllm_gr.v1.engine.engine_core_patch import _SCHEDULER_PATCH_MARKER
+    from vllm_gr.v1.engine.engine_core_patch import (
+        _SCHEDULER_FINISHED_PATCH_MARKER,
+        _SCHEDULER_FREE_PATCH_MARKER,
+        _SCHEDULER_PATCH_MARKER,
+        _SCHEDULER_UPDATE_PATCH_MARKER,
+    )
 
     return _verified(
-        bool(getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False)),
-        "Scheduler beam metadata propagation is not installed",
+        bool(getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False))
+        and bool(
+            getattr(
+                Scheduler.update_from_output,
+                _SCHEDULER_UPDATE_PATCH_MARKER,
+                False,
+            )
+        )
+        and bool(getattr(Scheduler._free_request, _SCHEDULER_FREE_PATCH_MARKER, False))
+        and bool(
+            getattr(
+                Scheduler.has_finished_requests,
+                _SCHEDULER_FINISHED_PATCH_MARKER,
+                False,
+            )
+        ),
+        "Scheduler beam lifecycle wrappers are not fully installed",
     )
 
 

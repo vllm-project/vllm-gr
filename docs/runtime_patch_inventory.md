@@ -202,7 +202,8 @@ aligned with it.
 - Risk: Critical
 - Behavior: integrates grouped Beam request processing and the staged
   EngineCore-owned `BeamSearchController` lifecycle into EngineCore. In
-  `engine_per_step_request` mode, Serving submits one controller start message;
+  `engine_per_step_request` and `engine_persistent_request` modes, Serving
+  submits one controller start message;
   EngineCore consumes each Worker result and internally reuses the grouped
   per-step request path until it emits one terminal utility result.
 - Catalog boundary in this mode:
@@ -221,15 +222,39 @@ aligned with it.
     - input queue payload layout.
 - Removal condition: vLLM exposes a stable control-message or request-dispatch extension point that avoids replacing the complete socket loop.
 
+#### Persistent Beam Streaming Continuation
+
+- Target: `Scheduler._update_request_as_session` (called, not replaced).
+- Isolation: `vllm_gr.v1.engine.persistent_beam.continue_persistent_request` is
+  the only call site for this private API and for private Request token-view
+  mutation.
+- Behavior: parks a resumable Beam Request at each step boundary, rewinds its
+  logical Scheduler token view to the immutable shared prefix, and appends one
+  grouped token row to the same Request object without an internal ADD. The
+  rewind is required because grouped Beam tokens are parallel rows rather than
+  the serial history assumed by upstream streaming sessions.
+- Lifecycle: GR keeps a sidecar state machine (`PREFILLING`, `PARKED`,
+  `BEAM_DECODING`, `FINALIZING`, `DRAINING`, terminal state). `scheduled_width`
+  describes the current active lanes; it is not a fixed graph execution width.
+- Reuse fence: only one persistent Beam Session owns a Worker slot at a time.
+  A queued Session is admitted only after the Worker execution carrying the
+  prior Session teardown has returned and the Scheduler Request was freed.
+- Unsupported in the first implementation: async scheduling, preemption, and
+  more than one in-flight epoch per Session; all fail explicitly.
+- Removal condition: vLLM exposes a public resumable-session continuation API.
+
 ### GR-PATCH-010 — Scheduler Beam Override
 
-- Target: `Scheduler.schedule`
+- Targets: `Scheduler.schedule`, `Scheduler.update_from_output`, and
+  `Scheduler._free_request`.
 - Mutation: scheduling hot-path wrapper or replacement
 - Risk: Critical
 - Behavior:
     - adapts KV cache lookup for grouped Beam requests;
     - builds Beam scheduling metadata;
     - attaches GR metadata to the scheduler result.
+    - enforces one in-flight epoch and exactly one final Request free for a
+      persistent Beam session.
 - Dependencies:
     - `Scheduler.requests`;
     - `Scheduler.kv_cache_manager`;

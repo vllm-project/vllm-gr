@@ -67,10 +67,12 @@ class BeamSearchController:
             raise ValueError("beam_width must be greater than zero")
         if request.catalog_strategy not in ("fill", "null"):
             raise ValueError("catalog_strategy must be 'fill' or 'null'")
-        if request.beam_control_mode != "engine_per_step_request":
+        if request.beam_control_mode not in (
+            "engine_per_step_request",
+            "engine_persistent_request",
+        ):
             raise ValueError(
-                "EngineCore BeamSearchController requires "
-                "beam_control_mode='engine_per_step_request'"
+                "EngineCore BeamSearchController requires an EngineCore beam_control_mode"
             )
         if request.constraint_backend == "trie":
             if request.constraint_resource_id is not None and constraint_resource is None:

@@ -77,7 +77,10 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         type=str,
         choices=[mode.value for mode in BeamControlMode],
         default=None,
-        help="Beam control owner: serving (default) or engine_per_step_request.",
+        help=(
+            "Beam control owner: serving (default), engine_per_step_request, "
+            "or engine_persistent_request."
+        ),
     )
     return parser
 

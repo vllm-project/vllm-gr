@@ -70,9 +70,14 @@ def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(
     runner = SimpleNamespace(
         input_batch=original_batch,
         _beam_logprobs_cache={"finished": {}, "active": {}},
+        _to_list=lambda tensor: tensor.tolist(),
     )
     ordinary_result = (1, ["lp"], ["valid"], object(), ["request"], {"request": 0}, [3])
-    sampler_output = object()
+    remuxed_logprobs = object()
+    sampler_output = SimpleNamespace(
+        logprobs_tensors=SimpleNamespace(tolists=lambda: remuxed_logprobs),
+        sampled_token_ids=torch.tensor([[9]], dtype=torch.int32),
+    )
 
     def original(
         self: Any,
@@ -108,7 +113,7 @@ def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(
     runner.input_batch = proxy
     result = wrapped(runner, beam_output, sampler_output)
     assert len(result) == 7
-    assert result[:3] == (1, [[]], [[]])
+    assert result[:3] == (1, remuxed_logprobs, [[9]])
     assert result[4:6] == (["beam"], {"beam": 0})
     assert runner.input_batch is original_batch
     assert "finished" not in runner._beam_logprobs_cache

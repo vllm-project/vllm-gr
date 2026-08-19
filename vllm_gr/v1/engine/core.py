@@ -33,6 +33,9 @@ def _ensure_beam_state(self) -> None:
         "beam_seen_session_ids",
         "beam_cancelled_session_ids",
         "beam_constraint_resources",
+        "persistent_beam_states",
+        "persistent_pending_starts",
+        "persistent_pending_session_ids",
     )
     if all(getattr(self, name, None) is not None for name in state_attributes):
         return
@@ -59,6 +62,9 @@ def _ensure_beam_state(self) -> None:
             )
 
             self.beam_constraint_resources = BeamConstraintResourceRegistry()
+        from vllm_gr.v1.engine.persistent_beam import initialize_persistent_engine_state
+
+        initialize_persistent_engine_state(self)
 
 
 def _controller_failure_result(
@@ -148,7 +154,11 @@ def create_controller(self, start, request) -> Any:
     if session_id in self.beam_seen_session_ids:
         raise ValueError(f"duplicate beam_session_id {session_id!r}")
     configured_mode = GRConfig.from_vllm_config(self.vllm_config).beam_control_mode
-    if configured_mode is not BeamControlMode.ENGINE_PER_STEP_REQUEST:
+    engine_modes = (
+        BeamControlMode.ENGINE_PER_STEP_REQUEST,
+        BeamControlMode.ENGINE_PERSISTENT_REQUEST,
+    )
+    if configured_mode not in engine_modes:
         raise ValueError(
             "EngineCore beam controller request rejected because configured "
             f"beam_control_mode is {configured_mode.value!r}"
@@ -158,6 +168,11 @@ def create_controller(self, start, request) -> Any:
             f"beam engine request id {request.request_id!r} does not match "
             f"session id {session_id!r}"
         )
+    if configured_mode is BeamControlMode.ENGINE_PERSISTENT_REQUEST:
+        from vllm_gr.v1.engine.persistent_beam import defer_persistent_start
+
+        if defer_persistent_start(self, start, request):
+            return None
 
     # Backward-compatible fallback for old clients. New clients register the
     # resource separately and Start carries only constraint_resource_id.
@@ -179,7 +194,7 @@ def create_controller(self, start, request) -> Any:
     )
     self.beam_seen_session_ids.add(session_id)
     self.beam_controllers[session_id] = controller
-    self.beam_controller_contexts[session_id] = {
+    context = {
         "client_index": start.client_index,
         "call_id": start.call_id,
         "current_wave": start.current_wave,
@@ -190,14 +205,22 @@ def create_controller(self, start, request) -> Any:
         "trace_headers": request.trace_headers,
         "priority": request.priority,
         "data_parallel_rank": start.data_parallel_rank,
+        "beam_control_mode": configured_mode,
     }
+    self.beam_controller_contexts[session_id] = context
 
     try:
         if not controller.requires_step:
             _finish_controller(self, session_id)
             return controller
 
-        self._cache_beam_request(request)
+        if configured_mode is BeamControlMode.ENGINE_PERSISTENT_REQUEST:
+            from vllm_gr.v1.engine.persistent_beam import admit_persistent_request
+
+            admit_persistent_request(self, request, controller)
+            context["persistent_request"] = request
+        else:
+            self._cache_beam_request(request)
         controller.mark_step_dispatched()
         self.add_request(request, start.current_wave)
     except Exception:
@@ -207,6 +230,10 @@ def create_controller(self, start, request) -> Any:
         remove_controller(self, session_id)
         with self.beam_cache_lock:
             self.beam_cache.pop(session_id, None)
+        if configured_mode is BeamControlMode.ENGINE_PERSISTENT_REQUEST:
+            from vllm_gr.v1.engine.persistent_beam import rollback_persistent_admission
+
+            rollback_persistent_admission(self, session_id)
         raise
     return controller
 
@@ -224,7 +251,6 @@ def consume_step_output(self, session_id: str, output) -> Any:
     from vllm.v1.engine import FinishReason
 
     from vllm_gr.v1.beam.controller_types import BeamControllerStepOutput
-    from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
     controller = get_controller(self, session_id)
     old_internal_ids = list(controller.previous_internal_ids)
@@ -265,36 +291,53 @@ def consume_step_output(self, session_id: str, output) -> Any:
         return decision
 
     context = self.beam_controller_contexts[session_id]
-    used_parents = {old_internal_ids[parent_index] for parent_index in decision.parent_beam_indices}
-    pruned_ids = [
-        internal_id for internal_id in old_internal_ids if internal_id not in used_parents
-    ]
-    update = BeamRequestStepUpdate(
-        session_id=session_id,
-        parent_beam_ids=[
-            old_internal_ids[parent_index] for parent_index in decision.parent_beam_indices
-        ],
-        child_beam_ids=list(controller.previous_internal_ids),
-        beam_tokens=[[token_id] for token_id in decision.next_tokens],
-        pruned_ids=pruned_ids,
-        prefix_len=len(controller.initial_tokens),
-        beam_width=decision.active_width,
-        sampling_params=copy(context["sampling_params"]),
-        eos_token_id=context["eos_token_id"],
-        client_index=context["client_index"],
-        current_wave=context["current_wave"],
-        priority=context["priority"],
-        data_parallel_rank=context["data_parallel_rank"],
-        lora_request=context["lora_request"],
-        cache_salt=context["cache_salt"],
-        trace_headers=context["trace_headers"],
-        parent_beam_indices=decision.parent_beam_indices,
-        max_decode_steps=controller.total_execution_steps,
-        decode_step=decision.completed_step,
-        controller_owned=True,
-    )
     controller.mark_step_dispatched()
-    self._handle_beam_request_step_update(update)
+    from vllm_gr.config import BeamControlMode
+
+    if context["beam_control_mode"] is BeamControlMode.ENGINE_PERSISTENT_REQUEST:
+        from vllm_gr.v1.engine.persistent_beam import continue_persistent_request
+
+        continue_persistent_request(
+            self,
+            session_id,
+            decision,
+            controller,
+            context["sampling_params"],
+        )
+    else:
+        from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+
+        used_parents = {
+            old_internal_ids[parent_index] for parent_index in decision.parent_beam_indices
+        }
+        pruned_ids = [
+            internal_id for internal_id in old_internal_ids if internal_id not in used_parents
+        ]
+        update = BeamRequestStepUpdate(
+            session_id=session_id,
+            parent_beam_ids=[
+                old_internal_ids[parent_index] for parent_index in decision.parent_beam_indices
+            ],
+            child_beam_ids=list(controller.previous_internal_ids),
+            beam_tokens=[[token_id] for token_id in decision.next_tokens],
+            pruned_ids=pruned_ids,
+            prefix_len=len(controller.initial_tokens),
+            beam_width=decision.active_width,
+            sampling_params=copy(context["sampling_params"]),
+            eos_token_id=context["eos_token_id"],
+            client_index=context["client_index"],
+            current_wave=context["current_wave"],
+            priority=context["priority"],
+            data_parallel_rank=context["data_parallel_rank"],
+            lora_request=context["lora_request"],
+            cache_salt=context["cache_salt"],
+            trace_headers=context["trace_headers"],
+            parent_beam_indices=decision.parent_beam_indices,
+            max_decode_steps=controller.total_execution_steps,
+            decode_step=decision.completed_step,
+            controller_owned=True,
+        )
+        self._handle_beam_request_step_update(update)
     return decision
 
 
@@ -332,29 +375,45 @@ def _finish_controller(self, session_id: str) -> None:
     context = self.beam_controller_contexts[session_id]
     result = controller.finalize()
 
-    # Reuse the authoritative legacy teardown signal for Scheduler/Worker KV.
-    self._handle_beam_request_step_update(
-        BeamRequestStepUpdate(
-            session_id=session_id,
-            parent_beam_ids=[],
-            child_beam_ids=[],
-            beam_tokens=[],
-            pruned_ids=list(controller.previous_internal_ids),
-            prefix_len=0,
-            beam_width=0,
-            sampling_params=SamplingParams(),
-            client_index=context["client_index"],
-            current_wave=context["current_wave"],
-            data_parallel_rank=context["data_parallel_rank"],
-            controller_owned=True,
+    from vllm_gr.config import BeamControlMode
+
+    if context["beam_control_mode"] is BeamControlMode.ENGINE_PERSISTENT_REQUEST:
+        # A zero-step controller never admitted its Request, so there is no
+        # parked Scheduler/Worker state to tear down.
+        if "persistent_request" in context:
+            from vllm_gr.v1.engine.persistent_beam import begin_persistent_finalization
+
+            begin_persistent_finalization(self, session_id)
+    else:
+        # Reuse the authoritative legacy teardown signal for Scheduler/Worker KV.
+        self._handle_beam_request_step_update(
+            BeamRequestStepUpdate(
+                session_id=session_id,
+                parent_beam_ids=[],
+                child_beam_ids=[],
+                beam_tokens=[],
+                pruned_ids=list(controller.previous_internal_ids),
+                prefix_len=0,
+                beam_width=0,
+                sampling_params=SamplingParams(),
+                client_index=context["client_index"],
+                current_wave=context["current_wave"],
+                data_parallel_rank=context["data_parallel_rank"],
+                controller_owned=True,
+            )
         )
-    )
     _put_controller_result(
         self,
         context["client_index"],
         context["call_id"],
         result.to_wire(),
     )
+    if context["beam_control_mode"] is BeamControlMode.ENGINE_PERSISTENT_REQUEST and (
+        "persistent_request" in context
+    ):
+        from vllm_gr.v1.engine.persistent_beam import mark_persistent_final_result_sent
+
+        mark_persistent_final_result_sent(self, session_id)
     remove_controller(self, session_id)
 
 

@@ -221,3 +221,83 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
 
     assert runner._current_beam_data == {}
     assert runner._current_beam_info is None
+
+
+def test_worker_releases_old_session_before_allocating_new_width(monkeypatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    class Registry:
+        def __init__(self) -> None:
+            self.sessions: set[str] = set()
+
+        def allocate(self, session_id, width, prefix_len):
+            events.append(("allocate", (session_id, width, prefix_len)))
+            self.sessions.add(session_id)
+            return 0
+
+        def release(self, session_id):
+            events.append(("release", session_id))
+            self.sessions.remove(session_id)
+
+    class Context:
+        def __init__(self, **kwargs):
+            self.max_beams = kwargs["max_beams"]
+            self.max_decode_steps = kwargs["max_decode_steps"]
+            self.registry = Registry()
+
+    class Session:
+        def __init__(self, session_id, slot, context):
+            self.session_id = session_id
+            self.context = context
+            self._state = SimpleNamespace(decode_step=0)
+
+        def begin_session(self, width, prefix_len):
+            self.context.registry.sessions.add(self.session_id)
+
+        def end_session(self):
+            self.context.registry.release(self.session_id)
+
+    monkeypatch.setattr("vllm_gr.v1.beam.beam_attention_context.BeamAttentionContext", Context)
+    monkeypatch.setattr("vllm_gr.v1.beam.beam_search_session.BeamSearchSession", Session)
+    model_config = SimpleNamespace(
+        get_num_kv_heads=lambda parallel: 1,
+        get_head_size=lambda: 8,
+        get_num_layers=lambda parallel: 1,
+    )
+    runner = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    first = {
+        "first": {
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_width": 1,
+            "prefix_len": 2,
+            "max_decode_steps": 3,
+        }
+    }
+    common._get_or_create_beam_session(runner, first, SimpleNamespace(beam_finished_session_ids=[]))
+    assert runner._beam_context.max_beams == 128
+    assert runner._beam_context.max_decode_steps == 64
+
+    second = {
+        "second": {
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_width": 128,
+            "prefix_len": 2,
+            "max_decode_steps": 8,
+        }
+    }
+    common._get_or_create_beam_session(
+        runner, second, SimpleNamespace(beam_finished_session_ids=["first"])
+    )
+
+    assert events == [
+        ("allocate", ("first", 1, 2)),
+        ("release", "first"),
+        ("allocate", ("second", 128, 2)),
+    ]

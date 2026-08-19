@@ -779,11 +779,10 @@ async def _engine_controlled_beam_search(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
-    """Thin Serving adapter for EngineCore-owned per-step beam control."""
+    """Thin Serving adapter for either EngineCore-owned beam control mode."""
     if not hasattr(self.engine_client, "run_beam_controller"):
         raise RuntimeError(
-            "beam_control_mode='engine_per_step_request' requires the "
-            "EngineCore beam controller client patch"
+            "EngineCore beam control requires the EngineCore beam controller client patch"
         )
     if params.beam_width <= 0:
         raise VLLMValidationError(
@@ -1001,7 +1000,11 @@ async def beam_search(
     ).beam_control_mode
     implementation = (
         _engine_controlled_beam_search
-        if mode is BeamControlMode.ENGINE_PER_STEP_REQUEST
+        if mode
+        in (
+            BeamControlMode.ENGINE_PER_STEP_REQUEST,
+            BeamControlMode.ENGINE_PERSISTENT_REQUEST,
+        )
         else _serving_controlled_beam_search
     )
     async for output in implementation(

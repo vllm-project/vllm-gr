@@ -16,6 +16,9 @@ logger = init_logger(__name__)
 
 _BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
 _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
+_SCHEDULER_UPDATE_PATCH_MARKER = "_vllm_gr_persistent_beam_scheduler_update_patch"
+_SCHEDULER_FREE_PATCH_MARKER = "_vllm_gr_persistent_beam_scheduler_free_patch"
+_SCHEDULER_FINISHED_PATCH_MARKER = "_vllm_gr_persistent_beam_finished_patch"
 _CONTROLLER_STEP_PATCH_MARKER = "_vllm_gr_beam_controller_step_patch"
 _CONTROLLER_INPUT_PATCH_MARKER = "_vllm_gr_beam_controller_input_patch"
 _CONTROLLER_SHUTDOWN_PATCH_MARKER = "_vllm_gr_beam_controller_shutdown_patch"
@@ -53,8 +56,11 @@ def make_patched_controller_step(original_step):
     def patched_step(self, *args, **kwargs):
         outputs, model_executed = original_step(self, *args, **kwargs)
         from vllm_gr.v1.engine.core import route_beam_controller_outputs
+        from vllm_gr.v1.engine.persistent_beam import finish_dispatched_persistent_drains
 
-        return route_beam_controller_outputs(self, outputs), model_executed
+        routed = route_beam_controller_outputs(self, outputs)
+        finish_dispatched_persistent_drains(self)
+        return routed, model_executed
 
     setattr(patched_step, _CONTROLLER_STEP_PATCH_MARKER, True)
     return patched_step
@@ -360,6 +366,8 @@ def apply_scheduler_patch():
     from vllm.v1.core.sched.scheduler import Scheduler
 
     if getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False):
+        _apply_scheduler_update_patch(Scheduler)
+        _apply_scheduler_free_patch(Scheduler)
         return
 
     _original_schedule = Scheduler.schedule
@@ -377,6 +385,14 @@ def apply_scheduler_patch():
         )
 
         def patch_cache_blocks(request, num_computed_tokens):
+            persistent_state = getattr(request, "gr_persistent_beam_state", None)
+            if persistent_state is not None and getattr(request, "is_beam_decode", False):
+                # Parallel lane tokens live in the Worker Beam pool and must
+                # never become reusable paged-prefix cache identity.
+                num_computed_tokens = min(
+                    num_computed_tokens,
+                    persistent_state.prefix_len,
+                )
             # Extend the num_computed_tokens passed to cache_blocks to the next
             # block boundary on the FINAL prefill chunk, so the trailing partial
             # block (whose hash exists thanks to the padding in _cache_beam_request)
@@ -407,6 +423,12 @@ def apply_scheduler_patch():
         try:
             output = _original_schedule(self)
 
+            from vllm_gr.v1.engine.persistent_beam import (
+                mark_persistent_step_scheduled,
+            )
+
+            mark_persistent_step_scheduled(self, output)
+
             # Propagate beam request attributes from Request objects to SchedulerOutput
             beam_data = {}
             if hasattr(output, "num_scheduled_tokens"):
@@ -431,6 +453,12 @@ def apply_scheduler_patch():
             beam_finished_session_ids = list(getattr(self, "_beam_finished_session_ids", []))
             self._beam_finished_session_ids = []  # consume after reading
 
+            from vllm_gr.v1.engine.persistent_beam import (
+                mark_persistent_teardown_dispatched,
+            )
+
+            mark_persistent_teardown_dispatched(self, beam_finished_session_ids)
+
             output.beam_data = beam_data
             output.beam_finished_session_ids = beam_finished_session_ids
             return output
@@ -441,4 +469,58 @@ def apply_scheduler_patch():
     Scheduler.schedule = patched_schedule
     setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)
     Scheduler._patched_for_beam_requests = True
+    _apply_scheduler_update_patch(Scheduler)
+    _apply_scheduler_free_patch(Scheduler)
+    _apply_scheduler_has_finished_patch(Scheduler)
     logger.debug("Scheduler.schedule patched for beam-requests propagation.")
+
+
+def _apply_scheduler_update_patch(scheduler_cls) -> None:
+    """Observe persistent epochs without copying Scheduler update logic."""
+    original = scheduler_cls.update_from_output
+    if getattr(original, _SCHEDULER_UPDATE_PATCH_MARKER, False):
+        return
+
+    @wraps(original)
+    def patched_update_from_output(self, scheduler_output, model_runner_output):
+        outputs = original(self, scheduler_output, model_runner_output)
+        from vllm_gr.v1.engine.persistent_beam import (
+            complete_persistent_step,
+        )
+
+        complete_persistent_step(self, scheduler_output)
+        return outputs
+
+    setattr(patched_update_from_output, _SCHEDULER_UPDATE_PATCH_MARKER, True)
+    scheduler_cls.update_from_output = patched_update_from_output
+
+
+def _apply_scheduler_free_patch(scheduler_cls) -> None:
+    """Enforce the persistent Request's single final free invariant."""
+    original = scheduler_cls._free_request
+    if getattr(original, _SCHEDULER_FREE_PATCH_MARKER, False):
+        return
+
+    @wraps(original)
+    def patched_free_request(self, request, *args, **kwargs):
+        from vllm_gr.v1.engine.persistent_beam import mark_persistent_request_free
+
+        mark_persistent_request_free(request)
+        return original(self, request, *args, **kwargs)
+
+    setattr(patched_free_request, _SCHEDULER_FREE_PATCH_MARKER, True)
+    scheduler_cls._free_request = patched_free_request
+
+
+def _apply_scheduler_has_finished_patch(scheduler_cls) -> None:
+    """Keep EngineCore stepping for a pending teardown-only Worker run."""
+    original = scheduler_cls.has_finished_requests
+    if getattr(original, _SCHEDULER_FINISHED_PATCH_MARKER, False):
+        return
+
+    @wraps(original)
+    def patched_has_finished_requests(self):
+        return bool(getattr(self, "_beam_finished_session_ids", ())) or original(self)
+
+    setattr(patched_has_finished_requests, _SCHEDULER_FINISHED_PATCH_MARKER, True)
+    scheduler_cls.has_finished_requests = patched_has_finished_requests

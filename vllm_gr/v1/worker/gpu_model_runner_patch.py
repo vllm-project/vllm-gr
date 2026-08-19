@@ -87,10 +87,22 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
             self, orig_input_batch, request_row_configs, beam_data, sampler_output
         )
 
+        # The scheduler contract requires LogprobsLists (with slice_request),
+        # not a nested Python list. _beam_collapse_bookkeeping has already
+        # remuxed and resized these tensors to one row per logical Request.
+        remuxed_logprobs = [[] for _ in range(n)] if logprobs_lists is not None else None
+        remuxed_sampled_token_ids = [[] for _ in range(n)]
+        logprobs_tensors = getattr(sampler_output, "logprobs_tensors", None)
+        if logprobs_lists is not None and logprobs_tensors is not None:
+            remuxed_logprobs = logprobs_tensors.tolists()
+        sampled_token_ids = getattr(sampler_output, "sampled_token_ids", None)
+        if sampled_token_ids is not None:
+            remuxed_sampled_token_ids = self._to_list(sampled_token_ids[:n])
+
         return (
             num_nans_in_logits,
-            [[] for _ in range(n)] if logprobs_lists is not None else None,
-            [[] for _ in range(n)],
+            remuxed_logprobs,
+            remuxed_sampled_token_ids,
             prompt_logprobs_dict,
             collapsed_req_ids,
             collapsed_idx,

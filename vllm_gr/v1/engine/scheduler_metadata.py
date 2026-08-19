@@ -41,12 +41,17 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
     # treats the full prefix as computed (see patch_get_computed_blocks in
     # engine_core_patch.py), so the scheduler-view cache_len is the number
     # of tokens the scheduler believes are already computed.
-    cache_len = req.num_computed_tokens - num_scheduled_tokens
+    persistent_state = getattr(req, "gr_persistent_beam_state", None)
+    cache_len = (
+        prefix_len
+        if persistent_state is not None
+        else req.num_computed_tokens - num_scheduled_tokens
+    )
 
     # decode_step: current decode step (0-indexed)
     decode_step = getattr(req, "beam_decode_step", 0)
 
-    return {
+    metadata = {
         "is_beam_decode": True,
         "beam_width": beam_width,
         "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
@@ -56,3 +61,14 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
         "parent_beam_ids": getattr(req, "parent_beam_indices", None),
         "max_decode_steps": getattr(req, "max_decode_steps", 0),
     }
+    if persistent_state is not None:
+        metadata.update(
+            {
+                "beam_stage": persistent_state.stage.value,
+                "logical_step": persistent_state.logical_step,
+                "scheduled_width": persistent_state.scheduled_width,
+                "active_width": persistent_state.active_width,
+                "in_flight_epoch": persistent_state.in_flight_epoch,
+            }
+        )
+    return metadata

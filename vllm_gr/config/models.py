@@ -19,6 +19,7 @@ class ConstraintBackend(str, Enum):
 class BeamControlMode(str, Enum):
     SERVING = "serving"
     ENGINE_PER_STEP_REQUEST = "engine_per_step_request"
+    ENGINE_PERSISTENT_REQUEST = "engine_persistent_request"
 
 
 @dataclass(frozen=True)

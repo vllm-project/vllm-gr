@@ -144,8 +144,9 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_scheduler_patch
       - tests/contract/test_engine_core_protocol_contracts.py
+      - tests/test_persistent_beam_request.py
     process_roles: [engine_core]
-    target: vllm.v1.core.sched.scheduler.Scheduler.schedule
+    target: vllm.v1.core.sched.scheduler.Scheduler schedule/update_from_output/_free_request
     risk: critical
     contract: scheduler-contract
     removal_condition: explicit upstream scheduler metadata hooks carry grouped Beam state
