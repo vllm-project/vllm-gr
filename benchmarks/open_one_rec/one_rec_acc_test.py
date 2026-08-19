@@ -5,7 +5,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any
 
 import requests
 
@@ -30,7 +30,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def get_sampling_params(gen_config: Dict[str, Any]) -> SamplingParams:
+def get_sampling_params(gen_config: dict[str, Any]) -> SamplingParams:
     """
     Construct vLLM SamplingParams from the task generation configuration.
     """
@@ -84,19 +84,19 @@ class MockCompletionOutput:
 
 
 class MockRequestOutput:
-    def __init__(self, prompt, outputs: List[MockCompletionOutput]):
+    def __init__(self, prompt, outputs: list[MockCompletionOutput]):
         self.prompt = prompt
         self.outputs = outputs
 
 
 def run_api_inference(
-    prompts: List[str],
+    prompts: list[str],
     model: str,
     api_url: str,
     api_key: str,
-    gen_config: Dict[str, Any],
+    gen_config: dict[str, Any],
     max_concurrency: int | None = None,
-) -> List[MockRequestOutput]:
+) -> list[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -122,7 +122,7 @@ def run_api_inference(
             data = response.json()
 
             # Extract content
-            if "choices" in data and data["choices"]:
+            if data.get("choices"):
                 mock_outputs = []
                 for choice in data["choices"]:
                     message = choice.get("message", {})
@@ -196,6 +196,15 @@ def main():
         "--catalog-path", type=str, default=None, help="Path to item validation (catalog) json file"
     )
     parser.add_argument(
+        "--beam-max-width",
+        type=int,
+        default=None,
+        help="Upper bound on beam width: sizes the beam KV pool and the "
+        "startup-captured FULL CUDA graph shape (num_tokens=width, runtime "
+        "is replay-only); must be >= the request beam width (--n). Unset "
+        "derives it from the effective beam width (--n / task config).",
+    )
+    parser.add_argument(
         "--max-concurrency", type=int, default=None, help="maximum prompts to run concurrently"
     )
     args = parser.parse_args()
@@ -234,6 +243,14 @@ def main():
         logger.info(f"\nUsing OpenAI-compatible API at: {args.endpoint}")
         logger.info(f"Model: {args.model}")
     else:
+        # The beam KV pool must cover every request's beam width.  This
+        # benchmark drives exactly gen_config["num_beams"], so derive the
+        # pool/graph upper bound from it unless the operator pinned an
+        # explicit --beam-max-width override.
+        beam_max_width = args.beam_max_width
+        if beam_max_width is None:
+            beam_max_width = gen_config.get("num_beams", 1)
+        logger.info(f"Beam KV pool upper bound (beam_max_width): {beam_max_width}")
         logger.info(f"\nInitializing vLLM with model: {args.model}")
         try:
             llm = GRLLM(
@@ -241,6 +258,7 @@ def main():
                 trust_remote_code=True,
                 max_logprobs=gen_config.get("num_beams", 1) * 2,
                 catalog_path=args.catalog_path if args.catalog_path is not None else None,
+                beam_max_width=beam_max_width,
                 attention_config={
                     "backend": args.backend if args.backend is not None else "CUSTOM"
                 },

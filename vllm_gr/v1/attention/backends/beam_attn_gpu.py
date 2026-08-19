@@ -166,33 +166,64 @@ def cascade_attention(
             else:
                 layer_idx = getattr(attn_metadata, "beam_layer_idx", 0)
                 pool = beam_session.pools[layer_idx]
-            step = beam_session.decode_step  # host int, no .item()
             slot = beam_session.slot
             H = pool.num_kv_heads
             D = pool.head_dim
             W = beam_session.beam_width
-
-            # Read pool slice: [W, H, step+1, D]
-            pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]  # [W, H, step+1, D]
-            pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
-
-            # Copy to pre-allocated fixed buffer (avoiding new allocation)
-            # Reshape: [W, H, step+1, D] -> [W*(step+1), H, D]
-            total_kv = W * (step + 1)
+            max_steps = pool.max_decode_steps
             suffix_k_buf = beam_session.suffix_k_buf
             suffix_v_buf = beam_session.suffix_v_buf
-            suffix_k_buf[:total_kv] = pool_k.permute(0, 2, 1, 3).reshape(-1, H, D)
-            suffix_v_buf[:total_kv] = pool_v.permute(0, 2, 1, 3).reshape(-1, H, D)
 
+            # Copy the pool's valid suffix KV into the packed suffix buffer.
+            #
+            # Graph-compatible path: a Triton kernel reads decode_step from
+            # the device buffer and computes the packed destination offsets at
+            # runtime.  The eager path below uses host-side Python slices
+            # (`: step + 1`), which CUDA Graph capture would bake in — a
+            # graph captured at step=1 would forever copy only 2 KV rows.
+            decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
+            if decode_step_buf is not None and decode_step_buf.is_cuda:
+                from vllm_gr.v1.attention.backends.beam_graph_kernels import (
+                    copy_suffix_kv_graph,
+                )
+
+                copy_suffix_kv_graph(
+                    pool.unshared_key,
+                    pool.unshared_value,
+                    suffix_k_buf,
+                    suffix_v_buf,
+                    slot,
+                    decode_step_buf,
+                    beam_width=W,
+                )
+            else:
+                # Eager fallback: host-int slice copy (packed layout)
+                step = beam_session.decode_step  # host int
+                pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
+                pool_v = pool.unshared_value[slot, :W, :, : step + 1, :]
+
+                # Copy to suffix_buf in packed layout: [W*(step+1), H, D]
+                # Beam 0's KV rows first, then beam 1's, etc.
+                total_kv = W * (step + 1)
+                suffix_k_buf[:total_kv] = pool_k.permute(0, 2, 1, 3).reshape(-1, H, D)
+                suffix_v_buf[:total_kv] = pool_v.permute(0, 2, 1, 3).reshape(-1, H, D)
+
+            # CUDA Graph-compatible: pass the full suffix_buf (fixed shape)
+            # instead of a variable-length view. FA2 uses cu_seqlens_k to
+            # determine the actual KV boundaries — the padding zeros beyond
+            # the packed prefix don't affect the output.
+            # max_seqlen_k is set to max_steps (fixed upper bound).
+            # Verified: FA2 produces identical output with over-set max_seqlen_k
+            # when cu_seqlens_k correctly delimits each batch element's KV.
             suffix_out, suffix_lse = flash_attn_varlen_func(
                 q=beam_query,
-                k=suffix_k_buf[:total_kv],
-                v=suffix_v_buf[:total_kv],
+                k=suffix_k_buf,
+                v=suffix_v_buf,
                 cu_seqlens_q=attn_metadata.suffix_cu_seqlens_q_device,
                 cu_seqlens_k=attn_metadata.suffix_cu_seqlens_k_device,
                 seqused_k=None,
                 max_seqlen_q=attn_metadata.suffix_max_q_len,
-                max_seqlen_k=attn_metadata.suffix_max_seq_len,
+                max_seqlen_k=max_steps,
                 softmax_scale=scale,
                 causal=True,
                 alibi_slopes=alibi_slopes,
@@ -237,11 +268,7 @@ def cascade_attention(
         # Transpose back so merge_attn_states sees the per-head layout. FA3 already
         # returns the head layout, and the prefix call (max_q > 1) is unaffected.
         group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
-        if (
-            attn_metadata.suffix_max_q_len == 1
-            and group_size > 1
-            and not vllm_flash_attn_version == 3
-        ):
+        if attn_metadata.suffix_max_q_len == 1 and group_size > 1 and vllm_flash_attn_version != 3:
             suffix_lse = (
                 suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
                 .transpose(1, 2)

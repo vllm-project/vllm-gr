@@ -59,6 +59,7 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
         model=model_name,
         trust_remote_code=True,
         max_logprobs=max_logprobs,
+        beam_max_width=beam_width,
         attention_config={"backend": "CUSTOM"},
         max_num_seqs=64,
     ) as llm:
@@ -109,6 +110,7 @@ def _run_offline_gr_beam_search_target(loops: int) -> None:
 
 
 @pytest.mark.slow  # type: ignore
+@pytest.mark.timeout(600)  # spawn subprocess compiles + loads engine twice
 def test_offline_gr_beam_search(loops: int) -> None:
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_run_offline_gr_beam_search_target, args=(loops,))

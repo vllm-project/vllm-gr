@@ -14,8 +14,6 @@ They will be optimized to Triton / CUDA kernels later.
 
 from __future__ import annotations
 
-from typing import List
-
 import torch
 
 
@@ -65,9 +63,11 @@ def cache_unshared_kv(
 def select_unshared_kv(
     beam_index: torch.Tensor,  # [W_cur] int32, source beam index for each beam
     slot: int,  # batch slot index
-    unshared_key_caches: List[torch.Tensor],  # per-layer pool key
-    unshared_value_caches: List[torch.Tensor],  # per-layer pool value
+    unshared_key_caches: list[torch.Tensor],  # per-layer pool key
+    unshared_value_caches: list[torch.Tensor],  # per-layer pool value
     decode_step: int,  # 0-indexed, reorder range [0:decode_step+1]
+    aux_key_bufs: list[torch.Tensor] | None = None,  # pre-allocated [W, H, max_steps, D]
+    aux_value_bufs: list[torch.Tensor] | None = None,  # pre-allocated [W, H, max_steps, D]
 ) -> None:
     """In-place reorder pool KV according to beam_index for a specific slot.
 
@@ -82,16 +82,38 @@ def select_unshared_kv(
     (the fixed-width case) ``n`` equals the pool width and this is a full
     reorder.
 
-    For each layer pool, clones the old KV for ``[0:decode_step+1]`` range,
-    then reorders by beam_index.
+    When aux_key_bufs/aux_value_bufs are provided, they are used instead of
+    .clone() to avoid per-step new allocations (CUDA Graph compatibility).
+    Otherwise, the original .clone() path is used (NPU or non-Graph).
+
+    Note: select_unshared_kv is called outside the CUDA Graph (after beam
+    decision), so decode_step remains a host int.
     """
     n = beam_index.shape[0]
-    for key_cache, value_cache in zip(unshared_key_caches, unshared_value_caches):
+    for layer_idx, (key_cache, value_cache) in enumerate(
+        zip(unshared_key_caches, unshared_value_caches)
+    ):
         # key_cache: [max_batch, W, H, max_steps, D]
         # Only reorder [0:decode_step+1] range for the given slot
-        old_key = key_cache[slot, :, :, : decode_step + 1, :].clone()  # [W, H, step+1, D]
-        old_value = value_cache[slot, :, :, : decode_step + 1, :].clone()  # [W, H, step+1, D]
-
-        # Reorder by beam_index (write into the first n pool slots)
-        key_cache[slot, :n, :, : decode_step + 1, :] = old_key[beam_index]
-        value_cache[slot, :n, :, : decode_step + 1, :] = old_value[beam_index]
+        if aux_key_bufs is not None and aux_value_bufs is not None:
+            # Graph-compatible path: use pre-allocated aux_buf instead of .clone()
+            aux_key = aux_key_bufs[layer_idx]
+            aux_value = aux_value_bufs[layer_idx]
+            # Copy only the [0:decode_step+1] range into aux_buf
+            aux_key[:, :, : decode_step + 1, :].copy_(key_cache[slot, :, :, : decode_step + 1, :])
+            aux_value[:, :, : decode_step + 1, :].copy_(
+                value_cache[slot, :, :, : decode_step + 1, :]
+            )
+            # Reorder by beam_index and write back (only first n beams, only valid steps)
+            key_cache[slot, :n, :, : decode_step + 1, :] = aux_key[
+                beam_index, :, : decode_step + 1, :
+            ]
+            value_cache[slot, :n, :, : decode_step + 1, :] = aux_value[
+                beam_index, :, : decode_step + 1, :
+            ]
+        else:
+            # Original path: .clone() creates new allocation (not Graph-compatible)
+            old_key = key_cache[slot, :, :, : decode_step + 1, :].clone()
+            old_value = value_cache[slot, :, :, : decode_step + 1, :].clone()
+            key_cache[slot, :n, :, : decode_step + 1, :] = old_key[beam_index]
+            value_cache[slot, :n, :, : decode_step + 1, :] = old_value[beam_index]

@@ -243,6 +243,9 @@ def test_beam_context_pool_follows_model_activation_dtype(
         device=torch.device("cpu"),
         # A quantized paged prefix cache must not determine the suffix pool dtype.
         cache_config=SimpleNamespace(cache_dtype="fp8"),
+        # Provide a GRConfig with beam_max_width set: beam decode requests
+        # without a configured pool raise in _get_or_create_beam_session.
+        _vllm_gr_config=SimpleNamespace(beam_max_width=128, beam_max_decode_steps=3),
     )
     beam_data = {
         "beam": {
@@ -266,3 +269,33 @@ def test_beam_context_pool_follows_model_activation_dtype(
     assert runner._beam_context.suffix_k_buf.dtype == model_dtype
     assert runner._beam_context.suffix_v_buf.dtype == model_dtype
     assert all(pool.dtype == model_dtype for pool in runner._beam_context.pools)
+
+
+def test_beam_session_raises_when_beam_max_width_unconfigured() -> None:
+    """Beam decode without a configured pool must fail loudly.
+
+    The scheduler freezes the paged cache at the prefix for beam decode
+    requests, so running them without the beam KV pool would silently
+    compute wrong attention; a RuntimeError pointing at --beam-max-width
+    is the only safe outcome.
+    """
+    runner = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(beam_max_width=None, beam_max_decode_steps=3),
+    )
+    beam_data = {
+        "beam": {
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_decode_steps": 1,
+            "beam_width": 2,
+            "prefix_len": 4,
+            "max_decode_steps": 3,
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="beam_max_width"):
+        common._get_or_create_beam_session(
+            runner,
+            beam_data,
+            SimpleNamespace(beam_finished_session_ids=[]),
+        )

@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm_gr.v1.worker.constraint_hook import apply_constrained_sample_override
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
+    _WORKER_DETERMINE_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
     InputBatchProxy,
@@ -139,6 +140,31 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
     return patched_bookkeeping_sync
 
 
+def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
+    """No-op wrapper for the NPU ``_determine_batch_execution_and_padding``.
+
+    NPU does not use CUDA Graph for beam decode (it always runs eager), so this
+    wrapper does not change any dispatch result.  It exists solely to stamp the
+    ``_WORKER_DETERMINE_PATCH_MARKER`` on the method so that
+    ``is_worker_runner_patched()`` recognises the runner as fully patched.
+
+    Without this marker, ``is_worker_runner_patched()`` sees that
+    ``NPUModelRunner`` *has* ``_determine_batch_execution_and_padding`` (inherited
+    from the vllm-ascend base) but the method lacks the marker, causing the
+    gate-check to fail and every ``re_apply_patches()`` in a spawned subprocess
+    to raise ``BeamPatchInitializationError``.
+    """
+    if getattr(_orig_determine, _WORKER_DETERMINE_PATCH_MARKER, False):
+        return _orig_determine
+
+    @wraps(_orig_determine)
+    def patched_determine(self, *args, **kwargs):
+        return _orig_determine(self, *args, **kwargs)
+
+    setattr(patched_determine, _WORKER_DETERMINE_PATCH_MARKER, True)
+    return patched_determine
+
+
 def discover_worker_runners() -> tuple[tuple[str, type], ...]:
     """Discover NPUModelRunner through vLLM-Ascend's supported entry point."""
     try:
@@ -161,3 +187,6 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
 make_patched_prepare_inputs = make_patched_prepare_inputs_npu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_npu
 make_patched_sample = make_patched_sample_npu
+make_patched_determine_batch_execution_and_padding = (
+    make_patched_determine_batch_execution_and_padding_npu
+)

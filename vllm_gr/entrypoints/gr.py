@@ -18,7 +18,7 @@ LLM path.
 import copy
 import gc
 import time
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -262,7 +262,7 @@ def _parse_step_logprobs(
     token: int,
     logprobs_num: int,
     fork_info_j: ForkInfo | None,
-    catalog: Optional[Any] = None,
+    catalog: Any | None = None,
     catalog_strategy: str | None = None,
     constraint_coordinator: BeamConstraintCoordinator | None = None,
     return_arrays: bool = False,
@@ -411,7 +411,7 @@ def _custom_beam_search_batch(
     ignore_eos: bool,
     initial_logprobs: "FlatLogprobs",
     logprobs_num: int,
-    catalog: Optional[Any] = None,
+    catalog: Any | None = None,
     catalog_strategy: str | None = None,
     constraint_coordinator: BeamConstraintCoordinator | None = None,
     max_decode_steps: int = 0,
@@ -569,8 +569,11 @@ class GRLLM(LLM):
         self,
         model: str = "",
         *,
-        catalog_path: Optional[str] = None,
+        catalog_path: str | None = None,
         constraint_backend: ConstraintBackend | str = ConstraintBackend.TRIE,
+        beam_graph_enabled: bool | None = None,
+        beam_max_width: int | None = None,
+        beam_max_decode_steps: int | None = None,
         **kwargs,
     ):
         # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
@@ -608,6 +611,22 @@ class GRLLM(LLM):
                 "vllm_gr.plugin.initialize_runtime() before constructing GRLLM "
                 "with constraint_backend='constraint_table'."
             )
+
+        # Beam-graph settings ride vLLM's native additional_config so they
+        # survive into the spawned engine-core process (same channel as the
+        # serve CLI flags; see vllm_gr/engine/arg_utils_gr.py).
+        beam_updates: dict[str, object] = {}
+        if beam_graph_enabled is not None:
+            beam_updates["vllm_gr_beam_graph_enabled"] = beam_graph_enabled
+        if beam_max_width is not None:
+            beam_updates["vllm_gr_beam_max_width"] = beam_max_width
+        if beam_max_decode_steps is not None:
+            beam_updates["vllm_gr_beam_max_decode_steps"] = beam_max_decode_steps
+        if beam_updates:
+            additional_config = dict(kwargs.pop("additional_config", None) or {})
+            additional_config.update(beam_updates)
+            kwargs["additional_config"] = additional_config
+
         super().__init__(
             model=model,
             **gr_engine_args,

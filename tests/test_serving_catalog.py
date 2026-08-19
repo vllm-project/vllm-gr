@@ -68,6 +68,7 @@ async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "
             enforce_eager=True,
             enable_log_requests=False,
             max_logprobs=1024,
+            additional_config={"vllm_gr_beam_max_width": 1024},
         )
         setattr(engine_args, "catalog_path", catalog_path)
 
@@ -212,6 +213,7 @@ async def _null_all_dead_impl() -> None:
             enforce_eager=True,
             enable_log_requests=False,
             max_logprobs=1024,
+            additional_config={"vllm_gr_beam_max_width": 4},
         )
         setattr(engine_args, "catalog_path", catalog_path)
 
@@ -325,6 +327,7 @@ async def _uniqueness_impl() -> None:
             enforce_eager=True,
             enable_log_requests=False,
             max_logprobs=1024,
+            additional_config={"vllm_gr_beam_max_width": 16},
         )
         setattr(engine_args, "catalog_path", catalog_path)
 

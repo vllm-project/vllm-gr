@@ -192,6 +192,7 @@ def test_incremental_metadata_builder_uses_active_session_contract() -> None:
     builder.num_kv_heads = 2
     builder._is_cuda = True
     builder._is_npu = False
+    builder._fixed_buffers = False  # no pre-allocated buffers in test harness
     builder.npu_causal_atten_mask = None
 
     common = type(

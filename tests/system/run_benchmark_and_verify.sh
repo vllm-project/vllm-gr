@@ -117,6 +117,12 @@ extract_numeric_value() {
 }
 
 echo "Running OneRec offline benchmark"
+# Single source of truth for the beam width driven by every client below
+# (--n).  The beam KV pool / captured graph width must cover it, so both are
+# derived from the same variable instead of an external environment override
+# (a missing override silently disabled the pool and corrupted beam decode).
+beam_width=128
+beam_graph_args=(--beam-max-width "$beam_width")
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --gr \
   --model "$MODEL_PATH" \
@@ -128,7 +134,8 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --task-type video \
   --catalog-path "$CATALOG_PATH" \
   --backend CUSTOM \
-  --n 128)
+  "${beam_graph_args[@]}" \
+  --n "$beam_width")
 offline_status=$?
 printf '%s\n' "$output"
 if [[ "$offline_status" -ne 0 ]]; then
@@ -182,6 +189,7 @@ wait_for_server() {
 
 echo "Starting OneRec online server"
 vllm-gr serve \
+  "${beam_graph_args[@]}" \
   --port "$run_port" \
   --seed 123 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
@@ -209,7 +217,7 @@ warmup_output=$(python -m benchmarks.open_one_rec.one_rec_main \
   --port "$run_port" \
   --request-rate 1 \
   --max-concurrency 1 \
-  --n 128)
+  --n "$beam_width")
 warmup_status=$?
 printf '%s\n' "$warmup_output"
 if [[ "$warmup_status" -ne 0 ]]; then
@@ -230,7 +238,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   --port "$run_port" \
   --request-rate 0.5 \
   --max-concurrency 1 \
-  --n 128)
+  --n "$beam_width")
 online_performance_status=$?
 printf '%s\n' "$output"
 if [[ "$online_performance_status" -ne 0 ]]; then
@@ -261,7 +269,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --task-type video \
   --endpoint /v1/chat/completions \
   --port "$run_port" \
-  --n 128)
+  --n "$beam_width")
 online_accuracy_status=$?
 printf '%s\n' "$output"
 if [[ "$online_accuracy_status" -ne 0 ]]; then

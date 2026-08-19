@@ -250,6 +250,7 @@ def test_step_complete_reorders_pool_kv_via_select_unshared_kv(
         key_caches: list[torch.Tensor],
         value_caches: list[torch.Tensor],
         decode_step: int,
+        **kwargs: object,
     ) -> None:
         select_calls.append(
             {

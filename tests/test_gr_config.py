@@ -12,6 +12,7 @@ import pytest
 from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
 from vllm_gr.config.parser import (
     ATTENTION_BACKEND_KEY,
+    BEAM_MAX_DECODE_STEPS_KEY,
     CATALOG_PATH_KEY,
     CONSTRAINT_BACKEND_KEY,
 )
@@ -391,3 +392,18 @@ def test_attention_selector_config_reader_propagates_validation_errors() -> None
         pytest.raises(ValueError, match="unsupported.*attention_backend"),
     ):
         _get_current_gr_attention_backend()
+
+
+def test_beam_max_decode_steps_defaults_to_onerec_sid_length() -> None:
+    """OneRec SID decode is max_tokens=5 minus begin/end → 3 steps."""
+    config = GRConfig.from_vllm_config(_vllm_config())
+    assert config.beam_max_decode_steps == 3
+
+    vllm_config = _vllm_config()
+    config.write_to_vllm_config(vllm_config)
+    assert BEAM_MAX_DECODE_STEPS_KEY not in vllm_config.additional_config
+
+    overridden = GRConfig(beam_max_decode_steps=8)
+    overridden.write_to_vllm_config(vllm_config)
+    assert vllm_config.additional_config[BEAM_MAX_DECODE_STEPS_KEY] == 8
+    assert GRConfig.from_vllm_config(vllm_config).beam_max_decode_steps == 8

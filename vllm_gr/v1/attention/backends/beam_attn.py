@@ -5,7 +5,7 @@
 from types import ModuleType
 
 import torch
-import vllm.envs as envs
+from vllm import envs
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -192,8 +192,6 @@ class BeamAttentionImpl(AttentionImpl):
         is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
 
         if is_beam_decode and beam_session is not None and beam_session.is_active:
-            from vllm_gr.v1.attention.backends.beam_kernels import cache_unshared_kv
-
             # Resolve this layer's KV pool with module-level caching.
             # First touch: extract the layer index from layer_name via
             # extract_layer_index (loud AssertionError on ambiguous names
@@ -206,27 +204,52 @@ class BeamAttentionImpl(AttentionImpl):
                 pool = beam_session.pools[layer_idx]
                 layer._beam_pool = pool
 
-            # Extract beam decode KV from key/value tensors
-            # key/value contain all scheduled tokens (including non-beam tokens)
-            # We need only the beam tokens for cache_unshared_kv
+            # Extract the beam tokens' KV from the key/value tensors (they
+            # contain all scheduled tokens).  The gather runs inside the
+            # captured graph: fancy indexing allocates from the graph pool
+            # (address-stable across replays) and re-gathers from the
+            # fixed-address prefix_indices buffer each replay.
             if attn_metadata.prefix_indices is not None:
-                # Beam tokens are at prefix_indices positions
+                # Beam tokens at prefix_indices positions (always set on the
+                # incremental decode path, mixed or pure batch alike).
                 beam_key = key[attn_metadata.prefix_indices]  # [W, H, D]
                 beam_value = value[attn_metadata.prefix_indices]  # [W, H, D]
             else:
-                # All tokens are beam tokens
+                # Fallback kept for callers that do not set prefix_indices;
+                # the incremental path always sets it (see beam_attn_metadata).
                 beam_key = key
                 beam_value = value
 
-            # cache_unshared_kv: write current step's KV into pool
-            cache_unshared_kv(
-                pool.unshared_key,
-                pool.unshared_value,
-                beam_key,
-                beam_value,
-                beam_session.slot,
-                beam_session.decode_step,
-            )
+            # cache_unshared_kv: write current step's KV into pool.
+            # Use Graph-compatible Triton kernel when decode_step_buf is
+            # available on CUDA (reads decode_step from device buffer instead
+            # of host Python int, enabling CUDA Graph capture/replay).
+            # Non-CUDA (e.g. CPU unit tests) falls back to the Python path.
+            decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
+            if decode_step_buf is not None and decode_step_buf.is_cuda:
+                from vllm_gr.v1.attention.backends.beam_graph_kernels import (
+                    cache_unshared_kv_graph,
+                )
+
+                cache_unshared_kv_graph(
+                    pool.unshared_key,
+                    pool.unshared_value,
+                    beam_key,
+                    beam_value,
+                    beam_session.slot,
+                    decode_step_buf,
+                )
+            else:
+                from vllm_gr.v1.attention.backends.beam_kernels import cache_unshared_kv
+
+                cache_unshared_kv(
+                    pool.unshared_key,
+                    pool.unshared_value,
+                    beam_key,
+                    beam_value,
+                    beam_session.slot,
+                    beam_session.decode_step,
+                )
 
             # The suffix pool stores unquantized model activations. Its dtype
             # follows the current attention K/V, independently of a possibly

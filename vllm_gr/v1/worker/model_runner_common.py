@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from functools import wraps
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -21,9 +21,11 @@ _WORKER_BOOKKEEPING_PATCH_MARKER = "_vllm_gr_beam_bookkeeping_patch"
 # Optional: only installed when the runner exposes ``_sample`` (NPU builds may
 # not).  is_worker_runner_patched() deliberately does not require it.
 _WORKER_SAMPLE_PATCH_MARKER = "_vllm_gr_beam_sample_patch"
+_WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
+_WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
 
 
-def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Safely extracts underlying hardware and host indexing position tensors."""
     gpu_positions = None
     cpu_positions = None
@@ -43,10 +45,10 @@ def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optiona
 
 def _write_position_segments(
     token_offset: int,
-    seg_starts: List[int],
-    seg_lens: List[int],
-    gpu_pos: Optional[torch.Tensor],
-    cpu_pos: Optional[torch.Tensor],
+    seg_starts: list[int],
+    seg_lens: list[int],
+    gpu_pos: torch.Tensor | None,
+    cpu_pos: torch.Tensor | None,
 ) -> None:
     """Write concatenated per-beam position-id segments in one vectorized pass.
 
@@ -76,14 +78,14 @@ def _write_position_segments(
 
 
 def _process_beam_decode_request(
-    mdata: Dict[str, Any],
+    mdata: dict[str, Any],
     seq_len: int,
     token_offset: int,
-    gpu_pos: Optional[torch.Tensor],
-    cpu_pos: Optional[torch.Tensor],
-    new_logits_indices: List[int],
+    gpu_pos: torch.Tensor | None,
+    cpu_pos: torch.Tensor | None,
+    new_logits_indices: list[int],
     is_incremental: bool = False,
-) -> Tuple[int, int, int, List[int]]:
+) -> tuple[int, int, int, list[int]]:
     """Traces allocation arrays and mutates position buffers for a speculative request.
 
     When is_incremental=True, each beam inputs 1 token with position_id = prefix_len + decode_step.
@@ -97,8 +99,8 @@ def _process_beam_decode_request(
     # --- Incremental decode path ---
     if is_incremental:
         decode_step = mdata.get("decode_step", 0)
-        seg_starts: List[int] = []
-        seg_lens: List[int] = []
+        seg_starts: list[int] = []
+        seg_lens: list[int] = []
 
         for b in range(beam_width):
             # Each beam: 1 token, position = prefix_len + decode_step
@@ -152,14 +154,14 @@ def _process_beam_decode_request(
 
 
 def _remux_logprobs_tensors(
-    request_row_configs: List[Tuple[Any, int, int]],
+    request_row_configs: list[tuple[Any, int, int]],
     max_chained_dim: int,
     target_K: int,
     orig_lps: torch.Tensor,
-    orig_lp_ids: Optional[torch.Tensor],
-    orig_ranks: Optional[torch.Tensor],
+    orig_lp_ids: torch.Tensor | None,
+    orig_ranks: torch.Tensor | None,
     st_ids: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Merges and aligns sampler tensor slices sequentially across runtime waves."""
     if max_chained_dim == 0 or orig_lps.numel() == 0:
         return st_ids, orig_lps, orig_lp_ids, orig_ranks
@@ -353,7 +355,7 @@ class InputBatchProxy:
         setattr(object.__getattribute__(self, "_obj"), name, value)
 
 
-def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[int]:
+def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[int]:
     """Expand a packed beam-decode batch into per-beam rows.
 
     Device-neutral. Overwrites per-beam RoPE position ids (Job B), builds the
@@ -371,7 +373,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
     beam_data = getattr(scheduler_output, "beam_data", {})
 
     runner.input_batch.logprob_token_ids = {}
-    new_logits_indices: List[int] = []
+    new_logits_indices: list[int] = []
     orig_req_ids = runner.input_batch.req_ids
 
     token_offset = 0
@@ -444,7 +446,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
 
 def _beam_collapse_bookkeeping(
     runner, orig_input_batch, request_row_configs, beam_data, sampler_output
-) -> Tuple[List[Any], Dict[Any, int], int]:
+) -> tuple[list[Any], dict[Any, int], int]:
     """Collapse per-beam sampler output back onto logical (session) requests.
 
     Device-neutral. Remuxes the sampler logprobs tensors in place so that each
@@ -474,8 +476,7 @@ def _beam_collapse_bookkeeping(
                     needed_dim = m_width * actual_K
                 else:
                     needed_dim = W * actual_K
-                if needed_dim > max_chained_dim:
-                    max_chained_dim = needed_dim
+                max_chained_dim = max(max_chained_dim, needed_dim)
 
             final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
                 request_row_configs,
@@ -584,7 +585,24 @@ def _beam_collapse_bookkeeping(
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
 
 
-def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) -> Optional[Any]:
+def _get_gr_config(runner) -> Any:
+    """Return the worker's GRConfig, cached on the runner (frozen dataclass).
+
+    Configuration flows exclusively through the engine config chain
+    (CLI flags / additional_config -> GRConfig -> VllmConfig.additional_config);
+    no environment variables are consulted at runtime.
+    """
+    cached = getattr(runner, "_vllm_gr_config", None)
+    if cached is not None:
+        return cached
+    from vllm_gr.config import GRConfig
+
+    cfg = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+    runner._vllm_gr_config = cfg
+    return cfg
+
+
+def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) -> Any | None:
     """Get or create per-request BeamSearchSession for incremental decode.
 
     Manages per-request sessions via runner._beam_sessions dict, keyed by
@@ -625,75 +643,90 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     if not has_incremental:
         return None
 
-    # 3. Ensure worker-level context exists (lazy creation)
-    if not hasattr(runner, "_beam_context"):
-        # Get model config for pool dimensions
-        model_config = getattr(runner, "model_config", None)
-        if model_config is None:
-            vllm_config = getattr(runner, "vllm_config", None)
-            if vllm_config is not None:
-                model_config = vllm_config.model_config
+    gr_cfg = _get_gr_config(runner)
 
-        if model_config is None:
-            logger.warning("Cannot create BeamAttentionContext: model_config not available")
-            return None
-
-        parallel_config = getattr(runner, "parallel_config", None)
-        if parallel_config is None:
-            vllm_config = getattr(runner, "vllm_config", None)
-            if vllm_config is not None:
-                parallel_config = vllm_config.parallel_config
-
-        if parallel_config is None:
-            logger.warning("Cannot create BeamAttentionContext: parallel_config not available")
-            return None
-
-        num_kv_heads = model_config.get_num_kv_heads(parallel_config)
-        head_dim = model_config.get_head_size()
-        num_layers = model_config.get_num_layers(parallel_config)
-        device = runner.device if hasattr(runner, "device") else torch.device("cuda")
-
-        # Determine max_batch: the maximum number of concurrent beam search sessions.
-        # This is NOT the scheduler's max_num_seqs (which includes all request types).
-        # For now, hardcode to 1 for max_batch=1 testing.  Future: read from
-        # beam-specific config or dynamically size the pool.
-        max_batch = 1
-
-        # Determine max_beams and max_decode_steps from the first beam request
-        # These will be used for pool pre-allocation.  In the future, we may
-        # need to support heterogeneous beam widths across requests.
-        first_mdata = None
-        for md in beam_data.values():
-            if md.get("is_beam_decode", False) and "decode_step" in md:
-                first_mdata = md
-                break
-
-        max_beams = first_mdata["beam_width"] if first_mdata else 128
-        max_decode_steps = first_mdata.get("max_decode_steps", 0) if first_mdata else 0
-        if max_decode_steps <= 0 and first_mdata is not None:
-            max_decode_steps = max(first_mdata.get("beam_decode_steps", 0), 64)
-        if max_decode_steps <= 0:
-            max_decode_steps = 64
-
-        from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-
-        runner._beam_context = BeamAttentionContext(
-            max_batch=max_batch,
-            max_beams=max_beams,
-            num_kv_heads=num_kv_heads,
-            max_decode_steps=max_decode_steps,
-            head_dim=head_dim,
-            num_layers=num_layers,
-            device=device,
-            dtype=model_config.dtype,
+    # Beam decode requests are scheduled incrementally (the scheduler freezes
+    # the paged cache at the prefix; decode KV belongs in the beam pool).  With
+    # no pool the attention would fall back to the standard paged path, which
+    # cannot represent per-beam divergent suffix KV — silently wrong logprobs.
+    # Fail loudly instead, mirroring the over-capacity error below.
+    if gr_cfg.beam_max_width is None:
+        raise RuntimeError(
+            "vllm-gr beam decode requests require a persistent beam KV pool, "
+            "but beam_max_width is not configured. Set --beam-max-width (or "
+            "vllm_gr_beam_max_width in additional_config) to the maximum "
+            "served beam width."
         )
+
+    # 3. Ensure worker-level context exists (lazy creation).
+    #    Uses the shared _create_beam_context so pool sizing (max_beams,
+    #    max_decode_steps, dtype, device) is derived from the same sources
+    #    as the dummy-capture path — a single source of truth prevents
+    #    silent size mismatches that would invalidate captured CUDA graphs.
+    if not hasattr(runner, "_beam_context"):
+        try:
+            from vllm_gr.v1.worker.gpu_model_runner_patch import _create_beam_context
+
+            runner._beam_context = _create_beam_context(runner, gr_cfg, max_batch=1)
+        except ImportError:
+            # GPU patch module not available (e.g. NPU-only deployment).
+            # Fall back to inline construction with the same parameter sources.
+            from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+
+            model_config = getattr(runner, "model_config", None)
+            if model_config is None:
+                vllm_config = getattr(runner, "vllm_config", None)
+                if vllm_config is not None:
+                    model_config = vllm_config.model_config
+            if model_config is None:
+                logger.warning("Cannot create BeamAttentionContext: model_config not available")
+                return None
+
+            parallel_config = getattr(runner, "parallel_config", None)
+            if parallel_config is None:
+                vllm_config = getattr(runner, "vllm_config", None)
+                if vllm_config is not None:
+                    parallel_config = vllm_config.parallel_config
+            if parallel_config is None:
+                logger.warning("Cannot create BeamAttentionContext: parallel_config not available")
+                return None
+
+            runner._beam_context = BeamAttentionContext(
+                max_batch=1,
+                max_beams=int(gr_cfg.beam_max_width),
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                max_decode_steps=int(gr_cfg.beam_max_decode_steps),
+                head_dim=model_config.get_head_size(),
+                num_layers=model_config.get_num_layers(parallel_config),
+                device=runner.device if hasattr(runner, "device") else torch.device("cuda"),
+                dtype=model_config.dtype,
+            )
 
     # 4. Per-request session management
     active_session = None
 
+    # The context above is sized once and is never resized (a regrow would
+    # move every buffer's data_ptr and silently invalidate any captured CUDA
+    # graph), so requests beyond its capacity are a hard configuration error.
+    # Without this check the Triton pool kernels write out of bounds silently
+    # (the eager Python path's IndexError safety net does not exist on the
+    # device-side path).
+    context = runner._beam_context
     for req_id, mdata in beam_data.items():
         if not mdata.get("is_beam_decode") or "decode_step" not in mdata:
             continue
+
+        req_width = int(mdata["beam_width"])
+        req_step = int(mdata.get("decode_step", 0))
+        if req_width > context.max_beams or req_step >= context.max_decode_steps:
+            raise ValueError(
+                f"vllm-gr beam request {req_id!r} exceeds the persistent beam "
+                f"KV pool capacity (pool: max_beams={context.max_beams}, "
+                f"max_decode_steps={context.max_decode_steps}; request: "
+                f"beam_width={req_width}, decode_step={req_step}). Raise "
+                f"--beam-max-width / --beam-max-decode-steps to cover the "
+                f"served request population."
+            )
 
         session = runner._beam_sessions.get(req_id)
         mdata_step = mdata.get("decode_step", 0)
@@ -713,9 +746,13 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 # the new KV is written, using the current decode_step to select
                 # the KV range to reorder.
                 parent_beam_ids = mdata.get("parent_beam_ids")
+                # Loop length is this request's max_tokens - pre_calc, already
+                # on metadata.  Fall back to the pool bound (default 3) only
+                # when the host omitted it — never to beam_decode_steps, which
+                # is "steps so far", not the planned length.
                 max_decode_steps = mdata.get("max_decode_steps", 0)
                 if max_decode_steps <= 0:
-                    max_decode_steps = max(mdata.get("beam_decode_steps", 0), 64)
+                    max_decode_steps = gr_cfg.beam_max_decode_steps
 
                 is_last_step = mdata_step >= max_decode_steps - 1
                 state = session._state
@@ -782,6 +819,20 @@ def make_patched_execute_model(_orig_execute_model):
         if beam_session is not None:
             beam_info["beam_session"] = beam_session
 
+            # Refresh device-side buffers before model forward / Graph replay.
+            # These fill_() calls are on the same CUDA stream as the model
+            # forward, so they are ordered before any kernel that reads them.
+            context = beam_session.context  # BeamAttentionContext
+            decode_step = beam_session.decode_step
+
+            # decode_step_buf: device scalar read by the Triton
+            # cache_unshared_kv / copy_suffix_kv kernels (the per-step KV
+            # extent for suffix FA2 is device-side data via the metadata
+            # builder's fixed-address cu_seqlens_k buffer, refreshed by
+            # build() each step).
+            if hasattr(context, "decode_step_buf"):
+                context.decode_step_buf.fill_(decode_step)
+
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info
         # Published for the optional Constraint Tables ``_sample`` hook
@@ -803,7 +854,15 @@ def make_patched_execute_model(_orig_execute_model):
 
 
 def is_worker_runner_patched(runner_class) -> bool:
-    """Return whether all grouped-beam hooks are present on a runner class."""
+    """Return whether all grouped-beam hooks are present on a runner class.
+
+    The ``_determine_batch_execution_and_padding`` hook stamps the beam
+    determine marker on all platforms.  On GPU it overrides the dispatch
+    result to force FULL CUDA Graph for beam decode; on NPU it is a no-op
+    wrapper that preserves the original result — but the marker must still
+    be present for the gate-check to pass.
+    """
+    has_determine = hasattr(runner_class, "_determine_batch_execution_and_padding")
     return bool(
         getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)
         and getattr(runner_class._prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False)
@@ -811,5 +870,13 @@ def is_worker_runner_patched(runner_class) -> bool:
             runner_class._bookkeeping_sync,
             _WORKER_BOOKKEEPING_PATCH_MARKER,
             False,
+        )
+        and (
+            not has_determine
+            or getattr(
+                runner_class._determine_batch_execution_and_padding,
+                _WORKER_DETERMINE_PATCH_MARKER,
+                False,
+            )
         )
     )

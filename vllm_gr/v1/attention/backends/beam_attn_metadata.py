@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
-import vllm.envs as envs
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -134,6 +134,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         device_type = getattr(device, "type", str(device).partition(":")[0])
         self._is_cuda = device_type == "cuda"
         self._is_npu = device_type == "npu"
+        # Default: no pre-allocated fixed-address buffers.  Overridden to True
+        # below when CUDA (or, in the future, ACL Graph on NPU) needs them.
+        # Tests / kernel harnesses that skip __init__ keep the default and
+        # allocate device tensors per build() call.
+        self._fixed_buffers = False
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
@@ -171,6 +176,85 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             )
         else:
             self.npu_causal_atten_mask = None
+
+        # --- Fixed-address metadata buffers for graph capture compatibility ---
+        # All buffers are pre-allocated at init time with maximum sizes.
+        # build() writes into these buffers and returns views (stable addresses).
+        # This ensures that tensor addresses captured during CUDA/ACL Graph
+        # capture remain valid across replays.  Currently only CUDA allocates
+        # these; when ACL Graph support lands, NPU will set _fixed_buffers=True
+        # here too and the rest of the code needs no change.
+        self._fixed_buffers = self._is_cuda
+        if self._fixed_buffers:
+            max_reqs = vllm_config.scheduler_config.max_num_seqs
+            max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            # Upper bound from GRConfig so the fixed-address metadata buffers
+            # always cover the configured beam_max_width (single source of
+            # truth; CLI --beam-max-width / additional_config).  When
+            # beam_max_width is None (beam decode disabled), no fixed buffers
+            # are needed — fall back to the per-request dynamic path.
+            from vllm_gr.config import GRConfig
+
+            max_beams = GRConfig.from_vllm_config(vllm_config).beam_max_width
+            if max_beams is None:
+                self._fixed_buffers = False
+            else:
+                max_segs = max_reqs * max_beams + 1
+                max_model_len = vllm_config.model_config.max_model_len
+                max_blocks = max(1, (max_model_len + self.block_size - 1) // self.block_size)
+
+                # cu_seqlens_q buffers (prefix + suffix)
+                # These include the leading 0 element: size = num_groups + 1
+                self._prefix_cu_seqlens_q_buf = torch.zeros(
+                    max_segs, dtype=torch.int32, device=self.device
+                )
+                self._suffix_cu_seqlens_q_buf = torch.zeros(
+                    max_segs, dtype=torch.int32, device=self.device
+                )
+
+                # seqused_k / seqlens_kv buffers (per-group, no leading 0)
+                self._prefix_seqlens_kv_buf = torch.zeros(
+                    max_reqs, dtype=torch.int32, device=self.device
+                )
+                self._suffix_seqlens_kv_buf = torch.zeros(
+                    max_reqs * max_beams, dtype=torch.int32, device=self.device
+                )
+
+                # cu_seqlens_k for suffix. Includes leading 0: size = num_suffix_groups + 1
+                self._suffix_cu_seqlens_k_buf = torch.zeros(
+                    max_segs, dtype=torch.int32, device=self.device
+                )
+
+                # block_table buffers
+                self._prefix_block_table_buf = torch.zeros(
+                    (max_reqs, max_blocks), dtype=torch.int32, device=self.device
+                )
+                self._std_block_table_buf = torch.zeros(
+                    (max_reqs, max_blocks), dtype=torch.int32, device=self.device
+                )
+
+                # indices buffers
+                # Per-token index buffers: each std/prefix token contributes one
+                # index (see _build_std_mappings: std_indices.extend(range(...))),
+                # so the upper bound is max_num_batched_tokens, not max_reqs*max_beams.
+                # When max_num_batched_tokens > max_reqs*max_beams (e.g. seqs=64,
+                # beams=128, budget=16384) the old sizing caused a silent slice
+                # truncation and copy_ shape mismatch → RuntimeError.
+                max_token_indices = max(max_reqs * max_beams, max_num_batched_tokens)
+                self._std_indices_buf = torch.zeros(
+                    max_token_indices, dtype=torch.long, device=self.device
+                )
+                self._prefix_indices_buf = torch.zeros(
+                    max_token_indices, dtype=torch.long, device=self.device
+                )
+
+                # std cu_seqlens_q / seqlens_kv
+                self._std_cu_seqlens_q_buf = torch.zeros(
+                    max_reqs + 1, dtype=torch.int32, device=self.device
+                )
+                self._std_seqlens_kv_buf = torch.zeros(
+                    max_reqs, dtype=torch.int32, device=self.device
+                )
 
     def _update_aot_schedule(self, fast_build: bool):
         self.aot_schedule = self.aot_schedule and not fast_build
@@ -483,35 +567,59 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         common_attn_metadata,
         device,
     ):
-        if std_seqlens_q_cpu:
+        if not std_seqlens_q_cpu:
+            return None, None, None, 0, 0, None
+
+        num_std = len(std_indices)
+        std_max_q_len = max(std_seqlens_q_cpu)
+        std_max_seq_len = max(std_seqlens_kv_cpu)
+        num_std_blocks = (std_max_seq_len + self.block_size - 1) // self.block_size
+
+        if self._fixed_buffers:
+            std_indices_tensor = self._std_indices_buf[:num_std]
+            std_indices_tensor.copy_(torch.tensor(std_indices, dtype=torch.long, device=device))
+            std_block_table = self._std_block_table_buf[: len(std_req_idxs), :num_std_blocks]
+            std_block_table.copy_(
+                common_attn_metadata.block_table_tensor[std_req_idxs, :num_std_blocks]
+            )
+            num_cu = len(std_cu_seqlens_q_cpu) + 1  # +1 for leading 0
+            std_cu_seqlens_q_device = self._std_cu_seqlens_q_buf[:num_cu]
+            std_cu_seqlens_q_device.copy_(
+                torch.tensor([0] + std_cu_seqlens_q_cpu, dtype=torch.int32, device=device)
+            )
+            std_seqlens_kv_device = self._std_seqlens_kv_buf[: len(std_seqlens_kv_cpu)]
+            std_seqlens_kv_device.copy_(
+                torch.tensor(std_seqlens_kv_cpu, dtype=torch.int32, device=device)
+            )
+        else:
             std_indices_tensor = torch.tensor(std_indices, dtype=torch.long, device=device)
-            std_max_q_len = max(std_seqlens_q_cpu)
-            std_max_seq_len = max(std_seqlens_kv_cpu)
-            num_std_blocks = (std_max_seq_len + self.block_size - 1) // self.block_size
             std_block_table = common_attn_metadata.block_table_tensor[
                 std_req_idxs, :num_std_blocks
             ].contiguous()
-
             if self._is_cuda:
+                # Tests / kernel harnesses that skip __init__ buffer alloc.
                 std_cu_seqlens_q_device = torch.tensor(
                     [0] + std_cu_seqlens_q_cpu, dtype=torch.int32, device=device
                 )
                 std_seqlens_kv_device = torch.tensor(
                     std_seqlens_kv_cpu, dtype=torch.int32, device=device
                 )
-            else:  # NPU
+            else:
+                # NPU: npu_fused_infer_attention_score_v2 currently reads
+                # CPU lists (std_cu_seqlens_q_cpu / std_seqlens_kv_cpu).
+                # TODO(ACL-graph): switch NPU to device tensors so this
+                # branch disappears and seqlens handling is unified.
                 std_cu_seqlens_q_device = None
                 std_seqlens_kv_device = None
 
-            return (
-                std_indices_tensor,
-                std_cu_seqlens_q_device,
-                std_seqlens_kv_device,
-                std_max_q_len,
-                std_max_seq_len,
-                std_block_table,
-            )
-        return None, None, None, 0, 0, None
+        return (
+            std_indices_tensor,
+            std_cu_seqlens_q_device,
+            std_seqlens_kv_device,
+            std_max_q_len,
+            std_max_seq_len,
+            std_block_table,
+        )
 
     def _create_beam_tensors(
         self,
@@ -530,68 +638,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         device,
         max_num_splits: int,
     ):
-        if prefix_seqlens_q_cpu:
-            prefix_indices_tensor = torch.tensor(prefix_indices, dtype=torch.long, device=device)
-            prefix_max_seq_len = max(prefix_seqlens_kv_cpu) if prefix_seqlens_kv_cpu else 0
-            prefix_max_q_len = max(prefix_seqlens_q_cpu) if prefix_seqlens_q_cpu else 0
-            prefix_block_table = common_attn_metadata.block_table_tensor[
-                prefix_req_idxs_cpu, :max_prefix_blocks_count
-            ].contiguous()
-
-            suffix_max_seq_len = max(suffix_seqlens_kv_cpu) if suffix_seqlens_kv_cpu else 0
-            suffix_max_q_len = max(suffix_seqlens_q_cpu) if suffix_seqlens_q_cpu else 0
-
-            if suffix_slot_mapping_out_list:
-                suffix_total_tokens = len(suffix_slot_mapping_out_list)
-                num_prefix = len(prefix_indices)
-                if num_prefix > 0:
-                    suffix_map_tensor = torch.tensor(
-                        suffix_slot_mapping_out_list, dtype=torch.long, device=device
-                    ).clamp_(0, num_prefix - 1)
-                    global_chunk_token_indices = prefix_indices_tensor[suffix_map_tensor]
-                    suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
-                        global_chunk_token_indices
-                    ].to(dtype=torch.int32)
-                else:
-                    suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
-            else:
-                suffix_total_tokens = 0
-                suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
-
-            if self._is_cuda:
-                prefix_seqlens_kv_device = torch.tensor(
-                    prefix_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-                prefix_cu_seqlens_q_device = torch.tensor(
-                    [0] + prefix_cu_seqlens_q_cpu, dtype=torch.int32, device=device
-                )
-
-                suffix_seqlens_kv_device = torch.tensor(
-                    suffix_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-                suffix_cu_seqlens_q_device = torch.tensor(
-                    [0] + suffix_cu_seqlens_q_cpu, dtype=torch.int32, device=device
-                )
-                suffix_cu_seqlens_k_device = torch.tensor(
-                    [0] + suffix_cu_seqlens_kv_cpu, dtype=torch.int32, device=device
-                )
-            else:  # NPU
-                prefix_seqlens_kv_device = None
-                prefix_cu_seqlens_q_device = None
-                suffix_seqlens_kv_device = None
-                suffix_cu_seqlens_q_device = None
-                suffix_cu_seqlens_k_device = None
-
-            prefix_scheduler_metadata = self._get_schedule(
-                batch_size=len(prefix_seqlens_q_cpu),
-                cu_query_lens=prefix_cu_seqlens_q_device,
-                max_query_len=prefix_max_q_len,
-                seqlens=prefix_seqlens_kv_device,
-                max_seq_len=prefix_max_seq_len,
-                causal=False,
-                max_num_splits=max_num_splits,
-            )
-        else:
+        if not prefix_seqlens_q_cpu:
             # Full structured initializations for profiling warm-up model passes
             prefix_indices_tensor = prefix_seqlens_kv_device = prefix_cu_seqlens_q_device = (
                 prefix_block_table
@@ -602,6 +649,135 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             ) = None
             suffix_max_q_len = suffix_max_seq_len = suffix_total_tokens = 0
             prefix_scheduler_metadata = None
+            return (
+                prefix_indices_tensor,
+                prefix_seqlens_kv_device,
+                prefix_max_seq_len,
+                prefix_cu_seqlens_q_device,
+                prefix_max_q_len,
+                prefix_block_table,
+                suffix_seqlens_kv_device,
+                suffix_slot_mapping_out,
+                suffix_max_seq_len,
+                suffix_total_tokens,
+                suffix_cu_seqlens_q_device,
+                suffix_cu_seqlens_k_device,
+                suffix_max_q_len,
+                prefix_scheduler_metadata,
+            )
+
+        num_prefix = len(prefix_indices)
+        prefix_max_q_len = max(prefix_seqlens_q_cpu) if prefix_seqlens_q_cpu else 0
+        suffix_max_seq_len = max(suffix_seqlens_kv_cpu) if suffix_seqlens_kv_cpu else 0
+        suffix_max_q_len = max(suffix_seqlens_q_cpu) if suffix_seqlens_q_cpu else 0
+
+        if self._fixed_buffers:
+            prefix_indices_tensor = self._prefix_indices_buf[:num_prefix]
+            prefix_indices_tensor.copy_(
+                torch.tensor(prefix_indices, dtype=torch.long, device=device)
+            )
+            # G1 constant prefix geometry: use a FIXED max_seqlen_k upper
+            # bound (the full block-table capacity) and the FULL-WIDTH
+            # block-table view, so the FA2 launch parameters baked into a
+            # captured CUDA graph are identical for every prompt length.
+            # FA2 reads the true KV extent from the device-side seqused_k,
+            # so the over-set bound and the never-read tail columns are
+            # harmless (verified: a graph captured at prefix_len=1024
+            # replays bit-identically for prefix_len=5120).
+            prefix_max_seq_len = self._prefix_block_table_buf.shape[1] * self.block_size
+            prefix_block_table = self._prefix_block_table_buf[: len(prefix_req_idxs_cpu)]
+            prefix_block_table[:, :max_prefix_blocks_count].copy_(
+                common_attn_metadata.block_table_tensor[
+                    prefix_req_idxs_cpu, :max_prefix_blocks_count
+                ]
+            )
+        else:
+            prefix_indices_tensor = torch.tensor(prefix_indices, dtype=torch.long, device=device)
+            prefix_max_seq_len = max(prefix_seqlens_kv_cpu) if prefix_seqlens_kv_cpu else 0
+            prefix_block_table = common_attn_metadata.block_table_tensor[
+                prefix_req_idxs_cpu, :max_prefix_blocks_count
+            ].contiguous()
+
+        if suffix_slot_mapping_out_list:
+            suffix_total_tokens = len(suffix_slot_mapping_out_list)
+            if num_prefix > 0:
+                suffix_map_tensor = torch.tensor(
+                    suffix_slot_mapping_out_list, dtype=torch.long, device=device
+                ).clamp_(0, num_prefix - 1)
+                global_chunk_token_indices = prefix_indices_tensor[suffix_map_tensor]
+                suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
+                    global_chunk_token_indices
+                ].to(dtype=torch.int32)
+            else:
+                suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
+        else:
+            suffix_total_tokens = 0
+            suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
+
+        if self._fixed_buffers:
+            num_prefix_groups = len(prefix_seqlens_kv_cpu)
+            prefix_seqlens_kv_device = self._prefix_seqlens_kv_buf[:num_prefix_groups]
+            prefix_seqlens_kv_device.copy_(
+                torch.tensor(prefix_seqlens_kv_cpu, dtype=torch.int32, device=device)
+            )
+            num_prefix_cu = len(prefix_cu_seqlens_q_cpu) + 1
+            prefix_cu_seqlens_q_device = self._prefix_cu_seqlens_q_buf[:num_prefix_cu]
+            prefix_cu_seqlens_q_device.copy_(
+                torch.tensor([0] + prefix_cu_seqlens_q_cpu, dtype=torch.int32, device=device)
+            )
+
+            num_suffix_beams = len(suffix_seqlens_kv_cpu)
+            suffix_seqlens_kv_device = self._suffix_seqlens_kv_buf[:num_suffix_beams]
+            suffix_seqlens_kv_device.copy_(
+                torch.tensor(suffix_seqlens_kv_cpu, dtype=torch.int32, device=device)
+            )
+            num_suffix_cu_q = len(suffix_cu_seqlens_q_cpu) + 1
+            suffix_cu_seqlens_q_device = self._suffix_cu_seqlens_q_buf[:num_suffix_cu_q]
+            suffix_cu_seqlens_q_device.copy_(
+                torch.tensor([0] + suffix_cu_seqlens_q_cpu, dtype=torch.int32, device=device)
+            )
+            num_suffix_cu_k = len(suffix_cu_seqlens_kv_cpu) + 1
+            suffix_cu_seqlens_k_device = self._suffix_cu_seqlens_k_buf[:num_suffix_cu_k]
+            suffix_cu_seqlens_k_device.copy_(
+                torch.tensor([0] + suffix_cu_seqlens_kv_cpu, dtype=torch.int32, device=device)
+            )
+        elif self._is_cuda:
+            # Tests / kernel harnesses that skip __init__ buffer alloc.
+            prefix_seqlens_kv_device = torch.tensor(
+                prefix_seqlens_kv_cpu, dtype=torch.int32, device=device
+            )
+            prefix_cu_seqlens_q_device = torch.tensor(
+                [0] + prefix_cu_seqlens_q_cpu, dtype=torch.int32, device=device
+            )
+            suffix_seqlens_kv_device = torch.tensor(
+                suffix_seqlens_kv_cpu, dtype=torch.int32, device=device
+            )
+            suffix_cu_seqlens_q_device = torch.tensor(
+                [0] + suffix_cu_seqlens_q_cpu, dtype=torch.int32, device=device
+            )
+            suffix_cu_seqlens_k_device = torch.tensor(
+                [0] + suffix_cu_seqlens_kv_cpu, dtype=torch.int32, device=device
+            )
+        else:
+            # NPU: npu_fused_infer_attention_score_v2 currently reads
+            # CPU lists (prefix_cu_seqlens_q_cpu / suffix_cu_seqlens_q_cpu etc.).
+            # TODO(ACL-graph): switch NPU to device tensors so this
+            # branch disappears and seqlens handling is unified.
+            prefix_seqlens_kv_device = None
+            prefix_cu_seqlens_q_device = None
+            suffix_seqlens_kv_device = None
+            suffix_cu_seqlens_q_device = None
+            suffix_cu_seqlens_k_device = None
+
+        prefix_scheduler_metadata = self._get_schedule(
+            batch_size=len(prefix_seqlens_q_cpu),
+            cu_query_lens=prefix_cu_seqlens_q_device,
+            max_query_len=prefix_max_q_len,
+            seqlens=prefix_seqlens_kv_device,
+            max_seq_len=prefix_max_seq_len,
+            causal=False,
+            max_num_splits=max_num_splits,
+        )
 
         return (
             prefix_indices_tensor,
@@ -809,6 +985,24 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         )
         return meta
 
+    def build_for_cudagraph_capture(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> BeamAttentionMetadata:
+        """Build metadata for CUDA Graph capture.
+
+        Uses the same build() method with fixed-address buffers.
+        The returned metadata references pre-allocated buffers whose addresses
+        are stable across steps, making them compatible with CUDA Graph capture.
+
+        During replay, buffer contents are refreshed via fill_()/copy_()
+        in patched_execute_model before the graph is replayed.
+        """
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
+
     def update_block_table(
         self,
         metadata: BeamAttentionMetadata,
@@ -820,10 +1014,29 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         new_metadata.slot_mapping = slot_mapping
 
         if metadata.std_req_idxs_cpu:
-            new_metadata.std_block_table = blk_table[metadata.std_req_idxs_cpu].contiguous()
+            if self._fixed_buffers:
+                num_std = len(metadata.std_req_idxs_cpu)
+                num_std_blocks = (
+                    metadata.std_block_table.shape[1] if metadata.std_block_table is not None else 0
+                )
+                std_block_table = self._std_block_table_buf[:num_std, :num_std_blocks]
+                std_block_table.copy_(blk_table[metadata.std_req_idxs_cpu, :num_std_blocks])
+                new_metadata.std_block_table = std_block_table
+            else:
+                new_metadata.std_block_table = blk_table[metadata.std_req_idxs_cpu].contiguous()
         if metadata.prefix_req_idxs_cpu:
-            new_metadata.prefix_block_table = blk_table[
-                metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count
-            ].contiguous()
+            if self._fixed_buffers:
+                num_prefix = len(metadata.prefix_req_idxs_cpu)
+                # G1: full-width view (must match the view used at capture time
+                # so the replayed graph reads the same tensor geometry).
+                prefix_block_table = self._prefix_block_table_buf[:num_prefix]
+                prefix_block_table[:, : metadata.max_prefix_blocks_count].copy_(
+                    blk_table[metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count]
+                )
+                new_metadata.prefix_block_table = prefix_block_table
+            else:
+                new_metadata.prefix_block_table = blk_table[
+                    metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count
+                ].contiguous()
 
         return new_metadata

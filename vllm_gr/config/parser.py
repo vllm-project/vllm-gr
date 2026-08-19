@@ -6,9 +6,15 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping
 from typing import Final
 
-from vllm_gr.config.models import GRConfig
+from vllm_gr.config.models import (
+    _BEAM_MAX_DECODE_STEPS_DEFAULT,
+    GRConfig,
+)
 from vllm_gr.config.validation import (
     validate_attention_backend,
+    validate_beam_graph_enabled,
+    validate_beam_max_decode_steps,
+    validate_beam_max_width,
     validate_catalog_path,
     validate_constraint_backend,
     validate_vocab_offset,
@@ -20,6 +26,9 @@ CONSTRAINT_BACKEND_KEY: Final = "vllm_gr_constraint_backend"
 ATTENTION_BACKEND_KEY: Final = "vllm_gr_attention_backend"
 VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
 VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
+BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
+BEAM_MAX_WIDTH_KEY: Final = "vllm_gr_beam_max_width"
+BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -28,6 +37,9 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         ATTENTION_BACKEND_KEY,
         VOCAB_OFFSET_KEY,
         VOCAB_SLICE_SIZE_KEY,
+        BEAM_GRAPH_ENABLED_KEY,
+        BEAM_MAX_WIDTH_KEY,
+        BEAM_MAX_DECODE_STEPS_KEY,
     }
 )
 
@@ -65,6 +77,13 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         attention_backend=validate_attention_backend(additional_config.get(ATTENTION_BACKEND_KEY)),
         vocab_offset=validate_vocab_offset(additional_config.get(VOCAB_OFFSET_KEY)),
         vocab_slice_size=validate_vocab_slice_size(additional_config.get(VOCAB_SLICE_SIZE_KEY)),
+        beam_graph_enabled=validate_beam_graph_enabled(
+            additional_config.get(BEAM_GRAPH_ENABLED_KEY, True)
+        ),
+        beam_max_width=validate_beam_max_width(additional_config.get(BEAM_MAX_WIDTH_KEY)),
+        beam_max_decode_steps=validate_beam_max_decode_steps(
+            additional_config.get(BEAM_MAX_DECODE_STEPS_KEY, _BEAM_MAX_DECODE_STEPS_DEFAULT)
+        ),
     )
 
 
@@ -104,3 +123,18 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(VOCAB_SLICE_SIZE_KEY, None)
     else:
         additional_config[VOCAB_SLICE_SIZE_KEY] = vocab_slice_size
+
+    if gr_config.beam_graph_enabled:
+        additional_config.pop(BEAM_GRAPH_ENABLED_KEY, None)
+    else:
+        additional_config[BEAM_GRAPH_ENABLED_KEY] = False
+
+    if gr_config.beam_max_width is None:
+        additional_config.pop(BEAM_MAX_WIDTH_KEY, None)
+    else:
+        additional_config[BEAM_MAX_WIDTH_KEY] = gr_config.beam_max_width
+
+    if gr_config.beam_max_decode_steps == _BEAM_MAX_DECODE_STEPS_DEFAULT:
+        additional_config.pop(BEAM_MAX_DECODE_STEPS_KEY, None)
+    else:
+        additional_config[BEAM_MAX_DECODE_STEPS_KEY] = gr_config.beam_max_decode_steps

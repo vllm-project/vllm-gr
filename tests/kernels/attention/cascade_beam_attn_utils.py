@@ -281,6 +281,7 @@ def build_beam_attn_metadata(
         device_type = getattr(device, "type", str(device).partition(":")[0])
         builder._is_cuda = device_type == "cuda"
         builder._is_npu = device_type == "npu"
+        builder._fixed_buffers = False  # no pre-allocated buffers in test harness
         if npu_causal_atten_mask is not None:
             # NPU cascade execution reads this for the causal STD/suffix calls.
             builder.npu_causal_atten_mask = npu_causal_atten_mask

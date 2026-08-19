@@ -97,6 +97,32 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         default=None,
         help="Constraint implementation: trie (default) or constraint_table.",
     )
+    model_group.add_argument(
+        "--beam-max-width",
+        type=int,
+        default=None,
+        help=(
+            "Upper bound on beam width for the persistent beam KV pool and "
+            "the captured CUDA graph shape (num_tokens=width). Must be >= "
+            "any served request's beam_width. When set, the engine allocates "
+            "the beam KV pool and (unless --no-beam-graph) captures a FULL "
+            "CUDA graph for this width at startup. Unset (default) disables "
+            "beam decode — no pool allocated, no graph captured."
+        ),
+    )
+    model_group.add_argument(
+        "--no-beam-graph",
+        action="store_true",
+        default=False,
+        help="Disable the beam-decode CUDA graph (beam decode runs eager).",
+    )
+    model_group.add_argument(
+        "--beam-max-decode-steps",
+        type=int,
+        default=None,
+        help="Upper bound on beam decode steps for the persistent beam KV "
+        "pool (default 3, matching OneRec SID: max_tokens=5 minus begin/end).",
+    )
     return parser
 
 
@@ -110,6 +136,9 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.constraint_backend = None
     if hasattr(args, "constraint_backend"):
         engine_args.constraint_backend = args.constraint_backend
+    for attr in ("beam_max_width", "beam_max_decode_steps"):
+        setattr(engine_args, attr, getattr(args, attr, None))
+    engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -236,6 +265,19 @@ def create_engine_config(self, usage_context=None, headless=False):
         vocab_slice_size=slice_size
         if slice_size is not None
         else existing_gr_config.vocab_slice_size,
+        beam_graph_enabled=(
+            existing_gr_config.beam_graph_enabled and not getattr(self, "no_beam_graph", False)
+        ),
+        beam_max_width=(
+            getattr(self, "beam_max_width", None)
+            if getattr(self, "beam_max_width", None) is not None
+            else existing_gr_config.beam_max_width
+        ),
+        beam_max_decode_steps=(
+            getattr(self, "beam_max_decode_steps", None)
+            if getattr(self, "beam_max_decode_steps", None) is not None
+            else existing_gr_config.beam_max_decode_steps
+        ),
     )
     if effective_gr_config != existing_gr_config:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields

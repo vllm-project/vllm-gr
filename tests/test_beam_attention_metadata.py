@@ -30,6 +30,7 @@ def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
     builder.num_kv_heads = 2
     builder._is_cuda = False
     builder._is_npu = False
+    builder._fixed_buffers = False
     builder.npu_causal_atten_mask = None
     return builder
 

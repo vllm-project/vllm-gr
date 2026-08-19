@@ -13,8 +13,6 @@ reference it but do not own it.
 
 from __future__ import annotations
 
-from typing import List, Tuple
-
 import torch
 
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool, _validate_pool_dtype
@@ -60,7 +58,7 @@ class BeamAttentionContext:
         self.registry = BeamSessionRegistry(max_batch)
 
         # Per-layer KV pools (shared across all sessions)
-        self.pools: List[BeamAttentionPool] = [
+        self.pools: list[BeamAttentionPool] = [
             BeamAttentionPool(
                 max_batch,
                 max_beams,
@@ -86,7 +84,30 @@ class BeamAttentionContext:
             device=device,
         )
 
-    def get_suffix_buf(self, slot: int, beam_width: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # --- CUDA Graph fixed-address device buffers ---
+        # decode_step_buf: device-side scalar, read by Triton cache_unshared_kv kernel
+        # and filled each step before model forward / graph replay.
+        self.decode_step_buf = torch.zeros(1, dtype=torch.int32, device=device)
+
+        # aux_key_buf / aux_value_buf: pre-allocated buffers for select_unshared_kv
+        # (replace per-step .clone() allocation). Shape matches one pool slot.
+        # WARNING: these are SINGLE shared buffers aliased across all layers in
+        # BeamSearchSession.step_complete (via [same_buf]*num_layers). This is
+        # safe ONLY because select_unshared_kv processes layers sequentially.
+        # Do NOT vectorize or parallelize the per-layer loop without giving each
+        # layer its own aux_buf slot.
+        self.aux_key_buf = torch.zeros(
+            (max_beams, num_kv_heads, max_decode_steps, head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        self.aux_value_buf = torch.zeros(
+            (max_beams, num_kv_heads, max_decode_steps, head_dim),
+            dtype=dtype,
+            device=device,
+        )
+
+    def get_suffix_buf(self, slot: int, beam_width: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Get suffix KV buffer slice for a specific slot.
 
         Returns (k_buf, v_buf) each of shape [beam_width * max_decode_steps, H, D].
