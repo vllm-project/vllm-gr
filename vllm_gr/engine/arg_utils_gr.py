@@ -9,7 +9,8 @@ from typing import Final
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
+from vllm_gr.config import GRAttentionBackend, GRConfig
+from vllm_gr.config.parser import load_gr_config
 
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
@@ -22,25 +23,12 @@ _NESTED_ATTENTION_BACKEND_EXPLICIT_ATTR: Final = "_vllm_gr_nested_attention_back
 def _init_engine_args(
     self: EngineArgs,
     *args: object,
-    catalog_path: str | None = None,
-    constraint_backend: ConstraintBackend | str | None = None,
+    vllm_gr_config: str | None = None,
     **kwargs: object,
 ) -> None:
-    """Accept the vllm-gr engine args on the Python-API construction path.
-
-    The CLI path (``--catalog-path`` / ``--constraint-backend``) stashes these
-    values as attributes in :func:`from_cli_args` after construction.  The
-    offline ``GRLLM`` Python API builds its ``EngineArgs`` indirectly through
-    ``LLM.__init__`` -> ``EngineArgs(model=..., **kwargs)``, so it cannot reach
-    the instance to set the attributes afterwards.  Threading the two values as
-    ``**kwargs`` here stashes them identically, and the patched
-    :func:`create_engine_config` reads them exactly like the CLI path —
-    otherwise ``EngineCore`` would not learn that the backend is
-    ``constraint_table`` and would never run the constrained hooks.
-    """
+    """Accept the sole vLLM-GR configuration entry on the Python API path."""
     origin_engine_args_init(self, *args, **kwargs)
-    self.catalog_path = catalog_path
-    self.constraint_backend = constraint_backend
+    self.vllm_gr_config = vllm_gr_config
 
 
 def _nested_attention_backend_is_explicit(value: object) -> bool:
@@ -85,43 +73,10 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     _preserve_nested_attention_backend_source(parser)
     model_group = parser.add_argument_group(title="vLLM-GR")
     model_group.add_argument(
-        "--catalog-path",
+        "--vllm-gr-config",
         type=str,
         default=None,
-        help="Optional JSON catalog used to constrain generation results.",
-    )
-    model_group.add_argument(
-        "--constraint-backend",
-        type=str,
-        choices=[backend.value for backend in ConstraintBackend],
-        default=None,
-        help="Constraint implementation: trie (default) or constraint_table.",
-    )
-    model_group.add_argument(
-        "--beam-max-width",
-        type=int,
-        default=None,
-        help=(
-            "Upper bound on beam width for the persistent beam KV pool and "
-            "the captured CUDA graph shape (num_tokens=width). Must be >= "
-            "any served request's beam_width. When set, the engine allocates "
-            "the beam KV pool and (unless --no-beam-graph) captures a FULL "
-            "CUDA graph for this width at startup. Unset (default) disables "
-            "beam decode — no pool allocated, no graph captured."
-        ),
-    )
-    model_group.add_argument(
-        "--no-beam-graph",
-        action="store_true",
-        default=False,
-        help="Disable the beam-decode CUDA graph (beam decode runs eager).",
-    )
-    model_group.add_argument(
-        "--beam-max-decode-steps",
-        type=int,
-        default=None,
-        help="Upper bound on beam decode steps for the persistent beam KV "
-        "pool (default 3, matching OneRec SID: max_tokens=5 minus begin/end).",
+        help="Path to the vLLM-GR schema-versioned YAML configuration.",
     )
     return parser
 
@@ -130,15 +85,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     raw_attention_config = getattr(args, "attention_config", None)
     nested_backend_is_explicit = _nested_attention_backend_is_explicit(raw_attention_config)
     engine_args = origin_from_cli_args(cls, args)
-    engine_args.catalog_path = None
-    if hasattr(args, "catalog_path"):
-        engine_args.catalog_path = args.catalog_path
-    engine_args.constraint_backend = None
-    if hasattr(args, "constraint_backend"):
-        engine_args.constraint_backend = args.constraint_backend
-    for attr in ("beam_max_width", "beam_max_decode_steps"):
-        setattr(engine_args, attr, getattr(args, attr, None))
-    engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
+    engine_args.vllm_gr_config = getattr(args, "vllm_gr_config", None)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -221,62 +168,18 @@ def _apply_npu_default_block_size(config) -> None:
 def create_engine_config(self, usage_context=None, headless=False):
     config = origin_create_engine_config(self, usage_context, headless)
     _apply_npu_default_block_size(config)
-    # Parse unconditionally so invalid raw vllm_gr_* options fail before
-    # the EngineConfig is returned and before runtime execution begins.
+    # Parse the serialized value unconditionally. The YAML file is Driver-only;
+    # Workers reconstruct exactly this normalized value from VllmConfig.
     existing_gr_config = GRConfig.from_vllm_config(config)
-    catalog_path = getattr(self, "catalog_path", None)
-    constraint_backend = getattr(self, "constraint_backend", None)
+    config_path = getattr(self, "vllm_gr_config", None)
+    file_gr_config = load_gr_config(config_path) if config_path is not None else existing_gr_config
     backend_is_explicit, backend_override = _explicit_gr_attention_backend(self)
-
-    effective_catalog_path = (
-        catalog_path if catalog_path is not None else existing_gr_config.catalog_path
-    )
-    effective_constraint_backend = (
-        ConstraintBackend(constraint_backend)
-        if constraint_backend is not None
-        else existing_gr_config.constraint_backend
-    )
-    offset, slice_size = None, None
-    if effective_catalog_path is not None:
-        model_name = getattr(self, "model", None)
-        if model_name is not None:
-            from vllm_gr.utils.catalog import (
-                compute_catalog_slice_config,
-            )
-
-            trust_remote_code = bool(getattr(self, "trust_remote_code", False))
-            offset, slice_size = compute_catalog_slice_config(
-                effective_catalog_path,
-                model_name,
-                trust_remote_code=trust_remote_code,
-            )
-            if offset is not None and slice_size is not None:
-                from vllm_gr.ops.sliced_logits import set_vocab_slice_config
-
-                set_vocab_slice_config(offset, slice_size)
-
     effective_gr_config = GRConfig(
-        catalog_path=effective_catalog_path,
-        constraint_backend=effective_constraint_backend,
+        schema_version=file_gr_config.schema_version,
+        beam=file_gr_config.beam,
+        constraint_table=file_gr_config.constraint_table,
         attention_backend=(
-            backend_override if backend_is_explicit else existing_gr_config.attention_backend
-        ),
-        vocab_offset=offset if offset is not None else existing_gr_config.vocab_offset,
-        vocab_slice_size=slice_size
-        if slice_size is not None
-        else existing_gr_config.vocab_slice_size,
-        beam_graph_enabled=(
-            existing_gr_config.beam_graph_enabled and not getattr(self, "no_beam_graph", False)
-        ),
-        beam_max_width=(
-            getattr(self, "beam_max_width", None)
-            if getattr(self, "beam_max_width", None) is not None
-            else existing_gr_config.beam_max_width
-        ),
-        beam_max_decode_steps=(
-            getattr(self, "beam_max_decode_steps", None)
-            if getattr(self, "beam_max_decode_steps", None) is not None
-            else existing_gr_config.beam_max_decode_steps
+            backend_override if backend_is_explicit else file_gr_config.attention_backend
         ),
     )
     if effective_gr_config != existing_gr_config:
@@ -297,10 +200,8 @@ def create_engine_config(self, usage_context=None, headless=False):
 def engine_args_accepts_gr_values() -> bool:
     """Return whether :func:`patch_add_cli_args` is mounted.
 
-    The offline ``GRLLM`` Python API only threads ``catalog_path`` /
-    ``constraint_backend`` through ``LLM.__init__`` kwargs when this patch is
-    active; without it, ``EngineArgs.__init__`` would reject the extra keyword
-    arguments.
+    The offline ``GRLLM`` Python API threads ``vllm_gr_config`` through
+    ``LLM.__init__`` only when this patch is active.
     """
     return EngineArgs.__init__ is _init_engine_args
 

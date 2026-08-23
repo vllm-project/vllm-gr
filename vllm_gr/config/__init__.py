@@ -3,6 +3,24 @@
 
 """Typed configuration boundary for vLLM-GR."""
 
-from vllm_gr.config.models import ConstraintBackend, GRAttentionBackend, GRConfig
+from vllm_gr.config.models import (
+    CONSTRAINT_TABLE_FORMAT,
+    GR_CONFIG_SCHEMA_VERSION,
+    BeamConfig,
+    ConstraintBackend,
+    ConstraintTableBackend,
+    ConstraintTableConfig,
+    GRAttentionBackend,
+    GRConfig,
+)
 
-__all__ = ["ConstraintBackend", "GRAttentionBackend", "GRConfig"]
+__all__ = [
+    "CONSTRAINT_TABLE_FORMAT",
+    "GR_CONFIG_SCHEMA_VERSION",
+    "BeamConfig",
+    "ConstraintBackend",
+    "ConstraintTableBackend",
+    "ConstraintTableConfig",
+    "GRAttentionBackend",
+    "GRConfig",
+]

@@ -1,60 +1,141 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""YAML and ``VllmConfig.additional_config`` configuration boundaries."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping
+from pathlib import Path
 from typing import Final
 
 from vllm_gr.config.models import (
-    _BEAM_MAX_DECODE_STEPS_DEFAULT,
+    CONSTRAINT_TABLE_FORMAT,
+    GR_CONFIG_SCHEMA_VERSION,
+    BeamConfig,
+    ConstraintTableConfig,
     GRConfig,
 )
-from vllm_gr.config.validation import (
-    validate_attention_backend,
-    validate_beam_graph_enabled,
-    validate_beam_max_decode_steps,
-    validate_beam_max_width,
-    validate_catalog_path,
-    validate_constraint_backend,
-    validate_vocab_offset,
-    validate_vocab_slice_size,
-)
 
-CATALOG_PATH_KEY: Final = "vllm_gr_catalog_path"
-CONSTRAINT_BACKEND_KEY: Final = "vllm_gr_constraint_backend"
-ATTENTION_BACKEND_KEY: Final = "vllm_gr_attention_backend"
-VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
-VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
-BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
-BEAM_MAX_WIDTH_KEY: Final = "vllm_gr_beam_max_width"
-BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
-GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
-KNOWN_GR_CONFIG_KEYS: Final = frozenset(
+GR_CONFIG_KEY: Final = "vllm_gr"
+_TOP_LEVEL_KEYS = frozenset({"schema_version", "beam", "constraint_table", "attention_backend"})
+_BEAM_KEYS = frozenset({"max_width", "max_decode_steps", "graph_enabled"})
+_CONSTRAINT_TABLE_KEYS = frozenset(
     {
-        CATALOG_PATH_KEY,
-        CONSTRAINT_BACKEND_KEY,
-        ATTENTION_BACKEND_KEY,
-        VOCAB_OFFSET_KEY,
-        VOCAB_SLICE_SIZE_KEY,
-        BEAM_GRAPH_ENABLED_KEY,
-        BEAM_MAX_WIDTH_KEY,
-        BEAM_MAX_DECODE_STEPS_KEY,
+        "enabled",
+        "backend",
+        "path",
+        "format",
+        "artifact_digest",
+        "tokenizer_digest",
+        "max_top_k",
     }
 )
 
 
-def _reject_unknown_gr_keys(additional_config: Mapping[object, object]) -> None:
-    unknown_keys = sorted(
+def _mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"vllm-gr {name} must be a mapping")
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"vllm-gr {name} keys must be strings")
+    return value  # type: ignore[return-value]
+
+
+def _reject_unknown(mapping: Mapping[str, object], allowed: frozenset[str], name: str) -> None:
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        rendered = ", ".join(repr(key) for key in unknown)
+        raise ValueError(f"unknown vllm-gr {name} key(s): {rendered}")
+
+
+def gr_config_from_mapping(raw: object) -> GRConfig:
+    mapping = _mapping(raw, "configuration")
+    _reject_unknown(mapping, _TOP_LEVEL_KEYS, "configuration")
+
+    beam_raw = _mapping(mapping.get("beam", {}), "beam")
+    _reject_unknown(beam_raw, _BEAM_KEYS, "beam")
+    table_raw = _mapping(mapping.get("constraint_table", {}), "constraint_table")
+    _reject_unknown(table_raw, _CONSTRAINT_TABLE_KEYS, "constraint_table")
+
+    beam = BeamConfig(
+        max_width=beam_raw.get("max_width"),
+        max_decode_steps=beam_raw.get("max_decode_steps", 3),
+        graph_enabled=beam_raw.get("graph_enabled", True),
+    )
+    table = ConstraintTableConfig(
+        enabled=table_raw.get("enabled", False),
+        backend=table_raw.get("backend", "cpu"),
+        path=table_raw.get("path"),
+        format=table_raw.get("format", CONSTRAINT_TABLE_FORMAT),
+        artifact_digest=table_raw.get("artifact_digest"),
+        tokenizer_digest=table_raw.get("tokenizer_digest"),
+        max_top_k=table_raw.get("max_top_k", 128),
+    )
+    return GRConfig(
+        schema_version=mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION),
+        beam=beam,
+        constraint_table=table,
+        attention_backend=mapping.get("attention_backend"),
+    )
+
+
+def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
+    return {
+        "schema_version": config.schema_version,
+        "beam": {
+            "max_width": config.beam.max_width,
+            "max_decode_steps": config.beam.max_decode_steps,
+            "graph_enabled": config.beam.graph_enabled,
+        },
+        "constraint_table": {
+            "enabled": config.constraint_table.enabled,
+            "backend": config.constraint_table.backend.value,
+            "path": config.constraint_table.path,
+            "format": config.constraint_table.format,
+            "artifact_digest": config.constraint_table.artifact_digest,
+            "tokenizer_digest": config.constraint_table.tokenizer_digest,
+            "max_top_k": config.constraint_table.max_top_k,
+        },
+        "attention_backend": (
+            config.attention_backend.value if config.attention_backend is not None else None
+        ),
+    }
+
+
+def load_gr_config(path: str | Path) -> GRConfig:
+    """Read and validate the Driver-only YAML file."""
+
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - packaging contract
+        raise RuntimeError("PyYAML is required to read --vllm-gr-config") from exc
+
+    config_path = Path(path)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read vllm-gr config {str(config_path)!r}: {exc}") from exc
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid vllm-gr YAML {str(config_path)!r}: {exc}") from exc
+    if raw is None:
+        raise ValueError(f"vllm-gr config {str(config_path)!r} is empty")
+    return gr_config_from_mapping(raw)
+
+
+def _reject_legacy_keys(additional_config: Mapping[object, object]) -> None:
+    legacy = sorted(
         key
         for key in additional_config
-        if isinstance(key, str)
-        and key.startswith(GR_CONFIG_KEY_PREFIX)
-        and key not in KNOWN_GR_CONFIG_KEYS
+        if isinstance(key, str) and key.startswith("vllm_gr_")
     )
-    if unknown_keys:
-        unknown = ", ".join(repr(key) for key in unknown_keys)
-        raise ValueError(f"unknown vLLM-GR additional_config key(s): {unknown}")
+    if legacy:
+        rendered = ", ".join(repr(key) for key in legacy)
+        raise ValueError(
+            f"legacy vLLM-GR additional_config key(s) are no longer supported: {rendered}; "
+            "use --vllm-gr-config"
+        )
 
 
 def parse_gr_config(vllm_config: object | None) -> GRConfig:
@@ -64,77 +145,18 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
     if additional_config is None:
         return GRConfig()
     if not isinstance(additional_config, Mapping):
-        # Upstream also accepts opaque SupportsHash configuration objects.
-        # They cannot carry primitive vllm_gr_* keys, so leave them untouched
-        # and treat them as an empty GR configuration on the read path.
         return GRConfig()
-    _reject_unknown_gr_keys(additional_config)
-    return GRConfig(
-        catalog_path=validate_catalog_path(additional_config.get(CATALOG_PATH_KEY)),
-        constraint_backend=validate_constraint_backend(
-            additional_config.get(CONSTRAINT_BACKEND_KEY, "trie")
-        ),
-        attention_backend=validate_attention_backend(additional_config.get(ATTENTION_BACKEND_KEY)),
-        vocab_offset=validate_vocab_offset(additional_config.get(VOCAB_OFFSET_KEY)),
-        vocab_slice_size=validate_vocab_slice_size(additional_config.get(VOCAB_SLICE_SIZE_KEY)),
-        beam_graph_enabled=validate_beam_graph_enabled(
-            additional_config.get(BEAM_GRAPH_ENABLED_KEY, True)
-        ),
-        beam_max_width=validate_beam_max_width(additional_config.get(BEAM_MAX_WIDTH_KEY)),
-        beam_max_decode_steps=validate_beam_max_decode_steps(
-            additional_config.get(BEAM_MAX_DECODE_STEPS_KEY, _BEAM_MAX_DECODE_STEPS_DEFAULT)
-        ),
-    )
+    _reject_legacy_keys(additional_config)
+    raw = additional_config.get(GR_CONFIG_KEY)
+    return GRConfig() if raw is None else gr_config_from_mapping(raw)
 
 
 def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, MutableMapping):
         raise ValueError("vLLM-GR additional_config must be a mutable mapping")
-    _reject_unknown_gr_keys(additional_config)
-
-    catalog_path = validate_catalog_path(gr_config.catalog_path)
-    constraint_backend = validate_constraint_backend(gr_config.constraint_backend)
-    attention_backend = validate_attention_backend(gr_config.attention_backend)
-    vocab_offset = validate_vocab_offset(gr_config.vocab_offset)
-    vocab_slice_size = validate_vocab_slice_size(gr_config.vocab_slice_size)
-
-    if catalog_path is None:
-        additional_config.pop(CATALOG_PATH_KEY, None)
+    _reject_legacy_keys(additional_config)
+    if gr_config.enabled:
+        additional_config[GR_CONFIG_KEY] = gr_config_to_mapping(gr_config)
     else:
-        additional_config[CATALOG_PATH_KEY] = catalog_path
-
-    if constraint_backend.value == "trie":
-        additional_config.pop(CONSTRAINT_BACKEND_KEY, None)
-    else:
-        additional_config[CONSTRAINT_BACKEND_KEY] = constraint_backend.value
-
-    if attention_backend is None:
-        additional_config.pop(ATTENTION_BACKEND_KEY, None)
-    else:
-        additional_config[ATTENTION_BACKEND_KEY] = attention_backend.value
-
-    if vocab_offset is None:
-        additional_config.pop(VOCAB_OFFSET_KEY, None)
-    else:
-        additional_config[VOCAB_OFFSET_KEY] = vocab_offset
-
-    if vocab_slice_size is None:
-        additional_config.pop(VOCAB_SLICE_SIZE_KEY, None)
-    else:
-        additional_config[VOCAB_SLICE_SIZE_KEY] = vocab_slice_size
-
-    if gr_config.beam_graph_enabled:
-        additional_config.pop(BEAM_GRAPH_ENABLED_KEY, None)
-    else:
-        additional_config[BEAM_GRAPH_ENABLED_KEY] = False
-
-    if gr_config.beam_max_width is None:
-        additional_config.pop(BEAM_MAX_WIDTH_KEY, None)
-    else:
-        additional_config[BEAM_MAX_WIDTH_KEY] = gr_config.beam_max_width
-
-    if gr_config.beam_max_decode_steps == _BEAM_MAX_DECODE_STEPS_DEFAULT:
-        additional_config.pop(BEAM_MAX_DECODE_STEPS_KEY, None)
-    else:
-        additional_config[BEAM_MAX_DECODE_STEPS_KEY] = gr_config.beam_max_decode_steps
+        additional_config.pop(GR_CONFIG_KEY, None)
