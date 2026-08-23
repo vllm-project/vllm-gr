@@ -39,6 +39,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.constraints.backend import ConstraintMetadata
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -119,14 +121,10 @@ def build_sequence_group_for_step(
     device: Any,
     step: int,
 ) -> torch.Tensor:
-    """Build the operator ``sequence_group`` tensor for constrained rows.
+    """Build flat ``prefix_token_ids [rows, max_steps]`` for the Backend.
 
-    - prefill (step 0): ``[B, 1, 1]`` zeros — the operator ignores content.
-    - decode (steps 1/2): ``[B, W, max_step]`` (int32), one request per ``B``;
-      each beam writes its last ``step`` beam tokens into ``[b, :step]``
-      (step 1 reads position 0 = ``s_a``; step 2 reads positions 0..1 =
-      ``s_a, s_b``).  ``max_step`` is ``max(step, max_decode_steps) + 1``, so
-      the operator's ``max_step > current_step`` check always passes.
+    Each logits row receives one prefix row. Prefill content is ignored;
+    decode rows carry the last ``step`` beam tokens in columns ``[:step]``.
 
     Cross-checks ``len(beam_suffix[b]) >= step``: the per-request
     ``constraint_step`` is authoritative and must not disagree with the suffix
@@ -134,7 +132,8 @@ def build_sequence_group_for_step(
     """
     step = validate_constraint_step(step)
     if step == 0:
-        return torch.zeros([len(rows), 1, 1], dtype=torch.int32, device=device)
+        row_count = sum(W_logits for _, _, W_logits, _ in rows)
+        return torch.zeros([row_count, 2], dtype=torch.int32, device=device)
 
     widths = {mdata["beam_width"] for _, _, _, mdata in rows}
     if len(widths) != 1:
@@ -144,14 +143,19 @@ def build_sequence_group_for_step(
         )
     width = next(iter(widths))
 
-    max_step = step + 1
+    max_step = max(2, step)
     for _, _, _, mdata in rows:
         request_steps = mdata.get("max_decode_steps") or 0
-        if request_steps + 1 > max_step:
-            max_step = request_steps + 1
+        if request_steps > max_step:
+            max_step = request_steps
 
     flat: list[int] = []
-    for _, _, _, mdata in rows:
+    for req_id, _, W_logits, mdata in rows:
+        if W_logits != width:
+            raise RuntimeError(
+                f"constrained decode request {req_id!r} has {W_logits} logits rows, "
+                f"expected beam_width={width}"
+            )
         suffix = mdata.get("beam_suffix") or []
         for b in range(width):
             seq = list(suffix[b][-step:]) if b < len(suffix) else []
@@ -164,7 +168,7 @@ def build_sequence_group_for_step(
                 )
             flat.extend(seq)
             flat.extend([0] * (max_step - step))
-    return torch.tensor(flat, dtype=torch.int32, device=device).reshape(len(rows), width, max_step)
+    return torch.tensor(flat, dtype=torch.int32, device=device).reshape(-1, max_step)
 
 
 def _temperatures_for_rows(runner: Any, rows: Sequence[int], device: Any) -> torch.Tensor:
@@ -190,7 +194,7 @@ def run_constrained_partition(
     logits: torch.Tensor,
     rows: Sequence[tuple[Any, int, int, dict[str, Any]]],
     width: int,
-    adapter: Any,
+    backend: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """Run the constrained operator on every constrained row group.
 
@@ -206,19 +210,21 @@ def run_constrained_partition(
 
     for req_id, row_start, W_logits, mdata in rows:
         step = validate_constraint_step(mdata.get("constraint_step", 0))
-        sequence_group = build_sequence_group_for_step(
+        prefix_token_ids = build_sequence_group_for_step(
             [(req_id, row_start, W_logits, mdata)], device, step
         )
         group_rows = list(range(row_start, row_start + W_logits))
-        result = adapter.run(
+        result = backend.select(
             logits[group_rows],
-            sequence_group,
-            _temperatures_for_rows(runner, group_rows, device),
-            step,
-            width,
+            ConstraintMetadata(
+                prefix_token_ids=prefix_token_ids,
+                temperatures=_temperatures_for_rows(runner, group_rows, device),
+                current_step=step,
+                top_k=width,
+            ),
         )
-        top_tokens_parts.append(result.top_tokens)
-        top_logprobs_parts.append(result.top_logprobs)
+        top_tokens_parts.append(result.token_ids)
+        top_logprobs_parts.append(result.logprobs)
         global_rows.extend(group_rows)
 
     return (
@@ -293,37 +299,6 @@ def patch_sampler_output_for_constrained(
         ranks[rows_idx] = torch.zeros(len(global_rows), dtype=ranks.dtype, device=ranks.device)
 
 
-def get_or_create_execution_adapter(runner: Any) -> Any:
-    """Lazily create the constrained execution adapter and load tables.
-
-    Fails explicitly when the platform adapter is missing/unavailable (the
-    factory already raises), when constraint tables were not injected into this
-    worker, or when the loaded digest differs from the injected one
-    (``load_tables`` rejects digest swaps).  Never falls back to Trie.
-    """
-    adapter = getattr(runner, "_gr_constraint_execution", None)
-    if adapter is not None:
-        return adapter
-
-    from vllm_gr.constraints.worker_inject import get_worker_manager
-
-    manager = get_worker_manager()
-    digest = manager.current_digest
-    if digest is None:
-        raise RuntimeError(
-            "constraint tables not injected into this worker; the driver must "
-            "inject them via EngineCore.collective_rpc before a constrained "
-            "request runs"
-        )
-
-    from vllm_gr.constraints.startup import create_constraint_execution
-
-    adapter = create_constraint_execution(device=getattr(runner, "device", None))
-    adapter.load_tables(manager.require(digest))
-    runner._gr_constraint_execution = adapter
-    return adapter
-
-
 def _validate_homogeneous_step(
     request_row_configs: Sequence[Any],
     beam_data: dict[str, Any],
@@ -386,9 +361,22 @@ def apply_constrained_sample_override(
         )
     width = next(iter(widths))
 
-    adapter = get_or_create_execution_adapter(runner)
+    backend = getattr(runner, "constraint_backend", None)
+    if backend is None:
+        from vllm_gr.config import GRConfig
+
+        config = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+        if config.constraint_table.enabled:
+            raise RuntimeError(
+                "constraint_table is enabled but runner.constraint_backend is None; "
+                "Worker startup did not complete and unconstrained sampling is forbidden"
+            )
+        raise RuntimeError(
+            "received constrained Beam metadata while constraint_table is disabled; "
+            "unconstrained sampling is forbidden"
+        )
     top_tokens, top_logprobs, global_rows = run_constrained_partition(
-        runner, logits, rows, width, adapter
+        runner, logits, rows, width, backend
     )
     patch_sampler_output_for_constrained(
         sampler_output, global_rows, top_tokens, top_logprobs, width

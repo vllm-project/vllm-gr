@@ -141,11 +141,6 @@ def patch_npu_worker_init_device() -> int:
         from vllm_gr.patch import re_apply_patches
 
         re_apply_patches()
-        # Mount set_gr_constraint_resources so the driver can inject constraint
-        # tables via EngineCore.collective_rpc after init_device returns.
-        from vllm_gr.constraints.worker_inject import install_worker_resource_hook
-
-        install_worker_resource_hook(type(self))
         return original_init_device(self)
 
     NPUWorker.init_device = _patched_init_device
