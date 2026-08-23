@@ -83,7 +83,7 @@ def rec_constrained_topk_npu(
     if custom_ops is None or not callable(getattr(custom_ops, "rec_constrained_topk", None)):
         raise RuntimeError(
             f"NPU rec_constrained_topk is unavailable ({unavailable_reason()}); "
-            "use the Torch implementation instead"
+            "production constraint execution has no fallback"
         )
     return custom_ops.rec_constrained_topk(
         logits,

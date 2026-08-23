@@ -10,10 +10,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from vllm_gr.config import CONSTRAINT_TABLE_FORMAT
 from vllm_gr.constraints.artifact import write_constraint_table_artifact
 from vllm_gr.constraints.compiler import ConstraintTableCompiler
-from vllm_gr.constraints.table import ConstraintTable, ConstraintTableInfo
 from vllm_gr.constraints.tokenizer_digest import compute_tokenizer_digest
 
 
@@ -42,26 +40,12 @@ def build_constraint_table(
     if not isinstance(document, dict):
         raise ValueError("constraint triples document must be a JSON object")
 
-    compiled = ConstraintTableCompiler(tokenizer, vocab_size).compile(document)
     tokenizer_digest = compute_tokenizer_digest(tokenizer)
-    info = ConstraintTableInfo(
-        format=CONSTRAINT_TABLE_FORMAT,
-        artifact_digest="unpersisted",
+    table = ConstraintTableCompiler(
+        tokenizer,
+        vocab_size,
         tokenizer_digest=tokenizer_digest,
-        vocab_size=vocab_size,
-        max_prefix1_degree=compiled.max_prefix1_degree,
-        max_prefix2_degree=compiled.max_prefix2_degree,
-        total_bytes=compiled.total_bytes,
-    )
-    table = ConstraintTable(
-        first_token_ids=compiled.first_token_ids,
-        prefix1_offsets=compiled.prefix1_offsets,
-        prefix1_values=compiled.prefix1_values,
-        prefix1_pair_keys=compiled.prefix1_pair_keys,
-        prefix2_value_offsets=compiled.prefix2_value_offsets,
-        prefix2_values=compiled.prefix2_values,
-        info=info,
-    )
+    ).compile(document)
     artifact_digest = write_constraint_table_artifact(table, output_path)
     return artifact_digest, tokenizer_digest, vocab_size
 

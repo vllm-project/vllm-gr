@@ -653,8 +653,8 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     if gr_cfg.beam_max_width is None:
         raise RuntimeError(
             "vllm-gr beam decode requests require a persistent beam KV pool, "
-            "but beam_max_width is not configured. Set --beam-max-width (or "
-            "vllm_gr_beam_max_width in additional_config) to the maximum "
+            "but beam.max_width is not configured. Set it in --vllm-gr-config "
+            "to the maximum "
             "served beam width."
         )
 
@@ -724,7 +724,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 f"KV pool capacity (pool: max_beams={context.max_beams}, "
                 f"max_decode_steps={context.max_decode_steps}; request: "
                 f"beam_width={req_width}, decode_step={req_step}). Raise "
-                f"--beam-max-width / --beam-max-decode-steps to cover the "
+                f"beam.max_width / beam.max_decode_steps in --vllm-gr-config to cover the "
                 f"served request population."
             )
 

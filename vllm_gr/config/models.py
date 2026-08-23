@@ -28,17 +28,6 @@ class ConstraintTableBackend(str, Enum):
     NPU = "npu"
 
 
-class ConstraintBackend(str, Enum):
-    """Temporary compatibility mode for the legacy frontend path.
-
-    Removed with the RPC/Manager/Trie chain in the cleanup commit. Runtime
-    implementations use :class:`vllm_gr.constraints.backend.ConstraintBackend`.
-    """
-
-    TRIE = "trie"
-    CONSTRAINT_TABLE = "constraint_table"
-
-
 @dataclass(frozen=True, slots=True)
 class BeamConfig:
     """Beam resource bounds shared by Driver and Workers."""

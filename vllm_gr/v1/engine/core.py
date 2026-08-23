@@ -23,7 +23,7 @@ _BEAM_STATE_INIT_LOCK = threading.Lock()
 
 
 def _constraint_table_backend_active() -> bool:
-    """True when the process runs with ``constraint_backend=constraint_table``.
+    """True when the serialized Worker constraint configuration is enabled.
 
     Reads the process-global vLLM config (same source as ``ascend_compat``) so
     both the driver and the EngineCore process agree without passing the flag
@@ -31,12 +31,11 @@ def _constraint_table_backend_active() -> bool:
     """
     from vllm.config import get_current_vllm_config_or_none
 
-    from vllm_gr.config import ConstraintBackend, GRConfig
+    from vllm_gr.config import GRConfig
 
-    return (
-        GRConfig.from_vllm_config(get_current_vllm_config_or_none()).constraint_backend
-        == ConstraintBackend.CONSTRAINT_TABLE
-    )
+    return GRConfig.from_vllm_config(
+        get_current_vllm_config_or_none()
+    ).constraint_table.enabled
 
 
 def _ensure_beam_state(self) -> None:

@@ -19,7 +19,7 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
-from vllm_gr.constraints.execution import INVALID_LOGIT
+from vllm_gr.constraints.backend import INVALID_LOGIT
 from vllm_gr.constraints.models import BeamCandidateCache
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 

@@ -190,7 +190,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             # Upper bound from GRConfig so the fixed-address metadata buffers
             # always cover the configured beam_max_width (single source of
-            # truth; CLI --beam-max-width / additional_config).  When
+            # truth; beam.max_width in --vllm-gr-config). When
             # beam_max_width is None (beam decode disabled), no fixed buffers
             # are needed — fall back to the per-request dynamic path.
             from vllm_gr.config import GRConfig

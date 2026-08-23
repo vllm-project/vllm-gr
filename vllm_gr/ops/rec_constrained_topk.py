@@ -6,8 +6,7 @@
 The operator consumes raw logits and the compact three-level constraint-table
 representation used by OneRec.  It returns the top-k valid token ids and their
 log probabilities for every input row.  This implementation intentionally uses
-ordinary PyTorch operators so it can serve as a portable fallback when the NPU
-ACLNN fused operator is unavailable.
+ordinary PyTorch operators and is retained only as an explicit test oracle.
 """
 
 from __future__ import annotations
@@ -213,7 +212,7 @@ def rec_constrained_topk(
     max_prefix1_degree: int = 0,
     max_prefix2_degree: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch constrained top-k to the NPU custom op or Torch fallback."""
+    """Production NPU dispatch with no Torch or unconstrained fallback."""
     if logits.device.type == "npu":
         from vllm_gr.ops.npu import (
             rec_constrained_topk_npu,
@@ -236,20 +235,14 @@ def rec_constrained_topk(
                 max_prefix1_degree,
                 max_prefix2_degree,
             )
-    return rec_constrained_topk_torch(
-        logits,
-        sequence_group,
-        first_token_ids,
-        prefix1_offsets,
-        prefix1_values,
-        prefix1_pair_keys,
-        prefix2_value_offsets,
-        prefix2_values,
-        temperatures,
-        current_step,
-        top_k,
-        max_prefix1_degree,
-        max_prefix2_degree,
+        raise RuntimeError(
+            "NPU rec_constrained_topk is unavailable; production execution "
+            "does not fall back to Torch"
+        )
+    raise RuntimeError(
+        "rec_constrained_topk production dispatch requires NPU; use "
+        "CPUConstraintBackend for Host-table execution or call "
+        "rec_constrained_topk_torch explicitly as a test oracle"
     )
 
 

@@ -219,7 +219,7 @@ def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
 
                 # Beam graphs are opt-in via GRConfig (beam_max_width) and
                 # can be disabled for A/B comparison (beam_graph_enabled /
-                # CLI --no-beam-graph).  Disabled or unconfigured -> fully
+                # YAML beam.graph_enabled). Disabled or unconfigured -> fully
                 # eager, nothing below changes the dispatch result.
                 if not _beam_graph_enabled_for_run(self):
                     return result
@@ -501,7 +501,7 @@ def capture_beam_decode_graph(runner) -> bool:
 
     Runs once after ``capture_model()`` when the GRConfig beam graph is active
     (``beam_graph_enabled`` and ``beam_max_width`` set; CLI
-    ``--beam-max-width``).  Mirrors
+    ``beam.max_width``). Mirrors
     vllm's own ``_warmup_and_capture`` pattern: N eager warmup forwards (mode
     NONE — primes the Triton JIT of cache_unshared_kv/copy_suffix_kv and FA2
     shape selection), then one FULL-mode forward which the CUDAGraphWrapper
