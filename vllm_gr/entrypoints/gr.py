@@ -71,6 +71,12 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
 
+    from vllm_gr.v1.beam.batch_contracts import (
+        BeamBatchParams,
+        BeamBatchResult,
+        BeamOutputOptions,
+    )
+
 logger = init_logger(__name__)
 
 ForkInfo = list[tuple[int, int]]
@@ -656,6 +662,66 @@ class GRLLM(LLM):
                     vocab_size=self.llm_engine.model_config.vocab_size,
                 )
                 self.constraint_strategy.digest = resource.digest
+
+    def beam_batch(
+        self,
+        prompts: list[Union["TokensPrompt", "TextPrompt"]] | Union["TokensPrompt", "TextPrompt"],
+        beam_params: "BeamBatchParams",
+        output_options: "BeamOutputOptions",
+        *,
+        lora_request: Union["LoRARequest", None] = None,
+    ) -> "BeamBatchResult":
+        """Submit one Beam Batch and return its single final result.
+
+        ``prompts`` is either one prompt (B=1) or a list of B prompts.  All
+        items share ``beam_params`` and ``output_options``.  The call blocks
+        until the EngineCore routes the final :class:`BeamBatchResult` back.
+        """
+        import uuid
+
+        from vllm.sampling_params import SamplingParams
+
+        from vllm_gr.v1.engine.beam_batch import build_beam_batch_request
+
+        if isinstance(prompts, (str, dict)):
+            prompts = [prompts]
+
+        sampling_params = SamplingParams(
+            max_tokens=beam_params.max_tokens,
+            temperature=beam_params.temperature,
+            stop_token_ids=list(beam_params.stop_token_ids),
+            ignore_eos=beam_params.ignore_stop_tokens,
+        )
+
+        batch_id = f"beam-batch-{uuid.uuid4().hex}"
+        supported_tasks = self.llm_engine.get_supported_tasks()
+        engine_requests: list[EngineCoreRequest] = []
+        for index, prompt in enumerate(prompts):
+            request = self.input_processor.process_inputs(
+                request_id=f"{batch_id}-item-{index}",
+                prompt=prompt,
+                params=sampling_params,
+                supported_tasks=supported_tasks,
+                lora_request=lora_request,
+            )
+            self.input_processor.assign_request_id(request)
+            engine_requests.append(request)
+
+        batch_request = build_beam_batch_request(
+            engine_requests,
+            beam_params=beam_params,
+            output_options=output_options,
+            batch_id=batch_id,
+        )
+
+        engine_core = self.llm_engine.engine_core
+        submit = getattr(engine_core, "submit_beam_batch", None)
+        if submit is None:
+            raise RuntimeError(
+                "EngineCore Beam Batch ingress is not installed; ensure the "
+                "vllm-gr plugin is active."
+            )
+        return submit(batch_request).result()
 
     def beam_search(
         self,

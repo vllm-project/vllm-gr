@@ -229,3 +229,27 @@ patches:
     risk: medium
     contract: sliced-vocabulary-projection
     removal_condition: vLLM exposes stable output-projection and logprob-width hooks
+
+  - id: GR-PATCH-016
+    owner:
+      - vllm_gr/v1/engine/beam_batch.py
+      - vllm_gr/v1/engine/engine_core_patch.py
+      - vllm_gr/v1/engine/core_client_patch.py
+      - vllm_gr/v1/engine/core.py
+      - vllm_gr/v1/engine/wire.py
+      - vllm_gr/v1/engine/codec.py
+    installer:
+      - vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
+      - vllm_gr.v1.engine.core_client_patch.apply_batch_fork_patches
+    activation: vLLM general-plugin loading installs the EngineCore and client Beam Batch dispatch
+    validator_or_test:
+      - tests/test_beam_batch_ingress.py
+    process_roles: [main, engine_core]
+    target:
+      - EngineCoreProc.process_input_sockets
+      - EngineCoreProc._handle_client_request
+      - AsyncMPClient / SyncMPClient / InprocClient
+      - AsyncLLM.beam_batch
+    risk: critical
+    contract: beam-batch-ingress
+    removal_condition: vLLM exposes a stable batch request/result ingress and router extension point

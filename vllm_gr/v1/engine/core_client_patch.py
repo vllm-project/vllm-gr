@@ -11,13 +11,20 @@ from vllm.logger import init_logger
 
 from vllm_gr.v1.engine.async_llm import (
     _add_requests_batch_fn,
+    beam_batch_fn,
     beam_request_step_update_fn,
     prepare_request_fn,
     register_beam_output_fn,
 )
 from vllm_gr.v1.engine.core_client import (
+    abort_beam_batch,
+    abort_beam_batch_async,
     add_requests_async,
     beam_request_step_update_async,
+    inproc_abort_beam_batch,
+    inproc_submit_beam_batch,
+    submit_beam_batch,
+    submit_beam_batch_async,
 )
 
 logger = init_logger(__name__)
@@ -83,10 +90,16 @@ def apply_engine_client_patches() -> None:
 
     AsyncMPClient.add_requests_async = add_requests_async
     AsyncMPClient.beam_request_step_update_async = beam_request_step_update_async
+    AsyncMPClient.submit_beam_batch_async = submit_beam_batch_async
+    AsyncMPClient.abort_beam_batch_async = abort_beam_batch_async
     SyncMPClient.add_requests = sync_mp_add_requests
     SyncMPClient.beam_request_step_update = sync_mp_beam_request_step_update
+    SyncMPClient.submit_beam_batch = submit_beam_batch
+    SyncMPClient.abort_beam_batch = abort_beam_batch
     InprocClient.add_requests = inproc_add_requests
     InprocClient.beam_request_step_update = inproc_beam_request_step_update
+    InprocClient.submit_beam_batch = inproc_submit_beam_batch
+    InprocClient.abort_beam_batch = inproc_abort_beam_batch
 
 
 def apply_async_llm_patches() -> None:
@@ -95,6 +108,7 @@ def apply_async_llm_patches() -> None:
 
     AsyncLLM.prepare_request = prepare_request_fn
     AsyncLLM._add_requests_batch = _add_requests_batch_fn
+    AsyncLLM.beam_batch = beam_batch_fn
     AsyncLLM.register_beam_output = register_beam_output_fn
     AsyncLLM.beam_request_step_update = beam_request_step_update_fn
 

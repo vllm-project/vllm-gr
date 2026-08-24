@@ -54,6 +54,7 @@ aligned with it.
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
+| GR-PATCH-016 | `vllm_gr/v1/engine/beam_batch.py` | `engine_core_patch.apply_engine_core_request_patches` and `core_client_patch.apply_batch_fork_patches` | vLLM general-plugin loading | `tests/test_beam_batch_ingress.py`; EngineCore protocol contracts | main, EngineCore |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -315,6 +316,22 @@ aligned with it.
 - Activation: hooks are installed during runtime initialization; sliced projection is
   used only when a valid vocabulary slice is configured.
 - Removal condition: vLLM exposes stable output-projection and logprob-width extension points.
+
+### GR-PATCH-016 — EngineCore Beam Batch Ingress and Final Router
+
+- Source: `vllm_gr/v1/engine/beam_batch.py`
+- EngineCore installers: `vllm_gr/v1/engine/engine_core_patch.py`,
+  `vllm_gr/v1/engine/core.py`, `wire.py`, `codec.py`
+- Frontend installer: `vllm_gr/v1/engine/core_client_patch.py`
+- Risk: Critical
+- Behavior:
+    - registers `BEAM_BATCH_SUBMIT` (`0x08`) and `BEAM_BATCH_ABORT` (`0x09`);
+    - materializes B native child `Request` objects and one `BeamBatch`;
+    - atomically registers and enqueues one batch with rollback on failure;
+    - routes exactly one final `BeamBatchResult` to a `BeamBatchHandle`;
+    - exposes `AsyncLLM.beam_batch` and `GRLLM.beam_batch` frontends.
+- Removal condition: vLLM provides a stable batch request ingress and
+  final-only result router extension point.
 
 ## Benchmark-only Runtime Mutations
 

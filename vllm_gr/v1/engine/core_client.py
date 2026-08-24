@@ -6,6 +6,8 @@ from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
+_MAX_BEAM_BATCH_ENGINE_MAPPINGS = 4096
+
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
 # ---------------------------------------------------------------------------
@@ -80,3 +82,90 @@ async def beam_request_step_update_async(self, update: BeamRequestStepUpdate) ->
         await self.first_req_send_socket.send(req_msg)
     await to_await
     self._ensure_output_queue_task()
+
+
+# ---------------------------------------------------------------------------
+# Beam Batch submit/abort (BEAM_BATCH_SUBMIT / BEAM_BATCH_ABORT)
+# ---------------------------------------------------------------------------
+
+
+async def submit_beam_batch_async(self, request):
+    """Send a single immutable BeamBatchRequest to EngineCore."""
+    engine = None
+    if hasattr(self, "get_core_engine_for_request") and request.items:
+        # Preserve data-parallel affinity: anchor on the first child's rank and
+        # retain the chosen engine for abort/result routing.
+        anchor = request.items[0].request
+        engine = self.get_core_engine_for_request(anchor)
+        engines = getattr(self, "_beam_batch_engines", None)
+        if engines is None:
+            from collections import OrderedDict
+
+            engines = OrderedDict()
+            self._beam_batch_engines = engines
+        engines[request.batch_id] = engine
+        engines.move_to_end(request.batch_id)
+        # Normal-completion cleanup is owned by the result adapter (#41), so
+        # bound the mapping: evicting the oldest entry only drops abort routing
+        # for a long-idle batch (mirrors the ingress tombstone cap).
+        while len(engines) > _MAX_BEAM_BATCH_ENGINE_MAPPINGS:
+            engines.popitem(last=False)
+        if hasattr(self, "first_req_send_socket") and not self.engines_running:
+            req_msg = msgspec.msgpack.encode(("FIRST_REQ", engine))
+            await self.first_req_send_socket.send(req_msg)
+    await self._send_input(EngineCoreRequestType.BEAM_BATCH_SUBMIT, request, engine)
+    self._ensure_output_queue_task()
+    return request.batch_id
+
+
+async def abort_beam_batch_async(self, batch_id: str) -> None:
+    """Send a Beam Batch abort to EngineCore."""
+    engine = None
+    engines = getattr(self, "_beam_batch_engines", None)
+    if engines:
+        engine = engines.pop(batch_id, None)
+    await self._send_input(EngineCoreRequestType.BEAM_BATCH_ABORT, batch_id, engine)
+    self._ensure_output_queue_task()
+
+
+def submit_beam_batch(self, request):
+    """Send a single immutable BeamBatchRequest to EngineCore.
+
+    Returns a local :class:`BeamBatchHandle` so the offline entry can block on
+    the final result; the handle's future is resolved when the result adapter
+    routes the terminal :class:`BeamBatchResult` back (issue #41).
+    """
+    self._send_input(EngineCoreRequestType.BEAM_BATCH_SUBMIT, request)
+    from concurrent.futures import Future
+
+    from vllm_gr.v1.engine.beam_batch import BeamBatchHandle, BeamBatchRecord
+
+    record = BeamBatchRecord(request=request, future=Future())
+    return BeamBatchHandle(batch_id=request.batch_id, record=record)
+
+
+def abort_beam_batch(self, batch_id: str) -> None:
+    """Send a Beam Batch abort to EngineCore."""
+    self._send_input(EngineCoreRequestType.BEAM_BATCH_ABORT, batch_id)
+
+
+def inproc_submit_beam_batch(self, request):
+    """Submit a BeamBatchRequest directly to the in-process ingress.
+
+    Delegates to the EngineCore handler so the in-process and wire paths share
+    one implementation; the returned handle lets callers block on the final
+    result.
+    """
+    from vllm_gr.v1.engine.core import _handle_beam_batch_submit
+
+    return _handle_beam_batch_submit(self.engine_core, request)
+
+
+def inproc_abort_beam_batch(self, batch_id: str) -> None:
+    """Abort a BeamBatchRequest directly through the in-process ingress."""
+    ingress = getattr(self.engine_core, "_beam_batch_ingress", None)
+    if ingress is None:
+        raise RuntimeError("EngineCore beam batch ingress is not initialized")
+    record = ingress.get_record(batch_id)
+    if record is not None:
+        ingress.cancel(batch_id)

@@ -114,6 +114,63 @@ async def _add_requests_batch_fn(
     await self.engine_core.add_requests_async(requests, force_batch=use_batch_message)
 
 
+async def beam_batch_fn(
+    self,
+    prompts,
+    beam_params,
+    output_options,
+    *,
+    priority: int = 0,
+    data_parallel_rank: int | None = None,
+    lora_request=None,
+) -> str:
+    """Submit one Beam Batch through the shared Online/Offline ingress.
+
+    Returns the ``batch_id`` once the request is queued to EngineCore.  Final
+    cross-process result delivery is owned by the issue #41/#42 output adapter;
+    until then callers can use the returned ``batch_id`` for cancellation.
+    """
+    import uuid
+
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_gr.v1.engine.beam_batch import build_beam_batch_request
+
+    if isinstance(prompts, (str, dict)):
+        prompts = [prompts]
+
+    sampling_params = SamplingParams(
+        max_tokens=beam_params.max_tokens,
+        temperature=beam_params.temperature,
+        stop_token_ids=list(beam_params.stop_token_ids),
+        ignore_eos=beam_params.ignore_stop_tokens,
+    )
+
+    supported_tasks = await self.get_supported_tasks()
+    batch_id = f"beam-batch-{uuid.uuid4().hex}"
+    engine_requests = []
+    for index, prompt in enumerate(prompts):
+        request = self.input_processor.process_inputs(
+            request_id=f"{batch_id}-item-{index}",
+            prompt=prompt,
+            params=sampling_params,
+            supported_tasks=supported_tasks,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            lora_request=lora_request,
+        )
+        self.input_processor.assign_request_id(request)
+        engine_requests.append(request)
+
+    batch_request = build_beam_batch_request(
+        engine_requests,
+        beam_params=beam_params,
+        output_options=output_options,
+        batch_id=batch_id,
+    )
+    return await self.engine_core.submit_beam_batch_async(batch_request)
+
+
 def register_beam_output_fn(
     self,
     request_id: str,

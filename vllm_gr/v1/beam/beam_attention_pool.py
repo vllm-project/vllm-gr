@@ -62,6 +62,47 @@ class BeamAttentionPool:
         self.unshared_key = torch.zeros(pool_shape, dtype=dtype, device=device)
         self.unshared_value = torch.zeros(pool_shape, dtype=dtype, device=device)
 
+        # issue #39 §4.2 decode-buffer reservation bookkeeping.  The pool is sized for
+        # ``max_batch * max_beams * max_decode_steps`` decode rows; ``reserve``
+        # marks rows as held so the Scheduler can track decode-buffer capacity
+        # before dispatch.  Reservations are host-side counters (the pool tensor
+        # is fixed-address and never re-allocated).
+        self._reserved_rows: int = 0
+
+    @property
+    def capacity_rows(self) -> int:
+        """Total decode rows the pool can hold (issue #39 §4.2 B×W×max_steps)."""
+        return self.max_batch * self.max_beams * self.max_decode_steps
+
+    @property
+    def reserved_rows(self) -> int:
+        """Number of decode rows currently reserved by the Scheduler."""
+        return self._reserved_rows
+
+    def reserve(self, num_rows: int) -> bool:
+        """Reserve ``num_rows`` decode rows, all-or-none.
+
+        Returns ``False`` (without changing state) when the request exceeds
+        the remaining capacity.  Matching the issue #39 all-or-none
+        reservation invariant, a partial reservation is never returned.
+        """
+        if num_rows < 0:
+            raise ValueError(f"reserve: num_rows must be >= 0, got {num_rows}")
+        if self._reserved_rows + num_rows > self.capacity_rows:
+            return False
+        self._reserved_rows += num_rows
+        return True
+
+    def release_reserved(self, num_rows: int) -> None:
+        """Release ``num_rows`` previously reserved decode rows back to the pool."""
+        if num_rows < 0:
+            raise ValueError(f"release_reserved: num_rows must be >= 0, got {num_rows}")
+        if num_rows > self._reserved_rows:
+            raise ValueError(
+                f"release_reserved: {num_rows} > reserved_rows={self._reserved_rows}"
+            )
+        self._reserved_rows -= num_rows
+
     def reset_slot(self, slot: int):
         """Zero out a single slot's KV for a new session."""
         self.unshared_key[slot].zero_()

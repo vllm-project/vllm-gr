@@ -6,11 +6,15 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 from __future__ import annotations
 
 from functools import wraps
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
 from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
+
+if TYPE_CHECKING:
+    from vllm_gr.v1.engine.beam_group import BeamGroupingConfig
 
 logger = init_logger(__name__)
 
@@ -32,9 +36,13 @@ def make_patched_engine_core_init(original_init):
     def patched_init(self, *args, **kwargs):
         # Initialize before calling upstream. EngineCoreProc starts its input
         # thread from __init__, so beam state must exist throughout startup.
-        from vllm_gr.v1.engine.core import _ensure_beam_state
+        from vllm_gr.v1.engine.core import (
+            _ensure_beam_batch_ingress,
+            _ensure_beam_state,
+        )
 
         _ensure_beam_state(self)
+        _ensure_beam_batch_ingress(self)
         original_init(self, *args, **kwargs)
 
     setattr(patched_init, _BEAM_STATE_INIT_MARKER, True)
@@ -53,6 +61,8 @@ def apply_engine_core_request_patches() -> None:
 
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
+        _handle_beam_batch_abort,
+        _handle_beam_batch_submit,
         _handle_beam_request_step_update,
         process_input_sockets,
     )
@@ -69,8 +79,12 @@ def apply_engine_core_request_patches() -> None:
     # Bind request handlers explicitly on both classes.
     EngineCore._cache_beam_request = _cache_beam_request
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
+    EngineCore._handle_beam_batch_submit = _handle_beam_batch_submit
+    EngineCore._handle_beam_batch_abort = _handle_beam_batch_abort
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
+    EngineCoreProc._handle_beam_batch_submit = _handle_beam_batch_submit
+    EngineCoreProc._handle_beam_batch_abort = _handle_beam_batch_abort
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
@@ -222,6 +236,81 @@ def make_patch_get_computed_blocks(
     return patch_get_computed_blocks
 
 
+def _drive_beam_phase_machine(scheduler):
+    """Drive the beam phase machine for one EngineCore step.
+
+    Returns the ``SchedulerOutput`` produced by the phase machine (an empty
+    output when no beam group is waiting and none is active).  The caller
+    only invokes this when ``beam_waiting`` or ``_beam_active`` is present,
+    so ordinary requests are never mixed in here.
+
+    Two-dispatch model:
+    - no active group + waiting non-empty → admit first group → single prefill;
+    - active PREFILL → single decode dispatch (Worker runs the full decode loop);
+    - active DECODE → empty output while waiting for the Worker's final result;
+    - resource release happens in ``_finalize_beam_group`` (EngineCore side),
+      triggered when the Worker's final result arrives — not here.
+    """
+    from vllm_gr.v1.engine.beam_group import BeamGroupingConfig
+    from vllm_gr.v1.engine.beam_scheduler import (
+        peek_prepared_dispatch_group,
+        pop_prepared_dispatch_group,
+        refresh_prepared_groups,
+        schedule,
+    )
+
+    active = getattr(scheduler, "_beam_active", None)
+    cfg = getattr(scheduler, "_beam_group_cfg", None) or BeamGroupingConfig()
+    cfg = _with_gr_max_decode_steps(scheduler, cfg)
+
+    if active is None:
+        refresh_prepared_groups(scheduler, cfg)
+        dispatch_unit = peek_prepared_dispatch_group(scheduler)
+    else:
+        dispatch_unit = None
+
+    output, new_state = schedule(
+        scheduler,
+        active,
+        config=cfg,
+        dispatch_unit=dispatch_unit,
+    )
+
+    if active is None and new_state is not None and dispatch_unit is not None:
+        pop_prepared_dispatch_group(scheduler, dispatch_unit)
+        scheduler._beam_active = new_state
+        return output
+
+    if active is not None:
+        # Prefill → decode transition, or decode → empty output while waiting
+        # for the Worker's final result.
+        scheduler._beam_active = new_state
+    return output
+
+
+def _with_gr_max_decode_steps(scheduler, cfg: BeamGroupingConfig) -> BeamGroupingConfig:
+    """Return ``cfg`` with ``max_decode_steps`` from GR config, when available.
+
+    ``max_decode_steps`` is authoritative from ``GRConfig.beam_max_decode_steps``
+    (injected via ``additional_config`` by the config PR).  If the scheduler
+    carries no ``vllm_config`` (e.g. unit tests) keep the existing value.
+    """
+    vllm_config = getattr(scheduler, "vllm_config", None)
+    if vllm_config is None:
+        return cfg
+    try:
+        from vllm_gr.config import GRConfig
+
+        gr_cfg = GRConfig.from_vllm_config(vllm_config)
+    except Exception:  # noqa: BLE001 - keep the existing value on any parse error
+        return cfg
+    if gr_cfg.beam_max_decode_steps != cfg.max_decode_steps:
+        from dataclasses import replace
+
+        return replace(cfg, max_decode_steps=gr_cfg.beam_max_decode_steps)
+    return cfg
+
+
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -233,6 +322,8 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
+        # Install the beam prefix-cache patches first so both the native path
+        # and the two-dispatch beam phase machine use them.
         _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
         _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
         block_size = self.cache_config.block_size
@@ -272,6 +363,14 @@ def apply_scheduler_patch():
         self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
         self.kv_cache_manager.coordinator.cache_blocks = patch_cache_blocks
         try:
+            # Two-dispatch phase machine: when a beam group is waiting or active,
+            # drive it through admission → single prefill → single decode → wait.
+            # Ordinary requests (no beam groups) keep the native path untouched.
+            beam_waiting: list = getattr(self, "beam_waiting", None)
+            beam_active = getattr(self, "_beam_active", None)
+            if beam_waiting or beam_active is not None:
+                return _drive_beam_phase_machine(self)
+
             output = _original_schedule(self)
 
             # Propagate beam request attributes from Request objects to SchedulerOutput

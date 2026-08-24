@@ -57,6 +57,200 @@ def _ensure_beam_state(self) -> None:
             self.beam_cache_lock = threading.Lock()
 
 
+def _ensure_beam_batch_ingress(self) -> None:
+    """Create the EngineCore Beam Batch ingress and bind its scheduler seams."""
+    from vllm_gr.v1.engine.beam_batch import (
+        BeamBatch,
+        EngineCoreBeamBatchIngress,
+    )
+
+    if getattr(self, "_beam_batch_ingress", None) is not None:
+        return
+
+    def child_builder(request):
+        from vllm.v1.request import Request
+
+        block_hasher = getattr(self, "request_block_hasher", None)
+        children = tuple(
+            Request.from_engine_core_request(item.request, block_hasher) for item in request.items
+        )
+        return BeamBatch(request=request, children=children)
+
+    self._beam_batch_ingress = EngineCoreBeamBatchIngress(
+        child_builder=child_builder,
+        enqueue=lambda record: _enqueue_beam_batch(self, record),
+        cancel=lambda record: _abort_beam_batch(self, record),
+        # NOTE: reject_mixed_requests stays at its default (False) here until
+        # #39/#40 wire the production hooks (set_beam_runtime_enabled /
+        # note_ordinary_request on the ordinary ADD path).  The capability is
+        # unit-tested; enabling it without those hooks would silently
+        # misadvertise the enforcement.
+    )
+
+
+def _enqueue_beam_batch(self, record) -> None:
+    """One-time scheduler enqueue seam for a fully materialized Beam Batch.
+
+    Places the materialized batch in the scheduler's ``beam_waiting`` queue and
+    eagerly prepares the next dispatch unit on the input thread (issue #39).
+
+    Prompts longer than ``max_model_len`` are rejected permanently (issue #39 §3
+    ``WAITING -> REJECTED``): they cannot be chunked in this issue, so they
+    are failed with ``PROMPT_TOO_LONG`` instead of being parked in the
+    waiting queue.
+    """
+    batch = record.batch
+    if batch is None:
+        logger.info("Beam batch %s: no materialized batch, skipping enqueue",
+                     record.request.batch_id)
+        return
+    scheduler = getattr(self, "scheduler", None)
+    if scheduler is None:
+        logger.info("Beam batch %s: scheduler not ready, skipping enqueue",
+                     record.request.batch_id)
+        return
+
+    # Permanent admission rejection: over-long prompts cannot be chunked
+    # (issue #39 does not chunk), so reject instead of waiting forever.
+    max_model_len = getattr(getattr(scheduler, "kv_cache_manager", None), "max_model_len", None)
+    beam_params = getattr(record.request, "beam_params", None)
+    if max_model_len is not None and beam_params is not None:
+        for child in batch.children:
+            prompt_len = getattr(child, "num_prompt_tokens", child.num_tokens)
+            total_len = prompt_len + beam_params.max_tokens
+            if total_len > max_model_len:
+                logger.warning(
+                    "Beam batch %s rejected: child %s prompt+max_tokens %d "
+                    "exceeds max_model_len %d",
+                    record.request.batch_id,
+                    child.request_id,
+                    total_len,
+                    max_model_len,
+                )
+                self._beam_batch_ingress.fail_beam_batch(
+                    record.request.batch_id,
+                    code="PROMPT_TOO_LONG",
+                    message=(
+                        f"prompt plus max_tokens ({total_len}) exceeds "
+                        f"max_model_len ({max_model_len})"
+                    ),
+                )
+                return
+
+    from vllm_gr.v1.engine.beam_group import BeamGroupingConfig
+    from vllm_gr.v1.engine.beam_scheduler import (
+        batch_child_count,
+        batch_max_prompt_len,
+        enqueue_beam_batch_and_prepare,
+    )
+
+    cfg = getattr(scheduler, "_beam_group_cfg", None) or BeamGroupingConfig()
+
+    batch_size = batch_child_count(batch)
+    max_target = max(cfg.group_target_sizes)
+    if batch_size > max_target:
+        self._beam_batch_ingress.fail_beam_batch(
+            record.request.batch_id,
+            code="BATCH_TOO_LARGE",
+            message=(
+                f"batch child count {batch_size} exceeds max target {max_target}"
+            ),
+        )
+        return
+
+    batch_len = batch_max_prompt_len(batch)
+    max_bucket = max(cfg.length_buckets)
+    if batch_len > max_bucket:
+        self._beam_batch_ingress.fail_beam_batch(
+            record.request.batch_id,
+            code="BATCH_TOO_LONG",
+            message=(
+                f"batch max prompt length {batch_len} exceeds max bucket {max_bucket}"
+            ),
+        )
+        return
+
+    enqueue_beam_batch_and_prepare(scheduler, batch, cfg)
+    logger.info(
+        "Beam batch %s enqueued and next dispatch unit prepared",
+        record.request.batch_id,
+    )
+
+
+def _abort_beam_batch(self, record) -> None:
+    """Forward a Beam Batch cancellation to the scheduler boundary.
+
+    Removes the batch's group from the scheduler ``beam_waiting`` queue and
+    releases any reserved resources when the group was already admitted (v7
+    §9 / issue #40 seam).
+    """
+    from vllm_gr.v1.engine.beam_scheduler import release_unit_resources, remove_beam_batch
+
+    scheduler = getattr(self, "scheduler", None)
+    batch = record.batch
+    if scheduler is not None and batch is not None:
+        remove_beam_batch(scheduler, batch.batch_id)
+        # Active group: release its reservation if the scheduler tracks it.
+        active = getattr(scheduler, "_beam_active", None)
+        if active is not None and active.unit is not None and batch.batch_id in active.unit.batch_ids:
+            try:
+                release_unit_resources(scheduler, active.reservation)
+            except Exception:
+                logger.exception(
+                    "Beam batch %s release failed during abort",
+                    record.request.batch_id,
+                )
+            scheduler._beam_active = None
+    logger.info(
+        "Beam batch %s cancel forwarded (issue #39/#40 seam).",
+        record.request.batch_id,
+    )
+
+
+def _finalize_beam_group(self) -> None:
+    """Terminal resource reclamation for the active beam group (issue #39 §9 / §10.3).
+
+    Called by EngineCore once the active beam group reaches FINALIZE: releases
+    prompt KV blocks and the decode buffer, then clears the scheduler's active
+    state so the next waiting group can be admitted.  Result routing is owned
+    by #40/#41.
+    """
+    from vllm_gr.v1.engine.beam_scheduler import release_unit_resources
+
+    scheduler = getattr(self, "scheduler", None)
+    if scheduler is None:
+        return
+    active = getattr(scheduler, "_beam_active", None)
+    if active is None:
+        return
+    try:
+        release_unit_resources(scheduler, active.reservation)
+    except Exception:
+        logger.exception("Beam group %s finalize release failed", getattr(active.unit, "group_id", None))
+    scheduler._beam_active = None
+    logger.debug("Beam group finalized and resources released.")
+
+
+def _handle_beam_batch_submit(self, request):
+    """Route a BEAM_BATCH_SUBMIT payload into the ingress.
+
+    Returns the :class:`BeamBatchHandle` so the in-process client can
+    block on the final result; the wire dispatch path ignores this value.
+    """
+    _ensure_beam_batch_ingress(self)
+    return self._beam_batch_ingress.submit_batch(request)
+
+
+def _handle_beam_batch_abort(self, batch_id: str) -> None:
+    """Route a BEAM_BATCH_ABORT payload into the ingress."""
+    _ensure_beam_batch_ingress(self)
+    record = self._beam_batch_ingress.get_record(batch_id)
+    if record is None:
+        logger.warning("Beam batch abort for unknown batch_id %r", batch_id)
+        return
+    self._beam_batch_ingress.cancel(batch_id)
+
+
 # ------------------------------------------------------------------------------------
 # _cache_beam_request / _handle_beam_request_step_update  (ported from source core.py)
 # ------------------------------------------------------------------------------------
@@ -335,6 +529,7 @@ def process_input_sockets(
         EngineCoreRequest,
     )
 
+    from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
     from vllm_gr.v1.engine.codec import (
         build_engine_core_decoders,
         decode_engine_core_payload,
@@ -421,6 +616,31 @@ def process_input_sockets(
                 elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
                     beam_update: BeamRequestStepUpdate = decoded_payload
                     self._handle_beam_request_step_update(beam_update)
+                    continue
+
+                elif request_type == EngineCoreRequestType.BEAM_BATCH_SUBMIT:
+                    batch_request: BeamBatchRequest = decoded_payload
+                    try:
+                        self._handle_beam_batch_submit(batch_request)
+                    except Exception:
+                        # Do not let an ingress validation / registration error
+                        # kill the EngineCore input loop.  A protocol failure
+                        # response for the sender is wired with #41/#42.
+                        logger.exception(
+                            "Beam batch submit failed for batch %r",
+                            getattr(batch_request, "batch_id", None),
+                        )
+                    continue
+
+                elif request_type == EngineCoreRequestType.BEAM_BATCH_ABORT:
+                    batch_id: str = decoded_payload
+                    try:
+                        self._handle_beam_batch_abort(batch_id)
+                    except Exception:
+                        logger.exception(
+                            "Beam batch abort failed for batch %r",
+                            batch_id,
+                        )
                     continue
 
                 else:

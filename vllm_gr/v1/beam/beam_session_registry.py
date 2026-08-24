@@ -80,6 +80,34 @@ class BeamSessionRegistry:
             del self._slots[slot]
             self._free_slots.append(slot)
 
+    def reserve(self, session_id: str, beam_width: int, prefix_len: int) -> int:
+        """Alias for :meth:`allocate`, matching the scheduler's slot vocabulary."""
+        return self.allocate(session_id, beam_width, prefix_len)
+
+    def reserve_many(
+        self,
+        session_ids: tuple[str, ...],
+        beam_widths: tuple[int, ...],
+        prefix_lens: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """Reserve one slot per session atomically.
+
+        If any reservation fails, all slots reserved so far in this call are
+        released back to the free list before the error propagates, matching
+        the issue #39 all-or-none reservation invariant.
+        """
+        if not (len(session_ids) == len(beam_widths) == len(prefix_lens)):
+            raise ValueError("session_ids, beam_widths, and prefix_lens must have equal length")
+        slots: list[int] = []
+        try:
+            for session_id, beam_width, prefix_len in zip(session_ids, beam_widths, prefix_lens):
+                slots.append(self.allocate(session_id, beam_width, prefix_len))
+        except Exception:
+            for session_id in session_ids[: len(slots)]:
+                self.release(session_id)
+            raise
+        return tuple(slots)
+
     def get_slot(self, session_id: str) -> int:
         """Get the slot index for a session. Raises KeyError if not found."""
         return self._slot_map[session_id]
