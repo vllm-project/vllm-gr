@@ -126,10 +126,10 @@ def _handle_beam_request_step_update(self, update) -> None:
         return
 
     # Validate parallel arrays
+    input_beam_count = len(update.beam_tokens)
     if (
-        len(update.beam_tokens) != beam_width
-        or len(update.parent_beam_ids) != beam_width
-        or len(update.child_beam_ids) != beam_width
+        len(update.parent_beam_ids) != input_beam_count
+        or len(update.child_beam_ids) != input_beam_count
     ):
         logger.error("BEAM_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
         for child_id in update.child_beam_ids:
@@ -194,8 +194,17 @@ def _handle_beam_request_step_update(self, update) -> None:
     beam_token_ids = list(prefill_tokens)
     decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
     assert all(len(t) == decode_steps for t in update.beam_tokens)
+    total_gen_tokens = 0
     for gen_tokens in update.beam_tokens:
         beam_token_ids.extend(gen_tokens)
+        total_gen_tokens += len(gen_tokens)
+
+    if decode_steps > 0:
+        calculated_beam_width = total_gen_tokens // decode_steps
+        if calculated_beam_width == 0:
+            calculated_beam_width = beam_width
+    else:
+        calculated_beam_width = beam_width
 
     req = Request(
         request_id=session_id,  # Single request ID representing all beams
@@ -222,7 +231,8 @@ def _handle_beam_request_step_update(self, update) -> None:
 
     # Metadata Enrichment
     req.is_beam = True
-    req.beam_width = beam_width
+    req.beam_width = calculated_beam_width
+    req.log_probs_num = beam_width
     req.is_beam_decode = True  # Flag indicating it's the decode stage
     req.beam_decode_steps = decode_steps
     req.prefix_len = update.prefix_len

@@ -722,9 +722,34 @@ class TestBeamCache:
         assert not eng.input_queue.empty()
         assert mock_req.is_beam is True
         assert mock_req.beam_width == 2
+        assert mock_req.log_probs_num == 2
         assert mock_req.is_beam_decode is True
         assert mock_req.beam_decode_steps == 1  # each beam_tokens list has length 1
         assert mock_req.prefix_len == 5
+
+    def test_filtered_beams_and_log_probs_num(self) -> None:
+        """Verify req.beam_width is calculated from sum(len(gen_tokens)) // decode_steps
+        and req.log_probs_num is set to update.beam_width when beams are filtered."""
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+        # 3 output logprobs requested (beam_width=3), but upper layer filtered 1 beam
+        # so only 2 input beams remain in beam_tokens
+        update = _make_beam_update(
+            session_id="s0",
+            parent_beam_ids=["p0", "p1"],
+            child_beam_ids=["c0", "c1"],
+            beam_tokens=[[50, 51], [60, 61]],
+            beam_width=3,
+            prefix_len=5,
+        )
+
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = MagicMock()
+            mock_req.block_hashes = []
+            MockReq.return_value = mock_req
+            _handle_beam_request_step_update(eng, update)
+
+        assert mock_req.beam_width == 2  # (2 * 2 tokens) // 2 decode_steps = 2 input beams
+        assert mock_req.log_probs_num == 3  # update.beam_width = 3 output logprobs
 
     def test_beam_width_protocol_to_runner_contract(self) -> None:
         """beam_width flows independently of SamplingParams.n through execution."""
@@ -747,6 +772,7 @@ class TestBeamCache:
         assert metadata is not None
         assert update.sampling_params.n == 1
         assert metadata["beam_width"] == 3
+        assert metadata["log_probs_num"] == 3
 
         logits_indices: list[int] = []
         rows, rows_with_logits, _, active_beam_ids = _process_beam_decode_request(
@@ -934,26 +960,26 @@ class TestBeamCache:
         assert error_req_ids == {"c0", "c1"}
 
     def test_handle_beam_width_child_count_mismatch_emits_error_outputs(self) -> None:
-        # beam_width=3 but only 2 children and 2 token lists → mismatch
+        # child_beam_ids has 3 entries but beam_tokens has 2 entries → mismatch
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
         update = _make_beam_update(
             session_id="s0",
             parent_beam_ids=["p0", "p1"],
-            child_beam_ids=["c0", "c1"],
+            child_beam_ids=["c0", "c1", "c2"],  # 3 children vs 2 beam_tokens
             beam_tokens=[[50], [60]],
-            beam_width=3,  # claims 3 beams but arrays have 2
+            beam_width=3,
         )
 
         _handle_beam_request_step_update(eng, update)
 
         assert eng.input_queue.empty()
-        assert eng.output_queue.qsize() == 2  # one error per child
+        assert eng.output_queue.qsize() == 3  # one error per child
         error_req_ids = set()
-        for _ in range(2):
+        for _ in range(3):
             _client_idx, outputs = eng.output_queue.get_nowait()
             assert outputs.outputs[0].finish_reason is FinishReason.ERROR
             error_req_ids.add(outputs.outputs[0].request_id)
-        assert error_req_ids == {"c0", "c1"}
+        assert error_req_ids == {"c0", "c1", "c2"}
 
     def test_handle_b0_removes_session_from_cache(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})

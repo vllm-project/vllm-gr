@@ -26,6 +26,7 @@ PERFORMANCE_KEYS = (
     "offline_elapsed_seconds_max",
     "p99_ttft_max",
     "p99_tpot_max",
+    "avg_decode_time_max",
 )
 FAILURE_MODE_KEYS = (
     "accuracy",
@@ -47,6 +48,7 @@ STRICT_BOOTSTRAP_POLICY: dict[str, Any] = {
             "offline_elapsed_seconds_max": 20,
             "p99_ttft_max": 300,
             "p99_tpot_max": 0.02,
+            "avg_decode_time_max": 120,
         },
     },
     "failure_modes": {

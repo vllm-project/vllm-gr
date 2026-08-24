@@ -175,6 +175,7 @@ def test_scheduler_beam_metadata_shape() -> None:
     assert metadata == {
         "is_beam_decode": True,
         "beam_width": 2,
+        "log_probs_num": 2,
         "beam_decode_steps": 3,
         "prefix_len": 8,
         "cache_len": 8,

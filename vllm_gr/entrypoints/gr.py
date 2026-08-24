@@ -35,9 +35,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.beam_search_decision_utils import (
+    GlobalRunningStats,
     complete_eos_candidates,
+    create_stat,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
+    mask_beam_star_candidates,
     mask_candidate_logprobs,
     materialize_selected_beams,
     select_top_indices,
@@ -272,10 +275,13 @@ def _parse_step_logprobs(
     raw_logprobs = flat.logprobs
     raw_ranks = getattr(flat, "ranks", None)
     raw_decoded = getattr(flat, "decoded_tokens", None)
-    total_logprobs = len(raw_token_ids)
 
     if token > 0 and fork_info_j is not None:
-        stride_k = total_logprobs // len(fork_info_j)
+        # Each beam contributes a fixed block of [sampled, top1..topK]
+        # entries. The engine may pad the request's flat row to the
+        # batch-wide maximum beam count, so the stride must come from the
+        # fixed block size, not from total_logprobs // len(fork_info_j).
+        stride_k = logprobs_num + 1
 
         for b_idx in range(len(fork_info_j)):
             current_beam = instance.beams[b_idx]
@@ -340,6 +346,10 @@ def _custom_beam_search_batch(
     logprobs_num: int,
     catalog: Optional[Any] = None,
     catalog_strategy: str = "fill",
+    beam_star: bool = False,
+    beam_star_coef: float = 2.0,
+    stats: Optional[list[GlobalRunningStats]] = None,
+    token_idx_offset: int = 1,
 ) -> None:
     """Run beam search in batch mode for custom attention backend."""
     instance_prefill_id: dict[int, str] = {}
@@ -443,6 +453,17 @@ def _custom_beam_search_batch(
                 instance.completed.extend(eos_beams)
 
             topn_idx = select_top_indices(all_beams_logprob, beam_width, catalog_strategy)
+
+            if beam_star:
+                topn_idx = mask_beam_star_candidates(
+                    all_beams_logprob,
+                    topn_idx,
+                    stats[token],
+                    token,
+                    token_idx_offset,
+                    beam_star_coef,
+                )
+
             new_beams, fork_info = materialize_selected_beams(
                 parents=instance.beams,
                 selected_indices=topn_idx,
@@ -533,6 +554,8 @@ class GRLLM(LLM):
         begin_token = params.begin_token if hasattr(params, "begin_token") else None
         end_token = params.end_token if hasattr(params, "end_token") else None
         catalog_strategy = getattr(params, "catalog_strategy", "fill")
+        beam_star = bool(getattr(params, "beam_star", False))
+        beam_star_coef = float(getattr(params, "beam_star_coef", 3.3))
 
         tokenizer = self.get_tokenizer()
         sid_begin_token_id: int | None = None
@@ -655,6 +678,7 @@ class GRLLM(LLM):
                     "reflect instance-level progress."
                 )
             if use_custom_attn:
+                stats = create_stat(max_tokens)
                 _custom_beam_search_batch(
                     llm_engine=self.llm_engine,
                     instances_batch=instances_batch,
@@ -669,8 +693,14 @@ class GRLLM(LLM):
                     logprobs_num=logprobs_num,
                     catalog=self.catalog,
                     catalog_strategy=catalog_strategy,
+                    beam_star=beam_star,
+                    beam_star_coef=beam_star_coef,
+                    stats=stats,
+                    token_idx_offset=2 if sid_begin_token_id is not None else 1,
                 )
             else:
+                if beam_star:
+                    logger.info("Beam star is not supported for non-custom attention backend")
                 for _ in token_iter:
                     all_beams: list[BeamSearchSequence] = list(
                         sum((instance.beams for instance in instances_batch), [])
@@ -831,3 +861,6 @@ class GRLLM(LLM):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
         return False
+
+
+GRLLM.beam_search.create_stat = create_stat

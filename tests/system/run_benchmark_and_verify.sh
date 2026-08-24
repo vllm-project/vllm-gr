@@ -85,6 +85,8 @@ elapsed_time_online_th="$ELAPSED_TIME_ONLINE_THRESHOLD"
 elapsed_time_offline_th="$ELAPSED_TIME_OFFLINE_THRESHOLD"
 p99_ttft_th="$P99_TTFT_THRESHOLD"
 p99_tpot_th="$P99_TPOT_THRESHOLD"
+avg_decode_time_th=120
+pass32_th_bs=0.21 #Beam star is measured without catalog.
 online_accuracy_failure_status=86
 online_performance_failure_status=87
 
@@ -183,46 +185,62 @@ stop_server() {
 
 trap stop_server EXIT
 
-vllm-gr serve \
-    --port $run_port \
-    --seed 123 \
-    --default-chat-template-kwargs '{"enable_thinking": false}' \
-    --max-logprobs 512 \
+# Start a vllm-gr server in the background, wait until it is ready, and
+# optionally run a warmup benchmark against it.
+# Usage: start_server <name> <warmup_prompts> [extra vllm-gr serve args...]
+#   warmup_prompts: number of warmup prompts, 0 to skip warmup
+start_server() {
+    local name="$1"
+    local warmup_prompts="$2"
+    shift 2
+
+    echo "Starting $name server..."
+    vllm-gr serve \
+        --port "$run_port" \
+        --seed 123 \
+        --default-chat-template-kwargs '{"enable_thinking": false}' \
+        --max-logprobs 512 \
+        --scheduling-policy priority \
+        --attention-backend CUSTOM \
+        "$@" \
+        "$MODEL_PATH" &
+
+    SERVER_PID=$!
+
+    echo "Waiting for $name server to be ready on port $run_port..."
+    if ! timeout $timeout bash -c "
+        until curl -s http://localhost:${run_port}/v1/models > /dev/null; do
+            sleep 2
+        done
+    "; then
+        echo "$name server failed to start within the timeout limit of $timeout seconds."
+        exit 1
+    fi
+    echo "$name server is ready!"
+
+    if [[ "$warmup_prompts" -gt 0 ]]; then
+        echo "Running warmup with $warmup_prompts prompts..."
+        output=$(python -m benchmarks.open_one_rec.one_rec_main \
+            bench serve \
+            --endpoint /v1/chat/completions \
+            --backend openai-chat \
+            --model "$MODEL_PATH" \
+            --dataset-name onerec \
+            --dataset-path "$DATASET_PATH" \
+            --task-type video \
+            --num-prompts "$warmup_prompts" \
+            --use-beam-search \
+            --port "$run_port" \
+            --request-rate 1 \
+            --n 128)
+        echo "Warmup complete."
+    fi
+}
+
+start_server "primary" 5 \
     --max_num_seqs 2048 \
     --max_num_batched_tokens 16384 \
-    --scheduling-policy priority \
-    --catalog-path "$CATALOG_PATH" \
-    --attention-backend CUSTOM \
-    "$MODEL_PATH" &
-
-SERVER_PID=$!
-
-echo "Waiting for server to be ready on port $run_port..."
-# Check health/models endpoint until it responds
-if ! timeout $timeout bash -c "
-  until curl -s http://localhost:${run_port}/v1/models > /dev/null; do
-    sleep 2
-  done
-"; then
-  echo "Server failed to start within the timeout limit of $timeout seconds."
-  exit 1
-fi
-echo "Server is ready! Running benchmark..."
-
-# warmup
-output=$(python -m benchmarks.open_one_rec.one_rec_main \
-  bench serve \
-  --endpoint /v1/chat/completions \
-  --backend openai-chat  \
-  --model "$MODEL_PATH"  \
-  --dataset-name onerec \
-  --dataset-path "$DATASET_PATH" \
-  --task-type video  \
-  --num-prompts 5 \
-  --use-beam-search \
-  --port $run_port \
-  --request-rate 1 \
-  --n 128)
+    --catalog-path "$CATALOG_PATH"
 
 
 output=$(python -m benchmarks.open_one_rec.one_rec_main \
@@ -310,30 +328,10 @@ stop_server
 # Online test 2: Chunked Prefill Server (--max_num_seqs 100 --max_num_batched_tokens 100)
 echo "Starting chunked prefill server test (--max_num_seqs 100 --max_num_batched_tokens 100)..."
 
-vllm-gr serve \
-    --port $run_port \
-    --seed 123 \
-    --default-chat-template-kwargs '{"enable_thinking": false}' \
-    --max-logprobs 512 \
+start_server "chunked prefill" 0 \
     --max_num_seqs 100 \
     --max_num_batched_tokens 100 \
-    --scheduling-policy priority \
-    --catalog-path "$CATALOG_PATH" \
-    --attention-backend CUSTOM \
-    "$MODEL_PATH" &
-
-SERVER_PID=$!
-
-echo "Waiting for chunked prefill server to be ready on port $run_port..."
-if ! timeout $timeout bash -c "
-  until curl -s http://localhost:${run_port}/v1/models > /dev/null; do
-    sleep 2
-  done
-"; then
-  echo "Chunked prefill server failed to start within the timeout limit of $timeout seconds."
-  exit 1
-fi
-echo "Chunked prefill server ready!"
+    --catalog-path "$CATALOG_PATH"
 
 # Run 1: Cold KV Cache (first execution)
 echo "Running Run 1 (Cold KV Cache)..."
@@ -402,6 +400,50 @@ validate_accuracy_metric "Chunked Prefill Run 2 recall@32" "$recall_32_r2" "$rec
 
 stop_server
 
+# Run beam star check
+start_server "beam-star" 5 \
+    --max_num_seqs 2048 \
+    --max_num_batched_tokens 16384
+
+output=$(python -m benchmarks.open_one_rec.one_rec_main \
+      bench serve \
+      --endpoint /v1/chat/completions \
+      --backend openai-chat \
+      --model "$MODEL_PATH" \
+      --dataset-name onerec \
+      --dataset-path "$DATASET_PATH" \
+      --task-type video \
+      --num-prompts 100 \
+      --use-beam-search \
+      --port $run_port \
+      --max-concurrency 1 \
+      --n 128 \
+      --beam-star 2.2)
+echo "Beam Star"
+echo "$output"
+avg_decode_time=$(extract_numeric_value "$output" "Avg Decode Time") || exit 1
+validate_performance_metric "Avg Decode Time" "$avg_decode_time" "$avg_decode_time_th" \
+  "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || exit $?
+
+output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+--model "$MODEL_PATH" \
+--dataset-path "$DATASET_PATH" \
+--dataset-name  onerec \
+--num-prompts 100 \
+--use-beam-search \
+--backend openai-chat \
+--task-type video \
+--endpoint /v1/chat/completions \
+--port $run_port \
+--max-concurrency 1 \
+--beam-star 2.2 \
+--n 128)
+
+pass32=$(extract_numeric_value "$output" "pass@32") || exit 1
+validate_accuracy_metric "Beam Star pass@32" "$pass32" "$pass32_th_bs" \
+  "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || exit $?
+
+stop_server
 )
 
 online_status=0

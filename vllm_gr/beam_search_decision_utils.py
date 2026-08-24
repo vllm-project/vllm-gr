@@ -10,6 +10,7 @@ an intermediate beam domain model.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,75 @@ if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
+
+
+class GlobalRunningStats:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.n = 0
+        self.mean = 0.0
+        self.M2 = 0.0
+        self.max_val = -np.inf  # Initialize to negative infinity
+
+    def push(self, array):
+        x = np.asanyarray(array).ravel()
+        batch_n = x.size
+        if batch_n == 0:
+            return
+
+        with self._lock:
+            # 1. Update Maximum
+            batch_max = np.max(x)
+            if batch_max > self.max_val:
+                self.max_val = batch_max
+
+            # 2. Calculate Batch Stats for Variance
+            batch_mean = np.mean(x)
+            batch_M2 = np.sum((x - batch_mean) ** 2)
+
+            # 3. Merge with Global Stats
+            if self.n == 0:
+                self.n = batch_n
+                self.mean = batch_mean
+                self.M2 = batch_M2
+            else:
+                delta = batch_mean - self.mean
+                total_n = self.n + batch_n
+
+                # Update mean
+                self.mean += delta * batch_n / total_n
+
+                # Update M2 (Chan et al. Formula)
+                self.M2 += batch_M2 + (delta**2) * (self.n * batch_n / total_n)
+                self.n = total_n
+
+    @property
+    def variance(self):
+        with self._lock:
+            return self.M2 / self.n if self.n > 0 else 0.0
+
+    @property
+    def std(self):
+        return np.sqrt(self.variance)
+
+    @property
+    def max(self):
+        with self._lock:
+            return self.max_val if self.n > 0 else None
+
+
+_CREATE_STAT_LOCK = threading.Lock()
+
+
+def create_stat(max_tokens: int) -> list[GlobalRunningStats]:
+    """Return a thread-safe singleton list of GlobalRunningStats using function attribute."""
+    with _CREATE_STAT_LOCK:
+        if not hasattr(create_stat, "_stats"):
+            create_stat._stats = []
+        while len(create_stat._stats) < max_tokens:
+            create_stat._stats.append(GlobalRunningStats())
+        return create_stat._stats[:max_tokens]
+
 
 BeamCandidateCache = tuple[
     Sequence[int],
@@ -43,6 +113,45 @@ def mask_candidate_logprobs(
         logprob if token_id in allowed_token_ids else -float("inf")
         for token_id, logprob in zip(token_ids, logprobs)
     ]
+
+
+_EXCEPT_MASKIN = [0]
+
+
+def mask_beam_star_candidates(
+    scores: np.ndarray,
+    indices: np.ndarray,
+    stats: GlobalRunningStats,
+    token_idx: int,
+    token_idx_offset: int,
+    coef: float = 3.3,
+) -> np.ndarray:
+    """Mask candidate indices whose scores fall strictly below the Beam* cutoff.
+
+    The cutoff is ``S_max - coef * (token_idx + token_idx_offset) * std(S)``,
+    where the offset is 2 when ``begin_token`` is defined (it occupies a
+    sequence position ahead of the first generated token) and 1 otherwise.
+    Callers compute ``token_idx_offset`` once, since it never changes during
+    iteration.
+    """
+    if token_idx in _EXCEPT_MASKIN:
+        return indices
+    max_scores = scores[indices]
+    finite_mask = max_scores > -10000.0
+    if not np.any(finite_mask):
+        return indices
+    finite_scores = max_scores[finite_mask]
+    stats.push(finite_scores)
+    sigma = stats.std
+    s_max = stats.max
+    cutoff = s_max - coef * (token_idx + token_idx_offset) * sigma
+    keep_mask = max_scores >= cutoff
+    if not np.any(keep_mask):
+        # return the best candidate
+        best_idx = np.argmax(max_scores)
+        return np.array([indices[best_idx]])
+    result_idx = indices[keep_mask]
+    return result_idx
 
 
 def extract_and_dedup_segment(

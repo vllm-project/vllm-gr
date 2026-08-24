@@ -90,12 +90,22 @@ class MockRequestOutput:
 
 
 def run_api_inference(
-    prompts: List[str], model: str, api_url: str, api_key: str, gen_config: Dict[str, Any]
+    prompts: List[str],
+    model: str,
+    api_url: str,
+    api_key: str,
+    gen_config: Dict[str, Any],
+    beam_star: float | None = None,
 ) -> List[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
+
+    vllm_xargs = {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"}
+    if beam_star is not None:
+        vllm_xargs["beam_star"] = True
+        vllm_xargs["beam_star_coef"] = float(beam_star)
 
     # Map generation config to API parameters
     api_params = {
@@ -105,7 +115,7 @@ def run_api_inference(
         "temperature": gen_config.get("temperature", 0.0),
         "top_p": gen_config.get("top_p", 1.0),
         "n": gen_config.get("num_return_sequences", 1),
-        "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
+        "vllm_xargs": vllm_xargs,
     }
 
     def _send_request(prompt):
@@ -175,6 +185,14 @@ def main():
         "--use-beam-search", action="store_true", help="Whether to use beam search for generation."
     )
     parser.add_argument("--n", type=int, help="Beam width to use if beam search is enabled.")
+    parser.add_argument(
+        "--beam-star",
+        type=float,
+        nargs="?",
+        const=3.3,
+        default=None,
+        help="Enable beam* candidate path masking with given coefficient (default: 3.3)",
+    )
     parser.add_argument("--gr", action="store_true", help="Whether to use vllm-gr.")
 
     parser.add_argument(
@@ -273,7 +291,9 @@ def main():
     if args.endpoint:
         gen_start = time.perf_counter()
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
-        outputs = run_api_inference(prompts, args.model, api_url, args.api_key, gen_config)
+        outputs = run_api_inference(
+            prompts, args.model, api_url, args.api_key, gen_config, beam_star=args.beam_star
+        )
         gen_end = time.perf_counter()
     else:
         params = BeamSearchParams(
@@ -285,6 +305,9 @@ def main():
         if hasattr(BeamSearchParams, "begin_token"):
             params.begin_token = "<|sid_begin|>"
             params.end_token = "<|sid_end|>"
+        if args.beam_star is not None:
+            params.beam_star = True
+            params.beam_star_coef = float(args.beam_star)
         prompts_dict = [{"prompt": prompt} for prompt in prompts]
         gen_start = time.perf_counter()
         raw_offline_outputs = llm.beam_search(

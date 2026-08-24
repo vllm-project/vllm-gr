@@ -34,6 +34,7 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
     return {
         "is_beam_decode": True,
         "beam_width": beam_width,
+        "log_probs_num": getattr(req, "log_probs_num", beam_width),
         "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
         "prefix_len": getattr(req, "prefix_len", 0),
         "cache_len": req.num_computed_tokens - num_scheduled_tokens,

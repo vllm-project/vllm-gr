@@ -478,7 +478,9 @@ def _beam_collapse_bookkeeping(
             max_chained_dim = 0
             for req_id, _, W, *_ in request_row_configs:
                 if req_id is not None and req_id in beam_data:
-                    m_width = beam_data[req_id].get("beam_width", 1)
+                    m_width = beam_data[req_id].get(
+                        "log_probs_num", beam_data[req_id].get("beam_width", 1)
+                    )
                     needed_dim = m_width * actual_K
                 else:
                     needed_dim = W * actual_K
@@ -503,11 +505,11 @@ def _beam_collapse_bookkeeping(
                 mdata = beam_data.get(req_id)
                 if mdata and mdata.get("is_beam_decode", False):
                     logits_num, active_beams = req_id_to_config.get(req_id, (0, []))
-                    total_beam_width = mdata.get("beam_width", 1)
+                    log_probs_num = mdata.get("log_probs_num", mdata.get("beam_width", 1))
 
                     if logits_num > 0:
                         # FAST-PATH: This chunk contains ALL beams directly.
-                        if logits_num == total_beam_width:
+                        if logits_num == log_probs_num:
                             if req_id in runner._beam_logprobs_cache:
                                 del runner._beam_logprobs_cache[req_id]
                             continue
@@ -528,13 +530,13 @@ def _beam_collapse_bookkeeping(
                         if req_id not in runner._beam_logprobs_cache:
                             runner._beam_logprobs_cache[req_id] = {
                                 "lps": torch.full(
-                                    (total_beam_width, actual_K),
+                                    (log_probs_num, actual_K),
                                     float("-inf"),
                                     device=orig_lps.device,
                                     dtype=orig_lps.dtype,
                                 ),
                                 "lp_ids": torch.zeros(
-                                    (total_beam_width, actual_K),
+                                    (log_probs_num, actual_K),
                                     dtype=orig_lp_ids.tensor.dtype
                                     if hasattr(orig_lp_ids, "tensor")
                                     else torch.long,
@@ -543,7 +545,7 @@ def _beam_collapse_bookkeeping(
                                 if orig_lp_ids is not None
                                 else None,
                                 "ranks": torch.zeros(
-                                    total_beam_width, dtype=torch.long, device=orig_lps.device
+                                    log_probs_num, dtype=torch.long, device=orig_lps.device
                                 )
                                 if orig_ranks is not None
                                 else None,
@@ -565,12 +567,12 @@ def _beam_collapse_bookkeeping(
                                     ]
                                 cache_entry["completed_beams"].add(physical_beam_id)
 
-                        if len(cache_entry["completed_beams"]) >= total_beam_width:
+                        if len(cache_entry["completed_beams"]) >= log_probs_num:
                             final_lps[idx].copy_(cache_entry["lps"].view(-1))
                             if final_lp_ids is not None:
                                 final_lp_ids[idx].copy_(cache_entry["lp_ids"].view(-1))
                             if final_ranks is not None:
-                                final_ranks[idx, :total_beam_width].copy_(cache_entry["ranks"])
+                                final_ranks[idx, :log_probs_num].copy_(cache_entry["ranks"])
 
                             del runner._beam_logprobs_cache[req_id]
 

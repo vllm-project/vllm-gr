@@ -177,9 +177,27 @@ def _get_output_len_from_argv():
     return 0
 
 
+def _get_beam_star_from_argv():
+    """
+    Parses sys.argv to find the value for --beam-star.
+    NOTE: Reading directly from sys.argv at module import is a fallback
+    for when RequestFuncInput is initialized directly.
+    """
+    try:
+        if "--beam-star" in sys.argv:
+            idx = sys.argv.index("--beam-star")
+            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
+                return float(sys.argv[idx + 1])
+            return 3.3
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
 USE_BEAM_SEARCH = _consume_use_beam_search_flag()
 ARGS_N_BEAMS = _get_n_beams_from_argv()
 ARGS_OUTPUT_LEN = _get_output_len_from_argv()
+ARGS_BEAM_STAR = _get_beam_star_from_argv()
 
 # ============================================================================
 # Beam Search Patching
@@ -193,12 +211,14 @@ def __init__(
     use_beam_search=USE_BEAM_SEARCH,
     n=ARGS_N_BEAMS,
     args_output_len=ARGS_OUTPUT_LEN,
+    beam_star=ARGS_BEAM_STAR,
     **kwargs,
 ):
     """Patched init to support beam search parameters."""
     original_init(self, *args, **kwargs)
     self.use_beam_search = use_beam_search
     self.n = n
+    self.beam_star = beam_star
     if args_output_len > 0:
         logger.info(f"Setting output_len to {args_output_len} based on command line argument")
         self.output_len = args_output_len
@@ -227,6 +247,14 @@ async def patched_async_request_openai_chat_completions(
             and request_func_input.extra_body.temperature is not None
         ):
             temperature = request_func_input.extra_body.temperature
+    vllm_xargs = {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"}
+    beam_star_val = getattr(request_func_input, "beam_star", None)
+    if beam_star_val is None:
+        beam_star_val = ARGS_BEAM_STAR
+    if beam_star_val is not None:
+        vllm_xargs["beam_star"] = True
+        vllm_xargs["beam_star_coef"] = float(beam_star_val)
+
     payload = {
         "model": request_func_input.model_name
         if request_func_input.model_name
@@ -242,7 +270,7 @@ async def patched_async_request_openai_chat_completions(
         "stream_options": {
             "include_usage": True,
         },
-        "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
+        "vllm_xargs": vllm_xargs,
     }
     _update_payload_common(payload, request_func_input)
 
@@ -392,6 +420,15 @@ def _add_beams_arguments(parser):
             default=ARGS_N_BEAMS,
             help="Number of beams for beam search",
         )
+    if not _has_option(parser, "--beam-star"):
+        beams_group.add_argument(
+            "--beam-star",
+            type=float,
+            nargs="?",
+            const=3.3,
+            default=None,
+            help="Enable beam* candidate path masking with given coefficient (default: 3.3)",
+        )
 
 
 def patched_get_samples(args, tokenizer):
@@ -539,6 +576,10 @@ def _run_offline_beam_search_benchmark(args):
     if hasattr(BeamSearchParams, "begin_token"):
         params.begin_token = "<|sid_begin|>"
         params.end_token = "<|sid_end|>"
+    beam_star_val = getattr(args, "beam_star", ARGS_BEAM_STAR)
+    if beam_star_val is not None:
+        params.beam_star = True
+        params.beam_star_coef = float(beam_star_val)
 
     logger.info(f"Running beam search benchmark with {beam_width} beams on {len(prompts)} prompts")
     logger.info(f"Max tokens per request: {max_tokens}")

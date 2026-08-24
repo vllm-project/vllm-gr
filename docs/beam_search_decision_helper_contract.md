@@ -71,6 +71,30 @@ This Offline utility:
 
 Catalog lookup remains the caller's responsibility.
 
+### `mask_beam_star_candidates`
+
+```python
+def mask_beam_star_candidates(
+    scores: np.ndarray,
+    indices: np.ndarray,
+    stats: GlobalRunningStats,
+    token_idx: int,
+    token_idx_offset: int,
+    coef: float = 3.3,
+) -> np.ndarray:
+    ...
+```
+
+This decision helper implements Beam* candidate energy masking:
+
+- operates on candidate score array `scores` and index array `indices`;
+- updates global running statistics (`stats`) with finite scores ($S > -\infty$);
+- computes cutoff threshold $\theta = S_{\max} - c \cdot (\text{token\_idx} + \text{token\_idx\_offset}) \cdot \sigma$ using $S_{\max} = \text{stats.max}$, $\sigma = \text{stats.std}$, $c = \text{coef}$, and step index `token_idx`;
+- `token_idx_offset` is 2 when `begin_token` is defined (the begin token occupies a sequence position ahead of the first generated token) and 1 otherwise; callers compute it once up front since it never changes during iteration;
+- filters out candidates whose indexed scores fall strictly below cutoff threshold $\theta$;
+- returns the updated array of indices;
+- does not prune candidates if all scores are equal ($\sigma = 0$) or if no finite scores exist.
+
 ### `extract_and_dedup_segment`
 
 The helper extracts one candidate block and applies the historical sampled

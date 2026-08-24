@@ -17,8 +17,10 @@ from vllm.utils import random_uuid
 
 from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
+    create_stat,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
+    mask_beam_star_candidates,
     materialize_selected_beams,
     select_top_indices,
 )
@@ -210,11 +212,17 @@ async def beam_search(
     begin_token = params.begin_token
     end_token = params.end_token
     catalog_strategy = getattr(params, "catalog_strategy", "fill")
+    beam_star = bool(getattr(params, "beam_star", False))
+    beam_star_coef = float(getattr(params, "beam_star_coef", 2.0))
 
     # All beams from the same logical beam search will share the same priority value
     # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
+
     MICROSECONDS = 1000000
     priority = int(time.perf_counter() * MICROSECONDS)  # us granularity
+    if beam_star:
+        stats = create_stat(max_tokens)
+
     rank = None
     if (
         hasattr(self.engine_client, "vllm_config")
@@ -315,6 +323,7 @@ async def beam_search(
     beam_search_start: int = time.perf_counter()
     prefill_start = beam_search_start  # Track initial start for prefill measurement
     pre_calc = 0 if sid_begin_token_id is None else 1
+    token_idx_offset = 2 if sid_begin_token_id is not None else 1
     if sid_end_token_id is not None:
         pre_calc += 1
     if max_tokens - pre_calc < 0:
@@ -463,9 +472,12 @@ async def beam_search(
                 raw_logprobs = flat.logprobs
                 raw_ranks = getattr(flat, "ranks", None)
                 raw_decoded = getattr(flat, "decoded_tokens", None)
-                total_logprobs = len(raw_token_ids)
 
-                stride_k = total_logprobs // logprobs_num
+                # Each beam contributes a fixed block of [sampled, top1..topK]
+                # entries. The engine may pad the request's flat row to the
+                # batch-wide maximum beam count, so the stride must come from
+                # the fixed block size, not from total_logprobs // len(fork_info).
+                stride_k = logprobs_num + 1
 
                 # Each logical beam block should extract its top choices natively
                 for b_idx in range(len(fork_info)):
@@ -576,11 +588,21 @@ async def beam_search(
             completed.extend(eos_beams)
 
         # Processing non-EOS tokens
+
         topn_idx = select_top_indices(
             all_beams_logprob,
             beam_width,
             catalog_strategy,
         )
+        if beam_star:
+            topn_idx = mask_beam_star_candidates(
+                all_beams_logprob,
+                topn_idx,
+                stats[token],
+                token,
+                token_idx_offset,
+                beam_star_coef,
+            )
         new_beams, selected_fork_info = materialize_selected_beams(
             parents=all_beams,
             selected_indices=topn_idx,
@@ -679,3 +701,6 @@ async def beam_search(
     record_beam_search_metrics(metrics, engine="0", model_name=model_name)
 
     yield out
+
+
+beam_search.create_stat = create_stat

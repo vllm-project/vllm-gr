@@ -1051,5 +1051,63 @@ class TestPatchedValidateArgs(unittest.TestCase):
             self._patch_mod.original_validate_args = original
 
 
+class TestBeamStarOption(unittest.TestCase):
+    """Unit tests for --beam-star CLI option parsing and vllm_xargs handling."""
+
+    _STUB_PREFIXES = (
+        "vllm",
+        "vllm_gr.sampling_params",
+        "benchmarks.open_one_rec",
+    )
+
+    def setUp(self) -> None:
+        self._saved = _purge_modules(*self._STUB_PREFIXES)
+        self._stubs = _install_stub_vllm_benchmarks()
+        self._stubs.update(_install_stub_third_party())
+        vllm_gr = types.ModuleType("vllm_gr")
+        vllm_gr.__path__ = []
+        sys.modules["vllm_gr"] = vllm_gr
+        self._stubs["vllm_gr"] = vllm_gr
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        self._patch_mod = patch_mod
+
+    def tearDown(self) -> None:
+        for name in list(self._stubs.keys()):
+            sys.modules.pop(name, None)
+        _restore_modules(self._saved)
+
+    def test_get_beam_star_from_argv_with_float_val(self) -> None:
+        with mock.patch.object(sys, "argv", ["script.py", "--beam-star", "3.3"]):
+            val = self._patch_mod._get_beam_star_from_argv()
+            self.assertEqual(val, 3.3)
+
+    def test_get_beam_star_from_argv_without_val(self) -> None:
+        with mock.patch.object(sys, "argv", ["script.py", "--beam-star"]):
+            val = self._patch_mod._get_beam_star_from_argv()
+            self.assertEqual(val, 3.3)
+
+    def test_get_beam_star_from_argv_absent(self) -> None:
+        with mock.patch.object(sys, "argv", ["script.py"]):
+            val = self._patch_mod._get_beam_star_from_argv()
+            self.assertIsNone(val)
+
+    def test_add_beams_arguments_registers_beam_star(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        self._patch_mod._add_beams_arguments(parser)
+        args = parser.parse_args(["--beam-star", "3.3"])
+        self.assertEqual(args.beam_star, 3.3)
+
+    def test_add_beams_arguments_default_const(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        self._patch_mod._add_beams_arguments(parser)
+        args = parser.parse_args(["--beam-star"])
+        self.assertEqual(args.beam_star, 3.3)
+
+
 if __name__ == "__main__":
     unittest.main()
