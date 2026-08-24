@@ -12,12 +12,16 @@ from vllm.logger import init_logger
 from vllm_gr.v1.engine.async_llm import (
     _add_requests_batch_fn,
     beam_request_step_update_fn,
+    beam_search_engine_abort_fn,
+    beam_search_engine_fn,
     prepare_request_fn,
     register_beam_output_fn,
 )
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
     beam_request_step_update_async,
+    beam_search_abort_async,
+    beam_search_async,
 )
 
 logger = init_logger(__name__)
@@ -44,6 +48,18 @@ def sync_mp_beam_request_step_update(self, update):
     self._send_input(EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, update)
 
 
+def sync_mp_beam_search(self, request):
+    from vllm.v1.engine import EngineCoreRequestType
+
+    self._send_input(EngineCoreRequestType.BEAM_SEARCH, request)
+
+
+def sync_mp_beam_search_abort(self, abort):
+    from vllm.v1.engine import EngineCoreRequestType
+
+    self._send_input(EngineCoreRequestType.BEAM_SEARCH_ABORT, abort)
+
+
 def inproc_add_requests(self, requests, force_batch=False):
     from vllm.v1.engine import EngineCoreRequestType
 
@@ -65,6 +81,14 @@ def inproc_beam_request_step_update(self, update):
     self.engine_core._handle_beam_request_step_update(update)
 
 
+def inproc_beam_search(self, request):
+    self.engine_core._handle_beam_search_request(request)
+
+
+def inproc_beam_search_abort(self, abort):
+    self.engine_core._handle_beam_search_abort(abort)
+
+
 # ---------------------------------------------------------------------------
 # apply_batch_fork_patches — wire ADD_BATCH / BEAM_REQUEST_STEP_UPDATE into client classes
 # ---------------------------------------------------------------------------
@@ -83,10 +107,16 @@ def apply_engine_client_patches() -> None:
 
     AsyncMPClient.add_requests_async = add_requests_async
     AsyncMPClient.beam_request_step_update_async = beam_request_step_update_async
+    AsyncMPClient.beam_search_async = beam_search_async
+    AsyncMPClient.beam_search_abort_async = beam_search_abort_async
     SyncMPClient.add_requests = sync_mp_add_requests
     SyncMPClient.beam_request_step_update = sync_mp_beam_request_step_update
+    SyncMPClient.beam_search = sync_mp_beam_search
+    SyncMPClient.beam_search_abort = sync_mp_beam_search_abort
     InprocClient.add_requests = inproc_add_requests
     InprocClient.beam_request_step_update = inproc_beam_request_step_update
+    InprocClient.beam_search = inproc_beam_search
+    InprocClient.beam_search_abort = inproc_beam_search_abort
 
 
 def apply_async_llm_patches() -> None:
@@ -97,6 +127,8 @@ def apply_async_llm_patches() -> None:
     AsyncLLM._add_requests_batch = _add_requests_batch_fn
     AsyncLLM.register_beam_output = register_beam_output_fn
     AsyncLLM.beam_request_step_update = beam_request_step_update_fn
+    AsyncLLM.beam_search_engine = beam_search_engine_fn
+    AsyncLLM.beam_search_engine_abort = beam_search_engine_abort_fn
 
 
 def apply_batch_fork_patches() -> None:

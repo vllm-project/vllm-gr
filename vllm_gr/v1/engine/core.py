@@ -5,6 +5,7 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any
@@ -27,6 +28,7 @@ def _ensure_beam_state(self) -> None:
     if (
         getattr(self, "beam_cache", None) is not None
         and getattr(self, "beam_cache_lock", None) is not None
+        and getattr(self, "_gr_beam_sessions_lock", None) is not None
     ):
         return
 
@@ -38,6 +40,11 @@ def _ensure_beam_state(self) -> None:
             self.beam_cache: dict[str, dict] = {}
         if getattr(self, "beam_cache_lock", None) is None:
             self.beam_cache_lock = threading.Lock()
+        if getattr(self, "_gr_beam_sessions_lock", None) is None:
+            # Serializes the beam-session map: the input thread mutates it
+            # (BEAM_SEARCH / BEAM_SEARCH_ABORT) while the step loop snapshots
+            # and pops from it in _route_beam_session_outputs.
+            self._gr_beam_sessions_lock = threading.Lock()
 
 
 # ------------------------------------------------------------------------------------
@@ -234,6 +241,286 @@ def _handle_beam_request_step_update(self, update) -> None:
 
 
 # ---------------------------------------------------------------------------
+# BEAM_SEARCH / BEAM_SEARCH_ABORT handlers (engine-side beam loop)
+# ---------------------------------------------------------------------------
+
+
+_CATALOG_CACHE_MAX_VERSIONS = 8
+# Rough per-token memory estimate (trie dict node + sequence-list entry) used
+# to bound the engine-side catalog cache by bytes instead of versions alone.
+_CATALOG_BYTES_PER_TOKEN = 128
+
+
+def _catalog_sequences_bytes(catalog_token_sequences) -> int:
+    """Approximate retained bytes of a cached catalog trie (heuristic)."""
+    return sum(len(seq) for seq in catalog_token_sequences) * _CATALOG_BYTES_PER_TOKEN
+
+
+def _insert_gr_catalog(self, catalog_hash, catalog_token_sequences, catalog) -> None:
+    """Insert a catalog into the byte- and version-bounded cache.
+
+    Evicts the oldest entries BEFORE inserting so the cache never exceeds
+    ``_gr_catalog_cache_budget`` bytes nor ``_CATALOG_CACHE_MAX_VERSIONS``
+    entries (no 9th-version peak during replacement).  Called with
+    ``_gr_beam_sessions_lock`` held.
+    """
+    new_size = _catalog_sequences_bytes(catalog_token_sequences)
+    cache = self._gr_catalog_cache
+    sizes = self._gr_catalog_cache_sizes
+    while cache and (
+        len(cache) >= _CATALOG_CACHE_MAX_VERSIONS
+        or self._gr_catalog_cache_size + new_size > self._gr_catalog_cache_budget
+    ):
+        oldest_hash, _ = next(iter(cache.items()))
+        cache.pop(oldest_hash)
+        self._gr_catalog_cache_size -= sizes.pop(oldest_hash, 0)
+    cache[catalog_hash] = catalog
+    sizes[catalog_hash] = new_size
+    self._gr_catalog_cache_size += new_size
+
+
+def _get_gr_engine_catalog(self, catalog_hash, catalog_token_sequences):
+    """Return the engine-side Catalog trie for a catalog identity.
+
+    The cache is keyed by the frontend-computed ``catalog_hash`` (O(1)
+    lookup — the sequences themselves are never re-hashed or rebuilt here).
+    The cache is bounded by an approximate byte budget (and a version cap),
+    so multiple large catalog versions cannot exhaust host memory.
+    Returns ``None`` when the trie is not cached and no sequences were
+    provided to build it.
+    """
+    _ensure_beam_state(self)
+    if catalog_token_sequences is None:
+        if catalog_hash is None:
+            return None
+        return getattr(self, "_gr_catalog_cache", {}).get(catalog_hash)
+
+    # The cache is shared with the background catalog-build thread and the
+    # input thread; guard the read-modify-write with the lifecycle lock.  The
+    # expensive trie build itself stays outside the lock.
+    with self._gr_beam_sessions_lock:
+        if not getattr(self, "_gr_catalog_cache", None):
+            self._gr_catalog_cache = {}
+            self._gr_catalog_cache_sizes: dict = {}
+            self._gr_catalog_cache_size = 0
+        if getattr(self, "_gr_catalog_cache_budget", None) is None:
+            self._gr_catalog_cache_budget = (
+                int(os.getenv("VLLM_GR_CATALOG_CACHE_BUDGET_MB", "2048")) * 1024 * 1024
+            )
+        if catalog_hash is not None and catalog_hash in self._gr_catalog_cache:
+            return self._gr_catalog_cache[catalog_hash]
+
+    from vllm_gr.utils.catalog import Catalog
+
+    catalog = Catalog()
+    catalog.load_from_sequences(catalog_token_sequences)
+    if catalog_hash is not None:
+        with self._gr_beam_sessions_lock:
+            _insert_gr_catalog(self, catalog_hash, catalog_token_sequences, catalog)
+    return catalog
+
+
+def _handle_beam_search_request(self, request) -> None:
+    """Start a full engine-side beam-search session."""
+    from vllm_gr.v1.beam.search_engine import BeamSearchSession
+
+    _ensure_beam_state(self)
+    sessions = getattr(self, "_gr_beam_sessions", None)
+    if sessions is None:
+        self._gr_beam_sessions = {}
+        sessions = self._gr_beam_sessions
+
+    # Catalog-only preload: build the engine-side catalog trie synchronously.
+    # The preload arrives during idle startup (before any traffic), so
+    # blocking the input thread here guarantees the cache is warm before the
+    # first beam-search request — no race on the critical path.
+    if request.preload_only:
+        if request.catalog_token_sequences is not None:
+            try:
+                _get_gr_engine_catalog(self, request.catalog_hash, request.catalog_token_sequences)
+            except Exception:
+                logger.exception("BEAM_SEARCH: catalog preload build failed")
+        return
+
+    # Requests whose token budget covers only the reserved begin/end tokens
+    # have no generation waves: mirror the frontend (which performs no model
+    # step in that case) and finish immediately, without a prefill wave or
+    # catalog work.
+    pre_calc = (1 if request.sid_begin_token_id is not None else 0) + (
+        1 if request.sid_end_token_id is not None else 0
+    )
+    if request.max_tokens - pre_calc <= 0:
+        session = BeamSearchSession(self, request, None, catalog_pending=False)
+        final = session._finish_session()
+        if hasattr(self, "output_queue"):
+            self.output_queue.put_nowait((request.client_index, final))
+        return
+
+    catalog = _get_gr_engine_catalog(self, request.catalog_hash, request.catalog_token_sequences)
+    catalog_pending = catalog is None and request.catalog_token_sequences is not None
+    session = BeamSearchSession(
+        self,
+        request,
+        catalog,
+        catalog_pending=catalog_pending,
+    )
+    # Register the session BEFORE submitting the prefill: the step loop may
+    # produce the prefill output immediately, and it must find the session in
+    # the map to route it back instead of treating it as a normal output.
+    with self._gr_beam_sessions_lock:
+        sessions[session.session_id] = session
+    try:
+        session._submit_prefill_wave()
+    except Exception:
+        logger.exception("BEAM_SEARCH: session %s prefill submission failed", request.session_id)
+        with self._gr_beam_sessions_lock:
+            sessions.pop(session.session_id, None)
+        error_output = session._finish_with_error()
+        if hasattr(self, "output_queue"):
+            self.output_queue.put_nowait((request.client_index, error_output))
+        return
+
+    # The catalog trie is large (hundreds of thousands of sequences); build
+    # it in a background thread while the prefill wave runs on the GPU.  The
+    # wave-0 decision (the only catalog consumer before the final sort) waits
+    # for readiness, so the build cost is hidden behind the model execution.
+    if catalog_pending:
+        threading.Thread(
+            target=_build_gr_catalog_for_session,
+            args=(self, session, request.catalog_hash, request.catalog_token_sequences),
+            daemon=True,
+        ).start()
+
+
+def _build_gr_catalog_for_session(self, session, catalog_hash, catalog_token_sequences) -> None:
+    """Build the catalog trie and attach it to a running session."""
+    try:
+        catalog = _get_gr_engine_catalog(self, catalog_hash, catalog_token_sequences)
+    except Exception:
+        logger.exception("BEAM_SEARCH: catalog build failed for session %s", session.session_id)
+        catalog = None
+    with self.beam_cache_lock:
+        session.catalog = catalog
+        session._catalog_ready.set()
+
+
+def _handle_beam_search_abort(self, abort) -> None:
+    """Abort an engine-side beam-search session."""
+    sessions = getattr(self, "_gr_beam_sessions", None)
+    if not sessions:
+        return
+    with self._gr_beam_sessions_lock:
+        session = sessions.pop(abort.session_id, None)
+    if session is not None:
+        session.abort()
+
+
+def _route_beam_session_outputs(self, outputs):
+    """Split session outputs out of the step outputs and run the beam loop.
+
+    Called from the patched step loop.  Returns the outputs dict that should
+    be forwarded to the frontend output queue.
+    """
+    sessions = getattr(self, "_gr_beam_sessions", None)
+    if not sessions or not outputs:
+        return outputs
+
+    # Snapshot the session map under the lifecycle lock: the input thread
+    # mutates it concurrently (BEAM_SEARCH / BEAM_SEARCH_ABORT) and the
+    # routing below iterates and pops from it.
+    with self._gr_beam_sessions_lock:
+        sessions_snapshot = list(sessions.values())
+
+    # Pre-build a reverse lookup so every request_id resolves in O(1)
+    # instead of scanning all sessions per output.
+    rid_to_session: dict[str, Any] = {}
+    for s in sessions_snapshot:
+        rid_to_session[s.session_id] = s
+        for rid in s.beam_request_ids:
+            rid_to_session[rid] = s
+
+    forwarded: dict[int, EngineCoreOutputs] = {}
+    finals_by_client: dict[int, list[EngineCoreOutput]] = {}
+    finals_finished_by_client: dict[int, set[str]] = {}
+    for client_index, engine_core_outputs in outputs.items():
+        session_outs: dict[int, list[EngineCoreOutput]] = {}
+        normal_outs: list[EngineCoreOutput] = []
+        for output in engine_core_outputs.outputs:
+            request_id = output.request_id
+            session = rid_to_session.get(request_id)
+            if session is None:
+                normal_outs.append(output)
+            else:
+                session_outs.setdefault(id(session), []).append(output)
+
+        if (
+            normal_outs
+            or engine_core_outputs.scheduler_stats is not None
+            or engine_core_outputs.finished_requests
+        ):
+            # Forward the step's outputs plus its scheduler stats.  The stats
+            # carry the (reset-on-read) prefix cache hit counters, so they
+            # must reach the frontend even when every output of this step was
+            # intercepted by a beam session.  Mirrors vLLM emitting
+            # stats-only EngineCoreOutputs for steps without request outputs.
+            # finished_requests carries the terminal bookkeeping of normal
+            # requests that finished in this step (possibly without an output
+            # row), so it must survive the rebuild as well.
+            forwarded[client_index] = EngineCoreOutputs(
+                engine_index=engine_core_outputs.engine_index,
+                outputs=normal_outs,
+                finished_requests=engine_core_outputs.finished_requests,
+                scheduler_stats=engine_core_outputs.scheduler_stats,
+                timestamp=engine_core_outputs.timestamp,
+                utility_output=engine_core_outputs.utility_output,
+            )
+
+        # Drive the beam sessions with their wave outputs (from the snapshot).
+        for session in sessions_snapshot:
+            outs = session_outs.get(id(session))
+            if not outs:
+                continue
+            final = session.on_wave_output(
+                EngineCoreOutputs(
+                    engine_index=engine_core_outputs.engine_index,
+                    outputs=outs,
+                    timestamp=engine_core_outputs.timestamp,
+                )
+            )
+            if final is not None:
+                finals_by_client.setdefault(session.client_index, []).extend(final.outputs)
+                finals_finished_by_client.setdefault(session.client_index, set()).update(
+                    final.finished_requests or set()
+                )
+                with self._gr_beam_sessions_lock:
+                    sessions.pop(session.session_id, None)
+
+    for client_index, final_outs in finals_by_client.items():
+        existing = forwarded.get(client_index)
+        if existing is not None:
+            # Merge the session finals into this step's forwarded batch so
+            # normal outputs and beam finals produced by the same step are
+            # all delivered, while the step's scheduler_stats ride along.
+            existing.outputs.extend(final_outs)
+            existing.finished_requests = (
+                (existing.finished_requests or set())
+                | finals_finished_by_client.get(client_index, set())
+                | {out.request_id for out in final_outs}
+            )
+        else:
+            forwarded[client_index] = EngineCoreOutputs(
+                engine_index=self.engine_index,
+                outputs=final_outs,
+                finished_requests=(
+                    finals_finished_by_client.get(client_index, set())
+                    | {out.request_id for out in final_outs}
+                ),
+                timestamp=time.time(),
+            )
+    return forwarded
+
+
+# ---------------------------------------------------------------------------
 # EngineCoreProc.process_input_sockets replacement
 # ---------------------------------------------------------------------------
 
@@ -343,6 +630,16 @@ def process_input_sockets(
                 elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
                     beam_update: BeamRequestStepUpdate = decoded_payload
                     self._handle_beam_request_step_update(beam_update)
+                    continue
+
+                elif request_type == EngineCoreRequestType.BEAM_SEARCH:
+                    beam_search_request = decoded_payload
+                    self._handle_beam_search_request(beam_search_request)
+                    continue
+
+                elif request_type == EngineCoreRequestType.BEAM_SEARCH_ABORT:
+                    beam_search_abort = decoded_payload
+                    self._handle_beam_search_abort(beam_search_abort)
                     continue
 
                 else:

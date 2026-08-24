@@ -54,6 +54,7 @@ aligned with it.
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
+| GR-PATCH-016 | `v1/beam/search_engine.py`, `v1/engine/core.py` | `apply_engine_core_request_patches` | enabled by default; `VLLM_GR_ENGINE_BEAM_SEARCH=0` disables the engine-side loop | `_validate_engine_core_request_patch`, `_validate_request_types_patch`; session, codec, and serving BeamSearch tests | EngineCore |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -315,6 +316,26 @@ aligned with it.
 - Activation: hooks are installed during runtime initialization; sliced projection is
   used only when a valid vocabulary slice is configured.
 - Removal condition: vLLM exposes stable output-projection and logprob-width extension points.
+
+### GR-PATCH-016 — Engine-Side Beam Search
+
+- Source: `vllm_gr/v1/beam/search_engine.py`, `vllm_gr/v1/engine/core.py`
+- Installer: `vllm_gr/v1/engine/engine_core_patch.py` (`apply_engine_core_request_patches`)
+- Orchestration: `vllm_gr/entrypoints/openai/serving_engine.py` (flag dispatch),
+  `vllm_gr/v1/engine/core_client_patch.py` (client bindings)
+- Targets:
+    - `EngineCore.step_with_batch_queue` (wrapped to route beam-session outputs)
+    - `EngineCore._handle_beam_search_request`
+    - `EngineCore._handle_beam_search_abort`
+    - `EngineCore._route_beam_session_outputs`
+    - `EngineCoreRequestType.BEAM_SEARCH` / `BEAM_SEARCH_ABORT` wire values
+- Risk: High
+- Activation: installed with the EngineCore request patches; the engine-side loop is
+  enabled by default and disabled only by `VLLM_GR_ENGINE_BEAM_SEARCH=0` (the
+  frontend client must expose `beam_search_engine`). The prefill wave submits one
+  ADD request (the ADD_BATCH equivalent inside the core); every decode wave
+  submits one packed beam request (the BEAM_REQUEST_STEP_UPDATE equivalent).
+- Removal condition: vLLM exposes a stable in-engine beam-search orchestration extension point.
 
 ## Benchmark-only Runtime Mutations
 

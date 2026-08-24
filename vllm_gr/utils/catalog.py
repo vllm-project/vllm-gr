@@ -58,11 +58,25 @@ class Catalog:
     # cannot collide with actual trie entries.
     _TERMINAL_MARKER = "__catalog_terminal__"
 
-    def __init__(self, tokenizer: TokenizerLike):
+    def __init__(self, tokenizer: TokenizerLike | None = None):
         self.tokenizer = tokenizer
         self.trie: dict[int, Any] = {}
         self.vocab_offset: int | None = None
         self.vocab_slice_size: int | None = None
+        self._cached_sequences: list[list[int]] | None = None
+        self._sequences_hash: int | None = None
+
+    def _build_trie(self, token_sequences: list[list[int]]) -> None:
+        self.trie = {}
+        self._cached_sequences = [list(s) for s in token_sequences]
+        for seq in token_sequences:
+            node = self.trie
+            for token_id in seq:
+                if token_id not in node:
+                    node[token_id] = {}
+                node = node[token_id]
+            node[self._TERMINAL_MARKER] = True
+        self._sequences_hash = hash(tuple(tuple(s) for s in token_sequences))
 
     def load(self, path: str):
         try:
@@ -73,9 +87,9 @@ class Catalog:
         except json.JSONDecodeError:
             raise ValueError(f"Failed to decode JSON from catalog file: {path}")
 
+        token_sequences = []
         for seq_idx, seq in enumerate(catalog_data):
             token_ids = self.tokenizer.convert_tokens_to_ids(seq)
-            node = self.trie
             for i, (token_str, token_id) in enumerate(zip(seq, token_ids)):
                 if token_id is None or token_id == -1:
                     raise ValueError(
@@ -83,10 +97,8 @@ class Catalog:
                         f"(got {token_id!r}). Token occurs at index {i} of sequence #{seq_idx} in catalog {path!r}. "
                         "Please verify that special/semantic tokens are registered in the model's tokenizer."
                     )
-                if token_id not in node:
-                    node[token_id] = {}
-                node = node[token_id]
-            node[self._TERMINAL_MARKER] = True
+            token_sequences.append([int(t) for t in token_ids])
+        self._build_trie(token_sequences)
 
         offset, slice_size = compute_catalog_slice_config(path, self.tokenizer)
         if offset is not None and slice_size is not None:
@@ -102,6 +114,33 @@ class Catalog:
                 self.vocab_offset,
                 self.vocab_offset + self.vocab_slice_size - 1,
             )
+
+    def load_from_sequences(self, token_sequences: list[list[int]]) -> None:
+        """Build the trie from pre-tokenized sequences (no tokenizer needed).
+
+        Used by the engine process, which receives the tokenized catalog from
+        the frontend in a ``BeamSearchRequest``."""
+        self._build_trie(token_sequences)
+
+    def to_sequences(self) -> list[list[int]]:
+        """Recover the token-id sequences encoded in the trie."""
+        if self._cached_sequences is not None:
+            return self._cached_sequences
+
+        sequences: list[list[int]] = []
+
+        def walk(node: dict[int, Any], prefix: list[int]) -> None:
+            for key in sorted(node):
+                if key == self._TERMINAL_MARKER:
+                    sequences.append(list(prefix))
+                    continue
+                prefix.append(int(key))
+                walk(node[key], prefix)
+                prefix.pop()
+
+        walk(self.trie, [])
+        self._cached_sequences = sequences
+        return sequences
 
     def is_terminal(self, token_ids: list[int]) -> bool:
         """Returns True if token_ids exactly matches a complete catalog item."""

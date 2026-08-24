@@ -22,6 +22,28 @@ _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
 # ---------------------------------------------------------------------------
 
 
+_STEP_LOOP_PATCH_MARKER = "_vllm_gr_beam_step_loop_patch"
+
+
+def make_patched_step_with_batch_queue(original_step_with_batch_queue):
+    """Wrap EngineCore.step_with_batch_queue to route beam-session outputs
+    into the engine-side beam-search state machine."""
+    if getattr(original_step_with_batch_queue, _STEP_LOOP_PATCH_MARKER, False):
+        return original_step_with_batch_queue
+
+    @wraps(original_step_with_batch_queue)
+    def patched_step_with_batch_queue(self):
+        outputs, model_executed = original_step_with_batch_queue(self)
+        if outputs is None or not getattr(self, "_gr_beam_sessions", None):
+            return outputs, model_executed
+        from vllm_gr.v1.engine.core import _route_beam_session_outputs
+
+        return _route_beam_session_outputs(self, outputs), model_executed
+
+    setattr(patched_step_with_batch_queue, _STEP_LOOP_PATCH_MARKER, True)
+    return patched_step_with_batch_queue
+
+
 def make_patched_engine_core_init(original_init):
     """Wrap EngineCore.__init__ to add beam state."""
 
@@ -53,7 +75,11 @@ def apply_engine_core_request_patches() -> None:
 
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
+        _get_gr_engine_catalog,
         _handle_beam_request_step_update,
+        _handle_beam_search_abort,
+        _handle_beam_search_request,
+        _route_beam_session_outputs,
         process_input_sockets,
     )
 
@@ -71,6 +97,20 @@ def apply_engine_core_request_patches() -> None:
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
+
+    # Engine-side beam-search loop handlers.
+    EngineCore._get_gr_engine_catalog = _get_gr_engine_catalog
+    EngineCore._handle_beam_search_request = _handle_beam_search_request
+    EngineCore._handle_beam_search_abort = _handle_beam_search_abort
+    EngineCore._route_beam_session_outputs = _route_beam_session_outputs
+    EngineCoreProc._get_gr_engine_catalog = _get_gr_engine_catalog
+    EngineCoreProc._handle_beam_search_request = _handle_beam_search_request
+    EngineCoreProc._handle_beam_search_abort = _handle_beam_search_abort
+
+    # Intercept the step loop for engine-side beam sessions.
+    EngineCore.step_with_batch_queue = make_patched_step_with_batch_queue(
+        EngineCore.step_with_batch_queue
+    )
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets

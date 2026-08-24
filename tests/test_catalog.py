@@ -174,3 +174,41 @@ def test_catalog_multiple_items_long_shared_prefix(mock_tokenizer: MagicMock) ->
     finally:
         if os.path.exists(catalog_path):
             os.remove(catalog_path)
+
+
+def test_catalog_transfer_payload_is_scoped_per_rank() -> None:
+    """The sequences transfer is tracked per target engine rank: each rank
+    receives the sequences once; later requests carry the hash only."""
+    from typing import Any
+
+    from vllm_gr.entrypoints.openai.serving_models import (
+        _catalog_transfer_payload,
+        _engine_catalog_sent,
+    )
+
+    _engine_catalog_sent.clear()
+    try:
+        seqs = [[1, 2, 3], [1, 2, 4]]
+
+        class FakeCatalog:
+            _sequences_hash = 42
+
+            @staticmethod
+            def to_sequences() -> list[list[int]]:
+                return seqs
+
+        catalog: Any = FakeCatalog()
+        h0, s0 = _catalog_transfer_payload(catalog, 0)
+        h1, s1 = _catalog_transfer_payload(catalog, 1)
+        h0b, s0b = _catalog_transfer_payload(catalog, 0)
+        assert (h0, s0) == (42, seqs)
+        assert (h1, s1) == (42, seqs)
+        assert (h0b, s0b) == (42, None)
+
+        # The single-engine (non-DP) rank key is tracked independently.
+        hn, sn = _catalog_transfer_payload(catalog, None)
+        assert (hn, sn) == (42, seqs)
+        hn2, sn2 = _catalog_transfer_payload(catalog, None)
+        assert (hn2, sn2) == (42, None)
+    finally:
+        _engine_catalog_sent.clear()

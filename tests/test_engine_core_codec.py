@@ -16,7 +16,11 @@ from vllm_gr.v1.engine.codec import (
     build_engine_core_decoders,
     decode_engine_core_payload,
 )
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.engine.types import (
+    BeamRequestStepUpdate,
+    BeamSearchAbort,
+    BeamSearchRequest,
+)
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
 register_engine_core_request_types()
@@ -66,6 +70,8 @@ def test_build_engine_core_decoders_shares_oob_tensor_provider() -> None:
     assert decoders.add_request.oob_tensor_provider is provider
     assert decoders.add_batch.oob_tensor_provider is provider
     assert decoders.beam_step_update.oob_tensor_provider is provider
+    assert decoders.beam_search.oob_tensor_provider is provider
+    assert decoders.beam_search_abort.oob_tensor_provider is provider
     assert decoders.generic.oob_tensor_provider is provider
 
 
@@ -101,3 +107,43 @@ def test_decode_beam_step_update_payload() -> None:
     assert isinstance(decoded, BeamRequestStepUpdate)
     assert decoded.session_id == "session-0"
     assert decoded.beam_width == 2
+
+
+def test_decode_beam_search_payload() -> None:
+    decoders = build_engine_core_decoders(None)
+    request = BeamSearchRequest(
+        session_id="session-0",
+        prompt_token_ids=[1, 2, 3],
+        beam_width=4,
+        max_tokens=8,
+        sampling_params=_sampling_params(),
+        eos_token_id=2,
+        catalog_strategy="null",
+        catalog_token_sequences=[[4, 5], [4, 6]],
+    )
+
+    decoded = decode_engine_core_payload(
+        decoders,
+        EngineCoreRequestType.BEAM_SEARCH,
+        _frames(request),
+    )
+
+    assert isinstance(decoded, BeamSearchRequest)
+    assert decoded.session_id == "session-0"
+    assert decoded.beam_width == 4
+    assert decoded.catalog_token_sequences == [[4, 5], [4, 6]]
+    assert decoded.catalog_strategy == "null"
+
+
+def test_decode_beam_search_abort_payload() -> None:
+    decoders = build_engine_core_decoders(None)
+    abort = BeamSearchAbort(session_id="session-0")
+
+    decoded = decode_engine_core_payload(
+        decoders,
+        EngineCoreRequestType.BEAM_SEARCH_ABORT,
+        _frames(abort),
+    )
+
+    assert isinstance(decoded, BeamSearchAbort)
+    assert decoded.session_id == "session-0"

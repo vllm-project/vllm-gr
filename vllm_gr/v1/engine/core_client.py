@@ -4,7 +4,11 @@
 import msgspec
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.engine.types import (
+    BeamRequestStepUpdate,
+    BeamSearchAbort,
+    BeamSearchRequest,
+)
 
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
@@ -80,3 +84,37 @@ async def beam_request_step_update_async(self, update: BeamRequestStepUpdate) ->
         await self.first_req_send_socket.send(req_msg)
     await to_await
     self._ensure_output_queue_task()
+
+
+# ---------------------------------------------------------------------------
+# AsyncMPClient.beam_search_async / beam_search_abort_async (engine-side path)
+# ---------------------------------------------------------------------------
+
+
+async def beam_search_async(self, request: BeamSearchRequest) -> None:
+    """Send BEAM_SEARCH to EngineCore (one message per full session)."""
+    request.client_index = self.client_index
+    if hasattr(self, "current_wave"):
+        request.current_wave = self.current_wave
+
+    engine = None
+    if hasattr(self, "get_core_engine_for_request") and request.data_parallel_rank is not None:
+        engine = self.core_engines[request.data_parallel_rank]
+        if hasattr(self, "reqs_in_flight"):
+            self.reqs_in_flight[request.session_id] = engine
+
+    to_await = self._send_input(EngineCoreRequestType.BEAM_SEARCH, request, engine)
+    if hasattr(self, "first_req_send_socket") and not self.engines_running:
+        req_msg = msgspec.msgpack.encode(("FIRST_REQ", engine))
+        await self.first_req_send_socket.send(req_msg)
+    await to_await
+    self._ensure_output_queue_task()
+
+
+async def beam_search_abort_async(self, abort: BeamSearchAbort) -> None:
+    """Send BEAM_SEARCH_ABORT to EngineCore."""
+    engine = None
+    if hasattr(self, "get_core_engine_for_request"):
+        if hasattr(self, "reqs_in_flight"):
+            engine = self.reqs_in_flight.pop(abort.session_id, None)
+    await self._send_input(EngineCoreRequestType.BEAM_SEARCH_ABORT, abort, engine)

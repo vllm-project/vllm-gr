@@ -110,9 +110,11 @@ def patch_installed_lmcache_adapter() -> bool:
             metadata = self._parent._get_connector_metadata()
             old_requests = _temporary_filter_requests(
                 metadata,
-                lambda request: request.slot_mapping is None
-                and getattr(request, "load_spec", None) is not None
-                and getattr(request.load_spec, "can_load", False),
+                lambda request: (
+                    request.slot_mapping is None
+                    and getattr(request, "load_spec", None) is not None
+                    and getattr(request.load_spec, "can_load", False)
+                ),
             )
             try:
                 return original_start_load_kv(self, forward_context, **kwargs)

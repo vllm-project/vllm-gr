@@ -5,9 +5,13 @@
 def patch_beam_search():
     from vllm.entrypoints.openai.engine.serving import OpenAIServing
 
-    from vllm_gr.entrypoints.openai.serving_engine import beam_search
+    from vllm_gr.entrypoints.openai.serving_engine import (
+        _beam_search_engine_path,
+        beam_search,
+    )
 
     OpenAIServing.beam_search = beam_search
+    OpenAIServing._beam_search_engine_path = _beam_search_engine_path
 
 
 def patch_sampling():

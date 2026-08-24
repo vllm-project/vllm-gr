@@ -188,11 +188,12 @@ vllm-gr serve \
     --seed 123 \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 512 \
-    --max_num_seqs 2048 \
+    --max_num_seqs 32 \
     --max_num_batched_tokens 16384 \
     --scheduling-policy priority \
     --catalog-path "$CATALOG_PATH" \
     --attention-backend CUSTOM \
+    --gpu-memory-utilization 0.8 \
     "$MODEL_PATH" &
 
 SERVER_PID=$!

@@ -14,10 +14,14 @@ from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
 from vllm.v1.serial_utils import MsgpackDecoder
 
 from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.engine.types import (
+    BeamRequestStepUpdate,
+)
 from vllm_gr.v1.engine.wire import (
     ADD_BATCH_WIRE_VALUE,
     BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE,
+    BEAM_SEARCH_ABORT_WIRE_VALUE,
+    BEAM_SEARCH_WIRE_VALUE,
     register_engine_core_request_types,
 )
 
@@ -33,6 +37,8 @@ UPSTREAM_REQUEST_WIRE_VALUES = {
 GR_REQUEST_WIRE_VALUES = {
     "ADD_BATCH": b"\x06",
     "BEAM_REQUEST_STEP_UPDATE": b"\x07",
+    "BEAM_SEARCH": b"\x08",
+    "BEAM_SEARCH_ABORT": b"\x09",
 }
 
 ENGINE_CORE_REQUEST_FIELDS = (
@@ -100,6 +106,8 @@ def _minimal_beam_step_update(**overrides: object) -> BeamRequestStepUpdate:
 def test_engine_core_wire_value_inventory() -> None:
     assert ADD_BATCH_WIRE_VALUE == b"\x06"
     assert BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE == b"\x07"
+    assert BEAM_SEARCH_WIRE_VALUE == b"\x08"
+    assert BEAM_SEARCH_ABORT_WIRE_VALUE == b"\x09"
     register_engine_core_request_types()
     register_engine_core_request_types()
 

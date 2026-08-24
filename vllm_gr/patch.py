@@ -145,6 +145,9 @@ def _validate_request_types_patch() -> str | None:
         getattr(getattr(EngineCoreRequestType, "ADD_BATCH", None), "value", None) == b"\x06"
         and getattr(getattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE", None), "value", None)
         == b"\x07"
+        and getattr(getattr(EngineCoreRequestType, "BEAM_SEARCH", None), "value", None) == b"\x08"
+        and getattr(getattr(EngineCoreRequestType, "BEAM_SEARCH_ABORT", None), "value", None)
+        == b"\x09"
     )
     return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
 
@@ -155,21 +158,33 @@ def _validate_engine_clients_patch() -> str | None:
     from vllm_gr.v1.engine.core_client import (
         add_requests_async,
         beam_request_step_update_async,
+        beam_search_abort_async,
+        beam_search_async,
     )
     from vllm_gr.v1.engine.core_client_patch import (
         inproc_add_requests,
         inproc_beam_request_step_update,
+        inproc_beam_search,
+        inproc_beam_search_abort,
         sync_mp_add_requests,
         sync_mp_beam_request_step_update,
+        sync_mp_beam_search,
+        sync_mp_beam_search_abort,
     )
 
     valid = (
         AsyncMPClient.add_requests_async is add_requests_async
         and AsyncMPClient.beam_request_step_update_async is beam_request_step_update_async
+        and AsyncMPClient.beam_search_async is beam_search_async
+        and AsyncMPClient.beam_search_abort_async is beam_search_abort_async
         and SyncMPClient.add_requests is sync_mp_add_requests
         and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
+        and SyncMPClient.beam_search is sync_mp_beam_search
+        and SyncMPClient.beam_search_abort is sync_mp_beam_search_abort
         and InprocClient.add_requests is inproc_add_requests
         and InprocClient.beam_request_step_update is inproc_beam_request_step_update
+        and InprocClient.beam_search is inproc_beam_search
+        and InprocClient.beam_search_abort is inproc_beam_search_abort
     )
     return _verified(valid, "EngineCore client methods are not fully installed")
 
@@ -180,6 +195,8 @@ def _validate_async_llm_patch() -> str | None:
     from vllm_gr.v1.engine.async_llm import (
         _add_requests_batch_fn,
         beam_request_step_update_fn,
+        beam_search_engine_abort_fn,
+        beam_search_engine_fn,
         prepare_request_fn,
         register_beam_output_fn,
     )
@@ -189,6 +206,8 @@ def _validate_async_llm_patch() -> str | None:
         and AsyncLLM._add_requests_batch is _add_requests_batch_fn
         and AsyncLLM.register_beam_output is register_beam_output_fn
         and AsyncLLM.beam_request_step_update is beam_request_step_update_fn
+        and AsyncLLM.beam_search_engine is beam_search_engine_fn
+        and AsyncLLM.beam_search_engine_abort is beam_search_engine_abort_fn
     )
     return _verified(valid, "AsyncLLM grouped-beam methods are not fully installed")
 
@@ -210,9 +229,15 @@ def _validate_engine_core_request_patch() -> str | None:
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
         _handle_beam_request_step_update,
+        _handle_beam_search_abort,
+        _handle_beam_search_request,
+        _route_beam_session_outputs,
         process_input_sockets,
     )
-    from vllm_gr.v1.engine.engine_core_patch import _BEAM_STATE_INIT_MARKER
+    from vllm_gr.v1.engine.engine_core_patch import (
+        _BEAM_STATE_INIT_MARKER,
+        _STEP_LOOP_PATCH_MARKER,
+    )
 
     valid = (
         getattr(EngineCore.__init__, _BEAM_STATE_INIT_MARKER, False)
@@ -221,6 +246,12 @@ def _validate_engine_core_request_patch() -> str | None:
         and EngineCoreProc._cache_beam_request is _cache_beam_request
         and EngineCore._handle_beam_request_step_update is _handle_beam_request_step_update
         and EngineCoreProc._handle_beam_request_step_update is _handle_beam_request_step_update
+        and EngineCore._handle_beam_search_request is _handle_beam_search_request
+        and EngineCoreProc._handle_beam_search_request is _handle_beam_search_request
+        and EngineCore._handle_beam_search_abort is _handle_beam_search_abort
+        and EngineCoreProc._handle_beam_search_abort is _handle_beam_search_abort
+        and EngineCore._route_beam_session_outputs is _route_beam_session_outputs
+        and bool(getattr(EngineCore.step_with_batch_queue, _STEP_LOOP_PATCH_MARKER, False))
         and EngineCoreProc.process_input_sockets is process_input_sockets
     )
     return _verified(valid, "EngineCore beam request dispatch is not fully installed")

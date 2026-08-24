@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.engine.types import BeamRequestStepUpdate, BeamSearchRequest
 
 logger = init_logger(__name__)
 
@@ -161,3 +161,17 @@ def register_beam_output_fn(
 async def beam_request_step_update_fn(self, update: BeamRequestStepUpdate) -> None:
     """Send BEAM_REQUEST_STEP_UPDATE to EngineCore to grouped processing."""
     await self.engine_core.beam_request_step_update_async(update)
+
+
+async def beam_search_engine_fn(self, request: BeamSearchRequest) -> None:
+    """Send one BEAM_SEARCH message to EngineCore for a full engine-side
+    beam-search session.  The session's final output arrives on the queue
+    registered via ``register_beam_output``."""
+    await self.engine_core.beam_search_async(request)
+
+
+async def beam_search_engine_abort_fn(self, session_id: str) -> None:
+    """Abort an engine-side beam-search session."""
+    from vllm_gr.v1.engine.types import BeamSearchAbort
+
+    await self.engine_core.beam_search_abort_async(BeamSearchAbort(session_id=session_id))

@@ -577,3 +577,64 @@ class TestStatsUpdateTask:
         asyncio.run(add_requests_async(mock_self, [req], force_batch=False))
 
         mock_self._ensure_stats_update_task.assert_not_called()
+
+
+# ===========================================================================
+# Section 10 — Engine-side finals carry the session id for DP affinity cleanup
+# ===========================================================================
+
+
+class TestEngineSideFinalsDPAffinity:
+    def test_routed_finals_carry_session_id_for_dp_cleanup(self) -> None:
+        """The routed finals' finished_requests must include the session id so
+        the DP client's process_engine_outputs removes the affinity entry on
+        normal completion."""
+        import threading
+
+        from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
+
+        from vllm_gr.v1.engine.core import _route_beam_session_outputs
+
+        engine: Any = SimpleNamespace(
+            engine_index=0,
+            _gr_beam_sessions_lock=threading.Lock(),
+            _gr_beam_sessions={},
+        )
+
+        def finish(eco: Any) -> EngineCoreOutputs:
+            return EngineCoreOutputs(
+                engine_index=0,
+                finished_requests={"sess", "sess-beam-final"},
+                outputs=[
+                    EngineCoreOutput(
+                        request_id="sess-beam-final",
+                        new_token_ids=[7],
+                        finish_reason=FinishReason.STOP,
+                    )
+                ],
+            )
+
+        session = SimpleNamespace(
+            session_id="sess",
+            client_index=0,
+            beam_request_ids=["sess-beam-0"],
+            on_wave_output=finish,
+        )
+        engine._gr_beam_sessions = {"sess": session}
+
+        wave_output = EngineCoreOutput(
+            request_id="sess-beam-0",
+            new_token_ids=[1],
+            finish_reason=FinishReason.LENGTH,
+        )
+        routed = _route_beam_session_outputs(
+            engine, {0: EngineCoreOutputs(engine_index=0, outputs=[wave_output])}
+        )
+        assert routed[0].finished_requests == {"sess", "sess-beam-final"}
+
+        # The DP client pops finished_requests from its affinity map
+        # (mirrors DPLBAsyncMPClient.process_engine_outputs).
+        reqs_in_flight: dict[str, str] = {"sess": "engine-0"}
+        for req_id in routed[0].finished_requests:
+            reqs_in_flight.pop(req_id, None)
+        assert reqs_in_flight == {}

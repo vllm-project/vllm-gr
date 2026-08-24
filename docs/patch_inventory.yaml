@@ -229,3 +229,19 @@ patches:
     risk: medium
     contract: sliced-vocabulary-projection
     removal_condition: vLLM exposes stable output-projection and logprob-width hooks
+
+  - id: GR-PATCH-016
+    owner: vllm_gr/v1/beam/search_engine.py and vllm_gr/v1/engine/core.py
+    installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
+    activation: enabled by default; VLLM_GR_ENGINE_BEAM_SEARCH=0 disables the engine-side loop
+    validator_or_test:
+      - vllm_gr.patch._validate_engine_core_request_patch
+      - vllm_gr.patch._validate_request_types_patch
+      - tests/test_beam_search_engine_session.py
+      - tests/test_engine_core_codec.py
+      - tests/test_serving_beam_search.py
+    process_roles: [engine_core]
+    target: vllm.v1.engine.core.EngineCore.step_with_batch_queue
+    risk: high
+    contract: null
+    removal_condition: vLLM exposes a stable in-engine beam-search orchestration extension point

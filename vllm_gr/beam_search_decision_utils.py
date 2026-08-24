@@ -10,8 +10,9 @@ an intermediate beam domain model.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Collection, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
@@ -19,6 +20,7 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
+from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 
 BeamCandidateCache = tuple[
@@ -208,3 +210,116 @@ def materialize_selected_beams(
         fork_info.append((parent_index, token_id))
 
     return new_beams, fork_info
+
+
+class WaveDecisionResult(NamedTuple):
+    new_beams: list[BeamSearchSequence]
+    fork_info: ForkInfo
+    new_completed_eos: list[BeamSearchSequence]
+
+
+def execute_wave_decision(
+    *,
+    all_beams: Sequence[BeamSearchSequence],
+    per_beam_candidates: Sequence[BeamCandidateCache | None],
+    catalog: Any | None,
+    catalog_strategy: str,
+    valid_tokens_sets: Sequence[Collection[int]] | None,
+    beam_width: int,
+    eos_token_id: int | None,
+    sid_end_token_id: int | None,
+    ignore_eos: bool,
+    include_stop_str_in_output: bool,
+    initial_logprobs: FlatLogprobs,
+) -> WaveDecisionResult:
+    """Consolidated wave candidate filtering, score summation, EOS, and Top-K selection."""
+    all_beams_token_id: list[int] = []
+    all_beams_logprob: list[float] = []
+    all_beams_beam_idx: list[int] = []
+    beam_flat_cache: list[BeamCandidateCache | None] = []
+
+    for b_idx, (current_beam, cached) in enumerate(zip(all_beams, per_beam_candidates)):
+        if cached is None:
+            beam_flat_cache.append(None)
+            continue
+        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = cached
+        # Catalog filtering only applies when both are present: the caller
+        # computes valid_tokens_sets exclusively from the catalog it passes
+        # (the frontend passes its serving catalog, the engine session its
+        # engine-side trie), so the pair is always consistent.
+        if valid_tokens_sets is not None and catalog is not None:
+            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = catalog.apply_catalog_filter(
+                token_ids_pos,
+                logprobs_pos,
+                ranks_pos,
+                decoded_pos,
+                valid_tokens_sets[b_idx],
+                catalog_strategy,
+            )
+        beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
+        all_beams_token_id.extend(token_ids_pos)
+        all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
+        all_beams_beam_idx.extend([b_idx] * len(token_ids_pos))
+
+    all_beams_token_id_arr = np.array(all_beams_token_id)
+    all_beams_logprob_arr = np.array(all_beams_logprob)
+    all_beams_beam_idx_arr = np.array(all_beams_beam_idx, dtype=np.intp)
+
+    eos_beams: list[BeamSearchSequence] = []
+    if not ignore_eos:
+        stop_token_ids = set()
+        if eos_token_id is not None:
+            stop_token_ids.add(eos_token_id)
+        if sid_end_token_id is not None:
+            stop_token_ids.add(sid_end_token_id)
+        eos_beams, all_beams_logprob_arr = complete_eos_candidates(
+            parents=all_beams,
+            token_ids=all_beams_token_id_arr,
+            scores=all_beams_logprob_arr,
+            beam_idx=all_beams_beam_idx_arr,
+            beam_flat_cache=beam_flat_cache,
+            stop_token_ids=stop_token_ids,
+            initial_logprobs=initial_logprobs,
+            include_eos_token=include_stop_str_in_output,
+            inherit_lora_request=False,
+        )
+
+    topn_idx = select_top_indices(all_beams_logprob_arr, beam_width, catalog_strategy)
+    new_beams, selected_fork_info = materialize_selected_beams(
+        parents=all_beams,
+        selected_indices=topn_idx,
+        token_ids=all_beams_token_id_arr,
+        scores=all_beams_logprob_arr,
+        beam_idx=all_beams_beam_idx_arr,
+        beam_flat_cache=beam_flat_cache,
+        initial_logprobs=initial_logprobs,
+    )
+    return WaveDecisionResult(
+        new_beams=new_beams,
+        fork_info=selected_fork_info,
+        new_completed_eos=eos_beams,
+    )
+
+
+def finalize_best_beams(
+    *,
+    all_beams: Sequence[BeamSearchSequence],
+    completed: Sequence[BeamSearchSequence],
+    beam_width: int,
+    initial_logprobs: FlatLogprobs,
+    sid_end_token_id: int | None,
+) -> tuple[list[BeamSearchSequence], float]:
+    """Appends SID tokens, sorts completed beams, reconstructs tree logprobs, and measures sort time."""
+    if sid_end_token_id is not None:
+        for beam in all_beams:
+            beam.tokens.append(sid_end_token_id)
+    all_completed = list(completed) + list(all_beams)
+
+    sort_start = time.perf_counter()
+    sorted_completed = sorted(all_completed, key=lambda x: x.cum_logprob, reverse=True)
+    sort_time = time.perf_counter() - sort_start
+
+    best_beams = sorted_completed[:beam_width]
+    for beam in best_beams:
+        reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
+    return best_beams, sort_time
