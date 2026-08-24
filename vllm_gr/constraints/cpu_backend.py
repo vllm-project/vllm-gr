@@ -10,27 +10,38 @@ import torch
 
 from vllm_gr.constraints.backend import (
     INVALID_LOGIT,
+    ConstraintBackendInfo,
     ConstraintMetadata,
     ConstraintOutput,
     build_constraint_output,
+    effective_temperatures,
     validate_select_inputs,
 )
-from vllm_gr.constraints.table import ConstraintTable, ConstraintTableInfo
+from vllm_gr.constraints.table import ConstraintTable
 
 
 class CPUConstraintBackend:
     """Keep all six tables on Host; transfer only per-batch IDs and masks."""
 
-    __slots__ = ("_table", "_closed")
+    __slots__ = ("_table", "_info", "_closed")
 
-    def __init__(self, table: ConstraintTable) -> None:
+    def __init__(
+        self,
+        table: ConstraintTable,
+        info: ConstraintBackendInfo,
+    ) -> None:
         self._table: ConstraintTable | None = table
+        if info.table is not table.info:
+            raise ValueError("CPU constraint backend info must reference table.info")
+        if info.device_memory_bytes != 0:
+            raise ValueError("CPU constraint backend device_memory_bytes must be zero")
+        self._info = info
         self._closed = False
 
     @property
-    def info(self) -> ConstraintTableInfo:
-        table = self._require_table()
-        return table.info
+    def info(self) -> ConstraintBackendInfo:
+        self._require_table()
+        return self._info
 
     def _require_table(self) -> ConstraintTable:
         if self._closed or self._table is None:
@@ -46,7 +57,7 @@ class CPUConstraintBackend:
             result: list[np.ndarray] = []
             for token_id in prefixes[:, 0]:
                 token = int(token_id)
-                if not 0 <= token < table.info.vocab_size:
+                if not 0 <= token < self._info.table.vocab_size:
                     result.append(table.prefix1_values[:0])
                     continue
                 begin = int(table.prefix1_offsets[token])
@@ -54,10 +65,9 @@ class CPUConstraintBackend:
                 result.append(table.prefix1_values[begin:end])
             return result
 
-        pair_keys = (
-            prefixes[:, 0].astype(np.int64) * table.info.vocab_size
-            + prefixes[:, 1].astype(np.int64)
-        )
+        pair_keys = prefixes[:, 0].astype(np.int64) * self._info.table.vocab_size + prefixes[
+            :, 1
+        ].astype(np.int64)
         positions = np.searchsorted(table.prefix1_pair_keys, pair_keys)
         result = []
         for key, position in zip(pair_keys, positions):
@@ -75,8 +85,8 @@ class CPUConstraintBackend:
         logits: torch.Tensor,
         metadata: ConstraintMetadata,
     ) -> ConstraintOutput:
-        table = self._require_table()
-        validate_select_inputs(logits, metadata, table.info)
+        self._require_table()
+        validate_select_inputs(logits, metadata, self._info)
 
         # Only the small request prefix crosses to Host. The full logits and
         # all six tables remain on their owning side of the boundary.
@@ -94,7 +104,9 @@ class CPUConstraintBackend:
         candidate_ids = torch.from_numpy(host_ids).to(device=logits.device)
         candidate_mask = torch.from_numpy(host_mask).to(device=logits.device)
         candidate_logits = logits.gather(1, candidate_ids).float()
-        temperatures = metadata.temperatures.to(device=logits.device).reshape(-1, 1)
+        temperatures = effective_temperatures(
+            metadata.temperatures.to(device=logits.device)
+        ).reshape(-1, 1)
         candidate_logits = candidate_logits / temperatures
         masked_logits = candidate_logits.masked_fill(~candidate_mask, float("-inf"))
         normalizer = torch.logsumexp(masked_logits, dim=1, keepdim=True)
@@ -111,7 +123,7 @@ class CPUConstraintBackend:
         )
         top_ids = candidate_ids.gather(1, top_indices)
         return build_constraint_output(
-            top_ids.contiguous(),
+            top_ids.to(dtype=torch.int32).contiguous(),
             top_logprobs.contiguous(),
             logits=logits,
             top_k=metadata.top_k,

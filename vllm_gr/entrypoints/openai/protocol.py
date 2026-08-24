@@ -24,6 +24,6 @@ def to_beam_search_params(self, max_tokens: int, default_sampling_params: dict) 
         begin_token=extra_args.get("begin_token"),
         end_token=extra_args.get("end_token"),
         # Absent → None: the coordinator resolves the backend-appropriate
-        # default (Trie: "fill"; Constraint Tables: None).
+        # default (ordinary Beam: "fill"; Constraint Tables: None).
         catalog_strategy=extra_args.get("catalog_strategy"),
     )

@@ -14,7 +14,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 DESCRIPTION = """Launch a local OpenAI-compatible API server for vllm-gr.
 
 This wraps vLLM's standard OpenAI API server; the vllm-gr beam-search and
-catalog-constrained generation patches are loaded automatically via the vLLM
+Worker-owned constraint generation patches are loaded automatically via the vLLM
 general plugin. Useful for serving OneRec-style checkpoints.
 """
 

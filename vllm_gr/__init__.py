@@ -16,7 +16,7 @@ point ``vllm_gr.plugin:register``.
 After the GR adapter / recommend runtime was removed, the only public symbol
 re-exported here is :class:`GRLLM`, which is now a thin subclass of vLLM's
 :class:`~vllm.entrypoints.llm.LLM` providing offline beam search with optional
-catalog-constrained generation (the OneRec path).
+Worker-owned Constraint Table generation (the OneRec path).
 """
 
 from typing import Any

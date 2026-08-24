@@ -7,10 +7,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeAlias
 
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_FORMAT,
+    DEFAULT_BEAM_MAX_DECODE_STEPS,
+    DEFAULT_CONSTRAINT_MAX_TOP_K,
     GR_CONFIG_SCHEMA_VERSION,
     BeamConfig,
     ConstraintTableConfig,
@@ -18,6 +20,7 @@ from vllm_gr.config.models import (
 )
 
 GR_CONFIG_KEY: Final = "vllm_gr"
+GRConfigInput: TypeAlias = str | Path | Mapping[str, object] | GRConfig
 _TOP_LEVEL_KEYS = frozenset({"schema_version", "beam", "constraint_table", "attention_backend"})
 _BEAM_KEYS = frozenset({"max_width", "max_decode_steps", "graph_enabled"})
 _CONSTRAINT_TABLE_KEYS = frozenset(
@@ -51,6 +54,8 @@ def _reject_unknown(mapping: Mapping[str, object], allowed: frozenset[str], name
 def gr_config_from_mapping(raw: object) -> GRConfig:
     mapping = _mapping(raw, "configuration")
     _reject_unknown(mapping, _TOP_LEVEL_KEYS, "configuration")
+    if "schema_version" not in mapping:
+        raise ValueError("vllm-gr configuration requires schema_version")
 
     beam_raw = _mapping(mapping.get("beam", {}), "beam")
     _reject_unknown(beam_raw, _BEAM_KEYS, "beam")
@@ -59,7 +64,7 @@ def gr_config_from_mapping(raw: object) -> GRConfig:
 
     beam = BeamConfig(
         max_width=beam_raw.get("max_width"),
-        max_decode_steps=beam_raw.get("max_decode_steps", 3),
+        max_decode_steps=beam_raw.get("max_decode_steps", DEFAULT_BEAM_MAX_DECODE_STEPS),
         graph_enabled=beam_raw.get("graph_enabled", True),
     )
     table = ConstraintTableConfig(
@@ -69,7 +74,7 @@ def gr_config_from_mapping(raw: object) -> GRConfig:
         format=table_raw.get("format", CONSTRAINT_TABLE_FORMAT),
         artifact_digest=table_raw.get("artifact_digest"),
         tokenizer_digest=table_raw.get("tokenizer_digest"),
-        max_top_k=table_raw.get("max_top_k", 128),
+        max_top_k=table_raw.get("max_top_k", DEFAULT_CONSTRAINT_MAX_TOP_K),
     )
     return GRConfig(
         schema_version=mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION),
@@ -110,7 +115,7 @@ def load_gr_config(path: str | Path) -> GRConfig:
     except ImportError as exc:  # pragma: no cover - packaging contract
         raise RuntimeError("PyYAML is required to read --vllm-gr-config") from exc
 
-    config_path = Path(path)
+    config_path = Path(path).expanduser()
     try:
         text = config_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -121,14 +126,44 @@ def load_gr_config(path: str | Path) -> GRConfig:
         raise ValueError(f"invalid vllm-gr YAML {str(config_path)!r}: {exc}") from exc
     if raw is None:
         raise ValueError(f"vllm-gr config {str(config_path)!r} is empty")
+    if isinstance(raw, Mapping):
+        table_raw = raw.get("constraint_table")
+        if isinstance(table_raw, Mapping):
+            artifact_path_raw = table_raw.get("path")
+            if isinstance(artifact_path_raw, str) and artifact_path_raw.strip():
+                artifact_path = Path(artifact_path_raw).expanduser()
+                if not artifact_path.is_absolute():
+                    artifact_path = config_path.parent / artifact_path
+                normalized_raw = dict(raw)
+                normalized_table = dict(table_raw)
+                normalized_table["path"] = str(artifact_path.resolve(strict=False))
+                normalized_raw["constraint_table"] = normalized_table
+                raw = normalized_raw
     return gr_config_from_mapping(raw)
+
+
+def normalize_gr_config_input(value: GRConfigInput) -> GRConfig:
+    """Normalize one Driver-side Python configuration input.
+
+    Only YAML inputs have a directory against which Artifact paths can be
+    resolved. Mapping and ``GRConfig`` inputs therefore retain the common
+    requirement that ``constraint_table.path`` is absolute.
+    """
+
+    if isinstance(value, GRConfig):
+        return value
+    if isinstance(value, (str, Path)):
+        return load_gr_config(value)
+    if isinstance(value, Mapping):
+        return gr_config_from_mapping(value)
+    raise TypeError(
+        f"vllm_gr_config must be a YAML path, mapping, or GRConfig; got {type(value).__name__}"
+    )
 
 
 def _reject_legacy_keys(additional_config: Mapping[object, object]) -> None:
     legacy = sorted(
-        key
-        for key in additional_config
-        if isinstance(key, str) and key.startswith("vllm_gr_")
+        key for key in additional_config if isinstance(key, str) and key.startswith("vllm_gr_")
     )
     if legacy:
         rendered = ", ".join(repr(key) for key in legacy)

@@ -276,7 +276,7 @@ def test_beam_session_raises_when_beam_max_width_unconfigured() -> None:
 
     The scheduler freezes the paged cache at the prefix for beam decode
     requests, so running them without the beam KV pool would silently
-    compute wrong attention; a RuntimeError pointing at --beam-max-width
+    compute wrong attention; a RuntimeError pointing at beam.max_width
     is the only safe outcome.
     """
     runner = SimpleNamespace(
@@ -293,7 +293,7 @@ def test_beam_session_raises_when_beam_max_width_unconfigured() -> None:
         }
     }
 
-    with pytest.raises(RuntimeError, match="beam_max_width"):
+    with pytest.raises(RuntimeError, match=r"beam\.max_width"):
         common._get_or_create_beam_session(
             runner,
             beam_data,

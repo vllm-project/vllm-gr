@@ -43,4 +43,5 @@ class CUDABackendProvider:
             import_module("vllm_gr.v1.attention.backends.beam_attn_gpu"),
         )
 
+
 CUDA_BACKEND = CUDABackendProvider()

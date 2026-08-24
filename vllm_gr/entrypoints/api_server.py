@@ -5,7 +5,7 @@
 
 After removing the GR adapter / recommend runtime, this is a thin wrapper
 around vLLM's standard ``vllm.entrypoints.openai.api_server``. The beam-search
-and catalog-constrained generation patches needed by the OneRec serving path
+and Worker-owned constraint generation patches needed by the OneRec serving path
 are applied via the vLLM general plugin (``vllm_gr.plugin:register``) and do
 not require any custom engine wiring here.
 """

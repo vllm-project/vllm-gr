@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import math
 import time
 from collections.abc import AsyncGenerator, Mapping
 
@@ -23,12 +24,12 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
-from vllm_gr.constraints import BeamConstraintCoordinator, ParentCandidateBuilder
-from vllm_gr.constraints.models import CandidateLayout
-from vllm_gr.constraints.strategies import (
-    validate_constraint_generation_limits,
-    validate_constraint_table_protocol,
+from vllm_gr.config import (
+    CONSTRAINT_TABLE_MAX_GENERATION_STEPS,
+    GRConfig,
 )
+from vllm_gr.constraints import ParentCandidateBuilder
+from vllm_gr.constraints.models import CandidateLayout
 from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
@@ -39,6 +40,61 @@ logger = init_logger(__name__)
 
 _dp_rank_counter = 0
 _dp_rank_lock = asyncio.Lock()
+
+
+def _validate_serving_constraint_options(
+    gr_config: GRConfig,
+    *,
+    temperature: object,
+    catalog_strategy: str | None,
+) -> tuple[float, str | None]:
+    if not gr_config.constraint_table.enabled:
+        return float(temperature), catalog_strategy
+    if catalog_strategy is not None:
+        raise ValueError(
+            f"catalog_strategy is not applicable to constraint_table; got {catalog_strategy!r}"
+        )
+    if (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not math.isfinite(float(temperature))
+        or temperature < 0
+    ):
+        raise ValueError(
+            "constraint_table temperature must be a finite non-negative number, "
+            f"got {temperature!r}"
+        )
+    return float(temperature), None
+
+
+def _validate_serving_constraint_capacity(
+    gr_config: GRConfig,
+    *,
+    beam_width: int,
+    max_generate_steps: int,
+) -> None:
+    if not gr_config.constraint_table.enabled:
+        return
+    max_width = gr_config.beam.max_width
+    if max_width is None:
+        raise RuntimeError("enabled constraint_table is missing configured beam.max_width")
+    if beam_width > max_width:
+        raise ValueError(
+            "constraint_table beam_width must be <= configured beam.max_width "
+            f"{max_width}, got {beam_width}"
+        )
+    if max_generate_steps > gr_config.beam.max_decode_steps:
+        raise ValueError(
+            "constraint_table generated steps must be <= configured "
+            f"beam.max_decode_steps {gr_config.beam.max_decode_steps}, "
+            f"got {max_generate_steps}"
+        )
+    if max_generate_steps > CONSTRAINT_TABLE_MAX_GENERATION_STEPS:
+        raise ValueError(
+            "constraint_table protocol supports at most "
+            f"{CONSTRAINT_TABLE_MAX_GENERATION_STEPS} generated steps, "
+            f"got {max_generate_steps}"
+        )
 
 
 # return rank for next beam search request in a round-robin manner across the data parallel ranks
@@ -226,22 +282,31 @@ async def beam_search(
     begin_token = params.begin_token
     end_token = params.end_token
     catalog_strategy = getattr(params, "catalog_strategy", None)
-    constraint_coordinator = getattr(self.models, "constraint_coordinator", None)
-    if constraint_coordinator is None:
-        constraint_coordinator = BeamConstraintCoordinator(False)
+    gr_config = getattr(self.models, "_gr_config", None)
+    if isinstance(gr_config, GRConfig):
+        constraints_enabled = gr_config.constraint_table.enabled
+    else:
+        constraints_enabled = bool(getattr(self.models, "constraints_enabled", False))
+        if constraints_enabled:
+            raise RuntimeError(
+                "constraint_table serving frontend is missing its validated GRConfig"
+            )
+        gr_config = GRConfig()
 
     # Frontend filtering is gone; an explicit legacy strategy is rejected when
     # Worker constraints are enabled.
     try:
-        catalog_strategy = constraint_coordinator.resolve_catalog_strategy(catalog_strategy)
+        temperature, catalog_strategy = _validate_serving_constraint_options(
+            gr_config,
+            temperature=temperature,
+            catalog_strategy=catalog_strategy,
+        )
     except ValueError as exc:
-        raise VLLMValidationError(
-            str(exc),
-            parameter="catalog_strategy",
-            value=catalog_strategy,
-        ) from exc
+        parameter = "catalog_strategy" if catalog_strategy is not None else "temperature"
+        value = catalog_strategy if catalog_strategy is not None else temperature
+        raise VLLMValidationError(str(exc), parameter=parameter, value=value) from exc
 
-    _is_constrained = constraint_coordinator.enabled
+    _is_constrained = constraints_enabled
 
     # All beams from the same logical beam search will share the same priority value
     # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
@@ -357,10 +422,9 @@ async def beam_search(
         )
 
     if _is_constrained:
-        # Constraint Tables are a fixed 3-level FSM; requesting more steps than
-        # the Worker can run is a hard error, never a silent fallback.
         try:
-            validate_constraint_generation_limits(
+            _validate_serving_constraint_capacity(
+                gr_config,
                 beam_width=beam_width,
                 max_generate_steps=max_tokens - pre_calc,
             )
@@ -369,19 +433,6 @@ async def beam_search(
 
     # Check once if the engine supports batch submission / beam fork.
     use_beam_request = hasattr(self.engine_client, "beam_request_step_update")
-
-    # Constraint Tables generate candidates in the Worker from a beam-request
-    # session (step0 prefill via EngineCore ADD_BATCH cache hook, step1/2 decode
-    # via beam_request_step_update).  The _add_batch_step fallback cannot express
-    # constraint_step + beam_suffix, so a client without the beam protocol must
-    # fail fast — never silently degrade.
-    validate_constraint_table_protocol(
-        is_constraint_table=_is_constrained,
-        beam_protocol_available=use_beam_request,
-        required=(
-            "an engine client implementing beam_request_step_update (EngineCore beam sessions)"
-        ),
-    )
 
     prev_beam_internal_ids: list[str] = []
     fork_info: list[tuple[int, int]] | None = None
@@ -536,29 +587,23 @@ async def beam_search(
                             )
                         )
 
-                    constraint_coordinator.add_parent_candidates(
-                        candidate_builder,
+                    candidate_builder.add_parent(
                         parent_index=b_idx,
                         parent_cumulative_logprob=current_beam.cum_logprob,
                         token_ids=token_ids_pos,
-                        logprobs=logprobs_pos,
+                        local_logprobs=logprobs_pos,
                         ranks=ranks_pos,
                         decoded_tokens=decoded_pos,
-                        valid_token_ids=None,
-                        candidate_strategy=catalog_strategy,
                     )
             else:
                 for b_idx, current_beam in enumerate(all_beams):
-                    constraint_coordinator.add_parent_candidates(
-                        candidate_builder,
+                    candidate_builder.add_parent(
                         parent_index=b_idx,
                         parent_cumulative_logprob=current_beam.cum_logprob,
                         token_ids=[],
-                        logprobs=[],
+                        local_logprobs=[],
                         ranks=None,
                         decoded_tokens=None,
-                        valid_token_ids=None,
-                        candidate_strategy=catalog_strategy,
                     )
         else:
             # Baseline execution path for prefill / batch loops
@@ -595,28 +640,22 @@ async def beam_search(
                         token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
                             extract_and_dedup_flat_logprobs(flat, logprobs_num)
                         )
-                    constraint_coordinator.add_parent_candidates(
-                        candidate_builder,
+                    candidate_builder.add_parent(
                         parent_index=i,
                         parent_cumulative_logprob=current_beam.cum_logprob,
                         token_ids=token_ids_pos,
-                        logprobs=logprobs_pos,
+                        local_logprobs=logprobs_pos,
                         ranks=ranks_pos,
                         decoded_tokens=decoded_pos,
-                        valid_token_ids=None,
-                        candidate_strategy=catalog_strategy,
                     )
                 else:
-                    constraint_coordinator.add_parent_candidates(
-                        candidate_builder,
+                    candidate_builder.add_parent(
                         parent_index=i,
                         parent_cumulative_logprob=current_beam.cum_logprob,
                         token_ids=[],
-                        logprobs=[],
+                        local_logprobs=[],
                         ranks=None,
                         decoded_tokens=None,
-                        valid_token_ids=None,
-                        candidate_strategy=catalog_strategy,
                     )
 
         candidate_batch = candidate_builder.build()

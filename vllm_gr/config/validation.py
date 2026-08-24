@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_FORMAT,
+    DEFAULT_BEAM_MAX_DECODE_STEPS,
     GR_CONFIG_SCHEMA_VERSION,
-    _BEAM_MAX_DECODE_STEPS_DEFAULT,
     ConstraintTableBackend,
     GRAttentionBackend,
 )
@@ -19,8 +20,7 @@ _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 def validate_schema_version(value: object) -> int:
     if isinstance(value, bool) or value != GR_CONFIG_SCHEMA_VERSION:
         raise ValueError(
-            f"unsupported vllm-gr schema_version {value!r}; "
-            f"expected {GR_CONFIG_SCHEMA_VERSION}"
+            f"unsupported vllm-gr schema_version {value!r}; expected {GR_CONFIG_SCHEMA_VERSION}"
         )
     return GR_CONFIG_SCHEMA_VERSION
 
@@ -52,6 +52,11 @@ def validate_constraint_table_path(value: object) -> str | None:
         raise ValueError("vllm-gr constraint_table.path must be a string or null")
     if not value.strip():
         raise ValueError("vllm-gr constraint_table.path must not be empty")
+    if not Path(value).is_absolute():
+        raise ValueError(
+            "vllm-gr constraint_table.path must be absolute; relative paths are only "
+            "supported in YAML and are resolved against the YAML file directory"
+        )
     return value
 
 
@@ -118,13 +123,10 @@ def validate_beam_max_width(value: object) -> int | None:
 
 def validate_beam_max_decode_steps(value: object) -> int:
     return _validate_positive_int(
-        value if value is not None else _BEAM_MAX_DECODE_STEPS_DEFAULT,
+        value if value is not None else DEFAULT_BEAM_MAX_DECODE_STEPS,
         "beam.max_decode_steps",
     )
 
 
 def validate_max_top_k(value: object) -> int:
-    normalized = _validate_positive_int(value, "constraint_table.max_top_k")
-    if normalized > 256:
-        raise ValueError("vllm-gr constraint_table.max_top_k must be <= 256")
-    return normalized
+    return _validate_positive_int(value, "constraint_table.max_top_k")

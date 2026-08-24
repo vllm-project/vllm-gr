@@ -9,7 +9,7 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.worker.constraint_hook import apply_constrained_sample_override
+from vllm_gr.v1.worker.constraint_hook import try_sample_constrained
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
@@ -52,21 +52,16 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
 
 def make_patched_sample_gpu(_orig_sample):
-    """Wrap the GPU ``_sample`` to run Constraint Tables on raw logits.
-
-    The original sampling runs first (it maps the proxy sampling metadata and
-    produces the unconstrained sampler output); constrained rows are then
-    overwritten in place with ``rec_constrained_topk`` results (issue #246,
-    N3).  Pure-completion and Trie-beam steps short-circuit untouched.
-    """
+    """Bypass the ordinary GPU sampler for pure Constraint Table batches."""
     if getattr(_orig_sample, _WORKER_SAMPLE_PATCH_MARKER, False):
         return _orig_sample
 
     @wraps(_orig_sample)
     def patched_sample(self, logits, spec_decode_metadata=None):
-        sampler_output = _orig_sample(self, logits, spec_decode_metadata)
-        apply_constrained_sample_override(self, logits, sampler_output)
-        return sampler_output
+        constrained_output = try_sample_constrained(self, logits, spec_decode_metadata)
+        if constrained_output is not None:
+            return constrained_output
+        return _orig_sample(self, logits, spec_decode_metadata)
 
     setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
     return patched_sample

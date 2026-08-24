@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Platform-neutral Constraint Tables raw-logits hook (issue #246).
+"""Platform-neutral Constraint Tables raw-logits sampler (issue #246).
 
-Constraint Tables generate candidates in the Worker at the raw-logits boundary,
-not in the frontend: the sampler's ``_sample(logits, ...)`` is wrapped so that,
-after the original sampling runs, every *constrained* row of the sampler output
-is overwritten in place with the ``rec_constrained_topk`` operator's fixed-width
-``W`` result.  ``_beam_collapse_bookkeeping`` / ``_remux_logprobs_tensors``
-(model_runner_common) then need zero changes: they derive ``actual_K`` from the
-logprob tensor width, which this hook shrinks to ``W`` (so ``W*W`` per session
-row, matching the transmission contract P2).
+Pure constrained batches bypass vLLM's ordinary sampler and construct a fresh,
+fixed-width ``SamplerOutput`` directly from ``ConstraintBackend.select()``.
+Ordinary and chunk-only batches still use the unmodified platform sampler.
+``_beam_collapse_bookkeeping`` derives ``actual_K`` from the direct output's
+width ``W`` (so decode produces ``W*W`` candidates per logical request).
 
 Wire contract (P2):
 
@@ -24,9 +21,8 @@ Guards:
 
 - ``constraint_step`` must be in ``(0, 1, 2)`` — a Constraint Table request
   never degrades to unconstrained sampling (P6).
-- A constrained step must not share the sampler output with unconstrained
-  logprobs rows, and all constrained rows must share one ``beam_width``
-  (mixed-batch / mixed-width routing is P8 scope).
+- A constrained step must not share logits rows with unconstrained requests,
+  and all constrained rows must share one ``beam_width`` (mixed routing is P8).
 - The operator is only invoked on the last prefill chunk (``W_logits == 1``);
   intermediate chunks carry no logits rows and keep the normal dummy path.
 """
@@ -34,12 +30,17 @@ Guards:
 from __future__ import annotations
 
 import operator
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.constraints.backend import ConstraintMetadata
+from vllm_gr.constraints.backend import (
+    INVALID_LOGIT,
+    ConstraintMetadata,
+    effective_temperatures,
+)
 
 logger = init_logger(__name__)
 
@@ -48,8 +49,11 @@ if TYPE_CHECKING:
 
 # Fixed 3-level FSM: constrained prefill (0) plus two constrained decode steps.
 _VALID_CONSTRAINT_STEPS = (0, 1, 2)
+_MIN_CONSTRAINT_PREFIX_WIDTH = len(_VALID_CONSTRAINT_STEPS)
 
 _DEFAULT_TEMPERATURE = 1.0
+
+ConstrainedRow = tuple[Any, int, int, dict[str, Any]]
 
 
 def validate_constraint_step(step: Any) -> int:
@@ -79,7 +83,7 @@ def validate_constraint_step(step: Any) -> int:
 def collect_constrained_rows(
     request_row_configs: Sequence[Any],
     beam_data: dict[str, Any],
-) -> list[tuple[Any, int, int, dict[str, Any]]]:
+) -> list[ConstrainedRow]:
     """Locate constrained requests and their sampler/logits row ranges.
 
     Walks ``request_row_configs`` with the same ``gpu_row_cursor`` traversal as
@@ -93,7 +97,7 @@ def collect_constrained_rows(
     ``is_constrained`` request's ``constraint_step`` is validated, including
     chunk-only visits, so an out-of-range step fails fast.
     """
-    collected: list[tuple[Any, int, int, dict[str, Any]]] = []
+    collected: list[ConstrainedRow] = []
     gpu_row_cursor = 0
     for req_id, _, W_logits, *_ in request_row_configs:
         mdata = beam_data.get(req_id) if req_id is not None else None
@@ -117,7 +121,7 @@ def collect_constrained_rows(
 
 
 def build_sequence_group_for_step(
-    rows: Sequence[tuple[Any, int, int, dict[str, Any]]],
+    rows: Sequence[ConstrainedRow],
     device: Any,
     step: int,
 ) -> torch.Tensor:
@@ -131,9 +135,21 @@ def build_sequence_group_for_step(
     the request actually carries (a global counter inference would hide this).
     """
     step = validate_constraint_step(step)
+    max_step = _MIN_CONSTRAINT_PREFIX_WIDTH
+    for _, _, _, mdata in rows:
+        request_steps = mdata.get("max_decode_steps") or 0
+        if request_steps > max_step:
+            max_step = request_steps
+
     if step == 0:
+        for req_id, _, W_logits, _ in rows:
+            if W_logits != 1:
+                raise RuntimeError(
+                    f"constrained prefill request {req_id!r} has {W_logits} logits rows, "
+                    "expected exactly 1"
+                )
         row_count = sum(W_logits for _, _, W_logits, _ in rows)
-        return torch.zeros([row_count, 2], dtype=torch.int32, device=device)
+        return torch.zeros([row_count, max_step], dtype=torch.int32, device=device)
 
     widths = {mdata["beam_width"] for _, _, _, mdata in rows}
     if len(widths) != 1:
@@ -142,12 +158,6 @@ def build_sequence_group_for_step(
             "mixed-width Constraint Table batches are not supported yet (P8)"
         )
     width = next(iter(widths))
-
-    max_step = max(2, step)
-    for _, _, _, mdata in rows:
-        request_steps = mdata.get("max_decode_steps") or 0
-        if request_steps > max_step:
-            max_step = request_steps
 
     flat: list[int] = []
     for req_id, _, W_logits, mdata in rows:
@@ -181,41 +191,85 @@ def _temperatures_for_rows(runner: Any, rows: Sequence[int], device: Any) -> tor
     s_meta = getattr(getattr(runner, "input_batch", None), "sampling_metadata", None)
     temps = getattr(s_meta, "temperature", None) if s_meta is not None else None
     if isinstance(temps, torch.Tensor) and temps.numel() > 0:
-        temps = temps.detach().float().to(device)
-        if temps.numel() == 1:
-            return temps
-        if temps.numel() >= max(rows) + 1:
-            return temps.index_select(0, torch.tensor(rows, dtype=torch.long, device=temps.device))
+        prepared = temps.detach().to(device=device, dtype=torch.float32).reshape(-1)
+        if prepared.numel() == 1:
+            return effective_temperatures(prepared).contiguous()
+        if prepared.numel() >= max(rows) + 1:
+            row_start = rows[0]
+            row_end = row_start + len(rows)
+            if list(rows) == list(range(row_start, row_end)):
+                selected = prepared[row_start:row_end]
+            else:
+                selected = prepared.index_select(
+                    0,
+                    torch.tensor(rows, dtype=torch.long, device=prepared.device),
+                )
+            return effective_temperatures(selected).contiguous()
     return torch.tensor([_DEFAULT_TEMPERATURE], dtype=torch.float32, device=device)
+
+
+def _prefix_width(mdata: dict[str, Any]) -> int:
+    request_steps = mdata.get("max_decode_steps") or 0
+    return max(_MIN_CONSTRAINT_PREFIX_WIDTH, int(request_steps))
+
+
+def _expanded_global_rows(rows: Sequence[ConstrainedRow]) -> list[int]:
+    return [
+        global_row
+        for _, row_start, W_logits, _ in rows
+        for global_row in range(row_start, row_start + W_logits)
+    ]
+
+
+def _group_logits(logits: torch.Tensor, rows: Sequence[ConstrainedRow]) -> torch.Tensor:
+    """Return a view for contiguous groups, copying only interleaved groups."""
+
+    first_start = rows[0][1]
+    expected_start = first_start
+    for _, row_start, W_logits, _ in rows:
+        if row_start != expected_start:
+            return torch.cat(
+                [logits[start : start + count] for _, start, count, _ in rows],
+                dim=0,
+            )
+        expected_start += W_logits
+    return logits[first_start:expected_start]
 
 
 def run_constrained_partition(
     runner: Any,
     logits: torch.Tensor,
-    rows: Sequence[tuple[Any, int, int, dict[str, Any]]],
+    rows: Sequence[ConstrainedRow],
     width: int,
     backend: Any,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """Run the constrained operator on every constrained row group.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+    """Run one Backend call per ``(step, prefix width)`` partition."""
 
-    Each request is run independently (its own sequence_group geometry and
-    ``constraint_step``), so requests at different FSM steps can share one
-    scheduler step.  The operator output rows are returned in the order of the
-    global sampler/logits row indices collected in ``global_rows``.
-    """
-    device = getattr(runner, "device", logits.device)
-    top_tokens_parts: list[torch.Tensor] = []
-    top_logprobs_parts: list[torch.Tensor] = []
-    global_rows: list[int] = []
-
-    for req_id, row_start, W_logits, mdata in rows:
-        step = validate_constraint_step(mdata.get("constraint_step", 0))
-        prefix_token_ids = build_sequence_group_for_step(
-            [(req_id, row_start, W_logits, mdata)], device, step
+    device = logits.device
+    global_rows = _expanded_global_rows(rows)
+    expected_rows = list(range(logits.shape[0]))
+    if global_rows != expected_rows:
+        raise RuntimeError(
+            "constrained logits row mapping must cover every logits row exactly once; "
+            f"mapped={global_rows}, logits_rows={logits.shape[0]}"
         )
-        group_rows = list(range(row_start, row_start + W_logits))
+
+    grouped: dict[tuple[int, int], list[ConstrainedRow]] = defaultdict(list)
+    for row in rows:
+        mdata = row[3]
+        step = validate_constraint_step(mdata.get("constraint_step", 0))
+        grouped[(step, _prefix_width(mdata))].append(row)
+
+    parts: list[tuple[list[int], Any]] = []
+    for (step, _), group in grouped.items():
+        group_rows = _expanded_global_rows(group)
+        prefix_token_ids = build_sequence_group_for_step(
+            group,
+            device,
+            step,
+        )
         result = backend.select(
-            logits[group_rows],
+            _group_logits(logits, group),
             ConstraintMetadata(
                 prefix_token_ids=prefix_token_ids,
                 temperatures=_temperatures_for_rows(runner, group_rows, device),
@@ -223,80 +277,82 @@ def run_constrained_partition(
                 top_k=width,
             ),
         )
-        top_tokens_parts.append(result.token_ids)
-        top_logprobs_parts.append(result.logprobs)
-        global_rows.extend(group_rows)
+        parts.append((group_rows, result))
 
-    return (
-        torch.cat(top_tokens_parts, dim=0),
-        torch.cat(top_logprobs_parts, dim=0),
-        global_rows,
-    )
+    if len(parts) == 1:
+        _, result = parts[0]
+        return result.token_ids, result.logprobs, result.valid_mask, global_rows
+
+    first_result = parts[0][1]
+    shape = (logits.shape[0], width)
+    top_tokens = torch.empty(shape, dtype=first_result.token_ids.dtype, device=device)
+    top_logprobs = torch.empty(shape, dtype=first_result.logprobs.dtype, device=device)
+    valid_mask = torch.empty(shape, dtype=torch.bool, device=device)
+    for part_rows, result in parts:
+        row_indices = torch.tensor(part_rows, dtype=torch.long, device=device)
+        top_tokens.index_copy_(0, row_indices, result.token_ids)
+        top_logprobs.index_copy_(0, row_indices, result.logprobs)
+        valid_mask.index_copy_(0, row_indices, result.valid_mask)
+    return top_tokens, top_logprobs, valid_mask, global_rows
 
 
-def patch_sampler_output_for_constrained(
-    sampler_output: Any,
-    global_rows: Sequence[int],
+def build_constrained_sampler_output(
     top_tokens: torch.Tensor,
     top_logprobs: torch.Tensor,
+    valid_mask: torch.Tensor,
     width: int,
-) -> None:
-    """Overwrite constrained sampler-output rows with operator results.
+) -> Any:
+    """Construct the fixed-width vLLM output without resizing sampler storage."""
 
-    Writes the operator ``[rows, width]`` result in place over the sampled
-    token / logprob tensors for ``global_rows``, then shrinks the logprob
-    tensors to width ``width`` so ``_beam_collapse_bookkeeping`` derives
-    ``actual_K == width`` (it reads the tensor width, not a request field).
-    The explicit ``.to(...)`` calls protect against dtype/device drift between
-    the operator (int32/float32 on the runner device) and the sampler tensors.
-    """
-    lp_tensors = sampler_output.logprobs_tensors
-    if lp_tensors is None or lp_tensors.logprobs is None:
+    expected_shape = (top_tokens.shape[0], width)
+    if tuple(top_tokens.shape) != expected_shape:
         raise RuntimeError(
-            "constrained rows require logprobs in the sampler output, but "
-            "logprobs_tensors.logprobs is None; check sampling_params.logprobs"
+            f"constraint token_ids shape {tuple(top_tokens.shape)} must be {expected_shape}"
         )
-    if lp_tensors.logprobs.shape[1] < width:
+    if top_tokens.dtype != torch.int32:
+        raise RuntimeError(f"constraint token_ids must be int32, got {top_tokens.dtype}")
+    if tuple(top_logprobs.shape) != expected_shape:
         raise RuntimeError(
-            f"sampler logprob width {lp_tensors.logprobs.shape[1]} is smaller "
-            f"than constrained beam_width {width}; sampling_params.logprobs "
-            "must be at least beam_width"
+            f"constraint logprobs shape {tuple(top_logprobs.shape)} must be {expected_shape}"
+        )
+    if top_logprobs.dtype != torch.float32:
+        raise RuntimeError(f"constraint logprobs must be float32, got {top_logprobs.dtype}")
+    if valid_mask.shape != top_logprobs.shape:
+        raise RuntimeError(
+            f"constraint valid_mask shape {tuple(valid_mask.shape)} must match "
+            f"logprobs shape {tuple(top_logprobs.shape)}"
+        )
+    if valid_mask.dtype != torch.bool:
+        raise RuntimeError(f"constraint valid_mask must be bool, got {valid_mask.dtype}")
+    if valid_mask.device != top_logprobs.device:
+        raise RuntimeError(
+            f"constraint valid_mask device {valid_mask.device} must match "
+            f"logprobs device {top_logprobs.device}"
+        )
+    if top_tokens.device != top_logprobs.device:
+        raise RuntimeError(
+            f"constraint token_ids device {top_tokens.device} must match "
+            f"logprobs device {top_logprobs.device}"
         )
 
-    rows_idx = torch.tensor(global_rows, dtype=torch.long, device=top_tokens.device)
+    # valid_mask is the Backend validity contract. INVALID_LOGIT is its stable
+    # encoding in the existing sampler/remux wire format.
+    wire_logprobs = top_logprobs.masked_fill(~valid_mask, INVALID_LOGIT)
 
-    # Shrink the logprob tensors to width W BEFORE the in-place scatter.  A
-    # ``resize_`` reinterprets the flat storage, so doing it after a scatter
-    # would misalign the rows; done first, the first ``num_rows * W`` storage
-    # elements are exactly the row-aligned ``[:, :W]`` slice, which is what
-    # ``_beam_collapse_bookkeeping`` needs (it derives ``actual_K`` from the
-    # tensor width).
-    num_rows = lp_tensors.logprobs.shape[0]
-    lp_tensors.logprobs.resize_(num_rows, width)
-    if lp_tensors.logprob_token_ids is not None:
-        lp_tensors.logprob_token_ids.resize_(num_rows, width)
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 
-    st_ids = sampler_output.sampled_token_ids
-    if st_ids is not None:
-        best_tokens = top_tokens[:, 0].to(st_ids.dtype)
-        if st_ids.dim() == 2:
-            st_ids[rows_idx, 0] = best_tokens
-        else:
-            st_ids[rows_idx] = best_tokens
-
-    # ``logprob_token_ids`` is nullable in the sampler-output contract (the
-    # beam-collapse remux in model_runner_common guards it the same way); only
-    # the logprobs tensor is mandatory.  When the sampler omits it, the
-    # constrained candidates simply have no token-id side-channel.
-    if lp_tensors.logprob_token_ids is not None:
-        lp_tensors.logprob_token_ids[rows_idx, :width] = top_tokens.to(
-            lp_tensors.logprob_token_ids.dtype
-        )
-    lp_tensors.logprobs[rows_idx, :width] = top_logprobs.to(lp_tensors.logprobs.dtype)
-
-    ranks = getattr(lp_tensors, "selected_token_ranks", None)
-    if ranks is not None:
-        ranks[rows_idx] = torch.zeros(len(global_rows), dtype=ranks.dtype, device=ranks.device)
+    return SamplerOutput(
+        sampled_token_ids=top_tokens[:, :1].contiguous(),
+        logprobs_tensors=LogprobsTensors(
+            logprob_token_ids=top_tokens,
+            logprobs=wire_logprobs,
+            selected_token_ranks=torch.zeros(
+                top_tokens.shape[0],
+                dtype=torch.int64,
+                device=top_tokens.device,
+            ),
+        ),
+    )
 
 
 def _validate_homogeneous_step(
@@ -305,11 +361,9 @@ def _validate_homogeneous_step(
 ) -> None:
     """Reject a constrained step that shares rows with unconstrained logprobs.
 
-    The whole logprob tensor is resized to the constrained ``W``, which would
-    corrupt unconstrained rows; a constrained request next to any
-    non-constrained logprobs row is a hard error (mixed-batch routing is P8).
-    Rows without logits (``W_logits == 0``, e.g. regular completion decodes)
-    keep the existing dummy path and are not part of this guard.
+    The direct constrained output owns every logits row and has one fixed
+    candidate width. A non-constrained logits row therefore cannot share this
+    path. Rows without logits (``W_logits == 0``) are not part of the guard.
     """
     for req_id, _, W_logits, *_ in request_row_configs:
         if W_logits == 0:
@@ -323,21 +377,21 @@ def _validate_homogeneous_step(
             )
 
 
-def apply_constrained_sample_override(
+def try_sample_constrained(
     runner: Any,
-    logits: torch.Tensor,
-    sampler_output: Any,
-) -> None:
-    """Override constrained sampler-output rows with operator results.
+    logits: torch.Tensor | None,
+    spec_decode_metadata: Any = None,
+) -> Any | None:
+    """Return a direct constrained output, or ``None`` for the normal sampler.
 
-    Short-circuits for pure-completion and Trie-beam steps (no constrained
+    Short-circuits for pure-completion and ordinary Beam steps (no constrained
     rows).  Requires the runner to carry ``_current_beam_data`` (from
     ``make_patched_execute_model``) and ``_current_scheduler_output`` (its
     ``_gr_request_row_configs``), both published before sampling runs.
     """
     beam_data = getattr(runner, "_current_beam_data", None)
     if not beam_data:
-        return
+        return None
     scheduler_output = getattr(runner, "_current_scheduler_output", None)
     request_row_configs = (
         getattr(scheduler_output, "_gr_request_row_configs", None)
@@ -345,11 +399,16 @@ def apply_constrained_sample_override(
         else None
     )
     if not request_row_configs:
-        return
+        return None
 
     rows = collect_constrained_rows(request_row_configs, beam_data)
     if not rows:
-        return
+        return None
+
+    if logits is None:
+        raise RuntimeError("constrained sampling requires raw logits, got None")
+    if spec_decode_metadata is not None:
+        raise RuntimeError("constraint_table does not support speculative decoding")
 
     _validate_homogeneous_step(request_row_configs, beam_data)
 
@@ -375,9 +434,18 @@ def apply_constrained_sample_override(
             "received constrained Beam metadata while constraint_table is disabled; "
             "unconstrained sampling is forbidden"
         )
-    top_tokens, top_logprobs, global_rows = run_constrained_partition(
+
+    update_async_tokens = getattr(
+        getattr(runner, "input_batch", None),
+        "update_async_output_token_ids",
+        None,
+    )
+    if callable(update_async_tokens):
+        update_async_tokens()
+
+    top_tokens, top_logprobs, valid_mask, global_rows = run_constrained_partition(
         runner, logits, rows, width, backend
     )
-    patch_sampler_output_for_constrained(
-        sampler_output, global_rows, top_tokens, top_logprobs, width
-    )
+    if global_rows != list(range(logits.shape[0])):
+        raise RuntimeError("direct constrained output rows must remain in global logits order")
+    return build_constrained_sampler_output(top_tokens, top_logprobs, valid_mask, width)

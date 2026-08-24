@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
 from typing import Any
 
 import torch
@@ -15,11 +14,9 @@ from vllm_gr.beam_search_decision_utils import (
 from vllm_gr.ops.sliced_logits import (
     compute_sliced_logits,
     get_rank_vocab_bounds,
-    get_vocab_slice_config,
     is_vocab_slice_enabled,
     set_vocab_slice_config,
 )
-from vllm_gr.utils.catalog import Catalog
 
 
 class MockLMHead(nn.Module):  # type: ignore[misc]
@@ -131,41 +128,6 @@ def test_token_id_remapping() -> None:
     assert list(seg_ids_small_offset) == [2200, 2200]
 
     # Reset config
-    set_vocab_slice_config(None, None)
-    assert not is_vocab_slice_enabled()
-
-
-def test_catalog_slice_config(tmp_path: Any) -> None:
-    set_vocab_slice_config(None, None)
-    assert not is_vocab_slice_enabled()
-
-    class DummyTokenizer:
-        def convert_tokens_to_ids(self, tokens: Any) -> Any:
-            mapping = {
-                "<|sid_begin|>": 1,
-                "<s_a_100>": 1000,
-                "<s_b_200>": 1200,
-                "<s_c_500>": 2499,
-                "<|sid_end|>": 2,
-            }
-            if isinstance(tokens, list):
-                return [mapping.get(t, None) for t in tokens]
-            return mapping.get(tokens, None)
-
-    catalog_data = [["<|sid_begin|>", "<s_a_100>", "<s_b_200>", "<s_c_500>", "<|sid_end|>"]]
-    catalog_file = tmp_path / "test_catalog.json"
-    catalog_file.write_text(json.dumps(catalog_data))
-
-    cat = Catalog(DummyTokenizer())
-    cat.load(str(catalog_file))
-
-    assert is_vocab_slice_enabled()
-    assert cat.vocab_offset == 1000
-    assert cat.vocab_slice_size == 1500  # 2499 - 1000 + 1
-    offset, slice_size, _ = get_vocab_slice_config()
-    assert offset == 1000
-    assert slice_size == 1500
-
     set_vocab_slice_config(None, None)
     assert not is_vocab_slice_enabled()
 
@@ -297,39 +259,3 @@ def test_quantized_lm_head_fallback() -> None:
     assert torch.allclose(sliced_logits, ref_sliced, atol=1e-5, rtol=1e-5)
     # Ensure pre-sliced weight proxy was NOT created for quantized head
     assert not hasattr(quant_head, "_sliced_weight")
-
-
-def test_validation_vocab_offset_and_slice_size() -> None:
-    import pytest
-
-    from vllm_gr.config.validation import (
-        validate_vocab_offset,
-        validate_vocab_slice_size,
-    )
-
-    # Valid values
-    assert validate_vocab_offset(0) == 0
-    assert validate_vocab_offset("1000") == 1000
-    assert validate_vocab_offset(None) is None
-
-    assert validate_vocab_slice_size(1500) == 1500
-    assert validate_vocab_slice_size("24000") == 24000
-    assert validate_vocab_slice_size(None) is None
-
-    # Invalid negative offset
-    with pytest.raises(ValueError, match="vocab_offset"):
-        validate_vocab_offset(-10)
-
-    # Invalid non-positive slice size
-    with pytest.raises(ValueError, match="vocab_slice_size"):
-        validate_vocab_slice_size(0)
-
-    with pytest.raises(ValueError, match="vocab_slice_size"):
-        validate_vocab_slice_size(-100)
-
-    # Invalid types
-    with pytest.raises(ValueError, match="vocab_offset"):
-        validate_vocab_offset("abc")
-
-    with pytest.raises(ValueError, match="vocab_slice_size"):
-        validate_vocab_slice_size(True)

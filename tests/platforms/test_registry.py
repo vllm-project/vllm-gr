@@ -43,10 +43,6 @@ class FakeProvider:
     def get_attention_execution(self) -> Any:
         return object()
 
-    def create_constrained_topk_execution(self, *, device: Any = None) -> None:
-        del device
-        return None
-
 
 def setup_function() -> None:
     _reset_backend_registry_for_tests()
@@ -176,39 +172,3 @@ def test_provider_class_and_missing_methods_are_rejected() -> None:
 
     with pytest.raises(InvalidBackendProviderError, match="required callable"):
         register_backend(IncompleteProvider())
-
-
-def test_provider_missing_only_constrained_topk_execution_is_rejected() -> None:
-    """A provider that has every required method but the new one must be refused.
-
-    Registration-time validation must not let such a provider through and fail
-    later with an ``AttributeError`` at the call site.
-    """
-
-    class IncompleteProvider:
-        device_type = "incomplete"
-
-        def check_environment(self) -> dict[str, str]:
-            return {}
-
-        def apply_runtime_patches(self, *, force: bool = False) -> int:
-            del force
-            return 0
-
-        def get_model_runner_hooks(self) -> Any:
-            return object()
-
-        def get_attention_execution(self) -> Any:
-            return object()
-
-    # Deliberately a structurally-invalid provider: typing it as Any keeps
-    # strict mypy from rejecting the call site (the point is that the runtime
-    # validation — not the type system — must refuse it).
-    provider: Any = IncompleteProvider()
-
-    with pytest.raises(
-        InvalidBackendProviderError, match="create_constrained_topk_execution"
-    ) as exc_info:
-        register_backend(provider)
-
-    assert "missing=('create_constrained_topk_execution',)" in str(exc_info.value)

@@ -21,7 +21,11 @@ def compute_tokenizer_digest(tokenizer: Any) -> str:
 
     normalized: list[tuple[str, int]] = []
     for token, token_id in vocab.items():
-        if not isinstance(token, str) or isinstance(token_id, bool) or not isinstance(token_id, int):
+        if (
+            not isinstance(token, str)
+            or isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+        ):
             raise ValueError("tokenizer vocabulary must map strings to integer token IDs")
         normalized.append((token, token_id))
     normalized.sort(key=lambda item: (item[1], item[0]))

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -16,10 +15,12 @@ from vllm_gr.constraints.artifact import load_constraint_table_artifact
 from vllm_gr.constraints.backend import (
     INVALID_LOGIT,
     ConstraintBackend,
+    ConstraintBackendInfo,
     ConstraintMetadata,
 )
 from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
 from vllm_gr.constraints.npu_backend import (
+    NPU_CONSTRAINT_MAX_TOP_K,
     NPUConstraintBackend,
     resolve_npu_constraint_op,
 )
@@ -79,9 +80,9 @@ def _ready_cases(table: ConstraintTable) -> list[tuple[int, list[int], int, int]
         raise ValueError("constraint Artifact has no step-2 candidate for its first pair")
     c = int(table.prefix2_values[begin2])
     return [
-        (0, [0, 0], a, len(table.first_token_ids)),
-        (1, [a, 0], b, end1 - begin1),
-        (2, [a, b], c, end2 - begin2),
+        (0, [0, 0, 0], a, len(table.first_token_ids)),
+        (1, [a, 0, 0], b, end1 - begin1),
+        (2, [a, b, 0], c, end2 - begin2),
     ]
 
 
@@ -147,7 +148,7 @@ def run_npu_ready_check(
     for step, prefix, expected_token, valid_count in cases:
         try:
             logits = torch.full(
-                (1, backend.info.vocab_size),
+                (1, backend.info.table.vocab_size),
                 -10.0,
                 dtype=dtype,
                 device=device,
@@ -177,11 +178,11 @@ def run_npu_ready_check(
             raise RuntimeError(
                 "NPU constraint readiness failed: "
                 f"step={step}, dtype={dtype}, top_k={top_k}, device={device}, "
-                f"artifact_digest={backend.info.artifact_digest}: {exc}"
+                f"artifact_digest={backend.info.table.artifact_digest}: {exc}"
             ) from exc
 
 
-def _upload_npu_backend(
+def _create_npu_constraint_backend(
     table: ConstraintTable,
     *,
     device: torch.device,
@@ -199,8 +200,8 @@ def _upload_npu_backend(
             device_tables[name] = torch.from_numpy(host_copy).to(device=device)
         _synchronize_npu(device)
         allocator_delta = max(0, _npu_memory_allocated(device) - before)
-        info = replace(
-            table.info,
+        info = ConstraintBackendInfo(
+            table=table.info,
             max_top_k=max_top_k,
             device_memory_bytes=allocator_delta,
         )
@@ -230,16 +231,27 @@ def load_constraint_backend(
     device: str | torch.device,
     vocab_size: int,
     dtype: torch.dtype,
-    max_rows: int,
 ) -> ConstraintBackend | None:
     """Construct one independent Backend for one Worker ModelRunner."""
 
     if not config.enabled:
         return None
-    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows <= 0:
-        raise ValueError(f"constraint max_rows must be positive, got {max_rows!r}")
     if config.path is None or config.artifact_digest is None or config.tokenizer_digest is None:
         raise ValueError("enabled constraint table configuration is incomplete")
+
+    target_device = _device(device)
+    if config.backend is ConstraintTableBackend.NPU:
+        if target_device.type != "npu":
+            raise RuntimeError(
+                f"NPU constraint backend requires an NPU model device, got {target_device}"
+            )
+        if config.max_top_k > NPU_CONSTRAINT_MAX_TOP_K:
+            raise ValueError(
+                "NPU constraint backend supports max_top_k <= "
+                f"{NPU_CONSTRAINT_MAX_TOP_K}, got {config.max_top_k}"
+            )
+    elif config.backend is not ConstraintTableBackend.CPU:
+        raise RuntimeError(f"unsupported constraint table backend {config.backend!r}")
 
     table = load_constraint_table_artifact(
         config.path,
@@ -248,27 +260,20 @@ def load_constraint_backend(
         expected_vocab_size=vocab_size,
         expected_format=config.format,
     )
-    info = replace(table.info, max_top_k=config.max_top_k)
-    table = ConstraintTable(
-        **{name: getattr(table, name) for name in TABLE_NAMES},
-        info=info,
-    )
-    target_device = _device(device)
     if config.backend is ConstraintTableBackend.CPU:
-        return CPUConstraintBackend(table)
-    if config.backend is not ConstraintTableBackend.NPU:
-        raise RuntimeError(f"unsupported constraint table backend {config.backend!r}")
-    if target_device.type != "npu":
-        raise RuntimeError(
-            f"NPU constraint backend requires an NPU model device, got {target_device}"
+        info = ConstraintBackendInfo(
+            table=table.info,
+            max_top_k=config.max_top_k,
+            device_memory_bytes=0,
         )
-    backend = _upload_npu_backend(
+        return CPUConstraintBackend(table, info=info)
+    backend = _create_npu_constraint_backend(
         table,
         device=target_device,
         dtype=dtype,
         max_top_k=config.max_top_k,
     )
-    # NPUConstraintBackend does not retain ``table``; this is the last Host
-    # owner and is intentionally released before Worker readiness.
+    # NPU creation completed upload and readiness without retaining ``table``;
+    # release the Worker's last Host-table owner now.
     del table
     return backend

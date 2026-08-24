@@ -55,7 +55,17 @@ async def beam_search_test(loops: int) -> None:
         enable_log_requests=False,
         max_logprobs=2 * beam_width,
         gpu_memory_utilization=gpu_memory_utilization,
-        additional_config={"vllm_gr_beam_max_width": beam_width},
+        additional_config={
+            "vllm_gr": {
+                "schema_version": 1,
+                "beam": {
+                    "max_width": beam_width,
+                    "max_decode_steps": 3,
+                    "graph_enabled": True,
+                },
+                "constraint_table": {"enabled": False},
+            }
+        },
     )
 
     async with build_async_engine_client_from_engine_args(engine_args) as engine_client:

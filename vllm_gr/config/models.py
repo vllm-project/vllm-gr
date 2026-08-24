@@ -8,11 +8,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-
 GR_CONFIG_SCHEMA_VERSION = 1
 CONSTRAINT_TABLE_FORMAT = "constraint_table_v1"
-_BEAM_MAX_DECODE_STEPS_DEFAULT = 3
-_CONSTRAINT_MAX_TOP_K_DEFAULT = 128
+CONSTRAINT_TABLE_MAX_GENERATION_STEPS = 3
+DEFAULT_BEAM_MAX_DECODE_STEPS = 3
+DEFAULT_CONSTRAINT_MAX_TOP_K = 128
 
 
 class GRAttentionBackend(str, Enum):
@@ -33,7 +33,7 @@ class BeamConfig:
     """Beam resource bounds shared by Driver and Workers."""
 
     max_width: int | None = None
-    max_decode_steps: int = _BEAM_MAX_DECODE_STEPS_DEFAULT
+    max_decode_steps: int = DEFAULT_BEAM_MAX_DECODE_STEPS
     graph_enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -70,7 +70,7 @@ class ConstraintTableConfig:
     format: str = CONSTRAINT_TABLE_FORMAT
     artifact_digest: str | None = None
     tokenizer_digest: str | None = None
-    max_top_k: int = _CONSTRAINT_MAX_TOP_K_DEFAULT
+    max_top_k: int = DEFAULT_CONSTRAINT_MAX_TOP_K
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -118,9 +118,7 @@ class ConstraintTableConfig:
                 if value is None
             ]
             if missing:
-                raise ValueError(
-                    "enabled vllm-gr constraint_table requires " + ", ".join(missing)
-                )
+                raise ValueError("enabled vllm-gr constraint_table requires " + ", ".join(missing))
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,15 +150,16 @@ class GRConfig:
             "attention_backend",
             validate_attention_backend(self.attention_backend),
         )
-        if (
-            self.constraint_table.enabled
-            and self.beam.max_width is not None
-            and self.constraint_table.max_top_k > self.beam.max_width
-        ):
-            raise ValueError(
-                "vllm-gr constraint_table.max_top_k must be <= beam.max_width "
-                f"({self.constraint_table.max_top_k} > {self.beam.max_width})"
-            )
+        if self.constraint_table.enabled:
+            if self.beam.max_width is None:
+                raise ValueError("enabled vllm-gr constraint_table requires beam.max_width")
+            if self.beam.max_width > self.constraint_table.max_top_k:
+                raise ValueError(
+                    "vllm-gr beam.max_width must be <= constraint_table.max_top_k when "
+                    "constraint_table is enabled "
+                    f"(beam.max_width={self.beam.max_width}, "
+                    f"constraint_table.max_top_k={self.constraint_table.max_top_k})"
+                )
 
     @property
     def beam_graph_active(self) -> bool:

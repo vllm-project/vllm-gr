@@ -127,34 +127,47 @@ def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(
     assert runner.input_batch is original_batch
 
 
-def test_gpu_sample_patch_runs_original_then_constraint_override(
+def test_gpu_sample_patch_bypasses_original_for_constrained_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_sample wrapper must sample first, then apply constrained rows."""
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
 
     events: list[str] = []
-    sample_output = object()
+    constrained_output = object()
 
     def original(self: Any, logits: Any, spec_decode_metadata: Any = None) -> Any:
-        assert logits == "logits"
         events.append("sample")
-        return sample_output
+        return object()
 
-    def override(self: Any, logits: Any, sampler_output: Any) -> None:
+    def direct(self: Any, logits: Any, spec_decode_metadata: Any) -> Any:
         assert self is runner
         assert logits == "logits"
-        assert sampler_output is sample_output
-        events.append("override")
+        assert spec_decode_metadata == "meta"
+        events.append("constraint")
+        return constrained_output
 
-    monkeypatch.setattr(gpu_patch, "apply_constrained_sample_override", override)
+    monkeypatch.setattr(gpu_patch, "try_sample_constrained", direct)
     wrapped = gpu_patch.make_patched_sample_gpu(original)
     assert getattr(wrapped, _WORKER_SAMPLE_PATCH_MARKER, False)
     assert gpu_patch.make_patched_sample_gpu(wrapped) is wrapped
 
     runner = SimpleNamespace()
-    assert wrapped(runner, "logits", "meta") is sample_output
-    assert events == ["sample", "override"]
+    assert wrapped(runner, "logits", "meta") is constrained_output
+    assert events == ["constraint"]
+
+
+def test_gpu_sample_patch_falls_back_to_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample_output = object()
+
+    def original(self: Any, logits: Any, spec_decode_metadata: Any = None) -> Any:
+        return sample_output
+
+    monkeypatch.setattr(gpu_patch, "try_sample_constrained", lambda *args: None)
+    wrapped = gpu_patch.make_patched_sample_gpu(original)
+
+    assert wrapped(SimpleNamespace(), "logits", None) is sample_output
 
 
 # ---------------------------------------------------------------------------

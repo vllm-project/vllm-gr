@@ -1,23 +1,24 @@
-# Using catalog to constrain recommendation results
+# Using a Constraint Table to constrain recommendation results
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Installation](#installation)
-- [Getting the Catalog](#getting-the-catalog)
+- [Building the Artifact](#building-the-artifact)
 - [Invoking the Server](#invoking-the-server)
 - [Invoking the Client](#invoking-the-client)
 
 ## Overview
 
-This example demonstrates using an items catalog to eliminate non-existing items given by the recommendation system.
-Limiting the available items increases accuracy and enables reducing the search space to get the same accuracy but with less latency.
+This example compiles an item catalog into the immutable six-table Artifact
+loaded by each Worker before it becomes ready. Limiting the available items
+increases accuracy and reduces the decoding search space.
 
 ## Installation
 
 - Refer to [quickstart.md](../../../docs/quickstart.md) for installation.
 
-## Getting the Catalog
+## Building the Artifact
 
 - Follow [Open One Rec Benchmark Dataset](../../../docs/benchmarks/README.md#open-one-rec-benchmark-dataset) for One Rec Benchmark Dataset retrieval.
 
@@ -31,20 +32,62 @@ Here's an example where `--dataset-path` must point to the directory containing 
 python benchmarks/open_one_rec/tools/convert_catalog.py \
     --dataset-path ./data \
     --output-path ${MyFolder}/catalog.json
+
+python tools/build_constraint_triples.py \
+    --catalog ${MyFolder}/catalog.json \
+    --output ${MyFolder}/constraint_triples.json \
+    --begin '<|sid_begin|>' \
+    --end '<|sid_end|>'
+
+python tools/build_constraint_table.py \
+    --triples ${MyFolder}/constraint_triples.json \
+    --model OpenOneRec/OneRec-1.7B \
+    --output ${MyFolder}/constraint_table.safetensors
 ```
+
+Copy the printed Artifact and tokenizer digests into
+`${MyFolder}/vllm_gr_config.yaml`:
+
+```yaml
+schema_version: 1
+beam:
+  max_width: 128
+  max_decode_steps: 3
+  graph_enabled: true
+constraint_table:
+  enabled: true
+  backend: npu
+  path: /absolute/path/to/constraint_table.safetensors
+  format: constraint_table_v1
+  artifact_digest: sha256:...
+  tokenizer_digest: sha256:...
+  max_top_k: 128
+attention_backend: CUSTOM
+```
+
+Use `backend: cpu` to keep the six tables on Host while the model logits stay
+on their accelerator device.
+
+Relative `constraint_table.path` values in this YAML file are resolved against
+the directory containing the YAML file. The normalized absolute path is then
+sent to Workers; all Workers must be able to access that path.
+
+`constraint_table.max_top_k` must cover `beam.max_width`. The NPU backend
+supports `max_top_k <= 256`; the CPU backend has no framework-defined fixed
+upper limit.
 
 ## Invoking the Server
 
-- Add the catalog attribute to server invocation
+- Pass the single vLLM-GR configuration entry to the server.
 
 ```bash
  vllm-gr serve OpenOneRec/OneRec-1.7B \
+    --vllm-gr-config ${MyFolder}/vllm_gr_config.yaml \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \
     --max-num-batched-tokens 16384 \
-    --scheduling-policy priority \
-    --catalog-path ${MyFolder}/catalog.json
+    --scheduling-policy priority
 
 ```
 

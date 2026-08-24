@@ -23,8 +23,8 @@ if [[ -z "${DATASET_PATH:-}" || ! -d "$DATASET_PATH" ]]; then
   echo "Error: DATASET_PATH must point to local OpenOneRec benchmark data." >&2
   exit 1
 fi
-if [[ -z "${CATALOG_PATH:-}" || ! -f "$CATALOG_PATH" ]]; then
-  echo "Error: CATALOG_PATH must point to the local video catalog JSON." >&2
+if [[ -z "${VLLM_GR_CONFIG:-}" || ! -f "$VLLM_GR_CONFIG" ]]; then
+  echo "Error: VLLM_GR_CONFIG must point to the generated vLLM-GR YAML." >&2
   exit 1
 fi
 
@@ -79,7 +79,7 @@ p99_tpot_th="$P99_TPOT_THRESHOLD"
 
 echo "Using model: $MODEL_PATH"
 echo "Using dataset: $DATASET_PATH"
-echo "Using catalog: $CATALOG_PATH"
+echo "Using vLLM-GR config: $VLLM_GR_CONFIG"
 echo "Benchmark policy: $policy_name"
 echo "Device: $device"
 echo "Accuracy failures: $ACCURACY_FAILURE_MODE"
@@ -117,12 +117,9 @@ extract_numeric_value() {
 }
 
 echo "Running OneRec offline benchmark"
-# Single source of truth for the beam width driven by every client below
-# (--n).  The beam KV pool / captured graph width must cover it, so both are
-# derived from the same variable instead of an external environment override
-# (a missing override silently disabled the pool and corrupted beam decode).
+# The generated YAML uses the same width for the Beam pool and constraint
+# Top-K bound; every client below requests that width.
 beam_width=128
-beam_graph_args=(--beam-max-width "$beam_width")
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --gr \
   --model "$MODEL_PATH" \
@@ -132,9 +129,8 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --max-concurrency 1 \
   --use-beam-search \
   --task-type video \
-  --catalog-path "$CATALOG_PATH" \
+  --vllm-gr-config "$VLLM_GR_CONFIG" \
   --backend CUSTOM \
-  "${beam_graph_args[@]}" \
   --n "$beam_width")
 offline_status=$?
 printf '%s\n' "$output"
@@ -189,7 +185,7 @@ wait_for_server() {
 
 echo "Starting OneRec online server"
 vllm-gr serve \
-  "${beam_graph_args[@]}" \
+  --vllm-gr-config "$VLLM_GR_CONFIG" \
   --port "$run_port" \
   --seed 123 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
@@ -197,7 +193,6 @@ vllm-gr serve \
   --max_num_seqs 2048 \
   --max_num_batched_tokens 16384 \
   --scheduling-policy priority \
-  --catalog-path "$CATALOG_PATH" \
   --attention-backend CUSTOM \
   "$MODEL_PATH" &
 SERVER_PID=$!

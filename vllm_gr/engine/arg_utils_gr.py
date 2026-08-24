@@ -9,8 +9,8 @@ from typing import Final
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_gr.config import GRAttentionBackend, GRConfig
-from vllm_gr.config.parser import load_gr_config
+from vllm_gr.config import GRAttentionBackend, GRConfig, GRConfigInput
+from vllm_gr.config.parser import normalize_gr_config_input
 
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
@@ -23,12 +23,12 @@ _NESTED_ATTENTION_BACKEND_EXPLICIT_ATTR: Final = "_vllm_gr_nested_attention_back
 def _init_engine_args(
     self: EngineArgs,
     *args: object,
-    vllm_gr_config: str | None = None,
+    vllm_gr_config: GRConfigInput | None = None,
     **kwargs: object,
 ) -> None:
     """Accept the sole vLLM-GR configuration entry on the Python API path."""
     origin_engine_args_init(self, *args, **kwargs)
-    self.vllm_gr_config = vllm_gr_config
+    self._vllm_gr_config_input = vllm_gr_config
 
 
 def _nested_attention_backend_is_explicit(value: object) -> bool:
@@ -85,7 +85,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     raw_attention_config = getattr(args, "attention_config", None)
     nested_backend_is_explicit = _nested_attention_backend_is_explicit(raw_attention_config)
     engine_args = origin_from_cli_args(cls, args)
-    engine_args.vllm_gr_config = getattr(args, "vllm_gr_config", None)
+    engine_args._vllm_gr_config_input = getattr(args, "vllm_gr_config", None)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -171,15 +171,17 @@ def create_engine_config(self, usage_context=None, headless=False):
     # Parse the serialized value unconditionally. The YAML file is Driver-only;
     # Workers reconstruct exactly this normalized value from VllmConfig.
     existing_gr_config = GRConfig.from_vllm_config(config)
-    config_path = getattr(self, "vllm_gr_config", None)
-    file_gr_config = load_gr_config(config_path) if config_path is not None else existing_gr_config
+    config_input = getattr(self, "_vllm_gr_config_input", None)
+    input_gr_config = (
+        normalize_gr_config_input(config_input) if config_input is not None else existing_gr_config
+    )
     backend_is_explicit, backend_override = _explicit_gr_attention_backend(self)
     effective_gr_config = GRConfig(
-        schema_version=file_gr_config.schema_version,
-        beam=file_gr_config.beam,
-        constraint_table=file_gr_config.constraint_table,
+        schema_version=input_gr_config.schema_version,
+        beam=input_gr_config.beam,
+        constraint_table=input_gr_config.constraint_table,
         attention_backend=(
-            backend_override if backend_is_explicit else file_gr_config.attention_backend
+            backend_override if backend_is_explicit else input_gr_config.attention_backend
         ),
     )
     if effective_gr_config != existing_gr_config:
@@ -200,7 +202,7 @@ def create_engine_config(self, usage_context=None, headless=False):
 def engine_args_accepts_gr_values() -> bool:
     """Return whether :func:`patch_add_cli_args` is mounted.
 
-    The offline ``GRLLM`` Python API threads ``vllm_gr_config`` through
+    The offline ``GRLLM`` Python API threads its configuration input through
     ``LLM.__init__`` only when this patch is active.
     """
     return EngineArgs.__init__ is _init_engine_args

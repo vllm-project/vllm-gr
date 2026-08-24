@@ -9,7 +9,7 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.worker.constraint_hook import apply_constrained_sample_override
+from vllm_gr.v1.worker.constraint_hook import try_sample_constrained
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
@@ -79,9 +79,22 @@ def make_patched_sample_npu(_orig_sample):
 
     @wraps(_orig_sample)
     def patched_sample(self, *args, **kwargs):
-        sampler_output = _orig_sample(self, *args, **kwargs)
-        apply_constrained_sample_override(self, args[0], sampler_output)
-        return sampler_output
+        if args:
+            logits = args[0]
+            spec_decode_metadata = args[1] if len(args) > 1 else kwargs.get("spec_decode_metadata")
+        elif "logits" in kwargs:
+            logits = kwargs["logits"]
+            spec_decode_metadata = kwargs.get("spec_decode_metadata")
+        else:
+            return _orig_sample(self, *args, **kwargs)
+        constrained_output = try_sample_constrained(
+            self,
+            logits,
+            spec_decode_metadata,
+        )
+        if constrained_output is not None:
+            return constrained_output
+        return _orig_sample(self, *args, **kwargs)
 
     setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
     return patched_sample

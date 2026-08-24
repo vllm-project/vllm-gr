@@ -3,8 +3,8 @@
 
 """Frontend parsing of Constraint Table candidates (issue #246).
 
-The Worker overwrites the sampler output with the constrained top-k operator's
-fixed-width rows (padding = INVALID_LOGIT); ``_parse_step_logprobs`` must slice
+The Worker directly emits the constrained top-k operator's fixed-width rows
+(padding = INVALID_LOGIT); ``_parse_step_logprobs`` must slice
 them per parent, filter the padding by threshold, and never dedup.
 """
 
@@ -15,8 +15,6 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 from vllm.inputs import tokens_input
 from vllm.logprobs import FlatLogprobs
 
-from vllm_gr.constraints import BeamConstraintCoordinator
-from vllm_gr.constraints.strategies import ConstraintTableStrategy
 from vllm_gr.entrypoints.gr import _parse_step_logprobs
 
 INVALID_LOGIT = -1.0e20
@@ -32,10 +30,6 @@ def _beam(tokens: list[int], score: float = 0.0) -> BeamSearchSequence:
     beam._lp_parent = None
     beam._lp_step_data = None
     return beam
-
-
-def _coordinator() -> BeamConstraintCoordinator:
-    return BeamConstraintCoordinator(ConstraintTableStrategy("catalog.json"))
 
 
 def _result_with_flat(flat: object) -> SimpleNamespace:
@@ -63,9 +57,7 @@ def test_constrained_decode_parses_fixed_width_rows_per_parent() -> None:
         token=1,
         logprobs_num=2,
         fork_info_j=[(0, 11), (1, 12)],
-        catalog=None,
-        catalog_strategy="fill",
-        constraint_coordinator=_coordinator(),
+        constraints_enabled=True,
     )
 
     assert not is_error
@@ -95,9 +87,7 @@ def test_constrained_decode_empty_valid_parent_contributes_no_candidates() -> No
         token=1,
         logprobs_num=2,
         fork_info_j=[(0, 0), (1, 12)],
-        catalog=None,
-        catalog_strategy="fill",
-        constraint_coordinator=_coordinator(),
+        constraints_enabled=True,
     )
 
     assert not is_error
@@ -127,9 +117,7 @@ def test_constrained_prefill_parses_wide_segment_no_dedup() -> None:
         token=0,
         logprobs_num=3,
         fork_info_j=None,
-        catalog=None,
-        catalog_strategy="fill",
-        constraint_coordinator=_coordinator(),
+        constraints_enabled=True,
     )
 
     assert not is_error

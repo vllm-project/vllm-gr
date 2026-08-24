@@ -4,406 +4,382 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
-from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
-from vllm_gr.config.parser import (
-    ATTENTION_BACKEND_KEY,
-    BEAM_MAX_DECODE_STEPS_KEY,
-    CATALOG_PATH_KEY,
-    CONSTRAINT_BACKEND_KEY,
+from vllm_gr.config import (
+    DEFAULT_BEAM_MAX_DECODE_STEPS,
+    DEFAULT_CONSTRAINT_MAX_TOP_K,
+    BeamConfig,
+    ConstraintTableBackend,
+    ConstraintTableConfig,
+    GRAttentionBackend,
+    GRConfig,
 )
+from vllm_gr.config.parser import (
+    GR_CONFIG_KEY,
+    gr_config_from_mapping,
+    gr_config_to_mapping,
+    load_gr_config,
+    normalize_gr_config_input,
+)
+
+DIGEST = "sha256:" + "1" * 64
+TOKENIZER_DIGEST = "sha256:" + "2" * 64
+
+
+def _enabled_config() -> GRConfig:
+    return GRConfig(
+        beam=BeamConfig(max_width=128, max_decode_steps=3, graph_enabled=True),
+        constraint_table=ConstraintTableConfig(
+            enabled=True,
+            backend=ConstraintTableBackend.NPU,
+            path="/models/constraint_table.safetensors",
+            artifact_digest=DIGEST,
+            tokenizer_digest=TOKENIZER_DIGEST,
+            max_top_k=128,
+        ),
+    )
 
 
 def _vllm_config(additional_config: object | None = None) -> SimpleNamespace:
-    normalized = {} if additional_config is None else additional_config
-    return SimpleNamespace(additional_config=normalized)
+    return SimpleNamespace(additional_config={} if additional_config is None else additional_config)
 
 
-class _OpaqueAdditionalConfig:
-    """Upstream-compatible non-mapping additional configuration."""
-
-    def compute_hash(self) -> str:
-        return "opaque-config"
-
-
-def test_empty_vllm_config_uses_defaults() -> None:
-    config = GRConfig.from_vllm_config(_vllm_config())
-    assert config == GRConfig()
-    assert config.enabled is False
-
-
-def test_none_vllm_config_uses_defaults() -> None:
-    assert GRConfig.from_vllm_config(None) == GRConfig()
-
-
-def test_parses_known_keys_and_normalizes_backend() -> None:
-    config = GRConfig.from_vllm_config(
-        _vllm_config(
-            {
-                CATALOG_PATH_KEY: "/models/catalog.json",
-                ATTENTION_BACKEND_KEY: "custom",
-            }
-        )
-    )
-    assert config.catalog_path == "/models/catalog.json"
-    assert config.attention_backend is GRAttentionBackend.CUSTOM
-    assert config.enabled is True
-
-
-def test_constraint_backend_round_trip_and_default_elision() -> None:
-    config = GRConfig.from_vllm_config(
-        _vllm_config(
-            {
-                CATALOG_PATH_KEY: "/models/catalog.json",
-                CONSTRAINT_BACKEND_KEY: "constraint_table",
-            }
-        )
-    )
-    assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
-    assert config.enabled is True
-
-    vllm_config = _vllm_config()
-    config.write_to_vllm_config(vllm_config)
-    assert vllm_config.additional_config[CONSTRAINT_BACKEND_KEY] == "constraint_table"
-
-    GRConfig().write_to_vllm_config(vllm_config)
-    assert CONSTRAINT_BACKEND_KEY not in vllm_config.additional_config
-
-
-@pytest.mark.parametrize("value", [1, True, [], "unknown"])  # type: ignore[misc]
-def test_rejects_invalid_constraint_backend(value: object) -> None:
-    with pytest.raises(ValueError, match="constraint_backend"):
-        GRConfig.from_vllm_config(_vllm_config({CONSTRAINT_BACKEND_KEY: value}))
-
-
-def test_constraint_table_requires_catalog_path() -> None:
-    with pytest.raises(ValueError, match="requires catalog_path"):
-        GRConfig(constraint_backend=ConstraintBackend.CONSTRAINT_TABLE)
-
-
-def test_write_preserves_unrelated_additional_config() -> None:
-    vllm_config = _vllm_config({"unrelated": {"value": 1}})
-    GRConfig(
-        catalog_path="/models/catalog.json",
-        attention_backend=GRAttentionBackend.CUSTOM,
-    ).write_to_vllm_config(vllm_config)
-
-    assert vllm_config.additional_config == {
-        "unrelated": {"value": 1},
-        CATALOG_PATH_KEY: "/models/catalog.json",
-        ATTENTION_BACKEND_KEY: "CUSTOM",
-    }
-
-
-def test_write_removes_stale_gr_keys() -> None:
-    vllm_config = _vllm_config(
-        {
-            CATALOG_PATH_KEY: "/old/catalog.json",
-            ATTENTION_BACKEND_KEY: "CUSTOM",
-            "unrelated": True,
-        }
-    )
-    GRConfig().write_to_vllm_config(vllm_config)
-    assert vllm_config.additional_config == {"unrelated": True}
-
-
-@pytest.mark.parametrize("value", [1, True, [], {}])  # type: ignore[misc]
-def test_rejects_non_string_catalog_path(value: object) -> None:
-    with pytest.raises(ValueError, match="catalog_path"):
-        GRConfig.from_vllm_config(_vllm_config({CATALOG_PATH_KEY: value}))
-
-
-@pytest.mark.parametrize("value", ["", "   "])  # type: ignore[misc]
-def test_rejects_empty_catalog_path(value: str) -> None:
-    with pytest.raises(ValueError, match="must not be empty"):
-        GRConfig.from_vllm_config(_vllm_config({CATALOG_PATH_KEY: value}))
-
-
-@pytest.mark.parametrize("value", [1, True, [], "FLASH_ATTN"])  # type: ignore[misc]
-def test_rejects_invalid_attention_backend(value: object) -> None:
-    with pytest.raises(ValueError, match="attention_backend"):
-        GRConfig.from_vllm_config(_vllm_config({ATTENTION_BACKEND_KEY: value}))
-
-
-def test_parse_preserves_opaque_additional_config() -> None:
-    additional_config = _OpaqueAdditionalConfig()
-    vllm_config = _vllm_config(additional_config)
-
-    assert GRConfig.from_vllm_config(vllm_config) == GRConfig()
-    assert vllm_config.additional_config is additional_config
-
-
-def test_write_rejects_opaque_additional_config_when_gr_values_are_stored() -> None:
-    with pytest.raises(ValueError, match="must be a mutable mapping"):
-        GRConfig(catalog_path="/models/catalog.json").write_to_vllm_config(
-            _vllm_config(_OpaqueAdditionalConfig())
-        )
-
-
-def test_rejects_unknown_prefixed_key_but_preserves_unrelated_keys() -> None:
-    with pytest.raises(ValueError, match="vllm_gr_attenton_backend"):
-        GRConfig.from_vllm_config(
-            _vllm_config(
-                {
-                    "vllm_gr_attenton_backend": "CUSTOM",
-                    "unrelated": "preserved",
-                }
-            )
-        )
-
-
-def test_write_rejects_unknown_prefixed_key() -> None:
-    with pytest.raises(ValueError, match="unknown vLLM-GR"):
-        GRConfig().write_to_vllm_config(_vllm_config({"vllm_gr_unknown_option": True}))
-
-
-def test_direct_construction_validates_and_normalizes() -> None:
-    config = GRConfig(attention_backend="custom")
-    assert config.attention_backend is GRAttentionBackend.CUSTOM
-
-    with pytest.raises(ValueError, match="catalog_path"):
-        GRConfig(catalog_path=123)
-    with pytest.raises(ValueError, match="must not be empty"):
-        GRConfig(catalog_path="   ")
-    with pytest.raises(ValueError, match="attention_backend"):
-        GRConfig(attention_backend="FLASH_ATTN")
-
-
-def test_serialized_wire_config_round_trip() -> None:
-    vllm_config = _vllm_config({"unrelated": "preserved"})
-    expected = GRConfig(
-        catalog_path="/models/catalog.json",
-        attention_backend=GRAttentionBackend.CUSTOM,
-    )
+def test_nested_additional_config_round_trip() -> None:
+    expected = _enabled_config()
+    vllm_config = _vllm_config({"unrelated": True})
     expected.write_to_vllm_config(vllm_config)
 
-    json_round_trip = json.loads(json.dumps(vllm_config.additional_config))
-    restored = _vllm_config(json_round_trip)
-
-    assert GRConfig.from_vllm_config(restored) == expected
-    assert restored.additional_config["unrelated"] == "preserved"
-
-
-def test_engine_config_entrypoint_writes_typed_catalog_config() -> None:
-    from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-    vllm_config = _vllm_config({"unrelated": True})
-    engine_args = SimpleNamespace(
-        catalog_path="/models/catalog.json",
-        attention_backend=None,
-        attention_config=None,
-    )
-    with mock.patch(
-        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
-        return_value=vllm_config,
-    ):
-        result = create_engine_config(engine_args)
-
-    assert GRConfig.from_vllm_config(result) == GRConfig(catalog_path="/models/catalog.json")
-    assert result.additional_config["unrelated"] is True
-
-
-def test_engine_config_writes_constraint_backend_override() -> None:
-    from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-    vllm_config = _vllm_config()
-    engine_args = SimpleNamespace(
-        catalog_path="/models/catalog.json",
-        constraint_backend="constraint_table",
-        attention_backend=None,
-        attention_config=None,
-        model=None,
-    )
-    with mock.patch(
-        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
-        return_value=vllm_config,
-    ):
-        result = create_engine_config(engine_args)
-
-    assert GRConfig.from_vllm_config(result) == GRConfig(
-        catalog_path="/models/catalog.json",
-        constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+    assert set(vllm_config.additional_config) == {"unrelated", GR_CONFIG_KEY}
+    assert GRConfig.from_vllm_config(vllm_config) == expected
+    assert (
+        json.loads(json.dumps(vllm_config.additional_config))[GR_CONFIG_KEY]["constraint_table"][
+            "backend"
+        ]
+        == "npu"
     )
 
 
-def test_engine_config_merges_existing_backend_with_cli_catalog() -> None:
-    from vllm_gr.engine.arg_utils_gr import create_engine_config
+def test_worker_reconstructs_without_reading_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _enabled_config()
+    vllm_config = _vllm_config({GR_CONFIG_KEY: gr_config_to_mapping(config)})
 
-    vllm_config = _vllm_config({ATTENTION_BACKEND_KEY: "CUSTOM"})
-    engine_args = SimpleNamespace(
-        catalog_path="/models/catalog.json",
-        attention_backend=None,
-        attention_config=None,
+    def forbidden(path: object) -> GRConfig:
+        raise AssertionError("Worker attempted to read YAML")
+
+    monkeypatch.setattr("vllm_gr.config.parser.load_gr_config", forbidden)
+    assert GRConfig.from_vllm_config(vllm_config) == config
+
+
+def test_load_yaml_schema(tmp_path: Path) -> None:
+    path = tmp_path / "vllm_gr.yaml"
+    path.write_text(
+        """schema_version: 1
+beam:
+  max_width: 128
+  max_decode_steps: 3
+  graph_enabled: true
+constraint_table:
+  enabled: true
+  backend: npu
+  path: /models/constraint_table.safetensors
+  format: constraint_table_v1
+  artifact_digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+  tokenizer_digest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+  max_top_k: 128
+""",
+        encoding="utf-8",
     )
-    with mock.patch(
-        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
-        return_value=vllm_config,
-    ):
-        result = create_engine_config(engine_args)
+    assert load_gr_config(path) == _enabled_config()
 
-    assert GRConfig.from_vllm_config(result) == GRConfig(
-        catalog_path="/models/catalog.json",
-        attention_backend=GRAttentionBackend.CUSTOM,
+
+def test_normalize_python_config_inputs(tmp_path: Path) -> None:
+    expected = _enabled_config()
+    path = tmp_path / "vllm_gr.yaml"
+    path.write_text(
+        f"""schema_version: 1
+beam:
+  max_width: 128
+constraint_table:
+  enabled: true
+  backend: npu
+  path: /models/constraint_table.safetensors
+  artifact_digest: {DIGEST}
+  tokenizer_digest: {TOKENIZER_DIGEST}
+  max_top_k: 128
+""",
+        encoding="utf-8",
     )
 
+    assert normalize_gr_config_input(expected) is expected
+    assert normalize_gr_config_input(gr_config_to_mapping(expected)) == expected
+    assert normalize_gr_config_input(path) == expected
+    assert normalize_gr_config_input(str(path)) == expected
 
-def test_engine_config_merges_existing_catalog_with_cli_backend() -> None:
-    from vllm_gr.engine.arg_utils_gr import create_engine_config
 
-    vllm_config = _vllm_config({CATALOG_PATH_KEY: "/models/catalog.json"})
-    engine_args = SimpleNamespace(
-        catalog_path=None,
-        attention_backend="CUSTOM",
-        attention_config=None,
+def test_normalize_rejects_unsupported_python_input() -> None:
+    with pytest.raises(TypeError, match="YAML path, mapping, or GRConfig"):
+        normalize_gr_config_input(1)  # type: ignore[arg-type]
+
+
+def test_mapping_uses_shared_defaults() -> None:
+    config = gr_config_from_mapping({"schema_version": 1})
+
+    assert config.beam.max_decode_steps == DEFAULT_BEAM_MAX_DECODE_STEPS
+    assert config.constraint_table.max_top_k == DEFAULT_CONSTRAINT_MAX_TOP_K
+
+
+def test_load_yaml_resolves_artifact_path_against_yaml_directory(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    path = config_dir / "vllm_gr.yaml"
+    path.write_text(
+        f"""schema_version: 1
+beam:
+  max_width: {DEFAULT_CONSTRAINT_MAX_TOP_K}
+constraint_table:
+  enabled: true
+  path: ./artifacts/constraint_table.safetensors
+  artifact_digest: {DIGEST}
+  tokenizer_digest: {TOKENIZER_DIGEST}
+""",
+        encoding="utf-8",
     )
-    with mock.patch(
-        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
-        return_value=vllm_config,
-    ):
-        result = create_engine_config(engine_args)
 
-    assert GRConfig.from_vllm_config(result) == GRConfig(
-        catalog_path="/models/catalog.json",
-        attention_backend=GRAttentionBackend.CUSTOM,
-    )
+    config = load_gr_config(path)
+    expected = (config_dir / "artifacts/constraint_table.safetensors").resolve()
+
+    assert config.constraint_table.path == str(expected)
+    assert gr_config_to_mapping(config)["constraint_table"]["path"] == str(expected)
 
 
-def test_explicit_native_backend_clears_existing_gr_backend() -> None:
-    from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-    vllm_config = _vllm_config({ATTENTION_BACKEND_KEY: "CUSTOM"})
-    engine_args = SimpleNamespace(
-        catalog_path=None,
-        attention_backend="FLASH_ATTN",
-        attention_config=None,
-    )
-    with mock.patch(
-        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
-        return_value=vllm_config,
-    ):
-        result = create_engine_config(engine_args)
-
-    assert GRConfig.from_vllm_config(result).attention_backend is None
+def test_mapping_input_rejects_relative_artifact_path() -> None:
+    with pytest.raises(ValueError, match="path must be absolute"):
+        normalize_gr_config_input(
+            {
+                "schema_version": 1,
+                "beam": {"max_width": DEFAULT_CONSTRAINT_MAX_TOP_K},
+                "constraint_table": {
+                    "enabled": True,
+                    "path": "./constraint_table.safetensors",
+                    "artifact_digest": DIGEST,
+                    "tokenizer_digest": TOKENIZER_DIGEST,
+                },
+            }
+        )
 
 
-@pytest.mark.parametrize("raw_backend", ["auto", None])  # type: ignore[misc]
-def test_explicit_nested_auto_or_null_clears_existing_gr_backend(
-    raw_backend: object,
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"schema_version": 2}, "schema_version"),
+        ({"unknown": True}, "unknown"),
+        ({"constraint_table": {"enabled": True}}, "requires"),
+        (
+            {
+                "constraint_table": {
+                    "enabled": True,
+                    "backend": "cuda",
+                    "path": "/table",
+                    "artifact_digest": DIGEST,
+                    "tokenizer_digest": TOKENIZER_DIGEST,
+                }
+            },
+            "backend",
+        ),
+    ],
+)  # type: ignore[misc]
+def test_invalid_config_fails_before_runtime(
+    update: dict[str, object],
+    message: str,
 ) -> None:
-    """Explicit nested auto and JSON null both request native auto-selection."""
+    raw: dict[str, object] = {"schema_version": 1}
+    raw.update(update)
+    with pytest.raises(ValueError, match=message):
+        gr_config_from_mapping(raw)
+
+
+def test_digest_format_is_strict() -> None:
+    with pytest.raises(ValueError, match="64 lowercase"):
+        ConstraintTableConfig(
+            enabled=True,
+            path="/table",
+            artifact_digest="abc",
+            tokenizer_digest=TOKENIZER_DIGEST,
+        )
+
+
+def test_constraint_table_capacity_must_cover_beam_width() -> None:
+    with pytest.raises(ValueError, match="beam.max_width must be <="):
+        GRConfig(
+            beam=BeamConfig(max_width=128),
+            constraint_table=ConstraintTableConfig(
+                enabled=True,
+                path="/table",
+                artifact_digest=DIGEST,
+                tokenizer_digest=TOKENIZER_DIGEST,
+                max_top_k=64,
+            ),
+        )
+
+
+def test_constraint_table_capacity_may_exceed_beam_width() -> None:
+    config = GRConfig(
+        beam=BeamConfig(max_width=64),
+        constraint_table=ConstraintTableConfig(
+            enabled=True,
+            backend=ConstraintTableBackend.NPU,
+            path="/table",
+            artifact_digest=DIGEST,
+            tokenizer_digest=TOKENIZER_DIGEST,
+            max_top_k=512,
+        ),
+    )
+
+    assert config.constraint_table.max_top_k == 512
+
+
+def test_enabled_constraint_table_requires_beam_capacity() -> None:
+    with pytest.raises(ValueError, match="requires beam.max_width"):
+        GRConfig(
+            constraint_table=ConstraintTableConfig(
+                enabled=True,
+                path="/table",
+                artifact_digest=DIGEST,
+                tokenizer_digest=TOKENIZER_DIGEST,
+            ),
+        )
+
+
+def test_legacy_flat_keys_are_rejected() -> None:
+    with pytest.raises(ValueError, match="legacy"):
+        GRConfig.from_vllm_config(_vllm_config({"vllm_gr_beam_max_width": 128}))
+
+
+def test_only_one_gr_cli_entrypoint() -> None:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    from vllm_gr.engine.arg_utils_gr import (
-        add_cli_args,
-        create_engine_config,
-        from_cli_args,
-    )
-
-    def add_upstream_attention_config(
-        parser: FlexibleArgumentParser,
-    ) -> FlexibleArgumentParser:
-        def normalize_attention_config(value: str) -> SimpleNamespace:
-            backend = json.loads(value)["backend"]
-            return SimpleNamespace(backend=None if backend in ("auto", None) else backend)
-
-        parser.add_argument(
-            "--attention-config",
-            type=normalize_attention_config,
-            default=SimpleNamespace(backend=None),
-        )
-        return parser
+    from vllm_gr.engine.arg_utils_gr import add_cli_args
 
     parser = FlexibleArgumentParser()
     with mock.patch(
         "vllm_gr.engine.arg_utils_gr.origin_add_cli_args",
-        side_effect=add_upstream_attention_config,
+        side_effect=lambda value: value,
     ):
         add_cli_args(parser)
-    cli_args = parser.parse_args(["--attention-config", json.dumps({"backend": raw_backend})])
-    normalized_engine_args = SimpleNamespace(
+    gr_options = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+        if option.startswith("--vllm-gr")
+    }
+    assert gr_options == {"--vllm-gr-config"}
+    for removed in (
+        "--catalog-path",
+        "--constraint-backend",
+        "--beam-max-width",
+        "--beam-max-decode-steps",
+        "--no-beam-graph",
+    ):
+        assert removed not in parser._option_string_actions
+
+
+def test_create_engine_config_reads_yaml_and_writes_nested_value(tmp_path: Path) -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """schema_version: 1
+beam:
+  max_width: 4
+  max_decode_steps: 3
+  graph_enabled: false
+constraint_table:
+  enabled: false
+""",
+        encoding="utf-8",
+    )
+    engine_args = SimpleNamespace(
+        _vllm_gr_config_input=str(path),
         attention_backend=None,
-        attention_config=SimpleNamespace(backend=None),
+        attention_config=None,
+    )
+    target = _vllm_config({"unrelated": "kept"})
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+        return_value=target,
+    ):
+        result = create_engine_config(engine_args)
+    parsed = GRConfig.from_vllm_config(result)
+    assert parsed.beam == BeamConfig(max_width=4, graph_enabled=False)
+    assert result.additional_config["unrelated"] == "kept"
+
+
+@pytest.mark.parametrize("as_mapping", [False, True])
+def test_create_engine_config_accepts_python_config_objects(as_mapping: bool) -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    expected = _enabled_config()
+    config_input: object = gr_config_to_mapping(expected) if as_mapping else expected
+    engine_args = SimpleNamespace(
+        _vllm_gr_config_input=config_input,
+        attention_backend=None,
+        attention_config=None,
+    )
+    target = _vllm_config({"unrelated": "kept"})
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+        return_value=target,
+    ):
+        result = create_engine_config(engine_args)
+
+    assert GRConfig.from_vllm_config(result) == expected
+    assert result.additional_config["unrelated"] == "kept"
+
+
+def test_engine_args_stores_config_under_input_name() -> None:
+    from vllm_gr.engine.arg_utils_gr import _init_engine_args
+
+    expected = _enabled_config()
+    engine_args = SimpleNamespace()
+    with mock.patch("vllm_gr.engine.arg_utils_gr.origin_engine_args_init"):
+        _init_engine_args(engine_args, vllm_gr_config=expected)  # type: ignore[arg-type]
+
+    assert engine_args._vllm_gr_config_input is expected
+    assert not hasattr(engine_args, "vllm_gr_config")
+
+
+def test_cli_path_is_moved_to_engine_config_input() -> None:
+    from vllm_gr.engine.arg_utils_gr import from_cli_args
+
+    engine_args = SimpleNamespace()
+    args = SimpleNamespace(
+        attention_config=None,
+        vllm_gr_config="/configs/vllm_gr.yaml",
     )
     with mock.patch(
         "vllm_gr.engine.arg_utils_gr.origin_from_cli_args",
-        return_value=normalized_engine_args,
+        return_value=engine_args,
     ):
-        engine_args = from_cli_args(SimpleNamespace, cli_args)
+        result = from_cli_args(SimpleNamespace, args)
 
-    with mock.patch(
-        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
-        return_value=_vllm_config({ATTENTION_BACKEND_KEY: "CUSTOM"}),
-    ):
-        result = create_engine_config(engine_args)
-
-    assert GRConfig.from_vllm_config(result).attention_backend is None
+    assert result is engine_args
+    assert engine_args._vllm_gr_config_input == "/configs/vllm_gr.yaml"
+    assert not hasattr(engine_args, "vllm_gr_config")
 
 
-def test_engine_config_preserves_opaque_additional_config_without_gr_overrides() -> None:
-    from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-    additional_config = _OpaqueAdditionalConfig()
-    vllm_config = _vllm_config(additional_config)
-    engine_args = SimpleNamespace(
-        catalog_path=None,
-        attention_backend=None,
-        attention_config=None,
-    )
-    with mock.patch(
-        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
-        return_value=vllm_config,
-    ):
-        result = create_engine_config(engine_args)
-
-    assert GRConfig.from_vllm_config(result) == GRConfig()
-    assert result.additional_config is additional_config
-
-
-def test_engine_config_rejects_invalid_raw_gr_value_without_cli_override() -> None:
-    from vllm_gr.engine.arg_utils_gr import create_engine_config
-
-    engine_args = SimpleNamespace(
-        catalog_path=None,
-        attention_backend=None,
-        attention_config=None,
-    )
-    with (
-        mock.patch(
-            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
-            return_value=_vllm_config({ATTENTION_BACKEND_KEY: "INVALID"}),
-        ),
-        pytest.raises(ValueError, match="unsupported.*attention_backend"),
-    ):
-        create_engine_config(engine_args)
-
-
-def test_attention_selector_config_reader_propagates_validation_errors() -> None:
-    from vllm_gr.v1.ascend_compat import _get_current_gr_attention_backend
-
-    with (
-        mock.patch(
-            "vllm.config.get_current_vllm_config_or_none",
-            return_value=_vllm_config({ATTENTION_BACKEND_KEY: "INVALID"}),
-        ),
-        pytest.raises(ValueError, match="unsupported.*attention_backend"),
-    ):
-        _get_current_gr_attention_backend()
-
-
-def test_beam_max_decode_steps_defaults_to_onerec_sid_length() -> None:
-    """OneRec SID decode is max_tokens=5 minus begin/end → 3 steps."""
-    config = GRConfig.from_vllm_config(_vllm_config())
-    assert config.beam_max_decode_steps == 3
-
+def test_attention_marker_is_nested() -> None:
+    config = GRConfig(attention_backend=GRAttentionBackend.CUSTOM)
     vllm_config = _vllm_config()
     config.write_to_vllm_config(vllm_config)
-    assert BEAM_MAX_DECODE_STEPS_KEY not in vllm_config.additional_config
+    assert vllm_config.additional_config[GR_CONFIG_KEY]["attention_backend"] == "CUSTOM"
 
-    overridden = GRConfig(beam_max_decode_steps=8)
-    overridden.write_to_vllm_config(vllm_config)
-    assert vllm_config.additional_config[BEAM_MAX_DECODE_STEPS_KEY] == 8
-    assert GRConfig.from_vllm_config(vllm_config).beam_max_decode_steps == 8
+
+def test_default_config_does_not_claim_additional_config() -> None:
+    target = _vllm_config({"unrelated": 1})
+    GRConfig().write_to_vllm_config(target)
+    assert target.additional_config == {"unrelated": 1}

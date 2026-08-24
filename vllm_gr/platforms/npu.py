@@ -41,4 +41,5 @@ class NPUBackendProvider:
             import_module("vllm_gr.v1.attention.backends.beam_attn_npu"),
         )
 
+
 NPU_BACKEND = NPUBackendProvider()

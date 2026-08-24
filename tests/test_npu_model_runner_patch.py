@@ -134,17 +134,36 @@ def test_npu_sample_patch_is_signature_agnostic(
         events.append("sample")
         return sample_output
 
-    def override(self: Any, logits: Any, sampler_output: Any) -> None:
+    def direct(self: Any, logits: Any, spec_decode_metadata: Any) -> None:
         assert self is runner
         assert logits == "logits"
-        assert sampler_output is sample_output
-        events.append("override")
+        assert spec_decode_metadata == "extra"
+        events.append("constraint-check")
+        return None
 
-    monkeypatch.setattr(npu_patch, "apply_constrained_sample_override", override)
+    monkeypatch.setattr(npu_patch, "try_sample_constrained", direct)
     wrapped = npu_patch.make_patched_sample_npu(original)
     assert getattr(wrapped, _WORKER_SAMPLE_PATCH_MARKER, False)
     assert npu_patch.make_patched_sample_npu(wrapped) is wrapped
 
     runner = SimpleNamespace()
     assert wrapped(runner, "logits", "extra") is sample_output
-    assert events == ["sample", "override"]
+    assert events == ["constraint-check", "sample"]
+
+
+def test_npu_sample_patch_bypasses_original_for_constrained_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constrained_output = object()
+
+    def original(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("ordinary sampler must be bypassed")
+
+    monkeypatch.setattr(
+        npu_patch,
+        "try_sample_constrained",
+        lambda *args: constrained_output,
+    )
+    wrapped = npu_patch.make_patched_sample_npu(original)
+
+    assert wrapped(SimpleNamespace(), "logits", None) is constrained_output

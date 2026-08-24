@@ -116,8 +116,8 @@ def extract_constrained_segment(
 ]:
     """Extract one constrained candidate block with padding filtering.
 
-    Constraint Tables (issue #246) overwrite the sampler output with the
-    constrained top-k operator's fixed-width ``W`` rows.  Padding slots carry
+    Constraint Tables (issue #246) produce direct fixed-width ``W`` sampler
+    rows from the constrained top-k operator. Padding slots carry
     the finite ``INVALID_LOGIT`` (-1e20) sentinel — ``np.isfinite`` cannot
     detect it, so the magnitude threshold ``> INVALID_LOGIT / 2`` is the only
     reliable filter.  Remux padding is ``-inf``, which the same threshold

@@ -33,9 +33,7 @@ def _constraint_table_backend_active() -> bool:
 
     from vllm_gr.config import GRConfig
 
-    return GRConfig.from_vllm_config(
-        get_current_vllm_config_or_none()
-    ).constraint_table.enabled
+    return GRConfig.from_vllm_config(get_current_vllm_config_or_none()).constraint_table.enabled
 
 
 def _ensure_beam_state(self) -> None:

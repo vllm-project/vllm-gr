@@ -25,8 +25,6 @@ from vllm_gr.constraints.table import (
 )
 from vllm_gr.constraints.triples import ConstraintTriple, build_relations
 
-MAX_TOP_K = 256
-
 
 class ConstraintTableCompiler:
     """Compile triples offline; this class is never imported by a Worker."""
@@ -36,7 +34,7 @@ class ConstraintTableCompiler:
         tokenizer: Any,
         vocab_size: int,
         *,
-        tokenizer_digest: str = "uncomputed",
+        tokenizer_digest: str,
     ) -> None:
         if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 0:
             raise ValueError(f"vocab_size must be a positive integer, got {vocab_size!r}")
@@ -120,7 +118,7 @@ class ConstraintTableCompiler:
             **arrays,
             info=ConstraintTableInfo(
                 format=CONSTRAINT_TABLE_FORMAT,
-                artifact_digest="unpersisted",
+                artifact_digest=None,
                 tokenizer_digest=self.tokenizer_digest,
                 vocab_size=self.vocab_size,
                 max_prefix1_degree=max_prefix1_degree,

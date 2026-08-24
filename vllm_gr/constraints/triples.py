@@ -101,7 +101,7 @@ def validate_semantic_depth(tokens: Sequence[str]) -> None:
         raise ValueError(
             "Constraint Tables require exactly three semantic tokens per sequence "
             f"([s_a, s_b, s_c]) but got {len(tokens)}: {list(tokens)!r}. "
-            "Catalogs with arbitrary depth must use the Trie backend."
+            "Constraint Tables support exactly three semantic tokens."
         )
 
 

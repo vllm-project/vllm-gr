@@ -205,7 +205,7 @@ def _serving(engine_client: Any) -> SimpleNamespace:
     return SimpleNamespace(
         engine_client=engine_client,
         input_processor=SimpleNamespace(tokenizer=_Tokenizer()),
-        models=SimpleNamespace(catalog=None, model_name="test-model"),
+        models=SimpleNamespace(model_name="test-model"),
     )
 
 

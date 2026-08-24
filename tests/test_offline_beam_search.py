@@ -3,6 +3,7 @@
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 import multiprocessing
 import os
+import tempfile
 import time
 from typing import Any, Dict
 
@@ -55,20 +56,32 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     # to improve performance. Reflect that here when use_patch is True.
     max_logprobs = beam_width if use_patch else 2 * beam_width
 
-    with GRLLM(
-        model=model_name,
-        trust_remote_code=True,
-        max_logprobs=max_logprobs,
-        beam_max_width=beam_width,
-        attention_config={"backend": "CUSTOM"},
-        max_num_seqs=64,
-    ) as llm:
-        start = time.perf_counter()
-        for _ in range(max(1, loops)):
-            outputs = llm.beam_search(prompts, params)
-            assert len(outputs) == len(prompts)
-            assert len(outputs[0].sequences) == beam_width
-        end = time.perf_counter()
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as config_file:
+        config_file.write(
+            f"""schema_version: 1
+beam:
+  max_width: {beam_width}
+  max_decode_steps: 3
+  graph_enabled: true
+constraint_table:
+  enabled: false
+"""
+        )
+        config_file.flush()
+        with GRLLM(
+            model=model_name,
+            trust_remote_code=True,
+            max_logprobs=max_logprobs,
+            vllm_gr_config=config_file.name,
+            attention_config={"backend": "CUSTOM"},
+            max_num_seqs=64,
+        ) as llm:
+            start = time.perf_counter()
+            for _ in range(max(1, loops)):
+                outputs = llm.beam_search(prompts, params)
+                assert len(outputs) == len(prompts)
+                assert len(outputs[0].sequences) == beam_width
+            end = time.perf_counter()
     print(f"Elapsed mean: {(end - start) / max(1, loops):.4f}s")
 
 
