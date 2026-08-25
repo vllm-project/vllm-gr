@@ -37,17 +37,17 @@ def _load_setup_module() -> ModuleType:
     [
         (
             "cpu",
-            {"msgspec", "safetensors>=0.4.5"},
+            {"msgspec", "safetensors>=0.4.5", "PyYAML>=6.0"},
             {"vllm"},
         ),
         (
             "cuda",
-            {"msgspec", "safetensors>=0.4.5"},
+            {"msgspec", "safetensors>=0.4.5", "PyYAML>=6.0"},
             {"vllm"},
         ),
         (
             "npu",
-            {"msgspec", "safetensors>=0.4.5"},
+            {"msgspec", "safetensors>=0.4.5", "PyYAML>=6.0"},
             {"vllm"},
         ),
     ],

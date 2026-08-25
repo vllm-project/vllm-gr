@@ -9,7 +9,18 @@ from typing import Final
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
+from vllm_gr.config import (
+    ConstraintBackend,
+    GRAttentionBackend,
+    GRConfig,
+    GRConfigInput,
+    write_canonical_gr_config,
+)
+from vllm_gr.config.parser import (
+    GR_CONFIG_KEY,
+    KNOWN_GR_CONFIG_KEYS,
+    normalize_gr_config_input,
+)
 
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
@@ -24,6 +35,7 @@ def _init_engine_args(
     *args: object,
     catalog_path: str | None = None,
     constraint_backend: ConstraintBackend | str | None = None,
+    vllm_gr_config: GRConfigInput | None = None,
     **kwargs: object,
 ) -> None:
     """Accept the vllm-gr engine args on the Python-API construction path.
@@ -41,6 +53,7 @@ def _init_engine_args(
     origin_engine_args_init(self, *args, **kwargs)
     self.catalog_path = catalog_path
     self.constraint_backend = constraint_backend
+    self._vllm_gr_config_input = vllm_gr_config
 
 
 def _nested_attention_backend_is_explicit(value: object) -> bool:
@@ -98,6 +111,12 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help="Constraint implementation: trie (default) or constraint_table.",
     )
     model_group.add_argument(
+        "--vllm-gr-config",
+        type=str,
+        default=None,
+        help="Path to a schema-versioned vLLM-GR YAML config.",
+    )
+    model_group.add_argument(
         "--beam-max-width",
         type=int,
         default=None,
@@ -136,6 +155,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.constraint_backend = None
     if hasattr(args, "constraint_backend"):
         engine_args.constraint_backend = args.constraint_backend
+    engine_args._vllm_gr_config_input = getattr(args, "vllm_gr_config", None)
     for attr in ("beam_max_width", "beam_max_decode_steps"):
         setattr(engine_args, attr, getattr(args, attr, None))
     engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
@@ -223,67 +243,131 @@ def create_engine_config(self, usage_context=None, headless=False):
     _apply_npu_default_block_size(config)
     # Parse unconditionally so invalid raw vllm_gr_* options fail before
     # the EngineConfig is returned and before runtime execution begins.
+    additional_config = getattr(config, "additional_config", None)
+    canonical_in_additional_config = (
+        isinstance(additional_config, Mapping) and GR_CONFIG_KEY in additional_config
+    )
+    legacy_keys_in_additional_config = (
+        sorted(key for key in KNOWN_GR_CONFIG_KEYS if key in additional_config)
+        if isinstance(additional_config, Mapping)
+        else []
+    )
     existing_gr_config = GRConfig.from_vllm_config(config)
+    canonical_input = getattr(self, "_vllm_gr_config_input", None)
     catalog_path = getattr(self, "catalog_path", None)
     constraint_backend = getattr(self, "constraint_backend", None)
     backend_is_explicit, backend_override = _explicit_gr_attention_backend(self)
 
-    effective_catalog_path = (
-        catalog_path if catalog_path is not None else existing_gr_config.catalog_path
+    # GRLLM historically forwards its default ConstraintBackend.TRIE value.
+    # Treat that exact enum default as omitted so a canonical config can pass
+    # through GRLLM's **kwargs path without changing the legacy signature.
+    legacy_argument_present = (
+        catalog_path is not None
+        or (constraint_backend is not None and constraint_backend is not ConstraintBackend.TRIE)
+        or getattr(self, "beam_max_width", None) is not None
+        or getattr(self, "beam_max_decode_steps", None) is not None
+        or bool(getattr(self, "no_beam_graph", False))
+        or backend_is_explicit
     )
-    effective_constraint_backend = (
-        ConstraintBackend(constraint_backend)
-        if constraint_backend is not None
-        else existing_gr_config.constraint_backend
-    )
-    offset, slice_size = None, None
-    if effective_catalog_path is not None:
-        model_name = getattr(self, "model", None)
-        if model_name is not None:
-            from vllm_gr.utils.catalog import (
-                compute_catalog_slice_config,
+
+    if canonical_input is not None:
+        if canonical_in_additional_config:
+            raise ValueError(
+                "vllm_gr_config cannot be combined with an existing canonical "
+                "additional_config['vllm_gr']"
             )
-
-            trust_remote_code = bool(getattr(self, "trust_remote_code", False))
-            offset, slice_size = compute_catalog_slice_config(
-                effective_catalog_path,
-                model_name,
-                trust_remote_code=trust_remote_code,
+        if legacy_argument_present or legacy_keys_in_additional_config:
+            raise ValueError(
+                "canonical vllm_gr_config cannot be combined with legacy "
+                "vLLM-GR CLI, Python, or additional_config inputs"
             )
-            if offset is not None and slice_size is not None:
-                from vllm_gr.ops.sliced_logits import set_vocab_slice_config
+        input_gr_config = normalize_gr_config_input(canonical_input)
+        effective_gr_config = input_gr_config
+        canonical_source = True
+    elif canonical_in_additional_config:
+        if legacy_argument_present:
+            raise ValueError(
+                "canonical additional_config['vllm_gr'] cannot be combined "
+                "with legacy vLLM-GR CLI or Python inputs"
+            )
+        effective_gr_config = existing_gr_config
+        canonical_source = True
+    else:
+        canonical_source = False
 
-                set_vocab_slice_config(offset, slice_size)
+        effective_catalog_path = (
+            catalog_path if catalog_path is not None else existing_gr_config.catalog_path
+        )
+        effective_constraint_backend = (
+            ConstraintBackend(constraint_backend)
+            if constraint_backend is not None
+            else existing_gr_config.constraint_backend
+        )
+        offset, slice_size = None, None
+        if effective_catalog_path is not None:
+            model_name = getattr(self, "model", None)
+            if model_name is not None:
+                from vllm_gr.utils.catalog import (
+                    compute_catalog_slice_config,
+                )
 
-    effective_gr_config = GRConfig(
-        catalog_path=effective_catalog_path,
-        constraint_backend=effective_constraint_backend,
-        attention_backend=(
-            backend_override if backend_is_explicit else existing_gr_config.attention_backend
-        ),
-        vocab_offset=offset if offset is not None else existing_gr_config.vocab_offset,
-        vocab_slice_size=slice_size
-        if slice_size is not None
-        else existing_gr_config.vocab_slice_size,
-        beam_graph_enabled=(
-            existing_gr_config.beam_graph_enabled and not getattr(self, "no_beam_graph", False)
-        ),
-        beam_max_width=(
-            getattr(self, "beam_max_width", None)
-            if getattr(self, "beam_max_width", None) is not None
-            else existing_gr_config.beam_max_width
-        ),
-        beam_max_decode_steps=(
-            getattr(self, "beam_max_decode_steps", None)
-            if getattr(self, "beam_max_decode_steps", None) is not None
-            else existing_gr_config.beam_max_decode_steps
-        ),
-    )
-    if effective_gr_config != existing_gr_config:
+                trust_remote_code = bool(getattr(self, "trust_remote_code", False))
+                offset, slice_size = compute_catalog_slice_config(
+                    effective_catalog_path,
+                    model_name,
+                    trust_remote_code=trust_remote_code,
+                )
+                if offset is not None and slice_size is not None:
+                    from vllm_gr.ops.sliced_logits import set_vocab_slice_config
+
+                    set_vocab_slice_config(offset, slice_size)
+
+        effective_gr_config = GRConfig(
+            catalog_path=effective_catalog_path,
+            constraint_backend=effective_constraint_backend,
+            attention_backend=(
+                backend_override if backend_is_explicit else existing_gr_config.attention_backend
+            ),
+            vocab_offset=(offset if offset is not None else existing_gr_config.vocab_offset),
+            vocab_slice_size=(
+                slice_size if slice_size is not None else existing_gr_config.vocab_slice_size
+            ),
+            beam_graph_enabled=(
+                existing_gr_config.beam_graph_enabled and not getattr(self, "no_beam_graph", False)
+            ),
+            beam_max_width=(
+                getattr(self, "beam_max_width", None)
+                if getattr(self, "beam_max_width", None) is not None
+                else existing_gr_config.beam_max_width
+            ),
+            beam_max_decode_steps=(
+                getattr(self, "beam_max_decode_steps", None)
+                if getattr(self, "beam_max_decode_steps", None) is not None
+                else existing_gr_config.beam_max_decode_steps
+            ),
+            schema_version=existing_gr_config.schema_version,
+            constraint_table=existing_gr_config.constraint_table,
+        )
+
+    if (
+        canonical_source
+        and effective_gr_config.constraint_table is not None
+        and effective_gr_config.constraint_table.enabled
+    ):
+        raise RuntimeError(
+            "canonical constraint_table.enabled=true is not supported until "
+            "the Worker integration PR; refusing to fall back to Trie or "
+            "unconstrained execution"
+        )
+
+    if effective_gr_config != existing_gr_config or canonical_input is not None:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
         # forbidden. Keep GR-only values in VllmConfig.additional_config so
         # that they also survive process serialization.
-        effective_gr_config.write_to_vllm_config(config)
+        if canonical_source:
+            write_canonical_gr_config(config, effective_gr_config)
+        else:
+            effective_gr_config.write_to_vllm_config(config)
 
     if effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM:
         attention_config = getattr(config, "attention_config", None)

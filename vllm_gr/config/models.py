@@ -6,6 +6,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+GR_CONFIG_SCHEMA_VERSION = 1
+CONSTRAINT_TABLE_FORMAT = "constraint_table_v1"
+
 
 class GRAttentionBackend(str, Enum):
     CUSTOM = "CUSTOM"
@@ -16,10 +19,75 @@ class ConstraintBackend(str, Enum):
     CONSTRAINT_TABLE = "constraint_table"
 
 
+class ConstraintTableBackendEnum(str, Enum):
+    """Execution placement requested for a canonical constraint table."""
+
+    CPU = "cpu"
+    NPU = "npu"
+
+
 # Default values for beam KV pool sizing — also used by parser.py (to decide
 # whether a value is the default and can be omitted from additional_config) and
 # by validation.py (as fallbacks).  Keep all three sites in sync.
 _BEAM_MAX_DECODE_STEPS_DEFAULT: int = 3  # OneRec SID: max_tokens=5 minus begin/end
+
+
+@dataclass(frozen=True, slots=True)
+class ConstraintTableConfig:
+    """Configuration for a prebuilt canonical constraint-table artifact."""
+
+    max_top_k: int
+    enabled: bool = False
+    backend: ConstraintTableBackendEnum = ConstraintTableBackendEnum.CPU
+    path: str | None = None
+    format: str = CONSTRAINT_TABLE_FORMAT
+    artifact_digest: str | None = None
+    tokenizer_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        from vllm_gr.config.validation import (
+            validate_artifact_digest,
+            validate_constraint_table_backend,
+            validate_constraint_table_enabled,
+            validate_constraint_table_format,
+            validate_constraint_table_max_top_k,
+            validate_constraint_table_path,
+            validate_tokenizer_digest,
+        )
+
+        object.__setattr__(self, "enabled", validate_constraint_table_enabled(self.enabled))
+        object.__setattr__(self, "backend", validate_constraint_table_backend(self.backend))
+        object.__setattr__(self, "path", validate_constraint_table_path(self.path))
+        object.__setattr__(self, "format", validate_constraint_table_format(self.format))
+        object.__setattr__(
+            self,
+            "artifact_digest",
+            validate_artifact_digest(self.artifact_digest),
+        )
+        object.__setattr__(
+            self,
+            "tokenizer_digest",
+            validate_tokenizer_digest(self.tokenizer_digest),
+        )
+        object.__setattr__(
+            self,
+            "max_top_k",
+            validate_constraint_table_max_top_k(self.max_top_k),
+        )
+
+        if self.enabled:
+            missing = [
+                name
+                for name, value in (
+                    ("path", self.path),
+                    ("format", self.format),
+                    ("artifact_digest", self.artifact_digest),
+                    ("tokenizer_digest", self.tokenizer_digest),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError("enabled vllm-gr constraint_table requires " + ", ".join(missing))
 
 
 class NPUDecodeExecution(str, Enum):
@@ -52,6 +120,10 @@ class GRConfig:
     # None = unset: the runtime picks per-platform defaults (xllm on NPU when
     # the operator library is present, cascade otherwise and on CUDA).
     npu_decode_execution: NPUDecodeExecution | None = None
+    # Canonical schema-v1 state. Keep these fields after every legacy field so
+    # positional construction of the pre-schema dataclass remains compatible.
+    schema_version: int = GR_CONFIG_SCHEMA_VERSION
+    constraint_table: ConstraintTableConfig | None = None
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -62,6 +134,7 @@ class GRConfig:
             validate_catalog_path,
             validate_constraint_backend,
             validate_npu_decode_execution,
+            validate_schema_version,
             validate_vocab_offset,
             validate_vocab_slice_size,
         )
@@ -97,6 +170,11 @@ class GRConfig:
             "npu_decode_execution",
             validate_npu_decode_execution(self.npu_decode_execution),
         )
+        object.__setattr__(self, "schema_version", validate_schema_version(self.schema_version))
+        if self.constraint_table is not None and not isinstance(
+            self.constraint_table, ConstraintTableConfig
+        ):
+            raise ValueError("vllm-gr constraint_table must be a ConstraintTableConfig or None")
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None
@@ -117,6 +195,7 @@ class GRConfig:
             or self.vocab_offset is not None
             or self.vocab_slice_size is not None
             or self.npu_decode_execution is not None
+            or (self.constraint_table is not None and self.constraint_table.enabled)
         )
 
     @classmethod
