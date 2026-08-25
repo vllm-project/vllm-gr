@@ -53,6 +53,66 @@ class ConstraintTable:
     prefix2_values: NDArray[np.int32]
     metadata: ConstraintTableMetadata
 
+    @classmethod
+    def _from_immutable_backing(
+        cls,
+        *,
+        backing: bytes,
+        first_token_ids: NDArray[np.int32],
+        prefix1_offsets: NDArray[np.int32],
+        prefix1_values: NDArray[np.int32],
+        prefix1_pair_keys: NDArray[np.int64],
+        prefix2_value_offsets: NDArray[np.int32],
+        prefix2_values: NDArray[np.int32],
+        metadata: ConstraintTableMetadata,
+    ) -> ConstraintTable:
+        """Build loader-owned views over one proven-immutable bytes buffer.
+
+        The normal constructor deliberately copies caller-owned arrays so they
+        cannot be mutated behind the frozen dataclass.  The artifact loader has
+        a stronger guarantee: every array is a view over the same immutable
+        ``bytes`` object.  Re-copying those views would only multiply startup
+        memory, so this private constructor verifies that guarantee and then
+        installs the views without running :meth:`__post_init__`.
+        """
+
+        values = {
+            "first_token_ids": first_token_ids,
+            "prefix1_offsets": prefix1_offsets,
+            "prefix1_values": prefix1_values,
+            "prefix1_pair_keys": prefix1_pair_keys,
+            "prefix2_value_offsets": prefix2_value_offsets,
+            "prefix2_values": prefix2_values,
+        }
+        table = object.__new__(cls)
+        for name, value in values.items():
+            if not isinstance(value, np.ndarray):
+                raise ValueError(f"constraint table tensor {name} must be a numpy.ndarray")
+            if value.flags.writeable:
+                raise ValueError(
+                    f"constraint table tensor {name} must be read-only when "
+                    "constructed from immutable backing"
+                )
+
+            owner: object = value
+            seen: set[int] = set()
+            while id(owner) not in seen:
+                seen.add(id(owner))
+                if isinstance(owner, np.ndarray) and owner.base is not None:
+                    owner = owner.base
+                elif isinstance(owner, memoryview):
+                    owner = owner.obj
+                else:
+                    break
+            if owner is not backing:
+                raise ValueError(
+                    f"constraint table tensor {name} does not reference the "
+                    "loader's immutable backing"
+                )
+            object.__setattr__(table, name, value)
+        object.__setattr__(table, "metadata", metadata)
+        return table
+
     def __post_init__(self) -> None:
         # A read-only flag alone can be re-enabled when an ndarray owns its
         # memory. Rebuilding over immutable bytes makes the returned tensors

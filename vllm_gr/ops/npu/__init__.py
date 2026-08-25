@@ -22,6 +22,7 @@ from vllm_gr.ops.npu.rec_constrained_topk import (
 )
 from vllm_gr.ops.npu.rec_constrained_topk import (
     rec_constrained_topk_npu,
+    resolve_rec_constrained_topk_npu,
 )
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "cache_unshared_kv",
     "rec_constrained_topk_npu",
     "rec_constrained_topk_npu_available",
+    "resolve_rec_constrained_topk_npu",
     "select_unshared_kv",
     "x_attention",
 ]

@@ -44,9 +44,10 @@ from vllm_gr.constraints.json_compiler import (
     TRIPLES_KEY,
 )
 from vllm_gr.constraints.triples import ConstraintTriple, build_relations
+from vllm_gr.ops.npu.rec_constrained_topk import MAX_TOP_K as MAX_TOP_K
 
-# Maximum number of candidates per beam accepted by the ACS operator.
-MAX_TOP_K = 256
+# ``MAX_TOP_K`` remains importable from this legacy module, but the NPU
+# operator boundary is its single source of truth.
 
 # Upper bound on the total device-table bytes a constraint resource may occupy.
 # Guards against a pathological catalog compiling into a multi-GiB resource that

@@ -80,12 +80,11 @@ def test_extract_and_dedup_segment_preserves_candidate_order(
     assert all(len(values) == len(expected) for values in result)
 
 
-def test_extract_constrained_segment_filters_finite_padding() -> None:
-    # One constrained parent block: 2 valid + 2 padded slots.  INVALID_LOGIT is
-    # finite, so a threshold (not isfinite) must drop the padding.
+def test_extract_constrained_segment_filters_transport_padding() -> None:
+    # The Worker converts structurally invalid slots to -inf for transport.
     token_ids, logprobs, ranks, decoded = extract_constrained_segment(
         [11, 12, 13, 14],
-        [-0.1, -0.2, INVALID_LOGIT, INVALID_LOGIT],
+        [-0.1, -0.2, -float("inf"), -float("inf")],
         [0, 0, 0, 0],
         ["a", "b", None, None],
         0,
@@ -99,12 +98,27 @@ def test_extract_constrained_segment_filters_finite_padding() -> None:
     assert decoded == ["a", "b"]
 
 
+def test_extract_constrained_segment_keeps_legal_sentinel_magnitude() -> None:
+    token_ids, logprobs, *_ = extract_constrained_segment(
+        [11, 12, 0],
+        [0.0, INVALID_LOGIT, -float("inf")],
+        None,
+        None,
+        0,
+        3,
+        2,
+    )
+
+    assert token_ids == [11, 12]
+    assert logprobs == [0.0, INVALID_LOGIT]
+
+
 def test_extract_constrained_segment_never_dedups() -> None:
     # Unlike the sampled-token path, constrained rows are fixed-width operator
     # output with no duplicate slot to strip; identical tokens survive.
     token_ids, logprobs, *_ = extract_constrained_segment(
         [5, 5, 9, 9],
-        [-0.1, -0.2, INVALID_LOGIT, INVALID_LOGIT],
+        [-0.1, -0.2, -float("inf"), -float("inf")],
         None,
         None,
         0,
@@ -116,10 +130,10 @@ def test_extract_constrained_segment_never_dedups() -> None:
 
 
 def test_extract_constrained_segment_drops_inf_remux_padding() -> None:
-    # The beam remux pads short rows with -inf; the same threshold drops it.
+    # The beam remux pads short rows with -inf; the non-finite filter drops it.
     token_ids, logprobs, *_ = extract_constrained_segment(
         [11, 0, 0, 0],
-        [-0.1, -float("inf"), INVALID_LOGIT, INVALID_LOGIT],
+        [-0.1, -float("inf"), -float("inf"), -float("inf")],
         None,
         None,
         0,
@@ -134,7 +148,7 @@ def test_extract_constrained_segment_drops_inf_remux_padding() -> None:
 def test_extract_constrained_segment_empty_valid_set() -> None:
     token_ids, logprobs, *_ = extract_constrained_segment(
         [0, 0, 0, 0],
-        [INVALID_LOGIT, INVALID_LOGIT, INVALID_LOGIT, INVALID_LOGIT],
+        [-float("inf")] * 4,
         None,
         None,
         0,
@@ -151,7 +165,7 @@ def test_extract_constrained_segment_respects_slice_bounds() -> None:
     # the block is exactly ``logprobs_num`` wide so every entry survives.
     token_ids, logprobs, *_ = extract_constrained_segment(
         [99, 21, 22, 99, 23, 24],
-        [-9.0, -0.1, -0.2, -9.0, INVALID_LOGIT, INVALID_LOGIT],
+        [-9.0, -0.1, -0.2, -9.0, -float("inf"), -float("inf")],
         None,
         None,
         1,
@@ -168,7 +182,7 @@ def test_extract_constrained_segment_truncates_to_logprobs_num() -> None:
     # capped (in practice there are never more than W valid per parent).
     token_ids, logprobs, *_ = extract_constrained_segment(
         [21, 22, 23, 24],
-        [-0.1, -0.2, -0.3, INVALID_LOGIT],
+        [-0.1, -0.2, -0.3, -float("inf")],
         None,
         None,
         0,
@@ -182,10 +196,10 @@ def test_extract_constrained_segment_truncates_to_logprobs_num() -> None:
 
 def test_extract_constrained_flat_logprobs_prefill_wide_segment() -> None:
     # Constrained prefill emits one wide flat segment: W valid candidates then
-    # remux -inf / operator -1e20 padding.
+    # structural transport padding.
     flat = SimpleNamespace(
         token_ids=[31, 32, 33, 0, 0, 0],
-        logprobs=[-0.1, -0.2, -0.3, -float("inf"), -float("inf"), INVALID_LOGIT],
+        logprobs=[-0.1, -0.2, -0.3, -float("inf"), -float("inf"), -float("inf")],
         ranks=[0, 0, 0, 0, 0, 0],
         decoded_tokens=[None, None, None, None, None, None],
         start_indices=[0],

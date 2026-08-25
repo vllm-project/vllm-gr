@@ -17,8 +17,8 @@ Wire contract (P2):
   stride ``W`` per parent block (each block is exactly one operator row).
 - prefill: one wide ``[1, W*W]`` segment — ``W`` valid candidates followed by
   ``-inf`` remux padding.
-- padding slots in operator rows carry the finite ``INVALID_LOGIT`` sentinel;
-  the frontend filters them by threshold, never by ``np.isfinite``.
+- the Worker carries the structural validity mask separately, then encodes
+  only transport padding as ``-inf`` for the frontend.
 
 Guards:
 
@@ -191,7 +191,7 @@ def run_constrained_partition(
     rows: Sequence[tuple[Any, int, int, dict[str, Any]]],
     width: int,
     adapter: Any,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
     """Run the constrained operator on every constrained row group.
 
     Each request is run independently (its own sequence_group geometry and
@@ -202,6 +202,7 @@ def run_constrained_partition(
     device = getattr(runner, "device", logits.device)
     top_tokens_parts: list[torch.Tensor] = []
     top_logprobs_parts: list[torch.Tensor] = []
+    valid_mask_parts: list[torch.Tensor] = []
     global_rows: list[int] = []
 
     for req_id, row_start, W_logits, mdata in rows:
@@ -219,11 +220,13 @@ def run_constrained_partition(
         )
         top_tokens_parts.append(result.top_tokens)
         top_logprobs_parts.append(result.top_logprobs)
+        valid_mask_parts.append(result.valid_mask)
         global_rows.extend(group_rows)
 
     return (
         torch.cat(top_tokens_parts, dim=0),
         torch.cat(top_logprobs_parts, dim=0),
+        torch.cat(valid_mask_parts, dim=0),
         global_rows,
     )
 
@@ -233,6 +236,7 @@ def patch_sampler_output_for_constrained(
     global_rows: Sequence[int],
     top_tokens: torch.Tensor,
     top_logprobs: torch.Tensor,
+    valid_mask: torch.Tensor,
     width: int,
 ) -> None:
     """Overwrite constrained sampler-output rows with operator results.
@@ -241,8 +245,10 @@ def patch_sampler_output_for_constrained(
     token / logprob tensors for ``global_rows``, then shrinks the logprob
     tensors to width ``width`` so ``_beam_collapse_bookkeeping`` derives
     ``actual_K == width`` (it reads the tensor width, not a request field).
-    The explicit ``.to(...)`` calls protect against dtype/device drift between
-    the operator (int32/float32 on the runner device) and the sampler tensors.
+    Structural padding is encoded as ``-inf`` only at this transport boundary;
+    legal logprobs are never classified by magnitude. The explicit ``.to(...)``
+    calls protect against dtype/device drift between the operator
+    (int32/float32 on the runner device) and the sampler tensors.
     """
     lp_tensors = sampler_output.logprobs_tensors
     if lp_tensors is None or lp_tensors.logprobs is None:
@@ -256,8 +262,14 @@ def patch_sampler_output_for_constrained(
             f"than constrained beam_width {width}; sampling_params.logprobs "
             "must be at least beam_width"
         )
+    expected_shape = tuple(top_logprobs.shape)
+    if tuple(top_tokens.shape) != expected_shape or tuple(valid_mask.shape) != expected_shape:
+        raise RuntimeError("constrained tokens, logprobs, and valid_mask must have equal shapes")
+    if valid_mask.dtype != torch.bool or valid_mask.device != top_logprobs.device:
+        raise RuntimeError("constrained valid_mask must be bool on the logprobs device")
 
     rows_idx = torch.tensor(global_rows, dtype=torch.long, device=top_tokens.device)
+    wire_logprobs = top_logprobs.masked_fill(~valid_mask, float("-inf"))
 
     # Shrink the logprob tensors to width W BEFORE the in-place scatter.  A
     # ``resize_`` reinterprets the flat storage, so doing it after a scatter
@@ -273,10 +285,11 @@ def patch_sampler_output_for_constrained(
     st_ids = sampler_output.sampled_token_ids
     if st_ids is not None:
         best_tokens = top_tokens[:, 0].to(st_ids.dtype)
+        has_valid = valid_mask[:, 0]
         if st_ids.dim() == 2:
-            st_ids[rows_idx, 0] = best_tokens
+            st_ids[rows_idx, 0] = torch.where(has_valid, best_tokens, st_ids[rows_idx, 0])
         else:
-            st_ids[rows_idx] = best_tokens
+            st_ids[rows_idx] = torch.where(has_valid, best_tokens, st_ids[rows_idx])
 
     # ``logprob_token_ids`` is nullable in the sampler-output contract (the
     # beam-collapse remux in model_runner_common guards it the same way); only
@@ -286,7 +299,7 @@ def patch_sampler_output_for_constrained(
         lp_tensors.logprob_token_ids[rows_idx, :width] = top_tokens.to(
             lp_tensors.logprob_token_ids.dtype
         )
-    lp_tensors.logprobs[rows_idx, :width] = top_logprobs.to(lp_tensors.logprobs.dtype)
+    lp_tensors.logprobs[rows_idx, :width] = wire_logprobs.to(lp_tensors.logprobs.dtype)
 
     ranks = getattr(lp_tensors, "selected_token_ranks", None)
     if ranks is not None:
@@ -387,9 +400,9 @@ def apply_constrained_sample_override(
     width = next(iter(widths))
 
     adapter = get_or_create_execution_adapter(runner)
-    top_tokens, top_logprobs, global_rows = run_constrained_partition(
+    top_tokens, top_logprobs, valid_mask, global_rows = run_constrained_partition(
         runner, logits, rows, width, adapter
     )
     patch_sampler_output_for_constrained(
-        sampler_output, global_rows, top_tokens, top_logprobs, width
+        sampler_output, global_rows, top_tokens, top_logprobs, valid_mask, width
     )

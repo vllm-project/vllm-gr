@@ -11,10 +11,9 @@ token IDs and log-probabilities.
 
 Design rules:
 
-- ``run`` returns a fixed-shape ``[rows, top_k]`` result; when a row has fewer
-  than ``top_k`` valid candidates the padding slots carry ``_INVALID_LOGIT``
-  (a *finite* ``-1e20``), so padding must be filtered by threshold
-  (``logprobs > _INVALID_LOGIT / 2``), never by ``torch.isfinite``.
+- ``run`` returns a fixed-shape ``[rows, top_k]`` result plus an explicit
+  structural validity mask derived from the canonical table ranges. Padding
+  validity is never inferred from a logprob value.
 - ``load_tables`` copies the NumPy tables to device tensors (the resource
   arrays are read-only bytes-backed) and is idempotent by digest: same digest
   reuses, a different digest is rejected rather than silently replaced.
@@ -31,12 +30,16 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 import torch
 
-# Single source of truth for the padding sentinel is the operator module; the
-# public name here avoids leaking the underscore-private operator constant.
-# Padding slots in a fixed-width output carry this finite value; torch.isfinite
-# cannot identify them, so callers filter with logprobs > INVALID_LOGIT / 2.
+# Single source of truth for the operator's legacy padding payload. Structural
+# validity is carried separately and never inferred from this numeric value.
 from vllm_gr.constraints.compiler import validate_resource_tables
-from vllm_gr.ops.rec_constrained_topk import _INVALID_LOGIT as INVALID_LOGIT
+from vllm_gr.constraints.validity import (
+    constraint_candidate_counts,
+    valid_mask_from_counts,
+)
+from vllm_gr.ops.rec_constrained_topk import _INVALID_LOGIT
+
+INVALID_LOGIT = _INVALID_LOGIT
 
 if TYPE_CHECKING:
     from vllm_gr.constraints.compiler import ConstraintTableResource
@@ -49,20 +52,20 @@ class ConstrainedTopKTensorResult:
     """Per-row constrained top-k token IDs and log-probabilities.
 
     ``top_tokens`` and ``top_logprobs`` both have shape ``[rows, top_k]``.
-    When a row has fewer than ``top_k`` valid candidates the remaining slots
-    carry ``INVALID_LOGIT`` log-probability and an arbitrary padding token id;
-    callers must filter them out (``logprobs > INVALID_LOGIT / 2``) before
-    feeding the result into global beam selection.
+    ``valid_mask`` is authoritative; logprobs may legally have any finite
+    float32 value, including the historical padding sentinel value.
     """
 
     top_tokens: torch.Tensor
     top_logprobs: torch.Tensor
+    valid_mask: torch.Tensor
 
     def __post_init__(self) -> None:
-        if self.top_tokens.shape != self.top_logprobs.shape:
+        if not (self.top_tokens.shape == self.top_logprobs.shape == self.valid_mask.shape):
             raise ValueError(
-                "top_tokens and top_logprobs must have the same shape, got "
-                f"{tuple(self.top_tokens.shape)} vs {tuple(self.top_logprobs.shape)}"
+                "top_tokens, top_logprobs, and valid_mask must have the same shape, got "
+                f"{tuple(self.top_tokens.shape)} vs {tuple(self.top_logprobs.shape)} "
+                f"vs {tuple(self.valid_mask.shape)}"
             )
         if self.top_tokens.dim() != 2:
             raise ValueError(f"expected a 2-D result, got {self.top_tokens.dim()} dims")
@@ -70,11 +73,12 @@ class ConstrainedTopKTensorResult:
             raise ValueError(f"top_tokens must be int32 (ACS/NPU ABI), got {self.top_tokens.dtype}")
         if self.top_logprobs.dtype != torch.float32:
             raise ValueError(f"top_logprobs must be float32, got {self.top_logprobs.dtype}")
-        if self.top_tokens.device != self.top_logprobs.device:
-            raise ValueError(
-                f"top_tokens.device {self.top_tokens.device} must match "
-                f"top_logprobs.device {self.top_logprobs.device}"
-            )
+        if self.valid_mask.dtype != torch.bool:
+            raise ValueError(f"valid_mask must be bool, got {self.valid_mask.dtype}")
+        if not self.valid_mask.is_contiguous():
+            raise ValueError("valid_mask must be contiguous")
+        if not (self.top_tokens.device == self.top_logprobs.device == self.valid_mask.device):
+            raise ValueError("top_tokens, top_logprobs, and valid_mask must share one device")
 
     @property
     def rows(self) -> int:
@@ -85,15 +89,10 @@ class ConstrainedTopKTensorResult:
         return int(self.top_tokens.shape[1])
 
 
-def valid_candidate_mask(top_logprobs: torch.Tensor) -> torch.Tensor:
-    """Boolean mask marking non-padding (valid) candidate slots.
+def valid_candidate_mask(valid_counts: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Expand authoritative per-row counts into a fixed-width mask."""
 
-    Padding slots carry the finite ``INVALID_LOGIT`` value, so ``isfinite``
-    cannot distinguish them; the threshold ``> INVALID_LOGIT / 2`` is the
-    reliable test.  Callers (remux) use this to drop padding slots before
-    feeding candidates into global beam selection.
-    """
-    return top_logprobs > (INVALID_LOGIT / 2)
+    return valid_mask_from_counts(valid_counts, top_k)
 
 
 class ConstrainedTopKExecution(Protocol):
@@ -237,17 +236,29 @@ class _ConstrainedTopKExecutionBase:
     ) -> ConstrainedTopKTensorResult:
         if self._digest is None:
             raise RuntimeError("constraint tables not loaded; call load_tables first")
+        if self._vocab_size is None:
+            raise RuntimeError("loaded constraint tables are missing vocab_size")
         self._validate_runtime_inputs(logits, sequence_group, temperatures, current_step, top_k)
 
         top_tokens, top_logprobs = self._call_op(
             logits, sequence_group, temperatures, current_step, top_k
         )
         self._validate_op_output(logits, top_k, top_tokens, top_logprobs)
+        valid_counts = constraint_candidate_counts(
+            sequence_group,
+            self._tables["first_token_ids"],
+            self._tables["prefix1_offsets"],
+            self._tables["prefix1_pair_keys"],
+            self._tables["prefix2_value_offsets"],
+            current_step=current_step,
+            vocab_size=self._vocab_size,
+        )
         # Normalize to the ACS/NPU ABI: top-k token ids are int32 (the Torch
         # operator returns int64); downstream consumers require int32.
         return ConstrainedTopKTensorResult(
             top_tokens=top_tokens.to(torch.int32),
             top_logprobs=top_logprobs,
+            valid_mask=valid_mask_from_counts(valid_counts, top_k),
         )
 
     def _validate_op_output(

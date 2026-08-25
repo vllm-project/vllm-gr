@@ -222,8 +222,9 @@ def test_patch_sampler_output_overrides_and_resizes() -> None:
     out = _sampler_output(width=3, rows=2)
     top_tokens = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
     top_logprobs = torch.tensor([[-0.1, -0.2], [-0.3, -0.4]], dtype=torch.float32)
+    valid_mask = torch.ones_like(top_logprobs, dtype=torch.bool)
 
-    patch_sampler_output_for_constrained(out, [0, 1], top_tokens, top_logprobs, width=2)
+    patch_sampler_output_for_constrained(out, [0, 1], top_tokens, top_logprobs, valid_mask, width=2)
 
     # Sampled token = best constrained candidate per row.
     assert out.sampled_token_ids.tolist() == [[7], [9]]
@@ -238,12 +239,26 @@ def test_patch_sampler_output_overrides_and_resizes() -> None:
     assert out.logprobs_tensors.selected_token_ranks.tolist() == [0, 0]
 
 
+def test_patch_sampler_output_uses_mask_not_logprob_magnitude() -> None:
+    out = _sampler_output(width=2, rows=2)
+    top_tokens = torch.tensor([[7, 8], [9, 0]], dtype=torch.int32)
+    top_logprobs = torch.tensor([[0.0, -1.0e20], [0.0, -1.0e20]])
+    valid_mask = torch.tensor([[True, True], [True, False]])
+
+    patch_sampler_output_for_constrained(out, [0, 1], top_tokens, top_logprobs, valid_mask, width=2)
+
+    assert out.logprobs_tensors.logprobs[0].tolist() == pytest.approx([0.0, -1.0e20])
+    assert out.logprobs_tensors.logprobs[1, 0].item() == 0.0
+    assert out.logprobs_tensors.logprobs[1, 1].item() == -float("inf")
+
+
 def test_patch_sampler_output_scatters_non_contiguous_rows() -> None:
     out = _sampler_output(width=3, rows=4)
     top_tokens = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     top_logprobs = torch.zeros((2, 2), dtype=torch.float32)
+    valid_mask = torch.ones_like(top_logprobs, dtype=torch.bool)
 
-    patch_sampler_output_for_constrained(out, [1, 3], top_tokens, top_logprobs, width=2)
+    patch_sampler_output_for_constrained(out, [1, 3], top_tokens, top_logprobs, valid_mask, width=2)
 
     assert out.sampled_token_ids.tolist() == [[0], [1], [0], [3]]
     # Unpatched row 2 keeps its original (pre-resize) values dropped.
@@ -263,6 +278,7 @@ def test_patch_sampler_output_requires_logprobs() -> None:
             [0, 1],
             torch.zeros((2, 2), dtype=torch.int32),
             torch.zeros((2, 2)),
+            torch.ones((2, 2), dtype=torch.bool),
             width=2,
         )
 
@@ -285,8 +301,9 @@ def test_patch_sampler_output_handles_nullable_logprob_token_ids() -> None:
     )
     top_tokens = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
     top_logprobs = torch.tensor([[-0.1, -0.2], [-0.3, -0.4]], dtype=torch.float32)
+    valid_mask = torch.ones_like(top_logprobs, dtype=torch.bool)
 
-    patch_sampler_output_for_constrained(out, [0, 1], top_tokens, top_logprobs, width=2)
+    patch_sampler_output_for_constrained(out, [0, 1], top_tokens, top_logprobs, valid_mask, width=2)
 
     assert out.sampled_token_ids.tolist() == [[7], [9]]
     assert lp.logprobs.shape == (2, 2)
@@ -319,6 +336,7 @@ class _RecordingAdapter:
         return SimpleNamespace(
             top_tokens=torch.arange(rows * top_k, dtype=torch.int32).reshape(rows, top_k),
             top_logprobs=torch.full((rows, top_k), -0.5, dtype=torch.float32),
+            valid_mask=torch.ones((rows, top_k), dtype=torch.bool),
         )
 
 
@@ -337,7 +355,7 @@ def test_run_constrained_partition_runs_per_request_and_step() -> None:
     adapter = _RecordingAdapter()
     logits = torch.randn(4, 20)
 
-    top_tokens, top_logprobs, global_rows = run_constrained_partition(
+    top_tokens, top_logprobs, valid_mask, global_rows = run_constrained_partition(
         runner, logits, rows, width=2, adapter=adapter
     )
 
@@ -348,6 +366,7 @@ def test_run_constrained_partition_runs_per_request_and_step() -> None:
     assert global_rows == [0, 1, 2, 3]
     assert tuple(top_tokens.shape) == (4, 2)
     assert tuple(top_logprobs.shape) == (4, 2)
+    assert valid_mask.all()
 
 
 def test_run_constrained_partition_uses_request_temperature() -> None:

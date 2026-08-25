@@ -42,6 +42,7 @@ def test_tensor_result_validates_shape() -> None:
     result = ConstrainedTopKTensorResult(
         top_tokens=torch.zeros(2, 3, dtype=torch.int32),
         top_logprobs=torch.zeros(2, 3),
+        valid_mask=torch.ones(2, 3, dtype=torch.bool),
     )
     assert result.rows == 2
     assert result.top_k == 3
@@ -50,12 +51,14 @@ def test_tensor_result_validates_shape() -> None:
         ConstrainedTopKTensorResult(
             top_tokens=torch.zeros(2, 3),
             top_logprobs=torch.zeros(2, 4),
+            valid_mask=torch.ones(2, 3, dtype=torch.bool),
         )
 
     with pytest.raises(ValueError, match="2-D"):
         ConstrainedTopKTensorResult(
             top_tokens=torch.zeros(3),
             top_logprobs=torch.zeros(3),
+            valid_mask=torch.ones(3, dtype=torch.bool),
         )
 
 
@@ -122,6 +125,7 @@ def test_run_step0_prefill_returns_expected_shape(tokenizer: MagicMock) -> None:
     assert result.top_logprobs.shape == result.top_tokens.shape
     assert result.top_tokens.dtype == torch.int32
     assert result.top_logprobs.dtype == torch.float32
+    assert result.valid_mask.dtype == torch.bool
 
 
 def test_run_step1_decode_returns_expected_shape(tokenizer: MagicMock) -> None:
@@ -171,8 +175,7 @@ def test_run_rejects_unsupported_step(tokenizer: MagicMock) -> None:
         )
 
 
-def test_padding_is_finite_and_filtered_by_threshold(tokenizer: MagicMock) -> None:
-    """Padding slots carry a finite -1e20, so isfinite cannot filter them."""
+def test_padding_validity_is_structural(tokenizer: MagicMock) -> None:
     resource = _build_resource(tokenizer)
     execution = TorchConstrainedTopKExecution(device="cpu")
     execution.load_tables(resource)
@@ -182,13 +185,34 @@ def test_padding_is_finite_and_filtered_by_threshold(tokenizer: MagicMock) -> No
     sequence_group = torch.zeros(2, 1, 1, dtype=torch.int32)
     result = execution.run(logits, sequence_group, torch.zeros(0), 0, 8)
 
-    # At least some padding slots must be finite (== INVALID_LOGIT), proving
-    # isfinite() would not have excluded them.
+    # Padding may retain the finite operator sentinel, but the explicit mask is
+    # authoritative and independent of score magnitude.
     assert INVALID_LOGIT == -1.0e20
     assert (result.top_logprobs == INVALID_LOGIT).any()
-    # The threshold filter identifies them.
-    valid = result.top_logprobs > (INVALID_LOGIT / 2)
-    assert valid.shape == result.top_logprobs.shape
+    assert result.valid_mask.shape == result.top_logprobs.shape
+    assert result.valid_mask.sum(dim=1).tolist() == [2, 2]
+
+
+def test_execution_keeps_legal_logprob_at_padding_sentinel_magnitude(
+    tokenizer: MagicMock,
+) -> None:
+    resource = _build_resource(tokenizer)
+    execution = TorchConstrainedTopKExecution(device="cpu")
+    execution.load_tables(resource)
+    logits = torch.zeros(1, 20)
+    logits[0, 7] = 1.0e20
+
+    result = execution.run(
+        logits,
+        torch.zeros(1, 1, 1, dtype=torch.int32),
+        torch.ones(1),
+        0,
+        3,
+    )
+
+    assert result.valid_mask.tolist() == [[True, True, False]]
+    assert set(result.top_tokens[0][result.valid_mask[0]].tolist()) == {1, 7}
+    assert bool((result.top_logprobs[0][result.valid_mask[0]] < (INVALID_LOGIT / 2)).any())
 
 
 def test_npu_adapter_fails_explicitly_when_op_unavailable(tokenizer: MagicMock) -> None:

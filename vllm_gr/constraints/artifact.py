@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -40,6 +42,14 @@ _ARTIFACT_METADATA_KEYS = frozenset(
 )
 _MAX_SAFETENSORS_HEADER_BYTES = 1024 * 1024
 _MAX_ARTIFACT_BYTES = MAX_CONSTRAINT_TABLE_BYTES + _MAX_SAFETENSORS_HEADER_BYTES + 8
+_TENSOR_DTYPES: dict[str, tuple[str, np.dtype[Any]]] = {
+    "first_token_ids": ("I32", np.dtype(np.int32)),
+    "prefix1_offsets": ("I32", np.dtype(np.int32)),
+    "prefix1_values": ("I32", np.dtype(np.int32)),
+    "prefix1_pair_keys": ("I64", np.dtype(np.int64)),
+    "prefix2_value_offsets": ("I32", np.dtype(np.int32)),
+    "prefix2_values": ("I32", np.dtype(np.int32)),
+}
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -68,7 +78,20 @@ def _read_artifact(path: Path) -> bytes:
     return data
 
 
-def _load_artifact_metadata(data: bytes) -> dict[str, str]:
+class _DuplicateHeaderKeyError(ValueError):
+    pass
+
+
+def _reject_duplicate_header_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateHeaderKeyError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _load_artifact_header(data: bytes) -> tuple[dict[str, str], dict[str, object], int]:
     if len(data) < 8:
         raise ValueError("constraint table artifact is too short for a safetensors header")
     header_size = int.from_bytes(data[:8], "little", signed=False)
@@ -79,8 +102,11 @@ def _load_artifact_metadata(data: bytes) -> dict[str, str]:
     ):
         raise ValueError(f"invalid safetensors header size {header_size}")
     try:
-        header = json.loads(data[8 : 8 + header_size].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        header = json.loads(
+            data[8 : 8 + header_size].decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_header_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateHeaderKeyError) as exc:
         raise ValueError(f"invalid safetensors header: {exc}") from exc
     if not isinstance(header, dict):
         raise ValueError("safetensors header must be a JSON object")
@@ -95,7 +121,104 @@ def _load_artifact_metadata(data: bytes) -> dict[str, str]:
         raise ValueError(
             f"constraint table artifact metadata mismatch: missing={missing}, unknown={unknown}"
         )
-    return metadata
+    return cast(dict[str, str], metadata), header, 8 + header_size
+
+
+def _load_immutable_tensors(
+    data: bytes,
+    header: dict[str, object],
+    payload_offset: int,
+) -> tuple[dict[str, NDArray[Any]], int]:
+    """Validate tensor descriptors and return zero-copy views over ``data``."""
+
+    tensor_names = set(header) - {"__metadata__"}
+    missing_tensors = sorted(set(CONSTRAINT_TABLE_TENSOR_NAMES) - tensor_names)
+    extra_tensors = sorted(tensor_names - set(CONSTRAINT_TABLE_TENSOR_NAMES))
+    if missing_tensors or extra_tensors:
+        raise ValueError(
+            "constraint table artifact tensor mismatch: "
+            f"missing={missing_tensors}, extra={extra_tensors}"
+        )
+
+    payload_size = len(data) - payload_offset
+    descriptors: dict[str, tuple[np.dtype[Any], int, int, int]] = {}
+    intervals: list[tuple[int, int, str]] = []
+    total_bytes = 0
+    for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+        descriptor = header[name]
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+            "dtype",
+            "shape",
+            "data_offsets",
+        }:
+            raise ValueError(f"invalid safetensors descriptor for tensor {name!r}")
+
+        dtype_name = descriptor["dtype"]
+        expected_dtype_name, dtype = _TENSOR_DTYPES[name]
+        if dtype_name != expected_dtype_name:
+            raise ValueError(
+                f"constraint table tensor {name}.dtype must be {dtype}, got {dtype_name!r}"
+            )
+
+        shape = descriptor["shape"]
+        if (
+            not isinstance(shape, list)
+            or len(shape) != 1
+            or type(shape[0]) is not int
+            or shape[0] < 0
+        ):
+            raise ValueError(
+                f"constraint table tensor {name} must be 1-D with a non-negative shape"
+            )
+        element_count = shape[0]
+
+        offsets = descriptor["data_offsets"]
+        if (
+            not isinstance(offsets, list)
+            or len(offsets) != 2
+            or any(type(value) is not int or value < 0 for value in offsets)
+        ):
+            raise ValueError(f"invalid data_offsets for tensor {name!r}")
+        start, end = offsets
+        if start > end or end > payload_size:
+            raise ValueError(f"data_offsets for tensor {name!r} are outside the payload")
+        expected_bytes = element_count * dtype.itemsize
+        if end - start != expected_bytes:
+            raise ValueError(
+                f"tensor {name!r} byte length {end - start} does not match "
+                f"shape {shape} and dtype {dtype_name}"
+            )
+        descriptors[name] = (dtype, element_count, start, end)
+        intervals.append((start, end, name))
+        total_bytes += expected_bytes
+
+    cursor = 0
+    for start, end, name in sorted(intervals):
+        if start != cursor:
+            raise ValueError(
+                f"safetensors payload must be contiguous and non-overlapping near tensor {name!r}"
+            )
+        cursor = end
+    if cursor != payload_size:
+        raise ValueError(
+            f"safetensors payload contains {payload_size - cursor} unclaimed trailing bytes"
+        )
+    if total_bytes > MAX_CONSTRAINT_TABLE_BYTES:
+        raise ValueError(
+            f"constraint table total_bytes {total_bytes} exceeds "
+            f"the {MAX_CONSTRAINT_TABLE_BYTES} byte limit"
+        )
+
+    tensors: dict[str, NDArray[Any]] = {}
+    for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+        dtype, element_count, start, _ = descriptors[name]
+        tensors[name] = np.frombuffer(
+            data,
+            dtype=dtype,
+            count=element_count,
+            offset=payload_offset + start,
+        )
+    return tensors, total_bytes
 
 
 def _metadata_int(metadata: dict[str, str], name: str, *, minimum: int) -> int:
@@ -135,7 +258,7 @@ def load_constraint_table_artifact(
             f"expected {normalized_digest}, got {actual_digest}"
         )
 
-    metadata = _load_artifact_metadata(data)
+    metadata, header, payload_offset = _load_artifact_header(data)
     if metadata["format"] != normalized_format:
         raise ValueError(
             "constraint table artifact format mismatch: "
@@ -154,22 +277,9 @@ def load_constraint_table_artifact(
             f"expected {expected_vocab_size}, got {vocab_size}"
         )
 
-    try:
-        from safetensors.numpy import load
-
-        tensors: dict[str, NDArray[Any]] = load(data)
-    except Exception as exc:
-        raise ValueError(f"cannot parse constraint table safetensors payload: {exc}") from exc
-    missing_tensors = sorted(set(CONSTRAINT_TABLE_TENSOR_NAMES) - set(tensors))
-    extra_tensors = sorted(set(tensors) - set(CONSTRAINT_TABLE_TENSOR_NAMES))
-    if missing_tensors or extra_tensors:
-        raise ValueError(
-            "constraint table artifact tensor mismatch: "
-            f"missing={missing_tensors}, extra={extra_tensors}"
-        )
-
-    total_bytes = sum(int(tensors[name].nbytes) for name in CONSTRAINT_TABLE_TENSOR_NAMES)
-    table = ConstraintTable(
+    tensors, total_bytes = _load_immutable_tensors(data, header, payload_offset)
+    table = ConstraintTable._from_immutable_backing(
+        backing=data,
         first_token_ids=tensors["first_token_ids"],
         prefix1_offsets=tensors["prefix1_offsets"],
         prefix1_values=tensors["prefix1_values"],
@@ -186,15 +296,11 @@ def load_constraint_table_artifact(
             total_bytes=total_bytes,
         ),
     )
-    del data, tensors
     validate_constraint_table(table)
     return table
 
 
-def serialize_constraint_table_artifact(table: ConstraintTable) -> bytes:
-    """Serialize a validated table without adding self-referential metadata."""
-
-    validate_constraint_table(table)
+def _build_artifact_header(table: ConstraintTable) -> bytes:
     metadata = {
         "format": table.metadata.format,
         "tokenizer_digest": table.metadata.tokenizer_digest,
@@ -202,43 +308,64 @@ def serialize_constraint_table_artifact(table: ConstraintTable) -> bytes:
         "max_prefix1_degree": str(table.metadata.max_prefix1_degree),
         "max_prefix2_degree": str(table.metadata.max_prefix2_degree),
     }
-    tensors: dict[str, Any] = {
-        name: np.ascontiguousarray(getattr(table, name)) for name in CONSTRAINT_TABLE_TENSOR_NAMES
-    }
     # safetensors.numpy.save currently routes metadata through a hash map, so
     # repeated calls can emit a different JSON-key order and therefore a
     # different whole-file digest. Build the small safetensors header directly
-    # in ABI order; the payload remains standard safetensors and is parsed by
-    # the official loader. Header length is padded to an 8-byte boundary as
-    # required by the format.
-    dtype_names = {
-        np.dtype(np.int32): "I32",
-        np.dtype(np.int64): "I64",
-    }
+    # in ABI order. The payload remains standard safetensors; header length is
+    # padded to an 8-byte boundary as required by the format.
     header: dict[str, object] = {"__metadata__": metadata}
-    payload_parts: list[bytes] = []
     offset = 0
     for name in CONSTRAINT_TABLE_TENSOR_NAMES:
-        tensor = tensors[name]
-        data = tensor.tobytes(order="C")
+        tensor = getattr(table, name)
+        dtype_name, expected_dtype = _TENSOR_DTYPES[name]
+        if tensor.dtype != expected_dtype or not tensor.flags.c_contiguous:
+            raise ValueError(f"constraint table tensor {name} is not ABI-contiguous")
         header[name] = {
-            "dtype": dtype_names[tensor.dtype],
+            "dtype": dtype_name,
             "shape": list(tensor.shape),
-            "data_offsets": [offset, offset + len(data)],
+            "data_offsets": [offset, offset + tensor.nbytes],
         }
-        payload_parts.append(data)
-        offset += len(data)
+        offset += tensor.nbytes
     header_bytes = json.dumps(
         header,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
     header_bytes += b" " * (-len(header_bytes) % 8)
-    return (
-        len(header_bytes).to_bytes(8, "little", signed=False)
-        + header_bytes
-        + b"".join(payload_parts)
-    )
+    if len(header_bytes) > _MAX_SAFETENSORS_HEADER_BYTES:
+        raise ValueError(
+            f"safetensors header size {len(header_bytes)} exceeds "
+            f"the {_MAX_SAFETENSORS_HEADER_BYTES} byte limit"
+        )
+    return header_bytes
+
+
+def _artifact_chunks(table: ConstraintTable, header_bytes: bytes) -> Iterator[bytes | memoryview]:
+    yield len(header_bytes).to_bytes(8, "little", signed=False)
+    yield header_bytes
+    for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+        yield memoryview(getattr(table, name)).cast("B")
+
+
+def serialize_constraint_table_artifact(table: ConstraintTable) -> bytes:
+    """Serialize a validated table with no per-tensor payload copies."""
+
+    validate_constraint_table(table)
+    header_bytes = _build_artifact_header(table)
+    output = io.BytesIO()
+    for chunk in _artifact_chunks(table, header_bytes):
+        output.write(chunk)
+    return output.getvalue()
+
+
+def _write_all(output: BinaryIO, data: bytes | memoryview) -> None:
+    view = memoryview(data)
+    written = 0
+    while written < len(view):
+        count = output.write(view[written:])
+        if count is None or count <= 0:
+            raise OSError(f"short artifact write after {written} of {len(view)} bytes")
+        written += count
 
 
 def save_constraint_table_artifact(
@@ -247,9 +374,11 @@ def save_constraint_table_artifact(
 ) -> str:
     """Atomically save an artifact and return its whole-file SHA-256 digest."""
 
-    data = serialize_constraint_table_artifact(table)
+    validate_constraint_table(table)
+    header_bytes = _build_artifact_header(table)
     output = Path(path)
     temporary_path: Path | None = None
+    hasher = hashlib.sha256()
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -259,9 +388,9 @@ def save_constraint_table_artifact(
             delete=False,
         ) as temporary_file:
             temporary_path = Path(temporary_file.name)
-            written = temporary_file.write(data)
-            if written != len(data):
-                raise OSError(f"short artifact write: expected {len(data)}, wrote {written}")
+            for chunk in _artifact_chunks(table, header_bytes):
+                _write_all(cast(BinaryIO, temporary_file), chunk)
+                hasher.update(chunk)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
 
@@ -282,4 +411,4 @@ def save_constraint_table_artifact(
                 temporary_path.unlink(missing_ok=True)
             except OSError:
                 pass
-    return _sha256_bytes(data)
+    return "sha256:" + hasher.hexdigest()

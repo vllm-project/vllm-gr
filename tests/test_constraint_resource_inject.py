@@ -20,7 +20,7 @@ from vllm_gr.constraints.compiler import (
     to_wire,
 )
 from vllm_gr.constraints.driver_inject import inject_constraint_resources
-from vllm_gr.constraints.execution import INVALID_LOGIT, valid_candidate_mask
+from vllm_gr.constraints.execution import valid_candidate_mask
 from vllm_gr.constraints.json_compiler import compile_relations_json
 from vllm_gr.constraints.resource_manager import ConstraintResourceManager
 from vllm_gr.constraints.worker_inject import (
@@ -204,17 +204,14 @@ def test_large_resource_roundtrips_via_msgpack_and_is_re_frozen(
 
 
 def test_valid_candidate_mask_marks_padding() -> None:
-    logprobs = torch.tensor(
-        [[-0.5, INVALID_LOGIT, -2.0], [INVALID_LOGIT, INVALID_LOGIT, -1.0]],
-        dtype=torch.float32,
-    )
-    mask = valid_candidate_mask(logprobs)
+    counts = torch.tensor([2, 1], dtype=torch.int64)
+    mask = valid_candidate_mask(counts, 3)
 
     assert mask.dtype == torch.bool
-    assert mask.shape == logprobs.shape
+    assert mask.shape == (2, 3)
     assert mask.tolist() == [
-        [True, False, True],
-        [False, False, True],
+        [True, True, False],
+        [True, False, False],
     ]
 
 

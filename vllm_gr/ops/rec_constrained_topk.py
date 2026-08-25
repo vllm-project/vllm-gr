@@ -49,14 +49,15 @@ def _finish_topk(
         else:
             temps = temps.reshape(-1, 1)
         candidate_logits = candidate_logits / torch.where(temps == 0, torch.ones_like(temps), temps)
-    candidate_logits = candidate_logits.masked_fill(~valid_candidates, _INVALID_LOGIT)
+    candidate_logits = candidate_logits.masked_fill(~valid_candidates, float("-inf"))
     log_denom = torch.logsumexp(candidate_logits, dim=1, keepdim=True)
     top_values, top_indices = candidate_logits.topk(top_k, dim=1, largest=True, sorted=True)
     top_logprobs = top_values - log_denom
+    top_valid = valid_candidates.gather(1, top_indices)
     top_logprobs = torch.where(
-        top_values.le(_INVALID_LOGIT / 2),
-        torch.full_like(top_logprobs, _INVALID_LOGIT),
+        top_valid,
         top_logprobs,
+        torch.full_like(top_logprobs, _INVALID_LOGIT),
     )
     top_tokens = candidate_tokens.gather(1, top_indices).to(torch.int64)
     return top_tokens, top_logprobs

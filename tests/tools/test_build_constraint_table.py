@@ -12,7 +12,8 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from tools.build_constraint_table import build_constraint_table
+import tools.build_constraint_table as build_constraint_table_module
+from tools.build_constraint_table import _resolve_model_revision, build_constraint_table
 from vllm_gr.constraints.artifact import load_constraint_table_artifact
 from vllm_gr.constraints.json_compiler import compile_relations_json
 
@@ -50,6 +51,13 @@ def test_build_tool_uses_one_revision_and_writes_loadable_artifact(
     transformers.AutoTokenizer = auto_tokenizer  # type: ignore[attr-defined]
     transformers.AutoConfig = auto_config  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "transformers", transformers)
+    commit_sha = "a" * 40
+    resolve_revision = MagicMock(return_value=commit_sha)
+    monkeypatch.setattr(
+        build_constraint_table_module,
+        "_resolve_model_revision",
+        resolve_revision,
+    )
 
     triples_path = tmp_path / "triples.json"
     triples_path.write_text(
@@ -66,9 +74,10 @@ def test_build_tool_uses_one_revision_and_writes_loadable_artifact(
     )
 
     expected_kwargs = {
-        "revision": "revision-id",
+        "revision": commit_sha,
         "trust_remote_code": False,
     }
+    resolve_revision.assert_called_once_with("model-id", "revision-id")
     auto_tokenizer.from_pretrained.assert_called_once_with("model-id", **expected_kwargs)
     auto_config.from_pretrained.assert_called_once_with("model-id", **expected_kwargs)
     assert artifact_digest.startswith("sha256:")
@@ -93,6 +102,11 @@ def test_build_tool_is_reproducible(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         from_pretrained=MagicMock(return_value=SimpleNamespace(vocab_size=20))
     )
     monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setattr(
+        build_constraint_table_module,
+        "_resolve_model_revision",
+        MagicMock(return_value="a" * 40),
+    )
     triples = tmp_path / "triples.json"
     triples.write_text(
         json.dumps(compile_relations_json([["1", "2", "3"]])),
@@ -116,3 +130,49 @@ def test_build_tool_is_reproducible(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     assert first_result == second_result
     assert first.read_bytes() == second.read_bytes()
+
+
+def test_remote_model_requires_revision_before_loading() -> None:
+    with pytest.raises(ValueError, match="requires --revision"):
+        build_constraint_table(
+            triples_path="unused.json",
+            model="organization/remote-model",
+            revision=None,
+            output_path="unused.safetensors",
+        )
+
+
+def test_symbolic_remote_revision_is_resolved_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import huggingface_hub
+
+    commit_sha = "b" * 40
+    api = MagicMock()
+    api.model_info.return_value = SimpleNamespace(sha=commit_sha)
+    api_type = MagicMock(return_value=api)
+    monkeypatch.setattr(huggingface_hub, "HfApi", api_type)
+
+    assert _resolve_model_revision("organization/model", "release") == commit_sha
+    api_type.assert_called_once_with()
+    api.model_info.assert_called_once_with("organization/model", revision="release")
+
+
+def test_commit_revision_does_not_require_remote_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import huggingface_hub
+
+    api_type = MagicMock()
+    monkeypatch.setattr(huggingface_hub, "HfApi", api_type)
+
+    commit_sha = "C" * 40
+    assert _resolve_model_revision("organization/model", commit_sha) == commit_sha.lower()
+    api_type.assert_not_called()
+
+
+def test_local_model_directory_allows_omitted_revision(tmp_path: Path) -> None:
+    model_path = tmp_path / "immutable-model-snapshot"
+    model_path.mkdir()
+
+    assert _resolve_model_revision(str(model_path), None) is None

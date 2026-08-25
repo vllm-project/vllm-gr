@@ -10,6 +10,7 @@ an intermediate beam domain model.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -19,7 +20,6 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
-from vllm_gr.constraints.execution import INVALID_LOGIT
 from vllm_gr.constraints.models import BeamCandidateCache
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 
@@ -117,21 +117,19 @@ def extract_constrained_segment(
     """Extract one constrained candidate block with padding filtering.
 
     Constraint Tables (issue #246) overwrite the sampler output with the
-    constrained top-k operator's fixed-width ``W`` rows.  Padding slots carry
-    the finite ``INVALID_LOGIT`` (-1e20) sentinel — ``np.isfinite`` cannot
-    detect it, so the magnitude threshold ``> INVALID_LOGIT / 2`` is the only
-    reliable filter.  Remux padding is ``-inf``, which the same threshold
-    drops.  Unlike the standard-sampler path there is no sampled-token
-    duplicate to remove, so no dedup runs: candidates are kept in the
-    operator's descending order, at most ``logprobs_num`` per parent.
+    constrained top-k operator's fixed-width ``W`` rows. The Worker derives an
+    explicit validity mask from the table ranges and encodes only padding as
+    ``-inf`` at the transport boundary. Legal finite scores are retained
+    regardless of magnitude. Unlike the standard-sampler path there is no
+    sampled-token duplicate to remove, so no dedup runs: candidates are kept
+    in the operator's descending order, at most ``logprobs_num`` per parent.
     """
     token_ids_pos = list(raw_token_ids[start_offset:end_offset])
     logprobs_pos = list(raw_logprobs[start_offset:end_offset])
     ranks_pos = list(raw_ranks[start_offset:end_offset]) if raw_ranks is not None else None
     decoded_pos = list(raw_decoded[start_offset:end_offset]) if raw_decoded is not None else None
 
-    threshold = INVALID_LOGIT / 2
-    keep = [i for i, lp in enumerate(logprobs_pos) if lp > threshold][:logprobs_num]
+    keep = [i for i, lp in enumerate(logprobs_pos) if math.isfinite(lp)][:logprobs_num]
     token_ids_pos = [token_ids_pos[i] for i in keep]
     logprobs_pos = [logprobs_pos[i] for i in keep]
     if ranks_pos is not None:

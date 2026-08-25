@@ -4,8 +4,9 @@
 """Frontend parsing of Constraint Table candidates (issue #246).
 
 The Worker overwrites the sampler output with the constrained top-k operator's
-fixed-width rows (padding = INVALID_LOGIT); ``_parse_step_logprobs`` must slice
-them per parent, filter the padding by threshold, and never dedup.
+fixed-width rows, encoding only structural padding as ``-inf``;
+``_parse_step_logprobs`` must slice them per parent, retain every finite legal
+score regardless of magnitude, and never dedup.
 """
 
 from types import SimpleNamespace
@@ -52,7 +53,7 @@ def test_constrained_decode_parses_fixed_width_rows_per_parent() -> None:
     # W=2 parents: parent0 block [11, padded], parent1 block [12, 13].
     flat = SimpleNamespace(
         token_ids=[11, 0, 12, 13],
-        logprobs=[-0.1, INVALID_LOGIT, -0.2, -0.3],
+        logprobs=[-0.1, -float("inf"), -0.2, -0.3],
         ranks=None,
         decoded_tokens=None,
     )
@@ -84,7 +85,7 @@ def test_constrained_decode_empty_valid_parent_contributes_no_candidates() -> No
     # parent0 has no valid continuation; parent1 yields [12, 13].
     flat = SimpleNamespace(
         token_ids=[0, 0, 12, 13],
-        logprobs=[INVALID_LOGIT, INVALID_LOGIT, -0.2, -0.3],
+        logprobs=[-float("inf"), -float("inf"), -0.2, -0.3],
         ranks=None,
         decoded_tokens=None,
     )
@@ -114,7 +115,7 @@ def test_constrained_prefill_parses_wide_segment_no_dedup() -> None:
     # W=3 prefill flat: 3 valid candidates then padding.
     flat = SimpleNamespace(
         token_ids=[31, 32, 33, 0, 0, 0],
-        logprobs=[-0.1, -0.2, -0.3, -float("inf"), -float("inf"), INVALID_LOGIT],
+        logprobs=[-0.1, -0.2, -0.3, -float("inf"), -float("inf"), -float("inf")],
         ranks=None,
         decoded_tokens=None,
         start_indices=[0],
@@ -137,3 +138,33 @@ def test_constrained_prefill_parses_wide_segment_no_dedup() -> None:
     assert scores == pytest.approx([-0.6, -0.7, -0.8])
     assert beam_idx == [0, 0, 0]
     assert list(cache[0][0]) == [31, 32, 33]
+
+
+def test_constrained_decode_keeps_legal_score_at_legacy_sentinel() -> None:
+    instance = SimpleNamespace(
+        beams=[_beam([10], 0.0)],
+        prompt_len=1,
+    )
+    flat = SimpleNamespace(
+        token_ids=[11, 12],
+        logprobs=[0.0, INVALID_LOGIT],
+        ranks=None,
+        decoded_tokens=None,
+    )
+
+    is_error, token_ids, scores, beam_idx, cache = _parse_step_logprobs(
+        result=_result_with_flat(flat),
+        instance=instance,
+        token=1,
+        logprobs_num=2,
+        fork_info_j=[(0, 11)],
+        catalog=None,
+        catalog_strategy="fill",
+        constraint_coordinator=_coordinator(),
+    )
+
+    assert not is_error
+    assert token_ids == [11, 12]
+    assert scores == [0.0, INVALID_LOGIT]
+    assert beam_idx == [0, 0]
+    assert [entry[0] for entry in cache] == [[11, 12]]
