@@ -100,20 +100,19 @@ class BeamAttentionContext:
         # allocation; request i maps to pool slot xllm_block_table_buf[i]).
         self.xllm_block_table_buf = torch.zeros(max_batch, dtype=torch.int32, device=device)
 
-        # aux_key_buf / aux_value_buf: pre-allocated buffers for select_unshared_kv
-        # (replace per-step .clone() allocation). Shape matches one pool slot.
-        # WARNING: these are SINGLE shared buffers aliased across all layers in
-        # BeamSearchSession.step_complete (via [same_buf]*num_layers). This is
-        # safe ONLY because select_unshared_kv processes layers sequentially.
-        # Do NOT vectorize or parallelize the per-layer loop without giving each
-        # layer its own aux_buf slot.
+        # aux_key_buf / aux_value_buf: pre-allocated PER-LAYER scratch buffers
+        # for select_unshared_kv. The leading dim is num_layers: the fused
+        # Triton path reorders all layers in one launch, so each layer must
+        # stage through its own slice (a single shared buffer would make
+        # layers clobber each other's staging data). The Python fallback
+        # and the cascade reorder path index the same buffer with [layer].
         self.aux_key_buf = torch.zeros(
-            (max_beams, num_kv_heads, max_decode_steps, head_dim),
+            (num_layers, max_beams, num_kv_heads, max_decode_steps, head_dim),
             dtype=dtype,
             device=device,
         )
         self.aux_value_buf = torch.zeros(
-            (max_beams, num_kv_heads, max_decode_steps, head_dim),
+            (num_layers, max_beams, num_kv_heads, max_decode_steps, head_dim),
             dtype=dtype,
             device=device,
         )

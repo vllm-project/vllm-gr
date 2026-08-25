@@ -70,26 +70,21 @@ class BeamSearchSession:
         if not state.is_last_step:
             from vllm_gr.v1.beam.reorder import reorder_unshared_kv
 
-            # Use pre-allocated aux_bufs when available (CUDA Graph compatible)
-            aux_key_bufs = None
-            aux_value_bufs = None
-            if hasattr(self.context, "aux_key_buf"):
-                # Build per-layer aux_buf lists from the context's SINGLE shared
-                # buffer.  WARNING: this aliases the same tensor across all layers.
-                # Safe ONLY because select_unshared_kv processes layers sequentially;
-                # do NOT parallelize the per-layer loop without giving each layer
-                # its own aux_buf slot (see beam_attention_context.py).
-                num_layers = len(self.context.pools)
-                aux_key_bufs = [self.context.aux_key_buf] * num_layers
-                aux_value_bufs = [self.context.aux_value_buf] * num_layers
+            # Hand the context's PER-LAYER [num_layers, ...] aux buffers to the
+            # reorder dispatcher.  In cascade mode the fused Triton path uses
+            # the whole tensor for its single all-layer launch; the per-layer
+            # reference slices it with [layer]; xllm reorders in place and
+            # ignores aux.
+            aux_key = getattr(self.context, "aux_key_buf", None)
+            aux_value = getattr(self.context, "aux_value_buf", None)
 
             reorder_unshared_kv(
                 parent,
                 self.slot,
                 self.context.pools,
                 state.decode_step,
-                aux_key_bufs=aux_key_bufs,
-                aux_value_bufs=aux_value_bufs,
+                aux_key=aux_key,
+                aux_value=aux_value,
             )
         state.decode_step += 1
 

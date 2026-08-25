@@ -5,9 +5,12 @@
 ``BeamSearchSession.step_complete`` calls ``reorder_unshared_kv`` after each
 beam decision.  The mode follows ``vllm_gr_npu_decode_execution``:
 
-- ``cascade`` (default, any device): the original
-  ``beam_kernels.select_unshared_kv``, indexed by ``slot`` with 0-based
-  ``decode_step`` semantics.
+- ``cascade`` (default, any device): the Triton fused fast path
+  ``beam_kernels.select_unshared_kv_fused`` (one gather + one scatter launch
+  across all layers, CUDA only), falling back to the per-layer reference
+  ``beam_kernels.select_unshared_kv`` indexed by ``slot`` with 0-based
+  ``decode_step`` semantics when the fused path declines (non-CUDA,
+  non-Triton, or unexpected pool/aux layouts).
 - ``xllm`` (NPU only): the fused ``beam_ops.select_unshared_kv`` operator,
   which consumes a ``block_table`` plus ``group_token_num`` prefix sums and a
   1-based step, and reorders every layer's pool in one call.
@@ -72,6 +75,8 @@ def reorder_unshared_kv(
     decode_step: int,
     aux_key_bufs: list[torch.Tensor] | None = None,
     aux_value_bufs: list[torch.Tensor] | None = None,
+    aux_key: torch.Tensor | None = None,
+    aux_value: torch.Tensor | None = None,
 ) -> None:
     """Reorder every layer's unshared pool KV in place after selection.
 
@@ -85,6 +90,12 @@ def reorder_unshared_kv(
             buffers forwarded to the cascade kernel to avoid per-step
             allocations (CUDA Graph compatibility).  The fused xllm path
             reorders in place and ignores them.
+        aux_key / aux_value: optional per-layer scratch buffers shaped
+            ``[num_layers, W, H, max_steps, D]`` consumed by the fused Triton
+            cascade fast path (one gather + one scatter launch across all
+            layers).  When present and the fused path applies, this is used in
+            preference to the per-layer ``aux_key_bufs``; otherwise it falls
+            back to the per-layer cascade kernel.
     """
     pools = list(pools)
     if _resolve_mode() == "xllm":
@@ -117,13 +128,40 @@ def reorder_unshared_kv(
             )
             _FALLBACK_LOGGED = True
 
-    from vllm_gr.v1.attention.backends.beam_kernels import select_unshared_kv
+    # Cascade mode (GPU / non-xllm).  Try the Triton fused fast path first:
+    # one gather + one scatter launch covering every layer at once.  It
+    # declines (returns False) on non-CUDA / non-Triton / unexpected pool or
+    # aux layouts, falling through to the per-layer reference below.
+    from vllm_gr.v1.attention.backends.beam_kernels import (
+        select_unshared_kv,
+        select_unshared_kv_fused,
+    )
+
+    key_caches = [p.unshared_key for p in pools]
+    value_caches = [p.unshared_value for p in pools]
+    if aux_key is not None and aux_value is not None:
+        if select_unshared_kv_fused(
+            parent,
+            slot,
+            key_caches,
+            value_caches,
+            decode_step,
+            aux_key=aux_key,
+            aux_value=aux_value,
+        ):
+            return
+
+        # Build per-layer aux slices from the [num_layers, ...] buffer so the
+        # reference path reuses the same allocation instead of .clone().
+        num_layers = len(pools)
+        aux_key_bufs = [aux_key[layer] for layer in range(num_layers)]
+        aux_value_bufs = [aux_value[layer] for layer in range(num_layers)]
 
     select_unshared_kv(
         parent,
         slot,
-        [p.unshared_key for p in pools],
-        [p.unshared_value for p in pools],
+        key_caches,
+        value_caches,
         decode_step,
         aux_key_bufs=aux_key_bufs,
         aux_value_bufs=aux_value_bufs,
