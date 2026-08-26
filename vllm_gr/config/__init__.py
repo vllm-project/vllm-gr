@@ -6,6 +6,7 @@
 from vllm_gr.config.models import (
     CONSTRAINT_TABLE_FORMAT,
     GR_CONFIG_SCHEMA_VERSION,
+    MAX_BEAM_WIDTH,
     ConstraintBackend,
     ConstraintTableBackendEnum,
     ConstraintTableConfig,
@@ -24,6 +25,7 @@ from vllm_gr.config.parser import (
 __all__ = [
     "CONSTRAINT_TABLE_FORMAT",
     "GR_CONFIG_SCHEMA_VERSION",
+    "MAX_BEAM_WIDTH",
     "ConstraintBackend",
     "ConstraintTableBackendEnum",
     "ConstraintTableConfig",

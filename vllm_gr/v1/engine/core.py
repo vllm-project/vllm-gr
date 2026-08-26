@@ -22,30 +22,6 @@ logger = init_logger(__name__)
 _BEAM_STATE_INIT_LOCK = threading.Lock()
 
 
-def _constraint_table_backend_active() -> bool:
-    """True when the process runs with ``constraint_backend=constraint_table``.
-
-    Reads the process-global vLLM config (same source as ``ascend_compat``) so
-    both the driver and the EngineCore process agree without passing the flag
-    around the request path.
-
-    NOTE: ``get_current_vllm_config_or_none()`` can return ``None`` inside the
-    EngineCore process (the global config hook is not always installed there),
-    which would silently read as the default TRIE backend.  Callers inside the
-    EngineCore must prefer the engine's own ``vllm_config`` (see
-    :func:`_handle_beam_request_step_update`); this fallback only fires when no
-    config is available at all.
-    """
-    from vllm.config import get_current_vllm_config_or_none
-
-    from vllm_gr.config import ConstraintBackend, GRConfig
-
-    return (
-        GRConfig.from_vllm_config(get_current_vllm_config_or_none()).constraint_backend
-        == ConstraintBackend.CONSTRAINT_TABLE
-    )
-
-
 def _engine_constraint_table_active(engine: Any) -> bool:
     """Whether the EngineCore's own config selects Constraint Tables.
 
@@ -55,9 +31,10 @@ def _engine_constraint_table_active(engine: Any) -> bool:
     """
     from vllm_gr.config import ConstraintBackend, GRConfig
 
-    return (
-        GRConfig.from_vllm_config(getattr(engine, "vllm_config", None)).constraint_backend
-        == ConstraintBackend.CONSTRAINT_TABLE
+    gr_config = GRConfig.from_vllm_config(getattr(engine, "vllm_config", None))
+    canonical_table = gr_config.constraint_table
+    return gr_config.constraint_backend == ConstraintBackend.CONSTRAINT_TABLE or (
+        canonical_table is not None and canonical_table.enabled
     )
 
 
@@ -433,16 +410,25 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
         # update (beam_width=0) which pops the beam_cache entry.
         return
 
-    out_token_ids = decision.get("out_token_ids")
-    out_token_index = decision.get("out_token_index")
-    if out_token_ids is None or out_token_index is None:
-        logger.debug("vllm-gr: beam self-advance skipped (no candidate tensors) for %s", session_id)
-        return
+    from vllm_gr.v1.beam.beam_decision import (
+        flatten_decision_value,
+        unpack_beam_result_buffer,
+    )
 
-    from vllm_gr.v1.beam.beam_decision import flatten_decision_value
-
-    tokens_flat = flatten_decision_value(out_token_ids)
-    parents_flat = flatten_decision_value(out_token_index)
+    compact = unpack_beam_result_buffer(decision)
+    if compact is not None:
+        tokens_flat, _, parents_flat = compact
+    else:
+        out_token_ids = decision.get("out_token_ids")
+        out_token_index = decision.get("out_token_index")
+        if out_token_ids is None or out_token_index is None:
+            logger.debug(
+                "vllm-gr: beam self-advance skipped (no candidate tensors) for %s",
+                session_id,
+            )
+            return
+        tokens_flat = flatten_decision_value(out_token_ids)
+        parents_flat = flatten_decision_value(out_token_index)
     if tokens_flat is None or parents_flat is None:
         logger.debug(
             "vllm-gr: beam self-advance skipped (unflattenable candidate payload) for %s",

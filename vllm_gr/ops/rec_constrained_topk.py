@@ -51,7 +51,17 @@ def _finish_topk(
         candidate_logits = candidate_logits / torch.where(temps == 0, torch.ones_like(temps), temps)
     candidate_logits = candidate_logits.masked_fill(~valid_candidates, float("-inf"))
     log_denom = torch.logsumexp(candidate_logits, dim=1, keepdim=True)
-    top_values, top_indices = candidate_logits.topk(top_k, dim=1, largest=True, sorted=True)
+    if candidate_logits.device.type == "npu":
+        # Preserve the established NPU fallback path; the fused NPU operator
+        # does not promise CUDA's strengthened exact-tie ordering.
+        top_values, top_indices = candidate_logits.topk(top_k, dim=1, largest=True, sorted=True)
+    else:
+        # Stable descending order freezes the lower constraint-table offset as
+        # the exact-tie winner and serves as the deterministic CUDA oracle.
+        top_indices = torch.argsort(candidate_logits, dim=1, descending=True, stable=True)[
+            :, :top_k
+        ]
+        top_values = candidate_logits.gather(1, top_indices)
     top_logprobs = top_values - log_denom
     top_valid = valid_candidates.gather(1, top_indices)
     top_logprobs = torch.where(
@@ -214,7 +224,26 @@ def rec_constrained_topk(
     max_prefix1_degree: int = 0,
     max_prefix2_degree: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch constrained top-k to the NPU custom op or Torch fallback."""
+    """Dispatch constrained top-k to a device implementation or Torch fallback."""
+    if logits.device.type == "cuda":
+        from vllm_gr.ops.cuda.rec_constrained_topk import rec_constrained_topk_cuda
+
+        tokens, logprobs, _, _ = rec_constrained_topk_cuda(
+            logits,
+            sequence_group,
+            first_token_ids,
+            prefix1_offsets,
+            prefix1_values,
+            prefix1_pair_keys,
+            prefix2_value_offsets,
+            prefix2_values,
+            temperatures,
+            current_step,
+            top_k,
+            max_prefix1_degree,
+            max_prefix2_degree,
+        )
+        return tokens, logprobs
     if logits.device.type == "npu":
         from vllm_gr.ops.npu import (
             rec_constrained_topk_npu,

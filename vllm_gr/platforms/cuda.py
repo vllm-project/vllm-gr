@@ -53,14 +53,10 @@ class CUDABackendProvider:
         *,
         device: str | torch.device | None = None,
     ) -> "ConstrainedTopKExecution | None":
-        """Return ``None``: CUDA has no production Constraint Table execution.
+        """Create the production CUDA Constraint Table execution adapter."""
+        from vllm_gr.constraints.execution import CUDAConstrainedTopKExecution
 
-        Deliberately returns ``None`` (not a Torch fallback) so a ModelRunner
-        integration must fail explicitly when constraint tables are requested
-        on CUDA, never silently degrade.
-        """
-        del device
-        return None
+        return CUDAConstrainedTopKExecution(device=device)
 
 
 CUDA_BACKEND = CUDABackendProvider()

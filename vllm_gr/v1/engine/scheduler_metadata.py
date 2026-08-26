@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from vllm_gr.config import MAX_BEAM_WIDTH
+
 
 def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional[Dict[str, Any]]:
     """Build scheduler metadata for a grouped beam-decode request.
@@ -27,10 +29,14 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
     """
     if getattr(req, "is_constraint_prefill", False):
         beam_width = getattr(req, "beam_width", None)
-        if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 1:
+        if (
+            isinstance(beam_width, bool)
+            or not isinstance(beam_width, int)
+            or not 1 <= beam_width <= MAX_BEAM_WIDTH
+        ):
             raise RuntimeError(
                 f"Constraint prefill request {req.request_id!r} is missing a valid "
-                f"beam_width={beam_width!r}; expected a positive integer"
+                f"beam_width={beam_width!r}; expected an integer in [1, {MAX_BEAM_WIDTH}]"
             )
         return {
             "is_beam_decode": False,
@@ -54,10 +60,14 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
         )
 
     beam_width = req.beam_width
-    if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 1:
+    if (
+        isinstance(beam_width, bool)
+        or not isinstance(beam_width, int)
+        or not 1 <= beam_width <= MAX_BEAM_WIDTH
+    ):
         raise RuntimeError(
             f"Grouped beam request {req.request_id!r} has invalid beam_width={beam_width!r}; "
-            "expected a positive integer"
+            f"expected an integer in [1, {MAX_BEAM_WIDTH}]"
         )
 
     prefix_len = getattr(req, "prefix_len", 0)

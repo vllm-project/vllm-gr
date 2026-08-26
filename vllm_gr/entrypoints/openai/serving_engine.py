@@ -24,6 +24,7 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
+from vllm_gr.config import MAX_BEAM_WIDTH
 from vllm_gr.constraints import BeamConstraintCoordinator, ParentCandidateBuilder
 from vllm_gr.constraints.models import CandidateLayout
 from vllm_gr.constraints.strategies import (
@@ -64,11 +65,18 @@ def _worker_decision_flatten(
     Returns ``(token_ids, cumulative_logprobs, parent_indices, parent_cache)``
     or ``None`` when the payload cannot be mapped to ``num_beams`` winners.
     """
-    from vllm_gr.v1.beam.beam_decision import flatten_decision_value
+    from vllm_gr.v1.beam.beam_decision import (
+        flatten_decision_value,
+        unpack_beam_result_buffer,
+    )
 
-    ids_flat = flatten_decision_value(decision.get("out_token_ids"))
-    lps_flat = flatten_decision_value(decision.get("out_log_probs"))
-    parent_flat = flatten_decision_value(decision.get("out_token_index"))
+    compact = unpack_beam_result_buffer(decision)
+    if compact is not None:
+        ids_flat, lps_flat, parent_flat = compact
+    else:
+        ids_flat = flatten_decision_value(decision.get("out_token_ids"))
+        lps_flat = flatten_decision_value(decision.get("out_log_probs"))
+        parent_flat = flatten_decision_value(decision.get("out_token_index"))
     if ids_flat is None or lps_flat is None or parent_flat is None:
         return None
     if not ids_flat:
@@ -349,9 +357,15 @@ async def beam_search(
             )
 
     include_stop_str_in_output = params.include_stop_str_in_output
-    if beam_width == 0:
+    if (
+        isinstance(beam_width, bool)
+        or not isinstance(beam_width, int)
+        or not 1 <= beam_width <= MAX_BEAM_WIDTH
+    ):
         raise VLLMValidationError(
-            "Beam width must be greater than 0", parameter="beam_width", value=0
+            f"Beam width must be an integer in [1, {MAX_BEAM_WIDTH}]",
+            parameter="beam_width",
+            value=beam_width,
         )
     input_processor = self.input_processor
     tokenizer = input_processor.tokenizer
@@ -595,11 +609,21 @@ async def beam_search(
                 else CandidateLayout.STANDARD_SAMPLER
             )
         )
-        # Worker-side beam decision result (NPU xllm path).  Initialised here so
+        # Worker-side beam decision result. Initialised here so
         # the per-beam extraction below can overwrite it and the bottom-of-loop
         # selection always has a defined value even on the prefill/batch path
         # (where the use_beam_request branch never runs).
         worker_candidates = None
+
+        # Constraint prefill also has a canonical CUDA worker decision.  It
+        # arrives through the same result channel as decode, but this first
+        # iteration uses the ADD_BATCH branch (``fork_info is None``).
+        if use_beam_request and _is_constrained and fork_info is None and len(output) == 1:
+            prefill_decision = _worker_decision_from_result(output[0])
+            if prefill_decision is not None:
+                worker_candidates = _worker_decision_flatten(
+                    prefill_decision, beam_width, all_beams
+                )
 
         # -------------------------------------------------------------------------
         # STRIDE-AWARE METADATA EXTRACTION FOR GENERATED BEAMS
@@ -630,7 +654,7 @@ async def beam_search(
                 )
                 return
 
-            # Worker-side beam decision (NPU xllm path, ACS-aligned): the worker
+            # Worker-side beam decision (accelerator path): the worker
             # already selected the surviving beams, so skip the frontend flat
             # logprobs extraction + NumPy top-k entirely and feed the worker's
             # winners into the existing EOS / materialisation pipeline.
@@ -728,6 +752,8 @@ async def beam_search(
         else:
             # Baseline execution path for prefill / batch loops
             for i, result in enumerate(output):
+                if worker_candidates is not None:
+                    break
                 current_beam = all_beams[i]
                 if result.outputs[0].finish_reason == "error":
                     yield RequestOutput(
@@ -828,10 +854,14 @@ async def beam_search(
             completed.extend(eos_beams)
 
         # Processing non-EOS tokens
-        topn_idx = select_top_indices(
-            all_beams_logprob,
-            beam_width,
-            catalog_strategy,
+        topn_idx = (
+            range(len(all_beams_token_id))
+            if worker_candidates is not None
+            else select_top_indices(
+                all_beams_logprob,
+                beam_width,
+                catalog_strategy,
+            )
         )
         new_beams, selected_fork_info = materialize_selected_beams(
             parents=all_beams,

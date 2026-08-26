@@ -36,7 +36,21 @@ def compute_catalog_slice_config(
         min_tid = float("inf")
         max_tid = -float("inf")
 
-        for seq in catalog_data:
+        if isinstance(catalog_data, dict):
+            triples = catalog_data.get("triples")
+            if not isinstance(triples, list):
+                raise ValueError("constraint triples document has no list-valued 'triples'")
+            sequences = (
+                [triple["a"], triple["b"], triple["c"]]
+                for triple in triples
+                if isinstance(triple, dict)
+            )
+        elif isinstance(catalog_data, list):
+            sequences = iter(catalog_data)
+        else:
+            raise ValueError("catalog must be a list or constraint triples object")
+
+        for seq in sequences:
             token_ids = tokenizer.convert_tokens_to_ids(seq)
             for token_str, token_id in zip(seq, token_ids):
                 if token_id is not None and token_id != -1:

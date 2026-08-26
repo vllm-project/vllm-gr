@@ -18,6 +18,8 @@ import msgspec
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreRequest
 
+from vllm_gr.config import MAX_BEAM_WIDTH
+
 BEAM_BATCH_PROTOCOL_VERSION = 1
 DEFAULT_CONSTRAINT_RESOURCE_ID = "default"
 
@@ -222,7 +224,9 @@ def _protocol_version(value: object) -> None:
 def _validate_beam_params(params: BeamBatchParams) -> None:
     if not isinstance(params, BeamBatchParams):
         _fail("beam_params must be BeamBatchParams")
-    _positive_int("beam_params.beam_width", params.beam_width)
+    beam_width = _positive_int("beam_params.beam_width", params.beam_width)
+    if beam_width > MAX_BEAM_WIDTH:
+        _fail(f"beam_params.beam_width must be <= {MAX_BEAM_WIDTH}, got {beam_width}")
     _positive_int("beam_params.max_tokens", params.max_tokens)
     if (
         isinstance(params.temperature, bool)
@@ -321,6 +325,8 @@ def validate_beam_batch_limits(limits: BeamBatchLimits) -> None:
         "max_model_len",
     ):
         _positive_int(f"limits.{name}", getattr(limits, name))
+    if limits.max_beam_width > MAX_BEAM_WIDTH:
+        _fail(f"limits.max_beam_width must be <= {MAX_BEAM_WIDTH}, got {limits.max_beam_width}")
     if not limits.supported_constraint_resource_ids:
         _fail("limits.supported_constraint_resource_ids must not be empty")
     resource_ids: set[str] = set()

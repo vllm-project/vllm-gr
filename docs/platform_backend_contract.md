@@ -159,7 +159,7 @@ registered.
 | `apply_runtime_patches()` | No-op | Ascend Attention selector patch, then NPUWorker initialization hook; return the summed patch count |
 | `get_model_runner_hooks()` | `gpu_model_runner_patch` | `npu_model_runner_patch` |
 | `get_attention_execution()` | `beam_attn_gpu` | `beam_attn_npu` |
-| `create_constrained_topk_execution()` | `None` — CUDA has no production Constraint Table execution; explicit unsupported | Lazy-loads a fresh `NPUConstrainedTopKExecution(device=device)` |
+| `create_constrained_topk_execution()` | Lazy-loads a fresh `CUDAConstrainedTopKExecution(device=device)` | Lazy-loads a fresh `NPUConstrainedTopKExecution(device=device)` |
 
 The NPU provider is built in during the initial migration so the contract is
 exercised against all current Ascend requirements. A later stage may move it

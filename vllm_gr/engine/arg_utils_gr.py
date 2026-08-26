@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Final
 
 from vllm.engine.arg_utils import EngineArgs
@@ -22,11 +23,6 @@ from vllm_gr.config.parser import (
     KNOWN_GR_CONFIG_KEYS,
     normalize_gr_config_input,
 )
-
-# Upper bound on beam_max_width for the NPU Constraint Table auto-promotion.
-# Mirrors vllm_gr.constraints.strategies.MAX_CONSTRAINT_BEAM_WIDTH (imported
-# lazily to keep the config-import graph flat here).
-_MAX_CONSTRAINT_TABLE_BEAM_WIDTH: Final = 256
 
 
 def _catalog_is_triples_document(catalog_path: str) -> bool:
@@ -151,7 +147,7 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help=(
             "Upper bound on beam width for the persistent beam KV pool and "
             "the captured CUDA graph shape (num_tokens=width). Must be >= "
-            "any served request's beam_width. When set, the engine allocates "
+            "any served request's beam_width and <= 256. When set, the engine allocates "
             "the beam KV pool and (unless --no-beam-graph) captures a FULL "
             "CUDA graph for this width at startup. Unset (default) disables "
             "beam decode — no pool allocated, no graph captured."
@@ -175,10 +171,11 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         action="store_true",
         default=None,
         help="Move the beam decision (beam_search_group / rec_final_select + "
-        "select_unshared_kv) into the NPU worker and return results via "
-        "ModelRunnerOutput.beam_search_result (ACS-aligned save flow). Only "
-        "takes effect on NPU + xllm decode execution with the xllm op library "
-        "present. Without this flag the frontend NumPy decision path is kept.",
+        "select_unshared_kv) into the accelerator worker and return results via "
+        "ModelRunnerOutput.beam_search_result (ACS-aligned save flow). CUDA "
+        "beam deployments enable this by default; NPU requires xllm decode "
+        "execution and its operator library. Without it the frontend NumPy "
+        "decision path is kept.",
     )
     model_group.add_argument(
         "--no-beam-worker-decision",
@@ -195,7 +192,9 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help="Let EngineCore drive intermediate beam steps itself: the "
         "worker's beam decision result is applied in-process to enqueue the "
         "next beam-decode step, eliminating the per-step frontend RPC "
-        "round-trip. Requires --beam-worker-decision (NPU xllm path).",
+        "round-trip. Requires --beam-worker-decision. Synchronously scheduled "
+        "accelerator Constraint Table beam deployments enable it by default; "
+        "async scheduling keeps frontend step submission unless explicitly enabled.",
     )
     model_group.add_argument(
         "--no-beam-self-advance",
@@ -312,6 +311,15 @@ def _is_npu_platform() -> bool:
     return getattr(current_platform, "device_type", None) == "npu"
 
 
+def _is_cuda_platform() -> bool:
+    """Return whether the active platform is CUDA."""
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return False
+    return getattr(current_platform, "device_type", None) == "cuda"
+
+
 def _constraint_explicitly_configured(
     engine_args: object,
     existing_gr_config: GRConfig,
@@ -410,15 +418,6 @@ def create_engine_config(self, usage_context=None, headless=False):
             if getattr(self, "beam_self_advance", None) is not None
             else existing_gr_config.beam_self_advance
         )
-        # Self-advance only applies when the worker decision path is active
-        # (the self-advance step consumes the worker's beam_search_result).
-        # Never silently enable it on the frontend NumPy decision path.
-        if effective_beam_self_advance and not effective_beam_worker_decision:
-            raise ValueError(
-                "beam_self_advance=True requires beam_worker_decision=True "
-                "(CLI --beam-worker-decision or additional_config "
-                "'vllm_gr_beam_worker_decision')"
-            )
         # NPU platform default for beam-serve deployments: when the user
         # enables beam search (beam_max_width) with a constraint catalog
         # (a Triples document) and no explicit backend choice, run Constraint
@@ -439,26 +438,13 @@ def create_engine_config(self, usage_context=None, headless=False):
             getattr(self, "beam_worker_decision", None) is not None
             or existing_gr_config.beam_worker_decision is not None
         )
-        # The auto-promotion must respect the Constraint Table capacity: the
-        # fused ``rec_constrained_topk`` kernel's top_k (== beam_width) is
-        # hard-capped at 256 (vllm_gr.constraints.strategies.
-        # MAX_CONSTRAINT_BEAM_WIDTH / ops.npu.rec_constrained_topk.MAX_TOP_K).
-        # Promoting a wider deployment (e.g. beam_max_width=512) would make
-        # every request fail the limit validation, so such deployments keep
-        # the default (unconstrained) backend instead.
-        effective_beam_max_width = (
-            getattr(self, "beam_max_width", None)
-            if getattr(self, "beam_max_width", None) is not None
-            else existing_gr_config.beam_max_width
-        )
-        beam_width_within_constraint_capacity = (
-            effective_beam_max_width is None
-            or effective_beam_max_width <= _MAX_CONSTRAINT_TABLE_BEAM_WIDTH
+        self_advance_explicit = (
+            getattr(self, "beam_self_advance", None) is not None
+            or existing_gr_config.beam_self_advance is not None
         )
         if (
             _is_npu_platform()
             and beam_width_configured
-            and beam_width_within_constraint_capacity
             and not _constraint_explicitly_configured(self, existing_gr_config)
             and effective_catalog_path is not None
             and _catalog_is_triples_document(effective_catalog_path)
@@ -475,38 +461,58 @@ def create_engine_config(self, usage_context=None, headless=False):
             # unconstrained (legacy) instead of force-building tables.  A
             # catalog document is therefore required for the promotion.
             effective_constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
-        elif (
-            _is_npu_platform()
-            and effective_catalog_path is None
-            and beam_width_configured
-            and not beam_width_within_constraint_capacity
-            and not _constraint_explicitly_configured(self, existing_gr_config)
-        ):
-            logger.warning(
-                "NPU Constraint Table auto-promotion skipped: beam_max_width %s "
-                "exceeds the constraint_table beam-width cap %s "
-                "(fused rec_constrained_topk top_k limit); running beam "
-                "decode without constraint tables.",
-                effective_beam_max_width,
-                _MAX_CONSTRAINT_TABLE_BEAM_WIDTH,
-            )
-        # Worker-side beam decision is enabled on NPU by default for any beam
+        # Worker-side beam decision is enabled on accelerator backends by default for any beam
         # deployment unless the user explicitly disabled it.  Independent of
         # the Constraint Table promotion above (which may already be explicit
         # via GRLLM passing the auto-build sentinel).
-        if _is_npu_platform() and beam_width_configured and not worker_decision_explicit:
+        if (
+            (_is_npu_platform() or _is_cuda_platform())
+            and beam_width_configured
+            and not worker_decision_explicit
+        ):
             if effective_beam_worker_decision is None:
                 effective_beam_worker_decision = True
+        # The canonical Worker decision otherwise paid one frontend
+        # step-update round-trip per SID decode.  On accelerator Constraint
+        # Tables, make the already-supported EngineCore self-advance path the
+        # default so the canonical path retains the legacy device-wire
+        # latency.  Explicit False remains a full opt-out. NPU cascade (no
+        # xllm decision result), async scheduling, and PP>1 keep their existing
+        # fallback behavior in the runtime gates.
+        if (
+            (_is_npu_platform() or _is_cuda_platform())
+            and beam_width_configured
+            and effective_constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
+            and effective_beam_worker_decision
+            and not getattr(self, "async_scheduling", False)
+            and not self_advance_explicit
+            and effective_beam_self_advance is None
+        ):
+            effective_beam_self_advance = True
+        # Self-advance only applies when the worker decision path is active
+        # (the self-advance step consumes the worker's beam_search_result).
+        # Validate after platform defaults so an explicit self-advance can use
+        # the accelerator's default worker decision.
+        if effective_beam_self_advance and not effective_beam_worker_decision:
+            raise ValueError(
+                "beam_self_advance=True requires beam_worker_decision=True "
+                "(CLI --beam-worker-decision or additional_config "
+                "'vllm_gr_beam_worker_decision')"
+            )
         offset, slice_size = None, None
-        # Vocab slicing is computed from the Trie catalog's token-sequence
-        # list.  A Constraint Tables triples document is a relations dict (not
-        # a sequence list), and the two features are mutually exclusive anyway
-        # (validate_constraint_table_platform rejects the combination), so the
-        # slice computation must be skipped for the constraint_table backend.
+        # CUDA Constraint Tables support sliced logits while keeping global
+        # table token ids (CUDAConstrainedTopKExecution._vocab_window).  The
+        # slice helper accepts both Trie lists and triples documents, so keep
+        # the old lm_head fast path on CUDA. NPU retains its full-vocabulary
+        # ABI and validate_constraint_table_platform rejects slicing there.
+        constraint_slice_supported = (
+            effective_constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
+            or _is_cuda_platform()
+        )
         if (
             effective_catalog_path is not None
             and effective_catalog_path != AUTO_CONSTRAINT_TABLE_PATH
-            and effective_constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
+            and constraint_slice_supported
         ):
             model_name = getattr(self, "model", None)
             if model_name is not None:
@@ -554,16 +560,32 @@ def create_engine_config(self, usage_context=None, headless=False):
             constraint_table=existing_gr_config.constraint_table,
         )
 
+    # Canonical configs bypass the legacy merge above. Apply accelerator
+    # runtime defaults here as well so omitted decision controls use the same
+    # Worker + EngineCore path as legacy arguments.
     if (
         canonical_source
-        and effective_gr_config.constraint_table is not None
-        and effective_gr_config.constraint_table.enabled
+        and (_is_cuda_platform() or _is_npu_platform())
+        and effective_gr_config.beam_max_width is not None
+        and effective_gr_config.beam_worker_decision is None
     ):
-        raise RuntimeError(
-            "canonical constraint_table.enabled=true is not supported until "
-            "the Worker integration PR; refusing to fall back to Trie or "
-            "unconstrained execution"
+        effective_gr_config = replace(effective_gr_config, beam_worker_decision=True)
+    if (
+        canonical_source
+        and (_is_cuda_platform() or _is_npu_platform())
+        and effective_gr_config.beam_max_width is not None
+        and (
+            effective_gr_config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
+            or (
+                effective_gr_config.constraint_table is not None
+                and effective_gr_config.constraint_table.enabled
+            )
         )
+        and effective_gr_config.beam_worker_decision
+        and not getattr(self, "async_scheduling", False)
+        and effective_gr_config.beam_self_advance is None
+    ):
+        effective_gr_config = replace(effective_gr_config, beam_self_advance=True)
 
     if effective_gr_config != existing_gr_config or canonical_input is not None:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields

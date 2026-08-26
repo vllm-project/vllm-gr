@@ -137,6 +137,19 @@ class TestValidateConstraintTablePlatform:
         with pytest.raises(ValueError, match="vocab slicing"):
             validate_constraint_table_platform(GRConfig(vocab_slice_size=1024))
 
+    def test_cuda_accepts_complete_vocab_slice(self) -> None:
+        validate_constraint_table_platform(
+            GRConfig(vocab_offset=1000, vocab_slice_size=1024),
+            device_type="cuda",
+        )
+
+    def test_npu_still_rejects_vocab_slice(self) -> None:
+        with pytest.raises(ValueError, match="platform 'npu'"):
+            validate_constraint_table_platform(
+                GRConfig(vocab_offset=1000, vocab_slice_size=1024),
+                device_type="npu",
+            )
+
 
 class TestCompileConstraintTableResource:
     def test_rejects_non_object_document(self, tmp_path: Path) -> None:

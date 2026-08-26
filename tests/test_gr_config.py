@@ -470,20 +470,19 @@ def _npic_engine_args(beam_max_width: int, catalog_path: str | None = None) -> S
 
 
 @pytest.mark.parametrize(
-    ("beam_max_width", "promoted"),
-    [(1, True), (128, True), (256, True), (257, False), (512, False)],
+    "beam_max_width",
+    [1, 128, 256],
 )  # type: ignore[misc]
 def test_npu_constraint_table_auto_promotion_respects_capacity(
-    beam_max_width: int, promoted: bool
+    beam_max_width: int,
 ) -> None:
     """An NPU beam deployment with a catalog promotes, capacity-limited at 256.
 
     With a constraint data source (a Triples document) available, auto-promotion
     to Constraint Tables fires on any beam_max_width within the fused
-    ``rec_constrained_topk`` top_k cap of 256; wider deployments must not
-    auto-promote (every request would fail
-    ``validate_constraint_generation_limits``).  The user's catalog is kept as
-    the data source — never replaced by the tokenizer auto-build sentinel.
+    ``rec_constrained_topk`` top_k cap of 256. Wider deployments are rejected
+    by the shared configuration validator. The user's catalog is kept as the
+    data source — never replaced by the tokenizer auto-build sentinel.
     """
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
@@ -507,12 +506,14 @@ def test_npu_constraint_table_auto_promotion_respects_capacity(
 
     config = GRConfig.from_vllm_config(result)
     assert config.catalog_path == catalog_path
-    if promoted:
-        assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
-    else:
-        # No auto-promotion: the constraint backend keeps its default and the
-        # catalog is not replaced by the tokenizer auto-build sentinel.
-        assert config.constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
+    assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
+    assert config.beam_worker_decision is True
+    assert config.beam_self_advance is True
+
+
+def test_beam_max_width_rejects_values_above_global_limit() -> None:
+    with pytest.raises(ValueError, match=r"beam_max_width must be <= 256"):
+        GRConfig(beam_max_width=257)
 
 
 def test_npu_beam_without_catalog_stays_unconstrained() -> None:
@@ -673,18 +674,32 @@ def test_gpu_catalog_path_without_backend_keeps_trie_default() -> None:
     assert config.catalog_path == "generated_data/video_catalog.json"
 
 
+def test_cuda_beam_enables_worker_decision_by_default() -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    engine_args = _npic_engine_args(beam_max_width=128)
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=_vllm_config(),
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=True),
+    ):
+        result = create_engine_config(engine_args)
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.beam_worker_decision is True
+    # Trie filtering has no Worker result to self-advance from.
+    assert config.beam_self_advance is None
+    assert config.constraint_backend is ConstraintBackend.TRIE
+
+
 @pytest.mark.parametrize("catalog_path", ["triples.json", "AUTO"])  # type: ignore[misc]
-def test_constraint_table_backend_skips_vocab_slice_computation(
+def test_non_cuda_constraint_table_backend_skips_vocab_slice_computation(
     catalog_path: str,
 ) -> None:
-    """A Constraint Tables config must not run the Trie vocab-slice computation.
-
-    The slice helper parses the Trie catalog's sequence list; a Constraint
-    Tables triples document is a relations dict, and the two features are
-    mutually exclusive (``validate_constraint_table_platform`` rejects the
-    combination).  Running the computation on a triples document previously
-    derived a bogus (offset, size) that broke startup.
-    """
+    """NPU/unknown Constraint Tables keep the full-vocabulary logits ABI."""
     from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
@@ -713,6 +728,10 @@ def test_constraint_table_backend_skips_vocab_slice_computation(
             return_value=False,
         ),
         mock.patch(
+            "vllm_gr.engine.arg_utils_gr._is_cuda_platform",
+            return_value=False,
+        ),
+        mock.patch(
             "vllm_gr.utils.catalog.compute_catalog_slice_config",
             side_effect=AssertionError("vocab slice computation must not run"),
         ) as slice_spy,
@@ -727,3 +746,53 @@ def test_constraint_table_backend_skips_vocab_slice_computation(
     assert config.vocab_slice_size is None
     slice_spy.assert_not_called()
     set_slice.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("self_advance", "async_scheduling", "expected_self_advance"),
+    [(None, False, True), (False, False, False), (None, True, None)],
+)  # type: ignore[misc]
+def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
+    self_advance: bool | None,
+    async_scheduling: bool,
+    expected_self_advance: bool | None,
+) -> None:
+    """CUDA triples use the sliced lm_head path supported by the CUDA backend."""
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    engine_args = SimpleNamespace(
+        catalog_path="triples.json",
+        constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+        attention_backend=None,
+        attention_config=None,
+        model="test-model",
+        trust_remote_code=False,
+        beam_max_width=32,
+        beam_worker_decision=None,
+        beam_self_advance=self_advance,
+        async_scheduling=async_scheduling,
+        no_beam_graph=False,
+        _vllm_gr_config_input=None,
+    )
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=_vllm_config(),
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=True),
+        mock.patch(
+            "vllm_gr.utils.catalog.compute_catalog_slice_config",
+            return_value=(151669, 24576),
+        ) as slice_spy,
+        mock.patch("vllm_gr.ops.sliced_logits.set_vocab_slice_config") as set_slice,
+    ):
+        result = create_engine_config(engine_args)
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.vocab_offset == 151669
+    assert config.vocab_slice_size == 24576
+    assert config.beam_worker_decision is True
+    assert config.beam_self_advance is expected_self_advance
+    slice_spy.assert_called_once()
+    set_slice.assert_called_once_with(151669, 24576)

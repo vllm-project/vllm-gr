@@ -181,6 +181,10 @@ def _remux_logprobs_tensors(
 
     new_st_ids, new_lps, new_lp_ids, new_ranks = [], [], [], []
     gpu_row_cursor = 0
+    logical_row_cursor = 0
+    logical_st_ids = st_ids.shape[0] == sum(
+        req_id is not None for req_id, *_ in request_row_configs
+    )
 
     for req_id, _, W_logits, *_ in request_row_configs:
         # CASE A: INTERMEDIATE CHUNKED PREFILL (No output rows generated)
@@ -211,7 +215,9 @@ def _remux_logprobs_tensors(
             continue
 
         # CASE B: ACTIVE SAMPLING PATH (Captures the full multi-beam footprint)
-        new_st_ids.append(st_ids[gpu_row_cursor : gpu_row_cursor + 1, :])
+        sampled_row = logical_row_cursor if logical_st_ids else gpu_row_cursor
+        new_st_ids.append(st_ids[sampled_row : sampled_row + 1, :])
+        logical_row_cursor += 1
 
         req_lps = orig_lps[gpu_row_cursor : gpu_row_cursor + W_logits, :target_K].reshape(
             1, W_logits * target_K
@@ -528,6 +534,25 @@ def _beam_collapse_bookkeeping(
     if sampler_output is not None:
         st_ids = sampler_output.sampled_token_ids
         lp_tensors = sampler_output.logprobs_tensors
+        if getattr(sampler_output, "_gr_beam_result_transport", False):
+            # Worker-side selection already reduced the candidate matrix to
+            # one O(W) row per logical request before upstream bookkeeping.
+            # The selected parent mapping travels independently in
+            # ModelRunnerOutput.beam_search_result; do not expand this small
+            # compatibility row back into the legacy W-by-W payload.
+            if st_ids is None or lp_tensors is None:
+                raise RuntimeError("worker Beam result transport is missing sampler tensors")
+            if st_ids.shape[0] != num_logical_requests:
+                raise RuntimeError(
+                    "worker Beam sampled row count does not match logical requests: "
+                    f"{st_ids.shape[0]} != {num_logical_requests}"
+                )
+            if lp_tensors.logprobs.shape[0] != num_logical_requests:
+                raise RuntimeError(
+                    "worker Beam logprob row count does not match logical requests: "
+                    f"{lp_tensors.logprobs.shape[0]} != {num_logical_requests}"
+                )
+            return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
         if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
             orig_lps = lp_tensors.logprobs
             orig_lp_ids = lp_tensors.logprob_token_ids
@@ -648,6 +673,53 @@ def _beam_collapse_bookkeeping(
                 raise RuntimeError("Inplace copy failed during beam collapse") from e
 
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
+
+
+def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any) -> bool:
+    """Reduce a CUDA worker-decision sampler payload from O(W^2) to O(W).
+
+    vLLM's synchronous bookkeeping copies ``sampler_output.logprobs_tensors``
+    to the host before :func:`_beam_collapse_bookkeeping` runs.  Once the
+    worker has selected the W survivors, copying the original W-by-W
+    candidate matrix is redundant: token/parent/score winners are carried by
+    ``beam_search_result``.  Keep one ordinary selected token/score row only
+    so upstream can still materialize a valid RequestOutput, and mark it so
+    the later collapse does not recreate the large matrix.
+
+    The parent indices are deliberately *not* packed into token ids.  This is
+    the normal sampler representation plus the canonical beam_search_result
+    channel, not the removed FlatLogprobs packed-wire protocol.
+    """
+    decision = getattr(runner, "_beam_decision_tensors", None)
+    if not isinstance(decision, dict) or sampler_output is None:
+        return False
+    lp_tensors = getattr(sampler_output, "logprobs_tensors", None)
+    if lp_tensors is None:
+        return False
+    token_ids = decision.get("out_token_ids")
+    scores = decision.get("out_log_probs")
+    if not torch.is_tensor(token_ids) or not torch.is_tensor(scores):
+        return False
+    if token_ids.ndim != 2 or scores.shape != token_ids.shape or token_ids.shape[0] < 1:
+        return False
+
+    selected_ids = token_ids.contiguous()
+    selected_scores = scores.contiguous()
+    sampler_output.sampled_token_ids = selected_ids[:, :1].contiguous()
+    ranks = getattr(lp_tensors, "selected_token_ranks", None)
+    rank_dtype = ranks.dtype if torch.is_tensor(ranks) else torch.int64
+    selected_ranks = torch.zeros(
+        selected_ids.shape[0],
+        dtype=rank_dtype,
+        device=selected_ids.device,
+    )
+    sampler_output.logprobs_tensors = lp_tensors._replace(
+        logprob_token_ids=selected_ids,
+        logprobs=selected_scores,
+        selected_token_ranks=selected_ranks,
+    )
+    sampler_output._gr_beam_result_transport = True
+    return True
 
 
 def _attach_beam_search_result(runner: Any, model_output: Any) -> None:
@@ -774,6 +846,28 @@ def _beam_graph_enabled_for_run(runner) -> bool:
     return _get_gr_config(runner).beam_graph_enabled
 
 
+def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
+    """Return capture/dispatch state through ``collective_rpc``.
+
+    vLLM utility RPC callables receive the Worker, while Beam graph state is
+    owned by its ModelRunner.  Keeping this probe in an importable module makes
+    it safe under both ``fork`` and ``spawn`` and lets profiling fail loudly
+    when startup capture succeeded but the measured request ran eager.
+    """
+
+    runner = getattr(worker, "model_runner", None)
+    if runner is None:
+        raise RuntimeError("worker has no model_runner for Beam graph diagnostics")
+    config = _get_gr_config(runner)
+    return {
+        "runner": type(runner).__name__,
+        "beam_graph_enabled": bool(config.beam_graph_enabled),
+        "beam_max_width": config.beam_max_width,
+        "captured_widths": sorted(int(width) for width in getattr(runner, "_beam_graph_keys", ())),
+        "full_dispatches": int(getattr(runner, "_beam_graph_full_dispatch_count", 0)),
+    }
+
+
 def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     """Create a BeamAttentionContext with sizing derived from model + GRConfig.
 
@@ -858,7 +952,6 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         session = runner._beam_sessions.pop(sid, None)
         if session is not None:
             session.end_session()
-
     # 2. Check if we have any beam decode requests with decode_step
     incremental_ids = [
         req_id
@@ -992,11 +1085,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 recorded = state.kv_reorder
                 if recorded is not None:
                     state.kv_reorder = None
-                    if (
-                        parent_beam_ids is not None
-                        and not is_last_step
-                        and list(parent_beam_ids) != recorded
-                    ):
+                    if parent_beam_ids is not None and list(parent_beam_ids) != recorded:
                         # Frontend mapping differs from what the worker
                         # applied (e.g. EOS re-ordering).  The pool currently
                         # holds pre-decision row `recorded[i]` at row i; the
@@ -1023,13 +1112,18 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                             context.pools,
                             state.decode_step - 1,  # KV range written through the previous step
                         )
-                    # Exact match (or no parent / last step): the same-step
-                    # path already reordered and advanced decode_step.
-                elif parent_beam_ids is not None and not is_last_step:
+                    # Exact matches were already applied by the worker.
+                elif parent_beam_ids is not None:
                     parent = torch.tensor(parent_beam_ids, dtype=torch.int32, device=runner.device)
-                    session.step_complete(parent)
+                    # This mapping belongs to the previous decision and must
+                    # be applied before the current, possibly terminal, step.
+                    state.is_last_step = False
+                    try:
+                        session.step_complete(parent)
+                    finally:
+                        state.is_last_step = is_last_step
                 else:
-                    # Last step or no parent: just advance decode_step
+                    # No previous parent mapping: just advance decode_step.
                     state.decode_step += 1
         else:
             # New session
@@ -1094,6 +1188,7 @@ def make_patched_execute_model(_orig_execute_model):
         # a stale result from a previous run can never leak into this step's
         # ModelRunnerOutput.beam_search_result.
         self._beam_decision_result = None
+        self._beam_decision_tensors = None
 
         # Manage BeamSearchSession for incremental decode
         beam_session = _get_or_create_beam_session(self, self._current_beam_data, scheduler_output)

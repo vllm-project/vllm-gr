@@ -13,16 +13,20 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_gr.constraints.backend import ConstraintOutput
 from vllm_gr.constraints.compiler import ConstraintTableCompiler
 from vllm_gr.constraints.execution import TorchConstrainedTopKExecution
 from vllm_gr.constraints.json_compiler import compile_relations_json
 from vllm_gr.v1.worker.constraint_hook import (
     apply_constrained_sample_override,
+    build_constraint_backend_prefix_token_ids,
+    build_direct_constrained_sampler_output,
     build_sequence_group_for_step,
     collect_constrained_rows,
     get_or_create_execution_adapter,
     patch_sampler_output_for_constrained,
     run_constrained_partition,
+    try_sample_with_constraint_backend,
     validate_constraint_step,
 )
 
@@ -114,6 +118,25 @@ def test_collect_constrained_rows_skips_intermediate_chunk() -> None:
     beam_data = {"cprefill": _prefill_mdata(width=2)}
 
     assert collect_constrained_rows(request_row_configs, beam_data) == []
+
+
+def test_direct_intermediate_chunk_returns_empty_sampler_output() -> None:
+    backend = _CanonicalBackend(max_top_k=2, max_rows=2)
+    runner, events = _direct_runner(
+        {"req": _prefill_mdata(width=2)},
+        [("req", 0, 0, [])],
+        backend,
+    )
+
+    output = try_sample_with_constraint_backend(runner, torch.empty((0, 8)))
+
+    assert output is not None
+    assert output.sampled_token_ids.shape == (1, 1)
+    assert output.sampled_token_ids.tolist() == [[-1]]
+    assert output.sampled_token_ids.dtype == torch.int32
+    assert output.logprobs_tensors is None
+    assert backend.calls == []
+    assert events == []
 
 
 def test_collect_constrained_rows_rejects_invalid_step_even_without_rows() -> None:
@@ -517,6 +540,365 @@ def test_get_or_create_execution_adapter_fails_when_not_injected(
 
     with pytest.raises(RuntimeError, match="not injected"):
         get_or_create_execution_adapter(SimpleNamespace(device=torch.device("cpu")))
+
+
+# --------------------------------------------------------------------------
+# Canonical runner-owned Backend direct path
+# --------------------------------------------------------------------------
+
+
+class _CanonicalBackend:
+    def __init__(self, *, max_top_k: int = 4, max_rows: int = 4) -> None:
+        self.info = SimpleNamespace(max_top_k=max_top_k, max_rows=max_rows)
+        self.calls: list[tuple[torch.Tensor, Any]] = []
+
+    def select(self, logits: torch.Tensor, metadata: Any) -> ConstraintOutput:
+        call_index = len(self.calls) + 1
+        self.calls.append((logits.clone(), metadata))
+        rows = logits.shape[0]
+        width = metadata.top_k
+        token_ids = (
+            torch.arange(rows * width, dtype=torch.int32, device=logits.device)
+            .reshape(rows, width)
+            .add(call_index * 10)
+        )
+        logprobs = torch.arange(
+            rows * width,
+            dtype=torch.float32,
+            device=logits.device,
+        ).reshape(rows, width)
+        logprobs = logprobs.neg()
+        return ConstraintOutput(
+            token_ids=token_ids,
+            logprobs=logprobs,
+            valid_mask=torch.ones_like(token_ids, dtype=torch.bool),
+        )
+
+
+def _direct_runner(
+    beam_data: dict[str, Any],
+    request_row_configs: list[tuple[Any, ...]],
+    backend: Any,
+) -> tuple[SimpleNamespace, list[str]]:
+    events: list[str] = []
+    logits_rows = sum(int(config[2]) for config in request_row_configs)
+    input_batch = SimpleNamespace(
+        sampling_metadata=SimpleNamespace(temperature=torch.ones(logits_rows, dtype=torch.float32)),
+        update_async_output_token_ids=lambda: events.append("async"),
+    )
+    return (
+        SimpleNamespace(
+            constraint_backend=backend,
+            device=torch.device("cpu"),
+            input_batch=input_batch,
+            _current_beam_data=beam_data,
+            _current_scheduler_output=SimpleNamespace(_gr_request_row_configs=request_row_configs),
+        ),
+        events,
+    )
+
+
+def test_canonical_prefix_is_fixed_rows_by_three_for_steps_zero_one_two() -> None:
+    step0, width0, prefix0 = build_constraint_backend_prefix_token_ids(
+        "prefill",
+        1,
+        _prefill_mdata(width=2),
+        torch.device("cpu"),
+    )
+    step1, width1, prefix1 = build_constraint_backend_prefix_token_ids(
+        "step1",
+        2,
+        _decode_mdata(step=1, width=2, suffix=[[11], [12]]),
+        torch.device("cpu"),
+    )
+    step2, width2, prefix2 = build_constraint_backend_prefix_token_ids(
+        "step2",
+        2,
+        _decode_mdata(step=2, width=2, suffix=[[1, 11], [2, 12]]),
+        torch.device("cpu"),
+    )
+
+    assert (step0, width0) == (0, 2)
+    assert (step1, width1) == (1, 2)
+    assert (step2, width2) == (2, 2)
+    assert prefix0.dtype is torch.int32
+    assert prefix0.shape == (1, 3)
+    assert prefix0.tolist() == [[0, 0, 0]]
+    assert prefix1.shape == (2, 3)
+    assert prefix1.tolist() == [[11, 0, 0], [12, 0, 0]]
+    assert prefix2.shape == (2, 3)
+    assert prefix2.tolist() == [[1, 11, 0], [2, 12, 0]]
+
+
+def test_canonical_prefix_rejects_missing_parent_or_short_suffix() -> None:
+    with pytest.raises(RuntimeError, match="parent beam suffixes"):
+        build_constraint_backend_prefix_token_ids(
+            "req",
+            2,
+            _decode_mdata(step=1, width=2, suffix=[[1]]),
+            torch.device("cpu"),
+        )
+    with pytest.raises(RuntimeError, match="last 2 token"):
+        build_constraint_backend_prefix_token_ids(
+            "req",
+            2,
+            _decode_mdata(step=2, width=2, suffix=[[1], [2, 3]]),
+            torch.device("cpu"),
+        )
+
+
+def test_direct_path_calls_backend_once_per_request_and_preserves_row_order() -> None:
+    backend = _CanonicalBackend(max_top_k=2, max_rows=2)
+    beam_data = {
+        "prefill": _prefill_mdata(width=2),
+        "step1": _decode_mdata(step=1, width=2, suffix=[[3], [4]]),
+        "step2": _decode_mdata(
+            step=2,
+            width=2,
+            suffix=[[5, 7], [6, 8]],
+        ),
+    }
+    request_row_configs = [
+        ("prefill", 0, 1, []),
+        ("step1", 1, 2, [0, 1]),
+        ("step2", 3, 2, [0, 1]),
+    ]
+    runner, events = _direct_runner(
+        beam_data,
+        request_row_configs,
+        backend,
+    )
+    logits = torch.arange(40, dtype=torch.float32).reshape(5, 8)
+
+    output = try_sample_with_constraint_backend(runner, logits)
+
+    assert output is not None
+    assert events == ["async"]
+    assert len(backend.calls) == 3
+    assert [call[0][:, 0].tolist() for call in backend.calls] == [
+        [0.0],
+        [8.0, 16.0],
+        [24.0, 32.0],
+    ]
+    assert [call[1].current_step for call in backend.calls] == [0, 1, 2]
+    assert [tuple(call[1].prefix_token_ids.shape) for call in backend.calls] == [
+        (1, 3),
+        (2, 3),
+        (2, 3),
+    ]
+    assert [call[1].top_k for call in backend.calls] == [2, 2, 2]
+    assert output.sampled_token_ids[:, 0].tolist() == [10, 20, 22, 30, 32]
+    assert output.logprobs_tensors.logprob_token_ids.shape == (5, 2)
+    assert output.logprobs_tensors.selected_token_ranks.tolist() == [0] * 5
+
+
+def test_direct_path_batches_requests_at_the_same_step() -> None:
+    backend = _CanonicalBackend(max_top_k=2, max_rows=4)
+    beam_data = {
+        "left": _decode_mdata(step=1, width=2, suffix=[[3], [4]]),
+        "right": _decode_mdata(step=1, width=2, suffix=[[5], [6]]),
+    }
+    runner, events = _direct_runner(
+        beam_data,
+        [("left", 0, 2, [0, 1]), ("right", 2, 2, [0, 1])],
+        backend,
+    )
+    logits = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+
+    output = try_sample_with_constraint_backend(runner, logits)
+
+    assert output is not None
+    assert events == ["async"]
+    assert len(backend.calls) == 1
+    called_logits, metadata = backend.calls[0]
+    assert torch.equal(called_logits, logits)
+    assert metadata.current_step == 1
+    assert metadata.prefix_token_ids.tolist() == [
+        [3, 0, 0],
+        [4, 0, 0],
+        [5, 0, 0],
+        [6, 0, 0],
+    ]
+    assert output.sampled_token_ids[:, 0].tolist() == [10, 12, 14, 16]
+
+
+def test_direct_output_uses_mask_for_negative_infinity_padding() -> None:
+    token_ids = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
+    logprobs = torch.tensor(
+        [[-1.0e20, -1.0e20], [-0.5, -1.0e20]],
+        dtype=torch.float32,
+    )
+    valid_mask = torch.tensor([[True, True], [True, False]])
+
+    output = build_direct_constrained_sampler_output(
+        token_ids,
+        logprobs,
+        valid_mask,
+    )
+
+    assert output.sampled_token_ids.tolist() == [[7], [9]]
+    assert output.logprobs_tensors.logprob_token_ids is token_ids
+    assert output.logprobs_tensors.logprobs[0, 1].item() == pytest.approx(-1.0e20)
+    assert torch.isneginf(output.logprobs_tensors.logprobs[1, 1])
+
+
+def test_direct_path_rejects_empty_legal_candidate_row() -> None:
+    class EmptyBackend(_CanonicalBackend):
+        def select(self, logits: torch.Tensor, metadata: Any) -> ConstraintOutput:
+            output = super().select(logits, metadata)
+            output.valid_mask[0, :] = False
+            return output
+
+    backend = EmptyBackend(max_top_k=2, max_rows=2)
+    runner, events = _direct_runner(
+        {"req": _prefill_mdata(width=2)},
+        [("req", 0, 1, [])],
+        backend,
+    )
+
+    with pytest.raises(RuntimeError, match="no legal candidate"):
+        try_sample_with_constraint_backend(runner, torch.zeros((1, 8)))
+    assert events == ["async"]
+
+
+def test_direct_path_rejects_spec_decode_before_backend_call() -> None:
+    backend = _CanonicalBackend(max_top_k=2, max_rows=2)
+    runner, events = _direct_runner(
+        {"req": _prefill_mdata(width=2)},
+        [("req", 0, 1, [])],
+        backend,
+    )
+
+    with pytest.raises(RuntimeError, match="speculative"):
+        try_sample_with_constraint_backend(
+            runner,
+            torch.zeros((1, 8)),
+            spec_decode_metadata=object(),
+        )
+    assert backend.calls == []
+    assert events == []
+
+    chunk_runner, chunk_events = _direct_runner(
+        {"chunk": _prefill_mdata(width=2)},
+        [("chunk", 0, 0, [])],
+        backend,
+    )
+    with pytest.raises(RuntimeError, match="speculative"):
+        try_sample_with_constraint_backend(
+            chunk_runner,
+            None,
+            spec_decode_metadata=object(),
+        )
+    assert backend.calls == []
+    assert chunk_events == []
+
+
+def test_direct_path_rejects_mixed_rows_and_widths_before_backend_call() -> None:
+    backend = _CanonicalBackend(max_top_k=4, max_rows=4)
+    mixed_rows_runner, row_events = _direct_runner(
+        {"constrained": _prefill_mdata(width=2)},
+        [("plain", 0, 1, []), ("constrained", 1, 1, [])],
+        backend,
+    )
+    with pytest.raises(RuntimeError, match="mixed-batch"):
+        try_sample_with_constraint_backend(
+            mixed_rows_runner,
+            torch.zeros((2, 8)),
+        )
+
+    mixed_width_runner, width_events = _direct_runner(
+        {
+            "a": _prefill_mdata(width=2),
+            "b": _prefill_mdata(width=3),
+        },
+        [("a", 0, 1, []), ("b", 1, 1, [])],
+        backend,
+    )
+    with pytest.raises(RuntimeError, match="mixed-width"):
+        try_sample_with_constraint_backend(
+            mixed_width_runner,
+            torch.zeros((2, 8)),
+        )
+
+    assert backend.calls == []
+    assert row_events == []
+    assert width_events == []
+
+
+def test_direct_path_rejects_beam_width_above_backend_top_k() -> None:
+    backend = _CanonicalBackend(max_top_k=1, max_rows=2)
+    runner, events = _direct_runner(
+        {"req": _prefill_mdata(width=2)},
+        [("req", 0, 1, [])],
+        backend,
+    )
+
+    with pytest.raises(RuntimeError, match="max_top_k"):
+        try_sample_with_constraint_backend(runner, torch.zeros((1, 8)))
+    assert backend.calls == []
+    assert events == []
+
+
+def test_missing_canonical_backend_fails_but_legacy_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    beam_data = {"req": _prefill_mdata(width=2)}
+    runner, events = _direct_runner(
+        beam_data,
+        [("req", 0, 1, [])],
+        None,
+    )
+    monkeypatch.setattr(
+        "vllm_gr.v1.worker.constraint_hook._canonical_constraint_table_enabled",
+        lambda runner: True,
+    )
+    with pytest.raises(RuntimeError, match="constraint_backend is None"):
+        try_sample_with_constraint_backend(runner, torch.zeros((1, 8)))
+
+    # A legacy request must return to the existing sampler-then-override path,
+    # even when its metadata is invalid; legacy validation still occurs later.
+    beam_data["req"].pop("constraint_step")
+    monkeypatch.setattr(
+        "vllm_gr.v1.worker.constraint_hook._canonical_constraint_table_enabled",
+        lambda runner: False,
+    )
+    assert try_sample_with_constraint_backend(runner, torch.zeros((1, 8))) is None
+    assert events == []
+
+
+def test_first_direct_request_uses_only_preloaded_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"runtime attempted persistent loading: {args} {kwargs}")
+
+    monkeypatch.setattr(
+        "vllm_gr.constraints.loader.load_constraint_backend",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        "vllm_gr.constraints.artifact.load_constraint_table_artifact",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        "vllm_gr.constraints.startup.create_constraint_execution",
+        forbidden,
+    )
+
+    backend = _CanonicalBackend(max_top_k=2, max_rows=2)
+    runner, events = _direct_runner(
+        {"req": _prefill_mdata(width=2)},
+        [("req", 0, 1, [])],
+        backend,
+    )
+
+    output = try_sample_with_constraint_backend(runner, torch.zeros((1, 8)))
+
+    assert output is not None
+    assert events == ["async"]
+    assert len(backend.calls) == 1
+    assert runner.constraint_backend is backend
+    assert not hasattr(runner, "_gr_constraint_execution")
 
 
 # --------------------------------------------------------------------------

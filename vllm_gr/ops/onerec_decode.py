@@ -270,6 +270,15 @@ def beam_search_rec_final_select(
     current_step: int,
     result_width: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if log_probs.device.type == "cuda":
+        return _beam_search_rec_final_select_cuda_dispatch(
+            log_probs,
+            top_tokens,
+            top_probs,
+            sequence,
+            current_step,
+            result_width,
+        )
     return _beam_search_rec_final_select_torch(
         log_probs, top_tokens, top_probs, sequence, current_step, result_width
     )
@@ -282,7 +291,7 @@ def _validate_group(
     sequence: torch.Tensor,
     current_step: int,
     top_k: int,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     _require_fp32("log_probs", log_probs)
     _require_fp32("top_probs", top_probs)
     _require_int32("top_tokens", top_tokens)
@@ -308,7 +317,7 @@ def _validate_group(
         top_probs=top_probs,
         sequence=sequence,
     )
-    return batch_size, beam_width, min(top_k, beam_width * beam_width)
+    return batch_size, beam_width, min(top_k, beam_width * beam_width), total_rounds
 
 
 def _beam_search_group_torch(
@@ -319,7 +328,7 @@ def _beam_search_group_torch(
     current_step: int,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size, beam_width, effective_k = _validate_group(
+    batch_size, beam_width, effective_k, total_rounds = _validate_group(
         log_probs, top_tokens, top_probs, sequence, current_step, top_k
     )
     device = sequence.device
@@ -328,7 +337,7 @@ def _beam_search_group_torch(
     out_log_probs = torch.zeros((batch_size, top_k), dtype=torch.float32, device=device)
     out_prefix = torch.zeros((batch_size, beam_width), dtype=torch.int32, device=device)
     out_sequence = torch.zeros(
-        (batch_size, top_k, current_step + 1),
+        (batch_size, top_k, total_rounds),
         dtype=torch.int32,
         device=device,
     )
@@ -338,7 +347,7 @@ def _beam_search_group_torch(
         # device): only the flat sequence rows [0, batch_size) receive their
         # own row's first candidate token; every other output stays zero.
         # The ACS integration bypasses this path through init_from_prefill.
-        flat_out_sequence = out_sequence.reshape(-1, current_step + 1)
+        flat_out_sequence = out_sequence.reshape(-1, total_rounds)
         flat_out_sequence[:batch_size, 0] = top_tokens[:batch_size, 0].to(torch.int32)
         return (
             out_token_ids,
@@ -402,7 +411,94 @@ def beam_search_group(
     current_step: int,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if log_probs.device.type == "cuda":
+        return _beam_search_group_cuda_dispatch(
+            log_probs,
+            top_tokens,
+            top_probs,
+            sequence,
+            current_step,
+            top_k,
+        )
     return _beam_search_group_torch(log_probs, top_tokens, top_probs, sequence, current_step, top_k)
+
+
+def _beam_search_rec_final_select_cuda_dispatch(
+    log_probs: torch.Tensor,
+    top_tokens: torch.Tensor,
+    top_probs: torch.Tensor,
+    sequence: torch.Tensor,
+    current_step: int,
+    result_width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from vllm_gr.ops.cuda.beam_selection import beam_search_rec_final_select_cuda
+
+    return beam_search_rec_final_select_cuda(
+        log_probs,
+        top_tokens,
+        top_probs,
+        sequence,
+        current_step,
+        result_width,
+    )
+
+
+def _beam_search_group_cuda_dispatch(
+    log_probs: torch.Tensor,
+    top_tokens: torch.Tensor,
+    top_probs: torch.Tensor,
+    sequence: torch.Tensor,
+    current_step: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from vllm_gr.ops.cuda.beam_selection import beam_search_group_cuda
+
+    return beam_search_group_cuda(
+        log_probs,
+        top_tokens,
+        top_probs,
+        sequence,
+        current_step,
+        top_k,
+    )
+
+
+def _beam_search_rec_final_select_meta(
+    log_probs: torch.Tensor,
+    top_tokens: torch.Tensor,
+    top_probs: torch.Tensor,
+    sequence: torch.Tensor,
+    current_step: int,
+    result_width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del top_probs, current_step
+    batch_size = sequence.shape[0]
+    total_rounds = sequence.shape[2]
+    return (
+        top_tokens.new_empty((batch_size * result_width, 1), dtype=torch.int32),
+        top_tokens.new_empty((batch_size * result_width, 1), dtype=torch.int32),
+        log_probs.new_empty((batch_size * result_width, 1), dtype=torch.float32),
+        sequence.new_empty((batch_size, result_width, total_rounds), dtype=torch.int32),
+    )
+
+
+def _beam_search_group_meta(
+    log_probs: torch.Tensor,
+    top_tokens: torch.Tensor,
+    top_probs: torch.Tensor,
+    sequence: torch.Tensor,
+    current_step: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del top_probs, current_step
+    batch_size, beam_width, total_rounds = sequence.shape
+    return (
+        top_tokens.new_empty((batch_size, top_k), dtype=torch.int32),
+        top_tokens.new_empty((batch_size, top_k), dtype=torch.int32),
+        log_probs.new_empty((batch_size, top_k), dtype=torch.float32),
+        top_tokens.new_empty((batch_size, beam_width), dtype=torch.int32),
+        sequence.new_empty((batch_size, top_k, total_rounds), dtype=torch.int32),
+    )
 
 
 # Keep explicit schemas alongside the Python API so aliasing and list mutation
@@ -431,6 +527,18 @@ _OP_LIBRARY.impl(
     "CompositeExplicitAutograd",
 )
 _OP_LIBRARY.impl("beam_search_group", _beam_search_group_torch, "CompositeExplicitAutograd")
+_OP_LIBRARY.impl(
+    "beam_search_rec_final_select",
+    _beam_search_rec_final_select_cuda_dispatch,
+    "CUDA",
+)
+_OP_LIBRARY.impl("beam_search_group", _beam_search_group_cuda_dispatch, "CUDA")
+_OP_LIBRARY.impl(
+    "beam_search_rec_final_select",
+    _beam_search_rec_final_select_meta,
+    "Meta",
+)
+_OP_LIBRARY.impl("beam_search_group", _beam_search_group_meta, "Meta")
 
 
 __all__ = [

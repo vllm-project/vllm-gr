@@ -8,6 +8,8 @@ from vllm.sampling_params import (
     SamplingParams,
 )
 
+from vllm_gr.config import MAX_BEAM_WIDTH
+
 
 def clone_beam_decode_sampling_params(params: SamplingParams) -> SamplingParams:
     """Clone sampling params for one logical grouped-beam request.
@@ -43,6 +45,16 @@ class BeamSearchParams(
     catalog_strategy: str | None = None
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.beam_width, bool)
+            or not isinstance(self.beam_width, int)
+            or not 1 <= self.beam_width <= MAX_BEAM_WIDTH
+        ):
+            raise VLLMValidationError(
+                f"beam_width must be an integer in [1, {MAX_BEAM_WIDTH}]",
+                parameter="beam_width",
+                value=self.beam_width,
+            )
         if self.catalog_strategy is not None and self.catalog_strategy not in ("fill", "null"):
             raise VLLMValidationError(
                 f"catalog_strategy must be 'fill', 'null', or None, got {self.catalog_strategy!r}",

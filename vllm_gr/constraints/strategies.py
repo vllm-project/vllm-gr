@@ -8,7 +8,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Literal
 
-from vllm_gr.config import ConstraintBackend
+from vllm_gr.config import MAX_BEAM_WIDTH, ConstraintBackend
 from vllm_gr.utils.catalog import Catalog
 
 if TYPE_CHECKING:
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 # other step, so the request-side loop is capped to match — never a silent
 # fall back to unconstrained generation.
 MAX_CONSTRAINT_GENERATION_STEPS = 3
-MAX_CONSTRAINT_BEAM_WIDTH = 256
+MAX_CONSTRAINT_BEAM_WIDTH = MAX_BEAM_WIDTH
 
 
 def validate_constraint_generation_limits(*, beam_width: int, max_generate_steps: int) -> None:

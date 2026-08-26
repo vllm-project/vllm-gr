@@ -67,6 +67,7 @@ if [ "${npu_state:-false}" == "true" ]; then
     echo "Found set_env.bash at ${CUSTOM_XLLM_MATH_SET_ENV}"
     CUSTOM_XLLM_MATH_LIB="${CUSTOM_XLLM_MATH_ROOT}/op_api/lib"
     export LD_LIBRARY_PATH="${CUSTOM_XLLM_MATH_LIB}:${LD_LIBRARY_PATH}"
+    # shellcheck source=/dev/null
     source "${CUSTOM_XLLM_MATH_ROOT}/bin/set_env.bash"
     cd "${run_test_workdir}"
 

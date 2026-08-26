@@ -23,6 +23,22 @@ from vllm_gr.constraints.strategies import (
 _original_init = OpenAIServingModels.__init__
 
 
+def _model_vocab_size(vllm_config: object | None) -> int:
+    """Resolve vocab size across vLLM ModelConfig API versions."""
+
+    model_config = getattr(vllm_config, "model_config", None)
+    get_vocab_size = getattr(model_config, "get_vocab_size", None)
+    vocab_size = (
+        get_vocab_size() if callable(get_vocab_size) else getattr(model_config, "vocab_size", None)
+    )
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError(
+            "constraint_backend='constraint_table' requires a positive "
+            "engine_client.vllm_config.model_config vocab size"
+        )
+    return vocab_size
+
+
 def init_gr(
     self,
     engine_client: EngineClient,
@@ -37,7 +53,12 @@ def init_gr(
     tokenizer = self.input_processor.tokenizer
     vllm_config = getattr(engine_client, "vllm_config", None)
     gr_config = GRConfig.from_vllm_config(vllm_config)
-    if gr_config.catalog_path:
+    canonical_table = gr_config.constraint_table
+    if canonical_table is not None and canonical_table.enabled:
+        self.constraint_strategy = ConstraintTableStrategy(canonical_table.path or "")
+        self.constraint_strategy.digest = canonical_table.artifact_digest
+        self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
+    elif gr_config.catalog_path:
         self.constraint_strategy = create_constraint_strategy(
             backend=gr_config.constraint_backend,
             tokenizer=tokenizer,
@@ -51,19 +72,7 @@ def init_gr(
             # Compile synchronously (cheap, no workers touched); the collective
             # RPC broadcast is deferred to the first beam_search so the async
             # client cannot race it (issue #246 §7).
-            vocab_size = None
-            model_config = getattr(vllm_config, "model_config", None)
-            if model_config is not None:
-                vocab_size = (
-                    model_config.get_vocab_size()
-                    if hasattr(model_config, "get_vocab_size")
-                    else getattr(model_config, "vocab_size", None)
-                )
-            if vocab_size is None:
-                raise ValueError(
-                    "constraint_backend='constraint_table' requires "
-                    "engine_client.vllm_config.model_config vocab size"
-                )
+            vocab_size = _model_vocab_size(vllm_config)
             resource = prepare_constraint_table(
                 catalog_path=gr_config.catalog_path,
                 tokenizer=tokenizer,

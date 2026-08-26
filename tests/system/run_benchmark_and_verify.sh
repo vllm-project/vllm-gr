@@ -77,20 +77,19 @@ elapsed_time_offline_th="$ELAPSED_TIME_OFFLINE_THRESHOLD"
 p99_ttft_th="$P99_TTFT_THRESHOLD"
 p99_tpot_th="$P99_TPOT_THRESHOLD"
 
-# Constraint Tables are only available on NPU (the CUDA platform provider has
-# no constrained-top-k execution adapter and fails fast at startup), so the
-# constraint_table backend is enabled only there.  The branch keys off the
-# actual hardware (npu-smi presence, same probe the CI policy resolver uses),
-# not the BENCHMARK_DEVICE policy label: a gpu-labeled local run on an NPU box
-# would otherwise hand the raw Trie catalog to the NPU platform default
-# (auto-promoted constraint_table), which rejects it as a non-triples document.
+# Constraint Tables are available on both CUDA and NPU.  Exercise that worker
+# path whenever the resolved policy or local hardware is an accelerator;
+# leaving CUDA on the Trie catalog would let this system test pass without
+# covering the CUDA constrained-top-k kernels it is meant to protect.
 #
 # The triples document follows the video_catalog.json generation flow: CI
 # pre-generates it in the "Build catalog" step (tools/build_constraint_triples.py)
 # and passes TRIPLES_PATH, mirroring CATALOG_PATH.  When it is absent (local
 # runs) it is derived from the catalog location and built on demand.
 constraint_backend_args=(--catalog-path "$CATALOG_PATH")
-if [[ "$device" == "npu" ]] || command -v npu-smi > /dev/null 2>&1; then
+if [[ "$device" == "npu" || "$device" == "gpu" || "$device" == "cuda" ]] \
+    || command -v npu-smi > /dev/null 2>&1 \
+    || nvidia-smi -L > /dev/null 2>&1; then
   triples_path="${TRIPLES_PATH:-$(dirname "$CATALOG_PATH")/video_constraint_triples.json}"
   if [[ ! -f "$triples_path" ]]; then
     echo "Building Constraint Tables triples: $triples_path"

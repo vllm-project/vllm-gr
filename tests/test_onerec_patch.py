@@ -258,7 +258,12 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
 
     _STUB_PREFIXES = (
         "vllm",
-        "vllm_gr.sampling_params",  # patch falls back to vllm.sampling_params
+        # setUp replaces the parent package itself, so save and restore the
+        # complete tree.  Saving only sampling_params leaves already-imported
+        # children in sys.modules without rebinding them on the restored
+        # vllm_gr package, making later string-based monkeypatch resolution
+        # depend on test order.
+        "vllm_gr",
         "benchmarks.open_one_rec",
     )
 

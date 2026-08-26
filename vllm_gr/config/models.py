@@ -8,6 +8,10 @@ from enum import Enum
 
 GR_CONFIG_SCHEMA_VERSION = 1
 CONSTRAINT_TABLE_FORMAT = "constraint_table_v1"
+# Temporary global Beam width ceiling. Keep every configuration, request,
+# runtime contract, and fused kernel on this single limit until wider kernels
+# are implemented and qualified end to end.
+MAX_BEAM_WIDTH = 256
 
 
 class GRAttentionBackend(str, Enum):
@@ -23,6 +27,7 @@ class ConstraintTableBackendEnum(str, Enum):
     """Execution placement requested for a canonical constraint table."""
 
     CPU = "cpu"
+    CUDA = "cuda"
     NPU = "npu"
 
 
@@ -43,7 +48,7 @@ class ConstraintTableConfig:
 
     max_top_k: int
     enabled: bool = False
-    backend: ConstraintTableBackendEnum = ConstraintTableBackendEnum.CPU
+    backend: ConstraintTableBackendEnum = ConstraintTableBackendEnum.CUDA
     path: str | None = None
     format: str = CONSTRAINT_TABLE_FORMAT
     artifact_digest: str | None = None
@@ -129,14 +134,15 @@ class GRConfig:
     # positional construction of the pre-schema dataclass remains compatible.
     schema_version: int = GR_CONFIG_SCHEMA_VERSION
     constraint_table: ConstraintTableConfig | None = None
-    # None = unset (safest: keep the frontend NumPy decision path).  True moves
-    # the beam decision (beam_search_group / beam_search_rec_final_select +
-    # select_unshared_kv) into the NPU worker and returns the result via
+    # None = unset (the Driver applies platform defaults).  True moves the beam
+    # decision (beam_search_group / beam_search_rec_final_select +
+    # select_unshared_kv) into the accelerator worker and returns the result via
     # ModelRunnerOutput.beam_search_result, aligning with the ACS save flow.
-    # Only takes effect on NPU + xllm decode execution; False explicitly keeps
-    # the frontend NumPy path.
+    # CUDA beam deployments default to True; NPU requires xllm execution.
+    # False explicitly keeps the frontend NumPy path.
     beam_worker_decision: bool | None = None
-    # None = unset (default: keep the frontend RPC step-update loop).  True
+    # None = unset (the Driver enables this by default for synchronously
+    # scheduled accelerator Constraint Table beam deployments).  True
     # lets EngineCore drive intermediate beam steps itself: after
     # scheduler.update_from_output it reads the worker's beam_search_result
     # and calls _apply_beam_step directly — no per-step ZMQ round-trip to the

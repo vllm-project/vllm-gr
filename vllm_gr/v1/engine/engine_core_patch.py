@@ -413,7 +413,9 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         # tensors are safe here (they were D2H'd by the worker).
         beam_data = getattr(scheduler_output, "beam_data", {})
         beam_ids = {
-            req_id for req_id, mdata in beam_data.items() if mdata.get("is_beam_decode", False)
+            req_id
+            for req_id, mdata in beam_data.items()
+            if mdata.get("is_beam_decode", False) or mdata.get("is_constraint_prefill", False)
         }
         attached = False
         for ec_outputs in result.values():

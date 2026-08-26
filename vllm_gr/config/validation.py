@@ -11,6 +11,7 @@ from vllm_gr.config.models import (
     _BEAM_MAX_DECODE_STEPS_DEFAULT,
     CONSTRAINT_TABLE_FORMAT,
     GR_CONFIG_SCHEMA_VERSION,
+    MAX_BEAM_WIDTH,
     ConstraintBackend,
     ConstraintTableBackendEnum,
     GRAttentionBackend,
@@ -212,7 +213,17 @@ def _validate_positive_int(value: object, name: str) -> int:
 def validate_beam_max_width(value: object) -> int | None:
     if value is None:
         return None
-    return _validate_positive_int(value, "beam_max_width")
+    width = _validate_positive_int(value, "beam_max_width")
+    if width > MAX_BEAM_WIDTH:
+        raise ValueError(f"vllm-gr beam_max_width must be <= {MAX_BEAM_WIDTH}, got {width}")
+    return width
+
+
+def validate_beam_width(value: object) -> int:
+    width = _validate_positive_int(value, "beam_width")
+    if width > MAX_BEAM_WIDTH:
+        raise ValueError(f"vllm-gr beam_width must be <= {MAX_BEAM_WIDTH}, got {width}")
+    return width
 
 
 def validate_beam_worker_decision(value: object) -> bool | None:

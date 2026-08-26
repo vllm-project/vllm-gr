@@ -317,6 +317,47 @@ def test_beam_collapse_accumulates_partial_rows_and_clears_cache() -> None:
     assert "beam" not in runner._beam_logprobs_cache
 
 
+def test_worker_decision_reduces_sampler_payload_before_host_copy() -> None:
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    width = 4
+    selected_ids = torch.tensor([[41, 42, 43, 44]], dtype=torch.int32)
+    selected_scores = torch.tensor([[-0.1, -0.2, -0.3, -0.4]], dtype=torch.float32)
+    runner = SimpleNamespace(
+        _beam_decision_tensors={
+            "out_token_ids": selected_ids,
+            "out_token_index": torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+            "out_log_probs": selected_scores,
+        }
+    )
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.arange(width, dtype=torch.int32).reshape(width, 1),
+        logprobs_tensors=LogprobsTensors(
+            logprob_token_ids=torch.arange(width * width, dtype=torch.int32).reshape(width, width),
+            logprobs=torch.zeros((width, width), dtype=torch.float32),
+            selected_token_ranks=torch.arange(width, dtype=torch.int64),
+        ),
+    )
+
+    assert common._reduce_sampler_output_for_worker_decision(runner, sampler_output)
+    assert sampler_output.sampled_token_ids.tolist() == [[41]]
+    assert sampler_output.logprobs_tensors.logprob_token_ids is selected_ids
+    assert sampler_output.logprobs_tensors.logprobs is selected_scores
+    assert sampler_output.logprobs_tensors.selected_token_ranks.tolist() == [0]
+    assert sampler_output._gr_beam_result_transport is True
+
+    collapsed = common._beam_collapse_bookkeeping(
+        runner,
+        object(),
+        [("beam", 0, width, list(range(width)))],
+        {"beam": {"is_beam_decode": True, "beam_width": width}},
+        sampler_output,
+    )
+    assert collapsed == (["beam"], {"beam": 0}, 1)
+    # The later collapse must preserve O(W), never recreate W-by-W.
+    assert sampler_output.logprobs_tensors.logprobs.shape == (1, width)
+
+
 def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     class ExpectedError(RuntimeError):
         pass

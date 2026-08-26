@@ -45,7 +45,7 @@ async def beam_search_test(loops: int) -> None:
         ) from exc
     if not 0 < gpu_memory_utilization <= 1:
         raise ValueError("VLLM_GR_TEST_GPU_MEMORY_UTILIZATION must be in (0, 1]")
-    beam_width = 512
+    beam_width = 256
     max_tokens = 5
 
     engine_args = AsyncEngineArgs(

@@ -123,7 +123,7 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
 def test_npu_sample_patch_is_signature_agnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """NPU _sample wrapper tolerates a different metadata argument."""
+    """The NPU legacy branch tolerates a different positional signature."""
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
 
     events: list[str] = []
@@ -150,6 +150,76 @@ def test_npu_sample_patch_is_signature_agnostic(
     runner = SimpleNamespace()
     assert wrapped(runner, "logits", "extra") is sample_output
     assert events == ["sample", "override"]
+
+
+def test_npu_sample_patch_parses_keyword_logits_and_spec_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, Any, Any]] = []
+    sample_output = object()
+
+    def direct(self: Any, logits: Any, spec_decode_metadata: Any) -> None:
+        events.append(("direct", logits, spec_decode_metadata))
+        return None
+
+    def original(
+        self: Any,
+        *,
+        logits: Any,
+        spec_decode_metadata: Any = None,
+    ) -> Any:
+        events.append(("sample", logits, spec_decode_metadata))
+        return sample_output
+
+    def override(self: Any, logits: Any, sampler_output: Any) -> None:
+        assert sampler_output is sample_output
+        events.append(("override", logits, None))
+
+    monkeypatch.setattr(npu_patch, "try_sample_with_constraint_backend", direct)
+    monkeypatch.setattr(npu_patch, "apply_constrained_sample_override", override)
+    wrapped = npu_patch.make_patched_sample_npu(original)
+
+    assert (
+        wrapped(
+            SimpleNamespace(),
+            logits="keyword-logits",
+            spec_decode_metadata="keyword-spec",
+        )
+        is sample_output
+    )
+    assert events == [
+        ("direct", "keyword-logits", "keyword-spec"),
+        ("sample", "keyword-logits", "keyword-spec"),
+        ("override", "keyword-logits", None),
+    ]
+
+
+def test_npu_sample_patch_returns_canonical_output_before_sampler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct_output = object()
+    observed: list[tuple[Any, Any]] = []
+
+    def direct(self: Any, logits: Any, spec_decode_metadata: Any) -> Any:
+        observed.append((logits, spec_decode_metadata))
+        return direct_output
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"ordinary sampler or legacy override ran: {args} {kwargs}")
+
+    monkeypatch.setattr(npu_patch, "try_sample_with_constraint_backend", direct)
+    monkeypatch.setattr(npu_patch, "apply_constrained_sample_override", forbidden)
+    wrapped = npu_patch.make_patched_sample_npu(forbidden)
+
+    assert (
+        wrapped(
+            SimpleNamespace(),
+            logits="keyword-logits",
+            spec_decode_metadata="keyword-spec",
+        )
+        is direct_output
+    )
+    assert observed == [("keyword-logits", "keyword-spec")]
 
 
 # ---------------------------------------------------------------------------
@@ -776,11 +846,15 @@ def test_npu_capture_forwards_run_under_inference_mode(
 # ---------------------------------------------------------------------------
 # These tests monkeypatch vllm_ascend.compilation.acl_graph.ACLGraphWrapper,
 # which requires vllm-ascend to be installed (it is an optional dependency on
-# GPU-only gates). Skip when absent, mirroring test_upstream_api_contract.py.
-pytest.importorskip("vllm_ascend.compilation.acl_graph", reason="vllm-ascend is not installed")
+# GPU-only gates). Keep the skip local so the platform-neutral NPU wrapper
+# contracts above still run on CPU/GPU CI.
 
 
 def test_npu_verify_and_record_records_on_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip(
+        "vllm_ascend.compilation.acl_graph",
+        reason="vllm-ascend is not installed",
+    )
     from unittest.mock import MagicMock
 
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
@@ -804,6 +878,10 @@ def test_npu_verify_and_record_records_on_match(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_npu_verify_and_record_no_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip(
+        "vllm_ascend.compilation.acl_graph",
+        reason="vllm-ascend is not installed",
+    )
     from unittest.mock import MagicMock
 
     mock_wrapper = MagicMock()
@@ -822,6 +900,10 @@ def test_npu_verify_and_record_no_match(monkeypatch: pytest.MonkeyPatch) -> None
 def test_npu_verify_and_record_appends_to_existing_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip(
+        "vllm_ascend.compilation.acl_graph",
+        reason="vllm-ascend is not installed",
+    )
     from unittest.mock import MagicMock
 
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode

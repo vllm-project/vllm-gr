@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Construct independent CPU/NPU Backends from a canonical Artifact."""
+"""Construct independent CPU/CUDA/NPU Backends from a canonical Artifact."""
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,7 @@ from vllm_gr.constraints.backend import (
     ConstraintMetadata,
 )
 from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
+from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
@@ -161,6 +163,10 @@ def _synchronize_current_npu_stream(device: torch.device) -> None:
     current_stream(device).synchronize()
 
 
+def _synchronize_current_cuda_stream(device: torch.device) -> None:
+    torch.cuda.current_stream(device).synchronize()
+
+
 def _unique_storage_bytes(tensors: dict[str, torch.Tensor]) -> int:
     """Count each owned storage once, independent of allocator state."""
 
@@ -217,6 +223,45 @@ def _upload_npu_backend(
         raise
 
 
+def _upload_cuda_backend(
+    table: ConstraintTable,
+    *,
+    device: torch.device,
+    max_top_k: int,
+    max_rows: int,
+) -> tuple[CUDAConstraintBackend, tuple[_ReadyCase, ...]]:
+    cases = _readiness_cases(table, max_top_k)
+    device_tables: dict[str, torch.Tensor] = {}
+    backend: CUDAConstraintBackend | None = None
+    try:
+        for name in CONSTRAINT_TABLE_TENSOR_NAMES:
+            device_tables[name] = _upload_table_tensor(getattr(table, name), device)
+        _synchronize_current_cuda_stream(device)
+        info = _backend_info(
+            table,
+            backend=ConstraintTableBackendEnum.CUDA,
+            max_top_k=max_top_k,
+            max_rows=max_rows,
+            host_memory_bytes=0,
+            device_memory_bytes=_unique_storage_bytes(device_tables),
+        )
+        backend = CUDAConstraintBackend(
+            first_token_ids=device_tables["first_token_ids"],
+            prefix1_offsets=device_tables["prefix1_offsets"],
+            prefix1_values=device_tables["prefix1_values"],
+            prefix1_pair_keys=device_tables["prefix1_pair_keys"],
+            prefix2_value_offsets=device_tables["prefix2_value_offsets"],
+            prefix2_values=device_tables["prefix2_values"],
+            info=info,
+        )
+        return backend, cases
+    except BaseException:
+        if backend is not None:
+            backend.close()
+        device_tables.clear()
+        raise
+
+
 def _device_matches(actual: torch.device, expected: torch.device) -> bool:
     """Compare devices the way PyTorch resolves them for placement calls.
 
@@ -251,7 +296,7 @@ def _validate_ready_output(
             f"readiness valid_mask device {output.valid_mask.device} is not the target {device}"
         )
     if not output.valid_mask.is_contiguous():
-        raise RuntimeError("readiness valid_mask must be contiguous on the target NPU")
+        raise RuntimeError("readiness valid_mask must be contiguous on the target device")
     expected_valid = min(candidate_count, top_k)
     for row in range(rows):
         row_mask = output.valid_mask[row]
@@ -316,13 +361,14 @@ def _expected_ready_logprobs(
     }
 
 
-def _run_npu_readiness(
-    backend: NPUConstraintBackend,
+def _run_device_readiness(
+    backend: CUDAConstraintBackend | NPUConstraintBackend,
     *,
     cases: tuple[_ReadyCase, ...],
     device: torch.device,
     dtype: torch.dtype,
     max_rows: int,
+    synchronize: Callable[[torch.device], None],
 ) -> None:
     rows = min(max_rows, 2)
     vocab_size = backend.info.table_metadata.vocab_size
@@ -386,7 +432,7 @@ def _run_npu_readiness(
                 top_k=top_k,
             ),
         )
-        _synchronize_current_npu_stream(device)
+        synchronize(device)
         _validate_ready_output(
             output,
             expected_logprobs=expected,
@@ -396,6 +442,42 @@ def _run_npu_readiness(
             vocab_size=vocab_size,
             device=device,
         )
+
+
+def _run_cuda_readiness(
+    backend: CUDAConstraintBackend,
+    *,
+    cases: tuple[_ReadyCase, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+    max_rows: int,
+) -> None:
+    _run_device_readiness(
+        backend,
+        cases=cases,
+        device=device,
+        dtype=dtype,
+        max_rows=max_rows,
+        synchronize=_synchronize_current_cuda_stream,
+    )
+
+
+def _run_npu_readiness(
+    backend: NPUConstraintBackend,
+    *,
+    cases: tuple[_ReadyCase, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+    max_rows: int,
+) -> None:
+    _run_device_readiness(
+        backend,
+        cases=cases,
+        device=device,
+        dtype=dtype,
+        max_rows=max_rows,
+        synchronize=_synchronize_current_npu_stream,
+    )
 
 
 def load_constraint_backend(
@@ -420,6 +502,15 @@ def load_constraint_backend(
         raise ValueError("enabled constraint table configuration is incomplete")
 
     op: NPUConstraintOp | None = None
+    if config.backend is ConstraintTableBackendEnum.CUDA:
+        if config.max_top_k > MAX_TOP_K:
+            raise ValueError(
+                f"CUDA constraint max_top_k must be <= {MAX_TOP_K}, got {config.max_top_k}"
+            )
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"CUDA constraint logits must be fp16/bf16, got {dtype}")
+        if device.type != "cuda":
+            raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
     if config.backend is ConstraintTableBackendEnum.NPU:
         if config.max_top_k > MAX_TOP_K:
             raise ValueError(
@@ -446,6 +537,27 @@ def load_constraint_backend(
             device_memory_bytes=0,
         )
         return CPUConstraintBackend(table, info)
+    if config.backend is ConstraintTableBackendEnum.CUDA:
+        backend, cases = _upload_cuda_backend(
+            table,
+            device=device,
+            max_top_k=config.max_top_k,
+            max_rows=max_rows,
+        )
+        del table
+        try:
+            _run_cuda_readiness(
+                backend,
+                cases=cases,
+                device=device,
+                dtype=dtype,
+                max_rows=max_rows,
+            )
+            backend._mark_ready()  # noqa: SLF001
+            return backend
+        except BaseException:
+            backend.close()
+            raise
     if config.backend is not ConstraintTableBackendEnum.NPU or op is None:
         raise RuntimeError(f"unsupported constraint table backend {config.backend!r}")
 
