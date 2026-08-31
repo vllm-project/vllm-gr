@@ -45,6 +45,7 @@ def _common_metadata(
         query_start_loc_cpu=torch.tensor(query_starts, dtype=torch.int32),
         query_start_loc=torch.tensor(query_starts, dtype=torch.int32),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
         block_table_tensor=torch.tensor(block_table, dtype=torch.int32),
         num_actual_tokens=num_tokens,
         max_query_len=max(
@@ -189,6 +190,25 @@ def test_build_routes_standard_and_beam_metadata(
         assert metadata.suffix_cu_seqlens_kv_cpu == [
             sum(expected["suffix_kv"][: index + 1]) for index in range(len(expected["suffix_kv"]))
         ]
+
+
+def test_build_pure_prefill_fast_path_carries_common_fields() -> None:
+    common = _common_metadata([0, 3, 7], [3, 7], [[0, 1], [2, 3]])
+    metadata = _build_metadata(common, ["a", "b"], {})
+
+    assert metadata.is_prefill_graph_exec is True
+    assert metadata.num_reqs == 2
+    assert metadata.num_heads == 8
+    assert metadata.num_kv_heads == 2
+    assert metadata.block_size == 2
+    assert metadata.std_indices is None
+    assert metadata.std_block_table is None
+    assert metadata.prefix_indices is None
+    assert metadata.query_start_loc_cpu == [0, 3, 7]
+    assert metadata.seq_lens_cpu == [3, 7]
+    assert torch.equal(metadata.query_start_loc, common.query_start_loc)
+    assert torch.equal(metadata.seq_lens, common.seq_lens)
+    assert torch.equal(metadata.block_table, common.block_table_tensor)
 
 
 def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:

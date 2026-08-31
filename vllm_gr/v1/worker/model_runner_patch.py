@@ -55,5 +55,17 @@ def apply_worker_patches() -> None:
         runner_class._bookkeeping_sync = platform_module.make_patched_bookkeeping_sync(
             runner_class._bookkeeping_sync
         )
+        if hasattr(runner_class, "_capture_cudagraphs") and hasattr(
+            platform_module, "make_patched_capture_cudagraphs"
+        ):
+            runner_class._capture_cudagraphs = platform_module.make_patched_capture_cudagraphs(
+                runner_class._capture_cudagraphs
+            )
+        if hasattr(runner_class, "_model_forward") and hasattr(
+            platform_module, "make_patched_model_forward"
+        ):
+            runner_class._model_forward = platform_module.make_patched_model_forward(
+                runner_class._model_forward
+            )
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)

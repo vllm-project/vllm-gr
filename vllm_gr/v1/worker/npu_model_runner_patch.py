@@ -16,6 +16,7 @@ from vllm_gr.v1.worker.model_runner_common import (
     _beam_collapse_bookkeeping,
     _beam_remap_inputs,
 )
+from vllm_gr.v1.worker.prefill_graph_runner import get_prefill_graph_runner
 
 logger = init_logger(__name__)
 
@@ -34,6 +35,10 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         # NPU builds attention metadata inside the original _prepare_inputs.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
+
+        # Publish the scheduler output so the _model_forward prefill-graph
+        # interception can classify the batch and extract token counts.
+        self._current_scheduler_output = scheduler_output
 
         out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
 
@@ -134,5 +139,121 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
     return (("NPUModelRunner", NPUModelRunner),)
 
 
+def make_patched_capture_cudagraphs_npu(_orig_capture_cudagraphs):
+    """Wrap _capture_cudagraphs to capture prefill graphs during warmup (GPU parity)."""
+
+    @wraps(_orig_capture_cudagraphs)
+    def patched_capture_cudagraphs(
+        self, batch_descriptors, cudagraph_runtime_mode, *args, **kwargs
+    ):
+        res = _orig_capture_cudagraphs(
+            self, batch_descriptors, cudagraph_runtime_mode, *args, **kwargs
+        )
+
+        # Trigger prefill graph capture once when FULL decode graphs are being captured
+        from vllm.config import CUDAGraphMode
+
+        from vllm_gr.v1.worker.prefill_graph_runner import is_prefill_graph_enabled
+
+        if (
+            is_prefill_graph_enabled()
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not getattr(self, "_prefill_graphs_captured", False)
+        ):
+            self._prefill_graphs_captured = True
+            p_runner = get_prefill_graph_runner(self)
+            p_runner.capture_graphs(self)
+
+        return res
+
+    return patched_capture_cudagraphs
+
+
+def make_patched_model_forward_npu(_orig_model_forward):
+    """Wrap _model_forward to intercept and replay pure prefill NPU graphs."""
+
+    @wraps(_orig_model_forward)
+    def patched_model_forward(
+        self,
+        num_tokens_padded,
+        input_ids=None,
+        positions=None,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        **model_kwargs,
+    ):
+        scheduler_output = getattr(self, "_current_scheduler_output", None)
+        if scheduler_output is not None:
+            from vllm_gr.v1.worker.prefill_graph_runner import (
+                SUPPORTED_NUM_REQS,
+                is_prefill_graph_enabled,
+                is_prefill_phase_batch,
+            )
+
+            if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
+                p_runner = get_prefill_graph_runner(self)
+
+                raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
+                token_counts = (
+                    list(raw_scheduled_tokens.values())
+                    if isinstance(raw_scheduled_tokens, dict)
+                    else list(raw_scheduled_tokens)
+                )
+                total_tokens = sum(token_counts) if token_counts else 0
+                num_reqs = len(token_counts)
+
+                if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
+                    bucket = p_runner.match_bucket(total_tokens)
+                    if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
+                        # Extract the current batch's slot mapping from the
+                        # attention metadata built by _prepare_inputs. The
+                        # metadata is published in the forward context by
+                        # execute_model (set_ascend_forward_context wraps the
+                        # _model_forward call); NPUModelRunner does not store
+                        # it as a runner attribute.
+                        slot_mapping = None
+                        try:
+                            from vllm.forward_context import get_forward_context
+
+                            attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
+                            if isinstance(attn_metadata, dict) and attn_metadata:
+                                slot_mapping = next(iter(attn_metadata.values())).slot_mapping
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug("Could not get slot_mapping: %r", e)
+
+                        output_buf = p_runner.execute_model_prefill(
+                            bucket=bucket,
+                            input_ids=input_ids,
+                            positions=positions,
+                            slot_mapping=slot_mapping,
+                            num_scheduled_tokens=token_counts,
+                        )
+
+                        if output_buf is not None:
+                            p_runner.log_replay(bucket, num_reqs, total_tokens)
+                            logger.debug(
+                                "Prefill NPU Graph Replay: Executed captured graph "
+                                "for bucket %d (reqs=%d, %d actual tokens).",
+                                bucket,
+                                num_reqs,
+                                total_tokens,
+                            )
+                            return output_buf
+
+        return _orig_model_forward(
+            self,
+            num_tokens_padded,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            **model_kwargs,
+        )
+
+    return patched_model_forward
+
+
 make_patched_prepare_inputs = make_patched_prepare_inputs_npu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_npu
+make_patched_capture_cudagraphs = make_patched_capture_cudagraphs_npu
+make_patched_model_forward = make_patched_model_forward_npu

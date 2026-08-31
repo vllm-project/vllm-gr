@@ -84,6 +84,54 @@ def reshape_and_cache(
     )
 
 
+def prefill_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: Any,
+    sliding_window_size: list[int] | tuple[int, int] | None,
+    scale: float,
+    logits_soft_cap: float,
+    vllm_flash_attn_version: int,
+    s_aux: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+) -> None:
+    """Dedicated pure prefill attention execution using CommonAttentionMetadata."""
+    cu_seqlens_q = getattr(attn_metadata, "query_start_loc", None)
+    max_q_len = getattr(attn_metadata, "max_query_len", 0)
+    seqused_k = getattr(attn_metadata, "seq_lens", None)
+    max_seq_len = getattr(attn_metadata, "max_seq_len", 0)
+    block_table = (
+        getattr(attn_metadata, "block_table_tensor", None)
+        if getattr(attn_metadata, "block_table_tensor", None) is not None
+        else getattr(attn_metadata, "block_table", None)
+    )
+    causal = getattr(attn_metadata, "causal", True)
+    assert cu_seqlens_q is not None, "query_start_loc must not be None for prefill attention"
+    assert seqused_k is not None, "seq_lens must not be None for prefill attention"
+
+    std_out = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_q_len,
+        seqused_k=seqused_k,
+        max_seqlen_k=max_seq_len,
+        softmax_scale=scale,
+        causal=causal,
+        alibi_slopes=alibi_slopes,
+        window_size=sliding_window_size,
+        block_table=block_table,
+        softcap=logits_soft_cap,
+        fa_version=vllm_flash_attn_version,
+        s_aux=s_aux,
+    )
+
+    output[: std_out.shape[0]] = std_out
+
+
 def cascade_attention(
     output: torch.Tensor,
     query: torch.Tensor,

@@ -232,11 +232,14 @@ aligned with it.
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
     - `GPUModelRunner._bookkeeping_sync`
+    - `GPUModelRunner._model_forward` (pure-prefill batch interception and CUDA graph replay)
 - Platform: GPU
 - Risk: Critical
 - Dependencies:
     - private method signatures;
     - the 2-item `_prepare_inputs` result;
+    - the `_current_scheduler_output` publication in `_prepare_inputs` (required
+      by the `_model_forward` prefill-graph interception);
     - the 7-item `_bookkeeping_sync` result;
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
 - Removal condition: upstream provides stable hooks for grouped input preparation and output collapsing.
@@ -250,13 +253,24 @@ aligned with it.
     - `NPUModelRunner.execute_model`
     - `NPUModelRunner._prepare_inputs`
     - `NPUModelRunner._bookkeeping_sync`
+    - `NPUModelRunner._capture_cudagraphs` (prefill graph capture trigger, GPU parity)
+    - `NPUModelRunner._model_forward` (prefill-phase batch interception and NPU graph replay)
 - Platform: NPU
 - Risk: Critical
 - Dependencies:
     - NPU-specific private method signatures;
     - the 4-item `_prepare_inputs` result;
     - the 6-item `_bookkeeping_sync` result;
-    - speculative decoding and token-compression state.
+    - speculative decoding and token-compression state;
+    - the NPU prefill graph runner (`vllm_gr/v1/worker/npu_prefill_graph_runner.py`);
+    - the NPU attention graph task-group capture path
+      (`vllm_gr/v1/attention/backends/beam_attn_npu.py`): task-group capture,
+      weak-tensor address carriers, per-layer `graph_task_update` on a
+      dedicated stream with `wait_stream` ordering;
+    - platform bucket/threshold dispatch in
+      `vllm_gr/v1/worker/prefill_graph_common.py` (`get_default_buckets`,
+      `get_dynamic_thresholds`; NPU buckets capped at 1024, GPU unchanged)
+      and the shared `max_num_batched_tokens` bucket clamp.
 - Removal condition: vLLM-Ascend exposes stable grouped input and output adaptation hooks.
 
 ### GR-PATCH-013 — CUSTOM Attention Backend Registration

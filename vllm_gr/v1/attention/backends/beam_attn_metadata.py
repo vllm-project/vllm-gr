@@ -9,8 +9,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import vllm.envs as envs
+from vllm import envs
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
@@ -20,6 +21,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
+
+logger = init_logger(__name__)
 
 
 def get_scheduler_metadata(*args, **kwargs):
@@ -51,6 +54,12 @@ class BeamAttentionMetadata:
     slot_mapping: torch.Tensor
     causal: bool = True
     npu_causal_atten_mask: torch.Tensor | None = None
+    is_prefill_graph_exec: bool = False
+    num_reqs: int = 0
+
+    # CPU lists for prefill graph execution (avoid CPU sync during capture)
+    query_start_loc_cpu: list | None = None
+    seq_lens_cpu: list | None = None
 
     # Standard Requests batch routing
     std_indices: torch.Tensor | None = None
@@ -627,8 +636,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         req_ids = beam_info["req_ids"] if beam_info else []
 
         q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
-        seq_lens_cpu_list = common_attn_metadata.seq_lens.cpu().tolist()
-
+        seq_lens_host = getattr(common_attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_host is None:
+            seq_lens_host = common_attn_metadata.seq_lens.cpu()
+        seq_lens_cpu_list = (
+            seq_lens_host if isinstance(seq_lens_host, list) else seq_lens_host.tolist()
+        )
         (
             std_reqs,
             beam_req_idxs,
@@ -638,6 +651,31 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             beam_cache_lens,
             beam_q_start_offsets,
         ) = self._segment_requests(num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list)
+
+        # Fast-path for pure prefill: Skip all grouped beam metadata computation
+        if not beam_req_idxs:
+            logger.debug(
+                "BeamAttentionMetadataBuilder: Pure prefill batch detected (%d actual tokens). Skipping grouped beam metadata build.",
+                common_attn_metadata.num_actual_tokens,
+            )
+            return BeamAttentionMetadata(
+                num_actual_tokens=common_attn_metadata.num_actual_tokens,
+                max_query_len=common_attn_metadata.max_query_len,
+                query_start_loc=common_attn_metadata.query_start_loc,
+                max_seq_len=common_attn_metadata.max_seq_len,
+                seq_lens=common_attn_metadata.seq_lens,
+                block_table=common_attn_metadata.block_table_tensor,
+                slot_mapping=common_attn_metadata.slot_mapping,
+                causal=True,
+                npu_causal_atten_mask=self.npu_causal_atten_mask,
+                is_prefill_graph_exec=True,
+                num_reqs=common_attn_metadata.num_reqs,
+                num_heads=self.num_heads_q,
+                num_kv_heads=self.num_kv_heads,
+                block_size=self.block_size,
+                query_start_loc_cpu=q_starts,
+                seq_lens_cpu=seq_lens_cpu_list,
+            )
 
         (
             std_indices,
