@@ -43,7 +43,17 @@ class BeamSearchSession:
         self.context = context  # shared ref, not owned
 
     def begin_session(self, beam_width: int, prefix_len: int):
-        """Start a beam search session. Resets slot state + pool KV."""
+        """Start a beam search session. Resets slot state (lazy KV reset).
+
+        Pool KV is NOT zeroed here. ``cache_unshared_kv_kernel`` is an exact
+        overwrite (writes only ``pool[slot, beam, head, decode_step, :]`` per
+        step), and cascade attention limits suffix reads to
+        ``[:decode_step+1]`` via ``suffix_seqlens_kv`` (built in
+        ``beam_attn_metadata.py``). A new session starts at ``decode_step=0``
+        and overwrites forward; stale rows beyond ``decode_step`` are never
+        read, so zeroing is redundant. ``select_unshared_kv`` also restricts
+        its gather→scatter to ``[:decode_step+1]``, so aux buffers stay clean.
+        """
         state = self._state
         state.decode_step = 0
         state.beam_width = beam_width
@@ -51,9 +61,6 @@ class BeamSearchSession:
         state.is_last_step = False
         state.is_active = True
         state.kv_reorder = None
-        # Reset pool KV for this slot (clear stale data from previous sessions)
-        for pool in self.context.pools:
-            pool.reset_slot(self.slot)
         # Reset the device-resident beam-decision state the same way (ACS
         # ``BeamSearchBufferPool.reset_buffers`` semantics): without this a
         # second session reusing the slot inherits the previous session's

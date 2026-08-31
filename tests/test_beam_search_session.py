@@ -143,10 +143,12 @@ def test_begin_and_end_change_logical_state_and_preserve_storage() -> None:
     assert session.is_active
     assert session.beam_width == 3
     assert session.decode_step == 0
-    # begin_session resets slot KV (zeros it)
+    # begin_session does NOT zero slot KV (lazy reset: cache_unshared_kv
+    # overwrites per-step and cascade attention reads only [:decode_step+1],
+    # so stale rows are never read. Storage is preserved.
     for pool in session.pools:
-        assert torch.count_nonzero(pool.unshared_key[session.slot]).item() == 0
-        assert torch.count_nonzero(pool.unshared_value[session.slot]).item() == 0
+        assert torch.count_nonzero(pool.unshared_key[session.slot]).item() != 0
+        assert torch.count_nonzero(pool.unshared_value[session.slot]).item() != 0
 
     session.end_session()
 
@@ -326,8 +328,14 @@ def test_public_export_is_stable() -> None:
     assert BeamSearchSession is SessionImplementation
 
 
-def test_begin_session_resets_slot_kv() -> None:
-    """Test that begin_session zeros out the pool KV for the session's slot."""
+def test_begin_session_preserves_slot_kv() -> None:
+    """Test that begin_session does NOT zero the pool KV for the session's slot.
+
+    Lazy reset: ``cache_unshared_kv_kernel`` overwrites exactly the current
+    ``decode_step`` slice and cascade attention limits suffix reads to
+    ``[:decode_step+1]``, so stale rows beyond ``decode_step`` are never read.
+    ``begin_session`` therefore skips the redundant per-layer zeroing.
+    """
     session = _make_session(max_batch=2)
     session.begin_session(beam_width=2, prefix_len=5)
 
@@ -341,7 +349,8 @@ def test_begin_session_resets_slot_kv() -> None:
     session.context.registry.allocate("test_session", beam_width=0, prefix_len=0)
     session.begin_session(beam_width=3, prefix_len=10)
 
-    # Pool KV should be zeroed for the session's slot
+    # Pool KV is preserved (not zeroed) — lazy reset relies on overwrite +
+    # read-range-limiting instead.
     for pool in session.pools:
-        assert torch.count_nonzero(pool.unshared_key[session.slot]).item() == 0
-        assert torch.count_nonzero(pool.unshared_value[session.slot]).item() == 0
+        assert torch.count_nonzero(pool.unshared_key[session.slot]).item() != 0
+        assert torch.count_nonzero(pool.unshared_value[session.slot]).item() != 0
