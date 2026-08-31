@@ -105,14 +105,16 @@ def mask_candidate_logprobs(
     logprobs: Sequence[float],
     allowed_token_ids: Collection[int] | None,
 ) -> list[float]:
-    """Mask disallowed candidates without filtering or reordering them."""
+    """Mask disallowed candidates without filtering or reordering them.
 
+    Delegates to the shared catalog masking implementation so the Offline
+    path cannot diverge from ``Catalog.apply_catalog_filter``.
+    """
     if allowed_token_ids is None:
         return list(logprobs)
-    return [
-        logprob if token_id in allowed_token_ids else -float("inf")
-        for token_id, logprob in zip(token_ids, logprobs)
-    ]
+    from vllm_gr.utils.catalog import mask_logprobs_by_token_set
+
+    return mask_logprobs_by_token_set(token_ids, logprobs, allowed_token_ids)
 
 
 _EXCEPT_MASKIN = [0]
@@ -236,6 +238,8 @@ def complete_eos_candidates(
     eos_beams: list[BeamSearchSequence] = []
     eos_indices = np.where(np.isin(token_ids, tuple(stop_token_ids)))[0]
     for candidate_index in eos_indices:
+        if not np.isfinite(scores[candidate_index]):
+            continue
         parent_index = int(beam_idx[candidate_index])
         parent = parents[parent_index]
         cached = beam_flat_cache[parent_index]
@@ -259,28 +263,26 @@ def complete_eos_candidates(
     return eos_beams, masked_scores
 
 
-def select_top_indices(
-    scores: np.ndarray, beam_width: int, catalog_strategy: str = "fill"
-) -> np.ndarray:
-    """Return top candidate indices with the legacy ``argpartition`` order."""
-    # For "null" strategy: only pick from finite (valid catalog) entries so that
-    # -inf slots from catalog-filtered tokens are never selected.
-    if catalog_strategy == "null":
-        finite_mask = np.isfinite(scores)
-        finite_idx = np.where(finite_mask)[0]
-        if finite_idx.size == 0:
-            # No valid candidates left — stop generating for this instance
-            return np.empty(0, dtype=np.intp)
-        if finite_idx.size > beam_width:
-            # argpartition requires kth < arr.size, so only call it when
-            # there are strictly more candidates than we need to keep.
-            topn_idx = finite_idx[np.argpartition(-scores[finite_idx], beam_width)[:beam_width]]
-        else:
-            topn_idx = finite_idx  # at most beam_width finite entries; take all
-    elif scores.size > beam_width:
-        topn_idx = np.argpartition(np.negative(scores), beam_width)[:beam_width]
+def select_top_indices(scores: np.ndarray, beam_width: int) -> np.ndarray:
+    """Return top finite-score candidate indices, always at least one.
+
+    ``-inf`` entries (catalog-invalid candidates) are always discarded.  If
+    every entry is ``-inf``, fall back to the single best index so that the
+    beam keeps one candidate alive instead of being eliminated.
+    """
+    if scores.size == 0:
+        return np.empty(0, dtype=np.intp)
+    finite_mask = np.isfinite(scores)
+    finite_idx = np.where(finite_mask)[0]
+    if finite_idx.size == 0:
+        # No finite candidates — keep the beam alive with one index anyway.
+        return np.array([int(np.argmax(scores))], dtype=np.intp)
+    if finite_idx.size > beam_width:
+        # argpartition requires kth < arr.size, so only call it when
+        # there are strictly more candidates than we need to keep.
+        topn_idx = finite_idx[np.argpartition(-scores[finite_idx], beam_width)[:beam_width]]
     else:
-        topn_idx = np.arange(scores.size)
+        topn_idx = finite_idx  # at most beam_width finite entries; take all
     return topn_idx
 
 

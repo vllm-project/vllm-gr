@@ -50,6 +50,7 @@ def _reset_prometheus_state(monkeypatch):
     _mod._beam_sort_time_total = None
     _mod._beam_requests_total = None
     _mod._total_beams_generated = None
+    _mod._beam_processed_tokens_total = None
     _mod._beam_prefill_time_histogram = None
     _mod._beam_decode_time_histogram = None
     _mod._beam_sort_time_histogram = None
@@ -69,6 +70,7 @@ class TestRecordBeamSearchMetrics:
         stats.beam_search_decode_time = 0.5
         stats.beam_search_sort_time = 0.01
         stats.num_beams = 4
+        stats.num_processed_tokens = 10
 
         record_beam_search_metrics(stats, engine="0", model_name="test_model")
 
@@ -78,6 +80,7 @@ class TestRecordBeamSearchMetrics:
         assert "vllm_gr_beam_search_sort_time_seconds_total" in text
         assert "vllm_gr_beam_search_requests_total" in text
         assert "vllm_gr_beam_search_total_beams_generated_total" in text
+        assert "vllm_gr_beam_search_processed_tokens_total" in text
         # Counters should contain the recorded values.
         assert 'engine="0"' in text
         assert 'model_name="test_model"' in text
@@ -157,12 +160,14 @@ class TestRecordBeamSearchMetrics:
         stats1.beam_search_decode_time = 0.2
         stats1.beam_search_sort_time = 0.01
         stats1.num_beams = 2
+        stats1.num_processed_tokens = 10
 
         stats2 = RequestStateStats()
         stats2.beam_search_prefill_time = 0.3
         stats2.beam_search_decode_time = 0.4
         stats2.beam_search_sort_time = 0.02
         stats2.num_beams = 4
+        stats2.num_processed_tokens = 20
 
         record_beam_search_metrics(stats1, engine="0", model_name="cum_model")
         record_beam_search_metrics(stats2, engine="0", model_name="cum_model")
@@ -170,6 +175,7 @@ class TestRecordBeamSearchMetrics:
         # Look up the counter values with the prometheus_client API directly.
         from vllm_gr.v1.metrics.beam_search_metrics import (
             _beam_prefill_time_total,
+            _beam_processed_tokens_total,
             _beam_requests_total,
             _total_beams_generated,
         )
@@ -178,6 +184,7 @@ class TestRecordBeamSearchMetrics:
         assert _beam_prefill_time_total.labels(**labels)._value.get() == pytest.approx(0.4)
         assert _beam_requests_total.labels(**labels)._value.get() == 2.0
         assert _total_beams_generated.labels(**labels)._value.get() == 6.0
+        assert _beam_processed_tokens_total.labels(**labels)._value.get() == 30.0
 
     def test_record_metrics_different_labels(self):
         """Metrics should be kept separate per label set."""

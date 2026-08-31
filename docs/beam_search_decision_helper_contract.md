@@ -22,11 +22,27 @@ Catalog lookup and candidate modification remain entry-point responsibilities:
 
 - Offline uses `mask_candidate_logprobs()`, preserving candidate IDs, count,
   and order while masking invalid scores.
-- OpenAI uses `Catalog.apply_catalog_filter()`, whose `fill` strategy may
-  replace candidates and whose `null` strategy may leave fewer candidates.
+- OpenAI uses `Catalog.apply_catalog_filter()`, which likewise only masks
+  invalid scores to negative infinity — token IDs, ranks, and decoded tokens
+  are never replaced.
 
-These behaviors are intentionally not unified by the decision helpers.
-Changing their equivalence or fill semantics is a separate correctness change.
+Both helpers delegate to the single shared implementation
+`mask_logprobs_by_token_set()` in `vllm_gr/utils/catalog.py`, so the two
+paths cannot silently diverge.
+
+Both entry points therefore produce the same masked geometry: catalog-invalid
+candidates carry `-inf` scores and are discarded by `select_top_indices()`.
+Beams are never eliminated mid-search; the final stage tops up the output
+with random catalog sequences when fewer than `beam_width` valid (finite
+score) beams remain.
+
+Before the top-K selection, entry points detect beams whose generated tokens
+complete a catalog item (`Catalog.valid()` is empty and
+`Catalog.is_terminal()` is true) and finish those beams immediately via
+`complete_catalog_beam()` instead of carrying them forward with masked
+candidates. `fill_catalog_beams()` enforces the remaining `max_tokens`
+budget and does not duplicate sequences already present in the real beams
+unless the catalog runs out of distinct entries that fit.
 
 The handoff to the shared boundary is:
 
@@ -67,7 +83,10 @@ This Offline utility:
 - returns a new list;
 - preserves candidate order and token IDs;
 - replaces disallowed scores with negative infinity;
-- retains the historical `zip(token_ids, logprobs)` length behavior.
+- retains the historical `zip(token_ids, logprobs)` length behavior;
+- delegates the masking itself to the shared
+  `mask_logprobs_by_token_set()` implementation used by
+  `Catalog.apply_catalog_filter()`.
 
 Catalog lookup remains the caller's responsibility.
 
@@ -152,7 +171,6 @@ When `ignore_eos=True`, callers skip completion and masking.
 def select_top_indices(
     scores: np.ndarray,
     beam_width: int,
-    catalog_strategy: str = "fill",
 ) -> np.ndarray:
     ...
 ```
@@ -160,22 +178,20 @@ def select_top_indices(
 Contract:
 
 - always return an integer `np.ndarray`;
+- always throw out every `-inf` (catalog-invalid) score;
+- return at least one index — if every score is `-inf`, fall back to the
+  single best index (the beam is kept alive instead of eliminated);
+- return all finite indices when there are at most `beam_width` of them;
+- when there are more finite indices than `beam_width`, select the top
+  `beam_width` via `np.argpartition` on the negated finite scores;
 - do not sort selected indices;
 - preserve NumPy `argpartition` ordering and tie behavior.
 
-For `fill`:
-
-- retain the legacy `np.argpartition(np.negative(scores), beam_width)` path;
-- retain negative-infinity fallback behavior;
-- return all indices when the candidate count is at most `beam_width`.
-
-For `null`:
-
-- select only finite scores;
-- return every finite index when there are at most `beam_width`;
-- return `np.empty(0, dtype=np.intp)` when no finite candidate exists.
-
 This helper does not replace, remove, or mask Catalog candidates.
+
+The final stage before output tops up `best_beams` with
+`fill_catalog_beams()` when the number of valid (finite-score) results is
+less than `beam_width`, using randomly selected catalog sequences.
 
 ### `materialize_selected_beams`
 
@@ -246,12 +262,11 @@ Changes at this boundary must preserve:
 - explicit candidate-to-parent geometry;
 - completed Beam ordering and scores;
 - stop masking before Top-K;
-- fill `argpartition` behavior;
-- null finite-only behavior;
+- finite-only Top-K with at least one survivor;
 - active child ordering and lineage;
 - grouped `fork_info`;
 - Offline and OpenAI output-policy differences;
-- existing Catalog behavior in each entry point.
+- final-stage random catalog fill behavior.
 
 The helper owner is `vllm_gr/beam_search_decision_utils.py`. Candidate helpers
 must not be re-exported from `vllm_gr/logprobs.py`; callers import them from the

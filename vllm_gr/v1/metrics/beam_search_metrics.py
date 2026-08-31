@@ -32,6 +32,7 @@ _beam_decode_time_total = None
 _beam_sort_time_total = None
 _beam_requests_total = None
 _total_beams_generated = None
+_beam_processed_tokens_total = None
 _beam_prefill_time_histogram = None
 _beam_decode_time_histogram = None
 _beam_sort_time_histogram = None
@@ -43,6 +44,7 @@ def _initialize_metrics() -> None:
     global _metrics_initialized
     global _beam_prefill_time_total, _beam_decode_time_total, _beam_sort_time_total
     global _beam_requests_total, _total_beams_generated
+    global _beam_processed_tokens_total
     global _beam_prefill_time_histogram, _beam_decode_time_histogram
     global _beam_sort_time_histogram, _beams_per_request_histogram
 
@@ -74,6 +76,11 @@ def _initialize_metrics() -> None:
         _total_beams_generated = Counter(
             "vllm_gr_beam_search_total_beams_generated_total",
             "Total number of beams generated across all requests",
+            labelnames=["engine", "model_name"],
+        )
+        _beam_processed_tokens_total = Counter(
+            "vllm_gr_beam_search_processed_tokens_total",
+            "Total number of processed tokens across all beam search requests",
             labelnames=["engine", "model_name"],
         )
 
@@ -154,6 +161,10 @@ def record_beam_search_metrics(
             _beam_sort_time_total.labels(**labels).inc(sort_time)
             if _beam_sort_time_histogram is not None:
                 _beam_sort_time_histogram.labels(**labels).observe(sort_time)
+
+        processed_tokens = getattr(metrics, "num_processed_tokens", 0)
+        if processed_tokens > 0 and _beam_processed_tokens_total is not None:
+            _beam_processed_tokens_total.labels(**labels).inc(processed_tokens)
 
         # Record beam count
         num_beams = getattr(metrics, "num_beams", 1)

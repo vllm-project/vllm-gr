@@ -64,6 +64,7 @@ def _fetch_prometheus_metrics(metrics_url: str) -> dict:
             "sort_time": 0.0,
             "requests": 0.0,
             "beams": 0.0,
+            "processed_tokens": 0.0,
         }
 
         metric_names = {
@@ -72,7 +73,13 @@ def _fetch_prometheus_metrics(metrics_url: str) -> dict:
             "sort_time": "vllm_gr_beam_search_sort_time_seconds_total",
             "requests": "vllm_gr_beam_search_requests_total",
             "beams": "vllm_gr_beam_search_total_beams_generated_total",
+            "processed_tokens": "vllm_gr_beam_search_processed_tokens_total",
         }
+
+        # Track which metrics were actually exported by the server so we can
+        # detect servers running an older vllm_gr without the processed-tokens
+        # counter (in that case the field would silently report 0).
+        seen: set[str] = set()
 
         # Parse exposition format line-by-line
         for line in response.text.split("\n"):
@@ -86,9 +93,11 @@ def _fetch_prometheus_metrics(metrics_url: str) -> dict:
                     try:
                         value = float(line.split()[-1])
                         metrics[key] = value
+                        seen.add(key)
                     except (ValueError, IndexError):
                         pass
 
+        metrics["_seen"] = seen
         return metrics
     except Exception:
         return {}
@@ -114,6 +123,14 @@ def _print_beam_search_delta(before: dict, after: dict):
     avg_prefill = (after.get("prefill_time", 0) - before.get("prefill_time", 0)) / num
     avg_decode = (after.get("decode_time", 0) - before.get("decode_time", 0)) / num
     avg_sort = (after.get("sort_time", 0) - before.get("sort_time", 0)) / num
+    processed_tokens = after.get("processed_tokens", 0) - before.get("processed_tokens", 0)
+    seen_after = after.get("_seen", set())
+    if "requests" in seen_after and "processed_tokens" not in seen_after:
+        logger.warning(
+            "Server /metrics does not export vllm_gr_beam_search_processed_tokens_total; "
+            "the server is running an older vllm_gr version. Restart the server to report "
+            "processed tokens."
+        )
     total = avg_prefill + avg_decode + avg_sort
     print("---------------Beam Search Metrics----------------")
     print(f"Avg Prefill Time (ms):                   {avg_prefill * 1000:.2f}")
@@ -121,6 +138,8 @@ def _print_beam_search_delta(before: dict, after: dict):
     print(f"Avg Sort Time (ms):                      {avg_sort * 1000:.3f}")
     print(f"Total Beam Time (ms):                    {total * 1000:.2f}")
     print(f"Beam Search Requests:                    {int(num)}")
+    print(f"Processed Tokens (total):                {int(processed_tokens)}")
+    print(f"Processed Tokens (avg per request):      {processed_tokens / num:.2f}")
     print("=" * 50)
 
 
@@ -606,6 +625,7 @@ def _run_offline_beam_search_benchmark(args):
 
     # Calculate metrics
     total_tokens = sum(len(output.sequences) * max_tokens for output in outputs)
+    total_processed_tokens = sum(getattr(output, "processed_tokens", 0) for output in outputs)
     elapsed_time = end_time - start_time
 
     # Prepare results
@@ -613,8 +633,10 @@ def _run_offline_beam_search_benchmark(args):
         "elapsed_time": elapsed_time,
         "num_requests": len(prompts),
         "total_num_tokens": total_tokens,
+        "total_num_processed_tokens": total_processed_tokens,
         "requests_per_second": len(prompts) / elapsed_time,
         "tokens_per_second": total_tokens / elapsed_time,
+        "processed_tokens_per_second": total_processed_tokens / elapsed_time,
         "beam_width": beam_width,
     }
 

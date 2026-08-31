@@ -568,9 +568,17 @@ def _beam_collapse_bookkeeping(
                                 cache_entry["completed_beams"].add(physical_beam_id)
 
                         if len(cache_entry["completed_beams"]) >= log_probs_num:
-                            final_lps[idx].copy_(cache_entry["lps"].view(-1))
+                            # The remuxed row is padded to the batch-wide
+                            # max_chained_dim, which may exceed this request's
+                            # own log_probs_num * actual_K when requests with
+                            # different beam widths are batched together.
+                            # Copy only the request's own footprint; the tail
+                            # stays as the -inf/zero padding already written
+                            # by _remux_logprobs_tensors.
+                            req_elems = log_probs_num * actual_K
+                            final_lps[idx, :req_elems].copy_(cache_entry["lps"].view(-1))
                             if final_lp_ids is not None:
-                                final_lp_ids[idx].copy_(cache_entry["lp_ids"].view(-1))
+                                final_lp_ids[idx, :req_elems].copy_(cache_entry["lp_ids"].view(-1))
                             if final_ranks is not None:
                                 final_ranks[idx, :log_probs_num].copy_(cache_entry["ranks"])
 

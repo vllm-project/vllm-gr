@@ -33,21 +33,10 @@ class BeamSearchParams(
 
     begin_token: str | None = None
     end_token: str | None = None
-    # Controls behavior when a beam has no valid catalog token in the model's
-    # top-K logprobs (all logprobs filtered to -inf).
-    # "fill": fill logprob slots with valid catalog tokens at low score.
-    # "null":   leave all logprobs as -inf; the beam is excluded from selection.
-    catalog_strategy: str = "fill"
     beam_star: bool = False
     beam_star_coef: float = 3.3
 
     def __post_init__(self) -> None:
-        if self.catalog_strategy not in ("fill", "null"):
-            raise VLLMValidationError(
-                f"catalog_strategy must be 'fill' or 'null', got {self.catalog_strategy!r}",
-                parameter="catalog_strategy",
-                value=self.catalog_strategy,
-            )
         if self.beam_star_coef <= 0:
             raise VLLMValidationError(
                 f"beam_star_coef must be positive, got {self.beam_star_coef!r}",

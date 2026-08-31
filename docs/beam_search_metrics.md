@@ -29,6 +29,13 @@ All metrics are exposed at the `/metrics` endpoint (Prometheus format) with labe
 5. **`vllm_gr_beam_search_total_beams_generated_total`**
    - Total number of beams generated across all requests
 
+6. **`vllm_gr_beam_search_processed_tokens_total`**
+   - Total number of processed tokens across all beam search requests.
+   - Each decode step contributes `active_beams * beam_width` candidate tokens
+     (the count after catalog/beam-star pruning), so for vanilla beam search
+     with beam width `BW` and `n` decode steps this equals
+     `BW + (n-1) * BW^2`. Pruning constrainers reduce this value.
+
 ### Histogram Metrics (Distributions)
 
 1. **`vllm_gr_beam_search_prefill_duration_seconds`**

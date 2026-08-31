@@ -184,6 +184,63 @@ def test_beam_collapse_accumulates_partial_rows_and_clears_cache() -> None:
     assert "beam" not in runner._beam_logprobs_cache
 
 
+def test_beam_collapse_cache_completion_copes_with_batch_padding() -> None:
+    """A narrower beam request must copy its own footprint, not the padded row.
+
+    When requests with different beam widths share a batch, _remux_logprobs_tensors
+    pads every row to the batch-wide max_chained_dim. Completing the logprobs cache
+    for the narrower request must write only log_probs_num * K elements, leaving the
+    -inf tail untouched (previously this raised a size-mismatch RuntimeError).
+    """
+    runner = SimpleNamespace()
+    beam_data = {
+        "narrow": {"is_beam_decode": True, "beam_width": 2},
+        "wide": {"is_beam_decode": True, "beam_width": 3},
+    }
+    row_configs = [("narrow", 0, 1, [0]), ("wide", 1, 3, [0, 1, 2])]
+
+    def sampler(
+        narrow_values: list[float], narrow_ids: list[int], narrow_rank: int
+    ) -> SimpleNamespace:
+        # orig GPU rows: 1 for narrow + 3 for wide; st_ids: one row per request.
+        return SimpleNamespace(
+            sampled_token_ids=torch.tensor([[narrow_ids[0]], [10], [20], [30]]),
+            logprobs_tensors=SimpleNamespace(
+                logprobs=torch.tensor([narrow_values, [9.0, 9.0], [9.0, 9.0], [9.0, 9.0]]),
+                logprob_token_ids=torch.tensor([narrow_ids, [11, 12], [21, 22], [31, 32]]),
+                selected_token_ranks=torch.tensor([narrow_rank, 7, 8, 9]),
+            ),
+        )
+
+    first = sampler([0.1, 0.2], [1, 2], 3)
+    common._beam_collapse_bookkeeping(
+        runner,
+        object(),
+        row_configs,
+        beam_data,
+        first,
+    )
+    assert runner._beam_logprobs_cache["narrow"]["completed_beams"] == {0}
+    assert first.logprobs_tensors.logprobs.shape == (2, 6)
+
+    second = sampler([0.3, 0.4], [3, 4], 5)
+    collapsed = common._beam_collapse_bookkeeping(
+        runner,
+        object(),
+        [("narrow", 0, 1, [1]), ("wide", 1, 3, [0, 1, 2])],
+        beam_data,
+        second,
+    )
+
+    assert collapsed == (["narrow", "wide"], {"narrow": 0, "wide": 1}, 2)
+    assert torch.allclose(
+        second.logprobs_tensors.logprobs[0],
+        torch.tensor([0.1, 0.2, 0.3, 0.4, float("-inf"), float("-inf")]),
+    )
+    assert second.logprobs_tensors.logprob_token_ids[0].tolist() == [1, 2, 3, 4, 0, 0]
+    assert "narrow" not in runner._beam_logprobs_cache
+
+
 def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     class ExpectedError(RuntimeError):
         pass

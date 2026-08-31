@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
 from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
 
@@ -162,12 +163,14 @@ class _GroupedEngineClient(_OrdinaryEngineClient):
         *,
         data_parallel_size: int | None = None,
         fail_cleanup: bool = False,
+        fail_step: int | None = None,
     ) -> None:
         super().__init__(prepare_outputs)
         self.grouped_outputs = list(grouped_outputs)
         self.register_calls: list[SimpleNamespace] = []
         self.beam_updates: list[BeamRequestStepUpdate] = []
         self.fail_cleanup = fail_cleanup
+        self.fail_step = fail_step
         if data_parallel_size is not None:
             self.vllm_config = SimpleNamespace(
                 parallel_config=SimpleNamespace(
@@ -196,16 +199,60 @@ class _GroupedEngineClient(_OrdinaryEngineClient):
         self,
         update: BeamRequestStepUpdate,
     ) -> None:
+        if (
+            self.fail_step is not None
+            and update.beam_width != 0
+            and len(self.beam_updates) == self.fail_step
+        ):
+            raise RuntimeError("injected failure")
         self.beam_updates.append(update)
         if self.fail_cleanup and update.beam_width == 0:
             raise RuntimeError("cleanup failed")
 
 
-def _serving(engine_client: Any) -> SimpleNamespace:
+class _FakeCatalog:
+    """Minimal Catalog stand-in for beam_search().
+
+    Each entry is a full token sequence; ``valid`` returns the trie
+    continuation set and ``is_terminal`` reports exact matches.
+    """
+
+    def __init__(self, entries: list[list[int]]) -> None:
+        self.entries = [tuple(entry) for entry in entries]
+
+    def valid(self, token_ids: list[int]) -> set[int]:
+        prefix = tuple(token_ids)
+        return {
+            entry[len(prefix)]
+            for entry in self.entries
+            if entry[: len(prefix)] == prefix and len(entry) > len(prefix)
+        }
+
+    def is_terminal(self, token_ids: list[int]) -> bool:
+        return tuple(token_ids) in self.entries
+
+    def apply_catalog_filter(
+        self,
+        token_ids: list[int],
+        logprobs: list[float],
+        valid_tokens_set: set[int],
+    ) -> list[float]:
+        return [
+            lp if tid in valid_tokens_set else -float("inf") for tid, lp in zip(token_ids, logprobs)
+        ]
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def sequence_at(self, i: int) -> list[int]:
+        return list(self.entries[i])
+
+
+def _serving(engine_client: Any, catalog: Any = None) -> SimpleNamespace:
     return SimpleNamespace(
         engine_client=engine_client,
         input_processor=SimpleNamespace(tokenizer=_Tokenizer()),
-        models=SimpleNamespace(catalog=None, model_name="test-model"),
+        models=SimpleNamespace(catalog=catalog, model_name="test-model"),
     )
 
 
@@ -223,7 +270,6 @@ def _params(
         begin_token=None,
         end_token=end_token,
         include_stop_str_in_output=False,
-        catalog_strategy="fill",
     )
 
 
@@ -283,6 +329,7 @@ def _assert_normal_output(output: RequestOutput, request_id: str) -> None:
     assert output.metrics is not None
     assert output.metrics.num_beams == 2
     assert output.metrics.num_generation_tokens >= 0
+    assert output.metrics.num_processed_tokens >= 0
     assert output.metrics.beam_search_prefill_time >= 0
     assert output.metrics.beam_search_decode_time >= 0
     assert output.metrics.beam_search_sort_time >= 0
@@ -365,6 +412,8 @@ def test_grouped_beam_request_lifecycle(
     assert len(outputs) == 1
     _assert_normal_output(outputs[0], "request-0")
     assert outputs[0].metrics.num_generation_tokens == 4
+    # BW=2, 3 steps: 2 (step 0) + 4 (step 1) + 4 (step 2)
+    assert outputs[0].metrics.num_processed_tokens == 10
 
 
 def test_grouped_engine_error_yields_error_and_cleans_up(
@@ -413,3 +462,100 @@ def test_eos_and_distinct_sid_end_token_both_complete() -> None:
     assert [choice.finish_reason for choice in choices] == ["stop", "stop"]
     assert [choice.stop_reason for choice in choices] == [3, 2]
     assert [choice.token_ids for choice in choices] == [[], []]
+
+
+def test_terminal_catalog_beams_are_completed_not_lost(
+    monkeypatch: Any,
+) -> None:
+    """A beam whose generated tokens complete a catalog item must be
+    finished and kept (regression for terminal beams being masked to -inf
+    and dropped by the finite-score filter)."""
+    _install_deterministic_request_ids(monkeypatch)
+    catalog = _FakeCatalog([[11, 21], [12, 31]])
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(
+                _combined_flat(
+                    [
+                        ([21, 41], [-0.5, -3.0]),
+                        ([31, 42], [-0.6, -3.0]),
+                    ]
+                )
+            ),
+            # Step 2: both prefixes [11, 21] and [12, 31] are terminal, so
+            # every candidate gets masked away; the beams must complete.
+            _engine_output(
+                _combined_flat(
+                    [
+                        ([99, 98], [-0.01, -0.02]),
+                        ([97, 96], [-0.03, -0.04]),
+                    ]
+                )
+            ),
+        ],
+    )
+
+    outputs = asyncio.run(
+        _collect_outputs(
+            serving_engine.beam_search(
+                _serving(engine, catalog=catalog),
+                {
+                    "prompt": "prompt text",
+                    "prompt_token_ids": [10],
+                },
+                "request-0",
+                _params(max_tokens=3),
+                trace_headers={"trace": "value"},
+            )
+        )
+    )
+
+    assert len(outputs) == 1
+    choices = outputs[0].outputs
+    assert [choice.finish_reason for choice in choices] == ["stop", "stop"]
+    assert [choice.token_ids for choice in choices] == [[11, 21], [12, 31]]
+    assert [choice.cumulative_logprob for choice in choices] == pytest.approx([-0.6, -0.8])
+    assert len(engine.beam_updates) == 3
+    assert engine.beam_updates[-1].beam_width == 0
+
+
+def test_grouped_step_exception_still_cleans_up_session(
+    monkeypatch: Any,
+) -> None:
+    """An exception mid-decode must still purge the persistent beam session
+    (regression for stranded KV-cache/session state on cancellation)."""
+    _install_deterministic_request_ids(monkeypatch)
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(
+                _combined_flat(
+                    [
+                        ([21, 22], [-0.1, -0.11]),
+                        ([31, 32], [-5.0, -6.0]),
+                    ]
+                )
+            ),
+            # Never consumed: the decode-step update raises before the
+            # grouped result is awaited, but register_beam_output already
+            # popped one entry.
+            _engine_output(
+                _combined_flat(
+                    [
+                        ([41, 42], [-0.1, -0.2]),
+                        ([51, 52], [-0.1, -0.2]),
+                    ]
+                )
+            ),
+        ],
+        fail_step=1,  # raise on the second beam_request_step_update
+    )
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        _run_search(engine, max_tokens=3)
+
+    # The finally block must still have signalled a cleanup update.
+    assert engine.beam_updates[-1].beam_width == 0
+    assert engine.beam_updates[-1].session_id == "request-0-step-0-beam-0"
+    assert engine.beam_updates[-1].pruned_ids == engine.beam_updates[0].child_beam_ids

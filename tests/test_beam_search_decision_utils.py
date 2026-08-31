@@ -141,46 +141,45 @@ def test_complete_stop_candidates_preserves_openai_output_policy() -> None:
 
 
 @pytest.mark.parametrize(
-    ("scores", "beam_width"),
-    [
-        ([-0.5, -float("inf"), -0.1, -0.2], 2),
-        ([-0.1, -0.2], 2),
-    ],
-)  # type: ignore[misc]
-def test_fill_top_indices_preserves_legacy_argpartition(
-    scores: list[float],
-    beam_width: int,
-) -> None:
-    score_array = np.asarray(scores)
-    expected = (
-        np.argpartition(np.negative(score_array), beam_width)[:beam_width]
-        if score_array.size > beam_width
-        else np.arange(score_array.size)
-    )
-
-    actual = select_top_indices(score_array, beam_width, "fill")
-
-    assert np.array_equal(actual, expected)
-    assert actual.dtype == expected.dtype
-
-
-@pytest.mark.parametrize(
     ("scores", "beam_width", "expected"),
     [
-        ([-0.1, -float("inf"), -0.2], 4, [0, 2]),
-        ([-float("inf"), -float("inf")], 2, []),
+        ([-0.1, -0.2, -0.3, -0.4], 2, [0, 1]),
+        ([-0.5, -float("inf"), -0.1, -0.2], 2, [2, 3]),
+        ([-float("inf"), -0.2, -float("inf")], 4, [1]),
+        ([], 2, []),
     ],
 )  # type: ignore[misc]
-def test_null_top_indices_only_returns_finite_candidates(
+def test_select_top_indices_keeps_only_finite_candidates(
     scores: list[float],
     beam_width: int,
     expected: list[int],
 ) -> None:
-    actual = select_top_indices(np.asarray(scores), beam_width, "null")
+    actual = select_top_indices(np.asarray(scores), beam_width)
 
     assert isinstance(actual, np.ndarray)
     assert actual.dtype == np.intp
-    assert actual.tolist() == expected
+    assert sorted(actual.tolist()) == expected
+
+
+@pytest.mark.parametrize(
+    ("scores", "beam_width"),
+    [
+        ([-float("inf"), -float("inf")], 2),
+        ([-float("inf")], 4),
+        ([-float("inf"), -float("inf"), -float("inf")], 2),
+    ],
+)  # type: ignore[misc]
+def test_select_top_indices_all_dead_returns_one_index(
+    scores: list[float],
+    beam_width: int,
+) -> None:
+    actual = select_top_indices(np.asarray(scores), beam_width)
+
+    assert isinstance(actual, np.ndarray)
+    assert actual.dtype == np.intp
+    assert actual.size == 1
+    assert 0 <= int(actual[0]) < len(scores)
+    assert not np.isfinite(np.asarray(scores)[actual[0]])
 
 
 def test_materialize_selected_beams_uses_explicit_nonuniform_parent_mapping() -> None:

@@ -16,4 +16,5 @@ class RequestStateStats(BaseRequestStateStats):
     beam_search_decode_time: float = 0.0
     beam_search_sort_time: float = 0.0
     num_generation_tokens: int = 0
+    num_processed_tokens: int = 0
     num_beams: int = 0

@@ -51,7 +51,7 @@ def _build_catalog_data() -> list[list[str]]:
     return catalog_data
 
 
-async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "fill") -> None:
+async def _serving_catalog_generation_impl(loops: int) -> None:
     catalog_data = _build_catalog_data()
     print(f"catalog created with {len(catalog_data)} items")
 
@@ -101,12 +101,10 @@ async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "
             if hasattr(BeamSearchParams, "begin_token"):
                 beam_search_params_dict["begin_token"] = "<|sid_begin|>"
                 beam_search_params_dict["end_token"] = "<|sid_end|>"
-            if hasattr(BeamSearchParams, "catalog_strategy"):
-                beam_search_params_dict["catalog_strategy"] = catalog_strategy
 
             params = BeamSearchParams(**beam_search_params_dict)
 
-            print(f"Starting beam search (strategy={catalog_strategy}), loops={loops}...")
+            print(f"Starting beam search, loops={loops}...")
 
             catalog_set = set("".join(item) for item in catalog_data)
             if loops <= 0:
@@ -119,13 +117,9 @@ async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "
                     final_output = output
 
                 assert final_output is not None
-                # With catalog_strategy='null', dead-end beams are eliminated, so we may have fewer outputs
-                if catalog_strategy == "fill":
-                    assert len(final_output.outputs) == beam_width
-                else:  # "null" strategy
-                    assert len(final_output.outputs) > 0, (
-                        "No valid outputs generated with null strategy"
-                    )
+                # Dead-end beams are kept alive and the final stage tops up
+                # with random catalog sequences, so we always get beam_width.
+                assert len(final_output.outputs) == beam_width
 
                 print(f"Loop {i}: Verifying {len(final_output.outputs)} generated choices...")
                 not_in_catalog = []
@@ -145,11 +139,11 @@ async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "
             os.remove(catalog_path)
 
 
-def _run_serving_catalog_generation_target(loops: int, catalog_strategy: str = "fill") -> None:
+def _run_serving_catalog_generation_target(loops: int) -> None:
     from vllm_gr.patch import re_apply_patches
 
     re_apply_patches()
-    asyncio.run(_serving_catalog_generation_impl(loops, catalog_strategy))
+    asyncio.run(_serving_catalog_generation_impl(loops))
 
 
 @pytest.mark.slow  # type: ignore
@@ -162,21 +156,11 @@ def test_serving_catalog_generation(loops: int) -> None:
 
 
 @pytest.mark.slow  # type: ignore
-def test_serving_catalog_dead_end_fill(loops: int) -> None:
-    """catalog_strategy='fill': all outputs must be in the catalog."""
+def test_serving_catalog_dead_end(loops: int) -> None:
+    """Dead-end beams survive with -inf scores; outputs are topped up with
+    random catalog sequences and must all be in the catalog."""
     ctx = multiprocessing.get_context("spawn")
-    p = ctx.Process(target=_run_serving_catalog_generation_target, args=(loops, "fill"))
-    p.start()
-    p.join()
-    assert p.exitcode == 0
-
-
-@pytest.mark.slow  # type: ignore
-def test_serving_catalog_dead_end_null(loops: int) -> None:
-    """catalog_strategy='null': dead-end beams are dropped; all surviving outputs
-    must still be in the catalog."""
-    ctx = multiprocessing.get_context("spawn")
-    p = ctx.Process(target=_run_serving_catalog_generation_target, args=(loops, "null"))
+    p = ctx.Process(target=_run_serving_catalog_generation_target, args=(loops,))
     p.start()
     p.join()
     assert p.exitcode == 0
@@ -198,7 +182,8 @@ async def _null_all_dead_impl() -> None:
     # model will never emit as its top prediction for a normal prompt.
     # After the begin token is prepended the catalog asks for <unk> next —
     # something the model essentially never puts in its top-K logprobs.
-    # The catalog path then sees every beam as a dead-end on step 1.
+    # Every beam becomes a dead-end on step 1 and the final stage must fill
+    # all outputs with random catalog sequences.
     impossible_catalog = [["<|sid_begin|>", "<unk>", "<|sid_end|>"]]
 
     with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
@@ -242,7 +227,6 @@ async def _null_all_dead_impl() -> None:
                 "max_tokens": 3,
                 "ignore_eos": False,
                 "temperature": 0.0,
-                "catalog_strategy": "null",
             }
             if hasattr(BeamSearchParams, "begin_token"):
                 beam_search_params_dict["begin_token"] = "<|sid_begin|>"
@@ -257,12 +241,12 @@ async def _null_all_dead_impl() -> None:
             # Must not crash and must return a finished output.
             assert final_output is not None, "beam_search must yield at least one output"
             assert final_output.finished is True
-            # The system stopped cleanly — no error finish_reason.
-            # Outputs may be partial (incomplete catalog entries) because the
-            # generator broke out early when all beams became dead-ends.
+            # All beams dead-ended, so every output is a random catalog fill
+            # (the single catalog entry) and none reports an error.
+            assert len(final_output.outputs) == 4
             for choice in final_output.outputs:
                 assert choice.finish_reason != "error", (
-                    "null all-dead must not return finish_reason='error'"
+                    "all-dead catalog must not return finish_reason='error'"
                 )
             print(
                 f"null all-dead test passed: {len(final_output.outputs)} outputs, "
@@ -275,7 +259,8 @@ async def _null_all_dead_impl() -> None:
 
 @pytest.mark.slow  # type: ignore
 def test_serving_catalog_null_all_dead_no_crash(loops: int) -> None:
-    """null strategy + impossible catalog → stops cleanly, no crash, no invalid tokens."""
+    """Impossible catalog → all beams dead-end; final stage fills outputs with
+    random catalog sequences; stops cleanly, no crash, no invalid tokens."""
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_run_null_all_dead_target)
     p.start()
@@ -297,9 +282,8 @@ async def _uniqueness_impl() -> None:
     model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
 
     # Create a catalog where every level has >beam_width valid continuations,
-    # so the fallback mechanism (j % len(valid_list)) maps each of the 16
-    # candidate positions to a distinct token, avoiding any tie-induced
-    # collisions in argpartition across levels.
+    # so beams can diverge into distinct tokens at every level without any
+    # tie-induced collisions in argpartition across levels.
     beam_width = 16
     catalog_data = []
     for a in range(32):
@@ -355,7 +339,6 @@ async def _uniqueness_impl() -> None:
                 "max_tokens": 5,
                 "ignore_eos": False,
                 "temperature": 0.7,  # Non-zero temp allows beam diversity
-                "catalog_strategy": "fill",
             }
             if hasattr(BeamSearchParams, "begin_token"):
                 beam_search_params_dict["begin_token"] = "<|sid_begin|>"
