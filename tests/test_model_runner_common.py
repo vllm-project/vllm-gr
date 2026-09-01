@@ -275,7 +275,7 @@ def test_logprob_remux_preserves_flattening_and_placeholder_rows() -> None:
 
 
 def test_beam_collapse_accumulates_partial_rows_and_clears_cache() -> None:
-    runner = SimpleNamespace()
+    runner = SimpleNamespace(_beam_result_host_ready=True)
     beam_data = {"beam": {"is_beam_decode": True, "beam_width": 2}}
 
     def sampler(values: list[float], token_ids: list[int], rank: int) -> SimpleNamespace:
@@ -367,6 +367,7 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     should_raise = False
 
     def execute_model(self: Any, output: Any) -> str:
+        assert self._beam_result_host_ready is False
         assert BEAM_DATA_VAR.get() is self._current_beam_info
         assert self._current_beam_info == {
             "beam_data": output.beam_data,
@@ -665,6 +666,40 @@ def test_execute_wrapper_does_not_inline_when_gate_closed() -> None:
     assert runner._sample_tokens_calls == []
     # State survives for the engine-initiated sample_tokens RPC.
     assert runner.execute_model_state == "state"
+
+
+def test_execute_wrapper_prelaunches_before_async_sample_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CUDA helper runs after ExecuteModelState publication, while the
+    engine-owned second sample_tokens RPC remains untouched."""
+
+    from vllm_gr.v1.worker import constraint_hook
+
+    events: list[str] = []
+    scheduler_output = SimpleNamespace(beam_data={})
+
+    def execute(self: Any, received: Any) -> None:
+        assert received is scheduler_output
+        self.execute_model_state = SimpleNamespace(
+            scheduler_output=received,
+            logits="logits",
+        )
+        events.append("execute")
+        return None
+
+    def launch(self: Any) -> bool:
+        assert self.execute_model_state.logits == "logits"
+        events.append("prelaunch")
+        return True
+
+    monkeypatch.setattr(constraint_hook, "launch_prepared_cuda_prefill_constraint", launch)
+    runner = _m2_runner(use_async_scheduling=True, state=None)
+
+    assert common.make_patched_execute_model(execute)(runner, scheduler_output) is None
+    assert events == ["execute", "prelaunch"]
+    assert runner._sample_tokens_calls == []
+    assert runner.execute_model_state.logits == "logits"
 
 
 def test_execute_wrapper_does_not_inline_non_none_output() -> None:

@@ -274,6 +274,76 @@ def test_gpu_bookkeeping_reduces_worker_decision_before_sync_copy(
     assert runner.input_batch is original_batch
 
 
+def test_gpu_bookkeeping_reuses_host_ready_prefill_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    width = 4
+    original_batch = SimpleNamespace()
+    host_ids = torch.tensor([[31, 32, 33, 34]], dtype=torch.int32)
+    host_scores = torch.tensor([[-0.5, -1.5, -2.5, -3.5]], dtype=torch.float32)
+    host_ranks = torch.zeros(1, dtype=torch.int32)
+
+    def unexpected_copy(value: torch.Tensor) -> list[list[int]]:
+        raise AssertionError("host-ready prefill must not call the CUDA copy helper")
+
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(_obj=original_batch),
+        use_async_scheduling=False,
+        _beam_result_host_ready=True,
+        _to_list=unexpected_copy,
+        _beam_decision_tensors={
+            "out_token_ids": torch.zeros((1, width), dtype=torch.int32),
+            "out_log_probs": torch.zeros((1, width), dtype=torch.float32),
+            "_host_token_ids": host_ids,
+            "_host_log_probs": host_scores,
+            "_host_selected_token_ranks": host_ranks,
+        },
+    )
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.zeros((1, 1), dtype=torch.int32),
+        logprobs_tensors=LogprobsTensors(
+            logprob_token_ids=torch.zeros((1, width), dtype=torch.int32),
+            logprobs=torch.zeros((1, width), dtype=torch.float32),
+            selected_token_ranks=torch.zeros(1, dtype=torch.int64),
+        ),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={"beam": {"is_constraint_prefill": True, "beam_width": width}},
+        _gr_request_row_configs=[("beam", 0, 1, [0])],
+        finished_req_ids=set(),
+    )
+
+    def original(self: Any, scheduler: Any, received: Any, *args: Any) -> tuple[Any, ...]:
+        assert received.sampled_token_ids.device.type == "cpu"
+        assert received.logprobs_tensors.logprobs.device.type == "cpu"
+        return (
+            0,
+            received.logprobs_tensors.tolists(),
+            self._to_list(received.sampled_token_ids),
+            {},
+            ["beam"],
+            {"beam": 0},
+            [],
+        )
+
+    monkeypatch.setattr(
+        gpu_patch,
+        "_beam_collapse_bookkeeping",
+        lambda *args, **kwargs: (["beam"], {"beam": 0}, 1),
+    )
+    result = gpu_patch.make_patched_bookkeeping_sync(original)(
+        runner,
+        scheduler_output,
+        sampler_output,
+    )
+
+    assert result[2] == [[31]]
+    assert result[1].slice_request(0, 1).logprob_token_ids.tolist() == [[31, 32, 33, 34]]
+    assert runner._to_list is unexpected_copy
+
+
 def test_gpu_sample_patch_runs_original_then_constraint_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -330,6 +400,62 @@ def test_gpu_sample_patch_returns_canonical_output_before_sampler(
 
     assert wrapped(SimpleNamespace(), "logits", "meta") is direct_output
     assert events == ["direct", "decision"]
+
+
+def test_gpu_sample_patch_consumes_prelaunched_prefill_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    prelaunched = object()
+
+    def consume(self: Any, logits: Any, spec: Any) -> Any:
+        assert logits == "logits"
+        assert spec == "meta"
+        events.append("consume")
+        return prelaunched
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"prelaunched prefill sampled twice: {args} {kwargs}")
+
+    def decide(self: Any, sampler_output: Any) -> None:
+        assert sampler_output is prelaunched
+        events.append("decision")
+
+    monkeypatch.setattr(gpu_patch, "consume_prelaunched_cuda_prefill", consume)
+    monkeypatch.setattr(gpu_patch, "try_sample_with_constraint_backend", forbidden)
+    monkeypatch.setattr(gpu_patch, "apply_constrained_sample_override", forbidden)
+    monkeypatch.setattr(gpu_patch, "maybe_run_worker_beam_decision", decide)
+
+    wrapped = gpu_patch.make_patched_sample_gpu(forbidden)
+    assert wrapped(SimpleNamespace(), "logits", "meta") is prelaunched
+    assert events == ["consume", "decision"]
+
+
+def test_compute_logits_hook_prelaunches_on_returned_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker import constraint_hook
+
+    events: list[Any] = []
+    logits = object()
+
+    class Model:
+        def compute_logits(self, hidden: Any) -> Any:
+            events.append(("lm_head", hidden))
+            return logits
+
+    runner = SimpleNamespace(model=Model())
+
+    def launch(received_runner: Any, received_logits: Any) -> bool:
+        assert received_runner is runner
+        events.append(("prelaunch", received_logits))
+        return True
+
+    monkeypatch.setattr(constraint_hook, "launch_prepared_cuda_prefill_constraint", launch)
+    assert gpu_patch._install_cuda_prefill_compute_logits_hook(runner) is True
+    assert gpu_patch._install_cuda_prefill_compute_logits_hook(runner) is True
+    assert runner.model.compute_logits("hidden") is logits
+    assert events == [("lm_head", "hidden"), ("prelaunch", logits)]
 
 
 # ---------------------------------------------------------------------------
@@ -954,3 +1080,66 @@ def test_verify_and_record_captured_graph_appends_to_existing_keys() -> None:
 
     assert result is True
     assert runner._beam_graph_keys == {4, 8}
+
+
+# ---------------------------------------------------------------------------
+# Persistent postprocess workspace load hook
+# ---------------------------------------------------------------------------
+
+
+def test_postprocess_workspace_load_wrapper_initializes_after_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    def original(runner: Any, marker: Any) -> str:
+        calls.append(("load", marker))
+        return "loaded"
+
+    def initialize(runner: Any) -> None:
+        calls.append(("workspace", runner))
+
+    monkeypatch.setattr(gpu_patch, "initialize_beam_postprocess_workspaces", initialize)
+    wrapped = gpu_patch.make_load_model_with_beam_postprocess_workspace(original)
+    runner = SimpleNamespace()
+
+    assert wrapped(runner, "weights") == "loaded"
+    assert calls == [("load", "weights"), ("workspace", runner)]
+    assert gpu_patch.make_load_model_with_beam_postprocess_workspace(wrapped) is wrapped
+
+
+def test_postprocess_workspace_load_wrapper_accounts_device_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_pool = SimpleNamespace(device_memory_bytes=37)
+
+    def original(runner: Any) -> str:
+        # Native load_model recomputes this value on every model load.
+        runner.model_memory_usage = 100
+        return "loaded"
+
+    monkeypatch.setattr(
+        gpu_patch,
+        "initialize_beam_postprocess_workspaces",
+        lambda runner: workspace_pool,
+    )
+    monkeypatch.setattr(
+        gpu_patch,
+        "_install_cuda_prefill_compute_logits_hook",
+        lambda runner: False,
+    )
+    wrapped = gpu_patch.make_load_model_with_beam_postprocess_workspace(original)
+    runner = SimpleNamespace()
+
+    assert wrapped(runner) == "loaded"
+    assert runner.model_memory_usage == 137
+    # Reusing an existing pool after reload must be accounted once relative
+    # to the freshly measured model memory, rather than accumulated twice.
+    assert wrapped(runner) == "loaded"
+    assert runner.model_memory_usage == 137
+
+
+def test_postprocess_workspace_initializer_is_noop_off_cuda() -> None:
+    runner = SimpleNamespace(device=torch.device("cpu"))
+    assert gpu_patch.initialize_beam_postprocess_workspaces(runner) is None
+    assert not hasattr(runner, "_beam_postprocess_workspaces")

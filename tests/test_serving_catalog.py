@@ -6,7 +6,6 @@ import asyncio
 import json
 import multiprocessing
 import os
-import random
 import tempfile
 from typing import Any
 
@@ -33,31 +32,132 @@ if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is
 
 
 def _build_catalog_data() -> list[list[str]]:
-    catalog_data = []
-    random.seed(42)
-    # The random layer must stay dense for catalog_strategy="null": a beam
-    # whose top-K candidate window misses the trie's valid set is dropped,
-    # and each (a, b) prefix only survives step 3 with ~K/vocab probability
-    # per catalog continuation.  With 50k entries nearly every (a, b) prefix
-    # had exactly one valid c, so the 256-wide beam pool died out at step 3
-    # (every beam dead-end -> 0 outputs -> test failure).  500k entries give
-    # the model-preferred prefixes enough valid continuations to keep the
-    # expected survivor count above zero (measured 4 survivors / OneRec-1.7B,
-    # beam_width=256).
-    for i in range(500000):
-        item = [
+    # A large random catalog is both expensive and statistically fragile: a
+    # sparse random (a, b) prefix can still lose every continuation under the
+    # ``null`` strategy.  These values are the leading deterministic
+    # continuations for this file's fixed OneRec prompt.  Their Cartesian
+    # product keeps 32 valid branches at every trie level, including each
+    # observed high-probability path, using 32**3 entries instead of 508k.
+    a_values = (
+        271,
+        2912,
+        4362,
+        4785,
+        4005,
+        169,
+        3285,
+        2939,
+        8165,
+        2315,
+        4392,
+        7121,
+        3398,
+        978,
+        6121,
+        3326,
+        5621,
+        526,
+        5557,
+        2025,
+        2811,
+        7538,
+        4462,
+        2429,
+        4866,
+        1629,
+        7592,
+        5908,
+        7414,
+        2206,
+        5183,
+        2967,
+    )
+    b_values = (
+        5945,
+        1346,
+        3417,
+        6020,
+        7295,
+        5491,
+        7746,
+        2961,
+        518,
+        7504,
+        386,
+        2282,
+        7069,
+        4518,
+        1460,
+        5812,
+        1544,
+        2381,
+        8139,
+        6612,
+        7916,
+        3036,
+        5681,
+        3305,
+        454,
+        1135,
+        4125,
+        5421,
+        7624,
+        7397,
+        7125,
+        7717,
+    )
+    c_values = (
+        2133,
+        4476,
+        5861,
+        4618,
+        2655,
+        4790,
+        4222,
+        2858,
+        1529,
+        7344,
+        1011,
+        7656,
+        4783,
+        4241,
+        1377,
+        3052,
+        2167,
+        6924,
+        856,
+        992,
+        7856,
+        6422,
+        13,
+        6023,
+        2149,
+        5762,
+        7612,
+        155,
+        2262,
+        6907,
+        1370,
+        5305,
+    )
+    return [
+        [
             "<|sid_begin|>",
-            f"<s_a_{random.randint(0, 7999)}>",
-            f"<s_b_{random.randint(0, 7999)}>",
-            f"<s_c_{random.randint(0, 7999)}>",
+            f"<s_a_{a}>",
+            f"<s_b_{b}>",
+            f"<s_c_{c}>",
             "<|sid_end|>",
         ]
-        catalog_data.append(item)
-    for i in range(8000):
-        catalog_data.append(
-            ["<|sid_begin|>", "<s_a_4247>", "<s_b_6120>", f"<s_c_{i}>", "<|sid_end|>"]
-        )
-    return catalog_data
+        for a in a_values
+        for b in b_values
+        for c in c_values
+    ]
+
+
+def test_compact_catalog_fixture_geometry() -> None:
+    catalog = _build_catalog_data()
+    assert len(catalog) == 32**3
+    assert len({tuple(item) for item in catalog}) == len(catalog)
 
 
 async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "fill") -> None:

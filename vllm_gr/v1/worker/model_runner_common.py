@@ -616,20 +616,26 @@ def _beam_collapse_bookkeeping(
                                     device=orig_lps.device,
                                     dtype=orig_lps.dtype,
                                 ),
-                                "lp_ids": torch.zeros(
-                                    (total_beam_width, actual_K),
-                                    dtype=orig_lp_ids.tensor.dtype
-                                    if hasattr(orig_lp_ids, "tensor")
-                                    else torch.long,
-                                    device=orig_lps.device,
-                                )
-                                if orig_lp_ids is not None
-                                else None,
-                                "ranks": torch.zeros(
-                                    total_beam_width, dtype=torch.long, device=orig_lps.device
-                                )
-                                if orig_ranks is not None
-                                else None,
+                                "lp_ids": (
+                                    torch.zeros(
+                                        (total_beam_width, actual_K),
+                                        dtype=(
+                                            orig_lp_ids.tensor.dtype
+                                            if hasattr(orig_lp_ids, "tensor")
+                                            else torch.long
+                                        ),
+                                        device=orig_lps.device,
+                                    )
+                                    if orig_lp_ids is not None
+                                    else None
+                                ),
+                                "ranks": (
+                                    torch.zeros(
+                                        total_beam_width, dtype=torch.long, device=orig_lps.device
+                                    )
+                                    if orig_ranks is not None
+                                    else None
+                                ),
                                 "completed_beams": set(),
                             }
 
@@ -703,16 +709,66 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
     if token_ids.ndim != 2 or scores.shape != token_ids.shape or token_ids.shape[0] < 1:
         return False
 
-    selected_ids = token_ids.contiguous()
-    selected_scores = scores.contiguous()
-    sampler_output.sampled_token_ids = selected_ids[:, :1].contiguous()
     ranks = getattr(lp_tensors, "selected_token_ranks", None)
     rank_dtype = ranks.dtype if torch.is_tensor(ranks) else torch.int64
-    selected_ranks = torch.zeros(
-        selected_ids.shape[0],
-        dtype=rank_dtype,
-        device=selected_ids.device,
+    workspace = getattr(runner, "_beam_postprocess_workspaces", None)
+    selected_ids = token_ids
+    selected_scores = scores
+    selected_sampled = None
+    selected_ranks = None
+    host_ids = decision.get("_host_token_ids")
+    host_scores = decision.get("_host_log_probs")
+    host_ranks = decision.get("_host_selected_token_ranks")
+    host_ready = bool(
+        getattr(runner, "_beam_result_host_ready", False)
+        and torch.is_tensor(host_ids)
+        and torch.is_tensor(host_scores)
+        and torch.is_tensor(host_ranks)
+        and host_ids.device.type == "cpu"
+        and host_scores.device.type == "cpu"
+        and host_ranks.device.type == "cpu"
     )
+    if host_ready:
+        selected_ids = host_ids
+        selected_scores = host_scores
+        selected_sampled = host_ids[:, :1]
+        selected_ranks = host_ranks
+    elif bool(getattr(runner, "use_async_scheduling", False)):
+        # AsyncGPUModelRunnerOutput starts its D2H copies only after this
+        # function returns.  The decision tensors may be views into a
+        # runner-owned workspace that the next execute_model can overwrite in
+        # the meantime, so publish private device storage for the async
+        # wrapper.  Its copy stream waits for these clones on the producer
+        # stream, and retaining the tensors keeps their storage alive until
+        # the copy has completed.
+        selected_ids = token_ids.clone()
+        selected_scores = scores.clone()
+        selected_sampled = selected_ids[:, :1]
+        selected_ranks = torch.zeros(
+            selected_ids.shape[0],
+            dtype=rank_dtype,
+            device=selected_ids.device,
+        )
+    elif workspace is not None:
+        from vllm_gr.v1.beam.beam_decision import get_beam_postprocess_workspace
+
+        fixed = get_beam_postprocess_workspace(runner, int(token_ids.shape[1]))
+        if fixed is not None and token_ids.shape[0] <= fixed.max_batch:
+            selected_sampled = fixed.sampled_token_ids[: token_ids.shape[0]]
+            selected_sampled.copy_(token_ids[:, :1])
+            if fixed.selected_token_ranks.dtype == rank_dtype:
+                selected_ranks = fixed.selected_token_ranks[: token_ids.shape[0]]
+    if selected_sampled is None:
+        selected_ids = token_ids.contiguous()
+        selected_scores = scores.contiguous()
+        selected_sampled = selected_ids[:, :1].contiguous()
+    if selected_ranks is None:
+        selected_ranks = torch.zeros(
+            selected_ids.shape[0],
+            dtype=rank_dtype,
+            device=selected_ids.device,
+        )
+    sampler_output.sampled_token_ids = selected_sampled
     sampler_output.logprobs_tensors = lp_tensors._replace(
         logprob_token_ids=selected_ids,
         logprobs=selected_scores,
@@ -1189,6 +1245,12 @@ def make_patched_execute_model(_orig_execute_model):
         # ModelRunnerOutput.beam_search_result.
         self._beam_decision_result = None
         self._beam_decision_tensors = None
+        self._beam_result_host_ready = False
+        # CUDA Prefill prelaunch state is single-step and single-consumer.
+        # Reset it before upstream input preparation may publish this run's
+        # prepared descriptor.
+        self._gr_prepared_cuda_prefill_constraint = None
+        self._gr_prelaunched_cuda_prefill = None
 
         # Manage BeamSearchSession for incremental decode
         beam_session = _get_or_create_beam_session(self, self._current_beam_data, scheduler_output)
@@ -1232,6 +1294,19 @@ def make_patched_execute_model(_orig_execute_model):
         self._current_scheduler_output = scheduler_output
         try:
             out = _orig_execute_model(self, scheduler_output, *args, **kwargs)
+            if out is None:
+                # GPU-only helper; all non-CUDA and unsupported cases are a
+                # cheap no-op.  Upstream has just published LM-Head logits in
+                # ExecuteModelState, so enqueue the complete P->D device chain
+                # before returning control to the scheduler.
+                from vllm_gr.v1.worker.constraint_hook import (
+                    launch_prepared_cuda_prefill_constraint,
+                )
+
+                with torch.autograd.profiler.record_function(
+                    "prefill_constraint_post_forward_enqueue"
+                ):
+                    launch_prepared_cuda_prefill_constraint(self)
             if out is None and _should_inline_sample_tokens(self):
                 # M2: finish sampling in-process and return the
                 # ModelRunnerOutput through the execute_model channel, so the

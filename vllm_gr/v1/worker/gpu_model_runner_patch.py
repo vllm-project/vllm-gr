@@ -12,6 +12,8 @@ from vllm.logger import init_logger
 from vllm_gr.v1.beam.beam_decision import maybe_run_worker_beam_decision
 from vllm_gr.v1.worker.constraint_hook import (
     apply_constrained_sample_override,
+    consume_prelaunched_cuda_prefill,
+    prepare_cuda_prefill_constraint,
     try_sample_with_constraint_backend,
 )
 
@@ -45,6 +47,140 @@ from vllm_gr.v1.worker.model_runner_common import (
 
 logger = init_logger(__name__)
 
+_BEAM_POSTPROCESS_LOAD_PATCH_MARKER = "_vllm_gr_beam_postprocess_load_patched"
+_PREFILL_COMPUTE_LOGITS_PATCH_MARKER = "_vllm_gr_prefill_compute_logits_patched"
+
+
+def _install_cuda_prefill_compute_logits_hook(runner) -> bool:
+    """Place the prepared TopK chain immediately after LM-Head returns."""
+
+    model = getattr(runner, "model", None)
+    original = getattr(model, "compute_logits", None)
+    if not callable(original):
+        return False
+    if getattr(original, _PREFILL_COMPUTE_LOGITS_PATCH_MARKER, False):
+        return True
+
+    @wraps(original)
+    def compute_logits_with_prefill_prelaunch(*args, **kwargs):
+        logits = original(*args, **kwargs)
+        from vllm_gr.v1.worker.constraint_hook import (
+            launch_prepared_cuda_prefill_constraint,
+        )
+
+        launch_prepared_cuda_prefill_constraint(runner, logits)
+        return logits
+
+    setattr(compute_logits_with_prefill_prelaunch, _PREFILL_COMPUTE_LOGITS_PATCH_MARKER, True)
+    model.compute_logits = compute_logits_with_prefill_prelaunch
+    return True
+
+
+def initialize_beam_postprocess_workspaces(
+    runner,
+    *,
+    max_batch: int | None = None,
+):
+    """Prewarm the configured CUDA Beam postprocess bucket on ``runner``.
+
+    The production Worker currently owns a one-slot Beam context.  ``max_batch``
+    remains an explicit construction input so operator tests and a future
+    multi-request Worker can reserve more than one batch row without changing
+    the workspace layout.
+    """
+
+    device = torch.device(getattr(runner, "device", "cpu"))
+    if device.type != "cuda":
+        return None
+
+    from vllm_gr.v1.beam.beam_decision import (
+        BeamPostprocessWorkspace,
+        BeamPostprocessWorkspaceKey,
+        BeamPostprocessWorkspacePool,
+    )
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    gr_cfg = _get_gr_config(runner)
+    width = gr_cfg.beam_max_width
+    if not bool(gr_cfg.beam_worker_decision) or width is None:
+        return None
+
+    context = getattr(runner, "_beam_context", None)
+    resolved_max_batch = (
+        int(max_batch) if max_batch is not None else int(getattr(context, "max_batch", 1))
+    )
+    dtype = getattr(getattr(runner, "model_config", None), "dtype", None)
+    if not isinstance(dtype, torch.dtype):
+        raise RuntimeError(
+            f"CUDA Beam postprocess workspace requires model_config.dtype, got {dtype!r}"
+        )
+
+    key = BeamPostprocessWorkspaceKey(int(width), int(width), dtype)
+    existing = getattr(runner, "_beam_postprocess_workspaces", None)
+    if existing is not None:
+        workspace = existing.require(key)
+        if workspace.max_batch != resolved_max_batch or workspace.max_decode_steps != int(
+            gr_cfg.beam_max_decode_steps
+        ):
+            raise RuntimeError(
+                "prewarmed Beam postprocess workspace geometry changed after "
+                "initialization; rebuilding fixed-address buffers is forbidden"
+            )
+        return existing
+
+    workspace = BeamPostprocessWorkspace.allocate(
+        max_batch=resolved_max_batch,
+        beam_width=int(width),
+        top_k=int(width),
+        max_decode_steps=int(gr_cfg.beam_max_decode_steps),
+        device=device,
+        logits_dtype=dtype,
+        pin_host=True,
+    )
+    pool = BeamPostprocessWorkspacePool()
+    pool.add(workspace)
+    runner._beam_postprocess_workspaces = pool
+    logger.info(
+        "vllm-gr: prewarmed CUDA Beam postprocess workspace "
+        "(batch=%d, width=%d, top_k=%d, dtype=%s, device_bytes=%d, pinned_bytes=%d)",
+        resolved_max_batch,
+        width,
+        width,
+        dtype,
+        workspace.device_memory_bytes,
+        workspace.pinned_memory_bytes,
+    )
+    return pool
+
+
+def make_load_model_with_beam_postprocess_workspace(original):
+    """Initialize fixed Beam postprocess storage after model weights load."""
+
+    if getattr(original, _BEAM_POSTPROCESS_LOAD_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def load_model_with_beam_postprocess_workspace(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        workspace_pool = initialize_beam_postprocess_workspaces(self)
+        if workspace_pool is not None:
+            # The pool is allocated after native load_model has measured the
+            # model weights, but before Worker memory profiling.  Treat its
+            # device storage as model-owned memory so KV-cache capacity is not
+            # computed from bytes that are already permanently resident.
+            self.model_memory_usage = int(getattr(self, "model_memory_usage", 0)) + int(
+                workspace_pool.device_memory_bytes
+            )
+        _install_cuda_prefill_compute_logits_hook(self)
+        return result
+
+    setattr(
+        load_model_with_beam_postprocess_workspace,
+        _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
+        True,
+    )
+    return load_model_with_beam_postprocess_workspace
+
 
 def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
     """Wrap the GPU two-item ``_prepare_inputs`` contract."""
@@ -66,6 +202,8 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
             return logits_indices, spec_decode_metadata
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
+        with torch.autograd.profiler.record_function("prefill_constraint_prepare"):
+            prepare_cuda_prefill_constraint(self, scheduler_output)
         return (
             torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device),
             spec_decode_metadata,
@@ -82,11 +220,13 @@ def make_patched_sample_gpu(_orig_sample):
 
     @wraps(_orig_sample)
     def patched_sample(self, logits, spec_decode_metadata=None):
-        sampler_output = try_sample_with_constraint_backend(
-            self,
-            logits,
-            spec_decode_metadata,
-        )
+        sampler_output = consume_prelaunched_cuda_prefill(self, logits, spec_decode_metadata)
+        if sampler_output is None:
+            sampler_output = try_sample_with_constraint_backend(
+                self,
+                logits,
+                spec_decode_metadata,
+            )
         if sampler_output is None:
             sampler_output = _orig_sample(self, logits, spec_decode_metadata)
             apply_constrained_sample_override(self, logits, sampler_output)
@@ -139,6 +279,34 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         # this after _orig_bookkeeping_sync is too late and copies/converts the
         # redundant W-by-W candidate matrix on every decode step.
         _reduce_sampler_output_for_worker_decision(self, sampler_output)
+        restore_to_list = None
+        delete_to_list = False
+        host_ready_sampled = (
+            not getattr(self, "use_async_scheduling", False)
+            and bool(getattr(self, "_beam_result_host_ready", False))
+            and sampler_output is not None
+            and isinstance(getattr(sampler_output, "sampled_token_ids", None), torch.Tensor)
+            and sampler_output.sampled_token_ids.device.type == "cpu"
+        )
+        if host_ready_sampled:
+            # The dedicated CUDA prefill path already synchronized its one
+            # pinned D2H and exposes CPU views over that exact staging. Keep all
+            # upstream bookkeeping, but prevent _to_list from enqueueing and
+            # synchronizing a second copy of the sampled token.
+            original_to_list = getattr(self, "_to_list", None)
+            if callable(original_to_list):
+                instance_dict = getattr(self, "__dict__", {})
+                had_instance_to_list = "_to_list" in instance_dict
+                previous_instance_to_list = instance_dict.get("_to_list")
+                try:
+                    self._to_list = lambda value: value.tolist()
+                except (AttributeError, TypeError):
+                    pass
+                else:
+                    if had_instance_to_list:
+                        restore_to_list = previous_instance_to_list
+                    else:
+                        delete_to_list = True
         if (
             sampler_output is not None
             and isinstance(getattr(sampler_output, "sampled_token_ids", None), torch.Tensor)
@@ -167,6 +335,10 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         try:
             res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
         finally:
+            if delete_to_list:
+                delattr(self, "_to_list")
+            elif restore_to_list is not None:
+                self._to_list = restore_to_list
             self.input_batch = orig_input_batch
 
         (

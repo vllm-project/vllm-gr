@@ -17,6 +17,35 @@ MAX_TOP_K = 256
 MAX_SORT_BLOCK = 65536
 
 
+def validate_cuda_sort_capacity(
+    first_token_count: int,
+    max_prefix1_degree: int,
+    max_prefix2_degree: int,
+) -> None:
+    """Validate the table-wide sort extents required by the CUDA kernel.
+
+    Unchecked Worker launches rely on this invariant being established once
+    when CUDA tables are loaded, rather than repeating structural table
+    validation on every sampling step.
+    """
+
+    for name, candidate_count in (
+        ("first_token_ids", first_token_count),
+        ("max_prefix1_degree", max_prefix1_degree),
+        ("max_prefix2_degree", max_prefix2_degree),
+    ):
+        if isinstance(candidate_count, bool) or not isinstance(candidate_count, int):
+            raise TypeError(f"{name} candidate count must be an int")
+        if candidate_count < 0:
+            raise ValueError(f"{name} candidate count must be non-negative")
+        block = triton.next_power_of_2(max(candidate_count, 1))
+        if block > MAX_SORT_BLOCK:
+            raise ValueError(
+                f"{name} candidate degree {candidate_count} requires sort block "
+                f"{block}, above supported {MAX_SORT_BLOCK}"
+            )
+
+
 @triton.jit(
     do_not_specialize=[
         "logits_vocab_size",
@@ -26,6 +55,8 @@ MAX_SORT_BLOCK = 65536
         "first_count",
         "prefix1_value_count",
         "prefix2_value_count",
+        "logits_row_stride",
+        "logits_vocab_stride",
         "prefix_stride",
         "temperature_count",
         "top_k",
@@ -43,8 +74,11 @@ def _fused_topk_kernel(
     temperatures,
     output_ids,
     output_logprobs,
+    output_wire_logprobs,
     output_valid_mask,
     valid_counts,
+    prefill_status,
+    prefill_payload,
     logits_vocab_size,
     table_vocab_size,
     vocab_offset,
@@ -52,9 +86,13 @@ def _fused_topk_kernel(
     first_count,
     prefix1_value_count,
     prefix2_value_count,
+    logits_row_stride,
+    logits_vocab_stride,
     prefix_stride,
     temperature_count,
     top_k,
+    WRITE_WIRE_LOGPROBS: tl.constexpr,
+    PACK_PREFILL_RESULT: tl.constexpr,
     step: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -110,7 +148,7 @@ def _fused_topk_kernel(
     candidate_mask = candidate_mask & token_in_window
     valid_degree = tl.sum(candidate_mask, axis=0)
     score = tl.load(
-        logits + row * logits_vocab_size + local_token,
+        logits + row * logits_row_stride + local_token * logits_vocab_stride,
         mask=candidate_mask,
         other=-float("inf"),
     ).to(tl.float32)
@@ -180,13 +218,33 @@ def _fused_topk_kernel(
         )
     output_offsets = row * top_k + offsets
     tl.store(output_ids + output_offsets, selected_tokens, mask=output_mask)
+    selected_logprobs = selected_scores - denominator
     tl.store(
         output_logprobs + output_offsets,
-        tl.where(valid_output, selected_scores - denominator, -1.0e20),
+        tl.where(valid_output, selected_logprobs, -1.0e20),
         mask=output_mask,
     )
+    if WRITE_WIRE_LOGPROBS:
+        tl.store(
+            output_wire_logprobs + output_offsets,
+            tl.where(valid_output, selected_logprobs, -float("inf")),
+            mask=output_mask,
+        )
     tl.store(output_valid_mask + output_offsets, valid_output, mask=output_mask)
     tl.store(valid_counts + row, valid_degree)
+    if PACK_PREFILL_RESULT:
+        active_count = tl.num_programs(0) * top_k
+        payload_token = tl.where(valid_output, selected_tokens, 0).to(tl.int32)
+        payload_score = tl.where(valid_output, selected_logprobs, -float("inf"))
+        payload_score_bits = payload_score.to(tl.int32, bitcast=True)
+        tl.store(prefill_payload + output_offsets, payload_token, mask=output_mask)
+        tl.store(prefill_payload + active_count + output_offsets, 0, mask=output_mask)
+        tl.store(
+            prefill_payload + 2 * active_count + output_offsets,
+            payload_score_bits,
+            mask=output_mask,
+        )
+        tl.store(prefill_status + row, tl.where(valid_degree > 0, 0, 1))
 
 
 def _require_cuda_contiguous(
@@ -230,11 +288,15 @@ def _validate_inputs(
         raise ValueError(f"CUDA constrained Top-K requires CUDA logits, got {logits.device}")
     if logits.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"logits must use fp16/bf16 on CUDA, got {logits.dtype}")
-    if logits.ndim != 2 or not logits.is_contiguous():
-        raise ValueError("logits must be a contiguous 2-D tensor")
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be 2-D, got shape {tuple(logits.shape)}")
     rows, logits_vocab_size = logits.shape
     if rows <= 0 or logits_vocab_size <= 0:
         raise ValueError("logits rows and vocabulary width must be positive")
+    if logits.stride(0) <= 0 or logits.stride(1) <= 0:
+        raise ValueError(
+            f"logits must have positive row and vocabulary strides, got {tuple(logits.stride())}"
+        )
     if isinstance(vocab_offset, bool) or not isinstance(vocab_offset, int):
         raise TypeError("vocab_offset must be an int")
     if vocab_offset < 0:
@@ -349,6 +411,82 @@ def _validate_outputs(
             raise ValueError(f"{name} must be contiguous")
 
 
+def _validate_nonoverlapping_outputs(outputs: tuple[tuple[str, torch.Tensor], ...]) -> None:
+    """Reject write/write aliasing between contiguous caller-owned outputs."""
+
+    ranges: list[tuple[str, torch.device, int, int]] = []
+    for name, tensor in outputs:
+        begin = int(tensor.data_ptr())
+        end = begin + int(tensor.numel()) * int(tensor.element_size())
+        for other_name, other_device, other_begin, other_end in ranges:
+            if tensor.device == other_device and begin < other_end and other_begin < end:
+                raise ValueError(f"{name} must not overlap {other_name}")
+        ranges.append((name, tensor.device, begin, end))
+
+
+def _launch_rec_constrained_topk_cuda_out(
+    logits: torch.Tensor,
+    first_token_ids: torch.Tensor,
+    prefix1_offsets: torch.Tensor,
+    prefix1_values: torch.Tensor,
+    prefix1_pair_keys: torch.Tensor,
+    prefix2_value_offsets: torch.Tensor,
+    prefix2_values: torch.Tensor,
+    temperatures: torch.Tensor,
+    current_step: int,
+    top_k: int,
+    out_token_ids: torch.Tensor,
+    out_logprobs: torch.Tensor,
+    out_valid_mask: torch.Tensor,
+    out_valid_counts: torch.Tensor,
+    vocab_offset: int,
+    out_wire_logprobs: torch.Tensor | None,
+    out_prefill_status: torch.Tensor | None = None,
+    out_prefill_payload: torch.Tensor | None = None,
+    *,
+    rows: int,
+    block: int,
+    flat_prefixes: torch.Tensor,
+    table_vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _fused_topk_kernel[(rows,)](
+        logits,
+        flat_prefixes,
+        first_token_ids,
+        prefix1_offsets,
+        prefix1_values,
+        prefix1_pair_keys,
+        prefix2_value_offsets,
+        prefix2_values,
+        temperatures,
+        out_token_ids,
+        out_logprobs,
+        out_wire_logprobs if out_wire_logprobs is not None else out_logprobs,
+        out_valid_mask,
+        out_valid_counts,
+        out_prefill_status if out_prefill_status is not None else out_valid_counts,
+        out_prefill_payload if out_prefill_payload is not None else out_token_ids,
+        logits_vocab_size=logits.shape[1],
+        table_vocab_size=table_vocab_size,
+        vocab_offset=vocab_offset,
+        pair_count=prefix1_pair_keys.numel(),
+        first_count=first_token_ids.numel(),
+        prefix1_value_count=prefix1_values.numel(),
+        prefix2_value_count=prefix2_values.numel(),
+        logits_row_stride=logits.stride(0),
+        logits_vocab_stride=logits.stride(1),
+        prefix_stride=flat_prefixes.shape[1],
+        temperature_count=temperatures.numel(),
+        top_k=top_k,
+        WRITE_WIRE_LOGPROBS=out_wire_logprobs is not None,
+        PACK_PREFILL_RESULT=(out_prefill_status is not None and out_prefill_payload is not None),
+        step=current_step,
+        BLOCK=block,
+        num_warps=8 if block >= 2048 else 4,
+    )
+    return out_token_ids, out_logprobs, out_valid_mask, out_valid_counts
+
+
 def rec_constrained_topk_cuda_out(
     logits: torch.Tensor,
     sequence_group: torch.Tensor,
@@ -369,6 +507,7 @@ def rec_constrained_topk_cuda_out(
     out_valid_counts: torch.Tensor,
     vocab_offset: int = 0,
     table_vocab_size: int | None = None,
+    out_wire_logprobs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Write constrained Top-K results into caller-owned CUDA tensors."""
 
@@ -398,9 +537,30 @@ def rec_constrained_topk_cuda_out(
         out_valid_mask,
         out_valid_counts,
     )
-    _fused_topk_kernel[(rows,)](
+    if out_wire_logprobs is not None:
+        _require_cuda_contiguous(
+            "out_wire_logprobs",
+            out_wire_logprobs,
+            device=logits.device,
+            dtype=torch.float32,
+            ndim=2,
+        )
+        if tuple(out_wire_logprobs.shape) != (rows, top_k):
+            raise ValueError(
+                "out_wire_logprobs must have shape "
+                f"{(rows, top_k)}, got {tuple(out_wire_logprobs.shape)}"
+            )
+    writable_outputs = [
+        ("out_token_ids", out_token_ids),
+        ("out_logprobs", out_logprobs),
+        ("out_valid_mask", out_valid_mask),
+        ("out_valid_counts", out_valid_counts),
+    ]
+    if out_wire_logprobs is not None:
+        writable_outputs.append(("out_wire_logprobs", out_wire_logprobs))
+    _validate_nonoverlapping_outputs(tuple(writable_outputs))
+    return _launch_rec_constrained_topk_cuda_out(
         logits,
-        flat_prefixes,
         first_token_ids,
         prefix1_offsets,
         prefix1_values,
@@ -408,25 +568,79 @@ def rec_constrained_topk_cuda_out(
         prefix2_value_offsets,
         prefix2_values,
         temperatures,
+        current_step,
+        top_k,
         out_token_ids,
         out_logprobs,
         out_valid_mask,
         out_valid_counts,
-        logits_vocab_size=logits.shape[1],
+        vocab_offset,
+        out_wire_logprobs,
+        rows=rows,
+        block=block,
+        flat_prefixes=flat_prefixes,
         table_vocab_size=resolved_table_vocab_size,
-        vocab_offset=vocab_offset,
-        pair_count=prefix1_pair_keys.numel(),
-        first_count=first_token_ids.numel(),
-        prefix1_value_count=prefix1_values.numel(),
-        prefix2_value_count=prefix2_values.numel(),
-        prefix_stride=flat_prefixes.shape[1],
-        temperature_count=temperatures.numel(),
-        top_k=top_k,
-        step=current_step,
-        BLOCK=block,
-        num_warps=8 if block >= 2048 else 4,
     )
-    return out_token_ids, out_logprobs, out_valid_mask, out_valid_counts
+
+
+def _rec_constrained_topk_cuda_out_unchecked(
+    logits: torch.Tensor,
+    sequence_group: torch.Tensor,
+    first_token_ids: torch.Tensor,
+    prefix1_offsets: torch.Tensor,
+    prefix1_values: torch.Tensor,
+    prefix1_pair_keys: torch.Tensor,
+    prefix2_value_offsets: torch.Tensor,
+    prefix2_values: torch.Tensor,
+    temperatures: torch.Tensor,
+    current_step: int,
+    top_k: int,
+    max_prefix1_degree: int,
+    max_prefix2_degree: int,
+    out_token_ids: torch.Tensor,
+    out_logprobs: torch.Tensor,
+    out_valid_mask: torch.Tensor,
+    out_valid_counts: torch.Tensor,
+    vocab_offset: int,
+    table_vocab_size: int,
+    out_wire_logprobs: torch.Tensor | None,
+    out_prefill_status: torch.Tensor | None = None,
+    out_prefill_payload: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch on startup-validated CUDA prefill tensors (Worker-internal)."""
+
+    rows = int(logits.shape[0])
+    candidate_count = (
+        int(first_token_ids.numel())
+        if current_step == 0
+        else (int(max_prefix1_degree) if current_step == 1 else int(max_prefix2_degree))
+    )
+    block = triton.next_power_of_2(max(top_k, candidate_count, 1))
+    flat_prefixes = sequence_group.view(rows, sequence_group.shape[-1])
+    return _launch_rec_constrained_topk_cuda_out(
+        logits,
+        first_token_ids,
+        prefix1_offsets,
+        prefix1_values,
+        prefix1_pair_keys,
+        prefix2_value_offsets,
+        prefix2_values,
+        temperatures,
+        current_step,
+        top_k,
+        out_token_ids,
+        out_logprobs,
+        out_valid_mask,
+        out_valid_counts,
+        vocab_offset,
+        out_wire_logprobs,
+        out_prefill_status,
+        out_prefill_payload,
+        rows=rows,
+        block=block,
+        flat_prefixes=flat_prefixes,
+        table_vocab_size=table_vocab_size,
+    )
 
 
 def rec_constrained_topk_cuda(
@@ -496,6 +710,7 @@ __all__ = [
     "INVALID_LOGIT",
     "MAX_SORT_BLOCK",
     "MAX_TOP_K",
+    "validate_cuda_sort_capacity",
     "rec_constrained_topk_cuda",
     "rec_constrained_topk_cuda_out",
 ]

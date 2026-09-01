@@ -77,6 +77,10 @@ def reorder_unshared_kv(
     aux_value_bufs: list[torch.Tensor] | None = None,
     aux_key: torch.Tensor | None = None,
     aux_value: torch.Tensor | None = None,
+    pool_key_ptrs: torch.Tensor | None = None,
+    pool_value_ptrs: torch.Tensor | None = None,
+    *,
+    layout_prevalidated: bool = False,
 ) -> None:
     """Reorder every layer's unshared pool KV in place after selection.
 
@@ -148,6 +152,9 @@ def reorder_unshared_kv(
             decode_step,
             aux_key=aux_key,
             aux_value=aux_value,
+            pool_key_ptrs=pool_key_ptrs,
+            pool_value_ptrs=pool_value_ptrs,
+            validate_layout=not layout_prevalidated,
         ):
             return
 

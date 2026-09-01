@@ -134,6 +134,7 @@ def _select_kv_gather_kernel(
     pool_v_ptrs,  # int64 [L]: per-layer value pool base byte addresses
     aux_k_addr,  # int64: aux key scratch base byte address ([L, W, H, S, D])
     aux_v_addr,  # int64: aux value scratch base byte address
+    pool_slot_offset,  # byte offset of the active batch slot
     n,  # live beam count (<= pool width)
     steps,  # reorder range = decode_step + 1
     beam_index_ptr,  # [n] source beam for each destination beam
@@ -160,8 +161,8 @@ def _select_kv_gather_kernel(
     # int64 byte addresses → uint16 pointers: element offsets map 1:1 for
     # any 2-byte dtype, so the copy is bit-exact without a dtype anchor
     # (a typed aux pointer would silently CONVERT uint16→bf16 values).
-    k_src = tl.load(pool_k_ptrs + layer).to(tl.pointer_type(tl.uint16))
-    v_src = tl.load(pool_v_ptrs + layer).to(tl.pointer_type(tl.uint16))
+    k_src = (tl.load(pool_k_ptrs + layer) + pool_slot_offset).to(tl.pointer_type(tl.uint16))
+    v_src = (tl.load(pool_v_ptrs + layer) + pool_slot_offset).to(tl.pointer_type(tl.uint16))
     k_dst = aux_k_addr.to(tl.pointer_type(tl.uint16))
     v_dst = aux_v_addr.to(tl.pointer_type(tl.uint16))
     src_off = j * stride_pw + h * stride_ph
@@ -179,6 +180,7 @@ def _select_kv_scatter_kernel(
     pool_v_ptrs,  # int64 [L]: per-layer value pool base byte addresses
     aux_k_addr,  # int64: aux key scratch base byte address ([L, W, H, S, D])
     aux_v_addr,  # int64: aux value scratch base byte address
+    pool_slot_offset,  # byte offset of the active batch slot
     n,  # live beam count (<= pool width)
     steps,  # reorder range = decode_step + 1
     H: tl.constexpr,  # num_kv_heads
@@ -200,8 +202,8 @@ def _select_kv_scatter_kernel(
     h = rem % H
     d = tl.arange(0, BLOCK_D)
     mask = d < D
-    k_dst = tl.load(pool_k_ptrs + layer).to(tl.pointer_type(tl.uint16))
-    v_dst = tl.load(pool_v_ptrs + layer).to(tl.pointer_type(tl.uint16))
+    k_dst = (tl.load(pool_k_ptrs + layer) + pool_slot_offset).to(tl.pointer_type(tl.uint16))
+    v_dst = (tl.load(pool_v_ptrs + layer) + pool_slot_offset).to(tl.pointer_type(tl.uint16))
     k_src = aux_k_addr.to(tl.pointer_type(tl.uint16))
     v_src = aux_v_addr.to(tl.pointer_type(tl.uint16))
     src_off = layer * stride_al + i * stride_aw + h * stride_ah
@@ -221,6 +223,10 @@ def select_unshared_kv_fused(
     decode_step: int,
     aux_key: torch.Tensor,  # [L, W, H, max_steps, D] per-layer scratch
     aux_value: torch.Tensor,
+    pool_key_ptrs: torch.Tensor | None = None,
+    pool_value_ptrs: torch.Tensor | None = None,
+    *,
+    validate_layout: bool = True,
 ) -> bool:
     """Triton fast path for select_unshared_kv; returns False when unavailable.
 
@@ -245,29 +251,50 @@ def select_unshared_kv_fused(
     # All layers must share layout (they do: same-shape contiguous pools) and
     # the head_dim axis must be unit-stride in both pool and aux.
     ref_strides = first.stride()
-    if (
-        ref_strides[4] != 1
-        or any(p.stride() != ref_strides for p in unshared_key_caches)
+    if ref_strides[4] != 1 or aux_key.stride(4) != 1:
+        return False
+    if validate_layout and (
+        any(p.stride() != ref_strides for p in unshared_key_caches)
         or any(v.stride() != ref_strides for v in unshared_value_caches)
-        or aux_key.stride(4) != 1
     ):
         return False
 
-    beam_index = beam_index.contiguous()
+    if not beam_index.is_contiguous():
+        return False
     device = first.device
-    k_ptrs = torch.tensor(
-        [p.data_ptr() for p in unshared_key_caches], dtype=torch.int64, device=device
-    )
-    v_ptrs = torch.tensor(
-        [p.data_ptr() for p in unshared_value_caches], dtype=torch.int64, device=device
-    )
+    if pool_key_ptrs is None or pool_value_ptrs is None:
+        k_ptrs = torch.tensor(
+            [p.data_ptr() for p in unshared_key_caches], dtype=torch.int64, device=device
+        )
+        v_ptrs = torch.tensor(
+            [p.data_ptr() for p in unshared_value_caches], dtype=torch.int64, device=device
+        )
+    else:
+        k_ptrs = pool_key_ptrs
+        v_ptrs = pool_value_ptrs
+        if validate_layout:
+            expected = (len(unshared_key_caches),)
+            for ptrs in (k_ptrs, v_ptrs):
+                if (
+                    ptrs.device != device
+                    or ptrs.dtype != torch.int64
+                    or tuple(ptrs.shape) != expected
+                    or not ptrs.is_contiguous()
+                ):
+                    return False
     # The batch-slot offset advances the byte addresses directly instead of
     # passing a stride_pb argument into the kernels.
     slot_off = slot * ref_strides[0] * first.element_size()
-    k_ptrs += slot_off
-    v_ptrs += slot_off
     grid = (len(unshared_key_caches) * n * H,)
-    base_args = (k_ptrs, v_ptrs, aux_key.data_ptr(), aux_value.data_ptr(), n, steps)
+    base_args = (
+        k_ptrs,
+        v_ptrs,
+        aux_key.data_ptr(),
+        aux_value.data_ptr(),
+        slot_off,
+        n,
+        steps,
+    )
     kernel_kwargs = {
         "H": H,
         "BLOCK_D": triton.next_power_of_2(D),

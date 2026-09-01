@@ -8,8 +8,10 @@ import torch
 
 from tests.constraints.test_table import make_table
 from vllm_gr.ops.cuda.rec_constrained_topk import (
+    _rec_constrained_topk_cuda_out_unchecked,
     rec_constrained_topk_cuda,
     rec_constrained_topk_cuda_out,
+    validate_cuda_sort_capacity,
 )
 from vllm_gr.ops.rec_constrained_topk import rec_constrained_topk_torch
 
@@ -337,6 +339,113 @@ def test_cuda_out_variant_supports_fixed_address_graph_replay() -> None:
     torch.testing.assert_close(outputs[1], expected_logprobs, rtol=2e-3, atol=2e-3)
 
 
+def test_cuda_out_variant_writes_optional_wire_logprobs_in_same_kernel() -> None:
+    inputs = _inputs(torch.float16)
+    rows, top_k = inputs[0].shape[0], 4
+    outputs = (
+        torch.empty((rows, top_k), dtype=torch.int32, device="cuda"),
+        torch.empty((rows, top_k), dtype=torch.float32, device="cuda"),
+        torch.empty((rows, top_k), dtype=torch.bool, device="cuda"),
+        torch.empty((rows,), dtype=torch.int32, device="cuda"),
+    )
+    wire = torch.empty((rows, top_k), dtype=torch.float32, device="cuda")
+
+    rec_constrained_topk_cuda_out(
+        *inputs,
+        1,
+        top_k,
+        2,
+        2,
+        *outputs,
+        out_wire_logprobs=wire,
+    )
+
+    assert torch.equal(wire[outputs[2]], outputs[1][outputs[2]])
+    assert torch.isneginf(wire[~outputs[2]]).all()
+    assert torch.equal(
+        outputs[1][~outputs[2]],
+        torch.full_like(outputs[1][~outputs[2]], -1.0e20),
+    )
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+def test_cuda_out_variant_rejects_exact_and_partial_output_alias(offset: int) -> None:
+    inputs = _inputs(torch.float16)
+    rows, top_k = inputs[0].shape[0], 4
+    element_count = rows * top_k
+    shared = torch.empty(element_count + offset, dtype=torch.float32, device="cuda")
+    out_logprobs = shared[:element_count].view(rows, top_k)
+    out_wire_logprobs = shared[offset : offset + element_count].view(rows, top_k)
+    outputs = (
+        torch.empty((rows, top_k), dtype=torch.int32, device="cuda"),
+        out_logprobs,
+        torch.empty((rows, top_k), dtype=torch.bool, device="cuda"),
+        torch.empty((rows,), dtype=torch.int32, device="cuda"),
+    )
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        rec_constrained_topk_cuda_out(
+            *inputs,
+            1,
+            top_k,
+            2,
+            2,
+            *outputs,
+            out_wire_logprobs=out_wire_logprobs,
+        )
+
+
+def test_cuda_sort_capacity_boundary() -> None:
+    validate_cuda_sort_capacity(65536, 65536, 65536)
+    for values in ((65537, 1, 1), (1, 65537, 1), (1, 1, 65537)):
+        with pytest.raises(ValueError, match="above supported 65536"):
+            validate_cuda_sort_capacity(*values)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_unchecked_out_matches_validated_prewarmed_launch(
+    dtype: torch.dtype,
+) -> None:
+    inputs = _uniform_degree_inputs(dtype, rows=2, degree=300)
+    rows, top_k = 2, 128
+
+    def make_outputs() -> tuple[torch.Tensor, ...]:
+        return (
+            torch.empty((rows, top_k), dtype=torch.int32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.float32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.bool, device="cuda"),
+            torch.empty((rows,), dtype=torch.int32, device="cuda"),
+            torch.empty((rows, top_k), dtype=torch.float32, device="cuda"),
+        )
+
+    expected = make_outputs()
+    actual = make_outputs()
+    rec_constrained_topk_cuda_out(
+        *inputs,
+        0,
+        top_k,
+        300,
+        300,
+        *expected[:4],
+        table_vocab_size=inputs[0].shape[1],
+        out_wire_logprobs=expected[4],
+    )
+    _rec_constrained_topk_cuda_out_unchecked(
+        *inputs,
+        0,
+        top_k,
+        300,
+        300,
+        *actual[:4],
+        vocab_offset=0,
+        table_vocab_size=inputs[0].shape[1],
+        out_wire_logprobs=actual[4],
+    )
+
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+
 def test_cuda_step2_empty_pair_table_returns_padding() -> None:
     inputs = list(_inputs(torch.float16))
     inputs[5] = torch.empty(0, dtype=torch.int64, device="cuda")
@@ -404,7 +513,7 @@ def test_cuda_degree_less_equal_greater_than_top_k(step: int, degree: int) -> No
     assert (actual[1][~expected_mask] == -1.0e20).all()
 
 
-def test_cuda_fail_fast_dtype_and_contiguity() -> None:
+def test_cuda_fail_fast_dtype_and_buffer_contiguity() -> None:
     inputs = list(_inputs(torch.float16))
     with pytest.raises(TypeError, match="fp16/bf16"):
         rec_constrained_topk_cuda(
@@ -417,21 +526,31 @@ def test_cuda_fail_fast_dtype_and_contiguity() -> None:
         )
 
     inputs = list(_inputs(torch.float16))
-    noncontiguous_logits = torch.empty(
+    padded_logits = torch.empty(
         (inputs[0].shape[0], inputs[0].shape[1] * 2),
         dtype=torch.float16,
         device="cuda",
-    )[:, ::2]
+    )
+    noncontiguous_logits = padded_logits[:, ::2]
+    noncontiguous_logits.copy_(inputs[0])
     assert not noncontiguous_logits.is_contiguous()
-    with pytest.raises(ValueError, match="logits must be a contiguous"):
-        rec_constrained_topk_cuda(
-            noncontiguous_logits,
-            *inputs[1:],
-            current_step=1,
-            top_k=2,
-            max_prefix1_degree=2,
-            max_prefix2_degree=2,
-        )
+    strided_actual = rec_constrained_topk_cuda(
+        noncontiguous_logits,
+        *inputs[1:],
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=2,
+        max_prefix2_degree=2,
+    )
+    contiguous_expected = rec_constrained_topk_cuda(
+        *inputs,
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=2,
+        max_prefix2_degree=2,
+    )
+    for actual, expected in zip(strided_actual, contiguous_expected, strict=True):
+        assert torch.equal(actual, expected)
 
     inputs = list(_inputs(torch.float16))
     inputs[2] = inputs[2].to(torch.int64)

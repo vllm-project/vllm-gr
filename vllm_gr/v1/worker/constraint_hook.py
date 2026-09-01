@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -43,6 +44,38 @@ _VALID_CONSTRAINT_STEPS = (0, 1, 2)
 _CONSTRAINT_PREFIX_WIDTH = len(_VALID_CONSTRAINT_STEPS)
 
 _DEFAULT_TEMPERATURE = 1.0
+
+
+@dataclass(slots=True)
+class PreparedCudaPrefillConstraint:
+    """Request metadata staged before forward for the CUDA prefill fast path.
+
+    The object contains only persistent workspace views and already-resolved
+    backend callables.  It deliberately does not retain logits: those are
+    published by upstream in ``ExecuteModelState`` after LM-Head completes.
+    """
+
+    scheduler_output: Any
+    rows: tuple[tuple[Any, int, int, dict[str, Any]], ...]
+    width: int
+    workspace: Any
+    backend: Any
+    execution_adapter: Any
+    prefixes: torch.Tensor
+    temperatures: torch.Tensor
+    metadata: ConstraintMetadata
+    sequence_group: torch.Tensor
+    out_token_ids: torch.Tensor
+    out_logprobs: torch.Tensor
+    out_valid_mask: torch.Tensor
+    out_valid_counts: torch.Tensor
+    out_wire_logprobs: torch.Tensor
+    out_status: torch.Tensor
+    out_payload: torch.Tensor
+    device_copy: torch.Tensor
+    host_copy: torch.Tensor
+    copy_event: Any
+    stream: Any
 
 
 def validate_constraint_step(step: Any) -> int:
@@ -447,9 +480,9 @@ def _has_constrained_metadata(
 
 
 def _canonical_constraint_table_enabled(runner: Any) -> bool:
-    from vllm_gr.config import GRConfig
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
-    config = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+    config = _get_gr_config(runner)
     table_config = config.constraint_table
     return table_config is not None and table_config.enabled
 
@@ -581,6 +614,537 @@ def _validate_direct_backend_output(
         )
 
 
+def _prepare_workspace_constraint_metadata(
+    runner: Any,
+    rows: Sequence[tuple[Any, int, int, dict[str, Any]]],
+    workspace: Any,
+    *,
+    total_rows: int,
+    device: torch.device,
+) -> tuple[int, torch.Tensor, torch.Tensor] | None:
+    """Fill fixed prefix/temperature inputs for one homogeneous CUDA step."""
+
+    if len(rows) > workspace.max_batch:
+        return None
+    steps = {validate_constraint_step(item[3].get("constraint_step")) for item in rows}
+    if len(steps) != 1:
+        return None
+    step = next(iter(steps))
+    capacity_rows = workspace.max_batch * workspace.key.beam_width
+    if total_rows > capacity_rows:
+        return None
+
+    host_prefix = workspace.host_prefix_token_ids.view(capacity_rows, 3)
+    host_prefix_numpy = workspace.host_prefix_token_ids_numpy.reshape(capacity_rows, 3)
+    device_prefix = workspace.prefix_token_ids.view(capacity_rows, 3)
+    # Step 0 never reads sequence_group.  Avoid the otherwise exposed pinned
+    # host write plus H2D copy on the LM-Head -> TopK critical path.
+    if step != 0:
+        host_prefix_numpy[:total_rows].fill(0)
+    for req_id, row_start, row_count, mdata in rows:
+        width = _constraint_beam_width(mdata, req_id)
+        if step == 0:
+            if row_count != 1:
+                raise RuntimeError(
+                    f"constrained prefill request {req_id!r} has {row_count} "
+                    "logits rows, expected exactly 1"
+                )
+            continue
+        if row_count != width:
+            raise RuntimeError(
+                f"constrained decode request {req_id!r} has {row_count} logits "
+                f"rows, expected beam_width={width}"
+            )
+        suffix = mdata.get("beam_suffix")
+        if (
+            not isinstance(suffix, Sequence)
+            or isinstance(suffix, (str, bytes))
+            or len(suffix) < width
+        ):
+            suffix_count = len(suffix) if isinstance(suffix, Sequence) else 0
+            raise RuntimeError(
+                f"constrained decode request {req_id!r} needs {width} parent "
+                f"beam suffixes, got {suffix_count}"
+            )
+        packed_prefixes: list[list[int]] = []
+        for parent in range(width):
+            parent_suffix = suffix[parent]
+            if (
+                not isinstance(parent_suffix, Sequence)
+                or isinstance(parent_suffix, (str, bytes))
+                or len(parent_suffix) < step
+            ):
+                suffix_length = (
+                    len(parent_suffix)
+                    if isinstance(parent_suffix, Sequence)
+                    and not isinstance(parent_suffix, (str, bytes))
+                    else 0
+                )
+                raise RuntimeError(
+                    f"constrained decode step {step} needs the last {step} "
+                    f"token(s) for parent {parent} of request {req_id!r}, got "
+                    f"{suffix_length}"
+                )
+            packed_row: list[int] = []
+            for position in range(step):
+                try:
+                    token_id = int(parent_suffix[len(parent_suffix) - step + position])
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError(
+                        f"constrained request {req_id!r} has invalid token IDs "
+                        f"in beam_suffix[{parent}]"
+                    ) from exc
+                packed_row.append(token_id)
+            packed_prefixes.append(packed_row)
+        # One NumPy bulk assignment replaces O(W*step) Tensor __setitem__
+        # dispatches (256 aten::select + 128 aten::copy_ at W=128, step=1).
+        host_prefix_numpy[
+            row_start : row_start + width,
+            :step,
+        ] = packed_prefixes
+    if step != 0:
+        device_prefix[:total_rows].copy_(host_prefix[:total_rows], non_blocking=True)
+
+    device_temperatures = workspace.temperatures.view(-1)[:total_rows]
+    sampling_metadata = getattr(getattr(runner, "input_batch", None), "sampling_metadata", None)
+    source_temperatures = (
+        getattr(sampling_metadata, "temperature", None) if sampling_metadata is not None else None
+    )
+    if (
+        isinstance(source_temperatures, torch.Tensor)
+        and source_temperatures.dtype == torch.float32
+        and source_temperatures.device == device
+        and source_temperatures.numel() in (1, total_rows)
+    ):
+        device_temperatures.copy_(source_temperatures.reshape(-1).expand(total_rows))
+    else:
+        host_temperatures = workspace.host_temperatures.view(-1)[:total_rows]
+        host_temperatures.fill_(_DEFAULT_TEMPERATURE)
+        device_temperatures.copy_(host_temperatures, non_blocking=True)
+    return step, device_prefix[:total_rows], device_temperatures
+
+
+def _populate_workspace_constraint_metadata(
+    runner: Any,
+    rows: Sequence[tuple[Any, int, int, dict[str, Any]]],
+    logits: torch.Tensor,
+    workspace: Any,
+) -> tuple[int, torch.Tensor, torch.Tensor] | None:
+    """Compatibility wrapper for paths that still prepare at sample time."""
+
+    return _prepare_workspace_constraint_metadata(
+        runner,
+        rows,
+        workspace,
+        total_rows=int(logits.shape[0]),
+        device=logits.device,
+    )
+
+
+def _build_workspace_constrained_sampler_output(
+    workspace: Any,
+    rows: int,
+    *,
+    deferred_prefill_status: bool = False,
+    deferred_decode_status: bool = False,
+) -> Any:
+    """Build the unchanged SamplerOutput ABI over caller-owned CUDA buffers."""
+
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    capacity_rows = workspace.max_batch * workspace.key.beam_width
+    width = workspace.key.top_k
+    token_ids = workspace.topk_token_ids.view(capacity_rows, width)[:rows]
+    logprobs = workspace.topk_scores.view(capacity_rows, width)[:rows]
+    valid_mask = workspace.topk_valid_mask.view(capacity_rows, width)[:rows]
+    wire_logprobs = workspace.wire_topk_scores.view(capacity_rows, width)[:rows]
+    if deferred_prefill_status:
+        # A prefill has one row, so this is already a contiguous [1, 1] view.
+        # Keeping the view removes a standalone D2D copy between TopK and the
+        # result-packing kernel.
+        sampled = token_ids[:, :1]
+    else:
+        sampled = workspace.sampled_token_ids[:rows]
+        sampled.copy_(token_ids[:, :1])
+    ranks = workspace.selected_token_ranks[:rows]
+    output = SamplerOutput(
+        sampled_token_ids=sampled,
+        logprobs_tensors=LogprobsTensors(
+            logprob_token_ids=token_ids,
+            logprobs=wire_logprobs,
+            selected_token_ranks=ranks,
+        ),
+    )
+    # Private Worker-only views let the decision consume the raw score and
+    # structural validity buffers without recreating them from the public
+    # SamplerOutput representation.
+    output._gr_constraint_token_ids = token_ids
+    output._gr_constraint_logprobs = logprobs
+    output._gr_constraint_valid_mask = valid_mask
+    output._gr_constraint_valid_counts = workspace.topk_valid_counts.view(-1)[:rows]
+    output._gr_deferred_prefill_status = bool(deferred_prefill_status)
+    output._gr_deferred_decode_status = bool(deferred_decode_status)
+    output._gr_beam_postprocess_workspace = workspace
+    return output
+
+
+def prepare_cuda_prefill_constraint(runner: Any, scheduler_output: Any) -> bool:
+    """Stage an eligible CUDA prefill's invariant inputs before model forward.
+
+    This is intentionally a narrow optimization gate.  Any unsupported or
+    ambiguous request returns ``False`` and reaches the unchanged sampling
+    path later.
+    """
+
+    runner._gr_prepared_cuda_prefill_constraint = None
+    device = torch.device(getattr(runner, "device", "cpu"))
+    if device.type != "cuda":
+        return False
+    if int(getattr(getattr(runner, "parallel_config", None), "pipeline_parallel_size", 1)) != 1:
+        return False
+    if getattr(scheduler_output, "scheduled_spec_decode_tokens", None):
+        return False
+
+    beam_data = getattr(scheduler_output, "beam_data", {})
+    request_row_configs = getattr(scheduler_output, "_gr_request_row_configs", None)
+    if not beam_data or not request_row_configs:
+        return False
+    rows = collect_constrained_rows(request_row_configs, beam_data)
+    if len(rows) != 1:
+        return False
+    req_id, row_start, row_count, mdata = rows[0]
+    if (
+        validate_constraint_step(mdata.get("constraint_step")) != 0
+        or row_start != 0
+        or row_count != 1
+        or sum(int(item[2]) for item in request_row_configs) != 1
+    ):
+        return False
+    width = _constraint_beam_width(mdata, req_id)
+
+    from vllm_gr.v1.beam.beam_decision import (
+        cuda_prefill_postprocess_enabled,
+        get_beam_postprocess_workspace,
+    )
+
+    if not cuda_prefill_postprocess_enabled(runner, width, len(rows)):
+        return False
+    workspace = get_beam_postprocess_workspace(runner, width)
+    if workspace is None:
+        return False
+
+    backend = getattr(runner, "constraint_backend", None)
+    execution_adapter = None
+    if backend is not None:
+        info = getattr(backend, "info", None)
+        max_top_k = getattr(info, "max_top_k", None)
+        max_rows = getattr(info, "max_rows", None)
+        if (
+            isinstance(max_top_k, bool)
+            or not isinstance(max_top_k, int)
+            or width > max_top_k
+            or isinstance(max_rows, bool)
+            or not isinstance(max_rows, int)
+            or max_rows < 1
+            or not callable(getattr(backend, "select_out_unchecked", None))
+        ):
+            return False
+    else:
+        if not _canonical_constraint_table_enabled(runner):
+            from vllm_gr.config import ConstraintBackend
+            from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+            if _get_gr_config(runner).constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE:
+                return False
+        execution_adapter = get_or_create_execution_adapter(runner)
+        if not callable(getattr(execution_adapter, "run_out_unchecked", None)):
+            return False
+
+    metadata_inputs = _prepare_workspace_constraint_metadata(
+        runner,
+        rows,
+        workspace,
+        total_rows=1,
+        device=device,
+    )
+    if metadata_inputs is None:
+        return False
+    step, prefixes, temperatures = metadata_inputs
+    if step != 0:
+        return False
+
+    capacity_rows = workspace.max_batch * width
+    out_token_ids = workspace.topk_token_ids.view(capacity_rows, width)[:1]
+    out_logprobs = workspace.topk_scores.view(capacity_rows, width)[:1]
+    out_valid_mask = workspace.topk_valid_mask.view(capacity_rows, width)[:1]
+    out_valid_counts = workspace.topk_valid_counts.view(-1)[:1]
+    out_wire_logprobs = workspace.wire_topk_scores.view(capacity_rows, width)[:1]
+    copy_words = workspace.max_batch + 3 * width
+
+    runner._gr_prepared_cuda_prefill_constraint = PreparedCudaPrefillConstraint(
+        scheduler_output=scheduler_output,
+        rows=tuple(rows),
+        width=width,
+        workspace=workspace,
+        backend=backend,
+        execution_adapter=execution_adapter,
+        prefixes=prefixes,
+        temperatures=temperatures,
+        metadata=ConstraintMetadata(
+            prefix_token_ids=prefixes,
+            temperatures=temperatures,
+            current_step=0,
+            top_k=width,
+        ),
+        sequence_group=prefixes.view(-1)[:1].view(1, 1, 1),
+        out_token_ids=out_token_ids,
+        out_logprobs=out_logprobs,
+        out_valid_mask=out_valid_mask,
+        out_valid_counts=out_valid_counts,
+        out_wire_logprobs=out_wire_logprobs,
+        out_status=workspace.prefill_staging[:1],
+        out_payload=workspace.prefill_staging[workspace.max_batch :],
+        device_copy=workspace.prefill_staging[:copy_words],
+        host_copy=workspace.host_prefill_staging[:copy_words],
+        copy_event=workspace.prefill_copy_event,
+        stream=torch.cuda.current_stream(device),
+    )
+    return True
+
+
+def launch_prepared_cuda_prefill_constraint(
+    runner: Any,
+    logits: torch.Tensor | None = None,
+) -> bool:
+    """Launch TopK, result packing, and pinned D2H immediately after LM-Head."""
+
+    prepared = getattr(runner, "_gr_prepared_cuda_prefill_constraint", None)
+    if not isinstance(prepared, PreparedCudaPrefillConstraint):
+        return False
+    if logits is None:
+        state = getattr(runner, "execute_model_state", None)
+        if (
+            state is None
+            or getattr(state, "scheduler_output", None) is not prepared.scheduler_output
+        ):
+            return False
+        logits = getattr(state, "logits", None)
+        if getattr(state, "spec_decode_metadata", None) is not None:
+            return False
+    if (
+        not isinstance(logits, torch.Tensor)
+        or logits.device.type != "cuda"
+        or logits.dtype != prepared.workspace.key.logits_dtype
+        or logits.dim() != 2
+        or logits.shape[0] != 1
+    ):
+        return False
+
+    update_async_output_token_ids = getattr(
+        getattr(runner, "input_batch", None),
+        "update_async_output_token_ids",
+        None,
+    )
+    if not callable(update_async_output_token_ids):
+        return False
+    update_async_output_token_ids()
+
+    workspace = prepared.workspace
+    width = prepared.width
+    launch_stream = torch.cuda.current_stream(logits.device)
+    if launch_stream != prepared.stream:
+        # Prefix/temperature metadata is staged before forward.  If forward
+        # changes the current stream, make that preparation visible before the
+        # logits consumer kernels start.
+        launch_stream.wait_stream(prepared.stream)
+
+    with torch.autograd.profiler.record_function("prefill_constraint_topk"):
+        if prepared.backend is not None:
+            prepared.backend.select_out_unchecked(
+                logits,
+                prepared.metadata,
+                out_token_ids=prepared.out_token_ids,
+                out_logprobs=prepared.out_logprobs,
+                out_valid_mask=prepared.out_valid_mask,
+                out_valid_counts=prepared.out_valid_counts,
+                out_wire_logprobs=prepared.out_wire_logprobs,
+                out_prefill_status=prepared.out_status,
+                out_prefill_payload=prepared.out_payload,
+            )
+        else:
+            prepared.execution_adapter.run_out_unchecked(
+                logits,
+                prepared.sequence_group,
+                prepared.temperatures,
+                0,
+                width,
+                out_token_ids=prepared.out_token_ids,
+                out_logprobs=prepared.out_logprobs,
+                out_valid_mask=prepared.out_valid_mask,
+                out_valid_counts=prepared.out_valid_counts,
+                out_wire_logprobs=prepared.out_wire_logprobs,
+                out_prefill_status=prepared.out_status,
+                out_prefill_payload=prepared.out_payload,
+            )
+
+    prepared.host_copy.copy_(prepared.device_copy, non_blocking=True)
+    # TopK, result packing, D2H, and the completion event must share the launch
+    # stream.  Recording on the earlier prepare stream could signal before the
+    # D2H has even started.
+    prepared.copy_event.record(launch_stream)
+    sampler_output = _build_workspace_constrained_sampler_output(
+        workspace,
+        1,
+        deferred_prefill_status=True,
+    )
+    sampler_output._gr_prefill_result_enqueued = True
+    sampler_output._gr_prefill_result_width = width
+    sampler_output._gr_prefill_result_copy_words = workspace.max_batch + 3 * width
+    runner._gr_prelaunched_cuda_prefill = (logits, sampler_output)
+    runner._gr_prepared_cuda_prefill_constraint = None
+    return True
+
+
+def consume_prelaunched_cuda_prefill(
+    runner: Any,
+    logits: Any,
+    spec_decode_metadata: Any,
+) -> Any | None:
+    """Return the prelaunched SamplerOutput exactly once from ``_sample``."""
+
+    cached = getattr(runner, "_gr_prelaunched_cuda_prefill", None)
+    if not isinstance(cached, tuple) or len(cached) != 2:
+        return None
+    cached_logits, sampler_output = cached
+    if spec_decode_metadata is not None or cached_logits is not logits:
+        raise RuntimeError("CUDA prefill prelaunch state does not match ExecuteModelState")
+    runner._gr_prelaunched_cuda_prefill = None
+    return sampler_output
+
+
+def _try_sample_into_postprocess_workspace(
+    runner: Any,
+    logits: torch.Tensor,
+    rows: Sequence[tuple[Any, int, int, dict[str, Any]]],
+    width: int,
+    backend: Any,
+    execution_adapter: Any,
+) -> Any | None:
+    """Run CUDA constrained Top-K into a prewarmed workspace, if available."""
+
+    if logits.device.type != "cuda":
+        return None
+    from vllm_gr.v1.beam.beam_decision import get_beam_postprocess_workspace
+
+    workspace = get_beam_postprocess_workspace(runner, width)
+    if workspace is None or workspace.key.logits_dtype != logits.dtype:
+        return None
+    metadata_inputs = _populate_workspace_constraint_metadata(
+        runner,
+        rows,
+        logits,
+        workspace,
+    )
+    if metadata_inputs is None:
+        return None
+    step, prefixes, temperatures = metadata_inputs
+    total_rows = logits.shape[0]
+    capacity_rows = workspace.max_batch * width
+    out_token_ids = workspace.topk_token_ids.view(capacity_rows, width)[:total_rows]
+    out_logprobs = workspace.topk_scores.view(capacity_rows, width)[:total_rows]
+    out_valid_mask = workspace.topk_valid_mask.view(capacity_rows, width)[:total_rows]
+    out_valid_counts = workspace.topk_valid_counts.view(-1)[:total_rows]
+    topk_range = "prefill_constraint_topk" if step == 0 else "constraint_topk"
+    from vllm_gr.v1.beam.beam_decision import (
+        cuda_decode_postprocess_enabled,
+        cuda_prefill_postprocess_enabled,
+    )
+
+    deferred_prefill_status = (
+        step == 0
+        and total_rows == len(rows)
+        and cuda_prefill_postprocess_enabled(runner, width, len(rows))
+    )
+    deferred_decode_status = step > 0 and cuda_decode_postprocess_enabled(
+        runner,
+        width,
+        total_rows,
+    )
+    deferred_candidate_status = deferred_prefill_status or deferred_decode_status
+
+    if backend is not None and callable(getattr(backend, "select_out", None)):
+        with torch.autograd.profiler.record_function(topk_range):
+            output = backend.select_out(
+                logits,
+                ConstraintMetadata(
+                    prefix_token_ids=prefixes,
+                    temperatures=temperatures,
+                    current_step=step,
+                    top_k=width,
+                ),
+                out_token_ids=out_token_ids,
+                out_logprobs=out_logprobs,
+                out_valid_mask=out_valid_mask,
+                out_valid_counts=out_valid_counts,
+                out_wire_logprobs=workspace.wire_topk_scores.view(capacity_rows, width)[
+                    :total_rows
+                ],
+            )
+        _validate_direct_backend_output(
+            output,
+            req_id="<workspace batch>",
+            rows=total_rows,
+            width=width,
+            device=logits.device,
+            require_legal_candidate=False,
+        )
+    elif execution_adapter is not None and callable(getattr(execution_adapter, "run_out", None)):
+        # The canonical Backend consumes one flat ``[logits_rows, 3]`` prefix
+        # row per logits row, while the execution adapter preserves the
+        # operator's historical sequence-group ABI.  Reinterpret the same
+        # persistent storage here instead of allocating a temporary tensor:
+        # prefill is exactly ``[B, 1, 1]`` and decode is ``[B, W, 3]``.
+        batch_size = len(rows)
+        if step == 0:
+            sequence_group = workspace.prefix_token_ids.view(-1)[:batch_size].view(batch_size, 1, 1)
+        else:
+            sequence_group = prefixes.view(batch_size, width, 3)
+        run_out = execution_adapter.run_out
+        if deferred_candidate_status and callable(
+            getattr(execution_adapter, "run_out_unchecked", None)
+        ):
+            run_out = execution_adapter.run_out_unchecked
+        with torch.autograd.profiler.record_function(topk_range):
+            run_out(
+                logits,
+                sequence_group,
+                temperatures,
+                step,
+                width,
+                out_token_ids=out_token_ids,
+                out_logprobs=out_logprobs,
+                out_valid_mask=out_valid_mask,
+                out_valid_counts=out_valid_counts,
+                out_wire_logprobs=workspace.wire_topk_scores.view(capacity_rows, width)[
+                    :total_rows
+                ],
+            )
+    else:
+        return None
+
+    if not deferred_candidate_status and not bool((out_valid_counts > 0).all().item()):
+        raise RuntimeError(
+            "constraint Backend returned no legal candidate for at least one "
+            "logits row; refusing to sample a padding token"
+        )
+    return _build_workspace_constrained_sampler_output(
+        workspace,
+        total_rows,
+        deferred_prefill_status=deferred_prefill_status,
+        deferred_decode_status=deferred_decode_status,
+    )
+
+
 def build_direct_constrained_sampler_output(
     token_ids: torch.Tensor,
     logprobs: torch.Tensor,
@@ -673,9 +1237,10 @@ def try_sample_with_constraint_backend(
                 "runner.constraint_backend is None; unconstrained sampling "
                 "is forbidden"
             )
-        from vllm_gr.config import ConstraintBackend, GRConfig
+        from vllm_gr.config import ConstraintBackend
+        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
-        gr_config = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+        gr_config = _get_gr_config(runner)
         if gr_config.constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE:
             return None
         execution_adapter = get_or_create_execution_adapter(runner)
@@ -728,14 +1293,50 @@ def try_sample_with_constraint_backend(
         # the grouped serving ABI still bounds one request to beam_width rows.
         max_rows = width
 
-    plans: list[tuple[Any, int, int, int, torch.Tensor, torch.Tensor]] = []
-    global_rows: list[int] = []
-    for req_id, row_start, row_count, mdata in rows:
+    expected_start = 0
+    for req_id, row_start, row_count, _ in rows:
         if row_count > max_rows:
             raise RuntimeError(
                 f"constrained request {req_id!r} has {row_count} logits rows, "
                 f"exceeding Backend max_rows={max_rows}"
             )
+        if row_start != expected_start:
+            raise RuntimeError(
+                "canonical constrained row mapping must cover every logits row "
+                f"exactly once; expected row {expected_start}, got {row_start}"
+            )
+        expected_start += row_count
+    if expected_start != logits.shape[0]:
+        raise RuntimeError(
+            "canonical constrained row mapping must cover every logits row "
+            f"exactly once; mapped {expected_start}, expected {logits.shape[0]}"
+        )
+
+    update_async_output_token_ids = getattr(
+        getattr(runner, "input_batch", None),
+        "update_async_output_token_ids",
+        None,
+    )
+    if not callable(update_async_output_token_ids):
+        raise RuntimeError(
+            "canonical constrained sampling requires input_batch.update_async_output_token_ids()"
+        )
+    update_async_output_token_ids()
+
+    workspace_output = _try_sample_into_postprocess_workspace(
+        runner,
+        logits,
+        rows,
+        width,
+        backend,
+        execution_adapter,
+    )
+    if workspace_output is not None:
+        return workspace_output
+
+    plans: list[tuple[Any, int, int, int, torch.Tensor, torch.Tensor]] = []
+    global_rows: list[int] = []
+    for req_id, row_start, row_count, mdata in rows:
         step, request_width, prefixes = build_constraint_backend_prefix_token_ids(
             req_id,
             row_count,
@@ -759,17 +1360,6 @@ def try_sample_with_constraint_backend(
             "canonical constrained row mapping must cover every logits row "
             f"exactly once; mapped={global_rows}, expected={expected_rows}"
         )
-
-    update_async_output_token_ids = getattr(
-        getattr(runner, "input_batch", None),
-        "update_async_output_token_ids",
-        None,
-    )
-    if not callable(update_async_output_token_ids):
-        raise RuntimeError(
-            "canonical constrained sampling requires input_batch.update_async_output_token_ids()"
-        )
-    update_async_output_token_ids()
 
     if execution_adapter is not None:
         top_tokens, top_logprobs, valid_mask, adapter_rows = run_constrained_partition(

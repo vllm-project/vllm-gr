@@ -350,6 +350,16 @@ class TorchConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
 class CUDAConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
     """CUDA constrained Top-K backed by the Triton lookup/gather kernel."""
 
+    def load_tables(self, resource: "ConstraintTableResource") -> None:
+        from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
+
+        validate_cuda_sort_capacity(
+            int(resource.first_token_ids.size),
+            resource.max_prefix1_degree,
+            resource.max_prefix2_degree,
+        )
+        super().load_tables(resource)
+
     def is_available(self) -> bool:
         return torch.cuda.is_available()
 
@@ -418,6 +428,142 @@ class CUDAConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
             table_vocab_size=table_vocab_size,
         )
         return tokens, logprobs
+
+    def run_out(
+        self,
+        logits: torch.Tensor,
+        sequence_group: torch.Tensor,
+        temperatures: torch.Tensor,
+        current_step: int,
+        top_k: int,
+        *,
+        out_token_ids: torch.Tensor,
+        out_logprobs: torch.Tensor,
+        out_valid_mask: torch.Tensor,
+        out_valid_counts: torch.Tensor,
+        out_wire_logprobs: torch.Tensor | None = None,
+    ) -> ConstrainedTopKTensorResult:
+        """CUDA-only caller-owned output path used by Worker postprocessing."""
+
+        return self._run_out_impl(
+            logits,
+            sequence_group,
+            temperatures,
+            current_step,
+            top_k,
+            out_token_ids=out_token_ids,
+            out_logprobs=out_logprobs,
+            out_valid_mask=out_valid_mask,
+            out_valid_counts=out_valid_counts,
+            out_wire_logprobs=out_wire_logprobs,
+            validate=True,
+        )
+
+    def run_out_unchecked(
+        self,
+        logits: torch.Tensor,
+        sequence_group: torch.Tensor,
+        temperatures: torch.Tensor,
+        current_step: int,
+        top_k: int,
+        *,
+        out_token_ids: torch.Tensor,
+        out_logprobs: torch.Tensor,
+        out_valid_mask: torch.Tensor,
+        out_valid_counts: torch.Tensor,
+        out_wire_logprobs: torch.Tensor | None = None,
+        out_prefill_status: torch.Tensor | None = None,
+        out_prefill_payload: torch.Tensor | None = None,
+    ) -> ConstrainedTopKTensorResult:
+        """Launch into a prewarmed Worker workspace without repeated validation."""
+
+        return self._run_out_impl(
+            logits,
+            sequence_group,
+            temperatures,
+            current_step,
+            top_k,
+            out_token_ids=out_token_ids,
+            out_logprobs=out_logprobs,
+            out_valid_mask=out_valid_mask,
+            out_valid_counts=out_valid_counts,
+            out_wire_logprobs=out_wire_logprobs,
+            out_prefill_status=out_prefill_status,
+            out_prefill_payload=out_prefill_payload,
+            validate=False,
+        )
+
+    def _run_out_impl(
+        self,
+        logits: torch.Tensor,
+        sequence_group: torch.Tensor,
+        temperatures: torch.Tensor,
+        current_step: int,
+        top_k: int,
+        *,
+        out_token_ids: torch.Tensor,
+        out_logprobs: torch.Tensor,
+        out_valid_mask: torch.Tensor,
+        out_valid_counts: torch.Tensor,
+        out_wire_logprobs: torch.Tensor | None,
+        out_prefill_status: torch.Tensor | None = None,
+        out_prefill_payload: torch.Tensor | None = None,
+        validate: bool,
+    ) -> ConstrainedTopKTensorResult:
+        """Shared checked/unchecked caller-owned launch implementation."""
+
+        if self._digest is None:
+            raise RuntimeError("constraint tables not loaded; call load_tables first")
+        if validate:
+            self._validate_runtime_inputs(
+                logits,
+                sequence_group,
+                temperatures,
+                current_step,
+                top_k,
+            )
+        from vllm_gr.ops.cuda.rec_constrained_topk import (
+            _rec_constrained_topk_cuda_out_unchecked,
+            rec_constrained_topk_cuda_out,
+        )
+
+        vocab_offset, table_vocab_size = self._vocab_window(logits)
+        launch = (
+            rec_constrained_topk_cuda_out if validate else _rec_constrained_topk_cuda_out_unchecked
+        )
+        launch_kwargs = {
+            "vocab_offset": vocab_offset,
+            "table_vocab_size": table_vocab_size,
+            "out_wire_logprobs": out_wire_logprobs,
+        }
+        if not validate:
+            launch_kwargs["out_prefill_status"] = out_prefill_status
+            launch_kwargs["out_prefill_payload"] = out_prefill_payload
+        launch(
+            logits,
+            sequence_group,
+            self._tables["first_token_ids"],
+            self._tables["prefix1_offsets"],
+            self._tables["prefix1_values"],
+            self._tables["prefix1_pair_keys"],
+            self._tables["prefix2_value_offsets"],
+            self._tables["prefix2_values"],
+            temperatures,
+            current_step,
+            top_k,
+            self._max_degrees["max_prefix1_degree"],
+            self._max_degrees["max_prefix2_degree"],
+            out_token_ids,
+            out_logprobs,
+            out_valid_mask,
+            out_valid_counts,
+            **launch_kwargs,
+        )
+        return ConstrainedTopKTensorResult(
+            top_tokens=out_token_ids,
+            top_logprobs=out_logprobs,
+            valid_mask=out_valid_mask,
+        )
 
 
 class NPUConstrainedTopKExecution(_ConstrainedTopKExecutionBase):

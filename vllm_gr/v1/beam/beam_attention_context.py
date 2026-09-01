@@ -117,6 +117,24 @@ class BeamAttentionContext:
             for _ in range(num_layers)
         ]
 
+        # Stable CUDA pointer tables consumed by the fused all-layer KV
+        # reorder.  Building these once removes two per-step device tensors and
+        # the matching in-place pointer-offset kernels from postprocessing.
+        if device.type == "cuda":
+            self.pool_key_ptrs = torch.tensor(
+                [pool.unshared_key.data_ptr() for pool in self.pools],
+                dtype=torch.int64,
+                device=device,
+            )
+            self.pool_value_ptrs = torch.tensor(
+                [pool.unshared_value.data_ptr() for pool in self.pools],
+                dtype=torch.int64,
+                device=device,
+            )
+        else:
+            self.pool_key_ptrs = None
+            self.pool_value_ptrs = None
+
         # Suffix KV temporary buffers (for cascade attention)
         # Partitioned by slot: each slot gets max_beams * max_decode_steps rows
         self.suffix_k_buf = torch.zeros(

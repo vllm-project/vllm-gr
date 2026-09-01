@@ -78,7 +78,7 @@ class BeamSearchSession:
         state.is_active = False
         self.context.registry.release(self.session_id)
 
-    def step_complete(self, parent: torch.Tensor):
+    def step_complete(self, parent: torch.Tensor, *, layout_prevalidated: bool = False):
         """Called after beam decision: select_unshared_kv + advance_step.
 
         On the last step, skip select_unshared_kv (no need to reorder KV
@@ -95,6 +95,8 @@ class BeamSearchSession:
             # ignores aux.
             aux_key = getattr(self.context, "aux_key_buf", None)
             aux_value = getattr(self.context, "aux_value_buf", None)
+            pool_key_ptrs = getattr(self.context, "pool_key_ptrs", None)
+            pool_value_ptrs = getattr(self.context, "pool_value_ptrs", None)
 
             reorder_unshared_kv(
                 parent,
@@ -103,6 +105,9 @@ class BeamSearchSession:
                 state.decode_step,
                 aux_key=aux_key,
                 aux_value=aux_value,
+                pool_key_ptrs=pool_key_ptrs,
+                pool_value_ptrs=pool_value_ptrs,
+                layout_prevalidated=layout_prevalidated,
             )
         state.decode_step += 1
 

@@ -29,6 +29,7 @@ from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
 )
+from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
 from vllm_gr.ops.npu.rec_constrained_topk import (
     MAX_TOP_K,
     NPUConstraintOp,
@@ -230,6 +231,11 @@ def _upload_cuda_backend(
     max_top_k: int,
     max_rows: int,
 ) -> tuple[CUDAConstraintBackend, tuple[_ReadyCase, ...]]:
+    validate_cuda_sort_capacity(
+        int(table.first_token_ids.size),
+        table.metadata.max_prefix1_degree,
+        table.metadata.max_prefix2_degree,
+    )
     cases = _readiness_cases(table, max_top_k)
     device_tables: dict[str, torch.Tensor] = {}
     backend: CUDAConstraintBackend | None = None

@@ -207,6 +207,16 @@ def apply_worker_patches() -> None:
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
             runner_class.load_model = make_load_model_with_constraint_backend(load_model)
 
+        workspace_load_patcher = getattr(
+            platform_module,
+            "make_load_model_with_beam_postprocess_workspace",
+            None,
+        )
+        if workspace_load_patcher is not None and callable(
+            getattr(runner_class, "load_model", None)
+        ):
+            runner_class.load_model = workspace_load_patcher(runner_class.load_model)
+
         shutdown = getattr(runner_class, "shutdown", None)
         if not getattr(shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
             runner_class.shutdown = make_shutdown_with_constraint_backend(
