@@ -9,7 +9,10 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.worker.constraint_hook import apply_constrained_sample_override
+from vllm_gr.v1.worker.constraint_hook import (
+    apply_constrained_sample_override,
+    try_sample_with_constraint_backend,
+)
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
@@ -101,10 +104,18 @@ def make_patched_sample_npu(_orig_sample):
 
     @wraps(_orig_sample)
     def patched_sample(self, *args, **kwargs):
-        sampler_output = _try_constrained_sampler_shortcut(self, args, kwargs)
+        logits = args[0] if args else kwargs.get("logits")
+        spec_decode_metadata = args[1] if len(args) > 1 else kwargs.get("spec_decode_metadata")
+        sampler_output = try_sample_with_constraint_backend(
+            self,
+            logits,
+            spec_decode_metadata,
+        )
+        if sampler_output is None:
+            sampler_output = _try_constrained_sampler_shortcut(self, args, kwargs)
         if sampler_output is None:
             sampler_output = _orig_sample(self, *args, **kwargs)
-            apply_constrained_sample_override(self, args[0], sampler_output)
+            apply_constrained_sample_override(self, logits, sampler_output)
         _maybe_run_worker_beam_decision(self, sampler_output)
         return sampler_output
 
@@ -194,97 +205,10 @@ def make_patched_sample_tokens_npu(_orig_sample_tokens):
 
 
 def _maybe_run_worker_beam_decision(runner, sampler_output) -> None:
-    """Run the worker-side beam decision on the NPU xllm decode path.
+    """Compatibility alias for the shared accelerator decision helper."""
+    from vllm_gr.v1.beam.beam_decision import maybe_run_worker_beam_decision
 
-    No-op unless the GRConfig opt-in, an active beam session, and a valid
-    incremental beam-decode step are all present; otherwise the frontend keeps
-    its NumPy decision path unchanged.  The result dict (device tensors, plus
-    host copies for the return channel) is stashed on the runner so
-    ``make_patched_execute_model`` can attach it to the ModelRunnerOutput.
-    """
-    from vllm_gr.v1.beam.beam_decision import (
-        run_beam_decision,
-        worker_decision_enabled,
-    )
-
-    if not worker_decision_enabled(runner):
-        runner._beam_decision_result = None
-        return
-    beam_info = getattr(runner, "_current_beam_info", None)
-    session = beam_info.get("beam_session") if beam_info else None
-    if session is None:
-        runner._beam_decision_result = None
-        return
-
-    state = session._state
-    # result_width is the FINAL-STEP OUTPUT WIDTH (number of returned
-    # sequences, ACS ``BeamSearchParams.result_width`` semantics) — NOT the
-    # decode step count.  Passing ``max_decode_steps`` here made the
-    # ``beam_search_rec_final_select`` vs ``beam_search_group`` dispatch
-    # depend on the step count (e.g. max_decode_steps=32 with beam_width=2
-    # dispatched a 32-wide final select).  Default to the beam width.
-    result_width = None
-    for mdata in (beam_info.get("beam_data") or {}).values():
-        if mdata.get("is_beam_decode", False):
-            result_width = mdata.get("result_width")
-            break  # single active session by design
-
-    decision = run_beam_decision(
-        runner,
-        session,
-        sampler_output,
-        is_last_step=state.is_last_step,
-        result_width=result_width,
-    )
-    if decision is not None:
-        # Plain-list host payload for the return channel.
-        # kv_transfer_params values are msgpack-encoded against the target
-        # type ``dict[str, Any]``: a CPU tensor encodes to a
-        # ``('int64', shape, data)`` triple whose decoder-side ``dec_hook``
-        # never fires (it only runs for typed fields), so the frontend would
-        # receive ``['int64', [1, 2], 0]`` — and for payloads at or above the
-        # zero-copy threshold the third element is an aux-buffer INDEX whose
-        # backing frame the consumer never receives, i.e. unrecoverable
-        # data.  Nested Python lists are the only representation that
-        # round-trips natively through the untyped mapping, so flatten at
-        # this D2H boundary.
-        # Intermediate steps omit ``out_sequence`` ([B, W, steps], grows with
-        # every step): both frontend consumers (_worker_decision_flatten in
-        # serving_engine.py and gr.py) read only out_token_ids /
-        # out_token_index / out_log_probs, and the frontend keeps its own
-        # running_sequences bookkeeping — the per-step D2H of the full
-        # history was pure overhead (profiling bw128_1k_t2: 5 tensor D2H per
-        # step contributing to 61 aclrtMemcpy / aclrtSynchronizeStream calls).
-        keys = (
-            ("out_token_ids", "out_token_index", "out_log_probs")
-            if not state.is_last_step
-            else ("out_token_ids", "out_token_index", "out_log_probs", "out_sequence")
-        )
-        payload = {}
-        for key in keys:
-            value = decision.get(key)
-            if value is None:
-                continue
-            payload[key] = value.detach().to("cpu").tolist() if torch.is_tensor(value) else value
-        # EngineCore self-advance (beam_self_advance) needs the terminal flag
-        # to know when to stop chaining steps; the frontend consumers ignore
-        # this key.
-        payload["is_last_step"] = bool(state.is_last_step)
-        if not state.is_last_step:
-            out_idx_host = payload.get("out_token_index")
-            if out_idx_host:
-                # Persist the applied same-step reorder record from this
-                # already-transferred host payload (request-0 row of the
-                # GLOBAL out_token_index == the request-local parent mapping,
-                # global offset 0).  The next step's
-                # ``_get_or_create_beam_session`` compares it against the
-                # frontend's parent_beam_ids — an exact match skips the
-                # duplicate reorder; a mismatch (e.g. EOS re-ordering)
-                # triggers the composite reorder.  Deriving it here avoids a
-                # second device→host sync inside ``_finalize_decision``.
-                state.kv_reorder = [int(p) for p in out_idx_host[0]]
-        decision = payload
-    runner._beam_decision_result = decision
+    maybe_run_worker_beam_decision(runner, sampler_output)
 
 
 def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):

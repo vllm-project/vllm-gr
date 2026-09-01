@@ -20,7 +20,9 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
-from vllm_gr.constraints.models import BeamCandidateCache
+from vllm_gr.constraints.models import (
+    BeamCandidateCache,
+)
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 
 ForkInfo = list[tuple[int, int]]
@@ -135,6 +137,15 @@ def extract_constrained_segment(
     logprobs_pos = list(raw_logprobs[start_offset:end_offset])
     ranks_pos = list(raw_ranks[start_offset:end_offset]) if raw_ranks is not None else None
     decoded_pos = list(raw_decoded[start_offset:end_offset]) if raw_decoded is not None else None
+
+    # Direct constrained SamplerOutput has one selected-token rank per logits
+    # row, while its transported candidate block has ``beam_width`` entries.
+    # Candidate ranks/decoded strings are optional metadata; discard a partial
+    # remux segment instead of indexing it as though it were candidate-wide.
+    if ranks_pos is not None and len(ranks_pos) != len(logprobs_pos):
+        ranks_pos = [None] * len(logprobs_pos)
+    if decoded_pos is not None and len(decoded_pos) != len(logprobs_pos):
+        decoded_pos = [None] * len(logprobs_pos)
 
     keep = [i for i, lp in enumerate(logprobs_pos) if math.isfinite(lp)][:logprobs_num]
     token_ids_pos = [token_ids_pos[i] for i in keep]

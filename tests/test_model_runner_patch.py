@@ -100,6 +100,10 @@ def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+    from vllm_gr.v1.worker.model_runner_patch import (
+        _CONSTRAINT_LOAD_PATCH_MARKER,
+        _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
+    )
 
     class Runner:
         def execute_model(self, scheduler_output: Any) -> None:
@@ -123,6 +127,15 @@ def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
         def _sample(self, logits: Any, spec_decode_metadata: Any = None) -> Any:
             return object()
 
+        def load_model(self) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+        def reload_weights(self) -> None:
+            return None
+
     platform_module = SimpleNamespace(
         discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
@@ -135,9 +148,14 @@ def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
         lambda: platform_module,
     )
 
+    reload_weights = Runner.reload_weights
     model_runner_patch.apply_worker_patches()
 
     assert getattr(Runner._sample, _WORKER_SAMPLE_PATCH_MARKER, False)
+    assert getattr(Runner.load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False)
+    assert getattr(Runner.shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
+    # In-place weight reloads do not rebuild the tokenizer/vocab-bound Backend.
+    assert Runner.reload_weights is reload_weights
     assert model_runner_patch.is_worker_runner_patched(Runner)
 
 

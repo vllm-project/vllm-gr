@@ -226,6 +226,12 @@ class _ConstrainedTopKExecutionBase:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    def _expected_logits_vocab_size(self, logits: torch.Tensor) -> int | None:
+        """Return the logits width required by this execution adapter."""
+
+        del logits
+        return self._vocab_size
+
     def run(
         self,
         logits: torch.Tensor,
@@ -303,7 +309,7 @@ class _ConstrainedTopKExecutionBase:
             temperatures=temperatures,
             current_step=current_step,
             top_k=top_k,
-            vocab_size=self._vocab_size,
+            vocab_size=self._expected_logits_vocab_size(logits),
             tables=self._tables,
         )
 
@@ -339,6 +345,79 @@ class TorchConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
             self._max_degrees["max_prefix1_degree"],
             self._max_degrees["max_prefix2_degree"],
         )
+
+
+class CUDAConstrainedTopKExecution(_ConstrainedTopKExecutionBase):
+    """CUDA constrained Top-K backed by the Triton lookup/gather kernel."""
+
+    def is_available(self) -> bool:
+        return torch.cuda.is_available()
+
+    def _default_device(self) -> torch.device:
+        return _default_device(prefer="cuda")
+
+    def _vocab_window(self, logits: torch.Tensor) -> tuple[int, int]:
+        """Resolve ``(offset, full_vocab_size)`` for full or sliced logits."""
+
+        if self._vocab_size is None:
+            raise RuntimeError("loaded constraint tables are missing vocab_size")
+        if logits.shape[1] == self._vocab_size:
+            return 0, self._vocab_size
+
+        from vllm_gr.ops.sliced_logits import get_vocab_slice_config
+
+        offset, slice_size, _ = get_vocab_slice_config()
+        if offset is None or slice_size is None:
+            raise ValueError(
+                f"CUDA constraint logits vocab {logits.shape[1]} differs from table "
+                f"vocab_size {self._vocab_size}, but vocab slicing is not configured"
+            )
+        if logits.shape[1] != slice_size:
+            raise ValueError(
+                f"CUDA constraint logits vocab {logits.shape[1]} must equal configured "
+                f"vocab_slice_size {slice_size}"
+            )
+        if offset < 0 or offset + slice_size > self._vocab_size:
+            raise ValueError(
+                "configured CUDA vocabulary slice is outside the constraint table "
+                f"vocabulary: offset={offset}, size={slice_size}, "
+                f"table_vocab_size={self._vocab_size}"
+            )
+        return offset, self._vocab_size
+
+    def _expected_logits_vocab_size(self, logits: torch.Tensor) -> int:
+        self._vocab_window(logits)
+        return int(logits.shape[1])
+
+    def _call_op(
+        self,
+        logits: torch.Tensor,
+        sequence_group: torch.Tensor,
+        temperatures: torch.Tensor,
+        current_step: int,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm_gr.ops.cuda.rec_constrained_topk import rec_constrained_topk_cuda
+
+        vocab_offset, table_vocab_size = self._vocab_window(logits)
+        tokens, logprobs, _, _ = rec_constrained_topk_cuda(
+            logits,
+            sequence_group,
+            self._tables["first_token_ids"],
+            self._tables["prefix1_offsets"],
+            self._tables["prefix1_values"],
+            self._tables["prefix1_pair_keys"],
+            self._tables["prefix2_value_offsets"],
+            self._tables["prefix2_values"],
+            temperatures,
+            current_step,
+            top_k,
+            self._max_degrees["max_prefix1_degree"],
+            self._max_degrees["max_prefix2_degree"],
+            vocab_offset=vocab_offset,
+            table_vocab_size=table_vocab_size,
+        )
+        return tokens, logprobs
 
 
 class NPUConstrainedTopKExecution(_ConstrainedTopKExecutionBase):

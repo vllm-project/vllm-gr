@@ -43,6 +43,7 @@ from vllm_gr.beam_search_decision_utils import (
     select_top_indices,
 )
 from vllm_gr.config import ConstraintBackend, GRConfig
+from vllm_gr.config.validation import validate_beam_max_width, validate_beam_width
 from vllm_gr.constraints import (
     BeamConstraintCoordinator,
     ParentCandidateBuilder,
@@ -240,7 +241,6 @@ def _prepare_beam_step_requests(
                 lora_request=instance.beams[0].lora_request,
             )
             llm_engine.input_processor.assign_request_id(ec_req)
-
             llm_engine.output_processor.add_request(ec_req, None, None, 0)
             engine_core_requests.append(ec_req)
 
@@ -516,7 +516,7 @@ def _custom_beam_search_batch(
             if result is None:
                 continue
 
-            # Worker-side beam decision (NPU xllm path): when the worker
+            # Worker-side beam decision: when the accelerator
             # already selected the surviving beams, use its winners directly
             # and skip the frontend flat-logprobs parsing + NumPy top-k.  The
             # downstream EOS handling / beam materialisation is unchanged.
@@ -601,7 +601,13 @@ def _custom_beam_search_batch(
                 )
                 instance.completed.extend(eos_beams)
 
-            topn_idx = select_top_indices(all_beams_logprob, beam_width, catalog_strategy)
+            # A worker decision already contains exactly W survivors in the
+            # order used by its device-resident KV state. Keep that order.
+            topn_idx = (
+                np.arange(all_beams_token_id.size, dtype=np.intp)
+                if worker_candidates is not None
+                else select_top_indices(all_beams_logprob, beam_width, catalog_strategy)
+            )
             new_beams, fork_info = materialize_selected_beams(
                 parents=instance.beams,
                 selected_indices=topn_idx,
@@ -644,6 +650,7 @@ class GRLLM(LLM):
         beam_max_decode_steps: int | None = None,
         **kwargs,
     ):
+        beam_max_width = validate_beam_max_width(beam_max_width)
         # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
         # vllm-gr default before LLM.__init__ constructs VllmConfig so the V1
         # beam-search worker patches remain active.
@@ -696,7 +703,6 @@ class GRLLM(LLM):
         # tokenizers whose s_a/s_b/s_c groups exceed max_valid_items (e.g.
         # OneRec 8192 > 500) and regresses catalog-free single-prompt tests.
         # Explicit user choices (any backend) pass through unchanged.
-        from vllm_gr.constraints.strategies import MAX_CONSTRAINT_BEAM_WIDTH
         from vllm_gr.engine.arg_utils_gr import (
             _catalog_is_triples_document,
             _is_npu_platform,
@@ -707,24 +713,9 @@ class GRLLM(LLM):
             and catalog_path is not None
             and _catalog_is_triples_document(catalog_path)
             and beam_max_width is not None
-            and beam_max_width <= MAX_CONSTRAINT_BEAM_WIDTH
             and _is_npu_platform()
         ):
             constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
-        elif (
-            constraint_backend is None
-            and beam_max_width is not None
-            and beam_max_width > MAX_CONSTRAINT_BEAM_WIDTH
-            and _is_npu_platform()
-        ):
-            logger.warning(
-                "NPU Constraint Table auto-promotion skipped: beam_max_width "
-                "%s exceeds the constraint_table beam-width cap %s (fused "
-                "rec_constrained_topk top_k limit); running beam decode "
-                "without constraint tables.",
-                beam_max_width,
-                MAX_CONSTRAINT_BEAM_WIDTH,
-            )
 
         gr_engine_args: dict[str, object] = {}
         if engine_args_accepts_gr_values():
@@ -770,8 +761,15 @@ class GRLLM(LLM):
         resolved_gr = GRConfig.from_vllm_config(getattr(self.llm_engine, "vllm_config", None))
         effective_backend = resolved_gr.constraint_backend
         effective_catalog_path = resolved_gr.catalog_path
-
-        if effective_catalog_path is not None:
+        canonical_table = resolved_gr.constraint_table
+        if canonical_table is not None and canonical_table.enabled:
+            # Canonical artifacts are loaded independently by every worker.
+            # The frontend strategy is only the request-routing marker that
+            # carries constraint_step/beam_suffix through the beam protocol.
+            self.constraint_strategy = ConstraintTableStrategy(canonical_table.path or "")
+            self.constraint_strategy.digest = canonical_table.artifact_digest
+            self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
+        elif effective_catalog_path is not None:
             self.constraint_strategy = create_constraint_strategy(
                 backend=effective_backend,
                 tokenizer=self.get_tokenizer(),
@@ -784,11 +782,16 @@ class GRLLM(LLM):
                 # Constraint Tables compile on the driver and are broadcast to
                 # every worker before any beam-search step runs.  Failing here
                 # is a hard startup error — never a silent fall back to Trie.
+                model_config = self.llm_engine.model_config
+                get_vocab_size = getattr(model_config, "get_vocab_size", None)
+                vocab_size = (
+                    get_vocab_size() if callable(get_vocab_size) else model_config.vocab_size
+                )
                 resource = install_constraint_table(
                     self.llm_engine,
                     catalog_path=effective_catalog_path,
                     tokenizer=self.get_tokenizer(),
-                    vocab_size=self.llm_engine.model_config.get_vocab_size(),
+                    vocab_size=vocab_size,
                 )
                 self.constraint_strategy.digest = resource.digest
 
@@ -818,7 +821,7 @@ class GRLLM(LLM):
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?
         logger.debug("Called beam_search")
-        beam_width = params.beam_width
+        beam_width = validate_beam_width(params.beam_width)
         max_tokens = params.max_tokens
         temperature = params.temperature
         ignore_eos = params.ignore_eos

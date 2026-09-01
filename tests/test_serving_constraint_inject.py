@@ -56,6 +56,45 @@ def _make_engine() -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "model_config",
+    [
+        SimpleNamespace(vocab_size=176384),
+        SimpleNamespace(get_vocab_size=lambda: 176384),
+    ],
+)
+def test_model_vocab_size_supports_field_and_method(
+    monkeypatch: pytest.MonkeyPatch,
+    model_config: SimpleNamespace,
+) -> None:
+    _install_fake_vllm_modules(monkeypatch)
+
+    from vllm_gr.entrypoints.openai import serving_models
+
+    assert serving_models._model_vocab_size(SimpleNamespace(model_config=model_config)) == 176384
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "model_config",
+    [
+        None,
+        SimpleNamespace(vocab_size=None),
+        SimpleNamespace(get_vocab_size=lambda: 0),
+        SimpleNamespace(get_vocab_size=lambda: True),
+    ],
+)
+def test_model_vocab_size_rejects_missing_or_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    model_config: SimpleNamespace | None,
+) -> None:
+    _install_fake_vllm_modules(monkeypatch)
+
+    from vllm_gr.entrypoints.openai import serving_models
+
+    with pytest.raises(ValueError, match="requires a positive"):
+        serving_models._model_vocab_size(SimpleNamespace(model_config=model_config))
+
+
 def test_ensure_constraint_tables_injected_awaits_before_marking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

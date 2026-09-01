@@ -4,11 +4,8 @@
 from __future__ import annotations
 
 import json
-import sys
-from enum import Enum
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from typing import Any
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -65,6 +62,46 @@ def test_canonical_mapping_round_trip_is_exact(tmp_path: Path) -> None:
     assert table is not None
     assert table.backend is ConstraintTableBackendEnum.CPU
     assert gr_config_to_mapping(config) == raw
+
+
+@pytest.mark.parametrize("worker_decision", [True, False])  # type: ignore[misc]
+def test_canonical_beam_runtime_options_round_trip(
+    worker_decision: bool,
+    tmp_path: Path,
+) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    beam = raw["beam"]
+    assert isinstance(beam, dict)
+    beam["worker_decision"] = worker_decision
+    beam["self_advance"] = False
+
+    config = gr_config_from_mapping(raw)
+
+    assert config.beam_worker_decision is worker_decision
+    assert config.beam_self_advance is False
+    assert gr_config_to_mapping(config) == raw
+
+
+def test_canonical_self_advance_requires_worker_decision(tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    beam = raw["beam"]
+    assert isinstance(beam, dict)
+    beam["self_advance"] = True
+
+    with pytest.raises(ValueError, match="requires beam_worker_decision=True"):
+        gr_config_from_mapping(raw)
+
+
+def test_canonical_mapping_defaults_constraint_backend_to_cuda(tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"), enabled=False)
+    table_mapping = raw["constraint_table"]
+    assert isinstance(table_mapping, dict)
+    del table_mapping["backend"]
+
+    table = gr_config_from_mapping(raw).constraint_table
+
+    assert table is not None
+    assert table.backend is ConstraintTableBackendEnum.CUDA
 
 
 def test_canonical_writer_uses_primitive_mapping(tmp_path: Path) -> None:
@@ -203,57 +240,9 @@ def test_constraint_max_top_k_has_no_npu_upper_bound(tmp_path: Path) -> None:
     assert config.max_top_k == 257
 
 
-def test_engine_creation_fails_closed_for_enabled_canonical_config(
+def test_engine_creation_writes_enabled_canonical_config(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Keep this unit test independent of optional vLLM runtime dependencies.
-    # The production module only needs these three upstream symbols before the
-    # patched EngineArgs method is invoked.
-    class EngineArgs:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        @staticmethod
-        def add_cli_args(parser: object) -> object:
-            return parser
-
-        def create_engine_config(self, *args: object, **kwargs: object) -> object:
-            raise NotImplementedError
-
-        @classmethod
-        def from_cli_args(cls, args: object) -> object:
-            raise NotImplementedError
-
-    class AttentionBackendEnum(str, Enum):
-        CUSTOM = "CUSTOM"
-
-    def module(name: str, **values: Any) -> ModuleType:
-        result = ModuleType(name)
-        for key, value in values.items():
-            setattr(result, key, value)
-        return result
-
-    fake_modules = {
-        "vllm.engine": module("vllm.engine"),
-        "vllm.engine.arg_utils": module("vllm.engine.arg_utils", EngineArgs=EngineArgs),
-        "vllm.utils.argparse_utils": module(
-            "vllm.utils.argparse_utils", FlexibleArgumentParser=object
-        ),
-        "vllm.v1.attention": module("vllm.v1.attention"),
-        "vllm.v1.attention.backends": module("vllm.v1.attention.backends"),
-        "vllm.v1.attention.backends.registry": module(
-            "vllm.v1.attention.backends.registry",
-            AttentionBackendEnum=AttentionBackendEnum,
-        ),
-    }
-    for name, fake_module in fake_modules.items():
-        monkeypatch.setitem(sys.modules, name, fake_module)
-    sys.modules.pop("vllm_gr.engine.arg_utils_gr", None)
-    engine_package = sys.modules.get("vllm_gr.engine")
-    if engine_package is not None and hasattr(engine_package, "arg_utils_gr"):
-        monkeypatch.delattr(engine_package, "arg_utils_gr")
-
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
     vllm_config = SimpleNamespace(additional_config={})
@@ -269,9 +258,16 @@ def test_engine_creation_fails_closed_for_enabled_canonical_config(
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
             return_value=vllm_config,
         ),
-        pytest.raises(RuntimeError, match="Worker integration"),
+        # This test covers canonical pass-through, not platform defaults.
+        # Isolate both accelerator probes so it behaves identically on CUDA,
+        # NPU, and CPU CI runners.
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
     ):
-        create_engine_config(engine_args)
+        assert create_engine_config(engine_args) is vllm_config
+    assert vllm_config.additional_config[GR_CONFIG_KEY] == _canonical_mapping(
+        str(tmp_path / "table.safetensors")
+    )
 
     conflicting_engine_args = SimpleNamespace(
         _vllm_gr_config_input=_canonical_mapping(
@@ -290,3 +286,41 @@ def test_engine_creation_fails_closed_for_enabled_canonical_config(
         pytest.raises(ValueError, match="cannot be combined"),
     ):
         create_engine_config(conflicting_engine_args)
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("async_scheduling", "expected_self_advance"),
+    [(False, True), (True, None)],
+)
+def test_engine_creation_serializes_cuda_decision_defaults(
+    tmp_path: Path,
+    async_scheduling: bool,
+    expected_self_advance: bool | None,
+) -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = SimpleNamespace(additional_config={})
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    engine_args = SimpleNamespace(
+        _vllm_gr_config_input=raw,
+        catalog_path=None,
+        constraint_backend=None,
+        attention_backend=None,
+        attention_config=None,
+        async_scheduling=async_scheduling,
+    )
+
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=True),
+    ):
+        assert create_engine_config(engine_args) is vllm_config
+
+    payload = vllm_config.additional_config[GR_CONFIG_KEY]
+    assert payload["beam"]["worker_decision"] is True
+    assert payload["beam"].get("self_advance") is expected_self_advance
+    assert parse_gr_config(vllm_config).beam_worker_decision is True
+    assert parse_gr_config(vllm_config).beam_self_advance is expected_self_advance

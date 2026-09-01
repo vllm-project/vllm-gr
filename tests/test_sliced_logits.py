@@ -170,6 +170,33 @@ def test_catalog_slice_config(tmp_path: Any) -> None:
     assert not is_vocab_slice_enabled()
 
 
+def test_constraint_triples_slice_config(tmp_path: Any) -> None:
+    from vllm_gr.utils.catalog import compute_catalog_slice_config
+
+    class DummyTokenizer:
+        def convert_tokens_to_ids(self, tokens: Any) -> Any:
+            mapping = {
+                "<s_a_100>": 1000,
+                "<s_b_200>": 1200,
+                "<s_c_500>": 2499,
+            }
+            return [mapping.get(token) for token in tokens]
+
+    triples_file = tmp_path / "constraint_triples.json"
+    triples_file.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "triples": [{"a": "<s_a_100>", "b": "<s_b_200>", "c": "<s_c_500>"}],
+                "sentinels": {"begin": "<|sid_begin|>", "end": "<|sid_end|>"},
+                "relations": {},
+            }
+        )
+    )
+
+    assert compute_catalog_slice_config(str(triples_file), DummyTokenizer()) == (1000, 1500)
+
+
 class MockTPHead(nn.Module):  # type: ignore[misc]
     """Simulates a shard of lm_head.weight for a specific TP rank."""
 

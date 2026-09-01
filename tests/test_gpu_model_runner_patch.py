@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
+from vllm_gr.v1.worker import model_runner_common as common
 
 
 def test_gpu_prepare_preserves_order_and_two_item_contract(
@@ -127,10 +128,156 @@ def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(
     assert runner.input_batch is original_batch
 
 
+def test_gpu_bookkeeping_materializes_sync_legacy_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    original_batch = SimpleNamespace()
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(_obj=original_batch),
+        use_async_scheduling=False,
+    )
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[11]], dtype=torch.int32),
+        logprobs_tensors=LogprobsTensors(
+            logprob_token_ids=torch.tensor([[11, 12]], dtype=torch.int32),
+            logprobs=torch.tensor([[-0.1, -0.2]], dtype=torch.float32),
+            selected_token_ranks=torch.tensor([0], dtype=torch.int64),
+        ),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={"beam": {}},
+        _gr_request_row_configs=[("beam", 0, 1, [0])],
+        finished_req_ids=set(),
+    )
+
+    def original(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        return (0, object(), [[99]], {}, ["physical"], {"physical": 0}, [])
+
+    monkeypatch.setattr(
+        gpu_patch,
+        "_beam_collapse_bookkeeping",
+        lambda *args, **kwargs: (["beam"], {"beam": 0}, 1),
+    )
+    result = gpu_patch.make_patched_bookkeeping_sync(original)(
+        runner,
+        scheduler_output,
+        sampler_output,
+    )
+
+    assert result[1].slice_request(0, 1).logprob_token_ids.tolist() == [[11, 12]]
+    assert result[2] == [[11]]
+    assert result[4:6] == (["beam"], {"beam": 0})
+    assert runner.input_batch is original_batch
+
+
+def test_gpu_bookkeeping_collapses_legacy_sampled_rows_before_sync_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    original_batch = SimpleNamespace()
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(_obj=original_batch),
+        use_async_scheduling=False,
+    )
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[11], [12], [13], [14]], dtype=torch.int32),
+        logprobs_tensors=LogprobsTensors(
+            logprob_token_ids=torch.arange(16, dtype=torch.int32).reshape(4, 4),
+            logprobs=torch.zeros((4, 4), dtype=torch.float32),
+            selected_token_ranks=torch.zeros(4, dtype=torch.int64),
+        ),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={"beam": {}},
+        _gr_request_row_configs=[("beam", 0, 4, [0, 1, 2, 3])],
+        finished_req_ids=set(),
+    )
+
+    def original(self: Any, scheduler: Any, received: Any, *args: Any) -> tuple[Any, ...]:
+        assert received.sampled_token_ids.tolist() == [[11]]
+        assert received.logprobs_tensors.logprobs.shape == (4, 4)
+        return (0, received.logprobs_tensors.tolists(), [[11]], {}, ["beam"], {"beam": 0}, [])
+
+    monkeypatch.setattr(
+        gpu_patch,
+        "_beam_collapse_bookkeeping",
+        lambda *args, **kwargs: (["beam"], {"beam": 0}, 1),
+    )
+    result = gpu_patch.make_patched_bookkeeping_sync(original)(
+        runner,
+        scheduler_output,
+        sampler_output,
+    )
+
+    assert result[2] == [[11]]
+    assert runner.input_batch is original_batch
+
+
+def test_gpu_bookkeeping_reduces_worker_decision_before_sync_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    width = 4
+    original_batch = SimpleNamespace()
+    selected_ids = torch.tensor([[21, 22, 23, 24]], dtype=torch.int32)
+    selected_scores = torch.tensor([[-0.1, -0.2, -0.3, -0.4]], dtype=torch.float32)
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(_obj=original_batch),
+        use_async_scheduling=False,
+        _beam_decision_tensors={
+            "out_token_ids": selected_ids,
+            "out_token_index": torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+            "out_log_probs": selected_scores,
+        },
+    )
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.arange(width, dtype=torch.int32).reshape(width, 1),
+        logprobs_tensors=LogprobsTensors(
+            logprob_token_ids=torch.arange(width * width, dtype=torch.int32).reshape(width, width),
+            logprobs=torch.zeros((width, width), dtype=torch.float32),
+            selected_token_ranks=torch.zeros(width, dtype=torch.int64),
+        ),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={"beam": {"is_beam_decode": True, "beam_width": width}},
+        _gr_request_row_configs=[("beam", 0, width, list(range(width)))],
+        finished_req_ids=set(),
+    )
+
+    def original(self: Any, scheduler: Any, received: Any, *args: Any) -> tuple[Any, ...]:
+        # This is the critical ordering contract: upstream D2H bookkeeping
+        # must see O(W), not the original O(W^2) candidate matrix.
+        assert received.sampled_token_ids.shape == (1, 1)
+        assert received.logprobs_tensors.logprobs.shape == (1, width)
+        return (
+            0,
+            received.logprobs_tensors.tolists(),
+            received.sampled_token_ids.tolist(),
+            {},
+            ["beam"],
+            {"beam": 0},
+            [],
+        )
+
+    result = gpu_patch.make_patched_bookkeeping_sync(original)(
+        runner,
+        scheduler_output,
+        sampler_output,
+    )
+
+    assert result[1].slice_request(0, 1).logprob_token_ids.tolist() == [[21, 22, 23, 24]]
+    assert result[2] == [[21]]
+    assert runner.input_batch is original_batch
+
+
 def test_gpu_sample_patch_runs_original_then_constraint_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_sample wrapper must sample first, then apply constrained rows."""
+    """The legacy branch must still sample first, then override rows."""
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
 
     events: list[str] = []
@@ -155,6 +302,34 @@ def test_gpu_sample_patch_runs_original_then_constraint_override(
     runner = SimpleNamespace()
     assert wrapped(runner, "logits", "meta") is sample_output
     assert events == ["sample", "override"]
+
+
+def test_gpu_sample_patch_returns_canonical_output_before_sampler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    direct_output = object()
+
+    def direct(self: Any, logits: Any, spec_decode_metadata: Any) -> Any:
+        assert logits == "logits"
+        assert spec_decode_metadata == "meta"
+        events.append("direct")
+        return direct_output
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"ordinary sampler or legacy override ran: {args} {kwargs}")
+
+    def decide(self: Any, sampler_output: Any) -> None:
+        assert sampler_output is direct_output
+        events.append("decision")
+
+    monkeypatch.setattr(gpu_patch, "try_sample_with_constraint_backend", direct)
+    monkeypatch.setattr(gpu_patch, "apply_constrained_sample_override", forbidden)
+    monkeypatch.setattr(gpu_patch, "maybe_run_worker_beam_decision", decide)
+    wrapped = gpu_patch.make_patched_sample_gpu(forbidden)
+
+    assert wrapped(SimpleNamespace(), "logits", "meta") is direct_output
+    assert events == ["direct", "decision"]
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +482,58 @@ def test_patched_determine_pure_beam_batch_grants_full() -> None:
         assert result[0] == CUDAGraphMode.FULL
         assert result[1].num_tokens == 4
         assert result[1].uniform is True
+        assert runner._beam_graph_full_dispatch_count == 1
+        wrapped(runner, num_tokens=4)
+        assert runner._beam_graph_full_dispatch_count == 2
     finally:
         mod._beam_graph_enabled_for_run = original_fn
+
+
+def test_beam_graph_runtime_stats_reports_capture_and_dispatch_state() -> None:
+    config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
+    runner = SimpleNamespace(
+        _vllm_gr_config=config,
+        _beam_graph_keys={128},
+        _beam_graph_full_dispatch_count=2,
+    )
+    worker = SimpleNamespace(model_runner=runner)
+
+    stats = common.get_beam_graph_runtime_stats(worker)
+
+    assert stats == {
+        "runner": "SimpleNamespace",
+        "beam_graph_enabled": True,
+        "beam_max_width": 128,
+        "captured_widths": [128],
+        "full_dispatches": 2,
+    }
+
+
+def test_worker_graph_stats_hook_is_named_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.worker.gpu_worker as gpu_worker
+
+    import vllm_gr.v1.worker.model_runner_patch as dispatcher
+
+    class FakeWorker:
+        pass
+
+    monkeypatch.setattr(gpu_worker, "Worker", FakeWorker)
+    monkeypatch.setattr(
+        dispatcher, "_active_platform_module_name", lambda: dispatcher._GPU_PATCH_MODULE
+    )
+    monkeypatch.setattr(
+        "vllm_gr.constraints.worker_inject.install_worker_resource_hook",
+        lambda worker_cls: 0,
+    )
+
+    dispatcher._install_active_worker_resource_hook()
+    first = getattr(FakeWorker, "get_gr_beam_graph_runtime_stats")
+    dispatcher._install_active_worker_resource_hook()
+
+    assert first is common.get_beam_graph_runtime_stats
+    assert getattr(FakeWorker, "get_gr_beam_graph_runtime_stats") is first
 
 
 def test_patched_determine_active_lora_downgrades_full() -> None:

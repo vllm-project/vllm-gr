@@ -35,7 +35,16 @@ if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is
 def _build_catalog_data() -> list[list[str]]:
     catalog_data = []
     random.seed(42)
-    for i in range(50000):
+    # The random layer must stay dense for catalog_strategy="null": a beam
+    # whose top-K candidate window misses the trie's valid set is dropped,
+    # and each (a, b) prefix only survives step 3 with ~K/vocab probability
+    # per catalog continuation.  With 50k entries nearly every (a, b) prefix
+    # had exactly one valid c, so the 256-wide beam pool died out at step 3
+    # (every beam dead-end -> 0 outputs -> test failure).  500k entries give
+    # the model-preferred prefixes enough valid continuations to keep the
+    # expected survivor count above zero (measured 4 survivors / OneRec-1.7B,
+    # beam_width=256).
+    for i in range(500000):
         item = [
             "<|sid_begin|>",
             f"<s_a_{random.randint(0, 7999)}>",
@@ -67,8 +76,8 @@ async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "
             trust_remote_code=True,
             enforce_eager=True,
             enable_log_requests=False,
-            max_logprobs=1024,
-            additional_config={"vllm_gr_beam_max_width": 1024},
+            max_logprobs=256,
+            additional_config={"vllm_gr_beam_max_width": 256},
         )
         setattr(engine_args, "catalog_path", catalog_path)
 
@@ -92,7 +101,7 @@ async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "
             prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
 
-            beam_width = 1024
+            beam_width = 256
             beam_search_params_dict: dict[str, Any] = {
                 "beam_width": beam_width,
                 "max_tokens": 5,

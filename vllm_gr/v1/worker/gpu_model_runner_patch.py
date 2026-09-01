@@ -9,7 +9,11 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.worker.constraint_hook import apply_constrained_sample_override
+from vllm_gr.v1.beam.beam_decision import maybe_run_worker_beam_decision
+from vllm_gr.v1.worker.constraint_hook import (
+    apply_constrained_sample_override,
+    try_sample_with_constraint_backend,
+)
 
 # Shared device-neutral beam-graph helpers live in model_runner_common; they
 # are re-exported here so callers/tests that historically reached them via
@@ -20,6 +24,7 @@ from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_DETERMINE_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
+    _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
     _beam_collapse_bookkeeping,
 )
 from vllm_gr.v1.worker.model_runner_common import (  # noqa: E402,F401
@@ -33,6 +38,9 @@ from vllm_gr.v1.worker.model_runner_common import (
 )
 from vllm_gr.v1.worker.model_runner_common import (
     _create_beam_context as _common_create_beam_context,
+)
+from vllm_gr.v1.worker.model_runner_common import (
+    _reduce_sampler_output_for_worker_decision,
 )
 
 logger = init_logger(__name__)
@@ -68,24 +76,42 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
 
 def make_patched_sample_gpu(_orig_sample):
-    """Wrap the GPU ``_sample`` to run Constraint Tables on raw logits.
-
-    The original sampling runs first (it maps the proxy sampling metadata and
-    produces the unconstrained sampler output); constrained rows are then
-    overwritten in place with ``rec_constrained_topk`` results (issue #246,
-    N3).  Pure-completion and Trie-beam steps short-circuit untouched.
-    """
+    """Run canonical constraints first, retaining the legacy override path."""
     if getattr(_orig_sample, _WORKER_SAMPLE_PATCH_MARKER, False):
         return _orig_sample
 
     @wraps(_orig_sample)
     def patched_sample(self, logits, spec_decode_metadata=None):
-        sampler_output = _orig_sample(self, logits, spec_decode_metadata)
-        apply_constrained_sample_override(self, logits, sampler_output)
+        sampler_output = try_sample_with_constraint_backend(
+            self,
+            logits,
+            spec_decode_metadata,
+        )
+        if sampler_output is None:
+            sampler_output = _orig_sample(self, logits, spec_decode_metadata)
+            apply_constrained_sample_override(self, logits, sampler_output)
+        maybe_run_worker_beam_decision(self, sampler_output)
         return sampler_output
 
     setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
     return patched_sample
+
+
+def make_patched_sample_tokens_gpu(_orig_sample_tokens):
+    """Attach a CUDA worker decision produced during async sampling."""
+    if getattr(_orig_sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, False):
+        return _orig_sample_tokens
+
+    @wraps(_orig_sample_tokens)
+    def patched_sample_tokens(self, grammar_output, *args, **kwargs):
+        from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
+
+        out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
+        _attach_beam_search_result(self, out)
+        return out
+
+    setattr(patched_sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, True)
+    return patched_sample_tokens
 
 
 def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
@@ -107,6 +133,37 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         request_row_configs = scheduler_output._gr_request_row_configs
         orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
 
+        sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+        # A worker decision already selected W survivors.  Shrink the ordinary
+        # sampler tensors before upstream's synchronous D2H bookkeeping; doing
+        # this after _orig_bookkeeping_sync is too late and copies/converts the
+        # redundant W-by-W candidate matrix on every decode step.
+        _reduce_sampler_output_for_worker_decision(self, sampler_output)
+        if (
+            sampler_output is not None
+            and isinstance(getattr(sampler_output, "sampled_token_ids", None), torch.Tensor)
+            and sampler_output.sampled_token_ids.shape[0] > len(request_row_configs)
+        ):
+            # vLLM 0.22 sizes its synchronous pinned sampled-token buffer by
+            # max_num_seqs (logical requests), while the legacy Beam path has
+            # one sampler row per parent.  Only the first sampled ID per
+            # logical request is bookkeeping data; all actual Beam candidates
+            # are carried by logprobs_tensors.  Collapse this small tensor
+            # before upstream's D2H copy and leave the W/W^2 logprob payload
+            # untouched for the compatibility path.
+            physical_row = 0
+            logical_sampled_rows = []
+            for req_id, _, logits_rows, *_ in request_row_configs:
+                if req_id is not None:
+                    logical_sampled_rows.append(
+                        sampler_output.sampled_token_ids[physical_row : physical_row + 1]
+                    )
+                physical_row += logits_rows
+            sampler_output.sampled_token_ids = torch.cat(
+                logical_sampled_rows,
+                dim=0,
+            )
+
         try:
             res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
         finally:
@@ -122,15 +179,38 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
             invalid_req_indices,
         ) = res
 
-        sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
         collapsed_req_ids, collapsed_idx, n = _beam_collapse_bookkeeping(
             self, orig_input_batch, request_row_configs, beam_data, sampler_output
         )
 
+        materialize_sync_output = bool(
+            not getattr(self, "use_async_scheduling", False)
+            and sampler_output is not None
+            and getattr(sampler_output, "sampled_token_ids", None) is not None
+            and getattr(sampler_output, "logprobs_tensors", None) is not None
+        )
+        if materialize_sync_output:
+            # Collapse runs after upstream bookkeeping because it must restore
+            # the logical request map.  In synchronous mode there is no later
+            # AsyncGPUModelRunnerOutput conversion, so materialize the now-
+            # collapsed tensors here.  Returning ``[[]]`` was accepted by an
+            # older scheduler but vLLM 0.22 requires LogprobsLists (including
+            # ``slice_request``) for the flattened candidate payload.
+            collapsed_logprobs = (
+                sampler_output.logprobs_tensors.tolists()
+                if logprobs_lists is not None and sampler_output.logprobs_tensors is not None
+                else None
+            )
+            collapsed_sampled = sampler_output.sampled_token_ids[:n].tolist()
+        else:
+            # AsyncGPUModelRunnerOutput copies the post-collapse tensors later.
+            collapsed_logprobs = [[] for _ in range(n)] if logprobs_lists is not None else None
+            collapsed_sampled = [[] for _ in range(n)]
+
         return (
             num_nans_in_logits,
-            [[] for _ in range(n)] if logprobs_lists is not None else None,
-            [[] for _ in range(n)],
+            collapsed_logprobs,
+            collapsed_sampled,
             prompt_logprobs_dict,
             collapsed_req_ids,
             collapsed_idx,
@@ -276,6 +356,15 @@ def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
                     result[0],
                     result[1],
                     new_descriptor,
+                )
+                # Count only real runtime dispatches.  Startup beam capture
+                # calls ``_dummy_beam_forward`` directly and therefore never
+                # reaches this branch.  The counter gives integration tests
+                # and profiling harnesses an authoritative, worker-local
+                # assertion that a request selected the captured FULL graph;
+                # it is deliberately outside the graph and has no CUDA work.
+                self._beam_graph_full_dispatch_count = (
+                    int(getattr(self, "_beam_graph_full_dispatch_count", 0)) + 1
                 )
                 result = (CUDAGraphMode.FULL, new_descriptor) + result[2:]
 
@@ -636,6 +725,7 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
 make_patched_prepare_inputs = make_patched_prepare_inputs_gpu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_gpu
 make_patched_sample = make_patched_sample_gpu
+make_patched_sample_tokens = make_patched_sample_tokens_gpu
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_gpu
 )

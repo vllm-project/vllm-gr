@@ -49,15 +49,13 @@ def test_npu_provider_creates_independent_instances() -> None:
     assert second._digest is None  # noqa: SLF001
 
 
-def test_cuda_provider_returns_none() -> None:
-    """CUDA provider must explicitly return None (no Constraint Table execution)."""
-    execution = cuda.CUDA_BACKEND.create_constrained_topk_execution()
+def test_cuda_provider_returns_cuda_execution_and_preserves_device() -> None:
+    """CUDA provider creates its execution and forwards an explicit device."""
+    from vllm_gr.constraints.execution import CUDAConstrainedTopKExecution
 
-    assert execution is None
+    default_execution = cuda.CUDA_BACKEND.create_constrained_topk_execution()
+    explicit_execution = cuda.CUDA_BACKEND.create_constrained_topk_execution(device="cuda")
 
-
-def test_cuda_provider_none_with_device_arg() -> None:
-    """CUDA provider returns None regardless of the requested device."""
-    execution = cuda.CUDA_BACKEND.create_constrained_topk_execution(device="cuda")
-
-    assert execution is None
+    assert isinstance(default_execution, CUDAConstrainedTopKExecution)
+    assert isinstance(explicit_execution, CUDAConstrainedTopKExecution)
+    assert explicit_execution._device == "cuda"  # noqa: SLF001

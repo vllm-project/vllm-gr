@@ -96,19 +96,24 @@ def create_constraint_execution(
     return adapter
 
 
-def validate_constraint_table_platform(gr_config: GRConfig) -> None:
+def validate_constraint_table_platform(
+    gr_config: GRConfig,
+    *,
+    device_type: str | None = None,
+) -> None:
     """Reject configurations Constraint Tables cannot support in this release.
 
-    Vocabulary slicing changes the logits vocab while the compiled tables are
-    keyed on the full ``model_config.vocab_size``; the two cannot be combined
-    yet (issue #246 §7).
+    CUDA carries full-vocabulary table ids alongside a sliced logits window
+    and translates ids to local logits columns inside the fused kernel. Other
+    platforms still use the original full-vocabulary ABI and reject slicing.
     """
-    if gr_config.vocab_offset is not None or gr_config.vocab_slice_size is not None:
+    slicing_enabled = gr_config.vocab_offset is not None or gr_config.vocab_slice_size is not None
+    if slicing_enabled and device_type != "cuda":
         raise ValueError(
             "constraint_backend='constraint_table' cannot be combined with "
             f"vocab slicing (vocab_offset={gr_config.vocab_offset!r}, "
-            f"vocab_slice_size={gr_config.vocab_slice_size!r}) in the initial "
-            "release"
+            f"vocab_slice_size={gr_config.vocab_slice_size!r}) on platform "
+            f"{device_type or 'unknown'!r}"
         )
 
 
@@ -225,9 +230,12 @@ def prepare_constraint_table(
     from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
     from vllm_gr.platforms.loader import activate_current_backend
 
-    activate_current_backend()
+    provider = activate_current_backend()
     if gr_config is not None:
-        validate_constraint_table_platform(gr_config)
+        validate_constraint_table_platform(
+            gr_config,
+            device_type=provider.device_type,
+        )
     # Startup-time fail-fast (issue #246 §7): the probe adapter is discarded;
     # the Worker lazily creates its own with the runner device (N3).
     create_constraint_execution()

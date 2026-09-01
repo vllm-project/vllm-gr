@@ -69,7 +69,15 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
 _TOP_LEVEL_KEYS: Final = frozenset(
     {"schema_version", "beam", "constraint_table", "attention_backend"}
 )
-_BEAM_KEYS: Final = frozenset({"graph_enabled", "max_width", "max_decode_steps"})
+_BEAM_KEYS: Final = frozenset(
+    {
+        "graph_enabled",
+        "max_width",
+        "max_decode_steps",
+        "worker_decision",
+        "self_advance",
+    }
+)
 _CONSTRAINT_TABLE_KEYS: Final = frozenset(
     {
         "enabled",
@@ -156,7 +164,7 @@ def gr_config_from_mapping(
 
     table = ConstraintTableConfig(
         enabled=validate_constraint_table_enabled(table_raw.get("enabled", False)),
-        backend=validate_constraint_table_backend(table_raw.get("backend", "cpu")),
+        backend=validate_constraint_table_backend(table_raw.get("backend", "cuda")),
         path=validate_constraint_table_path(
             _normalize_artifact_path(table_raw.get("path"), base_dir=base_dir)
         ),
@@ -172,6 +180,8 @@ def gr_config_from_mapping(
         beam_max_decode_steps=validate_beam_max_decode_steps(
             beam_raw.get("max_decode_steps", _BEAM_MAX_DECODE_STEPS_DEFAULT)
         ),
+        beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
+        beam_self_advance=validate_beam_self_advance(beam_raw.get("self_advance")),
         schema_version=validate_schema_version(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
@@ -207,13 +217,23 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     table = config.constraint_table
     if table is None:
         raise ValueError("cannot encode GRConfig without canonical constraint_table state")
+    beam: dict[str, object] = {
+        "graph_enabled": config.beam_graph_enabled,
+        "max_width": config.beam_max_width,
+        "max_decode_steps": config.beam_max_decode_steps,
+    }
+    # Keep omitted values omitted so existing schema-v1 artifacts round-trip
+    # byte-for-byte at the mapping level.  Explicit False is significant: it
+    # is the CUDA runtime-default opt-out and must survive Driver -> Worker
+    # serialization just like explicit True.
+    if config.beam_worker_decision is not None:
+        beam["worker_decision"] = config.beam_worker_decision
+    if config.beam_self_advance is not None:
+        beam["self_advance"] = config.beam_self_advance
+
     return {
         "schema_version": config.schema_version,
-        "beam": {
-            "graph_enabled": config.beam_graph_enabled,
-            "max_width": config.beam_max_width,
-            "max_decode_steps": config.beam_max_decode_steps,
-        },
+        "beam": beam,
         "constraint_table": {
             "enabled": table.enabled,
             "backend": table.backend.value,
@@ -397,8 +417,8 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
 
     beam_self_advance = validate_beam_self_advance(gr_config.beam_self_advance)
     if beam_self_advance is None:
-        # Unset stays out of the serialized config; runtime keeps the
-        # frontend RPC step-update loop.
+        # Unset stays out of the serialized config; the Driver may apply a
+        # platform/backend default before writing the final config.
         additional_config.pop(BEAM_SELF_ADVANCE_KEY, None)
     else:
         # Both explicit values round-trip (an opt-out must survive a write).

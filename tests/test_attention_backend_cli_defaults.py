@@ -19,12 +19,19 @@ class TestServeAttentionBackendDefault(unittest.TestCase):
 
         self.parser = FlexibleArgumentParser()
         subparsers = self.parser.add_subparsers(dest="subparser")
-        subcmd = GRServeSubcommand()
-        subcmd.subparser_init(subparsers)
+        self.subcmd = GRServeSubcommand()
+        self.subcmd.subparser_init(subparsers)
 
     def test_no_backend_defaults_to_custom(self) -> None:
         args = self.parser.parse_args(["serve"])
+        self.subcmd.validate(args)
         self.assertEqual(args.attention_backend, "CUSTOM")
+
+    def test_canonical_config_does_not_add_legacy_backend_default(self) -> None:
+        args = self.parser.parse_args(["serve", "--vllm-gr-config", "config.yaml"])
+        with mock.patch("vllm_gr.entrypoints.cli.serve.validate_parsed_serve_args"):
+            self.subcmd.validate(args)
+        self.assertIsNone(args.attention_backend)
 
     def test_dash_dash_backend_preserves_value(self) -> None:
         args = self.parser.parse_args(["serve", "--attention-backend", "FLASH_ATTN"])

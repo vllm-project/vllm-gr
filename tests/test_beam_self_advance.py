@@ -787,6 +787,31 @@ class TestDecisionPayloadShapes:
         _, kwargs = MockReq.call_args
         assert kwargs["prompt_token_ids"] == [10, 20, 30, 61, 71]
 
+    def test_compact_cuda_payload_chains_next_step(self) -> None:
+        from vllm_gr.v1.beam import beam_decision
+
+        eng = _seeded_engine("s0")
+        encoded = beam_decision._encode_cuda_beam_result(
+            {
+                "out_token_ids": torch.tensor([[61, 71]], dtype=torch.int32),
+                "out_token_index": torch.tensor([[1, 0]], dtype=torch.int32),
+                "out_log_probs": torch.tensor([[-1.0, -2.0]], dtype=torch.float32),
+            },
+            is_last_step=False,
+        )
+        assert encoded is not None
+        decision, _ = encoded
+
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = MagicMock()
+            mock_req.block_hashes = []
+            MockReq.return_value = mock_req
+            _beam_advance_from_decision(eng, "s0", decision)
+
+        assert eng.input_queue.qsize() == 1
+        _, kwargs = MockReq.call_args
+        assert kwargs["prompt_token_ids"] == [10, 20, 30, 61, 71]
+
     def test_serialized_tensor_triple_is_graceful_noop(self) -> None:
         """An unnormalized (encoder-triple) payload is unrecoverable data —
         skip, never crash; the frontend step-update loop remains the

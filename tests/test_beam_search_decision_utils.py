@@ -194,6 +194,22 @@ def test_extract_constrained_segment_truncates_to_logprobs_num() -> None:
     assert logprobs == [-0.1, -0.2]
 
 
+def test_extract_constrained_segment_ignores_row_wide_rank_metadata() -> None:
+    token_ids, logprobs, ranks, decoded = extract_constrained_segment(
+        [10, 11, 12, 13],
+        [-0.1, -0.2, -0.3, -0.4],
+        [0],
+        None,
+        0,
+        4,
+        4,
+    )
+    assert token_ids == [10, 11, 12, 13]
+    assert logprobs == [-0.1, -0.2, -0.3, -0.4]
+    assert ranks == [None, None, None, None]
+    assert decoded is None
+
+
 def test_extract_constrained_flat_logprobs_prefill_wide_segment() -> None:
     # Constrained prefill emits one wide flat segment: W valid candidates then
     # structural transport padding.

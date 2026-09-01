@@ -160,21 +160,26 @@ def test_result_width_decouples_from_max_decode_steps() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _gate_runner(context: BeamAttentionContext, device_type: str = "npu") -> SimpleNamespace:
+def _gate_runner(
+    context: BeamAttentionContext,
+    device_type: str = "npu",
+    beam_width: int = 4,
+) -> SimpleNamespace:
     session = _make_session(context)
-    session.begin_session(beam_width=4, prefix_len=8)
+    session.begin_session(beam_width=beam_width, prefix_len=8)
     return SimpleNamespace(
         _vllm_gr_config=SimpleNamespace(
             beam_worker_decision=True,
             catalog_path=None,
+            constraint_backend=None,
         ),
         _current_beam_info={
             "beam_data": {
                 "s": {
                     "is_beam_decode": True,
                     "decode_step": 1,
-                    "beam_width": 4,
-                    "parent_beam_ids": [0, 1, 2, 3],
+                    "beam_width": beam_width,
+                    "parent_beam_ids": list(range(beam_width)),
                 }
             },
             "beam_session": session,
@@ -200,6 +205,74 @@ def test_worker_decision_enabled_in_xllm_mode(monkeypatch: pytest.MonkeyPatch) -
     runner = _gate_runner(context)
     monkeypatch.setattr(beam_attn, "_NPU_DECODE_EXECUTION_MODE", "xllm")
     assert beam_decision.worker_decision_enabled(runner) is True
+
+
+def test_worker_decision_enabled_on_cuda_without_xllm() -> None:
+    context = _make_context()
+    runner = _gate_runner(context, device_type="cuda")
+    assert beam_decision.worker_decision_enabled(runner) is True
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("beam_width", "expected"),
+    [(256, True), (257, False)],
+)
+def test_cuda_worker_decision_respects_kernel_width_limit(
+    beam_width: int,
+    expected: bool,
+) -> None:
+    context = _make_context(max_beams=beam_width)
+    runner = _gate_runner(context, device_type="cuda", beam_width=beam_width)
+
+    assert beam_decision.worker_decision_enabled(runner) is expected
+
+
+def test_cuda_worker_decision_over_width_limit_falls_back() -> None:
+    beam_width = 257
+    context = _make_context(max_beams=beam_width)
+    runner = _gate_runner(context, device_type="cuda", beam_width=beam_width)
+    candidates = torch.arange(beam_width**2, dtype=torch.int32).reshape(beam_width, beam_width)
+    sampler_output = _sampler_output(candidates, torch.zeros_like(candidates, dtype=torch.float32))
+
+    beam_decision.maybe_run_worker_beam_decision(runner, sampler_output)
+
+    assert runner._beam_decision_result is None
+    assert not hasattr(runner, "_beam_decision_tensors")
+
+
+def test_cuda_constraint_prefill_publishes_without_seeding_decode_state() -> None:
+    """Step 0 must not fall back to frontend NumPy selection on CUDA."""
+    from vllm_gr.config import ConstraintBackend
+
+    width = 4
+    token_ids = torch.tensor([[11, 12, 13, 14]], dtype=torch.int32)
+    scores = torch.tensor([[-0.1, -0.2, -0.3, -0.4]], dtype=torch.float32)
+    runner = SimpleNamespace(
+        device=SimpleNamespace(type="cuda"),
+        _vllm_gr_config=SimpleNamespace(
+            beam_worker_decision=True,
+            constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+        ),
+        _current_beam_info={
+            "beam_data": {
+                "prefill-id": {
+                    "is_constraint_prefill": True,
+                    "beam_width": width,
+                }
+            }
+        },
+    )
+    sampler_output = _sampler_output(token_ids, scores)
+
+    beam_decision.maybe_run_worker_beam_decision(runner, sampler_output)
+
+    compact = beam_decision.unpack_beam_result_buffer(runner._beam_decision_result)
+    assert compact is not None
+    ids, logprobs, parents = compact
+    assert ids == [11, 12, 13, 14]
+    assert logprobs == pytest.approx([-0.1, -0.2, -0.3, -0.4])
+    assert parents == [0, 0, 0, 0]
+    assert not hasattr(runner, "_beam_prefill_state")
 
 
 def test_worker_decision_disabled_on_cpu_host(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -430,13 +503,12 @@ def test_next_step_skips_duplicate_reorder() -> None:
         assert torch.equal(before, pool.unshared_key[0])
 
 
-def test_next_step_composites_mismatched_frontend_parents() -> None:
+@pytest.mark.parametrize("is_terminal", [False, True])  # type: ignore[misc]
+def test_next_step_composites_mismatched_frontend_parents(is_terminal: bool) -> None:
     """Frontend mapping != recorded: composite reorder on top of the record.
 
-    Must run on a NON-terminal step: the terminal step skips reordering
-    entirely (ACS ``onerec_final_beam_select`` emits the final beams without
-    touching the pool), so a loop of 4 (prefill + 3 decodes) composites at
-    the middle decode (decode_step=1), not at decode_step=2.
+    The mapping describes the parents for the current attention step, so it
+    must be applied even when that current step is terminal.
     """
     context = _make_context(max_beams=4, max_decode_steps=4)
     session = _make_session(context)
@@ -473,7 +545,7 @@ def test_next_step_composites_mismatched_frontend_parents() -> None:
             "prefix_len": 8,
             "decode_step": 1,
             "parent_beam_ids": [0, 1, 2, 3],
-            "max_decode_steps": 4,
+            "max_decode_steps": 3 if is_terminal else 4,
         }
     }
     common._get_or_create_beam_session(
@@ -487,6 +559,40 @@ def test_next_step_composites_mismatched_frontend_parents() -> None:
     for layer, pool in enumerate(context.pools):
         for j in range(4):
             expected = float(j * 10 + layer)
+            assert pool.unshared_key[0, j, :, :1, :].max().item() == expected, (layer, j)
+
+
+def test_terminal_step_applies_deferred_frontend_parents() -> None:
+    """A deferred previous-step decision is not skipped at final attention."""
+    context = _make_context(max_beams=4, max_decode_steps=4)
+    session = _make_session(context)
+    session.begin_session(beam_width=4, prefix_len=8)
+    state = session._state
+
+    for layer, pool in enumerate(context.pools):
+        for b in range(4):
+            pool.unshared_key[0, b, :, :1, :].fill_(float(b * 10 + layer))
+
+    runner = _terminal_runner(context, session)
+    beam_data = {
+        session.session_id: {
+            "is_beam_decode": True,
+            "beam_width": 4,
+            "prefix_len": 8,
+            "decode_step": 1,
+            "parent_beam_ids": [2, 3, 0, 1],
+            "max_decode_steps": 3,
+        }
+    }
+    common._get_or_create_beam_session(
+        runner, beam_data, SimpleNamespace(beam_finished_session_ids=[])
+    )
+
+    assert state.is_last_step is True
+    assert state.decode_step == 1
+    for layer, pool in enumerate(context.pools):
+        for j, parent in enumerate([2, 3, 0, 1]):
+            expected = float(parent * 10 + layer)
             assert pool.unshared_key[0, j, :, :1, :].max().item() == expected, (layer, j)
 
 
@@ -793,3 +899,75 @@ def test_flatten_decision_value_scalar_and_other_types() -> None:
     assert beam_decision.flatten_decision_value(3) is None
     assert beam_decision.flatten_decision_value(None) is None
     assert beam_decision.flatten_decision_value("out") is None
+
+
+def test_cuda_beam_result_buffer_round_trip_uses_one_compact_payload() -> None:
+    raw = {
+        "out_token_ids": torch.tensor([[11, 12]], dtype=torch.int32),
+        "out_token_index": torch.tensor([[1, 0]], dtype=torch.int32),
+        "out_log_probs": torch.tensor([[-1.25, -2.5]], dtype=torch.float32),
+        # Device sequence history is intentionally not part of the return
+        # buffer; frontend materialization already owns the parent histories.
+        "out_sequence": torch.tensor([[[1, 11], [2, 12]]], dtype=torch.int32),
+    }
+
+    encoded = beam_decision._encode_cuda_beam_result(raw, is_last_step=True)
+
+    assert encoded is not None
+    payload, parents = encoded
+    assert set(payload) == {"buffer_format", "shape", "buffer", "is_last_step"}
+    assert payload["shape"] == [1, 2]
+    assert isinstance(payload["buffer"], bytes)
+    assert len(payload["buffer"]) == 2 * 3 * 4
+    assert payload["is_last_step"] is True
+    assert parents == [1, 0]
+    ids, scores, decoded_parents = beam_decision.unpack_beam_result_buffer(payload)
+    assert ids == [11, 12]
+    assert scores == pytest.approx([-1.25, -2.5])
+    assert decoded_parents == [1, 0]
+
+
+def test_beam_result_buffer_rejects_bad_shape_or_size() -> None:
+    assert (
+        beam_decision.unpack_beam_result_buffer(
+            {
+                "buffer_format": "beam_result_i32_f32_v1",
+                "shape": [1, 2],
+                "buffer": b"too-short",
+            }
+        )
+        is None
+    )
+
+
+def test_cuda_worker_decision_publishes_compact_result_and_keeps_device_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    width = 4
+    raw = {
+        "out_token_ids": torch.tensor([[11, 12, 13, 14]], dtype=torch.int32),
+        "out_token_index": torch.tensor([[1, 0, 3, 2]], dtype=torch.int32),
+        "out_log_probs": torch.tensor([[-1.0, -2.0, -3.0, -4.0]], dtype=torch.float32),
+    }
+    monkeypatch.setattr(beam_decision, "worker_decision_enabled", lambda runner: True)
+    monkeypatch.setattr(beam_decision, "run_beam_decision", lambda *args, **kwargs: raw)
+    state = SimpleNamespace(is_last_step=False, kv_reorder=None)
+    session = SimpleNamespace(_state=state, beam_width=width)
+    runner = SimpleNamespace(
+        device=SimpleNamespace(type="cuda"),
+        _current_beam_info={
+            "beam_session": session,
+            "beam_data": {"s": {"is_beam_decode": True, "result_width": width}},
+        },
+    )
+
+    beam_decision.maybe_run_worker_beam_decision(runner, object())
+
+    assert runner._beam_decision_tensors is raw
+    assert runner._beam_decision_result["buffer_format"] == "beam_result_i32_f32_v1"
+    assert beam_decision.unpack_beam_result_buffer(runner._beam_decision_result) == (
+        [11, 12, 13, 14],
+        [-1.0, -2.0, -3.0, -4.0],
+        [1, 0, 3, 2],
+    )
+    assert state.kv_reorder == [1, 0, 3, 2]

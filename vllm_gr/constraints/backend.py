@@ -81,6 +81,8 @@ def validate_select_inputs(
     logits: torch.Tensor,
     metadata: ConstraintMetadata,
     info: ConstraintBackendInfo,
+    *,
+    expected_logits_vocab_size: int | None = None,
 ) -> None:
     """Validate the common structural ABI without copying or device sync.
 
@@ -101,7 +103,11 @@ def validate_select_inputs(
     rows, vocab_size = logits.shape
     if not 1 <= rows <= info.max_rows:
         raise ValueError(f"logits rows must be in [1, {info.max_rows}], got {rows}")
-    expected_vocab = info.table_metadata.vocab_size
+    expected_vocab = (
+        info.table_metadata.vocab_size
+        if expected_logits_vocab_size is None
+        else expected_logits_vocab_size
+    )
     if vocab_size != expected_vocab:
         raise ValueError(
             f"logits vocab {vocab_size} must equal constraint vocab_size {expected_vocab}"

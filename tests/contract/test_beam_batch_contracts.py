@@ -230,7 +230,7 @@ def test_request_keeps_engine_core_input_generic() -> None:
     validate_beam_batch_request(request)
 
 
-@pytest.mark.parametrize("bad_value", [0, -1, True])  # type: ignore[misc]
+@pytest.mark.parametrize("bad_value", [0, -1, True, 257])  # type: ignore[misc]
 def test_request_positive_geometry_is_fail_closed(bad_value: object) -> None:
     with pytest.raises(BeamContractError, match="beam_width"):
         validate_beam_batch_request(_request(beam_params=_params(beam_width=bad_value)))
@@ -248,10 +248,10 @@ def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() 
 
 
 def test_limits_are_separate_from_protocol_and_check_batch_geometry() -> None:
-    request = _request(beam_params=_params(beam_width=512, max_tokens=5))
+    request = _request(beam_params=_params(beam_width=256, max_tokens=5))
     validate_beam_batch_request(request)
     with pytest.raises(BeamContractError, match="max_beam_width"):
-        validate_beam_batch_request_limits(request, _limits(), max_num_seqs=8)
+        validate_beam_batch_request_limits(request, _limits(max_beam_width=128), max_num_seqs=8)
     with pytest.raises(BeamContractError, match="max_num_seqs"):
         validate_beam_batch_request_limits(_request(), _limits(), max_num_seqs=1)
     with pytest.raises(BeamContractError, match=r"B \* W"):
@@ -261,8 +261,9 @@ def test_limits_are_separate_from_protocol_and_check_batch_geometry() -> None:
 def test_limits_are_non_wire_values_and_fail_closed() -> None:
     limits = _limits()
     assert not isinstance(limits, msgspec.Struct)
-    assert replace(limits, max_beam_width=512).max_beam_width == 512
     validate_beam_batch_limits(limits)
+    with pytest.raises(BeamContractError, match="max_beam_width must be <= 256"):
+        validate_beam_batch_limits(replace(limits, max_beam_width=257))
     with pytest.raises(BeamContractError, match="positive"):
         validate_beam_batch_limits(_limits(max_num_batched_tokens=0))
 

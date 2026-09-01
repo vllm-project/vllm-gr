@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_CAPTURE_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
+    get_beam_graph_runtime_stats,
     is_worker_runner_patched,
     make_patched_execute_model,
 )
@@ -21,6 +22,131 @@ logger = init_logger(__name__)
 
 _GPU_PATCH_MODULE = "vllm_gr.v1.worker.gpu_model_runner_patch"
 _NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu_model_runner_patch"
+_CONSTRAINT_LOAD_PATCH_MARKER = "_vllm_gr_constraint_load_patched"
+_CONSTRAINT_SHUTDOWN_PATCH_MARKER = "_vllm_gr_constraint_shutdown_patched"
+_BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
+
+
+def close_constraint_backend(runner: object) -> None:
+    """Detach and idempotently close the runner-owned canonical Backend."""
+
+    backend = getattr(runner, "constraint_backend", None)
+    # Detach first so no concurrent observer can discover a Backend while it is
+    # being closed, and so repeated shutdown/load calls are naturally idempotent.
+    setattr(runner, "constraint_backend", None)
+    if backend is not None:
+        backend.close()
+
+
+def _runner_vocab_size(runner: object) -> int:
+    """Read the effective model vocabulary through the upstream public API."""
+
+    model_config = getattr(runner, "model_config", None)
+    get_vocab_size = getattr(model_config, "get_vocab_size", None)
+    vocab_size = (
+        get_vocab_size() if callable(get_vocab_size) else getattr(model_config, "vocab_size", None)
+    )
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise RuntimeError(
+            f"constraint backend requires a positive model vocab_size, got {vocab_size!r}"
+        )
+    return vocab_size
+
+
+def make_load_model_with_constraint_backend(original):
+    """Load weights first, then atomically publish a ready canonical Backend."""
+
+    if getattr(original, _CONSTRAINT_LOAD_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def load_model_with_constraint_backend(self, *args, **kwargs):
+        from vllm_gr.config import GRConfig
+
+        # A complete load replaces the model runtime. Release the previous
+        # Backend before loading weights so a failed reload cannot leave stale
+        # canonical tables reachable from this runner.
+        close_constraint_backend(self)
+        result = original(self, *args, **kwargs)
+
+        backend = None
+        try:
+            gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
+            table_config = gr_config.constraint_table
+            if table_config is None or not table_config.enabled:
+                return result
+
+            max_rows = gr_config.beam_max_width
+            if max_rows is None:
+                raise ValueError(
+                    "canonical constraint_table.enabled=true requires "
+                    "beam_max_width to be configured"
+                )
+            if max_rows > table_config.max_top_k:
+                raise ValueError(
+                    "beam_max_width must be <= constraint_table.max_top_k "
+                    f"for canonical constraint sampling, got {max_rows} > "
+                    f"{table_config.max_top_k}"
+                )
+
+            from vllm_gr.constraints.loader import load_constraint_backend
+
+            backend = load_constraint_backend(
+                config=table_config,
+                device=getattr(self, "device", None),
+                vocab_size=_runner_vocab_size(self),
+                dtype=getattr(getattr(self, "model_config", None), "dtype", None),
+                # One Backend call is made per request. Decode requests carry
+                # exactly beam_width logits rows, so beam_max_width is the
+                # canonical row-capacity bound.
+                max_rows=max_rows,
+            )
+            if backend is None:
+                raise RuntimeError("enabled canonical constraint table loader returned no Backend")
+
+            model_memory_usage = int(getattr(self, "model_memory_usage", 0))
+            self.model_memory_usage = model_memory_usage + backend.info.device_memory_bytes
+
+            # Publication is the atomic boundary. The loader returns an NPU
+            # Backend only after readiness and returns an immediately usable CPU
+            # Backend, so requests never observe a partially initialized object.
+            self.constraint_backend = backend
+            return result
+        except BaseException:
+            if backend is not None:
+                backend.close()
+            self.constraint_backend = None
+            raise
+
+    setattr(load_model_with_constraint_backend, _CONSTRAINT_LOAD_PATCH_MARKER, True)
+    return load_model_with_constraint_backend
+
+
+def make_shutdown_with_constraint_backend(original=None):
+    """Detach the canonical Backend before running native runner shutdown."""
+
+    if original is not None and getattr(original, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
+        return original
+
+    if original is None:
+
+        def shutdown_with_constraint_backend(self, *args, **kwargs):
+            del args, kwargs
+            close_constraint_backend(self)
+
+    else:
+
+        @wraps(original)
+        def shutdown_with_constraint_backend(self, *args, **kwargs):
+            close_constraint_backend(self)
+            return original(self, *args, **kwargs)
+
+    setattr(
+        shutdown_with_constraint_backend,
+        _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
+        True,
+    )
+    return shutdown_with_constraint_backend
 
 
 def _active_platform_module_name() -> str:
@@ -41,9 +167,34 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
     return _get_active_platform_module().discover_worker_runners()
 
 
+def _install_active_worker_resource_hook() -> None:
+    """Mount named vllm-gr utility RPCs on the active CUDA Worker class."""
+
+    if _active_platform_module_name() != _GPU_PATCH_MODULE:
+        # NPUWorker installs this hook from its delayed init_device wrapper in
+        # ascend_compat, after vllm-ascend has finished resolving its class.
+        return
+    from vllm.v1.worker.gpu_worker import Worker
+
+    from vllm_gr.constraints.worker_inject import install_worker_resource_hook
+
+    install_worker_resource_hook(Worker)
+    if not getattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
+        # A named method is required here: vLLM's safe msgpack utility channel
+        # intentionally rejects callable serialization unless insecure pickle
+        # fallback is enabled.  The profiling contract must work under spawn
+        # without weakening that policy.
+        Worker.get_gr_beam_graph_runtime_stats = get_beam_graph_runtime_stats  # type: ignore[attr-defined]
+        setattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, True)
+
+
 def apply_worker_patches() -> None:
     """Install grouped-Beam hooks on active-platform ModelRunner targets."""
     logger.info("vllm-gr: apply_worker_patches called")
+    # collective_rpc targets the Worker, not its ModelRunner.  Install this
+    # even when all runner hooks were already present (idempotent) so canonical
+    # Constraint Tables can be injected in both uniproc and multiproc engines.
+    _install_active_worker_resource_hook()
     platform_module = _get_active_platform_module()
     runners_to_patch = [
         (runner_name, runner_class)
@@ -52,6 +203,16 @@ def apply_worker_patches() -> None:
     ]
 
     for runner_name, runner_class in runners_to_patch:
+        load_model = getattr(runner_class, "load_model", None)
+        if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
+            runner_class.load_model = make_load_model_with_constraint_backend(load_model)
+
+        shutdown = getattr(runner_class, "shutdown", None)
+        if not getattr(shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
+            runner_class.shutdown = make_shutdown_with_constraint_backend(
+                shutdown if callable(shutdown) else None
+            )
+
         runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs

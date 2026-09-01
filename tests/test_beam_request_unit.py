@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
 import pytest
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
     EngineCoreRequestType,
@@ -36,7 +37,7 @@ from vllm_gr.entrypoints.openai.serving_engine import (
     _beam_request_cleanup,
     _beam_request_step,
 )
-from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.sampling_params import BeamSearchParams, clone_beam_decode_sampling_params
 from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_request_step_update
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
@@ -64,6 +65,13 @@ from vllm_gr.v1.worker.model_runner_common import _process_beam_decode_request
 
 # Ensure custom enum members exist in this process for all tests below.
 register_engine_core_request_types()
+
+
+def test_beam_search_params_enforces_global_width_limit() -> None:
+    assert BeamSearchParams(beam_width=256, max_tokens=1).beam_width == 256
+    with pytest.raises(VLLMValidationError, match=r"\[1, 256\]"):
+        BeamSearchParams(beam_width=257, max_tokens=1)
+
 
 # ---------------------------------------------------------------------------
 # Module-level picklable targets for subprocess tests (§6)
@@ -211,6 +219,7 @@ def _make_beam_update(
     client_index: int = 0,
     current_wave: int = 0,
     data_parallel_rank: int | None = None,
+    constraint_step: int = 0,
 ) -> BeamRequestStepUpdate:
     return BeamRequestStepUpdate(
         session_id=session_id,
@@ -225,6 +234,7 @@ def _make_beam_update(
         client_index=client_index,
         current_wave=current_wave,
         data_parallel_rank=data_parallel_rank,
+        constraint_step=constraint_step,
     )
 
 
@@ -843,6 +853,7 @@ class TestBeamCache:
             beam_width=2,
             parent_beam_ids=["old-0", "old-1"],
             child_beam_ids=["new-0", "new-1"],
+            constraint_step=1,
         )
         with (
             patch("vllm.v1.request.Request") as MockReq,
@@ -884,18 +895,19 @@ class TestBeamCache:
         else:
             raise AssertionError("Scheduler accepted missing beam_width metadata")
 
-    def test_scheduler_rejects_invalid_beam_width(self) -> None:
+    @pytest.mark.parametrize("beam_width", [0, 257])  # type: ignore[misc]
+    def test_scheduler_rejects_invalid_beam_width(self, beam_width: int) -> None:
         req = SimpleNamespace(
             request_id="s0",
             is_beam_decode=True,
-            beam_width=0,
+            beam_width=beam_width,
             num_computed_tokens=1,
         )
 
         try:
             build_beam_request_metadata(req, num_scheduled_tokens=1)
         except RuntimeError as exc:
-            assert "invalid beam_width=0" in str(exc)
+            assert f"invalid beam_width={beam_width}" in str(exc)
         else:
             raise AssertionError("Scheduler accepted invalid beam_width metadata")
 
@@ -2074,6 +2086,30 @@ class TestWorkerDecisionFlatten:
         assert ids == [11, 12]
         assert lps == [-1.5, -2.5]
         assert parent == [0, 1]
+
+    def test_compact_beam_result_payload_flattens(self) -> None:
+        import torch
+
+        from vllm_gr.entrypoints.openai.serving_engine import _worker_decision_flatten
+        from vllm_gr.v1.beam import beam_decision
+
+        encoded = beam_decision._encode_cuda_beam_result(
+            {
+                "out_token_ids": torch.tensor([[11, 12]], dtype=torch.int32),
+                "out_token_index": torch.tensor([[0, 1]], dtype=torch.int32),
+                "out_log_probs": torch.tensor([[-1.5, -2.5]], dtype=torch.float32),
+            },
+            is_last_step=False,
+        )
+        assert encoded is not None
+        decision, _ = encoded
+
+        ids, lps, parent, cache = _worker_decision_flatten(decision, 2, self._parents())
+
+        assert ids == [11, 12]
+        assert lps == pytest.approx([-1.5, -2.5])
+        assert parent == [0, 1]
+        assert cache == [([11], [-1.5], [0], [None]), ([12], [-1.5], [0], [None])]
 
     def test_request_offset_stripped_from_parents(self) -> None:
         """out_token_index keeps the GLOBAL request offset (batch == 1: offset 0)."""
