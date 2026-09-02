@@ -172,6 +172,7 @@ def _validate_engine_clients_patch() -> str | None:
         and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
         and InprocClient.add_requests is inproc_add_requests
         and InprocClient.beam_request_step_update is inproc_beam_request_step_update
+        and getattr(InprocClient.get_output, "_vllm_gr_inproc_self_advance", False)
     )
     return _verified(valid, "EngineCore client methods are not fully installed")
 
@@ -218,7 +219,9 @@ def _validate_engine_core_request_patch() -> str | None:
     )
     from vllm_gr.v1.engine.engine_core_patch import (
         _BEAM_STATE_INIT_MARKER,
+        _CLIENT_REQUEST_PATCH_MARKER,
         _ENGINE_STEP_PATCH_MARKER,
+        _PIS_PATCH_MARKER,
     )
 
     valid = (
@@ -233,7 +236,9 @@ def _validate_engine_core_request_patch() -> str | None:
         and EngineCore._beam_self_advance is _beam_self_advance
         and EngineCoreProc._beam_self_advance is _beam_self_advance
         and getattr(EngineCoreProc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)
+        and getattr(EngineCoreProc._handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, False)
         and EngineCoreProc.process_input_sockets is process_input_sockets
+        and getattr(EngineCoreProc.process_input_sockets, _PIS_PATCH_MARKER, False)
     )
     return _verified(valid, "EngineCore beam request dispatch is not fully installed")
 

@@ -73,12 +73,12 @@ def test_canonical_beam_runtime_options_round_trip(
     beam = raw["beam"]
     assert isinstance(beam, dict)
     beam["worker_decision"] = worker_decision
-    beam["self_advance"] = False
+    beam["engine_driven"] = False
 
     config = gr_config_from_mapping(raw)
 
     assert config.beam_worker_decision is worker_decision
-    assert config.beam_self_advance is False
+    assert config.beam_engine_driven is False
     assert gr_config_to_mapping(config) == raw
 
 
@@ -86,7 +86,7 @@ def test_canonical_self_advance_requires_worker_decision(tmp_path: Path) -> None
     raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
     beam = raw["beam"]
     assert isinstance(beam, dict)
-    beam["self_advance"] = True
+    beam["engine_driven"] = True
 
     with pytest.raises(ValueError, match="requires beam_worker_decision=True"):
         gr_config_from_mapping(raw)
@@ -289,13 +289,13 @@ def test_engine_creation_writes_enabled_canonical_config(
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    ("async_scheduling", "expected_self_advance"),
-    [(False, True), (True, None)],
+    ("async_scheduling", "expected_engine_driven"),
+    [(False, True), (True, True)],
 )
 def test_engine_creation_serializes_cuda_decision_defaults(
     tmp_path: Path,
     async_scheduling: bool,
-    expected_self_advance: bool | None,
+    expected_engine_driven: bool | None,
 ) -> None:
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
@@ -321,6 +321,6 @@ def test_engine_creation_serializes_cuda_decision_defaults(
 
     payload = vllm_config.additional_config[GR_CONFIG_KEY]
     assert payload["beam"]["worker_decision"] is True
-    assert payload["beam"].get("self_advance") is expected_self_advance
+    assert payload["beam"].get("engine_driven") is expected_engine_driven
     assert parse_gr_config(vllm_config).beam_worker_decision is True
-    assert parse_gr_config(vllm_config).beam_self_advance is expected_self_advance
+    assert parse_gr_config(vllm_config).beam_engine_driven is expected_engine_driven

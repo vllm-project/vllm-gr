@@ -66,6 +66,7 @@ def test_build_engine_core_decoders_shares_oob_tensor_provider() -> None:
     assert decoders.add_request.oob_tensor_provider is provider
     assert decoders.add_batch.oob_tensor_provider is provider
     assert decoders.beam_step_update.oob_tensor_provider is provider
+    assert decoders.submit_session.oob_tensor_provider is provider
     assert decoders.generic.oob_tensor_provider is provider
 
 
@@ -116,3 +117,38 @@ def test_decode_beam_step_update_preserves_constraint_step() -> None:
     )
 
     assert decoded.constraint_step == 2
+
+
+def test_decode_submit_session_payload() -> None:
+    """SUBMIT_SESSION carries (prefill batch, session template) as one
+    tuple payload; the EngineCoreRequest entries need the same decoder
+    treatment as the ADD_BATCH list."""
+    from vllm_gr.v1.engine.wire import register_engine_core_request_types
+
+    register_engine_core_request_types()
+    decoders = build_engine_core_decoders(None)
+    requests = [
+        _engine_core_request("request-0"),
+        _engine_core_request("request-1"),
+    ]
+    template = _beam_step_update()
+    template.session_id = "request-0"
+    template.constraint_step = 1
+
+    decoded = decode_engine_core_payload(
+        decoders,
+        EngineCoreRequestType.SUBMIT_SESSION,
+        _frames((requests, template)),
+    )
+
+    assert isinstance(decoded, tuple)
+    assert len(decoded) == 2
+    decoded_requests, decoded_template = decoded
+    assert all(isinstance(request, EngineCoreRequest) for request in decoded_requests)
+    assert [request.request_id for request in decoded_requests] == [
+        "request-0",
+        "request-1",
+    ]
+    assert isinstance(decoded_template, BeamRequestStepUpdate)
+    assert decoded_template.session_id == "request-0"
+    assert decoded_template.constraint_step == 1

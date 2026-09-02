@@ -123,10 +123,26 @@ async def _next_data_parallel_rank(data_parallel_size: int) -> int:
         return rank
 
 
+# Collector timeout: EngineCore engine-driven chaining can run steps ahead
+# of the frontend's collector registration (buffered by register_beam_output's
+# replay).  A lost output would otherwise hang the request forever.
+_BEAM_COLLECT_TIMEOUT_S = 120.0
+
+
 async def _collect_beam_result(q):
-    """Drain output queue until finished."""
+    """Drain output queue until finished (bounded wait)."""
+    import asyncio
+
     while True:
-        out = await q.get()
+        try:
+            out = await asyncio.wait_for(q.get(), timeout=_BEAM_COLLECT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.error(
+                "vllm-gr: beam result collection timed out after %.0fs "
+                "(chained step output never reached the collector)",
+                _BEAM_COLLECT_TIMEOUT_S,
+            )
+            raise
         if out.finished:
             return out
 
@@ -147,8 +163,19 @@ async def _add_batch_step(
     trace_headers,
     priority=0,
     data_parallel_rank: int | None = None,
+    session_template=None,
 ):
-    """ADD_BATCH path: prepare and batch-send requests (step 0)."""
+    """ADD_BATCH path: prepare and batch-send requests (step 0).
+
+    ``session_template`` (engine-driven prefill chain) is sent fire-and-forget
+    right after the ADD_BATCH and BEFORE awaiting the prefill outputs: the
+    EngineCore consumes it in the same busy-loop iteration that processes
+    the prefill output, so any later send would always be too late.
+    When the client supports SUBMIT_SESSION, the ADD_BATCH and the template
+    travel as ONE wire message instead (same ordering guarantees, one fewer
+    message per session); the two-message path stays available for clients
+    without the merged send.
+    """
     queues = []
     engine_core_requests = []
     for i, (individual_prompt, lora_req) in enumerate(zip(prompts_batch, lora_req_batch)):
@@ -165,7 +192,39 @@ async def _add_batch_step(
         queues.append(q)
         engine_core_requests.append(ec_req)
 
-    await engine_client._add_requests_batch(engine_core_requests, use_batch_message=use_beam_req)
+    # Track the session before EngineCore dispatch: engine-driven chaining
+    # can emit the first decode output while this coroutine still awaits
+    # prefill, and process_outputs only buffers tracked session ids.
+    if use_beam_req and engine_core_requests:
+        track = getattr(engine_client, "track_beam_session", None)
+        if track is not None:
+            track(engine_core_requests[0].request_id)
+
+    # The template must land before the prefill output iteration runs its
+    # engine-driven hook — either merged into the SUBMIT_SESSION send below
+    # or as the fire-and-forget message right after ADD_BATCH; both precede
+    # the _gather_beam_results await, and anything later would be too late.
+    submit_session = getattr(engine_client, "submit_session", None)
+    if (
+        session_template is not None
+        and use_beam_req
+        and engine_core_requests
+        and submit_session is not None
+    ):
+        session_template.session_id = engine_core_requests[0].request_id
+        await submit_session(engine_core_requests, session_template)
+    else:
+        await engine_client._add_requests_batch(
+            engine_core_requests, use_batch_message=use_beam_req
+        )
+
+        # Cache the session's step template now (same socket as ADD_BATCH,
+        # FIFO) so it is in beam_cache before the prefill output iteration
+        # runs its engine-driven hook.  The session id is stamped from the
+        # actual request ids instead of assuming the batch layout.
+        if session_template is not None and use_beam_req and engine_core_requests:
+            session_template.session_id = engine_core_requests[0].request_id
+            await engine_client.beam_session_template(session_template)
 
     internal_ids = [r.request_id for r in engine_core_requests] if use_beam_req else []
     output = await _gather_beam_results(queues)
@@ -230,7 +289,7 @@ async def _beam_request_step(
 
     # Dispatch the consolidated persistent update to the client, unless
     # EngineCore already chained this decode step from the worker's beam
-    # decision (beam_self_advance). Re-sending the update would re-ADD the
+    # decision (engine-driven). Re-sending the update would re-ADD the
     # session's request while it is still running under the same
     # session_id, crashing scheduler.add_request with "duplicate request
     # id"; only the queue registration + await below are needed to receive
@@ -503,7 +562,7 @@ async def beam_search(
     fork_info: list[tuple[int, int]] | None = None
     prefill_id: str | None = None
     # Set when the previous decode step's worker decision was chained
-    # in-process by EngineCore (beam_self_advance); the next loop iteration
+    # in-process by EngineCore (engine-driven); the next loop iteration
     # must then skip its beam_request_step_update send (see
     # _beam_request_step) and only await the chained step's output.
     prev_step_self_advance_chained = False
@@ -576,11 +635,37 @@ async def beam_search(
                 max_decode_steps=max_tokens - pre_calc,
                 is_constrained=_is_constrained,
                 # EngineCore chained the previous step from the worker's
-                # beam decision (beam_self_advance); re-sending the step
+                # beam decision (engine-driven); re-sending the step
                 # update would duplicate the session request id.
                 self_advance_chained=prev_step_self_advance_chained,
             )
         else:
+            # Prefill session template: fields EngineCore cannot derive
+            # itself when it constructs the step-0 BeamRequestStepUpdate
+            # in-process from the worker's constrained-prefill decision.
+            # Sent unconditionally on the constrained beam path;
+            # EngineCore-side gating (beam_engine_driven) decides whether
+            # to consume it.
+            prefill_session_template = None
+            if use_beam_request and _is_constrained:
+                prefill_session_template = BeamRequestStepUpdate(
+                    session_id="",  # stamped by _add_batch_step from the request ids
+                    parent_beam_ids=[],
+                    child_beam_ids=[],
+                    beam_tokens=[],
+                    pruned_ids=[],
+                    prefix_len=len(initial_tokens),
+                    beam_width=beam_width,
+                    sampling_params=clone_beam_decode_sampling_params(beam_search_params),
+                    eos_token_id=eos_token_id,
+                    trace_headers=trace_headers,
+                    data_parallel_rank=rank,
+                    priority=priority,
+                    max_decode_steps=max_tokens - pre_calc,
+                    # Constraint Tables: 1 = constrained decode step 0 (the
+                    # value the frontend itself puts on the step-0 update).
+                    constraint_step=1,
+                )
             output, new_ids = await _add_batch_step(
                 self.engine_client,
                 prompts_batch,
@@ -591,6 +676,7 @@ async def beam_search(
                 trace_headers,
                 priority=priority,
                 data_parallel_rank=rank,
+                session_template=prefill_session_template,
             )
             if new_ids:
                 prev_beam_internal_ids = new_ids
@@ -623,6 +709,14 @@ async def beam_search(
             if prefill_decision is not None:
                 worker_candidates = _worker_decision_flatten(
                     prefill_decision, beam_width, all_beams
+                )
+                # EngineCore chained step-0 in-process from this prefill
+                # decision (engine-driven).  Iteration 1 must then use the
+                # existing skip path (only collector registration + await;
+                # re-sending the step update would re-ADD the running session
+                # request and trip scheduler.add_request's duplicate-id assert).
+                prev_step_self_advance_chained = bool(
+                    prefill_decision.get("beam_self_advance_chained")
                 )
 
         # -------------------------------------------------------------------------
@@ -663,7 +757,7 @@ async def beam_search(
             if worker_decision is not None:
                 worker_candidates = _worker_decision_flatten(worker_decision, beam_width, all_beams)
             # EngineCore chained this step's successor from the worker's
-            # decision (beam_self_advance): the next iteration skips its
+            # decision (engine-driven): the next iteration skips its
             # beam_request_step_update and only awaits the chained output.
             # Missing flag (terminal decision / skip / fallback) leaves the
             # frontend-driven path in charge.

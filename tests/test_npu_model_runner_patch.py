@@ -435,14 +435,15 @@ def test_npu_worker_decision_derives_kv_reorder_from_host_copy(
     npu_patch._maybe_run_worker_beam_decision(runner, object())
 
     result = runner._beam_decision_result
-    # is_last_step is always present: EngineCore self-advance
-    # (beam_self_advance) uses it as the stop-chaining signal; the frontend
-    # consumers ignore it.
+    # is_last_step is always present: EngineCore engine-driven chaining
+    # uses it as the stop-chaining signal; the frontend consumers ignore it.
     assert set(result) == {
         "out_token_ids",
         "out_token_index",
         "out_log_probs",
         "is_last_step",
+        "stage",
+        "session_id",
     }
     assert result["is_last_step"] is False
     # The return payload is nested Python lists: kv_transfer_params values

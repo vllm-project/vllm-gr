@@ -240,7 +240,7 @@ def validate_beam_worker_decision(value: object) -> bool | None:
     raise ValueError("vllm-gr beam_worker_decision must be a boolean or null")
 
 
-def validate_beam_self_advance(value: object) -> bool | None:
+def validate_beam_engine_driven(value: object) -> bool | None:
     if value is None:
         return None
     if isinstance(value, bool):
@@ -251,7 +251,7 @@ def validate_beam_self_advance(value: object) -> bool | None:
             return True
         if lowered in ("false", "0", "no", "off"):
             return False
-    raise ValueError("vllm-gr beam_self_advance must be a boolean or null")
+    raise ValueError("vllm-gr beam_engine_driven must be a boolean or null")
 
 
 def validate_beam_max_decode_steps(value: object) -> int:

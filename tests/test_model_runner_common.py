@@ -548,7 +548,7 @@ def test_beam_session_rejects_concurrent_incremental_requests() -> None:
 
 def _m2_runner(
     *,
-    beam_self_advance: bool = True,
+    beam_engine_driven: bool = True,
     beam_worker_decision: bool = True,
     use_async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -567,7 +567,7 @@ def _m2_runner(
 
     runner = SimpleNamespace(
         _vllm_gr_config=SimpleNamespace(
-            beam_self_advance=beam_self_advance,
+            beam_engine_driven=beam_engine_driven,
             beam_worker_decision=beam_worker_decision,
         ),
         use_async_scheduling=use_async_scheduling,
@@ -583,15 +583,62 @@ def test_should_inline_sample_tokens_gate() -> None:
     """Gate opens only with both opt-ins, sync scheduling, and PP=1."""
     assert common._should_inline_sample_tokens(_m2_runner()) is True
 
-    assert common._should_inline_sample_tokens(_m2_runner(beam_self_advance=False)) is False
+    assert common._should_inline_sample_tokens(_m2_runner(beam_engine_driven=False)) is False
     assert common._should_inline_sample_tokens(_m2_runner(beam_worker_decision=False)) is False
     assert common._should_inline_sample_tokens(_m2_runner(use_async_scheduling=True)) is False
     assert common._should_inline_sample_tokens(_m2_runner(pipeline_parallel_size=2)) is False
     # Missing attributes read as their safe defaults (sync / PP=1).
     minimal = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(beam_self_advance=True, beam_worker_decision=True)
+        _vllm_gr_config=SimpleNamespace(beam_engine_driven=True, beam_worker_decision=True)
     )
     assert common._should_inline_sample_tokens(minimal) is True
+
+
+def test_should_inline_sample_tokens_rejects_mixed_or_guided_rows() -> None:
+    """M2 is per-request: ordinary, mixed, and structured rows stay two-RPC."""
+    runner = _m2_runner()
+    beam_sched = SimpleNamespace(
+        beam_data={"b": {"is_beam_decode": True}},
+        num_scheduled_tokens={"b": 1},
+        pending_structured_output_tokens=False,
+        scheduled_new_reqs=[],
+    )
+    assert common._should_inline_sample_tokens(runner, beam_sched) is True
+
+    mixed = SimpleNamespace(
+        beam_data={"b": {"is_beam_decode": True}},
+        num_scheduled_tokens={"b": 1, "plain": 4},
+        pending_structured_output_tokens=False,
+        scheduled_new_reqs=[],
+    )
+    assert common._should_inline_sample_tokens(runner, mixed) is False
+
+    guided = SimpleNamespace(
+        beam_data={"b": {"is_beam_decode": True}},
+        num_scheduled_tokens={"b": 1},
+        pending_structured_output_tokens=True,
+        scheduled_new_reqs=[],
+    )
+    assert common._should_inline_sample_tokens(runner, guided) is False
+
+    structured_req = SimpleNamespace(
+        sampling_params=SimpleNamespace(structured_outputs=object(), guided_decoding=None)
+    )
+    structured_batch = SimpleNamespace(
+        beam_data={"b": {"is_beam_decode": True}},
+        num_scheduled_tokens={"b": 1},
+        pending_structured_output_tokens=False,
+        scheduled_new_reqs=[structured_req],
+    )
+    assert common._should_inline_sample_tokens(runner, structured_batch) is False
+
+    ordinary = SimpleNamespace(
+        beam_data={},
+        num_scheduled_tokens={"plain": 8},
+        pending_structured_output_tokens=False,
+        scheduled_new_reqs=[],
+    )
+    assert common._should_inline_sample_tokens(runner, ordinary) is False
 
 
 def test_inline_sample_tokens_runs_and_clears_state() -> None:
@@ -710,3 +757,20 @@ def test_execute_wrapper_does_not_inline_non_none_output() -> None:
 
     assert wrapped(runner, scheduler_output) == "direct"
     assert runner._sample_tokens_calls == []
+
+
+def test_execute_wrapper_does_not_inline_mixed_beam_plus_structured() -> None:
+    wrapped = common.make_patched_execute_model(_orig_execute_model_none)
+    runner = _m2_runner()
+    scheduler_output = SimpleNamespace(
+        beam_data={"b": {"is_beam_decode": True}},
+        num_scheduled_tokens={"b": 1, "guided": 2},
+        pending_structured_output_tokens=True,
+        scheduled_new_reqs=[],
+    )
+
+    out = wrapped(runner, scheduler_output)
+
+    assert out is None
+    assert runner._sample_tokens_calls == []
+    assert runner.execute_model_state == "state"

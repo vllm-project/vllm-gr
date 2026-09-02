@@ -170,6 +170,7 @@ def _run_gr_beam_search_target(loops: int) -> None:
 
 
 @pytest.mark.slow  # type: ignore
+@pytest.mark.timeout(600)  # spawn subprocess loads the 1.7B model + engine thrice
 def test_serving_gr_beam_search(loops: int) -> None:
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_run_gr_beam_search_target, args=(loops,))

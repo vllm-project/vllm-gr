@@ -18,6 +18,12 @@ logger = init_logger(__name__)
 _BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
 _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
 _ENGINE_STEP_PATCH_MARKER = "_vllm_gr_beam_self_advance_step"
+_CLIENT_REQUEST_PATCH_MARKER = "_vllm_gr_gr_input_dispatch"
+_PIS_PATCH_MARKER = "_vllm_gr_process_input_sockets"
+
+# Upstream EngineCoreProc.process_input_sockets captured before the adapter
+# is installed.  Parity tests inspect this object against the pinned vLLM.
+UPSTREAM_PROCESS_INPUT_SOCKETS = None
 
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
@@ -45,12 +51,12 @@ def make_patched_engine_core_init(original_init):
 
 
 # ---------------------------------------------------------------------------
-# EngineCoreProc._process_engine_step wrapper (beam_self_advance hook)
+# EngineCoreProc._process_engine_step wrapper (engine-driven chain hook)
 # ---------------------------------------------------------------------------
 
 
 def make_patched_process_engine_step(original_step):
-    """Wrap ``_process_engine_step`` to drive EngineCore self-advance.
+    """Wrap ``_process_engine_step`` to drive EngineCore engine-driven chaining.
 
     The wrapper runs between ``step_fn()`` producing the step's
     ``EngineCoreOutputs`` and those outputs being forwarded to the output
@@ -61,8 +67,8 @@ def make_patched_process_engine_step(original_step):
     chained step's ADD lands in ``input_queue`` before this iteration ends,
     so the busy loop continues straight into the next decode step.
 
-    ``_beam_self_advance`` itself is a no-op when the beam_self_advance
-    config is off, so the wrapper is safe for every engine.
+    ``_beam_self_advance`` itself is a no-op when ``beam_engine_driven``
+    is off, so the wrapper is safe for every engine.
     """
 
     if getattr(original_step, _ENGINE_STEP_PATCH_MARKER, False):
@@ -94,6 +100,28 @@ def make_patched_process_engine_step(original_step):
     return patched_process_engine_step
 
 
+def make_patched_handle_client_request(original):
+    """Dispatch GR wire types that reach the EngineCore busy loop.
+
+    Upstream logs unrecognized types.  The socket adapter normally consumes
+    GR messages on the input thread; this wrap is the in-process / fallback
+    path and a compile-time-shaped extension point for those types.
+    """
+    if getattr(original, _CLIENT_REQUEST_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def patched_handle_client_request(self, request_type, request, *args, **kwargs):
+        from vllm_gr.v1.engine.core import dispatch_gr_engine_core_input
+
+        if dispatch_gr_engine_core_input(self, request_type, request):
+            return None
+        return original(self, request_type, request, *args, **kwargs)
+
+    setattr(patched_handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, True)
+    return patched_handle_client_request
+
+
 # ---------------------------------------------------------------------------
 # Child-process patch applicator — called from patched run_engine_core
 # ---------------------------------------------------------------------------
@@ -101,13 +129,15 @@ def make_patched_process_engine_step(original_step):
 
 def apply_engine_core_request_patches() -> None:
     """Install EngineCore request dispatch and beam-state support."""
-    from vllm.v1.engine.core import EngineCore, EngineCoreProc
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 
     from vllm_gr.v1.engine.core import (
         _apply_beam_step,
         _beam_self_advance,
         _cache_beam_request,
         _handle_beam_request_step_update,
+        _handle_beam_session_template,
+        _handle_submit_session,
         process_input_sockets,
     )
 
@@ -123,15 +153,33 @@ def apply_engine_core_request_patches() -> None:
     # Bind request handlers explicitly on both classes.
     EngineCore._cache_beam_request = _cache_beam_request
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
+    EngineCore._handle_beam_session_template = _handle_beam_session_template
+    EngineCore._handle_submit_session = _handle_submit_session
     EngineCore._apply_beam_step = _apply_beam_step
     EngineCore._beam_self_advance = _beam_self_advance
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
+    EngineCoreProc._handle_beam_session_template = _handle_beam_session_template
+    EngineCoreProc._handle_submit_session = _handle_submit_session
     EngineCoreProc._apply_beam_step = _apply_beam_step
     EngineCoreProc._beam_self_advance = _beam_self_advance
 
-    # Replace EngineCoreProc.process_input_sockets
+    # Narrow GR dispatch on the busy-loop request handler so in-process
+    # EngineCore and any GR type that misses the socket adapter still land.
+    EngineCoreProc._handle_client_request = make_patched_handle_client_request(
+        EngineCoreProc._handle_client_request
+    )
+    DPEngineCoreProc._handle_client_request = make_patched_handle_client_request(
+        DPEngineCoreProc._handle_client_request
+    )
+
+    # vLLM-version adapter: capture the upstream loop once, then install ours.
+    global UPSTREAM_PROCESS_INPUT_SOCKETS
+    current_pis = EngineCoreProc.process_input_sockets
+    if UPSTREAM_PROCESS_INPUT_SOCKETS is None and current_pis is not process_input_sockets:
+        UPSTREAM_PROCESS_INPUT_SOCKETS = current_pis
     EngineCoreProc.process_input_sockets = process_input_sockets
+    setattr(EngineCoreProc.process_input_sockets, _PIS_PATCH_MARKER, True)
 
     # Self-advance hook: _process_engine_step feeds each step's outputs to
     # _beam_self_advance BEFORE they reach the output queue, so the chained
@@ -407,28 +455,45 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         if beam_search_result is None:
             return result
 
-        # Attach to exactly one EngineCoreOutput (the first beam-session
-        # output in this step).  The dict payload carries host tensors; the
-        # IPC envelope only serialises the kv_transfer_params mapping, so host
-        # tensors are safe here (they were D2H'd by the worker).
+        # Attach to exactly one EngineCoreOutput.  Prefer the output whose
+        # request_id owns the decision (worker decisions carry session_id —
+        # review P5: a mixed batch of session A's decode and session B's
+        # constrained prefill must never cross-attach); fall back to the first
+        # beam-session output for legacy payloads without the marker.  The
+        # dict payload carries host tensors; the IPC envelope only serialises
+        # the kv_transfer_params mapping, so host tensors are safe here (they
+        # were D2H'd by the worker).
         beam_data = getattr(scheduler_output, "beam_data", {})
         beam_ids = {
             req_id
             for req_id, mdata in beam_data.items()
             if mdata.get("is_beam_decode", False) or mdata.get("is_constraint_prefill", False)
         }
+        decision_owner = (
+            beam_search_result.get("session_id") if isinstance(beam_search_result, dict) else None
+        )
+
+        def _attach(target_out) -> bool:
+            kv_params = dict(target_out.kv_transfer_params or {})
+            kv_params["beam_search_result"] = beam_search_result
+            target_out.kv_transfer_params = kv_params
+            return True
+
         attached = False
+        fallback = None
         for ec_outputs in result.values():
-            if attached:
-                break
             for out in getattr(ec_outputs, "outputs", []):
                 if out.request_id not in beam_ids:
                     continue
-                kv_params = dict(out.kv_transfer_params or {})
-                kv_params["beam_search_result"] = beam_search_result
-                out.kv_transfer_params = kv_params
-                attached = True
+                if decision_owner is not None and out.request_id == decision_owner:
+                    attached = _attach(out)
+                    break
+                if fallback is None:
+                    fallback = out
+            if attached:
                 break
+        if not attached and fallback is not None:
+            _attach(fallback)
         if not attached:
             logger.debug(
                 "vllm-gr: beam_search_result present but no matching EngineCoreOutput "

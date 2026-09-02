@@ -817,16 +817,49 @@ def _attach_beam_search_result(runner: Any, model_output: Any) -> None:
     target.beam_search_result = decision
 
 
-def _should_inline_sample_tokens(runner: Any) -> bool:
+def _sampling_params_is_structured(params: Any) -> bool:
+    """True when the row carries guided / structured-output constraints."""
+    if params is None:
+        return False
+    if getattr(params, "structured_outputs", None) is not None:
+        return True
+    return getattr(params, "guided_decoding", None) is not None
+
+
+def _batch_has_non_beam_or_structured_row(scheduler_output: Any) -> bool:
+    """True when M2 must stay off: ordinary, mixed, or guided rows present."""
+    if scheduler_output is None:
+        return False
+    if getattr(scheduler_output, "pending_structured_output_tokens", False):
+        return True
+    beam_data = getattr(scheduler_output, "beam_data", None) or {}
+    scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
+    scheduled_ids = set(scheduled.keys()) if scheduled else set(beam_data.keys())
+    if not scheduled_ids:
+        # Ordinary empty/unknown batch: do not inline.
+        return True
+    for req_id in scheduled_ids:
+        meta = beam_data.get(req_id) or {}
+        if not (meta.get("is_beam_decode") or meta.get("is_constraint_prefill")):
+            return True
+        if meta.get("use_structured_output"):
+            return True
+    for req in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
+        if _sampling_params_is_structured(getattr(req, "sampling_params", None)):
+            return True
+    return False
+
+
+def _should_inline_sample_tokens(runner: Any, scheduler_output: Any = None) -> bool:
     """Whether ``execute_model`` should finish sampling in-process (M2).
 
     The upstream short-circuit (``vllm/v1/engine/core.py``: ``future.result()
     is None`` → ``model_executor.sample_tokens``) only exists on the plain
     ``step()`` path.  It therefore requires:
 
-    - the GRConfig opt-ins: ``beam_self_advance`` (M2 rides the M1 pipeline)
-      and ``beam_worker_decision`` (its validation already requires
-      ``beam_self_advance → beam_worker_decision``);
+    - the GRConfig opt-ins: ``beam_engine_driven`` (M2 rides the engine-
+      driven pipeline) and ``beam_worker_decision`` (its validation already
+      requires ``beam_engine_driven → beam_worker_decision``);
     - ``use_async_scheduling`` off: with async scheduling the engine runs
       ``step_with_batch_queue``, which issues the second ``sample_tokens``
       RPC unconditionally (the returned Future is fed through the batch
@@ -834,19 +867,26 @@ def _should_inline_sample_tokens(runner: Any) -> bool:
     - pipeline-parallel off: with PP>1 the worker contract (IntermediateTensors
       handoff / per-rank responses) is undefined for an inlined output, and
       the engine also switches to ``step_with_batch_queue``.
+    - per-request metadata: every scheduled row must be a beam decode or
+      constraint prefill.  Guided / structured-output rows need the engine
+      grammar bitmask computed *after* execute_model; inlining
+      ``sample_tokens(None)`` would sample them unmasked.  Mixed ordinary
+      batches keep the two-RPC path.
 
-    Everything else (plain requests, non-beam batches, cascade / frontend
-    decision mode) keeps the untouched two-RPC path.
+    When ``scheduler_output`` is omitted the config/topology gates are
+    returned alone (unit tests of those flags).
     """
     gr_cfg = _get_gr_config(runner)
-    if not (gr_cfg.beam_self_advance and gr_cfg.beam_worker_decision):
+    if not (gr_cfg.beam_engine_driven and gr_cfg.beam_worker_decision):
         return False
     if getattr(runner, "use_async_scheduling", False):
         return False
     parallel_config = getattr(runner, "parallel_config", None)
     if parallel_config is not None and getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
         return False
-    return True
+    return not (
+        scheduler_output is not None and _batch_has_non_beam_or_structured_row(scheduler_output)
+    )
 
 
 def _inline_sample_tokens(runner: Any) -> Any:
@@ -1093,7 +1133,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         # decode-only ``decode_step`` tops out at ``loop_len - 2``.
         # Comparing against ``loop_len - 1`` fired the terminal flag
         # one step late: the 3-iteration constrained FSM never saw a
-        # terminal step, beam_self_advance chained a 3rd decode, and
+        # terminal step, engine-driven chaining produced a 3rd decode, and
         # its constraint_step=3 was rejected by
         # build_beam_request_metadata (decode steps are 1/2 only).
         # This matches the ACS reference (``current_step`` there is
@@ -1307,7 +1347,7 @@ def make_patched_execute_model(_orig_execute_model):
                     "prefill_constraint_post_forward_enqueue"
                 ):
                     launch_prepared_cuda_prefill_constraint(self)
-            if out is None and _should_inline_sample_tokens(self):
+            if out is None and _should_inline_sample_tokens(self, scheduler_output):
                 # M2: finish sampling in-process and return the
                 # ModelRunnerOutput through the execute_model channel, so the
                 # engine's None short-circuit (core.py ``future.result()``)

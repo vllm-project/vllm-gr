@@ -18,6 +18,8 @@ from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.engine.wire import (
     ADD_BATCH_WIRE_VALUE,
     BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE,
+    BEAM_SESSION_TEMPLATE_WIRE_VALUE,
+    SUBMIT_SESSION_WIRE_VALUE,
     register_engine_core_request_types,
 )
 
@@ -33,6 +35,8 @@ UPSTREAM_REQUEST_WIRE_VALUES = {
 GR_REQUEST_WIRE_VALUES = {
     "ADD_BATCH": b"\x06",
     "BEAM_REQUEST_STEP_UPDATE": b"\x07",
+    "BEAM_SESSION_TEMPLATE": b"\x08",
+    "SUBMIT_SESSION": b"\x09",
 }
 
 ENGINE_CORE_REQUEST_FIELDS = (
@@ -105,6 +109,8 @@ def _minimal_beam_step_update(**overrides: object) -> BeamRequestStepUpdate:
 def test_engine_core_wire_value_inventory() -> None:
     assert ADD_BATCH_WIRE_VALUE == b"\x06"
     assert BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE == b"\x07"
+    assert BEAM_SESSION_TEMPLATE_WIRE_VALUE == b"\x08"
+    assert SUBMIT_SESSION_WIRE_VALUE == b"\x09"
     register_engine_core_request_types()
     register_engine_core_request_types()
 
@@ -203,3 +209,61 @@ def test_non_beam_request_has_no_scheduler_metadata() -> None:
     request = SimpleNamespace(request_id="request-0", is_beam_decode=False)
 
     assert build_beam_request_metadata(request, num_scheduled_tokens=1) is None
+
+
+def test_process_input_sockets_adapter_preserves_upstream_handshake() -> None:
+    """GR socket adapter is a vLLM-version wrapper: upstream handshake stays."""
+    import inspect
+
+    import vllm_gr.v1.engine.engine_core_patch as ecp
+
+    ecp.apply_engine_core_request_patches()
+    assert ecp.UPSTREAM_PROCESS_INPUT_SOCKETS is not None
+    src = inspect.getsource(ecp.UPSTREAM_PROCESS_INPUT_SOCKETS)
+    for token in (
+        "READY",
+        "ABORT",
+        "put_nowait",
+        "DEALER",
+        "EngineCoreReadyResponse",
+        "preprocess_add_request",
+    ):
+        assert token in src, token
+
+
+def test_gr_input_dispatch_consumes_registered_types() -> None:
+    from vllm.v1.engine import EngineCoreRequestType
+
+    from vllm_gr.v1.engine.core import dispatch_gr_engine_core_input
+    from vllm_gr.v1.engine.wire import register_engine_core_request_types
+
+    register_engine_core_request_types()
+    handled: list[object] = []
+    eng = SimpleNamespace(
+        preprocess_add_request=lambda req: handled.append(("pre", req)) or (req, 0),
+        _handle_request_preproc_error=lambda req: None,
+        _cache_beam_request=lambda req: handled.append(("cache", req)),
+        input_queue=SimpleNamespace(put_nowait=lambda item: handled.append(("put", item))),
+        _handle_beam_request_step_update=lambda payload: handled.append(("step", payload)),
+        _handle_beam_session_template=lambda payload: handled.append(("tpl", payload)),
+        _handle_submit_session=lambda reqs, tpl: handled.append(("submit", reqs, tpl)),
+    )
+
+    assert dispatch_gr_engine_core_input(eng, EngineCoreRequestType.ADD, object()) is False
+    assert dispatch_gr_engine_core_input(
+        eng, EngineCoreRequestType.BEAM_SESSION_TEMPLATE, "template"
+    )
+    assert dispatch_gr_engine_core_input(
+        eng, EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, "update"
+    )
+    assert dispatch_gr_engine_core_input(eng, EngineCoreRequestType.SUBMIT_SESSION, (["r"], "t"))
+    req = SimpleNamespace(request_id="s0")
+    assert dispatch_gr_engine_core_input(eng, EngineCoreRequestType.ADD_BATCH, [req])
+    assert handled == [
+        ("tpl", "template"),
+        ("step", "update"),
+        ("submit", ["r"], "t"),
+        ("pre", req),
+        ("cache", req),
+        ("put", (EngineCoreRequestType.ADD, (req, 0))),
+    ]

@@ -141,24 +141,24 @@ class GRConfig:
     # CUDA beam deployments default to True; NPU requires xllm execution.
     # False explicitly keeps the frontend NumPy path.
     beam_worker_decision: bool | None = None
-    # None = unset (the Driver enables this by default for synchronously
-    # scheduled accelerator Constraint Table beam deployments).  True
-    # lets EngineCore drive intermediate beam steps itself: after
-    # scheduler.update_from_output it reads the worker's beam_search_result
-    # and calls _apply_beam_step directly — no per-step ZMQ round-trip to the
-    # frontend.  The frontend then only sends the initial prefill and waits
-    # for the terminal result + cleanup.  Only valid with
-    # beam_worker_decision=True (the worker decision is the input the
-    # self-advance step consumes).
-    beam_self_advance: bool | None = None
+    # None = unset (the Driver enables this by default for accelerator beam
+    # deployments with worker decisions).  True makes EngineCore chain both
+    # the prefill -> step0 transition AND every decode-step transition
+    # in-process from the worker's beam decision.  The frontend still
+    # consumes each step's output (EOS / materialize / streaming) but skips
+    # the per-step RPC when the engine chained that step.  Safe under async
+    # scheduling: the advance runs in the busy-loop iteration that processes
+    # the step's outputs.  Only valid with beam_worker_decision=True (the
+    # chain consumes worker beam decisions).
+    beam_engine_driven: bool | None = None
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
+            validate_beam_engine_driven,
             validate_beam_graph_enabled,
             validate_beam_max_decode_steps,
             validate_beam_max_width,
-            validate_beam_self_advance,
             validate_beam_worker_decision,
             validate_catalog_path,
             validate_constraint_backend,
@@ -211,13 +211,13 @@ class GRConfig:
         )
         object.__setattr__(
             self,
-            "beam_self_advance",
-            validate_beam_self_advance(self.beam_self_advance),
+            "beam_engine_driven",
+            validate_beam_engine_driven(self.beam_engine_driven),
         )
-        if self.beam_self_advance and not self.beam_worker_decision:
+        if self.beam_engine_driven and not self.beam_worker_decision:
             raise ValueError(
-                "vllm-gr beam_self_advance=True requires beam_worker_decision=True "
-                "(the self-advance step consumes the worker beam decision)"
+                "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "
+                "(the engine-driven session consumes worker beam decisions)"
             )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
@@ -241,7 +241,7 @@ class GRConfig:
             or self.npu_decode_execution is not None
             or (self.constraint_table is not None and self.constraint_table.enabled)
             or self.beam_worker_decision is not None
-            or self.beam_self_advance is not None
+            or self.beam_engine_driven is not None
         )
 
     @classmethod

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for EngineCore self-advance (beam_self_advance, M1-b).
+"""Unit tests for EngineCore engine-driven chaining.
 
 Covers the chain that removes the per-step frontend RPC round-trip:
 
@@ -10,7 +10,7 @@ Covers the chain that removes the per-step frontend RPC round-trip:
   from the worker's beam decision (host tensors from
   ``kv_transfer_params['beam_search_result']``) and applies it in-process.
 - ``_beam_self_advance`` scans a step's EngineCoreOutputs for the decision
-  and chains at most one step per engine iteration.
+  and chains every independent session decision in that engine iteration.
 - ``make_patched_process_engine_step`` runs the hook between ``step_fn()``
   and the output-queue forward, with an exception fallback that keeps the
   frontend step-update loop usable.
@@ -37,7 +37,6 @@ import vllm_gr.v1.engine.core as core_module
 from vllm_gr.v1.engine.core import (
     _beam_advance_from_decision,
     _beam_self_advance,
-    _engine_self_advance_active,
     _handle_beam_request_step_update,
 )
 from vllm_gr.v1.engine.engine_core_patch import make_patched_process_engine_step
@@ -354,7 +353,7 @@ class TestBeamAdvanceFromDecision:
         MockReq.assert_not_called()
 
     def test_missing_running_suffix_is_graceful_noop(self) -> None:
-        """Session cached before self-advance was enabled has no
+        """Session cached before engine-driven chaining was enabled has no
         running_suffix; the chain must skip, not raise (the frontend
         step-update loop remains the fallback)."""
         eng = _make_engine_self(beam_cache={"s0": _session_entry()})
@@ -508,7 +507,7 @@ class TestBeamAdvanceFromDecision:
 
 
 # ===========================================================================
-# Section 3 — _beam_self_advance (gate + output scan)
+# Section 2b — engine-driven decode chaining (unified producer, Phase 2)
 # ===========================================================================
 
 
@@ -522,8 +521,8 @@ class TestBeamSelfAdvance:
 
         assert eng.input_queue.qsize() == 1
 
-    def test_chains_at_most_one_decision_per_step(self) -> None:
-        """One engine iteration chains exactly one step (first decision)."""
+    def test_drains_all_independent_session_decisions(self) -> None:
+        """One engine iteration chains every session that produced a decision."""
         eng = _seeded_engine("s0")
         entry1 = _session_entry()
         entry1["running_suffix"] = _running_suffix(beam_tokens=[[50]])
@@ -544,9 +543,9 @@ class TestBeamSelfAdvance:
             MockReq.return_value = mock_req
             _beam_self_advance(eng, outputs)
 
-        assert eng.input_queue.qsize() == 1
-        _, kwargs = MockReq.call_args
-        assert kwargs["request_id"] == "s0"
+        assert eng.input_queue.qsize() == 2
+        request_ids = [kwargs["request_id"] for _, kwargs in MockReq.call_args_list]
+        assert request_ids == ["s0", "s1"]
 
     def test_disabled_flag_is_noop(self) -> None:
         entry = _session_entry()
@@ -579,7 +578,7 @@ class TestBeamSelfAdvance:
         assert eng.input_queue.empty()
 
     def test_two_step_chain_then_terminal(self) -> None:
-        """End-to-end M1-b chain: two self-advanced steps recorded from the
+        """End-to-end engine-driven chain: two chained steps recorded from the
         running_suffix, then a terminal decision stops chaining."""
         eng = _seeded_engine("s0")
         step1 = _outputs_with_decision(_decision(parents=[1, 0], tokens=[61, 71]))
@@ -615,42 +614,7 @@ class TestBeamSelfAdvance:
 
 
 # ===========================================================================
-# Section 4 — self-advance config gate
-# ===========================================================================
-
-
-class TestSelfAdvanceGate:
-    def test_gate_reads_gr_config_and_caches(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from vllm_gr.config import GRConfig
-
-        enabled = GRConfig(beam_worker_decision=True, beam_self_advance=True)
-        monkeypatch.setattr(
-            GRConfig,
-            "from_vllm_config",
-            classmethod(lambda cls, vc: enabled),
-        )
-        eng = SimpleNamespace(vllm_config=object())
-        assert _engine_self_advance_active(eng) is True
-        # The per-engine cache avoids re-parsing on every step.
-        assert eng._vllm_gr_self_advance is True
-
-        # Flip the config; the cached value must win for this engine.
-        disabled = GRConfig()
-        monkeypatch.setattr(
-            GRConfig,
-            "from_vllm_config",
-            classmethod(lambda cls, vc: disabled),
-        )
-        assert _engine_self_advance_active(eng) is True
-
-        # A fresh engine reads the new (disabled) config.
-        eng2 = SimpleNamespace(vllm_config=object())
-        assert _engine_self_advance_active(eng2) is False
-        assert eng2._vllm_gr_self_advance is False
-
-
-# ===========================================================================
-# Section 5 — make_patched_process_engine_step wrapper
+# Section 4 — engine-driven config gate
 # ===========================================================================
 
 
@@ -734,9 +698,47 @@ class TestProcessEngineStepWrapper:
         assert result is False
 
     def test_wrapper_is_idempotent(self) -> None:
-        original = lambda self: True  # noqa: E731
+        def original(self: Any) -> bool:
+            return True
+
         wrapper = make_patched_process_engine_step(original)
         assert make_patched_process_engine_step(wrapper) is wrapper
+
+
+class TestInprocGetOutputHook:
+    def test_inproc_get_output_runs_self_advance(self) -> None:
+        from vllm.v1.engine import EngineCoreOutputs
+
+        from vllm_gr.v1.engine.core_client_patch import make_patched_inproc_get_output
+
+        outputs = _outputs_with_decision(_decision(parents=[1, 0], tokens=[61, 71]))
+        eng = _step_engine(outputs)
+        observed: list[Any] = []
+
+        def fake_advance(engine: Any, outs: dict[int, EngineCoreOutputs]) -> None:
+            observed.append((engine, outs))
+
+        client = SimpleNamespace(engine_core=eng)
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(core_module, "_beam_self_advance", fake_advance)
+        try:
+            wrapped = make_patched_inproc_get_output(lambda self: None)
+            result = wrapped(client)
+        finally:
+            monkey.undo()
+
+        assert observed == [(eng, outputs)]
+        eng.post_step.assert_called_once_with(model_executed=True)
+        assert isinstance(result, EngineCoreOutputs)
+
+    def test_inproc_get_output_is_idempotent(self) -> None:
+        from vllm_gr.v1.engine.core_client_patch import make_patched_inproc_get_output
+
+        def original(self: Any) -> None:
+            return None
+
+        wrapper = make_patched_inproc_get_output(original)
+        assert make_patched_inproc_get_output(wrapper) is wrapper
 
 
 # ===========================================================================
@@ -750,7 +752,7 @@ class TestDecisionPayloadShapes:
 
         kv_transfer_params values decode against ``dict[str, Any]``; the
         worker therefore normalizes to plain lists at the D2H boundary, and
-        self-advance must consume them (the old ``reshape(-1).tolist()``
+        engine-driven chaining must consume them (the old ``reshape(-1).tolist()``
         crashed with AttributeError: 'list' object has no attribute
         'reshape').
         """

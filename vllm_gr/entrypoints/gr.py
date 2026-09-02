@@ -205,7 +205,7 @@ def _prepare_beam_step_requests(
                 constraint_step=len(beam_tokens[0]) if is_constrained else 0,
             )
             # EngineCore already chained this decode step from the worker's
-            # beam decision (beam_self_advance). Re-sending the update would
+            # beam decision (engine-driven). Re-sending the update would
             # re-ADD the session's request while it is still running under
             # the same session_id, crashing scheduler.add_request with
             # "duplicate request id"; the output registration above already
@@ -438,7 +438,7 @@ def _custom_beam_search_batch(
     instance_prefix_len: dict[int, int] = {}
     instance_completed_sessions: set[int] = set()
     # Per-instance: EngineCore chained this step's successor from the worker's
-    # beam decision (beam_self_advance); the next iteration must skip its own
+    # beam decision (engine-driven); the next iteration must skip its own
     # beam_request_step_update send (the session request is still running
     # under the same session id — a second ADD trips the scheduler's
     # "duplicate request id" assert).
@@ -530,9 +530,9 @@ def _custom_beam_search_batch(
                     worker_decision, beam_width, instance.beams
                 )
             # EngineCore chained this step's successor from the worker's
-            # decision (beam_self_advance): the next iteration skips its
+            # decision (engine-driven): the next iteration skips its
             # beam_request_step_update send. A missing flag (terminal
-            # decision / skip path / self-advance disabled) keeps the
+            # decision / skip path / engine-driven disabled) keeps the
             # frontend-driven path in charge.
             if worker_decision is not None and worker_decision.get("beam_self_advance_chained"):
                 instance_self_advance_chained.add(j)

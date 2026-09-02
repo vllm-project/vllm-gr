@@ -463,7 +463,6 @@ def _npic_engine_args(beam_max_width: int, catalog_path: str | None = None) -> S
         model=None,
         beam_max_width=beam_max_width,
         beam_worker_decision=None,
-        beam_self_advance=None,
         no_beam_graph=False,
         _vllm_gr_config_input=None,
     )
@@ -508,7 +507,7 @@ def test_npu_constraint_table_auto_promotion_respects_capacity(
     assert config.catalog_path == catalog_path
     assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
     assert config.beam_worker_decision is True
-    assert config.beam_self_advance is True
+    assert config.beam_engine_driven is True
 
 
 def test_beam_max_width_rejects_values_above_global_limit() -> None:
@@ -608,7 +607,6 @@ def test_npu_catalog_path_without_backend_promotes_to_constraint_table(
         model=None,
         beam_max_width=128,
         beam_worker_decision=None,
-        beam_self_advance=None,
         no_beam_graph=False,
         _vllm_gr_config_input=None,
     )
@@ -651,7 +649,6 @@ def test_gpu_catalog_path_without_backend_keeps_trie_default() -> None:
         model=None,
         beam_max_width=128,
         beam_worker_decision=None,
-        beam_self_advance=None,
         no_beam_graph=False,
         _vllm_gr_config_input=None,
     )
@@ -690,8 +687,11 @@ def test_cuda_beam_enables_worker_decision_by_default() -> None:
 
     config = GRConfig.from_vllm_config(result)
     assert config.beam_worker_decision is True
-    # Trie filtering has no Worker result to self-advance from.
-    assert config.beam_self_advance is None
+    # The unified flag auto-enables for accelerator beam with worker
+    # decisions regardless of backend; actual chaining is lazy-gated by
+    # data availability (trie-catalog deployments never produce worker
+    # decisions, unconstrained deployments chain decode from step 1).
+    assert config.beam_engine_driven is True
     assert config.constraint_backend is ConstraintBackend.TRIE
 
 
@@ -712,7 +712,6 @@ def test_non_cuda_constraint_table_backend_skips_vocab_slice_computation(
         model="test-model",
         beam_max_width=32,
         beam_worker_decision=None,
-        beam_self_advance=None,
         no_beam_graph=False,
         _vllm_gr_config_input=None,
     )
@@ -749,13 +748,13 @@ def test_non_cuda_constraint_table_backend_skips_vocab_slice_computation(
 
 
 @pytest.mark.parametrize(
-    ("self_advance", "async_scheduling", "expected_self_advance"),
-    [(None, False, True), (False, False, False), (None, True, None)],
+    ("engine_driven", "async_scheduling", "expected_engine_driven"),
+    [(None, False, True), (False, False, False), (None, True, True)],
 )  # type: ignore[misc]
 def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
-    self_advance: bool | None,
+    engine_driven: bool | None,
     async_scheduling: bool,
-    expected_self_advance: bool | None,
+    expected_engine_driven: bool | None,
 ) -> None:
     """CUDA triples use the sliced lm_head path supported by the CUDA backend."""
     from vllm_gr.engine.arg_utils_gr import create_engine_config
@@ -769,7 +768,7 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
         trust_remote_code=False,
         beam_max_width=32,
         beam_worker_decision=None,
-        beam_self_advance=self_advance,
+        beam_engine_driven=engine_driven,
         async_scheduling=async_scheduling,
         no_beam_graph=False,
         _vllm_gr_config_input=None,
@@ -793,6 +792,6 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
     assert config.vocab_offset == 151669
     assert config.vocab_slice_size == 24576
     assert config.beam_worker_decision is True
-    assert config.beam_self_advance is expected_self_advance
+    assert config.beam_engine_driven is expected_engine_driven
     slice_spy.assert_called_once()
     set_slice.assert_called_once_with(151669, 24576)

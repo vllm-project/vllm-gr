@@ -19,6 +19,7 @@ class EngineCoreDecoders:
     add_request: MsgpackDecoder
     add_batch: MsgpackDecoder
     beam_step_update: MsgpackDecoder
+    submit_session: MsgpackDecoder
     generic: MsgpackDecoder
 
 
@@ -29,6 +30,12 @@ def build_engine_core_decoders(oob_tensor_provider: Any) -> EngineCoreDecoders:
         add_request=MsgpackDecoder(EngineCoreRequest, **decoder_kwargs),
         add_batch=MsgpackDecoder(list[EngineCoreRequest], **decoder_kwargs),
         beam_step_update=MsgpackDecoder(BeamRequestStepUpdate, **decoder_kwargs),
+        # SUBMIT_SESSION merges the ADD_BATCH payload and the session
+        # template into one wire message: EngineCoreRequest decoding needs
+        # the same oob_tensor_provider kwargs as the add_batch decoder.
+        submit_session=MsgpackDecoder(
+            tuple[list[EngineCoreRequest], BeamRequestStepUpdate], **decoder_kwargs
+        ),
         generic=MsgpackDecoder(**decoder_kwargs),
     )
 
@@ -45,6 +52,13 @@ def decode_engine_core_payload(
         decoder = decoders.add_batch
     elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
         decoder = decoders.beam_step_update
+    elif request_type == EngineCoreRequestType.BEAM_SESSION_TEMPLATE:
+        # The template payload is a BeamRequestStepUpdate whose beam_tokens
+        # are left empty as placeholders (only the routing/param fields are
+        # consumed by the EngineCore engine-driven prefill chain).
+        decoder = decoders.beam_step_update
+    elif request_type == EngineCoreRequestType.SUBMIT_SESSION:
+        decoder = decoders.submit_session
     else:
         decoder = decoders.generic
     return decoder.decode(data_frames)

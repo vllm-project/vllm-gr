@@ -618,8 +618,8 @@ def test_last_step_fires_on_final_decode_of_loop() -> None:
     (``max_tokens - pre_calc``) — iteration 0 is the prefill, so the request
     runs ``loop_len - 1`` decode steps and the 0-indexed ``decode_step``
     tops out at ``loop_len - 2``.  The old ``decode_step >= loop_len - 1``
-    comparison never fired for the 3-step constrained FSM: self-advance
-    chained a 3rd decode whose constraint_step=3 the scheduler rejects.
+    comparison never fired for the 3-step constrained FSM: engine-driven
+    chaining produced a 3rd decode whose constraint_step=3 the scheduler rejects.
     """
     context = _make_context(max_beams=4, max_decode_steps=4)
     session = _make_session(context)

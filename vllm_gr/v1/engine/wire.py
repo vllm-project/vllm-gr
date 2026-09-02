@@ -9,6 +9,8 @@ from vllm.v1.engine import EngineCoreRequestType
 
 ADD_BATCH_WIRE_VALUE = b"\x06"
 BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE = b"\x07"
+BEAM_SESSION_TEMPLATE_WIRE_VALUE = b"\x08"
+SUBMIT_SESSION_WIRE_VALUE = b"\x09"
 
 
 def _add_enum_member(name: str, value: bytes) -> None:
@@ -86,4 +88,12 @@ def register_engine_core_request_types() -> None:
     _add_enum_member(
         "BEAM_REQUEST_STEP_UPDATE",
         BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE,
+    )
+    _add_enum_member(
+        "BEAM_SESSION_TEMPLATE",
+        BEAM_SESSION_TEMPLATE_WIRE_VALUE,
+    )
+    _add_enum_member(
+        "SUBMIT_SESSION",
+        SUBMIT_SESSION_WIRE_VALUE,
     )

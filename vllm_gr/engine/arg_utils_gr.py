@@ -186,23 +186,27 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "of worker-side beam decision).",
     )
     model_group.add_argument(
-        "--beam-self-advance",
+        "--beam-engine-driven",
         action="store_true",
         default=None,
-        help="Let EngineCore drive intermediate beam steps itself: the "
-        "worker's beam decision result is applied in-process to enqueue the "
-        "next beam-decode step, eliminating the per-step frontend RPC "
-        "round-trip. Requires --beam-worker-decision. Synchronously scheduled "
-        "accelerator Constraint Table beam deployments enable it by default; "
-        "async scheduling keeps frontend step submission unless explicitly enabled.",
+        help="Make EngineCore chain beam step updates in-process from the "
+        "worker's beam decision (prefill -> step0 and every decode step). "
+        "The frontend still consumes each step's output (EOS / materialize) "
+        "but skips the per-step RPC when the engine chained that step. "
+        "Requires --beam-worker-decision. Safe under async scheduling: the "
+        "advance runs in the busy-loop iteration that processes the step's "
+        "outputs. Accelerator beam deployments with worker decisions enable "
+        "it by default. Inlined sample_tokens (skipping the second "
+        "collective RPC) additionally requires synchronous scheduling and "
+        "PP=1.",
     )
     model_group.add_argument(
-        "--no-beam-self-advance",
+        "--no-beam-engine-driven",
         action="store_false",
-        dest="beam_self_advance",
+        dest="beam_engine_driven",
         default=None,
-        help="Explicitly keep the frontend RPC beam step-update loop (opt-out "
-        "of EngineCore self-advance).",
+        help="Keep the frontend-driven beam step-update loop (opt out of "
+        "EngineCore in-process chaining).",
     )
     return parser
 
@@ -222,7 +226,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
         setattr(engine_args, attr, getattr(args, attr, None))
     engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
     engine_args.beam_worker_decision = getattr(args, "beam_worker_decision", None)
-    engine_args.beam_self_advance = getattr(args, "beam_self_advance", None)
+    engine_args.beam_engine_driven = getattr(args, "beam_engine_driven", None)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -371,7 +375,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         or getattr(self, "beam_max_decode_steps", None) is not None
         or bool(getattr(self, "no_beam_graph", False))
         or getattr(self, "beam_worker_decision", None) is not None
-        or getattr(self, "beam_self_advance", None) is not None
+        or getattr(self, "beam_engine_driven", None) is not None
         or backend_is_explicit
     )
 
@@ -413,10 +417,10 @@ def create_engine_config(self, usage_context=None, headless=False):
             if getattr(self, "beam_worker_decision", None) is not None
             else existing_gr_config.beam_worker_decision
         )
-        effective_beam_self_advance = (
-            getattr(self, "beam_self_advance", None)
-            if getattr(self, "beam_self_advance", None) is not None
-            else existing_gr_config.beam_self_advance
+        effective_beam_engine_driven = (
+            getattr(self, "beam_engine_driven", None)
+            if getattr(self, "beam_engine_driven", None) is not None
+            else existing_gr_config.beam_engine_driven
         )
         # NPU platform default for beam-serve deployments: when the user
         # enables beam search (beam_max_width) with a constraint catalog
@@ -438,9 +442,9 @@ def create_engine_config(self, usage_context=None, headless=False):
             getattr(self, "beam_worker_decision", None) is not None
             or existing_gr_config.beam_worker_decision is not None
         )
-        self_advance_explicit = (
-            getattr(self, "beam_self_advance", None) is not None
-            or existing_gr_config.beam_self_advance is not None
+        engine_driven_explicit = (
+            getattr(self, "beam_engine_driven", None) is not None
+            or existing_gr_config.beam_engine_driven is not None
         )
         if (
             _is_npu_platform()
@@ -472,30 +476,26 @@ def create_engine_config(self, usage_context=None, headless=False):
         ):
             if effective_beam_worker_decision is None:
                 effective_beam_worker_decision = True
-        # The canonical Worker decision otherwise paid one frontend
-        # step-update round-trip per SID decode.  On accelerator Constraint
-        # Tables, make the already-supported EngineCore self-advance path the
-        # default so the canonical path retains the legacy device-wire
-        # latency.  Explicit False remains a full opt-out. NPU cascade (no
-        # xllm decision result), async scheduling, and PP>1 keep their existing
-        # fallback behavior in the runtime gates.
+        # Unified engine-driven sessions: accelerator beam default with
+        # worker decisions, NO async-scheduling and NO constraint-backend
+        # condition.  The advance runs in the busy-loop iteration that
+        # processes the step's outputs (no two-phase pipeline conflict), and
+        # the constraint-table requirement is enforced by the data (worker
+        # beam decisions only exist for constrained beam sessions).
         if (
             (_is_npu_platform() or _is_cuda_platform())
             and beam_width_configured
-            and effective_constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and effective_beam_worker_decision
-            and not getattr(self, "async_scheduling", False)
-            and not self_advance_explicit
-            and effective_beam_self_advance is None
+            and not engine_driven_explicit
+            and effective_beam_engine_driven is None
         ):
-            effective_beam_self_advance = True
-        # Self-advance only applies when the worker decision path is active
-        # (the self-advance step consumes the worker's beam_search_result).
-        # Validate after platform defaults so an explicit self-advance can use
-        # the accelerator's default worker decision.
-        if effective_beam_self_advance and not effective_beam_worker_decision:
+            effective_beam_engine_driven = True
+        # Engine-driven chaining consumes the worker's beam_search_result.
+        # Validate after platform defaults so an explicit engine-driven
+        # choice can use the accelerator's default worker decision.
+        if effective_beam_engine_driven and not effective_beam_worker_decision:
             raise ValueError(
-                "beam_self_advance=True requires beam_worker_decision=True "
+                "beam_engine_driven=True requires beam_worker_decision=True "
                 "(CLI --beam-worker-decision or additional_config "
                 "'vllm_gr_beam_worker_decision')"
             )
@@ -555,7 +555,7 @@ def create_engine_config(self, usage_context=None, headless=False):
                 else existing_gr_config.beam_max_decode_steps
             ),
             beam_worker_decision=effective_beam_worker_decision,
-            beam_self_advance=effective_beam_self_advance,
+            beam_engine_driven=effective_beam_engine_driven,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
         )
@@ -570,22 +570,18 @@ def create_engine_config(self, usage_context=None, headless=False):
         and effective_gr_config.beam_worker_decision is None
     ):
         effective_gr_config = replace(effective_gr_config, beam_worker_decision=True)
+    # Canonical configs: engine-driven default mirrors the legacy rule above
+    # (accelerator beam + worker decisions; async scheduling and constraint
+    # backend are deliberately not conditions).  Unset stays unset until this
+    # promotion writes True.
     if (
         canonical_source
         and (_is_cuda_platform() or _is_npu_platform())
         and effective_gr_config.beam_max_width is not None
-        and (
-            effective_gr_config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
-            or (
-                effective_gr_config.constraint_table is not None
-                and effective_gr_config.constraint_table.enabled
-            )
-        )
         and effective_gr_config.beam_worker_decision
-        and not getattr(self, "async_scheduling", False)
-        and effective_gr_config.beam_self_advance is None
+        and effective_gr_config.beam_engine_driven is None
     ):
-        effective_gr_config = replace(effective_gr_config, beam_self_advance=True)
+        effective_gr_config = replace(effective_gr_config, beam_engine_driven=True)
 
     if effective_gr_config != existing_gr_config or canonical_input is not None:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields

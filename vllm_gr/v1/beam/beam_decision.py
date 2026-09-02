@@ -937,12 +937,16 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
 
     beam_info = getattr(runner, "_current_beam_info", None)
     beam_data = (beam_info.get("beam_data") or {}) if beam_info else {}
-    prefills = [mdata for mdata in beam_data.values() if mdata.get("is_constraint_prefill", False)]
+    prefills = [
+        (req_id, mdata)
+        for req_id, mdata in beam_data.items()
+        if mdata.get("is_constraint_prefill", False)
+    ]
     # The result ABI is one logical request. Multi-request prefill keeps the
     # established frontend path until the result channel becomes batched.
     if len(prefills) != 1:
         return None
-    mdata = prefills[0]
+    prefill_req_id, mdata = prefills[0]
     width = mdata.get("beam_width")
     if isinstance(width, bool) or not isinstance(width, int) or width < 1:
         return None
@@ -978,6 +982,12 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
         "out_token_ids": out_ids,
         "out_token_index": out_parents,
         "out_log_probs": out_scores,
+        # Ownership markers (review P5/P8): EngineCore's engine-driven prefill
+        # branch keys on stage="prefill" and validates session_id against the
+        # output it was attached to, so a mixed batch (A decode + B prefill)
+        # can never chain B's decision onto A's session.
+        "stage": "prefill",
+        "session_id": prefill_req_id,
     }
 
 
@@ -1619,6 +1629,11 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
             workspace=get_beam_postprocess_workspace(runner, width),
         )
         runner._beam_decision_result = compact[0] if compact is not None else None
+        if runner._beam_decision_result is not None:
+            # _encode_cuda_beam_result keeps only the packed arrays; re-attach
+            # the ownership markers so downstream consumers stay keyed.
+            runner._beam_decision_result["stage"] = "prefill"
+            runner._beam_decision_result["session_id"] = prefill_decision["session_id"]
         return
 
     if not worker_decision_enabled(runner):
@@ -1709,6 +1724,20 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
                 if out_idx_host:
                     state.kv_reorder = [int(parent) for parent in out_idx_host[0]]
             decision = payload
+    if decision is not None:
+        # Ownership markers (review P5): mixed batches must never let session
+        # B's decision chain onto session A's step update downstream.
+        decision["stage"] = "decode"
+        decode_req_id = next(
+            (
+                req_id
+                for req_id, mdata in (beam_info.get("beam_data") or {}).items()
+                if mdata.get("is_beam_decode", False)
+            ),
+            None,
+        )
+        if decode_req_id is not None:
+            decision["session_id"] = decode_req_id
     runner._beam_decision_result = decision
 
 

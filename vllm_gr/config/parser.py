@@ -18,10 +18,10 @@ from vllm_gr.config.models import (
 from vllm_gr.config.validation import (
     validate_artifact_digest,
     validate_attention_backend,
+    validate_beam_engine_driven,
     validate_beam_graph_enabled,
     validate_beam_max_decode_steps,
     validate_beam_max_width,
-    validate_beam_self_advance,
     validate_beam_worker_decision,
     validate_catalog_path,
     validate_constraint_backend,
@@ -49,7 +49,7 @@ BEAM_MAX_WIDTH_KEY: Final = "vllm_gr_beam_max_width"
 BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
 NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
 BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
-BEAM_SELF_ADVANCE_KEY: Final = "vllm_gr_beam_self_advance"
+BEAM_ENGINE_DRIVEN_KEY: Final = "vllm_gr_beam_engine_driven"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -63,7 +63,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         BEAM_MAX_DECODE_STEPS_KEY,
         NPU_DECODE_EXECUTION_KEY,
         BEAM_WORKER_DECISION_KEY,
-        BEAM_SELF_ADVANCE_KEY,
+        BEAM_ENGINE_DRIVEN_KEY,
     }
 )
 _TOP_LEVEL_KEYS: Final = frozenset(
@@ -75,7 +75,7 @@ _BEAM_KEYS: Final = frozenset(
         "max_width",
         "max_decode_steps",
         "worker_decision",
-        "self_advance",
+        "engine_driven",
     }
 )
 _CONSTRAINT_TABLE_KEYS: Final = frozenset(
@@ -181,7 +181,7 @@ def gr_config_from_mapping(
             beam_raw.get("max_decode_steps", _BEAM_MAX_DECODE_STEPS_DEFAULT)
         ),
         beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
-        beam_self_advance=validate_beam_self_advance(beam_raw.get("self_advance")),
+        beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
         schema_version=validate_schema_version(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
@@ -228,8 +228,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     # serialization just like explicit True.
     if config.beam_worker_decision is not None:
         beam["worker_decision"] = config.beam_worker_decision
-    if config.beam_self_advance is not None:
-        beam["self_advance"] = config.beam_self_advance
+    if config.beam_engine_driven is not None:
+        beam["engine_driven"] = config.beam_engine_driven
 
     return {
         "schema_version": config.schema_version,
@@ -331,7 +331,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_worker_decision=validate_beam_worker_decision(
             additional_config.get(BEAM_WORKER_DECISION_KEY)
         ),
-        beam_self_advance=validate_beam_self_advance(additional_config.get(BEAM_SELF_ADVANCE_KEY)),
+        beam_engine_driven=validate_beam_engine_driven(
+            additional_config.get(BEAM_ENGINE_DRIVEN_KEY)
+        ),
     )
 
 
@@ -415,14 +417,14 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         # Both explicit values round-trip (an opt-out must survive a write).
         additional_config[BEAM_WORKER_DECISION_KEY] = beam_worker_decision
 
-    beam_self_advance = validate_beam_self_advance(gr_config.beam_self_advance)
-    if beam_self_advance is None:
-        # Unset stays out of the serialized config; the Driver may apply a
-        # platform/backend default before writing the final config.
-        additional_config.pop(BEAM_SELF_ADVANCE_KEY, None)
+    beam_engine_driven = validate_beam_engine_driven(gr_config.beam_engine_driven)
+    if beam_engine_driven is None:
+        # Unset stays out of the serialized config; the runtime applies the
+        # accelerator engine-driven default at flag-read time.
+        additional_config.pop(BEAM_ENGINE_DRIVEN_KEY, None)
     else:
         # Both explicit values round-trip (an opt-out must survive a write).
-        additional_config[BEAM_SELF_ADVANCE_KEY] = beam_self_advance
+        additional_config[BEAM_ENGINE_DRIVEN_KEY] = beam_engine_driven
 
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:

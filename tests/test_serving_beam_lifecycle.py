@@ -420,7 +420,7 @@ def test_eos_and_distinct_sid_end_token_both_complete() -> None:
 def test_self_advance_chained_step_skips_frontend_update(
     monkeypatch: Any,
 ) -> None:
-    """EngineCore self-advance coordination (beam_self_advance).
+    """EngineCore engine-driven coordination.
 
     When a decode step's worker decision carries
     ``beam_self_advance_chained=True``, EngineCore already chained the next
@@ -458,7 +458,7 @@ def test_self_advance_chained_step_skips_frontend_update(
     outputs = _run_search(engine, max_tokens=3)
 
     # Only the step-1 decode update and the final cleanup were sent; the
-    # step-2 update was suppressed because that step was self-advanced.
+    # step-2 update was suppressed because that step was engine-chained.
     assert len(engine.beam_updates) == 2
     decode_update, cleanup_update = engine.beam_updates
     assert decode_update.session_id == "request-0-step-0-beam-0"
@@ -483,7 +483,7 @@ def test_self_advance_chained_step_skips_frontend_update(
 def test_self_advance_unflagged_decision_keeps_frontend_driven(
     monkeypatch: Any,
 ) -> None:
-    """Without the chained flag (self-advance disabled or a skip path in
+    """Without the chained flag (engine-driven disabled or a skip path in
     EngineCore), the frontend keeps driving every step with its own
     beam_request_step_update."""
     _install_deterministic_request_ids(monkeypatch)

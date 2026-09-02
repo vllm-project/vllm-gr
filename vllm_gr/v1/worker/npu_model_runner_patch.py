@@ -737,7 +737,7 @@ make_patched_sample = make_patched_sample_npu
 # The dispatcher (model_runner_patch.py) looks up this exact name; without the
 # alias the sample_tokens hook is silently skipped and the worker beam decision
 # never reaches the ModelRunnerOutput (async scheduling keeps the decision path
-# broken end-to-end: self-advance no-ops and the frontend keeps its RPC loop).
+# broken end-to-end: engine-driven chaining no-ops and the frontend keeps its RPC loop).
 make_patched_sample_tokens = make_patched_sample_tokens_npu
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_npu
