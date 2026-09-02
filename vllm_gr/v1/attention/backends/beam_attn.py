@@ -266,6 +266,17 @@ class BeamAttentionImpl(AttentionImpl):
         if attn_metadata is None:
             return output.fill_(0)
 
+        if getattr(attn_metadata, "is_prefill_graph_exec", False):
+            return self.prefill_forward(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                output=output,
+            )
+
         platform_execution = _get_platform_execution_module()
 
         # NPU provides kv_cache as a tuple (key_cache, value_cache);
@@ -402,6 +413,99 @@ class BeamAttentionImpl(AttentionImpl):
         sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
 
         platform_execution.cascade_attention(
+            output=output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            attn_metadata=attn_metadata,
+            sliding_window_size=sliding_window_size,
+            scale=self.scale,
+            logits_soft_cap=self.logits_soft_cap,
+            vllm_flash_attn_version=self.vllm_flash_attn_version,
+            s_aux=self.sinks,
+            alibi_slopes=self.alibi_slopes,
+        )
+
+        return output
+
+    @staticmethod
+    def prefill_attention(
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: BeamAttentionMetadata,
+        sliding_window_size: list[int] | tuple[int, int] | None,
+        scale: float,
+        logits_soft_cap: float,
+        vllm_flash_attn_version: int,
+        s_aux: torch.Tensor | None = None,
+        alibi_slopes: torch.Tensor | None = None,
+    ) -> None:
+        # The prefill path is never serviced by the xllm module (decode-only
+        # by design): on NPU resolve the cascade module directly so the
+        # prefill branch bypasses the process-global platform-module
+        # resolution entirely.
+        if NPU_DEVICE and not CUDA_DEVICE:
+            from vllm_gr.v1.attention.backends import beam_attn_npu
+
+            platform_execution = beam_attn_npu
+        else:
+            platform_execution = _get_platform_execution_module()
+        platform_execution.prefill_attention(
+            output=output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            attn_metadata=attn_metadata,
+            sliding_window_size=sliding_window_size,
+            scale=scale,
+            logits_soft_cap=logits_soft_cap,
+            vllm_flash_attn_version=vllm_flash_attn_version,
+            s_aux=s_aux,
+            alibi_slopes=alibi_slopes,
+        )
+
+    def prefill_forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: BeamAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Streamlined fast-path for pure prefill execution in Full Graph mode."""
+        platform_execution = _get_platform_execution_module()
+
+        if isinstance(kv_cache, tuple):
+            key_cache, value_cache = kv_cache[0], kv_cache[1]
+        else:
+            key_cache, value_cache = kv_cache.unbind(0)
+
+        if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
+            k_scale = None if NPU_DEVICE else getattr(layer, "_k_scale", None)
+            v_scale = None if NPU_DEVICE else getattr(layer, "_v_scale", None)
+            platform_execution.reshape_and_cache(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+
+        if self.kv_cache_dtype.startswith("fp8"):
+            dtype = BeamAttentionBackend.get_fp8_dtype_for_flashattn(self.kv_cache_dtype)
+            key_cache = key_cache.view(dtype)
+            value_cache = value_cache.view(dtype)
+
+        sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
+
+        self.prefill_attention(
             output=output,
             query=query,
             key_cache=key_cache,
