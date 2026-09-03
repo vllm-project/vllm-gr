@@ -60,6 +60,8 @@ def _init_engine_args(
     catalog_path: str | None = None,
     constraint_backend: ConstraintBackend | str | None = None,
     vllm_gr_config: GRConfigInput | None = None,
+    persistent_request: bool | None = None,
+    persistent_runner_state: bool | None = None,
     **kwargs: object,
 ) -> None:
     """Accept the vllm-gr engine args on the Python-API construction path.
@@ -78,6 +80,8 @@ def _init_engine_args(
     self.catalog_path = catalog_path
     self.constraint_backend = constraint_backend
     self._vllm_gr_config_input = vllm_gr_config
+    self.persistent_request = persistent_request
+    self.persistent_runner_state = persistent_runner_state
 
 
 def _nested_attention_backend_is_explicit(value: object) -> bool:
@@ -208,6 +212,20 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help="Keep the frontend-driven beam step-update loop (opt out of "
         "EngineCore in-process chaining).",
     )
+    model_group.add_argument(
+        "--enable-persistent-request",
+        action="store_true",
+        dest="persistent_request",
+        default=None,
+        help="Use one native vLLM request for the full GR request lifecycle.",
+    )
+    model_group.add_argument(
+        "--enable-persistent-runner-state",
+        action="store_true",
+        dest="persistent_runner_state",
+        default=None,
+        help="Keep GR beam state on the model runner between decode steps.",
+    )
     return parser
 
 
@@ -227,6 +245,10 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
     engine_args.beam_worker_decision = getattr(args, "beam_worker_decision", None)
     engine_args.beam_engine_driven = getattr(args, "beam_engine_driven", None)
+    engine_args.persistent_request = getattr(args, "persistent_request", None)
+    engine_args.persistent_runner_state = getattr(
+        args, "persistent_runner_state", None
+    )
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -376,6 +398,8 @@ def create_engine_config(self, usage_context=None, headless=False):
         or bool(getattr(self, "no_beam_graph", False))
         or getattr(self, "beam_worker_decision", None) is not None
         or getattr(self, "beam_engine_driven", None) is not None
+        or getattr(self, "persistent_request", None) is not None
+        or getattr(self, "persistent_runner_state", None) is not None
         or backend_is_explicit
     )
 
@@ -421,6 +445,16 @@ def create_engine_config(self, usage_context=None, headless=False):
             getattr(self, "beam_engine_driven", None)
             if getattr(self, "beam_engine_driven", None) is not None
             else existing_gr_config.beam_engine_driven
+        )
+        effective_persistent_request = (
+            getattr(self, "persistent_request", None)
+            if getattr(self, "persistent_request", None) is not None
+            else existing_gr_config.persistent_request
+        )
+        effective_persistent_runner_state = (
+            getattr(self, "persistent_runner_state", None)
+            if getattr(self, "persistent_runner_state", None) is not None
+            else existing_gr_config.persistent_runner_state
         )
         # NPU platform default for beam-serve deployments: when the user
         # enables beam search (beam_max_width) with a constraint catalog
@@ -556,6 +590,8 @@ def create_engine_config(self, usage_context=None, headless=False):
             ),
             beam_worker_decision=effective_beam_worker_decision,
             beam_engine_driven=effective_beam_engine_driven,
+            persistent_request=effective_persistent_request,
+            persistent_runner_state=effective_persistent_runner_state,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
         )
@@ -598,6 +634,16 @@ def create_engine_config(self, usage_context=None, headless=False):
             from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
             attention_config.backend = AttentionBackendEnum.CUSTOM
+    if effective_gr_config.persistent_request:
+        scheduler_config = config.scheduler_config
+        if scheduler_config.async_scheduling is False:
+            raise ValueError(
+                "persistent_request=True requires vLLM async scheduling"
+            )
+        scheduler_config.async_scheduling = True
+        scheduler_config.scheduler_cls = (
+            "vllm_gr.v1.core.sched.async_scheduler.GRAsyncScheduler"
+        )
     return config
 
 

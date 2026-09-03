@@ -31,6 +31,8 @@ from vllm_gr.config.validation import (
     validate_constraint_table_max_top_k,
     validate_constraint_table_path,
     validate_npu_decode_execution,
+    validate_persistent_request,
+    validate_persistent_runner_state,
     validate_schema_version,
     validate_tokenizer_digest,
     validate_vocab_offset,
@@ -50,6 +52,8 @@ BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
 NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
 BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
 BEAM_ENGINE_DRIVEN_KEY: Final = "vllm_gr_beam_engine_driven"
+PERSISTENT_REQUEST_KEY: Final = "vllm_gr_persistent_request"
+PERSISTENT_RUNNER_STATE_KEY: Final = "vllm_gr_persistent_runner_state"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -64,10 +68,12 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         NPU_DECODE_EXECUTION_KEY,
         BEAM_WORKER_DECISION_KEY,
         BEAM_ENGINE_DRIVEN_KEY,
+        PERSISTENT_REQUEST_KEY,
+        PERSISTENT_RUNNER_STATE_KEY,
     }
 )
 _TOP_LEVEL_KEYS: Final = frozenset(
-    {"schema_version", "beam", "constraint_table", "attention_backend"}
+    {"schema_version", "beam", "runtime", "constraint_table", "attention_backend"}
 )
 _BEAM_KEYS: Final = frozenset(
     {
@@ -88,6 +94,9 @@ _CONSTRAINT_TABLE_KEYS: Final = frozenset(
         "tokenizer_digest",
         "max_top_k",
     }
+)
+_RUNTIME_KEYS: Final = frozenset(
+    {"persistent_request", "persistent_runner_state"}
 )
 
 
@@ -153,6 +162,8 @@ def gr_config_from_mapping(
 
     beam_raw = _as_string_mapping(mapping.get("beam", {}), "beam")
     _reject_unknown_mapping_keys(beam_raw, _BEAM_KEYS, "beam")
+    runtime_raw = _as_string_mapping(mapping.get("runtime", {}), "runtime")
+    _reject_unknown_mapping_keys(runtime_raw, _RUNTIME_KEYS, "runtime")
     table_raw = _as_string_mapping(mapping.get("constraint_table", {}), "constraint_table")
     _reject_unknown_mapping_keys(table_raw, _CONSTRAINT_TABLE_KEYS, "constraint_table")
     if "max_top_k" not in table_raw:
@@ -182,6 +193,12 @@ def gr_config_from_mapping(
         ),
         beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
         beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
+        persistent_request=validate_persistent_request(
+            runtime_raw.get("persistent_request", False)
+        ),
+        persistent_runner_state=validate_persistent_runner_state(
+            runtime_raw.get("persistent_runner_state", False)
+        ),
         schema_version=validate_schema_version(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
@@ -231,7 +248,7 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     if config.beam_engine_driven is not None:
         beam["engine_driven"] = config.beam_engine_driven
 
-    return {
+    payload: dict[str, object] = {
         "schema_version": config.schema_version,
         "beam": beam,
         "constraint_table": {
@@ -247,6 +264,12 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
             config.attention_backend.value if config.attention_backend is not None else None
         ),
     }
+    if config.persistent_request or config.persistent_runner_state:
+        payload["runtime"] = {
+            "persistent_request": config.persistent_request,
+            "persistent_runner_state": config.persistent_runner_state,
+        }
+    return payload
 
 
 def load_gr_config(path: str | Path) -> GRConfig:
@@ -333,6 +356,12 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         ),
         beam_engine_driven=validate_beam_engine_driven(
             additional_config.get(BEAM_ENGINE_DRIVEN_KEY)
+        ),
+        persistent_request=validate_persistent_request(
+            additional_config.get(PERSISTENT_REQUEST_KEY, False)
+        ),
+        persistent_runner_state=validate_persistent_runner_state(
+            additional_config.get(PERSISTENT_RUNNER_STATE_KEY, False)
         ),
     )
 
@@ -425,6 +454,20 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     else:
         # Both explicit values round-trip (an opt-out must survive a write).
         additional_config[BEAM_ENGINE_DRIVEN_KEY] = beam_engine_driven
+
+    persistent_request = validate_persistent_request(gr_config.persistent_request)
+    if persistent_request:
+        additional_config[PERSISTENT_REQUEST_KEY] = True
+    else:
+        additional_config.pop(PERSISTENT_REQUEST_KEY, None)
+
+    persistent_runner_state = validate_persistent_runner_state(
+        gr_config.persistent_runner_state
+    )
+    if persistent_runner_state:
+        additional_config[PERSISTENT_RUNNER_STATE_KEY] = True
+    else:
+        additional_config.pop(PERSISTENT_RUNNER_STATE_KEY, None)
 
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:

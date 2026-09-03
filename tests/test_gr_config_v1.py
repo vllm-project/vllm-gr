@@ -64,6 +64,18 @@ def test_canonical_mapping_round_trip_is_exact(tmp_path: Path) -> None:
     assert gr_config_to_mapping(config) == raw
 
 
+def test_canonical_runtime_flags_round_trip(tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    raw["runtime"] = {
+        "persistent_request": True,
+        "persistent_runner_state": True,
+    }
+    config = gr_config_from_mapping(raw)
+    assert config.persistent_request is True
+    assert config.persistent_runner_state is True
+    assert gr_config_to_mapping(config) == raw
+
+
 @pytest.mark.parametrize("worker_decision", [True, False])  # type: ignore[misc]
 def test_canonical_beam_runtime_options_round_trip(
     worker_decision: bool,
@@ -324,3 +336,41 @@ def test_engine_creation_serializes_cuda_decision_defaults(
     assert payload["beam"].get("engine_driven") is expected_engine_driven
     assert parse_gr_config(vllm_config).beam_worker_decision is True
     assert parse_gr_config(vllm_config).beam_engine_driven is expected_engine_driven
+
+
+def test_persistent_request_selects_gr_async_scheduler(tmp_path: Path) -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    scheduler_config = SimpleNamespace(async_scheduling=None, scheduler_cls=None)
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        scheduler_config=scheduler_config,
+    )
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    raw["runtime"] = {
+        "persistent_request": True,
+        "persistent_runner_state": False,
+    }
+    engine_args = SimpleNamespace(
+        _vllm_gr_config_input=raw,
+        catalog_path=None,
+        constraint_backend=None,
+        attention_backend=None,
+        attention_config=None,
+        async_scheduling=None,
+    )
+
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
+    ):
+        assert create_engine_config(engine_args) is vllm_config
+
+    assert scheduler_config.async_scheduling is True
+    assert scheduler_config.scheduler_cls == (
+        "vllm_gr.v1.core.sched.async_scheduler.GRAsyncScheduler"
+    )

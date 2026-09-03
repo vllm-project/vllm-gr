@@ -97,6 +97,37 @@ def test_begin_session_resets_decision_buffers() -> None:
     assert torch.equal(bufs.group_token_num, torch.zeros_like(bufs.group_token_num))
 
 
+def test_d1_does_not_reset_prearmed_session() -> None:
+    context = _make_context(max_beams=4, max_decode_steps=3)
+    session = _make_session(context)
+    session.begin_session(beam_width=2, prefix_len=5)
+    session._gr_prefill_prearmed = True
+    context.decision.sequence.fill_(9)
+    context.decision.worker_decode_steps = 1
+    runner = _terminal_runner(context, session)
+    decode_metadata = {
+        session.session_id: {
+            "persistent_runner_state": True,
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_width": 2,
+            "prefix_len": 5,
+            "max_decode_steps": 3,
+        }
+    }
+
+    returned = common._get_or_create_beam_session(
+        runner,
+        decode_metadata,
+        SimpleNamespace(beam_finished_session_ids=[]),
+    )
+
+    assert returned is session
+    assert not hasattr(returned, "_gr_prefill_prearmed")
+    assert context.decision.worker_decode_steps == 1
+    assert torch.all(context.decision.sequence == 9)
+
+
 # ---------------------------------------------------------------------------
 # G2: result_width defaults to the beam width
 # ---------------------------------------------------------------------------

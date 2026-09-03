@@ -697,6 +697,26 @@ class TestProcessEngineStepWrapper:
         eng.post_step.assert_called_once_with(False)
         assert result is False
 
+    def test_persistent_scheduler_skips_legacy_hook_and_idle_sleep(self) -> None:
+        from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
+
+        outputs = _outputs_with_decision(_decision(parents=[1, 0], tokens=[61, 71]))
+        eng = _step_engine(outputs, model_executed=False, has_requests=True)
+        scheduler = object.__new__(GRAsyncScheduler)
+        scheduler.has_requests = lambda: True
+        eng.scheduler = scheduler
+
+        with (
+            patch.object(core_module, "_beam_self_advance") as advance,
+            patch("vllm_gr.v1.engine.engine_core_patch.time.sleep") as sleep,
+        ):
+            result = make_patched_process_engine_step(lambda self: None)(eng)
+
+        assert result is False
+        advance.assert_not_called()
+        sleep.assert_not_called()
+        assert eng.output_queue.qsize() == 1
+
     def test_wrapper_is_idempotent(self) -> None:
         def original(self: Any) -> bool:
             return True

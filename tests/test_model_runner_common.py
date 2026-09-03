@@ -441,6 +441,24 @@ def test_worker_decision_reduces_sampler_payload_before_host_copy() -> None:
     assert sampler_output.logprobs_tensors.logprobs.shape == (1, width)
 
 
+def test_persistent_control_transport_owns_async_snapshot() -> None:
+    from vllm.v1.outputs import SamplerOutput
+
+    control = torch.tensor([[7]], dtype=torch.int32)
+    state = SimpleNamespace(control_token_ids=control)
+    runner = SimpleNamespace(use_async_scheduling=True)
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[99]], dtype=torch.int32),
+        logprobs_tensors=None,
+    )
+    sampler_output._gr_model_runner_state = state
+
+    assert common._reduce_sampler_output_for_worker_decision(runner, sampler_output)
+    assert sampler_output.sampled_token_ids.tolist() == [[7]]
+    assert sampler_output.sampled_token_ids is not control
+    assert sampler_output._gr_persistent_state_transport is True
+
+
 def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     class ExpectedError(RuntimeError):
         pass

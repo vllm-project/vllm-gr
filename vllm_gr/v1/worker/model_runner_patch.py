@@ -25,6 +25,7 @@ _NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu_model_runner_patch"
 _CONSTRAINT_LOAD_PATCH_MARKER = "_vllm_gr_constraint_load_patched"
 _CONSTRAINT_SHUTDOWN_PATCH_MARKER = "_vllm_gr_constraint_shutdown_patched"
 _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
+_GR_STATE_RELEASE_HOOK_MARKER = "_vllm_gr_state_release_hook_installed"
 
 
 def close_constraint_backend(runner: object) -> None:
@@ -123,7 +124,7 @@ def make_load_model_with_constraint_backend(original):
 
 
 def make_shutdown_with_constraint_backend(original=None):
-    """Detach the canonical Backend before running native runner shutdown."""
+    """Release GR runner resources before native runner shutdown."""
 
     if original is not None and getattr(original, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
         return original
@@ -132,12 +133,22 @@ def make_shutdown_with_constraint_backend(original=None):
 
         def shutdown_with_constraint_backend(self, *args, **kwargs):
             del args, kwargs
+            from vllm_gr.v1.worker.gr_model_runner_state import (
+                release_gr_model_runner_states,
+            )
+
+            release_gr_model_runner_states(self)
             close_constraint_backend(self)
 
     else:
 
         @wraps(original)
         def shutdown_with_constraint_backend(self, *args, **kwargs):
+            from vllm_gr.v1.worker.gr_model_runner_state import (
+                release_gr_model_runner_states,
+            )
+
+            release_gr_model_runner_states(self)
             close_constraint_backend(self)
             return original(self, *args, **kwargs)
 
@@ -179,6 +190,17 @@ def _install_active_worker_resource_hook() -> None:
     from vllm_gr.constraints.worker_inject import install_worker_resource_hook
 
     install_worker_resource_hook(Worker)
+    if not getattr(Worker, _GR_STATE_RELEASE_HOOK_MARKER, False):
+        from vllm_gr.v1.worker.gr_model_runner_state import (
+            get_gr_model_runner_state_stats,
+            get_gr_memory_stats,
+            release_gr_model_runner_states,
+        )
+
+        Worker.release_gr_model_runner_states = release_gr_model_runner_states  # type: ignore[attr-defined]
+        Worker.get_gr_model_runner_state_stats = get_gr_model_runner_state_stats  # type: ignore[attr-defined]
+        Worker.get_gr_memory_stats = get_gr_memory_stats  # type: ignore[attr-defined]
+        setattr(Worker, _GR_STATE_RELEASE_HOOK_MARKER, True)
     if not getattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
         # A named method is required here: vLLM's safe msgpack utility channel
         # intentionally rejects callable serialization unless insecure pickle

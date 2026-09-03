@@ -20,6 +20,7 @@ _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
 _ENGINE_STEP_PATCH_MARKER = "_vllm_gr_beam_self_advance_step"
 _CLIENT_REQUEST_PATCH_MARKER = "_vllm_gr_gr_input_dispatch"
 _PIS_PATCH_MARKER = "_vllm_gr_process_input_sockets"
+_GR_ABORT_PATCH_MARKER = "_vllm_gr_releases_runner_state_on_abort"
 
 # Upstream EngineCoreProc.process_input_sockets captured before the adapter
 # is installed.  Parity tests inspect this object against the pinned vLLM.
@@ -50,6 +51,36 @@ def make_patched_engine_core_init(original_init):
     return patched_init
 
 
+def make_patched_abort_requests(original_abort):
+    """Release Worker-owned GR state when its logical request is aborted."""
+
+    if getattr(original_abort, _GR_ABORT_PATCH_MARKER, False) is True:
+        return original_abort
+
+    @wraps(original_abort)
+    def patched_abort_requests(self, request_ids):
+        ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+        requests = getattr(getattr(self, "scheduler", None), "requests", {})
+        gr_ids = [
+            request_id
+            for request_id in ids
+            if bool(
+                getattr(requests.get(request_id), "gr_persistent_runner_state", False)
+            )
+        ]
+        result = original_abort(self, ids)
+        if gr_ids:
+            self.model_executor.collective_rpc(
+                "release_gr_model_runner_states",
+                args=(gr_ids,),
+                non_block=True,
+            )
+        return result
+
+    setattr(patched_abort_requests, _GR_ABORT_PATCH_MARKER, True)
+    return patched_abort_requests
+
+
 # ---------------------------------------------------------------------------
 # EngineCoreProc._process_engine_step wrapper (engine-driven chain hook)
 # ---------------------------------------------------------------------------
@@ -74,12 +105,15 @@ def make_patched_process_engine_step(original_step):
     if getattr(original_step, _ENGINE_STEP_PATCH_MARKER, False):
         return original_step
 
+    from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
+
     @wraps(original_step)
     def patched_process_engine_step(self):
         from vllm_gr.v1.engine.core import _beam_self_advance
 
         outputs, model_executed = self.step_fn()
-        if outputs:
+        persistent_gr = isinstance(self.scheduler, GRAsyncScheduler)
+        if outputs and not persistent_gr:
             try:
                 _beam_self_advance(self, outputs)
             except Exception:
@@ -91,7 +125,11 @@ def make_patched_process_engine_step(original_step):
             self.output_queue.put_nowait(output)
         self.post_step(model_executed)
 
-        if not model_executed and self.scheduler.has_requests():
+        if (
+            not persistent_gr
+            and not model_executed
+            and self.scheduler.has_requests()
+        ):
             time.sleep(0.001)
 
         return model_executed
@@ -149,6 +187,10 @@ def apply_engine_core_request_patches() -> None:
     # against changes in upstream inheritance and plugin loading order.
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
     EngineCoreProc.__init__ = make_patched_engine_core_init(EngineCoreProc.__init__)
+    EngineCore.abort_requests = make_patched_abort_requests(EngineCore.abort_requests)
+    EngineCoreProc.abort_requests = make_patched_abort_requests(
+        EngineCoreProc.abort_requests
+    )
 
     # Bind request handlers explicitly on both classes.
     EngineCore._cache_beam_request = _cache_beam_request
@@ -340,6 +382,8 @@ def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from vllm.v1.core.sched.scheduler import Scheduler
 
+    from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
+
     if getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False):
         return
 
@@ -347,6 +391,10 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
+        # The persistent-request scheduler owns its KV-domain rules directly;
+        # never install the legacy per-step prefix-cache monkey patches on it.
+        if isinstance(self, GRAsyncScheduler):
+            return _original_schedule(self)
         _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
         _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
         block_size = self.cache_config.block_size

@@ -21,6 +21,8 @@ from vllm_gr.config.parser import (
     CATALOG_PATH_KEY,
     CONSTRAINT_BACKEND_KEY,
     NPU_DECODE_EXECUTION_KEY,
+    PERSISTENT_REQUEST_KEY,
+    PERSISTENT_RUNNER_STATE_KEY,
 )
 
 
@@ -40,6 +42,60 @@ def test_empty_vllm_config_uses_defaults() -> None:
     config = GRConfig.from_vllm_config(_vllm_config())
     assert config == GRConfig()
     assert config.enabled is False
+    assert config.persistent_request is False
+    assert config.persistent_runner_state is False
+
+
+def test_persistent_flags_round_trip_and_default_elision() -> None:
+    vllm_config = _vllm_config()
+    expected = GRConfig(persistent_request=True, persistent_runner_state=True)
+    expected.write_to_vllm_config(vllm_config)
+
+    assert vllm_config.additional_config[PERSISTENT_REQUEST_KEY] is True
+    assert vllm_config.additional_config[PERSISTENT_RUNNER_STATE_KEY] is True
+    assert GRConfig.from_vllm_config(vllm_config) == expected
+
+    GRConfig().write_to_vllm_config(vllm_config)
+    assert PERSISTENT_REQUEST_KEY not in vllm_config.additional_config
+    assert PERSISTENT_RUNNER_STATE_KEY not in vllm_config.additional_config
+
+
+def test_persistent_runner_state_requires_persistent_request() -> None:
+    with pytest.raises(ValueError, match="requires persistent_request"):
+        GRConfig(persistent_runner_state=True)
+
+
+def test_engine_config_writes_persistent_cli_flags() -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    vllm_config.scheduler_config = SimpleNamespace(
+        async_scheduling=True,
+        scheduler_cls="vllm.v1.core.sched.async_scheduler.AsyncScheduler",
+    )
+    engine_args = SimpleNamespace(
+        _vllm_gr_config_input=None,
+        catalog_path=None,
+        constraint_backend=None,
+        attention_backend=None,
+        attention_config=None,
+        persistent_request=True,
+        persistent_runner_state=True,
+    )
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
+    ):
+        create_engine_config(engine_args)
+
+    assert GRConfig.from_vllm_config(vllm_config) == GRConfig(
+        persistent_request=True,
+        persistent_runner_state=True,
+    )
 
 
 def test_none_vllm_config_uses_defaults() -> None:

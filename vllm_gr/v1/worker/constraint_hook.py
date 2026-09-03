@@ -666,6 +666,7 @@ def _prepare_workspace_constraint_metadata(
     host_prefix = workspace.host_prefix_token_ids.view(capacity_rows, 3)
     host_prefix_numpy = workspace.host_prefix_token_ids_numpy.reshape(capacity_rows, 3)
     device_prefix = workspace.prefix_token_ids.view(capacity_rows, 3)
+    device_state_rows = 0
     # Step 0 never reads sequence_group.  Avoid the otherwise exposed pinned
     # host write plus H2D copy on the LM-Head -> TopK critical path.
     if step != 0:
@@ -684,6 +685,21 @@ def _prepare_workspace_constraint_metadata(
                 f"constrained decode request {req_id!r} has {row_count} logits "
                 f"rows, expected beam_width={width}"
             )
+        states = getattr(runner, "_gr_model_runner_states", {})
+        gr_state = states.get(req_id) if mdata.get("persistent_runner_state") else None
+        if gr_state is not None:
+            if gr_state.step < step:
+                raise RuntimeError(
+                    f"persistent GR state for {req_id!r} has only "
+                    f"{gr_state.step} token(s), needs {step}"
+                )
+            target = device_prefix[row_start : row_start + width]
+            target.zero_()
+            target[:, :step].copy_(
+                gr_state.sequences[:, gr_state.step - step : gr_state.step]
+            )
+            device_state_rows += row_count
+            continue
         suffix = mdata.get("beam_suffix")
         if (
             not isinstance(suffix, Sequence)
@@ -731,7 +747,7 @@ def _prepare_workspace_constraint_metadata(
             row_start : row_start + width,
             :step,
         ] = packed_prefixes
-    if step != 0:
+    if step != 0 and device_state_rows != total_rows:
         device_prefix[:total_rows].copy_(host_prefix[:total_rows], non_blocking=True)
 
     device_temperatures = workspace.temperatures.view(-1)[:total_rows]
@@ -1016,11 +1032,14 @@ def launch_prepared_cuda_prefill_constraint(
                 out_prefill_payload=prepared.out_payload,
             )
 
-    prepared.host_copy.copy_(prepared.device_copy, non_blocking=True)
-    # TopK, result packing, D2H, and the completion event must share the launch
-    # stream.  Recording on the earlier prepare stream could signal before the
-    # D2H has even started.
-    prepared.copy_event.record(launch_stream)
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    if not _get_gr_config(runner).persistent_runner_state:
+        prepared.host_copy.copy_(prepared.device_copy, non_blocking=True)
+        # TopK, result packing, D2H, and the completion event must share the
+        # launch stream. Recording on the earlier prepare stream could signal
+        # before the D2H has even started.
+        prepared.copy_event.record(launch_stream)
     sampler_output = _build_workspace_constrained_sampler_output(
         workspace,
         1,
