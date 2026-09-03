@@ -11,11 +11,15 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import numpy as np
+import pytest
 from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
 
 from vllm_gr.entrypoints.openai import serving_engine
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.constraints import BeamConstraintCoordinator
+from vllm_gr.constraints.strategies import ConstraintTableStrategy
+from vllm_gr.v1.engine.types import GR_REQUEST_METADATA_KEY, BeamRequestStepUpdate
 
 
 class _OutputQueue:
@@ -140,7 +144,10 @@ class _OrdinaryEngineClient:
             data_parallel_rank=data_parallel_rank,
         )
         self.prepare_calls.append(call)
-        return _OutputQueue(self.prepare_outputs.pop(0)), SimpleNamespace(request_id=request_id)
+        return _OutputQueue(self.prepare_outputs.pop(0)), SimpleNamespace(
+            request_id=request_id,
+            sampling_params=sampling_params,
+        )
 
     async def _add_requests_batch(
         self,
@@ -523,3 +530,83 @@ def test_self_advance_unflagged_decision_keeps_frontend_driven(
 
     assert len(outputs) == 1
     _assert_normal_output(outputs[0], "request-0")
+
+
+def test_persistent_runner_state_uses_one_native_request(
+    monkeypatch: Any,
+) -> None:
+    _install_deterministic_request_ids(monkeypatch)
+    width = 2
+    steps = 3
+    sequences = np.asarray([[11, 21, 31], [12, 22, 32]], dtype=np.int32)
+    parents = np.asarray([[0, 0, 0], [0, 1, 1]], dtype=np.int32)
+    logprobs = np.asarray(
+        [[-0.1, -0.2, -0.3], [-0.2, -0.2, -0.3]], dtype=np.float32
+    )
+    scores = np.asarray([-0.6, -0.7], dtype=np.float32)
+    packed = np.concatenate(
+        (
+            sequences.reshape(-1),
+            parents.reshape(-1),
+            logprobs.reshape(-1).view(np.int32),
+            scores.view(np.int32),
+        )
+    ).tobytes()
+    decision = {
+        "buffer_format": "gr_final_i32_f32_v1",
+        "shape": [width, steps],
+        "buffer": packed,
+        "is_last_step": True,
+        "counters": {"native_request_created_per_session": 1},
+    }
+    engine = _GroupedEngineClient(
+        prepare_outputs=[
+            _engine_output(
+                None,
+                kv_transfer_params={"beam_search_result": decision},
+            )
+        ],
+        grouped_outputs=[],
+    )
+    engine.vllm_config = SimpleNamespace(
+        additional_config={
+            "vllm_gr_persistent_request": True,
+            "vllm_gr_persistent_runner_state": True,
+        },
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    serving = _serving(engine)
+    serving.models.constraint_coordinator = BeamConstraintCoordinator(
+        ConstraintTableStrategy("test-triples.json")
+    )
+    params = _params(max_tokens=4, ignore_eos=True, end_token="<end>")
+    params.catalog_strategy = None
+
+    outputs = asyncio.run(
+        _collect_outputs(
+            serving_engine.beam_search(
+                serving,
+                {"prompt": "prompt text", "prompt_token_ids": [10]},
+                "request-0",
+                params,
+            )
+        )
+    )
+
+    assert len(engine.prepare_calls) == 1
+    assert len(engine.add_batch_calls) == 1
+    assert engine.beam_updates == []
+    sampling_params = engine.prepare_calls[0].sampling_params
+    assert sampling_params.max_tokens == 3
+    assert sampling_params.logprobs is None
+    assert sampling_params.extra_args[GR_REQUEST_METADATA_KEY]["request_id"] == (
+        "request-0-step-0-beam-0"
+    )
+    assert [choice.token_ids for choice in outputs[0].outputs] == [
+        [11, 21, 31, 3],
+        [12, 22, 32, 3],
+    ]
+    assert [choice.cumulative_logprob for choice in outputs[0].outputs] == [
+        pytest.approx(-0.6),
+        pytest.approx(-0.7),
+    ]

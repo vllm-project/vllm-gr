@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
 from vllm.utils import random_uuid
 
 from vllm_gr.beam_search_decision_utils import (
@@ -21,10 +21,11 @@ from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_segment,
     extract_constrained_flat_logprobs,
     extract_constrained_segment,
+    materialize_final_beams,
     materialize_selected_beams,
     select_top_indices,
 )
-from vllm_gr.config import MAX_BEAM_WIDTH
+from vllm_gr.config import MAX_BEAM_WIDTH, GRConfig
 from vllm_gr.constraints import BeamConstraintCoordinator, ParentCandidateBuilder
 from vllm_gr.constraints.models import CandidateLayout
 from vllm_gr.constraints.strategies import (
@@ -35,7 +36,11 @@ from vllm_gr.constraints.strategies import (
 )
 from vllm_gr.logprobs import reconstruct_beam_logprobs
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.engine.types import (
+    GR_REQUEST_METADATA_KEY,
+    BeamRequestStepUpdate,
+    GRRequestMetadata,
+)
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
@@ -164,6 +169,7 @@ async def _add_batch_step(
     priority=0,
     data_parallel_rank: int | None = None,
     session_template=None,
+    gr_metadata: GRRequestMetadata | None = None,
 ):
     """ADD_BATCH path: prepare and batch-send requests (step 0).
 
@@ -189,6 +195,16 @@ async def _add_batch_step(
             priority=priority,
             data_parallel_rank=data_parallel_rank,
         )
+        if gr_metadata is not None:
+            metadata = {
+                field: getattr(gr_metadata, field)
+                for field in gr_metadata.__struct_fields__
+            }
+            metadata["request_id"] = ec_req.request_id
+            ec_req.sampling_params.extra_args = dict(
+                ec_req.sampling_params.extra_args or {}
+            )
+            ec_req.sampling_params.extra_args[GR_REQUEST_METADATA_KEY] = metadata
         queues.append(q)
         engine_core_requests.append(ec_req)
 
@@ -388,6 +404,15 @@ async def beam_search(
     _is_constrained = constraint_coordinator is not None and isinstance(
         constraint_coordinator.strategy, ConstraintTableStrategy
     )
+    gr_config = GRConfig.from_vllm_config(
+        getattr(self.engine_client, "vllm_config", None)
+    )
+    persistent_request = bool(gr_config.persistent_request)
+    persistent_runner_state = bool(gr_config.persistent_runner_state)
+    if persistent_request and not _is_constrained:
+        raise VLLMValidationError(
+            "persistent GR requests require constraint_backend='constraint_table'"
+        )
 
     # Constraint Tables defer the collective-RPC broadcast to the first
     # beam_search; ensure workers hold the tables before any constrained step.
@@ -528,6 +553,33 @@ async def beam_search(
         except ValueError as exc:
             raise VLLMValidationError(str(exc)) from exc
 
+    gr_metadata = None
+    if persistent_request:
+        decode_steps = max_tokens - pre_calc
+        if decode_steps < 1:
+            raise VLLMValidationError(
+                "persistent GR requests require at least one generated token",
+                parameter="max_tokens",
+                value=max_tokens,
+            )
+        beam_search_params.max_tokens = decode_steps
+        beam_search_params.output_kind = RequestOutputKind.DELTA
+        if persistent_runner_state:
+            beam_search_params.logprobs = None
+        finish_token_id = sid_end_token_id if sid_end_token_id is not None else eos_token_id
+        if finish_token_id is None:
+            finish_token_id = 0
+        continue_token_id = 0 if finish_token_id != 0 else 1
+        gr_metadata = GRRequestMetadata(
+            request_id="",
+            beam_width=beam_width,
+            max_tokens=decode_steps,
+            prefix_len=len(initial_tokens),
+            continue_token_id=continue_token_id,
+            finish_token_id=finish_token_id,
+            num_return_sequences=beam_width,
+        )
+
     # Check once if the engine supports batch submission / beam fork.
     use_beam_request = hasattr(self.engine_client, "beam_request_step_update")
 
@@ -643,11 +695,13 @@ async def beam_search(
             # Prefill session template: fields EngineCore cannot derive
             # itself when it constructs the step-0 BeamRequestStepUpdate
             # in-process from the worker's constrained-prefill decision.
-            # Sent unconditionally on the constrained beam path;
+            # Sent on the non-persistent constrained beam path;
             # EngineCore-side gating (beam_engine_driven) decides whether
-            # to consume it.
+            # to consume it. Persistent requests are advanced by
+            # GRAsyncScheduler and must not install the parallel
+            # engine-driven session chain.
             prefill_session_template = None
-            if use_beam_request and _is_constrained:
+            if use_beam_request and _is_constrained and not persistent_request:
                 prefill_session_template = BeamRequestStepUpdate(
                     session_id="",  # stamped by _add_batch_step from the request ids
                     parent_beam_ids=[],
@@ -677,16 +731,44 @@ async def beam_search(
                 priority=priority,
                 data_parallel_rank=rank,
                 session_template=prefill_session_template,
+                gr_metadata=gr_metadata,
             )
             if new_ids:
                 prev_beam_internal_ids = new_ids
                 if prefill_id is None:
                     prefill_id = new_ids[0]
 
+        if persistent_runner_state:
+            final_decision = (
+                _worker_decision_from_result(output[0])
+                if len(output) == 1
+                else None
+            )
+            if final_decision is None:
+                raise RuntimeError("persistent GR final output is missing")
+            from vllm_gr.v1.worker.gr_model_runner_state import (
+                unpack_gr_final_output,
+            )
+
+            final_output = unpack_gr_final_output(final_decision)
+            if final_output is None:
+                raise RuntimeError("persistent GR final output is invalid")
+            sequences, _, selected_logprobs, scores = final_output
+            all_beams = materialize_final_beams(
+                all_beams[0], sequences, selected_logprobs, scores
+            )
+            prev_beam_internal_ids = []
+            if final_decision.get("counters"):
+                logger.info(
+                    "vllm-gr request counters: %s",
+                    final_decision["counters"],
+                )
+            break
+
         valid_tokens_sets = None
         if catalog_task is not None:
             valid_tokens_sets = await catalog_task
-        if token > 0:
+        if token > 0 or persistent_runner_state:
             generation_time += time.perf_counter() - gen_start
         candidate_builder = ParentCandidateBuilder(
             layout=(

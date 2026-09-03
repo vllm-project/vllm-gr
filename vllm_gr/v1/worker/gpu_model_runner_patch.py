@@ -9,7 +9,10 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.beam.beam_decision import maybe_run_worker_beam_decision
+from vllm_gr.v1.beam.beam_decision import (
+    _create_persistent_gr_state,
+    maybe_run_worker_beam_decision,
+)
 from vllm_gr.v1.worker.constraint_hook import (
     apply_constrained_sample_override,
     consume_prelaunched_cuda_prefill,
@@ -241,6 +244,58 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
         if not beam_data:
             return logits_indices, spec_decode_metadata
 
+        # The native request advances with one logical control token while the
+        # grouped model invocation consumes W physical Beam tokens. Write each
+        # request into its packed-token slice so this path does not depend on
+        # the GR request occupying batch row zero.
+        token_offset = 0
+        for batch_idx, req_id in enumerate(self.input_batch.req_ids):
+            scheduled_tokens = (
+                num_scheduled_tokens[batch_idx] if batch_idx < len(num_scheduled_tokens) else 0
+            )
+            mdata = beam_data.get(req_id)
+            if not mdata or not mdata.get("persistent_request"):
+                token_offset += scheduled_tokens
+                continue
+            if mdata.get("persistent_runner_state") and mdata.get("is_beam_decode"):
+                state = getattr(self, "_gr_model_runner_states", {}).get(req_id)
+                if state is None:
+                    raise RuntimeError(f"persistent GR state is missing for request {req_id!r}")
+                width = int(mdata["beam_width"])
+                if scheduled_tokens != width:
+                    raise RuntimeError(
+                        "persistent GR scheduled token count does not match beam_width"
+                    )
+                self.input_ids.gpu[token_offset : token_offset + width].copy_(state.next_token_ids)
+            else:
+                next_token_ids = mdata.get("next_token_ids")
+                if next_token_ids:
+                    width = int(mdata["beam_width"])
+                    if len(next_token_ids) != width or scheduled_tokens != width:
+                        raise RuntimeError(
+                            "persistent GR next_token_ids width does not match "
+                            "the scheduled Beam rows"
+                        )
+                    self.input_ids.gpu[token_offset : token_offset + width].copy_(
+                        torch.tensor(
+                            next_token_ids,
+                            dtype=self.input_ids.gpu.dtype,
+                            device=self.device,
+                        )
+                    )
+            token_offset += scheduled_tokens
+
+        # Move state allocation ahead of the final Prefill forward; native
+        # input, slot-mapping and attention preparation stay unchanged.
+        for req_id, mdata in beam_data.items():
+            if (
+                mdata.get("persistent_runner_state")
+                and mdata.get("is_constraint_prefill")
+                and mdata.get("is_last_prefill", False)
+            ):
+                with torch.autograd.profiler.record_function("gr_prefill_prearm"):
+                    _create_persistent_gr_state(self, req_id, mdata)
+
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         with torch.autograd.profiler.record_function("prefill_constraint_prepare"):
             prepare_cuda_prefill_constraint(self, scheduler_output)
@@ -286,6 +341,10 @@ def make_patched_sample_tokens_gpu(_orig_sample_tokens):
     def patched_sample_tokens(self, grammar_output, *args, **kwargs):
         from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
 
+        bundled = getattr(self, "_gr_bundled_model_output", None)
+        if bundled is not None:
+            self._gr_bundled_model_output = None
+            return bundled
         out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
         _attach_beam_search_result(self, out)
         return out

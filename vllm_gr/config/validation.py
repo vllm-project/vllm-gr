@@ -254,6 +254,26 @@ def validate_beam_engine_driven(value: object) -> bool | None:
     raise ValueError("vllm-gr beam_engine_driven must be a boolean or null")
 
 
+def _validate_rollout_flag(value: object, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    raise ValueError(f"vllm-gr {name} must be a boolean")
+
+
+def validate_persistent_request(value: object) -> bool:
+    return _validate_rollout_flag(value, "persistent_request")
+
+
+def validate_persistent_runner_state(value: object) -> bool:
+    return _validate_rollout_flag(value, "persistent_runner_state")
+
+
 def validate_beam_max_decode_steps(value: object) -> int:
     return _validate_positive_int(
         value if value is not None else _BEAM_MAX_DECODE_STEPS_DEFAULT,

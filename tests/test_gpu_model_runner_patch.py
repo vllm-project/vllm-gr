@@ -12,6 +12,26 @@ from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
 from vllm_gr.v1.worker import model_runner_common as common
 
 
+def test_gpu_sample_tokens_returns_bundled_terminal_output_once() -> None:
+    terminal = object()
+    calls = 0
+
+    def original(_self: Any, _grammar_output: Any) -> object:
+        nonlocal calls
+        calls += 1
+        return object()
+
+    runner = SimpleNamespace(_gr_bundled_model_output=terminal)
+    wrapped = gpu_patch.make_patched_sample_tokens_gpu(original)
+
+    assert wrapped(runner, None) is terminal
+    assert runner._gr_bundled_model_output is None
+    assert calls == 0
+
+    wrapped(runner, None)
+    assert calls == 1
+
+
 def test_gpu_prepare_preserves_order_and_two_item_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -61,6 +81,44 @@ def test_gpu_prepare_preserves_order_and_two_item_contract(
     assert logits.dtype is torch.int32
     assert logits.tolist() == [2, 4]
     assert returned_spec is spec_metadata
+
+
+def test_gpu_prepare_writes_each_persistent_request_token_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["plain", "gr-0", "gr-1"]),
+        input_ids=SimpleNamespace(gpu=torch.full((7,), -1, dtype=torch.int32)),
+        _gr_model_runner_states={
+            "gr-0": SimpleNamespace(next_token_ids=torch.tensor([10, 11])),
+            "gr-1": SimpleNamespace(next_token_ids=torch.tensor([20, 21, 22])),
+        },
+        _current_beam_info={"req_ids": []},
+        device=torch.device("cpu"),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={
+            "gr-0": {
+                "persistent_request": True,
+                "persistent_runner_state": True,
+                "is_beam_decode": True,
+                "beam_width": 2,
+            },
+            "gr-1": {
+                "persistent_request": True,
+                "persistent_runner_state": True,
+                "is_beam_decode": True,
+                "beam_width": 3,
+            },
+        }
+    )
+    monkeypatch.setattr(gpu_patch, "_beam_remap_inputs", lambda *_args: [])
+    monkeypatch.setattr(gpu_patch, "prepare_cuda_prefill_constraint", lambda *_args: None)
+
+    wrapped = gpu_patch.make_patched_prepare_inputs(lambda *_args: (None, None))
+    wrapped(runner, scheduler_output, [2, 2, 3])
+
+    assert runner.input_ids.gpu.tolist() == [-1, -1, 10, 11, 20, 21, 22]
 
 
 def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(
@@ -578,8 +636,11 @@ def test_patched_determine_mixed_batch_downgrades_full() -> None:
         mod._beam_graph_enabled_for_run = original_fn
 
 
-def test_patched_determine_pure_beam_batch_grants_full() -> None:
-    """A pure beam batch with session + matching width should get FULL."""
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+def test_patched_determine_pure_beam_batch_grants_full(
+    enable_prefix_caching: bool,
+) -> None:
+    """FULL graph dispatch is independent of cross-request prefix caching."""
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
 
     session = SimpleNamespace(is_active=True)
@@ -592,27 +653,19 @@ def test_patched_determine_pure_beam_batch_grants_full() -> None:
     runner = SimpleNamespace(
         _current_beam_info=beam_info,
         _beam_graph_keys={4},
+        _vllm_gr_config=SimpleNamespace(beam_graph_enabled=True),
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching)
+        ),
     )
-
-    import vllm_gr.v1.worker.gpu_model_runner_patch as mod
-
-    original_fn = mod._beam_graph_enabled_for_run
-
-    def _stub_enabled(r: Any) -> bool:
-        return True
-
-    mod._beam_graph_enabled_for_run = _stub_enabled
-    try:
-        wrapped = _make_determine_wrapper(beam_info, native)
-        result = wrapped(runner, num_tokens=4)
-        assert result[0] == CUDAGraphMode.FULL
-        assert result[1].num_tokens == 4
-        assert result[1].uniform is True
-        assert runner._beam_graph_full_dispatch_count == 1
-        wrapped(runner, num_tokens=4)
-        assert runner._beam_graph_full_dispatch_count == 2
-    finally:
-        mod._beam_graph_enabled_for_run = original_fn
+    wrapped = _make_determine_wrapper(beam_info, native)
+    result = wrapped(runner, num_tokens=4)
+    assert result[0] == CUDAGraphMode.FULL
+    assert result[1].num_tokens == 4
+    assert result[1].uniform is True
+    assert runner._beam_graph_full_dispatch_count == 1
+    wrapped(runner, num_tokens=4)
+    assert runner._beam_graph_full_dispatch_count == 2
 
 
 def test_beam_graph_runtime_stats_reports_capture_and_dispatch_state() -> None:

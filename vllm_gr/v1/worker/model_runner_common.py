@@ -810,6 +810,10 @@ def _beam_collapse_bookkeeping(
     if sampler_output is not None:
         st_ids = sampler_output.sampled_token_ids
         lp_tensors = sampler_output.logprobs_tensors
+        if getattr(sampler_output, "_gr_persistent_state_transport", False):
+            if st_ids is None or st_ids.shape != (num_logical_requests, 1):
+                raise RuntimeError("persistent GR control-token rows do not match logical requests")
+            return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
         if getattr(sampler_output, "_gr_beam_result_transport", False):
             # Worker-side selection already reduced the candidate matrix to
             # one O(W) row per logical request before upstream bookkeeping.
@@ -972,6 +976,20 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
     the normal sampler representation plus the canonical beam_search_result
     channel, not the removed FlatLogprobs packed-wire protocol.
     """
+    gr_state = getattr(sampler_output, "_gr_model_runner_state", None)
+    if gr_state is not None:
+        control_token_ids = gr_state.control_token_ids
+        if bool(getattr(runner, "use_async_scheduling", False)):
+            # The state may return to the fixed-shape reuse pool before the
+            # AsyncGPUModelRunnerOutput copy stream consumes this scalar. Give
+            # the transport private storage so the next request cannot mutate
+            # an in-flight control-token D2H source.
+            control_token_ids = control_token_ids.clone()
+        sampler_output.sampled_token_ids = control_token_ids
+        sampler_output.logprobs_tensors = None
+        sampler_output._gr_persistent_state_transport = True
+        return True
+
     decision = getattr(runner, "_beam_decision_tensors", None)
     if not isinstance(decision, dict) or sampler_output is None:
         return False
@@ -1180,6 +1198,52 @@ def _inline_sample_tokens(runner: Any) -> Any:
     finally:
         runner.execute_model_state = None
     return out
+
+
+def _sample_persistent_stage_without_output(runner: Any) -> None:
+    """Sample one bundled GR stage without host bookkeeping or D2H.
+
+    A persistent GR stage consumes its candidates entirely on the device: the
+    patched ``_sample`` advances ``GRModelRunnerState`` and the beam KV session.
+    Intermediate native control tokens are known by the scheduler, so building
+    an AsyncModelRunnerOutput (and copying that scalar to the host) is needless.
+
+    This intentionally supports the Phase-A topology only: no speculative
+    decoder, no pipeline parallelism, and no KV/EC connector payload.  Those
+    configurations retain the ordinary per-step path.
+    """
+    state = getattr(runner, "execute_model_state", None)
+    if state is None:
+        raise RuntimeError("bundled persistent GR stage has no execute state")
+    if getattr(runner, "speculative_config", None) is not None:
+        raise RuntimeError("bundled persistent GR does not support speculative decode")
+    parallel_config = getattr(runner, "parallel_config", None)
+    if (
+        parallel_config is not None
+        and int(getattr(parallel_config, "pipeline_parallel_size", 1)) != 1
+    ):
+        raise RuntimeError("bundled persistent GR requires pipeline_parallel_size=1")
+    if (
+        state.ec_connector_output is not None
+        or getattr(runner, "kv_connector_output", None) is not None
+    ):
+        raise RuntimeError("bundled persistent GR does not support cache connectors")
+
+    # Clear before sampling, matching upstream sample_tokens.  The patched
+    # _sample performs constraint top-k, beam selection, state advance and KV
+    # reorder on the producer stream.
+    runner.execute_model_state = None
+    sampler_output = runner._sample(state.logits, state.spec_decode_metadata)
+    runner._update_states_after_model_execute(
+        sampler_output.sampled_token_ids, state.scheduler_output
+    )
+    runner._draft_token_ids = None
+    runner._draft_probs = None
+    runner._draft_prob_req_ids = None
+    runner._draft_token_req_ids = None
+    runner.valid_sampled_token_count_gpu = None
+    runner.input_batch.prev_sampled_token_ids = None
+    runner.eplb_step()
 
 
 def _get_gr_config(runner) -> Any:
@@ -1401,6 +1465,21 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
 
         session = runner._beam_sessions.get(req_id)
         mdata_step = mdata.get("decode_step", 0)
+        if mdata.get("persistent_runner_state"):
+            gr_state = getattr(runner, "_gr_model_runner_states", {}).get(req_id)
+            if gr_state is not None:
+                generation_index = mdata.get("generation_index")
+                if generation_index != gr_state.step:
+                    raise RuntimeError(
+                        "persistent GR worker state is not ready for the issued "
+                        f"generation: issued={generation_index}, device={gr_state.step}"
+                    )
+                expected_decode_step = max(gr_state.step - 1, 0)
+                if mdata_step != expected_decode_step:
+                    raise RuntimeError(
+                        "persistent GR decode metadata is out of sequence: "
+                        f"metadata={mdata_step}, device={expected_decode_step}"
+                    )
 
         # Terminal-step detection.  ``max_decode_steps`` on the
         # metadata is the frontend LOOP length (``max_tokens -
@@ -1436,7 +1515,10 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 # must not run, and decode KV must be written to pool slice 0.
                 # (parent_beam_indices is non-None even on the first step, so it
                 # cannot be used to distinguish the first step — decode_step can.)
-                session.begin_session(mdata["beam_width"], mdata["prefix_len"])
+                if getattr(session, "_gr_prefill_prearmed", False):
+                    del session._gr_prefill_prearmed
+                else:
+                    session.begin_session(mdata["beam_width"], mdata["prefix_len"])
                 session._state.is_last_step = is_last_step
             else:
                 # Subsequent decode steps: apply the previous step's beam decision.
@@ -1545,6 +1627,12 @@ def make_patched_execute_model(_orig_execute_model):
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
+        bundled_followups = list(getattr(scheduler_output, "gr_followup_outputs", None) or ())
+        if bundled_followups:
+            # sample_tokens() is still invoked once by async EngineCore after
+            # execute_model().  Stash the terminal output for that call rather
+            # than changing the upstream executor contract.
+            self._gr_bundled_model_output = None
         # Clear the previous step's beam context at the START of the next
         # execute_model, not in a finally: with async scheduling the sampled
         # tokens are produced by ``sample_tokens`` AFTER execute_model returns,
@@ -1628,7 +1716,32 @@ def make_patched_execute_model(_orig_execute_model):
                     "prefill_constraint_post_forward_enqueue"
                 ):
                     launch_prepared_cuda_prefill_constraint(self)
-            if out is None and _should_inline_sample_tokens(self, scheduler_output):
+            if out is None and bundled_followups:
+                # The current output is the final prefill.  Its device decision
+                # bootstraps GRModelRunnerState; every non-terminal follow-up is
+                # sampled through the no-output path.  The terminal stage uses
+                # normal sample_tokens once so final result D2H and upstream
+                # bookkeeping retain their established contracts.
+                with torch.autograd.profiler.record_function("gr_bundled_intermediate_sample"):
+                    _sample_persistent_stage_without_output(self)
+                for index, followup in enumerate(bundled_followups):
+                    with torch.autograd.profiler.record_function("gr_bundled_decode_execute"):
+                        followup_out = patched_execute_model(self, followup, *args, **kwargs)
+                    if followup_out is not None:
+                        raise RuntimeError(
+                            "bundled persistent GR follow-up returned an "
+                            "unexpected eager model output"
+                        )
+                    if index + 1 < len(bundled_followups):
+                        with torch.autograd.profiler.record_function(
+                            "gr_bundled_intermediate_sample"
+                        ):
+                            _sample_persistent_stage_without_output(self)
+                    else:
+                        terminal_output = self.sample_tokens(None)
+                        self._gr_bundled_model_output = terminal_output
+                out = None
+            elif out is None and _should_inline_sample_tokens(self, scheduler_output):
                 # M2: finish sampling in-process and return the
                 # ModelRunnerOutput through the execute_model channel, so the
                 # engine's None short-circuit (core.py ``future.result()``)

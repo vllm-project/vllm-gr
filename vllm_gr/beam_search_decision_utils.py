@@ -28,6 +28,47 @@ from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_ena
 ForkInfo = list[tuple[int, int]]
 
 
+def materialize_final_beams(
+    root: BeamSearchSequence,
+    token_ids: Sequence[Sequence[int]],
+    token_logprobs: Sequence[Sequence[float]],
+    scores: Sequence[float],
+) -> list[BeamSearchSequence]:
+    """Build vLLM beam outputs from the runner's final packed result."""
+    if len(token_ids) != len(token_logprobs) or len(token_ids) != len(scores):
+        raise ValueError("persistent GR final result has inconsistent beam counts")
+
+    beams = []
+    for generated, logprobs, score in zip(token_ids, token_logprobs, scores):
+        if len(generated) != len(logprobs):
+            raise ValueError("persistent GR final result has inconsistent step counts")
+        parent = root
+        cumulative_logprob = 0.0
+        for step, (token_id, logprob) in enumerate(zip(generated, logprobs)):
+            cumulative_logprob += float(logprob)
+            child = BeamSearchSequence(
+                orig_prompt=parent.orig_prompt,
+                tokens=parent.tokens + [int(token_id)],
+                logprobs=root.logprobs,
+                lora_request=parent.lora_request,
+                cum_logprob=(
+                    float(score)
+                    if step + 1 == len(generated)
+                    else cumulative_logprob
+                ),
+            )
+            child._lp_parent = parent
+            child._lp_step_data = (
+                [int(token_id)],
+                [float(logprob)],
+                [0],
+                [None],
+            )
+            parent = child
+        beams.append(parent)
+    return beams
+
+
 def mask_candidate_logprobs(
     token_ids: Sequence[int],
     logprobs: Sequence[float],

@@ -151,6 +151,9 @@ class GRConfig:
     # the step's outputs.  Only valid with beam_worker_decision=True (the
     # chain consumes worker beam decisions).
     beam_engine_driven: bool | None = None
+    # Persistent execution is opt-in so existing request behavior is unchanged.
+    persistent_request: bool = False
+    persistent_runner_state: bool = False
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -163,6 +166,8 @@ class GRConfig:
             validate_catalog_path,
             validate_constraint_backend,
             validate_npu_decode_execution,
+            validate_persistent_request,
+            validate_persistent_runner_state,
             validate_schema_version,
             validate_vocab_offset,
             validate_vocab_slice_size,
@@ -214,10 +219,24 @@ class GRConfig:
             "beam_engine_driven",
             validate_beam_engine_driven(self.beam_engine_driven),
         )
+        object.__setattr__(
+            self,
+            "persistent_request",
+            validate_persistent_request(self.persistent_request),
+        )
+        object.__setattr__(
+            self,
+            "persistent_runner_state",
+            validate_persistent_runner_state(self.persistent_runner_state),
+        )
         if self.beam_engine_driven and not self.beam_worker_decision:
             raise ValueError(
                 "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "
                 "(the engine-driven session consumes worker beam decisions)"
+            )
+        if self.persistent_runner_state and not self.persistent_request:
+            raise ValueError(
+                "vllm-gr persistent_runner_state=True requires persistent_request=True"
             )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
@@ -242,6 +261,8 @@ class GRConfig:
             or (self.constraint_table is not None and self.constraint_table.enabled)
             or self.beam_worker_decision is not None
             or self.beam_engine_driven is not None
+            or self.persistent_request
+            or self.persistent_runner_state
         )
 
     @classmethod
