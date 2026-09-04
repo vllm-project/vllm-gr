@@ -9,6 +9,7 @@ OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchma
     - [Offline Throughput Mode](#mode-1-offline-throughput-mode-simple-local)
     - [Offline Accuracy Mode](#mode-2-offline-accuracy-mode-simple-local)
     - [Online, API Server Mode](#mode-3-online-api-server-mode-production-like)
+    - [OneRec Beam Latency Benchmark](#onerec-beam-latency-benchmark)
 - [Installation](#installation)
 - [Open One Rec Benchmark Dataset](#open-one-rec-benchmark-dataset)
 - [Usage](#usage)
@@ -129,6 +130,13 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
 Note, that for benchmark accuracy results, the test itself sets a default beam width
 
 **Best for**: Production-like testing, distributed deployment, load testing
+
+### OneRec Beam Latency Benchmark
+
+For reproducible local eager-versus-CUDA-graph measurements of the OneRec beam
+path, use the [beam latency manual](beam.md). It records raw miss/hit samples,
+full output-token digests, and the hardware, vLLM, and vllm-gr repository
+metadata needed for an issue result.
 
 ### Operation Modes Comparison
 
