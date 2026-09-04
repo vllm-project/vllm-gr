@@ -147,6 +147,13 @@ def _handle_beam_request_step_update(self, update) -> None:
     _apply_beam_step(self, update)
 
 
+def _add_preprocessed_request(self, preprocessed) -> None:
+    if hasattr(self, "input_queue"):
+        self.input_queue.put_nowait((EngineCoreRequestType.ADD, preprocessed))
+    else:
+        self.add_request(*preprocessed)
+
+
 def _handle_beam_session_template(self, template, *, via: str | None = None) -> None:
     """Cache a session's step-update template for EngineCore engine-driven chaining.
 
@@ -196,8 +203,6 @@ def _handle_submit_session(self, requests, template) -> None:
     template is still absent.  Stub-preservation in ``_cache_beam_request``
     keeps an out-of-order template when ADD later (re)creates the entry.
     """
-    from vllm.v1.engine import EngineCoreRequestType
-
     if template is not None:
         self._handle_beam_session_template(template, via="SUBMIT_SESSION")
     for req in requests:
@@ -207,7 +212,7 @@ def _handle_submit_session(self, requests, template) -> None:
             self._handle_request_preproc_error(req)
             continue
         self._cache_beam_request(request[0])
-        self.input_queue.put_nowait((EngineCoreRequestType.ADD, request))
+        _add_preprocessed_request(self, request)
 
 
 def _apply_beam_step(self, update) -> bool:
@@ -390,7 +395,7 @@ def _apply_beam_step(self, update) -> bool:
         req.beam_suffix = [list(t) for t in update.beam_tokens]
         req.is_constraint_prefill = False
 
-    self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, update.current_wave)))
+    _add_preprocessed_request(self, (req, update.current_wave))
 
     for abort_id in update.pruned_ids:
         self.aborts_queue.put_nowait(abort_id)
@@ -739,7 +744,7 @@ def dispatch_gr_engine_core_input(self, request_type, payload) -> bool:
                 self._handle_request_preproc_error(req)
                 continue
             self._cache_beam_request(request[0])
-            self.input_queue.put_nowait((EngineCoreRequestType.ADD, request))
+            _add_preprocessed_request(self, request)
         return True
     if request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
         self._handle_beam_request_step_update(payload)

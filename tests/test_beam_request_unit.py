@@ -1401,10 +1401,8 @@ class TestClientPatches:
         inproc_add_requests(mock_self, [req], force_batch=False)
         mock_self.add_request.assert_called_once_with(req)
 
-    def test_inproc_add_requests_multiple_caches_and_queues(self) -> None:
-        inproc_q = queue.SimpleQueue()
+    def test_inproc_add_requests_multiple_caches_and_adds(self) -> None:
         mock_core = MagicMock()
-        mock_core.input_queue = inproc_q
         preprocessed = (MagicMock(), "extra")
         mock_core.preprocess_add_request.return_value = preprocessed
 
@@ -1415,17 +1413,11 @@ class TestClientPatches:
         inproc_add_requests(mock_self, reqs)  # multiple requests → always batch path
 
         assert mock_core._cache_beam_request.call_count == 2
-        assert inproc_q.qsize() == 2
-        # Each queue entry must be (ADD, preprocessed_tuple)
-        for _ in range(2):
-            req_type, payload = inproc_q.get_nowait()
-            assert req_type is EngineCoreRequestType.ADD
-            assert payload is preprocessed
+        assert mock_core.add_request.call_count == 2
+        mock_core.add_request.assert_called_with(*preprocessed)
 
     def test_inproc_add_requests_preproc_error_skips_bad_request(self) -> None:
-        inproc_q = queue.SimpleQueue()
         mock_core = MagicMock()
-        mock_core.input_queue = inproc_q
 
         good_preprocessed = (MagicMock(), "extra")
         mock_core.preprocess_add_request.side_effect = [
@@ -1441,11 +1433,7 @@ class TestClientPatches:
 
         # Error handler called for the failing request
         mock_core._handle_request_preproc_error.assert_called_once_with(reqs[0])
-        # Only the successful request was queued, with the correct type and payload
-        assert inproc_q.qsize() == 1
-        req_type, payload = inproc_q.get_nowait()
-        assert req_type is EngineCoreRequestType.ADD
-        assert payload is good_preprocessed
+        mock_core.add_request.assert_called_once_with(*good_preprocessed)
 
     def test_inproc_beam_request_step_update_delegates(self) -> None:
         mock_self = MagicMock()

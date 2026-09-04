@@ -65,8 +65,6 @@ def sync_mp_submit_session(self, requests, template):
 
 
 def inproc_add_requests(self, requests, force_batch=False):
-    from vllm.v1.engine import EngineCoreRequestType
-
     if not requests:
         return
     if len(requests) == 1 and not force_batch:
@@ -78,7 +76,7 @@ def inproc_add_requests(self, requests, force_batch=False):
             self.engine_core._handle_request_preproc_error(req)
             continue
         self.engine_core._cache_beam_request(preprocessed[0])
-        self.engine_core.input_queue.put_nowait((EngineCoreRequestType.ADD, preprocessed))
+        self.engine_core.add_request(*preprocessed)
 
 
 def inproc_beam_request_step_update(self, update):
