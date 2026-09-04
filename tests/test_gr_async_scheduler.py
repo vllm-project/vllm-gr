@@ -13,19 +13,39 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
-from vllm_gr.v1.engine.types import GR_REQUEST_METADATA_KEY, GRRequestMetadata
+from vllm_gr.v1.engine.types import (
+    GR_CONTROL_TOKEN_ID,
+    GR_REQUEST_METADATA_KEY,
+    GRRequestMetadata,
+)
 from vllm_gr.v1.metrics.stats import GRRequestCounters
+
+_DIGEST = "sha256:" + "a" * 64
 
 
 def _metadata() -> GRRequestMetadata:
     return GRRequestMetadata(
         request_id="gr-0",
         beam_width=3,
-        max_tokens=3,
+        generation_steps=3,
         prefix_len=4,
-        continue_token_id=7,
-        finish_token_id=8,
-        num_return_sequences=3,
+        result_width=3,
+        constraint_digest=_DIGEST,
+    )
+
+
+def _native_request(
+    raw_metadata: dict[str, object],
+    *,
+    request_id: str = "gr-0",
+    prefix_len: int = 4,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        num_prompt_tokens=prefix_len,
+        sampling_params=SimpleNamespace(
+            extra_args={GR_REQUEST_METADATA_KEY: raw_metadata}
+        ),
     )
 
 
@@ -46,16 +66,10 @@ def _request(step: int = 0):
 
 def test_add_request_reads_metadata_once() -> None:
     metadata = _metadata()
-    request = SimpleNamespace(
-        request_id="gr-0",
-        num_prompt_tokens=4,
-        sampling_params=SimpleNamespace(
-            extra_args={
-                GR_REQUEST_METADATA_KEY: {
-                    field: getattr(metadata, field) for field in metadata.__struct_fields__
-                }
-            }
-        ),
+    request = _native_request(
+        {
+            field: getattr(metadata, field) for field in metadata.__struct_fields__
+        }
     )
     scheduler = object.__new__(GRAsyncScheduler)
     scheduler.requests = {}
@@ -70,6 +84,83 @@ def test_add_request_reads_metadata_once() -> None:
     assert request.gr_completed_steps == 0
     assert request.gr_counters.native_request_created_per_session == 1
     assert request.gr_counters.scheduler_add_request_per_session == 1
+
+
+@pytest.mark.parametrize(
+    ("metadata_override", "request_override", "message"),
+    [
+        ({"protocol_version": 99}, {}, "protocol_version"),
+        ({}, {"request_id": "native-other"}, "request_id"),
+        ({}, {"prefix_len": 5}, "prefix_len"),
+        ({"beam_width": 0}, {}, "beam_width"),
+        ({"result_width": 4}, {}, "result_width"),
+    ],
+)
+def test_add_request_rejects_invalid_persistent_metadata_before_upstream_add(
+    metadata_override: dict[str, object],
+    request_override: dict[str, object],
+    message: str,
+) -> None:
+    metadata = _metadata()
+    raw = {
+        field: getattr(metadata, field) for field in metadata.__struct_fields__
+    }
+    raw.update(metadata_override)
+    request = _native_request(raw, **request_override)
+    scheduler = object.__new__(GRAsyncScheduler)
+    scheduler.requests = {}
+
+    with mock.patch.object(AsyncScheduler, "add_request") as upstream_add:
+        with pytest.raises(ValueError, match=message):
+            scheduler.add_request(request)
+
+    upstream_add.assert_not_called()
+
+
+def test_add_request_rejects_second_persistent_request_before_upstream_add() -> None:
+    metadata = _metadata()
+    raw = {
+        field: getattr(metadata, field) for field in metadata.__struct_fields__
+    }
+    raw["request_id"] = "gr-1"
+    request = _native_request(raw, request_id="gr-1")
+    scheduler = object.__new__(GRAsyncScheduler)
+    scheduler.requests = {"gr-0": _request()}
+
+    with mock.patch.object(AsyncScheduler, "add_request") as upstream_add:
+        with pytest.raises(ValueError, match="B=1"):
+            scheduler.add_request(request)
+
+    upstream_add.assert_not_called()
+
+
+def test_add_request_rejects_configured_constraint_digest_mismatch() -> None:
+    metadata = _metadata()
+    request = _native_request(
+        {
+            field: getattr(metadata, field) for field in metadata.__struct_fields__
+        }
+    )
+    scheduler = object.__new__(GRAsyncScheduler)
+    scheduler.requests = {}
+    configured = SimpleNamespace(
+        constraint_table=SimpleNamespace(
+            artifact_digest="sha256:" + "b" * 64,
+        ),
+        persistent_runner_state=True,
+    )
+
+    with (
+        mock.patch(
+            "vllm_gr.v1.core.sched.async_scheduler.GRConfig.from_vllm_config",
+            return_value=configured,
+        ),
+        mock.patch.object(AsyncScheduler, "add_request") as upstream_add,
+    ):
+        with pytest.raises(ValueError, match="constraint_digest"):
+            scheduler.add_request(request)
+
+    upstream_add.assert_not_called()
 
 
 def test_schedule_keeps_one_logical_token_and_dispatches_beam_rows() -> None:
@@ -155,7 +246,7 @@ def test_update_from_output_appends_one_control_token() -> None:
     assert result == {}
     assert scheduler_output.num_scheduled_tokens == {"gr-0": 1}
     assert scheduler_output.total_num_scheduled_tokens == 1
-    assert model_output.sampled_token_ids == [[7]]
+    assert model_output.sampled_token_ids == [[GR_CONTROL_TOKEN_ID]]
     assert request.gr_step == 2
     assert request.gr_completed_steps == 2
     assert request.gr_parent_ids == [2, 0, 1]
@@ -183,7 +274,7 @@ def test_runner_state_intermediate_output_is_control_only() -> None:
 
     assert result == {}
     assert scheduler_output.num_scheduled_tokens == {"gr-0": 1}
-    assert model_output.sampled_token_ids == [[7]]
+    assert model_output.sampled_token_ids == [[GR_CONTROL_TOKEN_ID]]
     assert request.gr_step == 2
     assert request.gr_completed_steps == 2
     assert request.gr_counters.intermediate_beam_state_d2h_bytes == 0
@@ -349,11 +440,10 @@ def test_one_token_gr_attaches_final_result_after_native_removal() -> None:
     request.gr_metadata = GRRequestMetadata(
         request_id="gr-0",
         beam_width=3,
-        max_tokens=1,
+        generation_steps=1,
         prefix_len=4,
-        continue_token_id=7,
-        finish_token_id=8,
-        num_return_sequences=3,
+        result_width=3,
+        constraint_digest=_DIGEST,
     )
     request.gr_persistent_runner_state = True
     scheduler = object.__new__(GRAsyncScheduler)
@@ -396,7 +486,7 @@ def test_one_token_gr_attaches_final_result_after_native_removal() -> None:
 
     assert result is core_outputs
     assert request_output.kv_transfer_params == {"beam_search_result": decision}
-    assert model_output.sampled_token_ids == [[8]]
+    assert model_output.sampled_token_ids == [[GR_CONTROL_TOKEN_ID]]
     assert request.gr_completed_steps == 1
 
 

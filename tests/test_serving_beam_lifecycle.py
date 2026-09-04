@@ -9,17 +9,21 @@ import asyncio
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
 from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_gr.entrypoints import gr as offline_gr
 from vllm_gr.entrypoints.openai import serving_engine
 from vllm_gr.constraints import BeamConstraintCoordinator
 from vllm_gr.constraints.strategies import ConstraintTableStrategy
 from vllm_gr.v1.engine.types import GR_REQUEST_METADATA_KEY, BeamRequestStepUpdate
+
+_DIGEST = "sha256:" + "a" * 64
 
 
 class _OutputQueue:
@@ -297,6 +301,148 @@ def _assert_normal_output(output: RequestOutput, request_id: str) -> None:
     assert output.metrics.beam_search_sort_time >= 0
 
 
+def _persistent_final_decision(*, width: int = 2, steps: int = 3) -> dict[str, Any]:
+    sequences = np.asarray([[11, 21, 31], [12, 22, 32]], dtype=np.int32)
+    parents = np.asarray([[0, 0, 0], [0, 1, 1]], dtype=np.int32)
+    logprobs = np.asarray(
+        [[-0.1, -0.2, -0.3], [-0.2, -0.2, -0.3]], dtype=np.float32
+    )
+    scores = np.asarray([-0.6, -0.7], dtype=np.float32)
+    packed = np.concatenate(
+        (
+            sequences.reshape(-1),
+            parents.reshape(-1),
+            logprobs.reshape(-1).view(np.int32),
+            scores.view(np.int32),
+        )
+    ).tobytes()
+    return {
+        "buffer_format": "gr_final_i32_f32_v1",
+        "shape": [width, steps],
+        "buffer": packed,
+        "is_last_step": True,
+        "counters": {"native_request_created_per_session": 1},
+    }
+
+
+def test_offline_persistent_prefill_builds_one_final_only_request() -> None:
+    actual_request_id = "offline-beam-0-0-native"
+    output_processor = SimpleNamespace(add_request=Mock())
+
+    def process_inputs(**kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            request_id=kwargs["request_id"],
+            sampling_params=kwargs["params"],
+        )
+
+    def assign_request_id(request: SimpleNamespace) -> None:
+        request.request_id = actual_request_id
+
+    llm_engine = SimpleNamespace(
+        input_processor=SimpleNamespace(
+            process_inputs=process_inputs,
+            assign_request_id=assign_request_id,
+        ),
+        output_processor=output_processor,
+        get_supported_tasks=lambda: ("generate",),
+    )
+    beam = SimpleNamespace(
+        tokens=[10],
+        lora_request=None,
+        get_prompt=lambda: {"prompt_token_ids": [10]},
+    )
+    params = SamplingParams(logprobs=2, max_tokens=1)
+    instance_prefill_id: dict[int, str] = {}
+    instance_prev_beam_internal_ids: dict[int, list[str]] = {}
+    instance_fork_info: dict[int, list[tuple[int, int]]] = {}
+    instance_prefix_len: dict[int, int] = {}
+    instance_completed_sessions: set[int] = set()
+
+    requests = offline_gr._prepare_beam_step_requests(
+        llm_engine=llm_engine,
+        instances_batch=[SimpleNamespace(beams=[beam])],
+        token=0,
+        prompt_start=0,
+        tokenizer=_Tokenizer(),
+        beam_search_params=params,
+        sid_end_token_id=3,
+        instance_prefill_id=instance_prefill_id,
+        instance_prev_beam_internal_ids=instance_prev_beam_internal_ids,
+        instance_fork_info=instance_fork_info,
+        instance_prefix_len=instance_prefix_len,
+        instance_completed_sessions=instance_completed_sessions,
+        max_decode_steps=3,
+        is_constrained=True,
+        constraint_digest="a" * 64,
+        persistent_request=True,
+    )
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.request_id == actual_request_id
+    assert request.sampling_params.output_kind is RequestOutputKind.FINAL_ONLY
+    assert request.sampling_params.max_tokens == 3
+    assert request.sampling_params.logprobs is None
+    assert request.sampling_params.ignore_eos is True
+    metadata = request.sampling_params.extra_args[GR_REQUEST_METADATA_KEY]
+    assert metadata["request_id"] == actual_request_id
+    assert metadata["constraint_digest"] == _DIGEST
+    assert set(metadata) == {
+        "request_id",
+        "beam_width",
+        "generation_steps",
+        "prefix_len",
+        "result_width",
+        "constraint_digest",
+        "protocol_version",
+    }
+    output_processor.add_request.assert_called_once_with(request, None, None, 0)
+
+    decode_requests = offline_gr._prepare_beam_step_requests(
+        llm_engine=llm_engine,
+        instances_batch=[SimpleNamespace(beams=[beam])],
+        token=1,
+        prompt_start=0,
+        tokenizer=_Tokenizer(),
+        beam_search_params=params,
+        sid_end_token_id=3,
+        instance_prefill_id=instance_prefill_id,
+        instance_prev_beam_internal_ids=instance_prev_beam_internal_ids,
+        instance_fork_info=instance_fork_info,
+        instance_prefix_len=instance_prefix_len,
+        instance_completed_sessions=instance_completed_sessions,
+        max_decode_steps=3,
+        is_constrained=True,
+        constraint_digest="a" * 64,
+        persistent_request=True,
+    )
+
+    assert decode_requests == []
+    output_processor.add_request.assert_called_once_with(request, None, None, 0)
+
+
+def test_offline_persistent_rejects_multiple_prompts_before_batch_split() -> None:
+    fake = SimpleNamespace(
+        llm_engine=SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                additional_config={
+                    "vllm_gr_persistent_request": True,
+                    "vllm_gr_persistent_runner_state": True,
+                    "vllm_gr_scheduling_mode": "async",
+                }
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="require B=1"):
+        offline_gr.GRLLM.beam_search(
+            fake,
+            [{"prompt_token_ids": [10]}, {"prompt_token_ids": [20]}],
+            _params(max_tokens=4),
+            concurrency_limit=1,
+        )
+
+
 def test_grouped_beam_request_lifecycle(
     monkeypatch: Any,
 ) -> None:
@@ -536,29 +682,7 @@ def test_persistent_runner_state_uses_one_native_request(
     monkeypatch: Any,
 ) -> None:
     _install_deterministic_request_ids(monkeypatch)
-    width = 2
-    steps = 3
-    sequences = np.asarray([[11, 21, 31], [12, 22, 32]], dtype=np.int32)
-    parents = np.asarray([[0, 0, 0], [0, 1, 1]], dtype=np.int32)
-    logprobs = np.asarray(
-        [[-0.1, -0.2, -0.3], [-0.2, -0.2, -0.3]], dtype=np.float32
-    )
-    scores = np.asarray([-0.6, -0.7], dtype=np.float32)
-    packed = np.concatenate(
-        (
-            sequences.reshape(-1),
-            parents.reshape(-1),
-            logprobs.reshape(-1).view(np.int32),
-            scores.view(np.int32),
-        )
-    ).tobytes()
-    decision = {
-        "buffer_format": "gr_final_i32_f32_v1",
-        "shape": [width, steps],
-        "buffer": packed,
-        "is_last_step": True,
-        "counters": {"native_request_created_per_session": 1},
-    }
+    decision = _persistent_final_decision()
     engine = _GroupedEngineClient(
         prepare_outputs=[
             _engine_output(
@@ -576,9 +700,9 @@ def test_persistent_runner_state_uses_one_native_request(
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     serving = _serving(engine)
-    serving.models.constraint_coordinator = BeamConstraintCoordinator(
-        ConstraintTableStrategy("test-triples.json")
-    )
+    strategy = ConstraintTableStrategy("test-triples.json")
+    strategy.digest = "a" * 64
+    serving.models.constraint_coordinator = BeamConstraintCoordinator(strategy)
     params = _params(max_tokens=4, ignore_eos=True, end_token="<end>")
     params.catalog_strategy = None
 
@@ -593,15 +717,30 @@ def test_persistent_runner_state_uses_one_native_request(
         )
     )
 
-    assert len(engine.prepare_calls) == 1
-    assert len(engine.add_batch_calls) == 1
-    assert engine.beam_updates == []
+    hard_counters = {
+        "native_request_created_per_session": len(engine.prepare_calls),
+        "scheduler_add_request_per_session": sum(
+            len(call.request_ids) for call in engine.add_batch_calls
+        ),
+        "beam_request_step_update_calls": len(engine.beam_updates),
+        "decode_request_objects_created": max(0, len(engine.prepare_calls) - 1),
+    }
+    assert hard_counters == {
+        "native_request_created_per_session": 1,
+        "scheduler_add_request_per_session": 1,
+        "beam_request_step_update_calls": 0,
+        "decode_request_objects_created": 0,
+    }
     sampling_params = engine.prepare_calls[0].sampling_params
     assert sampling_params.max_tokens == 3
     assert sampling_params.logprobs is None
-    assert sampling_params.extra_args[GR_REQUEST_METADATA_KEY]["request_id"] == (
+    assert sampling_params.output_kind is RequestOutputKind.FINAL_ONLY
+    assert sampling_params.ignore_eos is True
+    metadata = sampling_params.extra_args[GR_REQUEST_METADATA_KEY]
+    assert metadata["request_id"] == (
         "request-0-step-0-beam-0"
     )
+    assert metadata["constraint_digest"] == _DIGEST
     assert [choice.token_ids for choice in outputs[0].outputs] == [
         [11, 21, 31, 3],
         [12, 22, 32, 3],
@@ -610,3 +749,51 @@ def test_persistent_runner_state_uses_one_native_request(
         pytest.approx(-0.6),
         pytest.approx(-0.7),
     ]
+
+
+def test_persistent_openai_does_not_require_legacy_step_update_capability(
+    monkeypatch: Any,
+) -> None:
+    _install_deterministic_request_ids(monkeypatch)
+    engine = _OrdinaryEngineClient(
+        prepare_outputs=[
+            _engine_output(
+                None,
+                kv_transfer_params={
+                    "beam_search_result": _persistent_final_decision()
+                },
+            )
+        ]
+    )
+    engine.vllm_config = SimpleNamespace(
+        additional_config={
+            "vllm_gr_persistent_request": True,
+            "vllm_gr_persistent_runner_state": True,
+        },
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    serving = _serving(engine)
+    strategy = ConstraintTableStrategy("test-triples.json")
+    strategy.digest = "a" * 64
+    serving.models.constraint_coordinator = BeamConstraintCoordinator(strategy)
+    params = _params(max_tokens=4, ignore_eos=True, end_token="<end>")
+    params.catalog_strategy = None
+
+    outputs = asyncio.run(
+        _collect_outputs(
+            serving_engine.beam_search(
+                serving,
+                {"prompt": "prompt text", "prompt_token_ids": [10]},
+                "request-0",
+                params,
+            )
+        )
+    )
+
+    assert not hasattr(engine, "beam_request_step_update")
+    assert len(engine.prepare_calls) == 1
+    assert sum(len(call.request_ids) for call in engine.add_batch_calls) == 1
+    sampling_params = engine.prepare_calls[0].sampling_params
+    assert sampling_params.output_kind is RequestOutputKind.FINAL_ONLY
+    assert sampling_params.logprobs is None
+    assert len(outputs) == 1

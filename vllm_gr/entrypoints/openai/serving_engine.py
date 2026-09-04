@@ -12,11 +12,12 @@ from vllm.logger import init_logger
 from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
+from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 
 from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
+    configure_persistent_sampling_params,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
     extract_constrained_flat_logprobs,
@@ -40,6 +41,7 @@ from vllm_gr.v1.engine.types import (
     GR_REQUEST_METADATA_KEY,
     BeamRequestStepUpdate,
     GRRequestMetadata,
+    canonicalize_constraint_digest,
 )
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
@@ -562,22 +564,22 @@ async def beam_search(
                 parameter="max_tokens",
                 value=max_tokens,
             )
-        beam_search_params.max_tokens = decode_steps
-        beam_search_params.output_kind = RequestOutputKind.DELTA
-        if persistent_runner_state:
-            beam_search_params.logprobs = None
-        finish_token_id = sid_end_token_id if sid_end_token_id is not None else eos_token_id
-        if finish_token_id is None:
-            finish_token_id = 0
-        continue_token_id = 0 if finish_token_id != 0 else 1
+        configure_persistent_sampling_params(
+            beam_search_params,
+            generation_steps=decode_steps,
+        )
+        constraint_digest = getattr(
+            getattr(constraint_coordinator, "strategy", None),
+            "digest",
+            None,
+        )
         gr_metadata = GRRequestMetadata(
-            request_id="",
+            request_id=request_id,
             beam_width=beam_width,
-            max_tokens=decode_steps,
+            generation_steps=decode_steps,
             prefix_len=len(initial_tokens),
-            continue_token_id=continue_token_id,
-            finish_token_id=finish_token_id,
-            num_return_sequences=beam_width,
+            result_width=beam_width,
+            constraint_digest=canonicalize_constraint_digest(constraint_digest),
         )
 
     # Check once if the engine supports batch submission / beam fork.
@@ -604,9 +606,13 @@ async def beam_search(
     # fail fast — never silently degrade.
     validate_constraint_table_protocol(
         is_constraint_table=_is_constrained,
-        beam_protocol_available=use_beam_request,
+        # A persistent native request carries its immutable constraint binding
+        # in GRRequestMetadata and is advanced by GRAsyncScheduler. It does not
+        # require the legacy per-step BeamRequestStepUpdate client capability.
+        beam_protocol_available=persistent_request or use_beam_request,
         required=(
-            "an engine client implementing beam_request_step_update (EngineCore beam sessions)"
+            "a persistent native GR request or an engine client implementing "
+            "beam_request_step_update (EngineCore beam sessions)"
         ),
     )
 

@@ -9,9 +9,11 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 from vllm.inputs import tokens_input
 from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
+    configure_persistent_sampling_params,
     extract_and_dedup_segment,
     extract_constrained_flat_logprobs,
     extract_constrained_segment,
@@ -29,6 +31,46 @@ CandidateCache = tuple[
     list[int | None],
     list[str | None],
 ]
+
+
+def test_persistent_sampling_params_are_fixed_length_and_final_only() -> None:
+    params = SamplingParams(
+        max_tokens=1,
+        logprobs=4,
+        prompt_logprobs=1,
+        stop=["stop"],
+        stop_token_ids=[0, 9],
+        ignore_eos=False,
+    )
+
+    assert configure_persistent_sampling_params(params, generation_steps=3) is params
+    assert params.max_tokens == 3
+    assert params.output_kind is RequestOutputKind.FINAL_ONLY
+    assert params.logprobs is None
+    assert params.prompt_logprobs is None
+    assert params.ignore_eos is True
+    assert params.stop == []
+    assert params.stop_token_ids == []
+    assert params._all_stop_token_ids == set()
+    assert params.detokenize is False
+
+
+@pytest.mark.parametrize("derived_stop_ids", [None, frozenset({0, 9})])
+def test_persistent_sampling_params_replace_derived_stop_collection(
+    derived_stop_ids: object,
+) -> None:
+    params = SamplingParams(stop_token_ids=[0, 9])
+    params._all_stop_token_ids = derived_stop_ids
+
+    configure_persistent_sampling_params(params, generation_steps=2)
+
+    assert params._all_stop_token_ids == set()
+    assert isinstance(params._all_stop_token_ids, set)
+
+
+def test_persistent_sampling_params_reject_invalid_generation_steps() -> None:
+    with pytest.raises(ValueError, match="generation_steps"):
+        configure_persistent_sampling_params(SamplingParams(), generation_steps=0)
 
 
 def _beam(

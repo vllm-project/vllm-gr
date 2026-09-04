@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
@@ -26,6 +27,38 @@ from vllm_gr.constraints.models import (
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 
 ForkInfo = list[tuple[int, int]]
+
+
+def configure_persistent_sampling_params(
+    params: SamplingParams,
+    *,
+    generation_steps: int,
+) -> SamplingParams:
+    """Freeze native request execution to fixed-length, final-only control.
+
+    Intermediate sampled tokens are scheduler progress placeholders rather
+    than model output. Consequently they must not participate in EOS, stop
+    strings, logprob materialization, detokenization, or user-visible output.
+    """
+    if type(generation_steps) is not int or generation_steps < 1:
+        raise ValueError("persistent GR generation_steps must be a positive integer")
+    params.max_tokens = generation_steps
+    params.output_kind = RequestOutputKind.FINAL_ONLY
+    params.logprobs = None
+    params.prompt_logprobs = None
+    params.logprob_token_ids = None
+    params.ignore_eos = True
+    params.stop = []
+    params.stop_token_ids = []
+    params._eos_token_id = None
+    # This derived set can be a non-mutable collection on compatible vLLM
+    # builds; replace it instead of assuming ``clear()`` is available.
+    params._all_stop_token_ids = set()
+    params.include_stop_str_in_output = False
+    params.output_text_buffer_length = 0
+    params.detokenize = False
+    params.flat_logprobs = False
+    return params
 
 
 def materialize_final_beams(

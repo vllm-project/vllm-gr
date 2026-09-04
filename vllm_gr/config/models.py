@@ -257,6 +257,10 @@ class GRConfig:
             raise ValueError(
                 "vllm-gr persistent_runner_state=True requires persistent_request=True"
             )
+        if self.persistent_request and not self.persistent_runner_state:
+            raise ValueError(
+                "vllm-gr persistent_request=True requires persistent_runner_state=True"
+            )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None

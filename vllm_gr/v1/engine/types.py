@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import Enum
+import re
 from typing import Final
 
 import msgspec
@@ -18,6 +19,43 @@ from vllm.sampling_params import SamplingParams
 GR_PROTOCOL_VERSION: Final = 1
 GR_REQUEST_METADATA_KEY: Final = "vllm_gr"
 GR_REQUEST_OUTPUT_KEY: Final = "vllm_gr_request_output"
+# Native vLLM requires an O(B) sampled-token result for every generation
+# stage. This placeholder is transport-only: persistent SamplingParams ignore
+# EOS/stops and expose FINAL_ONLY output, while the next real Beam token stays
+# in the device-resident state.
+GR_CONTROL_TOKEN_ID: Final = 0
+_CANONICAL_SHA256_RE: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
+_BARE_SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _validate_protocol_version(version: object) -> None:
+    if type(version) is not int or version != GR_PROTOCOL_VERSION:
+        raise ValueError(
+            "unsupported persistent GR protocol_version "
+            f"{version!r}; expected {GR_PROTOCOL_VERSION}"
+        )
+
+
+def _require_non_empty_request_id(request_id: object) -> None:
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("persistent GR request_id must be a non-empty string")
+
+
+def canonicalize_constraint_digest(digest: object) -> str:
+    """Return the request-wire form of an installed Constraint Table digest."""
+    if isinstance(digest, str) and _BARE_SHA256_RE.fullmatch(digest) is not None:
+        return f"sha256:{digest}"
+    if isinstance(digest, str) and _CANONICAL_SHA256_RE.fullmatch(digest) is not None:
+        return digest
+    raise ValueError(
+        "persistent GR constraint_digest must be 'sha256:' followed by "
+        "64 lowercase hex digits"
+    )
+
+
+def _validate_non_negative_step(value: object, name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"persistent GR {name} must be a non-negative integer")
 
 
 class GRRequestStage(str, Enum):
@@ -62,19 +100,56 @@ class GRRequestMetadata(
     array_like=True,  # type: ignore[call-arg]
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,
+    frozen=True,
 ):
     """Request-wide metadata carried by the single native request."""
 
     request_id: str
     beam_width: int
-    max_tokens: int
+    generation_steps: int
     prefix_len: int
-    continue_token_id: int
-    finish_token_id: int
-    num_return_sequences: int = 1
-    return_logprobs: bool = False
-    constraint_digest: str | None = None
+    result_width: int = 1
+    constraint_digest: str = ""
     protocol_version: int = GR_PROTOCOL_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_protocol_version(self.protocol_version)
+        _require_non_empty_request_id(self.request_id)
+        if type(self.beam_width) is not int or self.beam_width < 1:
+            raise ValueError("persistent GR beam_width must be a positive integer")
+        if type(self.generation_steps) is not int or self.generation_steps < 1:
+            raise ValueError(
+                "persistent GR generation_steps must be a positive integer"
+            )
+        if type(self.prefix_len) is not int or self.prefix_len < 0:
+            raise ValueError("persistent GR prefix_len must be a non-negative integer")
+        if (
+            type(self.result_width) is not int
+            or not 1 <= self.result_width <= self.beam_width
+        ):
+            raise ValueError(
+                "persistent GR result_width must be in [1, beam_width]"
+            )
+        if canonicalize_constraint_digest(self.constraint_digest) != self.constraint_digest:
+            raise ValueError("persistent GR constraint_digest must use canonical wire form")
+
+    # Compatibility names used by the scheduler while its per-step sidecar is
+    # migrated independently. They are derived, not serialized request state.
+    @property
+    def max_tokens(self) -> int:
+        return self.generation_steps
+
+    @property
+    def num_return_sequences(self) -> int:
+        return self.result_width
+
+    @property
+    def continue_token_id(self) -> int:
+        return GR_CONTROL_TOKEN_ID
+
+    @property
+    def finish_token_id(self) -> int:
+        return GR_CONTROL_TOKEN_ID
 
 
 class GRSchedulerOutput(
@@ -94,6 +169,12 @@ class GRSchedulerOutput(
     is_final: bool = False
     prefix_block_ids: list[list[int]] | None = None
     protocol_version: int = GR_PROTOCOL_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_protocol_version(self.protocol_version)
+        _require_non_empty_request_id(self.request_id)
+        _validate_non_negative_step(self.step, "step")
+        _validate_non_negative_step(self.device_step, "device_step")
 
 
 class GRSequenceOutput(
@@ -126,6 +207,14 @@ class GRRequestOutput(
     counters: dict[str, int] | None = None
     protocol_version: int = GR_PROTOCOL_VERSION
 
+    def __post_init__(self) -> None:
+        _validate_protocol_version(self.protocol_version)
+        _require_non_empty_request_id(self.request_id)
+        _validate_non_negative_step(self.step, "step")
+        _validate_non_negative_step(self.device_step, "device_step")
+        if self.stage is not GRRequestStage.FINAL_READY:
+            raise ValueError("persistent GR final output stage must be final_ready")
+
 
 class GRModelRunnerOutput(
     msgspec.Struct,
@@ -144,6 +233,43 @@ class GRModelRunnerOutput(
     final_output: GRRequestOutput | None = None
     error: str | None = None
     protocol_version: int = GR_PROTOCOL_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_protocol_version(self.protocol_version)
+        _require_non_empty_request_id(self.request_id)
+        _validate_non_negative_step(self.step, "step")
+        _validate_non_negative_step(self.device_step, "device_step")
+        if self.final_output is not None:
+            if not self.finished:
+                raise ValueError("persistent GR final output requires finished=true")
+            if self.final_output.request_id != self.request_id:
+                raise ValueError(
+                    "persistent GR final output request_id does not match control output"
+                )
+            if self.final_output.protocol_version != self.protocol_version:
+                raise ValueError(
+                    "persistent GR final output protocol_version does not match "
+                    "control output"
+                )
+            if self.final_output.step != self.step:
+                raise ValueError(
+                    "persistent GR final output step does not match control output"
+                )
+            if self.final_output.device_step != self.device_step:
+                raise ValueError(
+                    "persistent GR final output device_step does not match control output"
+                )
+            if self.final_output.stage is not self.stage:
+                raise ValueError(
+                    "persistent GR final output stage does not match control output"
+                )
+        if self.stage is GRRequestStage.FINAL_READY and (
+            not self.finished or self.final_output is None
+        ):
+            raise ValueError(
+                "persistent GR final_ready control output requires finished=true "
+                "and a final output"
+            )
 
 # ---------------------------------------------------------------------------
 # BeamRequestStepUpdate — Improved Beam handling by a single Beam request

@@ -48,6 +48,25 @@ class GRAsyncScheduler(AsyncScheduler):
                 raise ValueError(f"persistent GR beam_width must be in [1, {MAX_BEAM_WIDTH}]")
             if metadata.max_tokens < 1:
                 raise ValueError("persistent GR max_tokens must be at least 1")
+            gr_config = GRConfig.from_vllm_config(
+                getattr(self, "vllm_config", None)
+            )
+            configured_digest = (
+                gr_config.constraint_table.artifact_digest
+                if gr_config.constraint_table is not None
+                else None
+            )
+            if (
+                configured_digest is not None
+                and metadata.constraint_digest != configured_digest
+            ):
+                raise ValueError(
+                    "persistent GR constraint_digest does not match the configured "
+                    "Constraint Table artifact"
+                )
+            # The request/config digest is the host-side immutable binding.
+            # Resolving it to an installed worker resource is a backend concern
+            # and is deliberately deferred to the Step-4 backend boundary.
             if any(self._is_gr_request(existing) for existing in self.requests.values()):
                 raise ValueError("persistent GR requests currently require B=1")
 
@@ -60,9 +79,7 @@ class GRAsyncScheduler(AsyncScheduler):
             request.gr_step = 0
             request.gr_issued_steps = 0
             request.gr_completed_steps = 0
-            request.gr_persistent_runner_state = GRConfig.from_vllm_config(
-                getattr(self, "vllm_config", None)
-            ).persistent_runner_state
+            request.gr_persistent_runner_state = gr_config.persistent_runner_state
             request.gr_parent_ids = [0] * metadata.beam_width
             request.gr_beam_suffix = []
             request.gr_counters = GRRequestCounters(

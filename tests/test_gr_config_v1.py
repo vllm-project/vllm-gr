@@ -377,7 +377,7 @@ def test_persistent_request_selects_gr_async_scheduler(tmp_path: Path) -> None:
     raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
     raw["runtime"] = {
         "persistent_request": True,
-        "persistent_runner_state": False,
+        "persistent_runner_state": True,
         "scheduling_mode": "async",
     }
     engine_args = SimpleNamespace(
@@ -416,7 +416,7 @@ def test_persistent_request_rejects_disabled_async_scheduler(tmp_path: Path) -> 
     raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
     raw["runtime"] = {
         "persistent_request": True,
-        "persistent_runner_state": False,
+        "persistent_runner_state": True,
         "scheduling_mode": "async",
     }
     engine_args = SimpleNamespace(

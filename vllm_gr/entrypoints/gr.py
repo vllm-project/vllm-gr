@@ -36,6 +36,7 @@ from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
+    configure_persistent_sampling_params,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
     extract_constrained_flat_logprobs,
@@ -70,6 +71,7 @@ from vllm_gr.v1.engine.types import (
     GR_REQUEST_METADATA_KEY,
     BeamRequestStepUpdate,
     GRRequestMetadata,
+    canonicalize_constraint_digest,
 )
 
 if TYPE_CHECKING:
@@ -124,9 +126,9 @@ def _prepare_beam_step_requests(
     instance_completed_sessions: set[int],
     max_decode_steps: int = 0,
     is_constrained: bool = False,
+    constraint_digest: str | None = None,
     instance_self_advance_chained: set[int] | None = None,
     persistent_request: bool = False,
-    persistent_runner_state: bool = False,
 ) -> list["EngineCoreRequest"]:
     """Prepare EngineCoreRequest items for active instances at this step."""
     engine_core_requests = []
@@ -246,25 +248,20 @@ def _prepare_beam_step_requests(
             request_params = beam_search_params
             if persistent_request:
                 request_params = beam_search_params.clone()
-                request_params.max_tokens = max_decode_steps
-                request_params.output_kind = type(request_params.output_kind).DELTA
-                execution_width = int(beam_search_params.logprobs or 1)
-                if persistent_runner_state:
-                    request_params.logprobs = None
-                eos_token_id = (
-                    sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
+                configure_persistent_sampling_params(
+                    request_params,
+                    generation_steps=max_decode_steps,
                 )
-                if eos_token_id is None:
-                    eos_token_id = 0
-                continue_token_id = 0 if eos_token_id != 0 else 1
+                execution_width = int(beam_search_params.logprobs or 1)
                 metadata = GRRequestMetadata(
                     request_id=request_id_item,
                     beam_width=execution_width,
-                    max_tokens=max_decode_steps,
+                    generation_steps=max_decode_steps,
                     prefix_len=instance_prefix_len[j],
-                    continue_token_id=continue_token_id,
-                    finish_token_id=eos_token_id,
-                    num_return_sequences=execution_width,
+                    result_width=execution_width,
+                    constraint_digest=canonicalize_constraint_digest(
+                        constraint_digest
+                    ),
                 )
                 request_params.extra_args = dict(request_params.extra_args or {})
                 request_params.extra_args[GR_REQUEST_METADATA_KEY] = {
@@ -517,6 +514,11 @@ def _custom_beam_search_batch(
             raise ValueError(
                 "persistent GR requests currently require constraint_backend='constraint_table'"
             )
+    constraint_digest = getattr(
+        getattr(constraint_coordinator, "strategy", None),
+        "digest",
+        None,
+    )
 
     for token in token_iter:
         # Check if all instances are done
@@ -544,9 +546,9 @@ def _custom_beam_search_batch(
             instance_completed_sessions=instance_completed_sessions,
             max_decode_steps=max_decode_steps,
             is_constrained=_is_constrained,
+            constraint_digest=constraint_digest,
             instance_self_advance_chained=instance_self_advance_chained,
             persistent_request=persistent_request,
-            persistent_runner_state=persistent_runner_state,
         )
 
         if engine_core_requests:
@@ -925,6 +927,14 @@ class GRLLM(LLM):
         # frequency, penalty, and stopping criteria, etc.?
         logger.debug("Called beam_search")
         beam_width = validate_beam_width(params.beam_width)
+        gr_config = GRConfig.from_vllm_config(
+            getattr(self.llm_engine, "vllm_config", None)
+        )
+        if gr_config.persistent_request and len(prompts) != 1:
+            raise ValueError(
+                "persistent GR requests require B=1; multiple prompts cannot "
+                "be split into independent persistent sessions"
+            )
         max_tokens = params.max_tokens
         temperature = params.temperature
         ignore_eos = params.ignore_eos

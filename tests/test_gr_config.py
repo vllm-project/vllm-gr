@@ -70,6 +70,11 @@ def test_persistent_runner_state_requires_persistent_request() -> None:
         GRConfig(persistent_runner_state=True)
 
 
+def test_persistent_request_requires_runner_state() -> None:
+    with pytest.raises(ValueError, match="requires persistent_runner_state"):
+        GRConfig(persistent_request=True)
+
+
 def test_multi_step_scheduling_fails_fast() -> None:
     with pytest.raises(ValueError, match="scheduling_mode='multi_step'.*not supported"):
         GRConfig(scheduling_mode=GRSchedulingMode.MULTI_STEP)
