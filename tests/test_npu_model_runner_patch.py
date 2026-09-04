@@ -66,6 +66,7 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
     )
     ordinary_result = (["lp"], ["valid"], object(), ["request"], {"request": 0}, [3])
     sampler_output = object()
+    reduced: list[object] = []
 
     def original(
         self: Any,
@@ -75,6 +76,8 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
     ) -> tuple[Any, ...]:
         if getattr(scheduler_output, "fail", False):
             raise RuntimeError("boom")
+        if getattr(scheduler_output, "beam_data", {}):
+            assert reduced == [sampler_output]
         return ordinary_result
 
     def collapse(
@@ -89,6 +92,11 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
         return ["beam"], {"beam": 0}, 1
 
     monkeypatch.setattr(npu_patch, "_beam_collapse_bookkeeping", collapse)
+    monkeypatch.setattr(
+        npu_patch,
+        "_reduce_sampler_output_for_worker_decision",
+        lambda _runner, output: reduced.append(output),
+    )
     wrapped = npu_patch.make_patched_bookkeeping_sync(original)
 
     assert wrapped(runner, SimpleNamespace(beam_data={}), sampler_output) is ordinary_result
@@ -118,6 +126,35 @@ def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
             sampler_output,
         )
     assert runner.input_batch is original_batch
+
+
+def test_npu_bookkeeping_collapses_beam_rows_before_host_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_batch = SimpleNamespace()
+    runner = SimpleNamespace(input_batch=SimpleNamespace(_obj=original_batch))
+    sampler_output = SimpleNamespace(
+        sampled_token_ids=torch.arange(128, dtype=torch.int32).reshape(128, 1)
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={"beam": {}},
+        _gr_request_row_configs=[("beam", 0, 128, list(range(128)))],
+    )
+
+    def original(self: Any, output: Any, sampler: Any) -> tuple[Any, ...]:
+        assert sampler.sampled_token_ids.shape == (1, 1)
+        return (None, [[]], None, ["beam"], {"beam": 0}, [])
+
+    monkeypatch.setattr(
+        npu_patch,
+        "_beam_collapse_bookkeeping",
+        lambda *_args: (["beam"], {"beam": 0}, 1),
+    )
+    wrapped = npu_patch.make_patched_bookkeeping_sync(original)
+    result = wrapped(runner, scheduler_output, sampler_output)
+
+    assert result[1] == [[]]
+    assert sampler_output.sampled_token_ids.tolist() == [[0]]
 
 
 def test_npu_sample_patch_is_signature_agnostic(

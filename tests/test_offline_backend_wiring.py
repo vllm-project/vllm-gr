@@ -268,6 +268,52 @@ class TestEngineArgsGrInitPatch:
         assert engine_args.catalog_path == "/models/triples.json"
         assert engine_args.constraint_backend == "constraint_table"
 
+    def test_patch_applies_engine_defaults_and_preserves_overrides(self) -> None:
+        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+
+        patch_add_cli_args()
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        defaults = EngineArgs(model="Qwen/Qwen3-1.7B")
+        assert defaults.max_model_len == 8192
+        assert defaults.max_num_batched_tokens == 8192
+        assert defaults.enable_chunked_prefill is False
+        assert defaults.enable_prefix_caching is True
+
+        overridden = EngineArgs(
+            model="Qwen/Qwen3-1.7B",
+            max_model_len=4096,
+            max_num_batched_tokens=4096,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=False,
+        )
+        assert overridden.max_model_len == 4096
+        assert overridden.max_num_batched_tokens == 4096
+        assert overridden.enable_chunked_prefill is True
+        assert overridden.enable_prefix_caching is False
+
+        long_context = EngineArgs(
+            model="Qwen/Qwen3-1.7B",
+            max_model_len=32768,
+        )
+        assert long_context.max_model_len == 32768
+        assert long_context.max_num_batched_tokens == 32768
+
+        chunked_long_context = EngineArgs(
+            model="Qwen/Qwen3-1.7B",
+            max_model_len=32768,
+            enable_chunked_prefill=True,
+        )
+        assert chunked_long_context.max_num_batched_tokens == 8192
+
+        explicit_batched_limit = EngineArgs(
+            model="Qwen/Qwen3-1.7B",
+            max_model_len=32768,
+            max_num_batched_tokens=16384,
+        )
+        assert explicit_batched_limit.max_num_batched_tokens == 16384
+
     def test_create_engine_config_writes_constraint_backend(self) -> None:
         """The threaded values reach VllmConfig via the patched factory."""
         from vllm_gr.engine import arg_utils_gr

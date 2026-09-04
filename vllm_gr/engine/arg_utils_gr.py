@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
+import inspect
 import json
 import logging
 from collections.abc import Mapping
@@ -52,6 +53,45 @@ origin_from_cli_args = EngineArgs.from_cli_args.__func__
 origin_engine_args_init = EngineArgs.__init__
 logger = logging.getLogger("vllm_gr.engine.arg_utils_gr")
 _NESTED_ATTENTION_BACKEND_EXPLICIT_ATTR: Final = "_vllm_gr_nested_attention_backend_explicit"
+VLLM_GR_ENGINE_DEFAULTS: Final[dict[str, object]] = {
+    "max_model_len": 8192,
+    "max_num_batched_tokens": 8192,
+    "enable_chunked_prefill": False,
+    "enable_prefix_caching": True,
+}
+_ORIGIN_ENGINE_ARG_POSITIONAL_NAMES: Final = tuple(
+    list(inspect.signature(origin_engine_args_init).parameters)[1:]
+)
+
+
+def _apply_vllm_gr_engine_defaults(args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+    """Fill vllm-gr engine defaults without replacing explicit arguments."""
+    explicit_values = dict(zip(_ORIGIN_ENGINE_ARG_POSITIONAL_NAMES, args))
+    explicit_values.update(kwargs)
+    explicitly_set = set(explicit_values)
+    for name, value in VLLM_GR_ENGINE_DEFAULTS.items():
+        if name not in explicitly_set:
+            kwargs[name] = value
+
+    # Disabling chunked prefill makes vLLM require one scheduling batch to
+    # accommodate the full model context. Keep the 8K default for ordinary
+    # vLLM-GR construction, but follow an explicitly enlarged model length
+    # when the caller did not independently choose a batched-token limit.
+    # Explicit (including intentionally invalid) pairs remain upstream's
+    # responsibility to validate.
+    max_model_len = explicit_values.get("max_model_len", kwargs.get("max_model_len"))
+    enable_chunked_prefill = explicit_values.get(
+        "enable_chunked_prefill", kwargs.get("enable_chunked_prefill")
+    )
+    if (
+        "max_num_batched_tokens" not in explicitly_set
+        and enable_chunked_prefill is False
+        and isinstance(max_model_len, int)
+        and not isinstance(max_model_len, bool)
+    ):
+        default_batched_tokens = kwargs.get("max_num_batched_tokens")
+        if isinstance(default_batched_tokens, int):
+            kwargs["max_num_batched_tokens"] = max(default_batched_tokens, max_model_len)
 
 
 def _init_engine_args(
@@ -62,11 +102,13 @@ def _init_engine_args(
     vllm_gr_config: GRConfigInput | None = None,
     **kwargs: object,
 ) -> None:
-    """Accept the vllm-gr engine args on the Python-API construction path.
+    """Apply vllm-gr defaults and accept GR-only Python API arguments.
 
     The CLI path (``--catalog-path`` / ``--constraint-backend``) stashes these
-    values as attributes in :func:`from_cli_args` after construction.  The
-    offline ``GRLLM`` Python API builds its ``EngineArgs`` indirectly through
+    values as attributes in :func:`from_cli_args` after construction. Shared
+    engine defaults are filled here only when callers did not pass
+    those arguments explicitly. The offline ``GRLLM`` Python API builds its
+    ``EngineArgs`` indirectly through
     ``LLM.__init__`` -> ``EngineArgs(model=..., **kwargs)``, so it cannot reach
     the instance to set the attributes afterwards.  Threading the two values as
     ``**kwargs`` here stashes them identically, and the patched
@@ -74,6 +116,7 @@ def _init_engine_args(
     otherwise ``EngineCore`` would not learn that the backend is
     ``constraint_table`` and would never run the constrained hooks.
     """
+    _apply_vllm_gr_engine_defaults(args, kwargs)
     origin_engine_args_init(self, *args, **kwargs)
     self.catalog_path = catalog_path
     self.constraint_backend = constraint_backend
@@ -119,6 +162,7 @@ def _preserve_nested_attention_backend_source(
 
 def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     parser = origin_add_cli_args(parser)
+    parser.set_defaults(**VLLM_GR_ENGINE_DEFAULTS)
     _preserve_nested_attention_backend_source(parser)
     model_group = parser.add_argument_group(title="vLLM-GR")
     model_group.add_argument(

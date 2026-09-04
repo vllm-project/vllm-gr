@@ -388,6 +388,52 @@ def test_explicit_nested_auto_or_null_clears_existing_gr_backend(
     assert GRConfig.from_vllm_config(result).attention_backend is None
 
 
+def test_cli_parser_uses_vllm_gr_engine_defaults() -> None:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    from vllm_gr.engine.arg_utils_gr import add_cli_args
+
+    def add_upstream_engine_args(
+        parser: FlexibleArgumentParser,
+    ) -> FlexibleArgumentParser:
+        for name in ("max_model_len", "max_num_batched_tokens"):
+            parser.add_argument(f"--{name.replace('_', '-')}", type=int, default=None)
+        for name in (
+            "enable_chunked_prefill",
+            "enable_prefix_caching",
+        ):
+            parser.add_argument(f"--{name.replace('_', '-')}", action="store_true", default=None)
+        return parser
+
+    parser = FlexibleArgumentParser()
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_add_cli_args",
+        side_effect=add_upstream_engine_args,
+    ):
+        add_cli_args(parser)
+
+    defaults = parser.parse_args([])
+    assert defaults.max_model_len == 8192
+    assert defaults.max_num_batched_tokens == 8192
+    assert defaults.enable_chunked_prefill is False
+    assert defaults.enable_prefix_caching is True
+
+    overridden = parser.parse_args(
+        [
+            "--max-model-len",
+            "4096",
+            "--max-num-batched-tokens",
+            "4096",
+            "--enable-chunked-prefill",
+            "--enable-prefix-caching",
+        ]
+    )
+    assert overridden.max_model_len == 4096
+    assert overridden.max_num_batched_tokens == 4096
+    assert overridden.enable_chunked_prefill is True
+    assert overridden.enable_prefix_caching is True
+
+
 def test_engine_config_preserves_opaque_additional_config_without_gr_overrides() -> None:
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 

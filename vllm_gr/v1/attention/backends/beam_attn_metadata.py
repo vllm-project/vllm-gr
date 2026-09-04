@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
@@ -21,6 +22,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
+
+logger = init_logger(__name__)
 
 
 def get_scheduler_metadata(*args, **kwargs):
@@ -104,6 +107,16 @@ class BeamAttentionMetadata:
     block_size: int = 16
     num_heads: int = 0
     num_kv_heads: int = 0
+
+    # --- Pure-prefill fast path (prefill graph capture/replay) ---
+    # When is_prefill_graph_exec is True the attention forward uses the
+    # streamlined single-call prefill path that consumes only the common
+    # fields (query_start_loc, seq_lens, block_table, slot_mapping); all the
+    # grouped std_*/prefix_*/suffix_* fields stay None and must not be read.
+    is_prefill_graph_exec: bool = False
+    num_reqs: int = 0
+    query_start_loc_cpu: list | None = None
+    seq_lens_cpu: list | None = None
 
     # --- Incremental decode fields ---
     # When is_beam_decode is True and beam_session is available,
@@ -1332,6 +1345,32 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list, beam_session
             )
             decode_step = beam_decode_step_list[0] if beam_decode_step_list else None
+
+            # Fast-path for pure prefill: skip grouped beam metadata computation.
+            if not beam_req_idxs:
+                logger.debug(
+                    "BeamAttentionMetadataBuilder: Pure prefill batch detected "
+                    "(%d actual tokens). Skipping grouped beam metadata build.",
+                    common_attn_metadata.num_actual_tokens,
+                )
+                return BeamAttentionMetadata(
+                    num_actual_tokens=common_attn_metadata.num_actual_tokens,
+                    max_query_len=common_attn_metadata.max_query_len,
+                    query_start_loc=common_attn_metadata.query_start_loc,
+                    max_seq_len=common_attn_metadata.max_seq_len,
+                    seq_lens=common_attn_metadata.seq_lens,
+                    block_table=common_attn_metadata.block_table_tensor,
+                    slot_mapping=common_attn_metadata.slot_mapping,
+                    causal=True,
+                    npu_causal_atten_mask=self.npu_causal_atten_mask,
+                    is_prefill_graph_exec=True,
+                    num_reqs=common_attn_metadata.num_reqs,
+                    num_heads=self.num_heads_q,
+                    num_kv_heads=self.num_kv_heads,
+                    block_size=self.block_size,
+                    query_start_loc_cpu=q_starts,
+                    seq_lens_cpu=seq_lens_cpu_list,
+                )
 
             (
                 std_indices,
