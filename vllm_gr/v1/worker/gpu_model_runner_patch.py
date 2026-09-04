@@ -341,10 +341,6 @@ def make_patched_sample_tokens_gpu(_orig_sample_tokens):
     def patched_sample_tokens(self, grammar_output, *args, **kwargs):
         from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
 
-        bundled = getattr(self, "_gr_bundled_model_output", None)
-        if bundled is not None:
-            self._gr_bundled_model_output = None
-            return bundled
         out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
         _attach_beam_search_result(self, out)
         return out

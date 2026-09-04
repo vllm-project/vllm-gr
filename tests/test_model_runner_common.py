@@ -1012,6 +1012,7 @@ def test_inline_sample_tokens_clears_state_on_failure() -> None:
 
 def _orig_execute_model_none(self: Any, scheduler_output: Any) -> None:
     """Upstream async-scheduling-style execute_model: stashes state, returns None."""
+    self._execute_model_calls = getattr(self, "_execute_model_calls", 0) + 1
     self.execute_model_state = "state"
     return None
 
@@ -1059,6 +1060,7 @@ def test_execute_wrapper_does_not_inline_when_gate_closed() -> None:
     out = wrapped(runner, scheduler_output)
 
     assert out is None
+    assert runner._execute_model_calls == 1
     assert runner._sample_tokens_calls == []
     # State survives for the engine-initiated sample_tokens RPC.
     assert runner.execute_model_state == "state"

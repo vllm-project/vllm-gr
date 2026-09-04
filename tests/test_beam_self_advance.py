@@ -697,7 +697,7 @@ class TestProcessEngineStepWrapper:
         eng.post_step.assert_called_once_with(False)
         assert result is False
 
-    def test_persistent_scheduler_skips_legacy_hook_and_idle_sleep(self) -> None:
+    def test_persistent_scheduler_skips_legacy_hook_but_keeps_idle_sleep(self) -> None:
         from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
 
         outputs = _outputs_with_decision(_decision(parents=[1, 0], tokens=[61, 71]))
@@ -714,7 +714,7 @@ class TestProcessEngineStepWrapper:
 
         assert result is False
         advance.assert_not_called()
-        sleep.assert_not_called()
+        sleep.assert_called_once_with(0.001)
         assert eng.output_queue.qsize() == 1
 
     def test_wrapper_is_idempotent(self) -> None:

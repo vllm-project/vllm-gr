@@ -13,6 +13,7 @@ from vllm_gr.config import (
     ConstraintBackend,
     GRAttentionBackend,
     GRConfig,
+    GRSchedulingMode,
     NPUDecodeExecution,
 )
 from vllm_gr.config.parser import (
@@ -23,6 +24,7 @@ from vllm_gr.config.parser import (
     NPU_DECODE_EXECUTION_KEY,
     PERSISTENT_REQUEST_KEY,
     PERSISTENT_RUNNER_STATE_KEY,
+    SCHEDULING_MODE_KEY,
 )
 
 
@@ -44,6 +46,7 @@ def test_empty_vllm_config_uses_defaults() -> None:
     assert config.enabled is False
     assert config.persistent_request is False
     assert config.persistent_runner_state is False
+    assert config.scheduling_mode is GRSchedulingMode.ASYNC
 
 
 def test_persistent_flags_round_trip_and_default_elision() -> None:
@@ -53,16 +56,90 @@ def test_persistent_flags_round_trip_and_default_elision() -> None:
 
     assert vllm_config.additional_config[PERSISTENT_REQUEST_KEY] is True
     assert vllm_config.additional_config[PERSISTENT_RUNNER_STATE_KEY] is True
+    assert vllm_config.additional_config[SCHEDULING_MODE_KEY] == "async"
     assert GRConfig.from_vllm_config(vllm_config) == expected
 
     GRConfig().write_to_vllm_config(vllm_config)
     assert PERSISTENT_REQUEST_KEY not in vllm_config.additional_config
     assert PERSISTENT_RUNNER_STATE_KEY not in vllm_config.additional_config
+    assert SCHEDULING_MODE_KEY not in vllm_config.additional_config
 
 
 def test_persistent_runner_state_requires_persistent_request() -> None:
     with pytest.raises(ValueError, match="requires persistent_request"):
         GRConfig(persistent_runner_state=True)
+
+
+def test_multi_step_scheduling_fails_fast() -> None:
+    with pytest.raises(ValueError, match="scheduling_mode='multi_step'.*not supported"):
+        GRConfig(scheduling_mode=GRSchedulingMode.MULTI_STEP)
+
+
+def test_legacy_explicit_scheduling_requires_persistent_request() -> None:
+    with pytest.raises(ValueError, match="scheduling_mode requires persistent_request=True"):
+        GRConfig.from_vllm_config(
+            _vllm_config({SCHEDULING_MODE_KEY: "async"})
+        )
+
+
+def test_python_explicit_scheduling_requires_persistent_request() -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    engine_args = SimpleNamespace(
+        _vllm_gr_config_input=None,
+        catalog_path=None,
+        constraint_backend=None,
+        attention_backend=None,
+        attention_config=None,
+        persistent_request=False,
+        persistent_runner_state=False,
+        gr_scheduling_mode="async",
+    )
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=_vllm_config(),
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
+        pytest.raises(ValueError, match="gr-scheduling-mode requires persistent_request=True"),
+    ):
+        create_engine_config(engine_args)
+
+
+def test_cli_explicit_scheduling_requires_persistent_request() -> None:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    from vllm_gr.engine.arg_utils_gr import (
+        add_cli_args,
+        create_engine_config,
+        from_cli_args,
+    )
+
+    parser = FlexibleArgumentParser()
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_add_cli_args",
+        side_effect=lambda value: value,
+    ):
+        add_cli_args(parser)
+    cli_args = parser.parse_args(["--gr-scheduling-mode", "async"])
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_from_cli_args",
+        return_value=SimpleNamespace(),
+    ):
+        engine_args = from_cli_args(SimpleNamespace, cli_args)
+
+    assert engine_args.gr_scheduling_mode == "async"
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=_vllm_config(),
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
+        pytest.raises(ValueError, match="gr-scheduling-mode requires persistent_request=True"),
+    ):
+        create_engine_config(engine_args)
 
 
 def test_engine_config_writes_persistent_cli_flags() -> None:
@@ -81,6 +158,7 @@ def test_engine_config_writes_persistent_cli_flags() -> None:
         attention_config=None,
         persistent_request=True,
         persistent_runner_state=True,
+        gr_scheduling_mode="async",
     )
     with (
         mock.patch(
@@ -95,6 +173,7 @@ def test_engine_config_writes_persistent_cli_flags() -> None:
     assert GRConfig.from_vllm_config(vllm_config) == GRConfig(
         persistent_request=True,
         persistent_runner_state=True,
+        scheduling_mode=GRSchedulingMode.ASYNC,
     )
 
 

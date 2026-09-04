@@ -12,6 +12,7 @@ from vllm_gr.config.models import (
     ConstraintTableConfig,
     GRAttentionBackend,
     GRConfig,
+    GRSchedulingMode,
     NPUDecodeExecution,
 )
 from vllm_gr.config.parser import (
@@ -31,6 +32,7 @@ __all__ = [
     "ConstraintTableConfig",
     "GRAttentionBackend",
     "GRConfig",
+    "GRSchedulingMode",
     "NPUDecodeExecution",
     "GRConfigInput",
     "gr_config_from_mapping",

@@ -12,26 +12,6 @@ from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
 from vllm_gr.v1.worker import model_runner_common as common
 
 
-def test_gpu_sample_tokens_returns_bundled_terminal_output_once() -> None:
-    terminal = object()
-    calls = 0
-
-    def original(_self: Any, _grammar_output: Any) -> object:
-        nonlocal calls
-        calls += 1
-        return object()
-
-    runner = SimpleNamespace(_gr_bundled_model_output=terminal)
-    wrapped = gpu_patch.make_patched_sample_tokens_gpu(original)
-
-    assert wrapped(runner, None) is terminal
-    assert runner._gr_bundled_model_output is None
-    assert calls == 0
-
-    wrapped(runner, None)
-    assert calls == 1
-
-
 def test_gpu_prepare_preserves_order_and_two_item_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -15,6 +15,7 @@ from vllm_gr.config.models import (
     ConstraintBackend,
     ConstraintTableBackendEnum,
     GRAttentionBackend,
+    GRSchedulingMode,
     NPUDecodeExecution,
 )
 
@@ -149,6 +150,20 @@ def validate_npu_decode_execution(value: object) -> NPUDecodeExecution | None:
         supported = ", ".join(mode.value for mode in NPUDecodeExecution)
         raise ValueError(
             f"unsupported vllm-gr npu_decode_execution {value!r}; supported: {supported}"
+        ) from exc
+
+
+def validate_gr_scheduling_mode(value: object) -> GRSchedulingMode:
+    if isinstance(value, GRSchedulingMode):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("vllm-gr scheduling_mode must be a string")
+    try:
+        return GRSchedulingMode(value.lower())
+    except ValueError as exc:
+        supported = ", ".join(mode.value for mode in GRSchedulingMode)
+        raise ValueError(
+            f"unsupported vllm-gr scheduling_mode {value!r}; supported: {supported}"
         ) from exc
 
 

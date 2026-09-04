@@ -14,6 +14,7 @@ from vllm_gr.config.models import (
     ConstraintBackend,
     ConstraintTableConfig,
     GRConfig,
+    GRSchedulingMode,
 )
 from vllm_gr.config.validation import (
     validate_artifact_digest,
@@ -30,6 +31,7 @@ from vllm_gr.config.validation import (
     validate_constraint_table_format,
     validate_constraint_table_max_top_k,
     validate_constraint_table_path,
+    validate_gr_scheduling_mode,
     validate_npu_decode_execution,
     validate_persistent_request,
     validate_persistent_runner_state,
@@ -54,6 +56,7 @@ BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
 BEAM_ENGINE_DRIVEN_KEY: Final = "vllm_gr_beam_engine_driven"
 PERSISTENT_REQUEST_KEY: Final = "vllm_gr_persistent_request"
 PERSISTENT_RUNNER_STATE_KEY: Final = "vllm_gr_persistent_runner_state"
+SCHEDULING_MODE_KEY: Final = "vllm_gr_scheduling_mode"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -70,6 +73,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         BEAM_ENGINE_DRIVEN_KEY,
         PERSISTENT_REQUEST_KEY,
         PERSISTENT_RUNNER_STATE_KEY,
+        SCHEDULING_MODE_KEY,
     }
 )
 _TOP_LEVEL_KEYS: Final = frozenset(
@@ -96,7 +100,7 @@ _CONSTRAINT_TABLE_KEYS: Final = frozenset(
     }
 )
 _RUNTIME_KEYS: Final = frozenset(
-    {"persistent_request", "persistent_runner_state"}
+    {"persistent_request", "persistent_runner_state", "scheduling_mode"}
 )
 
 
@@ -173,6 +177,17 @@ def gr_config_from_mapping(
     if not isinstance(graph_enabled, bool):
         raise ValueError("vllm-gr beam.graph_enabled must be a boolean")
 
+    persistent_request = validate_persistent_request(
+        runtime_raw.get("persistent_request", False)
+    )
+    scheduling_mode = validate_gr_scheduling_mode(
+        runtime_raw.get("scheduling_mode", GRSchedulingMode.ASYNC.value)
+    )
+    if "scheduling_mode" in runtime_raw and not persistent_request:
+        raise ValueError(
+            "vllm-gr runtime.scheduling_mode requires persistent_request=True"
+        )
+
     table = ConstraintTableConfig(
         enabled=validate_constraint_table_enabled(table_raw.get("enabled", False)),
         backend=validate_constraint_table_backend(table_raw.get("backend", "cuda")),
@@ -193,12 +208,11 @@ def gr_config_from_mapping(
         ),
         beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
         beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
-        persistent_request=validate_persistent_request(
-            runtime_raw.get("persistent_request", False)
-        ),
+        persistent_request=persistent_request,
         persistent_runner_state=validate_persistent_runner_state(
             runtime_raw.get("persistent_runner_state", False)
         ),
+        scheduling_mode=scheduling_mode,
         schema_version=validate_schema_version(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
@@ -268,6 +282,7 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         payload["runtime"] = {
             "persistent_request": config.persistent_request,
             "persistent_runner_state": config.persistent_runner_state,
+            "scheduling_mode": config.scheduling_mode.value,
         }
     return payload
 
@@ -333,6 +348,16 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         )
     if canonical_present:
         return gr_config_from_mapping(additional_config[GR_CONFIG_KEY])
+    persistent_request = validate_persistent_request(
+        additional_config.get(PERSISTENT_REQUEST_KEY, False)
+    )
+    scheduling_mode = validate_gr_scheduling_mode(
+        additional_config.get(SCHEDULING_MODE_KEY, GRSchedulingMode.ASYNC.value)
+    )
+    if SCHEDULING_MODE_KEY in additional_config and not persistent_request:
+        raise ValueError(
+            "vllm-gr scheduling_mode requires persistent_request=True"
+        )
     return GRConfig(
         catalog_path=validate_catalog_path(additional_config.get(CATALOG_PATH_KEY)),
         constraint_backend=validate_constraint_backend(
@@ -357,12 +382,11 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_engine_driven=validate_beam_engine_driven(
             additional_config.get(BEAM_ENGINE_DRIVEN_KEY)
         ),
-        persistent_request=validate_persistent_request(
-            additional_config.get(PERSISTENT_REQUEST_KEY, False)
-        ),
+        persistent_request=persistent_request,
         persistent_runner_state=validate_persistent_runner_state(
             additional_config.get(PERSISTENT_RUNNER_STATE_KEY, False)
         ),
+        scheduling_mode=scheduling_mode,
     )
 
 
@@ -468,6 +492,12 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config[PERSISTENT_RUNNER_STATE_KEY] = True
     else:
         additional_config.pop(PERSISTENT_RUNNER_STATE_KEY, None)
+
+    scheduling_mode = validate_gr_scheduling_mode(gr_config.scheduling_mode)
+    if persistent_request:
+        additional_config[SCHEDULING_MODE_KEY] = scheduling_mode.value
+    else:
+        additional_config.pop(SCHEDULING_MODE_KEY, None)
 
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:

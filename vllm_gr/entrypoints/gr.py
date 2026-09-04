@@ -714,9 +714,8 @@ def _custom_beam_search_batch(
             instance.beams = new_beams
             instance_fork_info[j] = fork_info
 
-        # A bundled persistent request returns its terminal Worker result from
-        # the first (and only) engine drain.  Do not enter another token-loop
-        # iteration after the native request has already finished.
+        # The terminal persistent result finishes the native request. Do not
+        # enter another token-loop iteration after it has already finished.
         if persistent_final_ready:
             break
 

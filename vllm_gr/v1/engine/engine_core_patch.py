@@ -125,11 +125,10 @@ def make_patched_process_engine_step(original_step):
             self.output_queue.put_nowait(output)
         self.post_step(model_executed)
 
-        if (
-            not persistent_gr
-            and not model_executed
-            and self.scheduler.has_requests()
-        ):
+        # Match the upstream idle policy for every scheduler. Merely selecting
+        # GRAsyncScheduler is not evidence of BatchQueue/Worker progress and
+        # must not turn an idle engine into a busy spin.
+        if not model_executed and self.scheduler.has_requests():
             time.sleep(0.001)
 
         return model_executed

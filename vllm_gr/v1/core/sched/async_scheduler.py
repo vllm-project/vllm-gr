@@ -60,7 +60,6 @@ class GRAsyncScheduler(AsyncScheduler):
             request.gr_step = 0
             request.gr_issued_steps = 0
             request.gr_completed_steps = 0
-            request.gr_bundled_inflight = False
             request.gr_persistent_runner_state = GRConfig.from_vllm_config(
                 getattr(self, "vllm_config", None)
             ).persistent_runner_state
@@ -77,27 +76,16 @@ class GRAsyncScheduler(AsyncScheduler):
     def _is_gr_request(request: Request) -> bool:
         return bool(getattr(request, "is_gr_request", False))
 
-    def has_requests(self) -> bool:
-        """Hide an atomically issued GR session while its Worker future runs.
-
-        ``step_with_batch_queue`` otherwise tries to fill its second queue slot
-        after the complete P/D program has already been issued.  Returning
-        false here makes it consume the existing future; the request remains
-        registered and is reconciled normally by update_from_output.
-        """
-        if len(self.requests) == 1:
-            request = next(iter(self.requests.values()))
-            if (
-                self._is_gr_request(request)
-                and bool(getattr(request, "gr_bundled_inflight", False))
-                and bool(getattr(request, "gr_persistent_runner_state", False))
-                and int(getattr(request, "gr_issued_steps", 0)) >= request.gr_metadata.max_tokens
-                and int(getattr(request, "gr_completed_steps", 0)) < request.gr_metadata.max_tokens
-            ):
-                return False
-        return super().has_requests()
-
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        if not any(
+            self._is_gr_request(self.requests[req_id])
+            for req_id in scheduler_output.num_scheduled_tokens
+        ):
+            # Preserve upstream AsyncScheduler bookkeeping byte-for-byte for
+            # an ordinary batch; the custom placeholder rules below exist
+            # only for batches that actually contain a GR request.
+            return super()._update_after_schedule(scheduler_output)
+
         # Keep vLLM's normal request accounting, then reproduce the upstream
         # AsyncScheduler placeholder logic.  A persistent runner-state GR
         # request is safe to schedule one stage ahead because its next Beam
@@ -156,11 +144,16 @@ class GRAsyncScheduler(AsyncScheduler):
 
     def _decorate_gr_output(self, output: SchedulerOutput) -> None:
         """Attach Worker metadata and advance the issue cursor for one batch."""
-        beam_data: dict[str, dict[str, Any]] = getattr(output, "beam_data", {})
+        existing_beam_data = getattr(output, "beam_data", None)
+        beam_data: dict[str, dict[str, Any]] = (
+            existing_beam_data if existing_beam_data is not None else {}
+        )
+        scheduled_gr = False
         for req_id, logical_tokens in tuple(output.num_scheduled_tokens.items()):
             request = self.requests.get(req_id)
             if request is None or not self._is_gr_request(request):
                 continue
+            scheduled_gr = True
 
             metadata: GRRequestMetadata = request.gr_metadata
             # Use the issue cursor, not the host completion cursor. With a
@@ -230,88 +223,18 @@ class GRAsyncScheduler(AsyncScheduler):
 
             request.gr_counters.decode_scheduler_calls += int(step > 0)
 
-        output.beam_data = beam_data
-
-    def _can_bundle_session(self, output: SchedulerOutput) -> bool:
-        """Whether the final prefill can carry the complete decode program.
-
-        Phase A deliberately supports one persistent GR request.  Requiring it
-        to be the scheduler's only request keeps ordinary-request fairness and
-        preemption semantics unchanged.  Chunked prefills are bundled only on
-        their final chunk, after the complete prefix KV is resident.
-        """
-        if type(output) is not SchedulerOutput or len(self.requests) != 1:
-            return False
-        if len(output.num_scheduled_tokens) != 1:
-            return False
-        req_id = next(iter(output.num_scheduled_tokens))
-        request = self.requests.get(req_id)
-        if request is None or not self._is_gr_request(request):
-            return False
-        if not bool(getattr(request, "gr_persistent_runner_state", False)):
-            return False
-        metadata = (getattr(output, "beam_data", {}) or {}).get(req_id, {})
-        return bool(
-            metadata.get("is_constraint_prefill")
-            and metadata.get("is_last_prefill")
-            and int(getattr(request, "gr_issued_steps", 0)) < request.gr_metadata.max_tokens
-        )
+        # An ordinary request must observe the upstream SchedulerOutput
+        # unchanged; only GR scheduling introduces this sidecar.
+        if scheduled_gr:
+            output.beam_data = beam_data
 
     def schedule(self) -> SchedulerOutput:
+        """Issue exactly one upstream SchedulerOutput and one GR stage."""
         output = super().schedule()
         self._decorate_gr_output(output)
-
-        if self._can_bundle_session(output):
-            req_id = next(iter(output.num_scheduled_tokens))
-            request = self.requests[req_id]
-            followups: list[SchedulerOutput] = []
-            while request.gr_issued_steps < request.gr_metadata.max_tokens:
-                followup = super().schedule()
-                self._decorate_gr_output(followup)
-                if followup.total_num_scheduled_tokens <= 0 or set(
-                    followup.num_scheduled_tokens
-                ) != {req_id}:
-                    raise RuntimeError(
-                        "persistent GR decode program could not be scheduled "
-                        f"atomically for request {req_id!r}"
-                    )
-                followups.append(followup)
-            # SchedulerOutput is a mutable dataclass.  Keeping the individual
-            # outputs preserves upstream's request/KV accounting while the
-            # Worker executes them as one uninterrupted device program.
-            output.gr_followup_outputs = followups
-            request.gr_bundled_inflight = True
-
         return output
 
     def update_from_output(self, scheduler_output, model_runner_output):
-        followups = getattr(scheduler_output, "gr_followup_outputs", None)
-        if followups:
-            from vllm.v1.outputs import ModelRunnerOutput
-
-            bundled_outputs = [scheduler_output, *followups]
-            final_result = {}
-            req_id = next(iter(scheduler_output.num_scheduled_tokens))
-            request = self.requests[req_id]
-            try:
-                for index, bundled_output in enumerate(bundled_outputs):
-                    if index + 1 == len(bundled_outputs):
-                        step_model_output = model_runner_output
-                    else:
-                        step_model_output = ModelRunnerOutput(
-                            req_ids=[req_id],
-                            req_id_to_index={req_id: 0},
-                            sampled_token_ids=[[request.gr_metadata.continue_token_id]],
-                        )
-                    step_result = self._update_single_output(bundled_output, step_model_output)
-                    # Intermediate control outputs are an implementation detail
-                    # of the native request. Publish only the terminal result.
-                    if index + 1 == len(bundled_outputs):
-                        final_result = step_result
-            finally:
-                request.gr_bundled_inflight = False
-            return final_result
-
         return self._update_single_output(scheduler_output, model_runner_output)
 
     def _update_single_output(self, scheduler_output, model_runner_output):

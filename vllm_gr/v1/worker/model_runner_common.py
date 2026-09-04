@@ -1200,52 +1200,6 @@ def _inline_sample_tokens(runner: Any) -> Any:
     return out
 
 
-def _sample_persistent_stage_without_output(runner: Any) -> None:
-    """Sample one bundled GR stage without host bookkeeping or D2H.
-
-    A persistent GR stage consumes its candidates entirely on the device: the
-    patched ``_sample`` advances ``GRModelRunnerState`` and the beam KV session.
-    Intermediate native control tokens are known by the scheduler, so building
-    an AsyncModelRunnerOutput (and copying that scalar to the host) is needless.
-
-    This intentionally supports the Phase-A topology only: no speculative
-    decoder, no pipeline parallelism, and no KV/EC connector payload.  Those
-    configurations retain the ordinary per-step path.
-    """
-    state = getattr(runner, "execute_model_state", None)
-    if state is None:
-        raise RuntimeError("bundled persistent GR stage has no execute state")
-    if getattr(runner, "speculative_config", None) is not None:
-        raise RuntimeError("bundled persistent GR does not support speculative decode")
-    parallel_config = getattr(runner, "parallel_config", None)
-    if (
-        parallel_config is not None
-        and int(getattr(parallel_config, "pipeline_parallel_size", 1)) != 1
-    ):
-        raise RuntimeError("bundled persistent GR requires pipeline_parallel_size=1")
-    if (
-        state.ec_connector_output is not None
-        or getattr(runner, "kv_connector_output", None) is not None
-    ):
-        raise RuntimeError("bundled persistent GR does not support cache connectors")
-
-    # Clear before sampling, matching upstream sample_tokens.  The patched
-    # _sample performs constraint top-k, beam selection, state advance and KV
-    # reorder on the producer stream.
-    runner.execute_model_state = None
-    sampler_output = runner._sample(state.logits, state.spec_decode_metadata)
-    runner._update_states_after_model_execute(
-        sampler_output.sampled_token_ids, state.scheduler_output
-    )
-    runner._draft_token_ids = None
-    runner._draft_probs = None
-    runner._draft_prob_req_ids = None
-    runner._draft_token_req_ids = None
-    runner.valid_sampled_token_count_gpu = None
-    runner.input_batch.prev_sampled_token_ids = None
-    runner.eplb_step()
-
-
 def _get_gr_config(runner) -> Any:
     """Return the worker's GRConfig, cached on the runner (frozen dataclass).
 
@@ -1627,12 +1581,6 @@ def make_patched_execute_model(_orig_execute_model):
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
-        bundled_followups = list(getattr(scheduler_output, "gr_followup_outputs", None) or ())
-        if bundled_followups:
-            # sample_tokens() is still invoked once by async EngineCore after
-            # execute_model().  Stash the terminal output for that call rather
-            # than changing the upstream executor contract.
-            self._gr_bundled_model_output = None
         # Clear the previous step's beam context at the START of the next
         # execute_model, not in a finally: with async scheduling the sampled
         # tokens are produced by ``sample_tokens`` AFTER execute_model returns,
@@ -1716,32 +1664,7 @@ def make_patched_execute_model(_orig_execute_model):
                     "prefill_constraint_post_forward_enqueue"
                 ):
                     launch_prepared_cuda_prefill_constraint(self)
-            if out is None and bundled_followups:
-                # The current output is the final prefill.  Its device decision
-                # bootstraps GRModelRunnerState; every non-terminal follow-up is
-                # sampled through the no-output path.  The terminal stage uses
-                # normal sample_tokens once so final result D2H and upstream
-                # bookkeeping retain their established contracts.
-                with torch.autograd.profiler.record_function("gr_bundled_intermediate_sample"):
-                    _sample_persistent_stage_without_output(self)
-                for index, followup in enumerate(bundled_followups):
-                    with torch.autograd.profiler.record_function("gr_bundled_decode_execute"):
-                        followup_out = patched_execute_model(self, followup, *args, **kwargs)
-                    if followup_out is not None:
-                        raise RuntimeError(
-                            "bundled persistent GR follow-up returned an "
-                            "unexpected eager model output"
-                        )
-                    if index + 1 < len(bundled_followups):
-                        with torch.autograd.profiler.record_function(
-                            "gr_bundled_intermediate_sample"
-                        ):
-                            _sample_persistent_stage_without_output(self)
-                    else:
-                        terminal_output = self.sample_tokens(None)
-                        self._gr_bundled_model_output = terminal_output
-                out = None
-            elif out is None and _should_inline_sample_tokens(self, scheduler_output):
+            if out is None and _should_inline_sample_tokens(self, scheduler_output):
                 # M2: finish sampling in-process and return the
                 # ModelRunnerOutput through the execute_model channel, so the
                 # engine's None short-circuit (core.py ``future.result()``)

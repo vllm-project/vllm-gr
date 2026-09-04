@@ -107,6 +107,13 @@ class NPUDecodeExecution(str, Enum):
     XLLM = "xllm"
 
 
+class GRSchedulingMode(str, Enum):
+    """Scheduling topology for a persistent GR request."""
+
+    ASYNC = "async"
+    MULTI_STEP = "multi_step"
+
+
 @dataclass(frozen=True)
 class GRConfig:
     """Validated vLLM-GR configuration reconstructed in each process."""
@@ -154,6 +161,7 @@ class GRConfig:
     # Persistent execution is opt-in so existing request behavior is unchanged.
     persistent_request: bool = False
     persistent_runner_state: bool = False
+    scheduling_mode: GRSchedulingMode = GRSchedulingMode.ASYNC
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -165,6 +173,7 @@ class GRConfig:
             validate_beam_worker_decision,
             validate_catalog_path,
             validate_constraint_backend,
+            validate_gr_scheduling_mode,
             validate_npu_decode_execution,
             validate_persistent_request,
             validate_persistent_runner_state,
@@ -229,6 +238,16 @@ class GRConfig:
             "persistent_runner_state",
             validate_persistent_runner_state(self.persistent_runner_state),
         )
+        object.__setattr__(
+            self,
+            "scheduling_mode",
+            validate_gr_scheduling_mode(self.scheduling_mode),
+        )
+        if self.scheduling_mode is GRSchedulingMode.MULTI_STEP:
+            raise ValueError(
+                "vllm-gr scheduling_mode='multi_step' is not supported; "
+                "use scheduling_mode='async'"
+            )
         if self.beam_engine_driven and not self.beam_worker_decision:
             raise ValueError(
                 "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "

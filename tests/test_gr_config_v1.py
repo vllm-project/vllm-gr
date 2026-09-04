@@ -16,6 +16,7 @@ from vllm_gr.config import (
     ConstraintTableBackendEnum,
     ConstraintTableConfig,
     GRConfig,
+    GRSchedulingMode,
     NPUDecodeExecution,
     gr_config_from_mapping,
     gr_config_to_mapping,
@@ -69,11 +70,38 @@ def test_canonical_runtime_flags_round_trip(tmp_path: Path) -> None:
     raw["runtime"] = {
         "persistent_request": True,
         "persistent_runner_state": True,
+        "scheduling_mode": "async",
     }
     config = gr_config_from_mapping(raw)
     assert config.persistent_request is True
     assert config.persistent_runner_state is True
+    assert config.scheduling_mode is GRSchedulingMode.ASYNC
     assert gr_config_to_mapping(config) == raw
+
+
+def test_canonical_multi_step_scheduling_fails_fast(tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    raw["runtime"] = {
+        "persistent_request": True,
+        "persistent_runner_state": True,
+        "scheduling_mode": "multi_step",
+    }
+
+    with pytest.raises(ValueError, match="scheduling_mode='multi_step'.*not supported"):
+        gr_config_from_mapping(raw)
+
+
+def test_canonical_explicit_scheduling_requires_persistent_request(
+    tmp_path: Path,
+) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    raw["runtime"] = {"scheduling_mode": "async"}
+
+    with pytest.raises(
+        ValueError,
+        match="runtime.scheduling_mode requires persistent_request=True",
+    ):
+        gr_config_from_mapping(raw)
 
 
 @pytest.mark.parametrize("worker_decision", [True, False])  # type: ignore[misc]
@@ -350,6 +378,7 @@ def test_persistent_request_selects_gr_async_scheduler(tmp_path: Path) -> None:
     raw["runtime"] = {
         "persistent_request": True,
         "persistent_runner_state": False,
+        "scheduling_mode": "async",
     }
     engine_args = SimpleNamespace(
         _vllm_gr_config_input=raw,
@@ -374,3 +403,38 @@ def test_persistent_request_selects_gr_async_scheduler(tmp_path: Path) -> None:
     assert scheduler_config.scheduler_cls == (
         "vllm_gr.v1.core.sched.async_scheduler.GRAsyncScheduler"
     )
+
+
+def test_persistent_request_rejects_disabled_async_scheduler(tmp_path: Path) -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    scheduler_config = SimpleNamespace(async_scheduling=False, scheduler_cls=None)
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        scheduler_config=scheduler_config,
+    )
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    raw["runtime"] = {
+        "persistent_request": True,
+        "persistent_runner_state": False,
+        "scheduling_mode": "async",
+    }
+    engine_args = SimpleNamespace(
+        _vllm_gr_config_input=raw,
+        catalog_path=None,
+        constraint_backend=None,
+        attention_backend=None,
+        attention_config=None,
+        async_scheduling=False,
+    )
+
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
+        pytest.raises(ValueError, match="requires vLLM async scheduling"),
+    ):
+        create_engine_config(engine_args)

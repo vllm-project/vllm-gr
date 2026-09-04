@@ -37,7 +37,6 @@ def _request(step: int = 0):
         gr_step=step,
         gr_issued_steps=step,
         gr_completed_steps=step,
-        gr_bundled_inflight=False,
         gr_parent_ids=[0, 1, 2],
         gr_beam_suffix=[[11], [12], [13]] if step else [],
         gr_counters=GRRequestCounters(),
@@ -82,9 +81,13 @@ def test_schedule_keeps_one_logical_token_and_dispatches_beam_rows() -> None:
     scheduler = object.__new__(GRAsyncScheduler)
     scheduler.requests = {"gr-0": request}
 
-    with mock.patch.object(AsyncScheduler, "schedule", return_value=output):
+    with mock.patch.object(
+        AsyncScheduler, "schedule", return_value=output
+    ) as upstream_schedule:
         result = scheduler.schedule()
 
+    upstream_schedule.assert_called_once_with()
+    assert not hasattr(result, "gr_followup_outputs")
     assert result.num_scheduled_tokens == {"gr-0": 3}
     assert result.total_num_scheduled_tokens == 3
     assert result.beam_data["gr-0"]["next_token_ids"] == [11, 12, 13]
@@ -205,6 +208,53 @@ def test_persistent_gr_adds_placeholder_without_waiting_for_output() -> None:
 
     update.assert_called_once_with(scheduler, output)
     assert request.num_output_placeholders == 1
+
+
+def test_ordinary_batch_delegates_upstream_async_bookkeeping() -> None:
+    request = SimpleNamespace(request_id="plain", is_gr_request=False)
+    scheduler = object.__new__(GRAsyncScheduler)
+    scheduler.requests = {request.request_id: request}
+    output = SimpleNamespace(num_scheduled_tokens={request.request_id: 1})
+
+    with mock.patch.object(
+        AsyncScheduler, "_update_after_schedule"
+    ) as upstream_update:
+        scheduler._update_after_schedule(output)
+
+    upstream_update.assert_called_once_with(output)
+    assert upstream_update.call_args.args[0] is output
+
+
+def test_mixed_batch_keeps_gr_placeholder_bookkeeping() -> None:
+    gr_request = _request(step=0)
+    gr_request.gr_persistent_runner_state = True
+    gr_request.is_prefill_chunk = False
+    gr_request.num_output_placeholders = 0
+    plain_request = SimpleNamespace(
+        request_id="plain",
+        is_gr_request=False,
+        is_prefill_chunk=True,
+    )
+    scheduler = object.__new__(GRAsyncScheduler)
+    scheduler.requests = {
+        gr_request.request_id: gr_request,
+        plain_request.request_id: plain_request,
+    }
+    output = SimpleNamespace(
+        num_scheduled_tokens={gr_request.request_id: 1, plain_request.request_id: 1},
+        scheduled_spec_decode_tokens={},
+        pending_structured_output_tokens=False,
+    )
+
+    with (
+        mock.patch.object(Scheduler, "_update_after_schedule") as base_update,
+        mock.patch.object(AsyncScheduler, "_update_after_schedule") as upstream_update,
+    ):
+        scheduler._update_after_schedule(output)
+
+    base_update.assert_called_once_with(scheduler, output)
+    upstream_update.assert_not_called()
+    assert gr_request.num_output_placeholders == 1
 
 
 def test_persistent_gr_does_not_add_placeholder_after_last_issue() -> None:
@@ -350,67 +400,19 @@ def test_one_token_gr_attaches_final_result_after_native_removal() -> None:
     assert request.gr_completed_steps == 1
 
 
-def test_bundled_session_hides_inflight_request_from_batch_queue() -> None:
-    request = _request(step=0)
-    request.gr_persistent_runner_state = True
-    request.gr_bundled_inflight = True
-    request.gr_issued_steps = request.gr_metadata.max_tokens
-    request.gr_completed_steps = 0
-    scheduler = object.__new__(GRAsyncScheduler)
-    scheduler.requests = {request.request_id: request}
-
-    with mock.patch.object(AsyncScheduler, "has_requests", return_value=True):
-        assert scheduler.has_requests() is False
-
-    request.gr_completed_steps = request.gr_metadata.max_tokens
-    with mock.patch.object(AsyncScheduler, "has_requests", return_value=True):
-        assert scheduler.has_requests() is True
-
-
-def test_only_final_prefill_of_isolated_runner_state_request_can_bundle() -> None:
-    request = _request(step=0)
-    request.gr_persistent_runner_state = True
-    request.gr_issued_steps = 1
-    scheduler = object.__new__(GRAsyncScheduler)
-    scheduler.requests = {request.request_id: request}
+def test_ordinary_request_delegates_one_schedule_unchanged() -> None:
+    request = SimpleNamespace(request_id="plain", is_gr_request=False)
     output = SchedulerOutput.make_empty()
-    output.num_scheduled_tokens = {request.request_id: 4}
-    output.total_num_scheduled_tokens = 4
-    output.beam_data = {
-        request.request_id: {
-            "is_constraint_prefill": True,
-            "is_last_prefill": True,
-        }
-    }
-
-    assert scheduler._can_bundle_session(output) is True
-    output.beam_data[request.request_id]["is_last_prefill"] = False
-    assert scheduler._can_bundle_session(output) is False
-
-
-def test_bundled_update_reconciles_every_stage_but_returns_only_final() -> None:
     scheduler = object.__new__(GRAsyncScheduler)
-    request = _request(step=0)
-    request.gr_persistent_runner_state = True
-    request.gr_bundled_inflight = True
     scheduler.requests = {request.request_id: request}
-    first = SimpleNamespace(num_scheduled_tokens={request.request_id: 4})
-    decode_1 = SimpleNamespace(num_scheduled_tokens={request.request_id: 3})
-    decode_2 = SimpleNamespace(num_scheduled_tokens={request.request_id: 3})
-    first.gr_followup_outputs = [decode_1, decode_2]
-    final_model_output = SimpleNamespace(sampled_token_ids=[[8]])
-    calls = []
 
-    def update_one(scheduler_output, model_output):
-        calls.append((scheduler_output, model_output))
-        return {len(calls): scheduler_output}
+    with mock.patch.object(
+        AsyncScheduler, "schedule", return_value=output
+    ) as upstream_schedule:
+        result = scheduler.schedule()
 
-    scheduler._update_single_output = update_one
-    result = scheduler.update_from_output(first, final_model_output)
-
-    assert [item[0] for item in calls] == [first, decode_1, decode_2]
-    assert calls[0][1].sampled_token_ids == [[7]]
-    assert calls[1][1].sampled_token_ids == [[7]]
-    assert calls[2][1] is final_model_output
-    assert result == {3: decode_2}
-    assert request.gr_bundled_inflight is False
+    upstream_schedule.assert_called_once_with()
+    assert result is output
+    assert result.num_scheduled_tokens == {}
+    assert result.total_num_scheduled_tokens == 0
+    assert not hasattr(result, "beam_data")
