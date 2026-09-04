@@ -487,11 +487,50 @@ def _custom_beam_search_batch(
 
         if engine_core_requests:
             llm_engine.engine_core.add_requests(engine_core_requests, force_batch=True)
+            added: list[tuple[int, Any]] = []
             for ec_req in engine_core_requests:
                 parts = ec_req.external_req_id.split("-")
                 j = int(parts[2]) - prompt_start
                 instance_prefill_id[j] = ec_req.request_id
                 instance_prev_beam_internal_ids[j] = [ec_req.request_id]
+                added.append((j, ec_req))
+
+            # Engine-driven prefill chain (Constraint Tables): cache each
+            # session's step template right after the ADD_BATCH — the same
+            # ordering the serving path uses (_add_batch_step) — so the
+            # prefill output iteration's engine-driven hook can chain step 0
+            # in the engine instead of waiting for this loop's first
+            # beam_request_step_update send.  The template and the ADD travel
+            # back-to-back on the same transport (socket FIFO for the
+            # multiprocess EngineCore, direct calls for InprocClient), so it
+            # is always cached before the hook runs.  EngineCore-side gating
+            # (beam_engine_driven) decides whether the template is consumed.
+            if _is_constrained:
+                send_template = getattr(llm_engine.engine_core, "beam_session_template", None)
+                if send_template is not None:
+                    eos_token_id = (
+                        sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
+                    )
+                    for j, ec_req in added:
+                        send_template(
+                            BeamRequestStepUpdate(
+                                session_id=ec_req.request_id,
+                                parent_beam_ids=[],
+                                child_beam_ids=[],
+                                beam_tokens=[],
+                                pruned_ids=[],
+                                prefix_len=instance_prefix_len[j],
+                                beam_width=beam_width,
+                                sampling_params=clone_beam_decode_sampling_params(
+                                    beam_search_params
+                                ),
+                                eos_token_id=eos_token_id,
+                                max_decode_steps=max_decode_steps,
+                                # 1 = constrained decode step 0 (the value the
+                                # frontend itself puts on the step-0 update).
+                                constraint_step=1,
+                            )
+                        )
 
         # Step 2: Step engine and collect outputs
         outputs_map = _step_engine_and_collect_outputs(
