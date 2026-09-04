@@ -121,7 +121,19 @@ def test_protocol_version_mismatch_fails_fast(factory) -> None:
         (GRRequestMetadata, ["request-0", 4, 3, 16, 1, _DIGEST, 99]),
         (
             GRSchedulerOutput,
-            ["request-0", "decode_running", 1, 1, False, False, False, None, 99],
+            [
+                "request-0",
+                "decode_running",
+                1,
+                1,
+                False,
+                False,
+                False,
+                1,
+                1,
+                None,
+                99,
+            ],
         ),
         (GRRequestOutput, ["request-0", [], 1, 1, "final_ready", None, 99]),
         (
@@ -153,6 +165,8 @@ def test_scheduler_output_contains_no_beam_state() -> None:
         "is_prefill",
         "is_last_prefill",
         "is_final",
+        "logical_token_count",
+        "physical_row_count",
         "prefix_block_ids",
         "protocol_version",
     }

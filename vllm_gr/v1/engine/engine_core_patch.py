@@ -45,6 +45,16 @@ def make_patched_engine_core_init(original_init):
 
         _ensure_beam_state(self)
         original_init(self, *args, **kwargs)
+        from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
+
+        if (
+            isinstance(getattr(self, "scheduler", None), GRAsyncScheduler)
+            and int(getattr(self, "batch_queue_size", 1)) != 2
+        ):
+            raise ValueError(
+                "persistent GR requires EngineCore BatchQueue depth == 2; "
+                "single-depth and pipeline-parallel queues are not validated"
+            )
 
     setattr(patched_init, _BEAM_STATE_INIT_MARKER, True)
 
@@ -105,14 +115,35 @@ def make_patched_process_engine_step(original_step):
     if getattr(original_step, _ENGINE_STEP_PATCH_MARKER, False):
         return original_step
 
-    from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
+    def has_persistent_gr_work(engine) -> bool:
+        """Return true only when this iteration can advance persistent GR.
+
+        Looking only at the scheduler class would also change idle and legacy
+        self-advance behavior for ordinary requests hosted by the same async
+        scheduler.  The oldest BatchQueue entry is the output that this call
+        can reconcile; active request state covers an immediately-completed
+        first dispatch before it has a queue entry at function entry.
+        """
+        batch_queue = getattr(engine, "batch_queue", None)
+        if batch_queue:
+            scheduler_output = batch_queue[-1][1]
+            # The oldest entry is the only frame this call can reconcile. An
+            # unrelated active GR request must not change ordinary-frame idle
+            # or legacy self-advance behavior in a mixed queue.
+            return bool(getattr(scheduler_output, "gr_outputs", None))
+        requests = getattr(getattr(engine, "scheduler", None), "requests", {})
+        return any(
+            bool(getattr(request, "is_gr_request", False))
+            and bool(getattr(request, "gr_persistent_runner_state", False))
+            for request in requests.values()
+        )
 
     @wraps(original_step)
     def patched_process_engine_step(self):
         from vllm_gr.v1.engine.core import _beam_self_advance
 
+        persistent_gr = has_persistent_gr_work(self)
         outputs, model_executed = self.step_fn()
-        persistent_gr = isinstance(self.scheduler, GRAsyncScheduler)
         if outputs and not persistent_gr:
             try:
                 _beam_self_advance(self, outputs)
@@ -128,7 +159,11 @@ def make_patched_process_engine_step(original_step):
         # Match the upstream idle policy for every scheduler. Merely selecting
         # GRAsyncScheduler is not evidence of BatchQueue/Worker progress and
         # must not turn an idle engine into a busy spin.
-        if not model_executed and self.scheduler.has_requests():
+        # ``None`` means BatchQueue only enqueued work; any concrete output
+        # (including an empty dict for a final-only intermediate control step)
+        # means a queued Worker result was reconciled and is real progress.
+        made_progress = model_executed or (persistent_gr and outputs is not None)
+        if not made_progress and self.scheduler.has_requests():
             time.sleep(0.001)
 
         return model_executed

@@ -13,7 +13,12 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_gr.config import MAX_BEAM_WIDTH, GRConfig
 from vllm_gr.v1.beam.beam_decision import unpack_beam_result_buffer
-from vllm_gr.v1.engine.types import GR_REQUEST_METADATA_KEY, GRRequestMetadata
+from vllm_gr.v1.engine.types import (
+    GR_REQUEST_METADATA_KEY,
+    GRRequestMetadata,
+    GRRequestStage,
+    GRSchedulerOutput,
+)
 from vllm_gr.v1.metrics.stats import GRRequestCounters
 
 
@@ -93,6 +98,51 @@ class GRAsyncScheduler(AsyncScheduler):
     def _is_gr_request(request: Request) -> bool:
         return bool(getattr(request, "is_gr_request", False))
 
+    def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        """Reject force-preempt/resume while a persistent GR session is active.
+
+        Upstream reset moves running requests back to WAITING and resets their
+        computed-token cursor to zero. A persistent GR request cannot resume
+        that native prefill while its device Beam state and generation cursor
+        have already advanced. Fail before upstream mutates queues, KV blocks,
+        placeholders, or stale-frame counters.
+        """
+        if reset_running_requests and any(
+            self._is_gr_request(request)
+            and bool(getattr(request, "gr_persistent_runner_state", False))
+            for request in self.requests.values()
+        ):
+            raise RuntimeError(
+                "reset_prefix_cache(reset_running_requests=True) is not supported "
+                "while a persistent GR request is active; abort the request first"
+            )
+        return super().reset_prefix_cache(
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Disallow native preempt/resume for a persistent GR request.
+
+        Native preemption resets ``num_computed_tokens`` to zero and resumes
+        through the waiting/prefill path. That cannot be reconciled with an
+        already-bound prefix and device-resident Beam session. An allocation
+        failure therefore follows the documented memory-budget stop condition
+        instead of silently restarting the logical request as a decode stage.
+        """
+        if self._is_gr_request(request) and bool(
+            getattr(request, "gr_persistent_runner_state", False)
+        ):
+            raise RuntimeError(
+                "persistent GR request preemption/resume is not supported; "
+                "abort the request or increase the native KV cache budget"
+            )
+        return super()._preempt_request(request, timestamp)
+
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         if not any(
             self._is_gr_request(self.requests[req_id])
@@ -165,6 +215,7 @@ class GRAsyncScheduler(AsyncScheduler):
         beam_data: dict[str, dict[str, Any]] = (
             existing_beam_data if existing_beam_data is not None else {}
         )
+        gr_outputs: dict[str, GRSchedulerOutput] = {}
         scheduled_gr = False
         for req_id, logical_tokens in tuple(output.num_scheduled_tokens.items()):
             request = self.requests.get(req_id)
@@ -175,7 +226,15 @@ class GRAsyncScheduler(AsyncScheduler):
             metadata: GRRequestMetadata = request.gr_metadata
             # Use the issue cursor, not the host completion cursor. With a
             # BatchQueue of depth two these intentionally differ by one.
-            step = int(getattr(request, "gr_issued_steps", request.gr_step))
+            issued_steps = int(getattr(request, "gr_issued_steps", request.gr_step))
+            completed_steps = int(
+                getattr(request, "gr_completed_steps", request.gr_step)
+            )
+            if issued_steps - completed_steps not in (0, 1):
+                raise RuntimeError(
+                    "persistent GR issued/completed cursor invariant violated"
+                )
+            step = issued_steps
             persistent_runner_state = bool(getattr(request, "gr_persistent_runner_state", False))
             if step == 0:
                 is_last_prefill = request.num_computed_tokens >= metadata.prefix_len
@@ -201,11 +260,26 @@ class GRAsyncScheduler(AsyncScheduler):
                 }
                 if is_last_prefill:
                     request.gr_issued_steps = 1
+                gr_outputs[req_id] = GRSchedulerOutput(
+                    request_id=req_id,
+                    stage=GRRequestStage.PREFILL_RUNNING,
+                    step=0,
+                    device_step=0,
+                    is_prefill=True,
+                    is_last_prefill=is_last_prefill,
+                    is_final=is_last_prefill and metadata.max_tokens == 1,
+                    logical_token_count=1,
+                    physical_row_count=1,
+                )
             else:
                 if step >= metadata.max_tokens:
                     raise RuntimeError(
                         "persistent GR scheduled beyond max_tokens: "
                         f"issued={step}, max_tokens={metadata.max_tokens}"
+                    )
+                if logical_tokens != 1:
+                    raise RuntimeError(
+                        "persistent GR decode must schedule exactly one logical token"
                     )
                 beam_data[req_id] = {
                     "is_beam_decode": True,
@@ -231,11 +305,19 @@ class GRAsyncScheduler(AsyncScheduler):
                     beam_data[req_id]["next_token_ids"] = [
                         suffix[-1] for suffix in request.gr_beam_suffix
                     ]
-                # The scheduler advances one logical control token while the
-                # worker executes W physical Beam rows. Runner-state requests
-                # source their token ids directly from device state.
-                output.num_scheduled_tokens[req_id] = metadata.beam_width
-                output.total_num_scheduled_tokens += metadata.beam_width - logical_tokens
+                # Native scheduler accounting remains one logical control
+                # token. The typed sidecar is the only declaration of the W
+                # physical Beam rows consumed by the ModelRunner adapter.
+                gr_outputs[req_id] = GRSchedulerOutput(
+                    request_id=req_id,
+                    stage=GRRequestStage.DECODE_RUNNING,
+                    step=step,
+                    device_step=step,
+                    is_prefill=False,
+                    is_final=step + 1 >= metadata.max_tokens,
+                    logical_token_count=logical_tokens,
+                    physical_row_count=metadata.beam_width,
+                )
                 request.gr_issued_steps = step + 1
 
             request.gr_counters.decode_scheduler_calls += int(step > 0)
@@ -244,9 +326,21 @@ class GRAsyncScheduler(AsyncScheduler):
         # unchanged; only GR scheduling introduces this sidecar.
         if scheduled_gr:
             output.beam_data = beam_data
+            output.gr_outputs = gr_outputs
 
     def schedule(self) -> SchedulerOutput:
         """Issue exactly one upstream SchedulerOutput and one GR stage."""
+        if any(
+            self._is_gr_request(request)
+            and int(getattr(request, "gr_issued_steps", 0))
+            - int(getattr(request, "gr_completed_steps", 0))
+            >= 2
+            for request in self.requests.values()
+        ):
+            # EngineCore's BatchQueue normally prevents this call while its
+            # executing+queued pair is full. Both non-blocking dispatches are
+            # truthfully counted as issued; a third would exceed look-ahead 1.
+            raise RuntimeError("persistent GR look-ahead depth exceeds one")
         output = super().schedule()
         self._decorate_gr_output(output)
         return output
@@ -256,22 +350,27 @@ class GRAsyncScheduler(AsyncScheduler):
 
     def _update_single_output(self, scheduler_output, model_runner_output):
         beam_data = getattr(scheduler_output, "beam_data", {})
-        logical_counts: dict[str, int] = {}
-        for req_id, physical_tokens in tuple(scheduler_output.num_scheduled_tokens.items()):
-            request = self.requests.get(req_id)
-            if request is None or not self._is_gr_request(request):
-                continue
-            if bool(beam_data.get(req_id, {}).get("is_beam_decode", False)):
-                logical_counts[req_id] = 1
-                scheduler_output.num_scheduled_tokens[req_id] = 1
-                scheduler_output.total_num_scheduled_tokens -= physical_tokens - 1
-
+        gr_outputs: dict[str, GRSchedulerOutput] = getattr(
+            scheduler_output, "gr_outputs", {}
+        )
         decision = getattr(model_runner_output, "beam_search_result", None)
         scheduled_gr = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
-            if self._is_gr_request(self.requests.get(req_id))
-            and beam_data.get(req_id, {}).get("generation_index") is not None
+            if (
+                self._is_gr_request(request := self.requests.get(req_id))
+                # reset_prefix_cache/preemption marks already-dispatched
+                # frames stale. Let AsyncScheduler consume that counter first;
+                # stale frames must never advance the GR completion cursor.
+                and int(getattr(request, "async_tokens_to_discard", 0)) == 0
+            )
+            and (
+                (
+                    (sidecar := gr_outputs.get(req_id)) is not None
+                    and (not sidecar.is_prefill or sidecar.is_last_prefill)
+                )
+                or beam_data.get(req_id, {}).get("generation_index") is not None
+            )
         ]
         runner_state_enabled = any(
             bool(getattr(self.requests.get(req_id), "gr_persistent_runner_state", False))
@@ -281,18 +380,17 @@ class GRAsyncScheduler(AsyncScheduler):
             raise RuntimeError("persistent GR worker output is missing beam_search_result")
         if decision is not None:
             for req_id in scheduler_output.num_scheduled_tokens:
+                if req_id not in scheduled_gr:
+                    continue
                 request = self.requests.get(req_id)
                 if request is None or not self._is_gr_request(request):
                     continue
                 if getattr(request, "gr_persistent_runner_state", False):
                     continue
-                generation_index = int(beam_data[req_id]["generation_index"])
-                completed_steps = int(getattr(request, "gr_completed_steps", request.gr_step))
-                if generation_index != completed_steps:
-                    raise RuntimeError(
-                        "persistent GR output order mismatch: "
-                        f"generation_index={generation_index}, completed={completed_steps}"
-                    )
+                generation_index = self._generation_index(
+                    req_id, gr_outputs, beam_data
+                )
+                self._validate_gr_completion_order(request, generation_index)
                 unpacked = unpack_beam_result_buffer(decision)
                 if unpacked is None:
                     raise RuntimeError("persistent GR requires a compact Beam decision")
@@ -308,8 +406,7 @@ class GRAsyncScheduler(AsyncScheduler):
                     for token, parent in zip(token_ids, parent_ids)
                 ]
                 request.gr_parent_ids = [int(parent) for parent in parent_ids]
-                request.gr_completed_steps = generation_index + 1
-                request.gr_step = request.gr_completed_steps
+                self._complete_gr_stage(request, generation_index)
 
                 req_index = model_runner_output.req_id_to_index[req_id]
                 is_final = bool(decision.get("is_last_step"))
@@ -336,20 +433,16 @@ class GRAsyncScheduler(AsyncScheduler):
         if runner_state_enabled:
             for req_id in scheduled_gr:
                 request = self.requests[req_id]
-                generation_index = int(beam_data[req_id]["generation_index"])
-                completed_steps = int(getattr(request, "gr_completed_steps", request.gr_step))
-                if generation_index != completed_steps:
-                    raise RuntimeError(
-                        "persistent GR output order mismatch: "
-                        f"generation_index={generation_index}, completed={completed_steps}"
-                    )
+                generation_index = self._generation_index(
+                    req_id, gr_outputs, beam_data
+                )
+                self._validate_gr_completion_order(request, generation_index)
                 is_final_dispatch = generation_index + 1 >= request.gr_metadata.max_tokens
                 if is_final_dispatch and decision is None:
                     raise RuntimeError(
                         "persistent GR final worker output is missing the final result"
                     )
-                request.gr_completed_steps = generation_index + 1
-                request.gr_step = request.gr_completed_steps
+                self._complete_gr_stage(request, generation_index)
                 is_final = bool(decision and decision.get("is_last_step"))
                 if is_final != is_final_dispatch:
                     raise RuntimeError(
@@ -392,3 +485,35 @@ class GRAsyncScheduler(AsyncScheduler):
                         output.kv_transfer_params = params
                         return result
         return result
+
+    @staticmethod
+    def _generation_index(
+        request_id: str,
+        gr_outputs: dict[str, GRSchedulerOutput],
+        beam_data: dict[str, dict[str, Any]],
+    ) -> int:
+        sidecar = gr_outputs.get(request_id)
+        if sidecar is not None:
+            return int(sidecar.step)
+        return int(beam_data[request_id]["generation_index"])
+
+    @staticmethod
+    def _validate_gr_completion_order(request: Request, generation_index: int) -> None:
+        completed_steps = int(
+            getattr(request, "gr_completed_steps", request.gr_step)
+        )
+        if generation_index != completed_steps:
+            raise RuntimeError(
+                "persistent GR output order mismatch: "
+                f"generation_index={generation_index}, completed={completed_steps}"
+            )
+
+    @staticmethod
+    def _complete_gr_stage(request: Request, generation_index: int) -> None:
+        """Reconcile one of at most two truthfully issued stages."""
+        request.gr_completed_steps = generation_index + 1
+        request.gr_step = request.gr_completed_steps
+        if int(request.gr_issued_steps) - int(request.gr_completed_steps) not in (0, 1):
+            raise RuntimeError(
+                "persistent GR issued/completed cursor invariant violated"
+            )

@@ -18,6 +18,7 @@ Covers the chain that removes the per-step frontend RPC round-trip:
 
 from __future__ import annotations
 
+from collections import deque
 import queue
 import threading
 from types import SimpleNamespace
@@ -631,6 +632,20 @@ def _step_engine(
     )
 
 
+def _persistent_gr_scheduler() -> Any:
+    from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
+
+    scheduler = object.__new__(GRAsyncScheduler)
+    scheduler.requests = {
+        "gr": SimpleNamespace(
+            is_gr_request=True,
+            gr_persistent_runner_state=True,
+        )
+    }
+    scheduler.has_requests = lambda: True
+    return scheduler
+
+
 class TestProcessEngineStepWrapper:
     def test_self_advance_runs_before_outputs_are_forwarded(self) -> None:
         outputs = _outputs_with_decision(_decision(parents=[1, 0], tokens=[61, 71]))
@@ -698,13 +713,9 @@ class TestProcessEngineStepWrapper:
         assert result is False
 
     def test_persistent_scheduler_skips_legacy_hook_but_keeps_idle_sleep(self) -> None:
-        from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
-
-        outputs = _outputs_with_decision(_decision(parents=[1, 0], tokens=[61, 71]))
+        outputs = None
         eng = _step_engine(outputs, model_executed=False, has_requests=True)
-        scheduler = object.__new__(GRAsyncScheduler)
-        scheduler.has_requests = lambda: True
-        eng.scheduler = scheduler
+        eng.scheduler = _persistent_gr_scheduler()
 
         with (
             patch.object(core_module, "_beam_self_advance") as advance,
@@ -715,7 +726,61 @@ class TestProcessEngineStepWrapper:
         assert result is False
         advance.assert_not_called()
         sleep.assert_called_once_with(0.001)
-        assert eng.output_queue.qsize() == 1
+        assert eng.output_queue.empty()
+
+    def test_persistent_scheduler_suppresses_sleep_only_on_actual_progress(self) -> None:
+        eng = _step_engine({}, model_executed=True, has_requests=True)
+        eng.scheduler = _persistent_gr_scheduler()
+
+        with patch("vllm_gr.v1.engine.engine_core_patch.time.sleep") as sleep:
+            result = make_patched_process_engine_step(lambda self: None)(eng)
+
+        assert result is True
+        sleep.assert_not_called()
+
+    def test_batch_queue_reconciliation_counts_as_progress_for_sleep(self) -> None:
+        eng = _step_engine({}, model_executed=False, has_requests=True)
+        eng.scheduler = _persistent_gr_scheduler()
+        gr_output = SimpleNamespace(gr_outputs={"gr": object()})
+        eng.batch_queue = deque([(object(), gr_output, object())])
+
+        with patch("vllm_gr.v1.engine.engine_core_patch.time.sleep") as sleep:
+            result = make_patched_process_engine_step(lambda self: None)(eng)
+
+        assert result is False
+        sleep.assert_not_called()
+
+    def test_ordinary_request_on_gr_scheduler_keeps_upstream_idle_sleep(self) -> None:
+        from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler
+
+        eng = _step_engine({}, model_executed=False, has_requests=True)
+        scheduler = object.__new__(GRAsyncScheduler)
+        scheduler.requests = {
+            "plain": SimpleNamespace(
+                is_gr_request=False,
+                gr_persistent_runner_state=False,
+            )
+        }
+        scheduler.has_requests = lambda: True
+        eng.scheduler = scheduler
+
+        with patch("vllm_gr.v1.engine.engine_core_patch.time.sleep") as sleep:
+            result = make_patched_process_engine_step(lambda self: None)(eng)
+
+        assert result is False
+        sleep.assert_called_once_with(0.001)
+
+    def test_oldest_ordinary_frame_wins_over_unrelated_active_gr(self) -> None:
+        eng = _step_engine({}, model_executed=False, has_requests=True)
+        eng.scheduler = _persistent_gr_scheduler()
+        ordinary_output = SimpleNamespace(gr_outputs={})
+        eng.batch_queue = deque([(object(), ordinary_output, object())])
+
+        with patch("vllm_gr.v1.engine.engine_core_patch.time.sleep") as sleep:
+            result = make_patched_process_engine_step(lambda self: None)(eng)
+
+        assert result is False
+        sleep.assert_called_once_with(0.001)
 
     def test_wrapper_is_idempotent(self) -> None:
         def original(self: Any) -> bool:

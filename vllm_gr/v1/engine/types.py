@@ -167,6 +167,8 @@ class GRSchedulerOutput(
     is_prefill: bool
     is_last_prefill: bool = False
     is_final: bool = False
+    logical_token_count: int = 1
+    physical_row_count: int = 1
     prefix_block_ids: list[list[int]] | None = None
     protocol_version: int = GR_PROTOCOL_VERSION
 
@@ -175,6 +177,14 @@ class GRSchedulerOutput(
         _require_non_empty_request_id(self.request_id)
         _validate_non_negative_step(self.step, "step")
         _validate_non_negative_step(self.device_step, "device_step")
+        if type(self.logical_token_count) is not int or self.logical_token_count < 1:
+            raise ValueError(
+                "persistent GR logical_token_count must be a positive integer"
+            )
+        if type(self.physical_row_count) is not int or self.physical_row_count < 1:
+            raise ValueError(
+                "persistent GR physical_row_count must be a positive integer"
+            )
 
 
 class GRSequenceOutput(
