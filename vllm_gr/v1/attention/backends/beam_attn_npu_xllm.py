@@ -22,6 +22,9 @@ import torch
 
 from vllm_gr.ops.npu import beam_ops
 from vllm_gr.v1.attention.backends import beam_attn_npu
+from vllm_gr.v1.attention.backends.beam_attn_metadata import (
+    BeamAttentionMetadata,
+)
 
 # Fail fast when the mode selects this module but the operator library is
 # missing: without this check the failure would surface at the first beam
@@ -40,6 +43,32 @@ is_available = beam_attn_npu.is_available
 get_flash_attn_version = beam_attn_npu.get_flash_attn_version
 supports_sinks = beam_attn_npu.supports_sinks
 reshape_and_cache = beam_attn_npu.reshape_and_cache
+
+
+def prefill_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: BeamAttentionMetadata,
+    sliding_window_size: list | tuple | None,
+    scale: float,
+    logits_soft_cap: float,
+    vllm_flash_attn_version: int,
+    s_aux: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+) -> None:
+    """Validation guard: the prefill path must never execute through xllm.
+
+    The xllm module is decode-only by design; BeamAttentionImpl routes the
+    prefill branch to ``beam_attn_npu`` directly on NPU. Reaching this
+    function means a routing regression, so fail loudly.
+    """
+    raise RuntimeError(
+        "prefill attention reached the xllm execution module — prefill must "
+        "route to the cascade module (beam_attn_npu), not the decode-only "
+        "xllm path"
+    )
 
 
 def cache_unshared_kv(
@@ -252,6 +281,7 @@ __all__ = [
     "cascade_attention",
     "get_flash_attn_version",
     "is_available",
+    "prefill_attention",
     "reshape_and_cache",
     "supports_sinks",
 ]

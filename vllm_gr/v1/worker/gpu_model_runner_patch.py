@@ -24,6 +24,7 @@ from vllm_gr.v1.worker.constraint_hook import (
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
+    _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
@@ -44,6 +45,12 @@ from vllm_gr.v1.worker.model_runner_common import (
 from vllm_gr.v1.worker.model_runner_common import (
     _materialize_logits_indices,
     _reduce_sampler_output_for_worker_decision,
+)
+from vllm_gr.v1.worker.prefill_graph_runner import (
+    SUPPORTED_NUM_REQS,
+    get_prefill_graph_runner,
+    is_prefill_graph_enabled,
+    is_prefill_phase_batch,
 )
 
 logger = init_logger(__name__)
@@ -190,6 +197,10 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        # Publish the scheduler output so the _model_forward prefill-graph
+        # interception can classify the batch and extract token counts.
+        self._current_scheduler_output = scheduler_output
+
         logits_indices, spec_decode_metadata = _orig_prepare_inputs(
             self, scheduler_output, num_scheduled_tokens
         )
@@ -902,3 +913,100 @@ make_patched_sample_tokens = make_patched_sample_tokens_gpu
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_gpu
 )
+
+
+def make_patched_model_forward_gpu(_orig_model_forward):
+    """Wrap _model_forward to intercept and replay pure prefill CUDA graphs."""
+    if getattr(_orig_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, False):
+        return _orig_model_forward
+
+    @wraps(_orig_model_forward)
+    def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
+        scheduler_output = getattr(self, "_current_scheduler_output", None)
+        if scheduler_output is not None:
+            if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
+                p_runner = get_prefill_graph_runner(self)
+
+                raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
+                token_counts = (
+                    list(raw_scheduled_tokens.values())
+                    if isinstance(raw_scheduled_tokens, dict)
+                    else list(raw_scheduled_tokens)
+                )
+                total_tokens = sum(token_counts) if token_counts else 0
+                num_reqs = len(token_counts)
+
+                if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
+                    bucket = p_runner.match_bucket(total_tokens)
+                    if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
+                        # Extract slot mapping from active block table
+                        slot_mapping = None
+                        if (
+                            hasattr(self, "input_batch")
+                            and getattr(self.input_batch, "block_table", None) is not None
+                        ):
+                            try:
+                                blk_table = self.input_batch.block_table[0]
+                                if hasattr(blk_table, "slot_mapping") and hasattr(
+                                    blk_table.slot_mapping, "gpu"
+                                ):
+                                    slot_mapping = blk_table.slot_mapping.gpu
+                            except Exception as e:
+                                logger.warning("Could not get slot_mapping: %r", e)
+                        if slot_mapping is None:
+                            logger.debug("Could not get slot_mapping: extraction unavailable.")
+
+                        output_buf = p_runner.execute_model_prefill(
+                            bucket=bucket,
+                            input_ids=input_ids,
+                            positions=positions,
+                            slot_mapping=slot_mapping,
+                            num_scheduled_tokens=raw_scheduled_tokens,
+                        )
+
+                        if output_buf is not None:
+                            logger.debug(
+                                "Prefill Graph Replay: Executed captured CUDA Graph for bucket %d (reqs=%d, %d actual tokens).",
+                                bucket,
+                                num_reqs,
+                                total_tokens,
+                            )
+                            return output_buf
+
+        return _orig_model_forward(self, input_ids=input_ids, positions=positions, *args, **kwargs)
+
+    setattr(patched_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, True)
+    return patched_model_forward
+
+
+def capture_prefill_graphs(runner) -> None:
+    """Startup capture of the pure-prefill CUDA graphs (one per bucket).
+
+    Chained after the beam decode-graph capture in ``capture_model``; runs
+    only when the prefill graph env gate is enabled. Every failure falls back
+    to eager prefill (the interception simply never matches a bucket).
+    """
+    if not is_prefill_graph_enabled():
+        return
+    if getattr(runner, "_prefill_graphs_captured", False):
+        return
+    try:
+        # CUDA graph capture requires a non-default stream; capture_model()
+        # already returned, so its capture stream context is gone. Mirror the
+        # beam decode-graph capture: a side stream, ordered against the
+        # default stream before and after.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.accelerator.current_stream())
+        with torch.cuda.stream(side):
+            p_runner = get_prefill_graph_runner(runner)
+            p_runner.capture_graphs(runner)
+        torch.accelerator.current_stream().wait_stream(side)
+        torch.accelerator.synchronize()
+        runner._prefill_graphs_captured = True
+    except Exception:
+        logger.exception(
+            "vllm-gr: prefill CUDA graph capture failed; prefill will fall back to eager"
+        )
+
+
+make_patched_model_forward = make_patched_model_forward_gpu

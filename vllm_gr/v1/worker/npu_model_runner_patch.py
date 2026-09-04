@@ -16,6 +16,7 @@ from vllm_gr.v1.worker.constraint_hook import (
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
+    _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
@@ -26,6 +27,12 @@ from vllm_gr.v1.worker.model_runner_common import (
     _beam_remap_inputs,
     _create_beam_context,
     _materialize_logits_indices,
+)
+from vllm_gr.v1.worker.prefill_graph_runner import (
+    SUPPORTED_NUM_REQS,
+    get_prefill_graph_runner,
+    is_prefill_graph_enabled,
+    is_prefill_phase_batch,
 )
 
 logger = init_logger(__name__)
@@ -38,6 +45,10 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
 
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        # Publish the scheduler output so the _model_forward prefill-graph
+        # interception can classify the batch and extract token counts.
+        self._current_scheduler_output = scheduler_output
+
         # NPU sampling can leave a proxy behind when bookkeeping is skipped.
         if isinstance(self.input_batch, InputBatchProxy):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
@@ -743,3 +754,115 @@ make_patched_sample_tokens = make_patched_sample_tokens_npu
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_npu
 )
+
+
+def make_patched_model_forward_npu(_orig_model_forward):
+    """Wrap _model_forward to intercept and replay pure prefill NPU graphs."""
+    if getattr(_orig_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, False):
+        return _orig_model_forward
+
+    @wraps(_orig_model_forward)
+    def patched_model_forward(
+        self,
+        num_tokens_padded,
+        input_ids=None,
+        positions=None,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        **model_kwargs,
+    ):
+        scheduler_output = getattr(self, "_current_scheduler_output", None)
+        if scheduler_output is not None:
+            if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
+                p_runner = get_prefill_graph_runner(self)
+
+                raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
+                token_counts = (
+                    list(raw_scheduled_tokens.values())
+                    if isinstance(raw_scheduled_tokens, dict)
+                    else list(raw_scheduled_tokens)
+                )
+                total_tokens = sum(token_counts) if token_counts else 0
+                num_reqs = len(token_counts)
+
+                if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
+                    bucket = p_runner.match_bucket(total_tokens)
+                    if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
+                        # Extract the current batch's slot mapping from the
+                        # attention metadata built by _prepare_inputs. The
+                        # metadata is published in the forward context by
+                        # execute_model; NPUModelRunner does not store it as
+                        # a runner attribute.
+                        slot_mapping = None
+                        try:
+                            from vllm.forward_context import get_forward_context
+
+                            attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
+                            if isinstance(attn_metadata, dict) and attn_metadata:
+                                slot_mapping = next(iter(attn_metadata.values())).slot_mapping
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug("Could not get slot_mapping: %r", e)
+
+                        output_buf = p_runner.execute_model_prefill(
+                            bucket=bucket,
+                            input_ids=input_ids,
+                            positions=positions,
+                            slot_mapping=slot_mapping,
+                            num_scheduled_tokens=token_counts,
+                        )
+
+                        if output_buf is not None:
+                            p_runner.log_replay(bucket, num_reqs, total_tokens)
+                            logger.debug(
+                                "Prefill NPU Graph Replay: Executed captured graph "
+                                "for bucket %d (reqs=%d, %d actual tokens).",
+                                bucket,
+                                num_reqs,
+                                total_tokens,
+                            )
+                            return output_buf
+
+        return _orig_model_forward(
+            self,
+            num_tokens_padded,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            **model_kwargs,
+        )
+
+    setattr(patched_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, True)
+    return patched_model_forward
+
+
+def capture_prefill_graphs(runner) -> None:
+    """Startup capture of the pure-prefill NPU graphs (one per bucket).
+
+    Chained after the beam decode-graph capture in ``capture_model``; runs
+    only when the prefill graph env gate is enabled. Every failure falls back
+    to eager prefill (the interception simply never matches a bucket).
+    """
+    if not is_prefill_graph_enabled():
+        return
+    if getattr(runner, "_prefill_graphs_captured", False):
+        return
+    try:
+        # Mirror the beam decode-graph capture: run the prefill capture on a
+        # dedicated side stream ordered against the default stream (the
+        # native capture_stream context is gone once capture_model returns).
+        side = torch.npu.Stream(device=runner.device)
+        side.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(side):
+            p_runner = get_prefill_graph_runner(runner)
+            p_runner.capture_graphs(runner)
+        torch.npu.current_stream().wait_stream(side)
+        torch.npu.synchronize()
+        runner._prefill_graphs_captured = True
+    except Exception:
+        logger.exception(
+            "vllm-gr: prefill NPU graph capture failed; prefill will fall back to eager"
+        )
+
+
+make_patched_model_forward = make_patched_model_forward_npu

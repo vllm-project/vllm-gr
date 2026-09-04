@@ -230,6 +230,12 @@ def apply_worker_patches() -> None:
         runner_class._bookkeeping_sync = platform_module.make_patched_bookkeeping_sync(
             runner_class._bookkeeping_sync
         )
+        # Pure-prefill graph interception: replays captured prefill graphs for
+        # prompt batches inside _model_forward (installed on both platforms;
+        # the runner classes expose _model_forward on vllm 0.22.1).
+        model_forward_patch = getattr(platform_module, "make_patched_model_forward", None)
+        if model_forward_patch is not None and hasattr(runner_class, "_model_forward"):
+            runner_class._model_forward = model_forward_patch(runner_class._model_forward)
         # Constraint Tables raw-logits hook: only where the runner exposes
         # ``_sample`` (a vllm-ascend build may not).  A Constraint Table worker
         # without the hook fails at injection (worker_inject), never here.
@@ -248,29 +254,39 @@ def apply_worker_patches() -> None:
         # of the beam-decode FULL graph (only when GRConfig enables it —
         # beam_max_width configured and not disabled; no-op otherwise).
         beam_capture = getattr(platform_module, "capture_beam_decode_graph", None)
+        prefill_capture = getattr(platform_module, "capture_prefill_graphs", None)
         if (
-            beam_capture is not None
+            (beam_capture is not None or prefill_capture is not None)
             and hasattr(runner_class, "capture_model")
             and not getattr(runner_class.capture_model, _WORKER_CAPTURE_PATCH_MARKER, False)
         ):
             _orig_capture_model = runner_class.capture_model
 
-            def make_patched_capture_model(_orig, _beam_capture):
+            def make_patched_capture_model(_orig, _beam_capture, _prefill_capture):
                 @wraps(_orig)
                 def patched_capture_model(self, *args, **kwargs):
                     res = _orig(self, *args, **kwargs)
-                    try:
-                        _beam_capture(self)
-                    except Exception:
-                        logger.exception(
-                            "vllm-gr: beam decode graph dummy capture failed; "
-                            "beam decode will fall back to eager"
-                        )
+                    if _beam_capture is not None:
+                        try:
+                            _beam_capture(self)
+                        except Exception:
+                            logger.exception(
+                                "vllm-gr: beam decode graph dummy capture failed; "
+                                "beam decode will fall back to eager"
+                            )
+                    if _prefill_capture is not None:
+                        try:
+                            _prefill_capture(self)
+                        except Exception:
+                            logger.exception(
+                                "vllm-gr: prefill graph capture failed; "
+                                "prefill will fall back to eager"
+                            )
                     return res
 
                 return patched_capture_model
 
-            patched = make_patched_capture_model(_orig_capture_model, beam_capture)
+            patched = make_patched_capture_model(_orig_capture_model, beam_capture, prefill_capture)
             setattr(patched, _WORKER_CAPTURE_PATCH_MARKER, True)
             runner_class.capture_model = patched
 
