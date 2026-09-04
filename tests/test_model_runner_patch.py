@@ -49,6 +49,17 @@ def test_dispatcher_selects_one_platform_module(
     assert imported == [model_runner_patch._NPU_PATCH_MODULE]
 
 
+def test_missing_optional_diagnostic_installer_does_not_block_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_get_active_platform_module",
+        lambda: SimpleNamespace(),
+    )
+    assert model_runner_patch.install_active_worker_diagnostic_hook(type("Worker", (), {})) == 0
+
+
 def test_dispatcher_installs_three_wrappers_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

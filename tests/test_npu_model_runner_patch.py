@@ -12,6 +12,42 @@ from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
 from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
 
 
+def test_npu_named_profile_diagnostic_returns_runner_and_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRunner:
+        device = SimpleNamespace(type="npu")
+        _vllm_gr_config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
+        _beam_graph_keys = {128}
+        _beam_graph_full_dispatch_count = 5
+
+    fake_npu = SimpleNamespace(
+        get_device_properties=lambda device: SimpleNamespace(name="Ascend"),
+        memory_allocated=lambda device: 21,
+        memory_reserved=lambda device: 22,
+        max_memory_allocated=lambda device: 23,
+        max_memory_reserved=lambda device: 24,
+    )
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+
+    result = npu_patch.get_gr_profile_runtime_stats(SimpleNamespace(model_runner=FakeRunner()))
+    assert result["backend"] == "npu"
+    assert result["runner_class"].endswith(".FakeRunner")
+    assert result["device_name"] == "Ascend"
+    assert result["memory"]["allocated_bytes"] == 21
+    assert result["beam_graph"]["captured_widths"] == [128]
+    assert result["beam_graph"]["full_dispatches"] == 5
+
+
+def test_npu_profile_diagnostic_hook_is_named_and_idempotent() -> None:
+    class FakeWorker:
+        pass
+
+    assert npu_patch.install_worker_diagnostic_hook(FakeWorker) == 1
+    assert npu_patch.install_worker_diagnostic_hook(FakeWorker) == 0
+    assert FakeWorker.get_gr_profile_runtime_stats is npu_patch.get_gr_profile_runtime_stats
+
+
 def test_npu_prepare_unproxies_and_preserves_four_item_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -150,6 +186,40 @@ def test_npu_sample_patch_is_signature_agnostic(
     runner = SimpleNamespace()
     assert wrapped(runner, "logits", "extra") is sample_output
     assert events == ["sample", "override"]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_marker"),
+    [
+        ({"is_constraint_prefill": True}, "gr_npu_prefill_stage"),
+        ({"is_beam_decode": True}, "gr_npu_decode_stage"),
+    ],
+)
+def test_npu_sample_patch_records_backend_stage_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: dict[str, bool],
+    expected_marker: str,
+) -> None:
+    markers: list[str] = []
+
+    class MarkerContext:
+        def __init__(self, marker: str) -> None:
+            markers.append(marker)
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(torch.autograd.profiler, "record_function", MarkerContext)
+    monkeypatch.setattr(npu_patch, "try_sample_with_constraint_backend", lambda *args: object())
+    monkeypatch.setattr(npu_patch, "_maybe_run_worker_beam_decision", lambda *args: None)
+    runner = SimpleNamespace(_current_beam_info={"beam_data": {"request": metadata}})
+
+    npu_patch.make_patched_sample_npu(lambda *_args: object())(runner, "logits")
+
+    assert markers == [expected_marker]
 
 
 def test_npu_sample_patch_parses_keyword_logits_and_spec_metadata(
@@ -636,6 +706,9 @@ def test_npu_determine_pure_beam_batch_grants_full() -> None:
         assert result[0] == CUDAGraphMode.FULL
         assert result[1].num_tokens == 4
         assert result[1].uniform is True
+        assert runner._beam_graph_full_dispatch_count == 1
+        wrapped(runner, num_tokens=4)
+        assert runner._beam_graph_full_dispatch_count == 2
     finally:
         npu_patch._npu_xllm_decode_mode_active = orig_xllm
         npu_patch._beam_graph_enabled_for_run = orig_enabled

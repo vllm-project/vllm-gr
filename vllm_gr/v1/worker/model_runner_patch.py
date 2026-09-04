@@ -167,6 +167,18 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
     return _get_active_platform_module().discover_worker_runners()
 
 
+def install_active_worker_diagnostic_hook(worker_cls: type) -> int:
+    """Install only the diagnostic supplied by the active backend adapter."""
+    installer = getattr(_get_active_platform_module(), "install_worker_diagnostic_hook", None)
+    if not callable(installer):
+        # Profiling diagnostics are observational, never a runtime dependency.
+        # The profiling harness calls the named RPC and fails its evidence gate
+        # if a backend does not provide it; ordinary patch initialization and
+        # third-party/fake adapters must retain their pre-diagnostic behavior.
+        return 0
+    return int(installer(worker_cls))
+
+
 def _install_active_worker_resource_hook() -> None:
     """Mount named vllm-gr utility RPCs on the active CUDA Worker class."""
 
@@ -179,6 +191,7 @@ def _install_active_worker_resource_hook() -> None:
     from vllm_gr.constraints.worker_inject import install_worker_resource_hook
 
     install_worker_resource_hook(Worker)
+    install_active_worker_diagnostic_hook(Worker)
     if not getattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
         # A named method is required here: vLLM's safe msgpack utility channel
         # intentionally rejects callable serialization unless insecure pickle

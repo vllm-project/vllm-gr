@@ -660,6 +660,39 @@ def test_worker_graph_stats_hook_is_named_and_idempotent(
 
     assert first is common.get_beam_graph_runtime_stats
     assert getattr(FakeWorker, "get_gr_beam_graph_runtime_stats") is first
+    assert getattr(FakeWorker, "get_gr_profile_runtime_stats") is (
+        gpu_patch.get_gr_profile_runtime_stats
+    )
+
+
+def test_gpu_named_profile_diagnostic_returns_runner_and_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRunner:
+        device = torch.device("cuda:0")
+        _vllm_gr_config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
+        _beam_graph_keys = {128}
+        _beam_graph_full_dispatch_count = 7
+
+    fake_properties = SimpleNamespace(name="L20")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: fake_properties)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 11)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 12)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 13)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 14)
+
+    result = gpu_patch.get_gr_profile_runtime_stats(SimpleNamespace(model_runner=FakeRunner()))
+    assert result["backend"] == "gpu"
+    assert result["runner_class"].endswith(".FakeRunner")
+    assert result["device_name"] == "L20"
+    assert result["memory"] == {
+        "allocated_bytes": 11,
+        "reserved_bytes": 12,
+        "peak_allocated_bytes": 13,
+        "peak_reserved_bytes": 14,
+    }
+    assert result["beam_graph"]["captured_widths"] == [128]
+    assert result["beam_graph"]["full_dispatches"] == 7
 
 
 def test_patched_determine_active_lora_downgrades_full() -> None:

@@ -44,12 +44,51 @@ from vllm_gr.v1.worker.model_runner_common import (
 from vllm_gr.v1.worker.model_runner_common import (
     _materialize_logits_indices,
     _reduce_sampler_output_for_worker_decision,
+    get_beam_graph_runtime_stats,
 )
 
 logger = init_logger(__name__)
 
 _BEAM_POSTPROCESS_LOAD_PATCH_MARKER = "_vllm_gr_beam_postprocess_load_patched"
 _PREFILL_COMPUTE_LOGITS_PATCH_MARKER = "_vllm_gr_prefill_compute_logits_patched"
+_PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
+
+
+def get_gr_profile_runtime_stats(worker) -> dict:
+    """Named, read-only CUDA Worker RPC for attributable profiling."""
+    runner = getattr(worker, "model_runner", None)
+    if runner is None:
+        raise RuntimeError("GPU worker has no model_runner for profiling diagnostics")
+    device = getattr(runner, "device", None)
+    device_type = getattr(device, "type", str(device).split(":", 1)[0])
+    if device is None or device_type != "cuda":
+        raise RuntimeError(f"GPU profiling diagnostic requires a CUDA runner, got {device!r}")
+    properties = torch.cuda.get_device_properties(device)
+    runner_class = type(runner)
+    return {
+        "backend": "gpu",
+        "worker_class": f"{type(worker).__module__}.{type(worker).__qualname__}",
+        "runner_class": f"{runner_class.__module__}.{runner_class.__qualname__}",
+        "device": str(device),
+        "device_name": str(getattr(properties, "name", properties)),
+        "device_properties": repr(properties),
+        "memory": {
+            "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+            "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+            "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+        },
+        "beam_graph": get_beam_graph_runtime_stats(worker),
+    }
+
+
+def install_worker_diagnostic_hook(worker_cls: type) -> int:
+    """Install the CUDA diagnostic as a safe named utility RPC."""
+    if getattr(worker_cls, _PROFILE_DIAGNOSTIC_HOOK_MARKER, False):
+        return 0
+    worker_cls.get_gr_profile_runtime_stats = get_gr_profile_runtime_stats  # type: ignore[attr-defined]
+    setattr(worker_cls, _PROFILE_DIAGNOSTIC_HOOK_MARKER, True)
+    return 1
 
 
 def _install_cuda_prefill_compute_logits_hook(runner) -> bool:

@@ -26,9 +26,61 @@ from vllm_gr.v1.worker.model_runner_common import (
     _beam_remap_inputs,
     _create_beam_context,
     _materialize_logits_indices,
+    get_beam_graph_runtime_stats,
 )
 
 logger = init_logger(__name__)
+
+_PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
+
+
+def _npu_beam_stage_trace_marker(runner) -> str | None:
+    """Return a stable NPU trace boundary for the active GR stage."""
+    beam_info = getattr(runner, "_current_beam_info", None)
+    beam_data = (beam_info.get("beam_data") or {}) if beam_info else {}
+    if any(metadata.get("is_constraint_prefill", False) for metadata in beam_data.values()):
+        return "gr_npu_prefill_stage"
+    if any(metadata.get("is_beam_decode", False) for metadata in beam_data.values()):
+        return "gr_npu_decode_stage"
+    return None
+
+
+def get_gr_profile_runtime_stats(worker) -> dict:
+    """Named, read-only NPU Worker RPC for attributable profiling."""
+    runner = getattr(worker, "model_runner", None)
+    if runner is None:
+        raise RuntimeError("NPU worker has no model_runner for profiling diagnostics")
+    device = getattr(runner, "device", None)
+    npu = getattr(torch, "npu", None)
+    device_type = getattr(device, "type", str(device).split(":", 1)[0])
+    if device is None or device_type != "npu" or npu is None:
+        raise RuntimeError(f"NPU profiling diagnostic requires an NPU runner, got {device!r}")
+    properties = npu.get_device_properties(device)
+    runner_class = type(runner)
+    return {
+        "backend": "npu",
+        "worker_class": f"{type(worker).__module__}.{type(worker).__qualname__}",
+        "runner_class": f"{runner_class.__module__}.{runner_class.__qualname__}",
+        "device": str(device),
+        "device_name": str(getattr(properties, "name", properties)),
+        "device_properties": repr(properties),
+        "memory": {
+            "allocated_bytes": int(npu.memory_allocated(device)),
+            "reserved_bytes": int(npu.memory_reserved(device)),
+            "peak_allocated_bytes": int(npu.max_memory_allocated(device)),
+            "peak_reserved_bytes": int(npu.max_memory_reserved(device)),
+        },
+        "beam_graph": get_beam_graph_runtime_stats(worker),
+    }
+
+
+def install_worker_diagnostic_hook(worker_cls: type) -> int:
+    """Install the NPU diagnostic as a safe named utility RPC."""
+    if getattr(worker_cls, _PROFILE_DIAGNOSTIC_HOOK_MARKER, False):
+        return 0
+    worker_cls.get_gr_profile_runtime_stats = get_gr_profile_runtime_stats  # type: ignore[attr-defined]
+    setattr(worker_cls, _PROFILE_DIAGNOSTIC_HOOK_MARKER, True)
+    return 1
 
 
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
@@ -117,7 +169,12 @@ def make_patched_sample_npu(_orig_sample):
         if sampler_output is None:
             sampler_output = _orig_sample(self, *args, **kwargs)
             apply_constrained_sample_override(self, logits, sampler_output)
-        _maybe_run_worker_beam_decision(self, sampler_output)
+        trace_marker = _npu_beam_stage_trace_marker(self)
+        if trace_marker is None:
+            _maybe_run_worker_beam_decision(self, sampler_output)
+        else:
+            with torch.autograd.profiler.record_function(trace_marker):
+                _maybe_run_worker_beam_decision(self, sampler_output)
         return sampler_output
 
     setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
@@ -389,6 +446,11 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
             result[0],
             result[1],
             new_descriptor,
+        )
+        # Host-only diagnostic counter. Startup capture bypasses this runtime
+        # dispatch branch, so profiling deltas count real request replays.
+        self._beam_graph_full_dispatch_count = (
+            int(getattr(self, "_beam_graph_full_dispatch_count", 0)) + 1
         )
         return (CUDAGraphMode.FULL, new_descriptor) + result[2:]
 

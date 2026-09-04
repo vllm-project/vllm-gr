@@ -147,8 +147,12 @@ def patch_npu_worker_init_device() -> int:
             install_worker_resource_hook,
             load_constraint_tables_on_worker,
         )
+        from vllm_gr.v1.worker.model_runner_patch import (
+            install_active_worker_diagnostic_hook,
+        )
 
         install_worker_resource_hook(type(self))
+        install_active_worker_diagnostic_hook(type(self))
         result = original_init_device(self)
         # Preload constraint tables onto the device at weight-load time so the
         # runtime never does a lazy build/H2D on the first constrained step.
