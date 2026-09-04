@@ -1612,7 +1612,7 @@ def run_beam_decision(
 
 
 def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
-    """Advance the runner-owned state without publishing intermediate Beam data."""
+    """Advance persistent state exclusively through its selected backend."""
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
     gr_config = _get_gr_config(runner)
@@ -1625,9 +1625,13 @@ def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
         for req_id, mdata in beam_data.items()
         if mdata.get("persistent_runner_state")
     ]
+    if not persistent:
+        return False
     if len(persistent) != 1:
-        runner._beam_decision_result = None
-        return True
+        raise RuntimeError(
+            "persistent GR ModelRunner V1 supports exactly one active request, "
+            f"got {len(persistent)}"
+        )
     req_id, mdata = persistent[0]
     states = getattr(runner, "_gr_model_runner_states", None)
     if states is None:
@@ -1637,25 +1641,17 @@ def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
         if not mdata.get("is_last_prefill", False):
             runner._beam_decision_result = None
             return True
-        prefill_decision = _run_cuda_prefill_decision(runner, sampler_output)
-        if prefill_decision is None:
-            raise RuntimeError("persistent GR prefill has no device Beam decision")
         if gr_state is None:
             gr_state = _create_persistent_gr_state(runner, req_id, mdata)
-        gr_state.bootstrap(
-            prefill_decision["out_token_ids"],
-            prefill_decision["out_log_probs"],
-        )
+        gr_state.bootstrap_from_prefill(runner, sampler_output, mdata)
         is_last_step = gr_state.step >= gr_state.max_tokens
-        gr_state.set_control_token(is_last_step)
-        runner._beam_decision_tensors = prefill_decision
         sampler_output._gr_model_runner_state = gr_state
         if is_last_step:
             from vllm_gr.v1.worker.gr_model_runner_state import (
                 release_gr_model_runner_states,
             )
 
-            payload = gr_state.make_final_output()
+            payload = gr_state.finalize_output(runner)
             payload["gr_state_created"] = 1
             payload["gr_state_freed"] = release_gr_model_runner_states(runner, [req_id])
             runner._beam_decision_result = payload
@@ -1663,46 +1659,20 @@ def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
             runner._beam_decision_result = None
         return True
 
-    session = beam_info.get("beam_session") if beam_info else None
-    if gr_state is None or session is None:
+    if gr_state is None:
         raise RuntimeError(f"persistent GR state is missing for request {req_id!r}")
-    # AsyncScheduler may reconcile placeholder control tokens independently
-    # of the host-side Beam session counter. The device state is the canonical
-    # GR lifecycle counter, so terminal selection must be derived from it.
-    # Set the existing BeamSearchSession flag before the decision because it
-    # also controls whether same-step KV reorder is needed.
-    is_last_step = gr_state.step + 1 >= gr_state.max_tokens
-    session._state.is_last_step = is_last_step
-    decision = run_beam_decision(
-        runner,
-        session,
-        sampler_output,
-        is_last_step=is_last_step,
-        result_width=mdata.get("result_width"),
-    )
-    if decision is None:
-        raise RuntimeError("persistent GR decode has no device Beam decision")
-    gr_state.advance(
-        decision["out_token_ids"],
-        decision["out_log_probs"],
-        decision["out_token_index"],
-    )
-    gr_state.set_control_token(is_last_step)
-    runner._beam_decision_tensors = decision
+    is_last_step = gr_state.advance_beam(runner, sampler_output, mdata)
     sampler_output._gr_model_runner_state = gr_state
     if is_last_step:
         from vllm_gr.v1.worker.gr_model_runner_state import (
             release_gr_model_runner_states,
         )
 
-        payload = gr_state.make_final_output()
+        payload = gr_state.finalize_output(runner)
         payload["gr_state_created"] = 1
         payload["gr_state_freed"] = release_gr_model_runner_states(runner, [req_id])
         runner._beam_decision_result = payload
     else:
-        # Same-step KV reorder already advanced the session. This marker is
-        # consumed on the next dispatch and prevents a second advance.
-        session._state.kv_reorder = []
         runner._beam_decision_result = None
     return True
 
@@ -1719,6 +1689,7 @@ def _create_persistent_gr_state(runner: Any, req_id: str, mdata: dict[str, Any])
     from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
     from vllm_gr.v1.worker.gr_model_runner_state import (
         acquire_gr_model_runner_state,
+        require_gr_device_backend,
     )
     from vllm_gr.v1.worker.model_runner_common import (
         _create_beam_context,
@@ -1726,6 +1697,7 @@ def _create_persistent_gr_state(runner: Any, req_id: str, mdata: dict[str, Any])
     )
 
     gr_config = _get_gr_config(runner)
+    backend = require_gr_device_backend(runner)
     if not hasattr(runner, "_beam_context"):
         runner._beam_context = _create_beam_context(runner, gr_config, max_batch=1)
     context = runner._beam_context
@@ -1733,30 +1705,24 @@ def _create_persistent_gr_state(runner: Any, req_id: str, mdata: dict[str, Any])
     prefix_len = int(mdata["prefix_len"])
     runner._beam_sessions = getattr(runner, "_beam_sessions", {})
     slot = context.registry.allocate(req_id, width, prefix_len)
-    session = BeamSearchSession(session_id=req_id, slot=slot, context=context)
-    session.begin_session(width, prefix_len)
-    session._gr_prefill_prearmed = True
+    try:
+        session = BeamSearchSession(session_id=req_id, slot=slot, context=context)
+        session.begin_session(width, prefix_len)
+        session._gr_prefill_prearmed = True
+        gr_state = acquire_gr_model_runner_state(
+            runner,
+            request_id=req_id,
+            session=session,
+            backend=backend,
+            beam_width=width,
+            max_tokens=int(mdata["max_decode_steps"]),
+            continue_token_id=int(mdata["continue_token_id"]),
+            finish_token_id=int(mdata["finish_token_id"]),
+        )
+    except BaseException:
+        context.registry.release(req_id)
+        raise
     runner._beam_sessions[req_id] = session
-    input_batch = getattr(runner.input_batch, "_obj", runner.input_batch)
-    req_idx = input_batch.req_id_to_index[req_id]
-    native_block_table = input_batch.block_table[0]
-    num_prefix_blocks = (
-        prefix_len + native_block_table.block_size - 1
-    ) // native_block_table.block_size
-    prefix_block_table = native_block_table.get_device_tensor(input_batch.num_reqs)[
-        req_idx, :num_prefix_blocks
-    ].clone()
-    gr_state = acquire_gr_model_runner_state(
-        runner,
-        request_id=req_id,
-        session=session,
-        beam_width=width,
-        max_tokens=int(mdata["max_decode_steps"]),
-        continue_token_id=int(mdata["continue_token_id"]),
-        finish_token_id=int(mdata["finish_token_id"]),
-        device=runner.device,
-        prefix_block_table=prefix_block_table,
-    )
 
     active_state_bytes = gr_state.device_memory_bytes + sum(
         state.device_memory_bytes for state in states.values()

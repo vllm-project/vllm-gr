@@ -91,6 +91,42 @@ def test_npu_prepare_unproxies_and_preserves_four_item_contract(
     assert returned_compressed is compressed
 
 
+def test_npu_persistent_backend_prepares_before_native_attention_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    scheduler_output = SimpleNamespace(
+        beam_data={
+            "gr-0": {
+                "persistent_runner_state": True,
+                "is_beam_decode": True,
+                "generation_index": 1,
+            }
+        }
+    )
+
+    class State:
+        def prepare_decode_inputs(self, runner, output, counts, metadata) -> None:
+            assert output is scheduler_output
+            events.append("backend-prepare")
+
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["gr-0"]),
+        _current_beam_info={"req_ids": []},
+        _gr_model_runner_states={"gr-0": State()},
+        device=torch.device("cpu"),
+    )
+
+    def original(self, output, counts):
+        events.append("native-prepare")
+        return object(), object(), 1, object()
+
+    monkeypatch.setattr(npu_patch, "_beam_remap_inputs", lambda *args: [0])
+    wrapped = npu_patch.make_patched_prepare_inputs(original)
+    wrapped(runner, scheduler_output, [1])
+    assert events == ["backend-prepare", "native-prepare"]
+
+
 def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

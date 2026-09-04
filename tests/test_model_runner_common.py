@@ -689,7 +689,7 @@ def test_worker_decision_reduces_sampler_payload_before_host_copy() -> None:
     assert sampler_output.logprobs_tensors.logprobs.shape == (1, width)
 
 
-def test_persistent_control_transport_owns_async_snapshot() -> None:
+def test_persistent_control_transport_uses_backend_ping_pong_slot() -> None:
     from vllm.v1.outputs import SamplerOutput
 
     control = torch.tensor([[7]], dtype=torch.int32)
@@ -703,7 +703,7 @@ def test_persistent_control_transport_owns_async_snapshot() -> None:
 
     assert common._reduce_sampler_output_for_worker_decision(runner, sampler_output)
     assert sampler_output.sampled_token_ids.tolist() == [[7]]
-    assert sampler_output.sampled_token_ids is not control
+    assert sampler_output.sampled_token_ids is control
     assert sampler_output._gr_persistent_state_transport is True
 
 
@@ -887,6 +887,62 @@ def test_beam_session_rejects_concurrent_incremental_requests() -> None:
             beam_data,
             SimpleNamespace(beam_finished_session_ids=[]),
         )
+
+
+def test_stale_persistent_session_releases_state_owner_before_slot_reuse() -> None:
+    runner = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(beam_max_width=4, beam_max_decode_steps=3),
+        model_config=SimpleNamespace(
+            dtype=torch.float16,
+            get_num_kv_heads=lambda config: 2,
+            get_head_size=lambda: 8,
+            get_num_layers=lambda config: 1,
+        ),
+        parallel_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    def metadata(req_id: str) -> dict[str, dict[str, Any]]:
+        return {
+            req_id: {
+                "is_beam_decode": True,
+                "decode_step": 0,
+                "beam_decode_steps": 1,
+                "beam_width": 2,
+                "prefix_len": 4,
+                "max_decode_steps": 3,
+            }
+        }
+
+    old_session = common._get_or_create_beam_session(
+        runner,
+        metadata("old"),
+        SimpleNamespace(beam_finished_session_ids=[]),
+    )
+    assert old_session is not None
+
+    class PersistentState:
+        released = False
+
+        def release(self) -> bool:
+            self.released = True
+            old_session.end_session()
+            return True
+
+    old_state = PersistentState()
+    runner._gr_model_runner_states = {"old": old_state}
+
+    new_session = common._get_or_create_beam_session(
+        runner,
+        metadata("new"),
+        SimpleNamespace(beam_finished_session_ids=[]),
+    )
+
+    assert new_session is not None
+    assert new_session.session_id == "new"
+    assert old_state.released is True
+    assert runner._gr_model_runner_states == {}
+    assert runner._gr_state_freed_count == 1
 
 
 # ---------------------------------------------------------------------------

@@ -693,11 +693,16 @@ def _prepare_workspace_constraint_metadata(
                     f"persistent GR state for {req_id!r} has only "
                     f"{gr_state.step} token(s), needs {step}"
                 )
+            session = gr_state.session
+            decision = session.context.decision
+            authoritative_sequence = decision.sequence[
+                session.slot,
+                :width,
+                gr_state.step - step : gr_state.step,
+            ]
             target = device_prefix[row_start : row_start + width]
             target.zero_()
-            target[:, :step].copy_(
-                gr_state.sequences[:, gr_state.step - step : gr_state.step]
-            )
+            target[:, :step].copy_(authoritative_sequence)
             device_state_rows += row_count
             continue
         suffix = mdata.get("beam_suffix")

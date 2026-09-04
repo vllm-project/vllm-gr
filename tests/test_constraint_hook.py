@@ -18,6 +18,7 @@ from vllm_gr.constraints.compiler import ConstraintTableCompiler
 from vllm_gr.constraints.execution import TorchConstrainedTopKExecution
 from vllm_gr.constraints.json_compiler import compile_relations_json
 from vllm_gr.v1.worker.constraint_hook import (
+    _prepare_workspace_constraint_metadata,
     apply_constrained_sample_override,
     build_constraint_backend_prefix_token_ids,
     build_direct_constrained_sampler_output,
@@ -694,6 +695,52 @@ def test_canonical_prefix_rejects_missing_parent_or_short_suffix() -> None:
             _decode_mdata(step=2, width=2, suffix=[[1], [2, 3]]),
             torch.device("cpu"),
         )
+
+
+def test_persistent_constraint_prefix_uses_authoritative_session_decision() -> None:
+    sequence = torch.tensor(
+        [[[11, 21, 0], [12, 22, 0]]],
+        dtype=torch.int32,
+    )
+    session = SimpleNamespace(
+        slot=0,
+        context=SimpleNamespace(decision=SimpleNamespace(sequence=sequence)),
+    )
+    state = SimpleNamespace(step=2, session=session)
+    runner = SimpleNamespace(
+        _gr_model_runner_states={"gr-0": state},
+        input_batch=SimpleNamespace(
+            sampling_metadata=SimpleNamespace(
+                temperature=torch.ones(2, dtype=torch.float32)
+            )
+        ),
+    )
+    host_prefix = torch.empty((1, 2, 3), dtype=torch.int32)
+    workspace = SimpleNamespace(
+        max_batch=1,
+        key=SimpleNamespace(beam_width=2),
+        host_prefix_token_ids=host_prefix,
+        host_prefix_token_ids_numpy=host_prefix.numpy(),
+        prefix_token_ids=torch.empty((1, 2, 3), dtype=torch.int32),
+        temperatures=torch.empty((1, 2), dtype=torch.float32),
+        host_temperatures=torch.empty((1, 2), dtype=torch.float32),
+    )
+    metadata = _decode_mdata(step=2, width=2, suffix=None)
+    metadata["persistent_runner_state"] = True
+
+    prepared = _prepare_workspace_constraint_metadata(
+        runner,
+        [("gr-0", 0, 2, metadata)],
+        workspace,
+        total_rows=2,
+        device=torch.device("cpu"),
+    )
+
+    assert prepared is not None
+    step, prefix, temperatures = prepared
+    assert step == 2
+    assert prefix.tolist() == [[11, 21, 0], [12, 22, 0]]
+    assert temperatures.tolist() == [1.0, 1.0]
 
 
 def test_direct_path_calls_backend_once_per_request_and_preserves_row_order() -> None:

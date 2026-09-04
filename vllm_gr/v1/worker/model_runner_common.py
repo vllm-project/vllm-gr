@@ -979,12 +979,9 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
     gr_state = getattr(sampler_output, "_gr_model_runner_state", None)
     if gr_state is not None:
         control_token_ids = gr_state.control_token_ids
-        if bool(getattr(runner, "use_async_scheduling", False)):
-            # The state may return to the fixed-shape reuse pool before the
-            # AsyncGPUModelRunnerOutput copy stream consumes this scalar. Give
-            # the transport private storage so the next request cannot mutate
-            # an in-flight control-token D2H source.
-            control_token_ids = control_token_ids.clone()
+        # The backend publishes alternating fixed control slots. BatchQueue
+        # permits one look-ahead frame, so an in-flight D2H source cannot be
+        # overwritten and no per-step clone is required.
         sampler_output.sampled_token_ids = control_token_ids
         sampler_output.logprobs_tensors = None
         sampler_output._gr_persistent_state_transport = True
@@ -1339,9 +1336,20 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     # 1. Clean up finished sessions (beam_width=0 teardown signal)
     finished_ids = getattr(scheduler_output, "beam_finished_session_ids", [])
     for sid in finished_ids:
-        session = runner._beam_sessions.pop(sid, None)
-        if session is not None:
-            session.end_session()
+        persistent_states = getattr(runner, "_gr_model_runner_states", {})
+        if sid in persistent_states:
+            # Persistent state owns the BeamSearchSession. Releasing the
+            # session first makes state.release() re-enter a missing registry
+            # slot. Keep success/abort/error teardown on one idempotent path.
+            from vllm_gr.v1.worker.gr_model_runner_state import (
+                release_gr_model_runner_states,
+            )
+
+            release_gr_model_runner_states(runner, [sid])
+        else:
+            session = runner._beam_sessions.pop(sid, None)
+            if session is not None:
+                session.end_session()
     # 2. Check if we have any beam decode requests with decode_step
     incremental_ids = [
         req_id
@@ -1552,8 +1560,16 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                     sid for sid in list(runner._beam_sessions.keys()) if sid not in active_req_ids
                 ]
                 for sid in stale_ids:
-                    old_session = runner._beam_sessions.pop(sid)
-                    old_session.end_session()
+                    persistent_states = getattr(runner, "_gr_model_runner_states", {})
+                    if sid in persistent_states:
+                        from vllm_gr.v1.worker.gr_model_runner_state import (
+                            release_gr_model_runner_states,
+                        )
+
+                        release_gr_model_runner_states(runner, [sid])
+                    else:
+                        old_session = runner._beam_sessions.pop(sid)
+                        old_session.end_session()
                 # Retry allocation after cleanup
                 slot = runner._beam_context.registry.allocate(
                     req_id, mdata["beam_width"], mdata["prefix_len"]
@@ -1608,36 +1624,6 @@ def make_patched_execute_model(_orig_execute_model):
         beam_session = _get_or_create_beam_session(self, self._current_beam_data, scheduler_output)
         if beam_session is not None:
             beam_info["beam_session"] = beam_session
-
-            # Refresh device-side buffers before model forward / Graph replay.
-            # These fill_() calls are on the same CUDA stream as the model
-            # forward, so they are ordered before any kernel that reads them.
-            context = beam_session.context  # BeamAttentionContext
-            decode_step = beam_session.decode_step
-
-            # decode_step_buf: device scalar read by the Triton
-            # cache_unshared_kv / copy_suffix_kv kernels (the per-step KV
-            # extent for suffix FA2 is device-side data via the metadata
-            # builder's fixed-address cu_seqlens_k buffer, refreshed by
-            # build() each step).
-            if hasattr(context, "decode_step_buf"):
-                context.decode_step_buf.fill_(decode_step)
-
-            # decode_step_1based_buf / xllm_block_table_buf: device inputs for
-            # the xllm fused kernels (NPU).  Same refresh-outside-the-graph
-            # contract — a captured ACL graph reads fresh values at replay.
-            # Only NPU kernels consume them; on GPU (Triton cache_unshared /
-            # copy_suffix reads decode_step_buf only) skip the two redundant
-            # fill_ launches to cut per-step stream setup time.
-            if getattr(context, "_gr_uses_xllm_buffers", True):
-                if hasattr(context, "decode_step_1based_buf"):
-                    context.decode_step_1based_buf.fill_(decode_step + 1)
-                if hasattr(context, "xllm_block_table_buf"):
-                    # max_batch-sized; request 0 maps to the active session's
-                    # pool slot (the registry is max_batch=1, so one active
-                    # session).
-                    context.xllm_block_table_buf.fill_(0)
-                    context.xllm_block_table_buf[0] = beam_session.slot
 
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info

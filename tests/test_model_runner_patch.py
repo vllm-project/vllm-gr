@@ -236,3 +236,72 @@ def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     model_runner_patch.apply_worker_patches()
 
     assert getattr(Runner.sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, False)
+
+
+def test_runner_init_selects_gr_backend_once_and_not_after_failed_init() -> None:
+    calls: list[str] = []
+
+    def original(self: Any, fail: bool = False) -> None:
+        calls.append("init")
+        if fail:
+            raise RuntimeError("init failed")
+
+    backend = object()
+
+    def factory(runner: Any) -> object:
+        calls.append("factory")
+        return backend
+
+    wrapped = model_runner_patch.make_init_with_gr_device_backend(original, factory)
+    runner = SimpleNamespace()
+    wrapped(runner)
+    wrapped(runner)
+    assert runner._gr_device_backend is backend
+    assert calls == ["init", "factory", "init"]
+
+    failed = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="init failed"):
+        wrapped(failed, True)
+    assert not hasattr(failed, "_gr_device_backend_initialized")
+
+
+def test_gr_state_named_worker_hooks_install_on_any_backend() -> None:
+    class Worker:
+        pass
+
+    assert model_runner_patch.install_gr_state_worker_hooks(Worker) == 1
+    assert model_runner_patch.install_gr_state_worker_hooks(Worker) == 0
+    worker = Worker()
+    worker.model_runner = SimpleNamespace(_gr_model_runner_states={})
+    assert worker.get_gr_model_runner_state_stats() == {
+        "created": 0,
+        "freed": 0,
+        "active": 0,
+    }
+
+
+def test_shutdown_runs_native_even_when_gr_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker import gr_model_runner_state
+
+    events: list[str] = []
+
+    def fail_release(runner: Any) -> None:
+        events.append("release")
+        raise RuntimeError("release failed")
+
+    monkeypatch.setattr(
+        gr_model_runner_state,
+        "release_gr_model_runner_states",
+        fail_release,
+    )
+
+    def native(runner: Any) -> None:
+        events.append("native")
+
+    runner = SimpleNamespace(constraint_backend=None)
+    wrapped = model_runner_patch.make_shutdown_with_constraint_backend(native)
+    with pytest.raises(RuntimeError, match="release failed"):
+        wrapped(runner)
+    assert events == ["release", "native"]

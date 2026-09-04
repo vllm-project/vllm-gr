@@ -57,6 +57,40 @@ _PREFILL_COMPUTE_LOGITS_PATCH_MARKER = "_vllm_gr_prefill_compute_logits_patched"
 _PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
 
 
+def create_gr_device_backend(runner):
+    """Step 4 selection point; the CUDA V1 implementation lands in Step 5."""
+
+    del runner
+    return None
+
+
+def get_gr_memory_stats(worker) -> dict[str, int]:
+    """Add CUDA graph-pool accounting to the shared device-neutral totals."""
+
+    from vllm_gr.v1.worker.gr_model_runner_state import get_gr_memory_stats as common_stats
+
+    stats = common_stats(worker)
+    runner = getattr(worker, "model_runner", worker)
+    device = getattr(runner, "device", None)
+    if getattr(device, "type", None) != "cuda":
+        return stats
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    allocated = 0
+    reserved = 0
+    for segment in torch.cuda.memory._snapshot().get("segments", ()):
+        if segment.get("device") != device_index:
+            continue
+        if tuple(segment.get("segment_pool_id", (0, 0))) == (0, 0):
+            continue
+        allocated += int(segment.get("allocated_size", 0))
+        reserved += int(segment.get("total_size", 0))
+    stats["graph_pool_allocated_bytes"] = allocated
+    stats["graph_pool_reserved_bytes"] = reserved
+    return stats
+
+
 def get_gr_profile_runtime_stats(worker) -> dict:
     """Named, read-only CUDA Worker RPC for attributable profiling."""
     runner = getattr(worker, "model_runner", None)
@@ -232,15 +266,32 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
     @wraps(_orig_prepare_inputs)
     def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        beam_data = getattr(scheduler_output, "beam_data", {})
         logits_indices, spec_decode_metadata = _orig_prepare_inputs(
             self, scheduler_output, num_scheduled_tokens
         )
+
+        # Upstream GPU _prepare_inputs materializes the native logical token
+        # into self.input_ids.gpu.  Publish the persistent physical Beam rows
+        # afterwards so the native write cannot overwrite the backend's D2D
+        # token update.  GPU attention metadata is built after this wrapper
+        # returns, while the NPU adapter intentionally uses the opposite order.
+        for req_id, mdata in beam_data.items():
+            if mdata.get("persistent_runner_state") and mdata.get("is_beam_decode"):
+                state = getattr(self, "_gr_model_runner_states", {}).get(req_id)
+                if state is None:
+                    raise RuntimeError(f"persistent GR state is missing for request {req_id!r}")
+                state.prepare_decode_inputs(
+                    self,
+                    scheduler_output,
+                    num_scheduled_tokens,
+                    mdata,
+                )
 
         # GPU attention metadata is built after _prepare_inputs returns.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data:
             return logits_indices, spec_decode_metadata
 
@@ -258,15 +309,9 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
                 token_offset += scheduled_tokens
                 continue
             if mdata.get("persistent_runner_state") and mdata.get("is_beam_decode"):
-                state = getattr(self, "_gr_model_runner_states", {}).get(req_id)
-                if state is None:
-                    raise RuntimeError(f"persistent GR state is missing for request {req_id!r}")
-                width = int(mdata["beam_width"])
-                if scheduled_tokens != width:
-                    raise RuntimeError(
-                        "persistent GR scheduled token count does not match beam_width"
-                    )
-                self.input_ids.gpu[token_offset : token_offset + width].copy_(state.next_token_ids)
+                # Physical row expansion and D2D input writes belong to the
+                # selected GPU backend's prepare_decode_inputs implementation.
+                pass
             else:
                 next_token_ids = mdata.get("next_token_ids")
                 if next_token_ids:

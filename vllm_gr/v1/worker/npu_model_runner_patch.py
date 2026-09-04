@@ -34,6 +34,13 @@ logger = init_logger(__name__)
 _PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
 
 
+def create_gr_device_backend(runner):
+    """Step 4 selection point; the NPU V1 implementation lands in Step 6."""
+
+    del runner
+    return None
+
+
 def _npu_beam_stage_trace_marker(runner) -> str | None:
     """Return a stable NPU trace boundary for the active GR stage."""
     beam_info = getattr(runner, "_current_beam_info", None)
@@ -98,9 +105,24 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
+        # NPU constructs attention metadata inside the original method, so
+        # backend state (token ids, device step and physical block mapping)
+        # must be published before entering it.
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        for req_id, mdata in beam_data.items():
+            if mdata.get("persistent_runner_state") and mdata.get("is_beam_decode"):
+                state = getattr(self, "_gr_model_runner_states", {}).get(req_id)
+                if state is None:
+                    raise RuntimeError(f"persistent GR state is missing for request {req_id!r}")
+                state.prepare_decode_inputs(
+                    self,
+                    scheduler_output,
+                    num_scheduled_tokens,
+                    mdata,
+                )
+
         out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
 
-        beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data:
             return out
 

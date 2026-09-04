@@ -63,16 +63,25 @@ def test_gpu_prepare_preserves_order_and_two_item_contract(
     assert returned_spec is spec_metadata
 
 
-def test_gpu_prepare_writes_each_persistent_request_token_slice(
+def test_gpu_prepare_delegates_persistent_device_writes_to_backend_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    events: list[str] = []
+
+    class State:
+        next_token_ids = torch.tensor([10, 11])
+
+        def prepare_decode_inputs(self, runner, output, counts, metadata) -> None:
+            assert runner.input_ids.gpu.tolist() == [9, 9, 9, 9]
+            assert output is scheduler_output
+            assert counts == [2, 2]
+            assert metadata["beam_width"] == 2
+            events.append("backend-prepare")
+
     runner = SimpleNamespace(
-        input_batch=SimpleNamespace(req_ids=["plain", "gr-0", "gr-1"]),
-        input_ids=SimpleNamespace(gpu=torch.full((7,), -1, dtype=torch.int32)),
-        _gr_model_runner_states={
-            "gr-0": SimpleNamespace(next_token_ids=torch.tensor([10, 11])),
-            "gr-1": SimpleNamespace(next_token_ids=torch.tensor([20, 21, 22])),
-        },
+        input_batch=SimpleNamespace(req_ids=["plain", "gr-0"]),
+        input_ids=SimpleNamespace(gpu=torch.full((4,), -1, dtype=torch.int32)),
+        _gr_model_runner_states={"gr-0": State()},
         _current_beam_info={"req_ids": []},
         device=torch.device("cpu"),
     )
@@ -84,21 +93,21 @@ def test_gpu_prepare_writes_each_persistent_request_token_slice(
                 "is_beam_decode": True,
                 "beam_width": 2,
             },
-            "gr-1": {
-                "persistent_request": True,
-                "persistent_runner_state": True,
-                "is_beam_decode": True,
-                "beam_width": 3,
-            },
         }
     )
     monkeypatch.setattr(gpu_patch, "_beam_remap_inputs", lambda *_args: [])
     monkeypatch.setattr(gpu_patch, "prepare_cuda_prefill_constraint", lambda *_args: None)
 
-    wrapped = gpu_patch.make_patched_prepare_inputs(lambda *_args: (None, None))
-    wrapped(runner, scheduler_output, [2, 2, 3])
+    def original(*_args):
+        events.append("original")
+        runner.input_ids.gpu.fill_(9)
+        return None, None
 
-    assert runner.input_ids.gpu.tolist() == [-1, -1, 10, 11, 20, 21, 22]
+    wrapped = gpu_patch.make_patched_prepare_inputs(original)
+    wrapped(runner, scheduler_output, [2, 2])
+
+    assert events == ["original", "backend-prepare"]
+    assert runner.input_ids.gpu.tolist() == [9, 9, 9, 9]
 
 
 def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(

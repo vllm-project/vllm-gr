@@ -26,6 +26,45 @@ _CONSTRAINT_LOAD_PATCH_MARKER = "_vllm_gr_constraint_load_patched"
 _CONSTRAINT_SHUTDOWN_PATCH_MARKER = "_vllm_gr_constraint_shutdown_patched"
 _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 _GR_STATE_RELEASE_HOOK_MARKER = "_vllm_gr_state_release_hook_installed"
+_GR_BACKEND_INIT_PATCH_MARKER = "_vllm_gr_backend_init_patched"
+
+
+def make_init_with_gr_device_backend(original, factory):
+    """Select the active platform backend exactly once per runner instance."""
+
+    if getattr(original, _GR_BACKEND_INIT_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def init_with_gr_device_backend(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        if not getattr(self, "_gr_device_backend_initialized", False):
+            self._gr_device_backend = factory(self)
+            self._gr_device_backend_initialized = True
+
+    setattr(init_with_gr_device_backend, _GR_BACKEND_INIT_PATCH_MARKER, True)
+    return init_with_gr_device_backend
+
+
+def install_gr_state_worker_hooks(worker_cls: type) -> int:
+    """Mount safe named GR lifecycle RPCs on either V1 Worker backend."""
+
+    if getattr(worker_cls, _GR_STATE_RELEASE_HOOK_MARKER, False):
+        return 0
+    from vllm_gr.v1.worker.gr_model_runner_state import (
+        get_gr_memory_stats,
+        get_gr_model_runner_state_stats,
+        release_gr_model_runner_states,
+    )
+
+    worker_cls.release_gr_model_runner_states = release_gr_model_runner_states
+    worker_cls.get_gr_model_runner_state_stats = get_gr_model_runner_state_stats
+    platform_memory_stats = getattr(
+        _get_active_platform_module(), "get_gr_memory_stats", get_gr_memory_stats
+    )
+    worker_cls.get_gr_memory_stats = platform_memory_stats
+    setattr(worker_cls, _GR_STATE_RELEASE_HOOK_MARKER, True)
+    return 1
 
 
 def close_constraint_backend(runner: object) -> None:
@@ -137,8 +176,10 @@ def make_shutdown_with_constraint_backend(original=None):
                 release_gr_model_runner_states,
             )
 
-            release_gr_model_runner_states(self)
-            close_constraint_backend(self)
+            try:
+                release_gr_model_runner_states(self)
+            finally:
+                close_constraint_backend(self)
 
     else:
 
@@ -148,9 +189,20 @@ def make_shutdown_with_constraint_backend(original=None):
                 release_gr_model_runner_states,
             )
 
-            release_gr_model_runner_states(self)
-            close_constraint_backend(self)
-            return original(self, *args, **kwargs)
+            cleanup_error: BaseException | None = None
+            try:
+                release_gr_model_runner_states(self)
+            except BaseException as exc:
+                cleanup_error = exc
+            try:
+                close_constraint_backend(self)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            result = original(self, *args, **kwargs)
+            if cleanup_error is not None:
+                raise cleanup_error
+            return result
 
     setattr(
         shutdown_with_constraint_backend,
@@ -203,17 +255,7 @@ def _install_active_worker_resource_hook() -> None:
 
     install_worker_resource_hook(Worker)
     install_active_worker_diagnostic_hook(Worker)
-    if not getattr(Worker, _GR_STATE_RELEASE_HOOK_MARKER, False):
-        from vllm_gr.v1.worker.gr_model_runner_state import (
-            get_gr_model_runner_state_stats,
-            get_gr_memory_stats,
-            release_gr_model_runner_states,
-        )
-
-        Worker.release_gr_model_runner_states = release_gr_model_runner_states  # type: ignore[attr-defined]
-        Worker.get_gr_model_runner_state_stats = get_gr_model_runner_state_stats  # type: ignore[attr-defined]
-        Worker.get_gr_memory_stats = get_gr_memory_stats  # type: ignore[attr-defined]
-        setattr(Worker, _GR_STATE_RELEASE_HOOK_MARKER, True)
+    install_gr_state_worker_hooks(Worker)
     if not getattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
         # A named method is required here: vLLM's safe msgpack utility channel
         # intentionally rejects callable serialization unless insecure pickle
@@ -238,6 +280,11 @@ def apply_worker_patches() -> None:
     ]
 
     for runner_name, runner_class in runners_to_patch:
+        backend_factory = getattr(platform_module, "create_gr_device_backend", None)
+        if callable(backend_factory):
+            runner_class.__init__ = make_init_with_gr_device_backend(
+                runner_class.__init__, backend_factory
+            )
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
             runner_class.load_model = make_load_model_with_constraint_backend(load_model)

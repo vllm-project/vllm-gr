@@ -242,8 +242,12 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
 
     assert ascend_compat.patch_npu_worker_init_device() == 1
     assert ascend_compat.patch_npu_worker_init_device() == 0
-    assert worker_class().init_device() == "ready"
+    worker = worker_class()
+    assert worker.init_device() == "ready"
     assert events == ["re_apply", "original"]
+    assert hasattr(worker_class, "release_gr_model_runner_states")
+    assert hasattr(worker_class, "get_gr_model_runner_state_stats")
+    assert hasattr(worker_class, "get_gr_memory_stats")
 
     events.clear()
     raise_from_original = True
