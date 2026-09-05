@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import json
 import logging
 import os
@@ -317,6 +318,11 @@ def main():
                 enable_prefix_caching=args.prefix_caching,
                 additional_config=additional_config,
             )
+            # The benchmark historically relied on interpreter teardown, which
+            # leaves NCCL's process group live and hides lifecycle failures.
+            # Register immediately so exceptions after engine startup also use
+            # the normal GR shutdown path. GRLLM.shutdown is idempotent.
+            atexit.register(llm.shutdown)
         except Exception as e:
             logger.error(f"Failed to initialize vLLM: {e}")
             sys.exit(1)
@@ -468,6 +474,11 @@ def main():
     model_params["beam_width"] = gen_config.get("num_beams", 1)
     model_params["temperature"] = gen_config.get("temperature", 0.0)
     model_params["time_per_sample"] = (gen_end - gen_start) / len(prompts) if prompts else 0.0
+    model_params["persistent"] = args.persistent
+    model_params["async_scheduling"] = args.async_scheduling
+    model_params["prefix_caching"] = args.prefix_caching
+    model_params["beam_graph_enabled"] = args.beam_graph_enabled
+    model_params["constraint_backend"] = args.constraint_backend
     metrics = {**model_params, **metrics}
     print(json.dumps(metrics, indent=2))
     if args.result_dir is not None:
@@ -479,6 +490,8 @@ def main():
         with open(output_path, "w") as f:
             json.dump(metrics, f, indent=2)
         logger.info(f"Saved metrics to {output_path}")
+    if llm is not None:
+        llm.shutdown()
 
 
 if __name__ == "__main__":
