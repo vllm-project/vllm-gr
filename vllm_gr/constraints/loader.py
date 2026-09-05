@@ -345,16 +345,16 @@ def _expected_ready_logprobs(
     selected: tuple[int, ...],
     selected_logits: torch.Tensor,
     *,
-    candidate_count: int,
+    normalization_size: int,
     background_logit: float,
     temperature: float,
 ) -> dict[int, float]:
-    """Normalize selected scores over every legal candidate without a wide buffer."""
+    """Normalize selected scores without materializing the complete domain."""
 
     effective_temperature = 1.0 if temperature == 0.0 else temperature
     selected_scores = selected_logits.float() / effective_temperature
     denominator_terms = selected_scores
-    remaining = candidate_count - len(selected)
+    remaining = normalization_size - len(selected)
     if remaining:
         repeated_background = background_logit / effective_temperature + math.log(remaining)
         denominator_terms = torch.cat(
@@ -375,6 +375,7 @@ def _run_device_readiness(
     dtype: torch.dtype,
     max_rows: int,
     synchronize: Callable[[torch.device], None],
+    normalize_over_candidates: bool,
 ) -> None:
     rows = min(max_rows, 2)
     vocab_size = backend.info.table_metadata.vocab_size
@@ -411,7 +412,9 @@ def _run_device_readiness(
                     _expected_ready_logprobs(
                         selected,
                         host_values,
-                        candidate_count=case.candidate_count,
+                        normalization_size=(
+                            case.candidate_count if normalize_over_candidates else vocab_size
+                        ),
                         background_logit=background_logit,
                         temperature=temperature_values[row],
                     )
@@ -465,6 +468,7 @@ def _run_cuda_readiness(
         dtype=dtype,
         max_rows=max_rows,
         synchronize=_synchronize_current_cuda_stream,
+        normalize_over_candidates=True,
     )
 
 
@@ -483,6 +487,7 @@ def _run_npu_readiness(
         dtype=dtype,
         max_rows=max_rows,
         synchronize=_synchronize_current_npu_stream,
+        normalize_over_candidates=False,
     )
 
 

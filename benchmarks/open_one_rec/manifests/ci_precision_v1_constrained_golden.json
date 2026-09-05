@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "description": "Blocking five-task Constraint Tables golden captured on NVIDIA L20.",
+  "captured_utc": "2026-09-07",
+  "policy": {
+    "comparison": "candidate_greater_than_or_equal",
+    "blocking_absolute_tolerance": 0.02,
+    "blocking_metric_absolute_tolerances": {
+      "pass@1": 0.03,
+      "pid_pass@1": 0.03
+    },
+    "blocking_metrics": [
+      "pass@1",
+      "pass@32",
+      "recall@32",
+      "pid_pass@1",
+      "pid_pass@32",
+      "pid_recall@32"
+    ],
+    "diagnostic_metrics": [
+      "position1_pass@1",
+      "position1_pass@32",
+      "recall@1",
+      "pid_position1_pass@1",
+      "pid_position1_pass@32",
+      "pid_recall@1"
+    ]
+  },
+  "protocol": {
+    "format_version": 1,
+    "model": "/home/z00469465/OneRec/OneRec-1.7B",
+    "revision": null,
+    "beam_width": 32,
+    "temperature": 0.0,
+    "evaluation_mode": "both",
+    "execution": "online",
+    "execution_variant": "graph-worker",
+    "seed": 123,
+    "selected_samples": 100,
+    "sample_manifest_sha256": "65fb8b240f72dea0391edd325d47acd138367bfae9198f5c56c889112b1c369c",
+    "prepared_manifest_sha256": "ea67fc82889552b13d96296022970960e4d8fa60c71f2e830ce78eb45e92857d"
+  },
+  "tasks": {
+    "video": {
+      "source_sha256": "66079915e3c3daab7df3487f9babb658df99ec1672c3ef42d7893d87cef2e6d8",
+      "constraint": {
+        "mode": "triples",
+        "domain": "video",
+        "digest": "fba93a0f741cf11247a831dfbf6c20e0e4b33b765481da17d46cd72b48a5c6be"
+      },
+      "metrics": {
+        "pass@1": 0.09,
+        "pass@32": 0.21,
+        "position1_pass@1": 0.02,
+        "position1_pass@32": 0.08,
+        "recall@1": 0.01038888888888889,
+        "recall@32": 0.02922222222222223,
+        "pid_pass@1": 0.09,
+        "pid_pass@32": 0.21,
+        "pid_position1_pass@1": 0.02,
+        "pid_position1_pass@32": 0.08,
+        "pid_recall@1": 0.01038888888888889,
+        "pid_recall@32": 0.02922222222222223
+      }
+    },
+    "ad": {
+      "source_sha256": "d671fb497eb5495d05705688980db57a7bf5640eb7c18b9ab0cc89c76193e6c8",
+      "constraint": {
+        "mode": "triples",
+        "domain": "video",
+        "digest": "fba93a0f741cf11247a831dfbf6c20e0e4b33b765481da17d46cd72b48a5c6be"
+      },
+      "metrics": {
+        "pass@1": 0.02,
+        "pass@32": 0.27,
+        "position1_pass@1": 0.01,
+        "position1_pass@32": 0.08,
+        "recall@1": 0.004166666666666667,
+        "recall@32": 0.09448015873015873,
+        "pid_pass@1": 0.0,
+        "pid_pass@32": 0.25,
+        "pid_position1_pass@1": 0.0,
+        "pid_position1_pass@32": 0.07,
+        "pid_recall@1": 0.0,
+        "pid_recall@32": 0.09013492063492062
+      }
+    },
+    "product": {
+      "source_sha256": "355dd1807995a62af6bd33fe28eefbe9b267e836b4a76f081d8e92eb3996d5bb",
+      "constraint": {
+        "mode": "triples",
+        "domain": "product",
+        "digest": "a401a749b6d3737dae97a61dffce5011f033ed35fcf3367ae6f759158b10a44d"
+      },
+      "metrics": {
+        "pass@1": 0.04,
+        "pass@32": 0.22,
+        "position1_pass@1": 0.0,
+        "position1_pass@32": 0.08,
+        "recall@1": 0.0060952380952380945,
+        "recall@32": 0.06590873015873017,
+        "pid_pass@1": 0.01,
+        "pid_pass@32": 0.1,
+        "pid_position1_pass@1": 0.0,
+        "pid_position1_pass@32": 0.04,
+        "pid_recall@1": 0.001,
+        "pid_recall@32": 0.03229761904761905
+      }
+    },
+    "label_cond": {
+      "source_sha256": "b339ea60a1acfae625822b1e865dde170cd65ad75d9cd770838b625323373c8f",
+      "constraint": {
+        "mode": "triples",
+        "domain": "video",
+        "digest": "fba93a0f741cf11247a831dfbf6c20e0e4b33b765481da17d46cd72b48a5c6be"
+      },
+      "metrics": {
+        "pass@1": 0.02,
+        "pass@32": 0.09,
+        "position1_pass@1": 0.02,
+        "position1_pass@32": 0.04,
+        "recall@1": 0.015,
+        "recall@32": 0.04441666666666667,
+        "pid_pass@1": 0.02,
+        "pid_pass@32": 0.08,
+        "pid_position1_pass@1": 0.02,
+        "pid_position1_pass@32": 0.04,
+        "pid_recall@1": 0.015,
+        "pid_recall@32": 0.041916666666666665
+      }
+    },
+    "interactive": {
+      "source_sha256": "1ebcd2a20fa54430daba3600df2fe9bd2ddbbbcbe38601ca81211a78eed16a25",
+      "constraint": {
+        "mode": "triples",
+        "domain": "video",
+        "digest": "fba93a0f741cf11247a831dfbf6c20e0e4b33b765481da17d46cd72b48a5c6be"
+      },
+      "metrics": {
+        "pass@1": 0.04,
+        "pass@32": 0.29,
+        "position1_pass@1": 0.03,
+        "position1_pass@32": 0.15,
+        "recall@1": 0.025333333333333333,
+        "recall@32": 0.15557936507936507,
+        "pid_pass@1": 0.03,
+        "pid_pass@32": 0.27,
+        "pid_position1_pass@1": 0.02,
+        "pid_position1_pass@32": 0.13,
+        "pid_recall@1": 0.015333333333333332,
+        "pid_recall@32": 0.14224603174603176
+      }
+    }
+  }
+}

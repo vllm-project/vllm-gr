@@ -22,7 +22,7 @@ def test_rec_constrained_topk_step_zero_filters_and_normalizes() -> None:
         top_k=2,
     )
     assert tokens.tolist() == [[2, 3]]
-    expected = torch.log_softmax(torch.tensor([2.0, 1.0, 0.0]), dim=0)[:2]
+    expected = torch.log_softmax(logits, dim=1)[0, torch.tensor([2, 3])]
     torch.testing.assert_close(logprobs[0], expected)
 
 

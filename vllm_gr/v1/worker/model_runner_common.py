@@ -1286,6 +1286,21 @@ def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     )
 
 
+def _seed_beam_decision_from_metadata(session: Any, mdata: dict[str, Any]) -> None:
+    """Seed a reset worker decision session from selected parent beams."""
+    parent_scores = mdata.get("parent_cumulative_logprobs")
+    if parent_scores is None:
+        return
+    parent_sequences = mdata.get("beam_suffix")
+    if not parent_sequences:
+        raise RuntimeError(
+            "worker beam decision received parent scores without parent beam suffixes"
+        )
+    from vllm_gr.v1.beam.beam_decision import init_beam_decision_from_parents
+
+    init_beam_decision_from_parents(session, parent_sequences, parent_scores)
+
+
 def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) -> Any | None:
     """Get or create per-request BeamSearchSession for incremental decode.
 
@@ -1437,6 +1452,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 # (parent_beam_indices is non-None even on the first step, so it
                 # cannot be used to distinguish the first step — decode_step can.)
                 session.begin_session(mdata["beam_width"], mdata["prefix_len"])
+                _seed_beam_decision_from_metadata(session, mdata)
                 session._state.is_last_step = is_last_step
             else:
                 # Subsequent decode steps: apply the previous step's beam decision.
@@ -1524,6 +1540,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 )
             session = BeamSearchSession(session_id=req_id, slot=slot, context=runner._beam_context)
             session.begin_session(mdata["beam_width"], mdata["prefix_len"])
+            _seed_beam_decision_from_metadata(session, mdata)
             # Set initial decode_step from scheduler
             session._state.decode_step = mdata_step
             session._state.is_last_step = is_last_step

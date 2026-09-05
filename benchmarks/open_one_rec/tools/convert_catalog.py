@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
         help="Dataset root path containing sid2pid.json. Default: data.",
     )
     parser.add_argument(
+        "--mapping-file",
+        choices=["sid2pid.json", "sid2iid.json"],
+        default="sid2pid.json",
+        help=(
+            "SID mapping filename inside --dataset-path. Use sid2pid.json for "
+            "video/ad/label_cond/interactive and sid2iid.json for product."
+        ),
+    )
+    parser.add_argument(
         "--output-path",
         "-o",
         default="catalog.json",
@@ -97,7 +106,7 @@ def main() -> int:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
 
-    input_path = Path(args.dataset_path) / "sid2pid.json"
+    input_path = Path(args.dataset_path) / args.mapping_file
     try:
         count = process_json(str(input_path), args.output_path)
     except (FileNotFoundError, ValueError) as error:

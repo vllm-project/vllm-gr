@@ -40,7 +40,7 @@ OneRec is a benchmark suite designed to evaluate generative recommendation model
 
 ## Quick Start
 
-OneRec supports two operation modes. Choose based on your needs:
+OneRec supports three operation modes. Choose based on your needs:
 
 ### Mode 1: Offline Throughput Mode (Simple, Local)
 
@@ -68,13 +68,24 @@ For quick local benchmarking without an API server:
 
 ```bash
 # Single command - everything in one process
-python -m benchmarks.open_one_rec.one_rec_acc_test
+python -m benchmarks.open_one_rec.one_rec_acc_test \
+  --gr \
   --model OpenOneRec/OneRec-1.7B \
   --dataset-path ./data \
   --task-type video \
   --num-prompts 1000 \
+  --max-concurrency 1 \
+  --use-beam-search \
+  --n 32 \
+  --temperature 0 \
   --result-dir results/acc_test_results
 ```
+
+This pins the official paired accuracy settings instead of inheriting the
+generic task-generation defaults. For the recommended full-universe Constraint
+Tables run, constrained-golden gate, and paired native-vLLM diagnostic, follow
+the [accuracy manual](accuracy.md). A reduced task catalog is not a valid
+official accuracy baseline.
 
 **Best for**: Testing, development, validating accuracy
 
@@ -86,7 +97,9 @@ For production-like testing with separate server and client:
 
 ```bash
 # On Terminal 1: Start vLLM API server
+# Capacity 128 is needed by the throughput example below; accuracy still uses BW32.
 vllm-gr serve OpenOneRec/OneRec-1.7B \
+    --beam-max-width 128 \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
     --max-logprobs 1024 \
     --max-num-seqs 1024 \
@@ -122,24 +135,28 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
   --dataset-path ./data \
   --task-type video \
   --num-prompts 100 \
+  --max-concurrency 1 \
+  --use-beam-search \
+  --n 32 \
+  --temperature 0 \
   --result-dir results/acc_test_results
 
 ```
 
-Note, that for benchmark accuracy results, the test itself sets a default beam width
+The official paired recommendation accuracy configuration uses beam width 32
+and temperature 0. Always pass them explicitly in reported runs; see the
+[accuracy manual](accuracy.md) for the paired baseline and CI policy.
 
 **Best for**: Production-like testing, distributed deployment, load testing
 
 ### Operation Modes Comparison
 
-| Aspect | Throughput Mode | API Server Mode |
-| -------- | --- | --- |
-| Setup | 1 command | 2 terminals |
-| Latency | Lower | Higher (+HTTP) |
-| Throughput | Higher | Lower |
-| Production-like | No | Yes |
-| Network overhead | None | Yes (HTTP) |
-| Use case | Local testing | Deployment simulation |
+| Aspect | Offline throughput | Offline accuracy | API server |
+| -------- | --- | --- | --- |
+| Setup | 1 command | 1 command | 2 terminals |
+| Primary purpose | Performance | Accuracy | Deployment simulation |
+| Network overhead | None | None | HTTP |
+| Official accuracy settings | No | Yes, when explicitly pinned | Yes, when explicitly pinned |
 
 ## Installation
 
@@ -240,14 +257,14 @@ Each Parquet file must contain these columns:
 | ---------- | ------ | --------- | ------------- |
 | `--task-types` | str | All 6 tasks | Comma-separated list of task types to run |
 | `--use-beam-search` | bool | False | Enable beam search during generation |
-| `--n` | int | 8 | Number of beams for beam search |
+| `--n` | int | task config | Number of beams; official paired accuracy uses 32 |
 
 #### Generation Arguments
 
 | Argument | Type | Default | Description |
 | ---------- | ------ | --------- | ------------- |
 | `--max-tokens` | int | 128 | Maximum tokens to generate |
-| `--temperature` | float | 0.8 | Sampling temperature |
+| `--temperature` | float | task config | Official paired accuracy uses 0 |
 | `--top-p` | float | 0.95 | Nucleus sampling parameter |
 
 ## API Server Interactions

@@ -21,6 +21,10 @@ except ImportError:
 # Must be imported before any vllm.benchmarks module usage.
 import benchmarks.open_one_rec.one_rec_patch  # noqa: F401
 from benchmarks.open_one_rec.open_one_rec_loader import TASK_REGISTRY, DataLoaderWrapper
+from benchmarks.open_one_rec.regression import (
+    RECOMMENDATION_TASKS,
+    validate_generations,
+)
 
 try:
     from vllm_gr.sampling_params import BeamSearchParams
@@ -96,6 +100,7 @@ def run_api_inference(
     api_key: str,
     gen_config: dict[str, Any],
     max_concurrency: int | None = None,
+    request_timeout: float = 600.0,
 ) -> list[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
@@ -105,45 +110,77 @@ def run_api_inference(
     # Map generation config to API parameters
     api_params = {
         "model": model,
-        "use_beam_search": True if (gen_config.get("num_beams", 1) > 1) else False,
+        "use_beam_search": gen_config.get("num_beams", 1) > 1,
         "max_tokens": gen_config.get("max_new_tokens", 1024),
         "temperature": gen_config.get("temperature", 0.0),
         "top_p": gen_config.get("top_p", 1.0),
         "n": gen_config.get("num_return_sequences", 1),
         "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
     }
+    # DataLoaderWrapper has already rendered each prompt with the model's
+    # chat template.  The Completion API accepts that rendered text verbatim;
+    # sending it as the content of a new Chat message would apply the template
+    # a second time and change the model input.
+    completion_endpoint = api_url.rstrip("/").endswith("/v1/completions")
 
-    def _send_request(prompt):
+    def _send_request(prompt: str) -> tuple[MockRequestOutput | None, str | None]:
         response = None
-        payload = {"messages": [{"role": "user", "content": prompt}], **api_params}
+        if completion_endpoint:
+            payload = {"prompt": prompt, **api_params}
+        else:
+            payload = {"messages": [{"role": "user", "content": prompt}], **api_params}
         try:
-            response = requests.post(api_url, headers=headers, json=payload)
+            response = requests.post(
+                api_url,
+                headers=headers,
+                json=payload,
+                timeout=request_timeout,
+            )
             response.raise_for_status()
             data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("API response JSON must be an object")
+
+            choices = data.get("choices")
+            expected_choices = int(api_params["n"])
+            if not isinstance(choices, list):
+                raise ValueError("API response 'choices' must be a list")
+            if len(choices) != expected_choices:
+                raise ValueError(
+                    f"API response returned {len(choices)} choices, expected {expected_choices}"
+                )
 
             # Extract content
-            if data.get("choices"):
-                mock_outputs = []
-                for choice in data["choices"]:
-                    message = choice.get("message", {})
+            mock_outputs = []
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    raise ValueError("API response choices must be objects")
+                if completion_endpoint:
+                    full_text = choice.get("text")
+                    if not isinstance(full_text, str):
+                        raise ValueError("Completion choice 'text' must be a string")
+                else:
+                    message = choice.get("message")
+                    if not isinstance(message, dict):
+                        raise ValueError("Chat choice 'message' must be an object")
                     content = message.get("content", "")
                     reasoning = message.get("reasoning_content", "")  # Support for reasoning models
-
-                    full_text = ""
-                    if reasoning:
-                        full_text += reasoning
-                    if content:
-                        full_text += content
-                    mock_outputs.append(MockCompletionOutput(full_text))
-                return MockRequestOutput(prompt, mock_outputs)
-            return MockRequestOutput(prompt, [MockCompletionOutput("")])
-        except Exception as e:
-            status_code = response.status_code if response is not None else "N/A"
-            response_text = response.text if response is not None else "N/A"
+                    if content is None:
+                        content = ""
+                    if reasoning is None:
+                        reasoning = ""
+                    if not isinstance(content, str) or not isinstance(reasoning, str):
+                        raise ValueError("Chat choice content fields must be strings")
+                    full_text = reasoning + content
+                mock_outputs.append(MockCompletionOutput(full_text))
+            return MockRequestOutput(prompt, mock_outputs), None
+        except Exception as e:  # noqa: BLE001 - record per-sample failures, keep the run going
+            status_code = getattr(response, "status_code", "N/A")
+            response_text = getattr(response, "text", "N/A")
             logger.error(f"Request failed. Status code: {status_code}")
             logger.error(f"[DEBUG] Response text: {response_text}")
             logger.error(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
-            return MockRequestOutput(prompt, [MockCompletionOutput("")])
+            return None, f"status={status_code}: {e}"
 
     # Run in parallel. The BeamAttentionPool is max_batch=1: only one beam
     # session may be active at a time, so cap workers at max_concurrency
@@ -151,9 +188,50 @@ def run_api_inference(
     worker_limit = max_concurrency if max_concurrency is not None else 16
     logger.info(f"Sending {len(prompts)} requests to {api_url}...")
     with ThreadPoolExecutor(max_workers=min(len(prompts), worker_limit)) as executor:
-        results = list(executor.map(_send_request, prompts))
+        request_results = list(executor.map(_send_request, prompts))
 
-    return results
+    outputs: list[MockRequestOutput] = []
+    failures: list[str] = []
+    for output, failure in request_results:
+        if failure is not None:
+            failures.append(failure)
+        elif output is not None:
+            outputs.append(output)
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} of {len(prompts)} API requests failed; first failure: {failures[0]}"
+        )
+
+    return outputs
+
+
+def _validate_recommendation_outputs(
+    outputs: list[MockRequestOutput],
+    *,
+    expected_requests: int,
+    beam_width: int,
+) -> None:
+    """Reject incomplete or structurally invalid OneRec recommendation output."""
+    if len(outputs) != expected_requests:
+        raise RuntimeError(
+            f"inference returned {len(outputs)} requests, expected {expected_requests}"
+        )
+
+    invalid: list[tuple[int, dict[str, Any]]] = []
+    for index, output in enumerate(outputs):
+        contract = validate_generations([choice.text for choice in output.outputs], beam_width)
+        if (
+            not contract["beam_count_ok"]
+            or contract["empty_count"] > 0
+            or contract["invalid_sid_count"] > 0
+        ):
+            invalid.append((index, contract))
+    if invalid:
+        first_index, first_contract = invalid[0]
+        raise RuntimeError(
+            f"{len(invalid)} of {expected_requests} requests violated the OneRec output "
+            f"contract; first invalid request index={first_index}: {first_contract}"
+        )
 
 
 def main():
@@ -218,6 +296,12 @@ def main():
     parser.add_argument(
         "--max-concurrency", type=int, default=None, help="maximum prompts to run concurrently"
     )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=600.0,
+        help="Per-request timeout in seconds for online API inference.",
+    )
     args = parser.parse_args()
 
     # 1. Load Configuration
@@ -276,7 +360,7 @@ def main():
                 },
                 gpu_memory_utilization=0.7,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - report any init failure and exit cleanly
             logger.error(f"Failed to initialize vLLM: {e}")
             sys.exit(1)
 
@@ -318,6 +402,7 @@ def main():
             args.api_key,
             gen_config,
             max_concurrency=args.max_concurrency,
+            request_timeout=args.request_timeout,
         )
         gen_end = time.perf_counter()
     else:
@@ -333,7 +418,13 @@ def main():
         prompts_dict = [{"prompt": prompt} for prompt in prompts]
         gen_start = time.perf_counter()
         raw_offline_outputs = llm.beam_search(
-            prompts_dict, params, concurrency_limit=args.max_concurrency
+            prompts_dict,
+            params,
+            concurrency_limit=args.max_concurrency,
+            # The evaluator matches SID token ids; decoding the (long)
+            # recommendation-history prompt into text only burns CPU while
+            # the GPU sits idle.
+            decode_prompt_in_text=False,
         )
         assert len(raw_offline_outputs) == len(prompts)
         gen_end = time.perf_counter()
@@ -344,12 +435,12 @@ def main():
             # beam_search returns BeamSearchOutput with .outputs containing BeamSearchSequence objects
             # Each BeamSearchSequence has .text attribute
             mock_completions = []
-            prompt_len = len(prompts[i])
             if hasattr(raw_output, "sequences"):
                 for beam_seq in raw_output.sequences:
-                    text = (
-                        beam_seq.text[prompt_len:] if hasattr(beam_seq, "text") else str(beam_seq)
-                    )
+                    # beam_search runs with decode_prompt_in_text=False, so
+                    # BeamSearchSequence.text already carries the generated
+                    # tail only — no prompt prefix to strip here.
+                    text = beam_seq.text if hasattr(beam_seq, "text") else str(beam_seq)
                     logprobs = getattr(beam_seq, "cum_logprob", None)
                     mock_completions.append(MockCompletionOutput(text, logprobs))
             else:
@@ -357,6 +448,17 @@ def main():
                 mock_completions.append(MockCompletionOutput(str(raw_output)))
 
             outputs.append(MockRequestOutput(prompts[i], mock_completions))
+
+    # Accuracy thresholds may be disabled for branches covered by the newer
+    # five-task gate, but execution and output-shape correctness are invariants.
+    # In particular, never let failed HTTP requests represented by empty text
+    # turn into a fast, zero-score benchmark that exits successfully.
+    if args.endpoint and args.task_type in RECOMMENDATION_TASKS:
+        _validate_recommendation_outputs(
+            outputs,
+            expected_requests=len(prompts),
+            beam_width=int(gen_config.get("num_return_sequences", 1)),
+        )
 
     # Print a sample output
     if outputs:
@@ -406,7 +508,7 @@ def main():
         predictions_dir=args.result_dir,
         debug=args.debug,
     )
-    metrics, per_sample_metrics = evaluator.evaluate()
+    metrics, _ = evaluator.evaluate()
     metrics["elapsed_time"] = gen_end - gen_start
 
     print(f"\n--- Evaluation Results for {args.task_type} on model {args.model} ---")

@@ -277,6 +277,9 @@ jobs:
       ELAPSED_TIME_OFFLINE_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ELAPSED_TIME_OFFLINE_THRESHOLD }}
       P99_TTFT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TTFT_THRESHOLD }}
       P99_TPOT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_THRESHOLD }}
+      LEGACY_ONEREC_ACCURACY_GATE: >-
+        ${{ github.ref_name != 'decode_graph' &&
+            github.event.pull_request.base.ref != 'decode_graph' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -337,6 +340,17 @@ jobs:
             --local-dir ./OpenOneRec \
             --repo-type=dataset
 
+      - name: Cache full OneRec constraint representations
+        if: >-
+          github.ref_name == 'decode_graph' ||
+          github.event.pull_request.base.ref == 'decode_graph'
+        uses: corca-ai/local-cache@v2
+        with:
+          path: generated_full
+          base: /data/actions/cache
+          # Pinned to the sid2pid/sid2iid inputs recorded by the preparation manifest.
+          key: onerec-full-v1-e7271126-6ea5055a-${{ runner.os }}
+
       - name: Build catalog
         run: |
           mkdir -p generated_data
@@ -356,6 +370,35 @@ jobs:
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
           TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
         run: ./tests/system/run_benchmark_and_verify.sh
+
+      - name: Run official-protocol five-task precision differential
+        if: >-
+          github.ref_name == 'decode_graph' ||
+          github.event.pull_request.base.ref == 'decode_graph'
+        run: |
+          ./tests/system/run_onerec_precision_diff.sh \
+            --model OpenOneRec/OneRec-1.7B \
+            --revision cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b \
+            --dataset-path "${{ github.workspace }}/OpenOneRec/benchmark_data" \
+            --prepared-dir "${{ github.workspace }}/generated_full" \
+            --output-dir "${{ github.workspace }}/onerec_precision_results" \
+            --constrained-golden \
+              "${{ github.workspace }}/benchmarks/open_one_rec/manifests/ci_precision_v1_constrained_golden.json" \
+            --beam-width 32 \
+            --temperature 0 \
+            --overwrite
+
+      - name: Upload five-task precision diagnostics
+        if: >-
+          always() &&
+          (github.ref_name == 'decode_graph' ||
+           github.event.pull_request.base.ref == 'decode_graph')
+        uses: actions/upload-artifact@v4
+        with:
+          name: onerec-precision-${{ github.run_id }}
+          path: onerec_precision_results
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Check clear device
         if: always()

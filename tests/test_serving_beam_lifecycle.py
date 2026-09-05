@@ -417,6 +417,24 @@ def test_eos_and_distinct_sid_end_token_both_complete() -> None:
     assert [choice.token_ids for choice in choices] == [[], []]
 
 
+def test_eos_completion_does_not_reenter_active_beams_with_fabricated_score() -> None:
+    engine = _OrdinaryEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 2], [-0.2, -2.0]))],
+    )
+
+    outputs = _run_search(
+        engine,
+        max_tokens=1,
+        request_id="mixed-active-and-eos",
+    )
+
+    choices = outputs[0].outputs
+    assert [choice.token_ids for choice in choices] == [[11], []]
+    assert [choice.cumulative_logprob for choice in choices] == [-0.2, -2.0]
+    assert [choice.finish_reason for choice in choices] == ["length", "stop"]
+    assert [choice.stop_reason for choice in choices] == [None, 2]
+
+
 def test_self_advance_chained_step_skips_frontend_update(
     monkeypatch: Any,
 ) -> None:

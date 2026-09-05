@@ -112,7 +112,10 @@ def apply_sid_to_pid_strategy(pid_info_list: List[Dict[str, int]], strategy: str
 
     Strategies:
         - "most_popular_originally": Return the PID with highest original count (already sorted)
-        - "most_popular_after_downsampling": Return the PID with highest downsampled count (random if tie)
+        - "most_popular_after_downsampling": Return the PID with highest
+          downsampled count. Ties preserve the mapping-file order, which is
+          already sorted by original popularity. This makes repeated accuracy
+          evaluations deterministic.
         - "random": Randomly select one PID from the list
     """
     if not pid_info_list:
@@ -124,14 +127,14 @@ def apply_sid_to_pid_strategy(pid_info_list: List[Dict[str, int]], strategy: str
     elif strategy == "most_popular_after_downsampling":
         # Find max downsampled count
         max_count = max(info["count_after_downsample"] for info in pid_info_list)
-        # Get all PIDs/IIDs with max downsampled count
-        max_pids = [
+        # Preserve mapping order on ties. The imported mapping is sorted by
+        # original popularity, so the first maximum is both meaningful and
+        # stable across runs and branches.
+        return next(
             _get_id_from_info(info)
             for info in pid_info_list
             if info["count_after_downsample"] == max_count
-        ]
-        # Randomly select one if there are ties
-        return random.choice(max_pids)
+        )
     elif strategy == "random":
         # Randomly select a PID/IID
         return random.choice([_get_id_from_info(info) for info in pid_info_list])

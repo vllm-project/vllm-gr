@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from abc import ABC
+from collections import Counter
 from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any, Dict, Optional, Type
@@ -180,6 +181,8 @@ class DataLoaderWrapper:
         task_name: str,
         split: str = "test",
         sample_size: Optional[Any] = None,
+        sample_ids: Optional[list[int | str]] = None,
+        cache_sample: bool = True,
     ):
         """Load data using new loader system"""
         if task_name not in self._loader_cache:
@@ -192,7 +195,12 @@ class DataLoaderWrapper:
             )
 
         loader = self._loader_cache[task_name]
-        return loader.load_data(split=split, sample_size=sample_size)
+        return loader.load_data(
+            split=split,
+            sample_size=sample_size,
+            sample_ids=sample_ids,
+            cache_sample=cache_sample,
+        )
 
 
 class BaseLoader(ABC):
@@ -228,7 +236,11 @@ class BaseLoader(ABC):
             )
 
     def load_data(
-        self, split: str = "test", sample_size: Optional[Any] = None
+        self,
+        split: str = "test",
+        sample_size: Optional[Any] = None,
+        sample_ids: Optional[list[int | str]] = None,
+        cache_sample: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Load data for the task in messages-based format
@@ -236,6 +248,11 @@ class BaseLoader(ABC):
         Args:
             split: Dataset split (default "test")
             sample_size: Override sample size (can be int, "full", or None to use task config)
+            sample_ids: Exact dataframe row indices to load, preserving the
+                supplied order. Mutually exclusive with sample_size.
+            cache_sample: Whether a size-based random sample may be loaded
+                from or written to the dataset directory. Explicit-ID loads
+                never use this cache.
 
         Returns:
             Dictionary mapping sample_id to sample data:
@@ -250,6 +267,28 @@ class BaseLoader(ABC):
                 }
             }
         """
+        if sample_ids is not None and sample_size is not None:
+            raise ValueError("sample_ids and sample_size are mutually exclusive")
+
+        # An explicit manifest is the reproducibility contract used by CI.
+        # Always select it from the canonical parquet rather than a previously
+        # generated sample file whose row index may have been reset.
+        if sample_ids is not None:
+            df = self._load_dataframe(split)
+            normalized_ids = [int(sample_id) for sample_id in sample_ids]
+            duplicate_ids = sorted(
+                sample_id for sample_id, count in Counter(normalized_ids).items() if count > 1
+            )
+            if duplicate_ids:
+                raise ValueError(f"sample_ids contains duplicates: {duplicate_ids[:10]}")
+            missing_ids = [sample_id for sample_id in normalized_ids if sample_id not in df.index]
+            if missing_ids:
+                raise ValueError(
+                    f"sample_ids are not present in {self.task_name}: {missing_ids[:10]}"
+                )
+            df = df.loc[normalized_ids]
+            return self._process_dataframe(df)
+
         # Determine effective sample size
         if sample_size is not None:
             if sample_size == "full":
@@ -264,7 +303,8 @@ class BaseLoader(ABC):
         # Try to load cached sample dataframe
         df = None
         if (
-            effective_sample_size is not None
+            cache_sample
+            and effective_sample_size is not None
             and full_size is not None
             and effective_sample_size < full_size
         ):
@@ -279,7 +319,7 @@ class BaseLoader(ABC):
                 df = self._sample_data(df, effective_sample_size)
 
                 # Save sampled data
-                if full_size is not None and effective_sample_size < full_size:
+                if cache_sample and full_size is not None and effective_sample_size < full_size:
                     self._save_sample_data(df, split, effective_sample_size)
 
         if "messages" not in df.columns:

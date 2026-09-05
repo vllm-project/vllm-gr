@@ -220,6 +220,7 @@ def _make_beam_update(
     current_wave: int = 0,
     data_parallel_rank: int | None = None,
     constraint_step: int = 0,
+    parent_cumulative_logprobs: list[float] | None = None,
 ) -> BeamRequestStepUpdate:
     return BeamRequestStepUpdate(
         session_id=session_id,
@@ -235,6 +236,7 @@ def _make_beam_update(
         current_wave=current_wave,
         data_parallel_rank=data_parallel_rank,
         constraint_step=constraint_step,
+        parent_cumulative_logprobs=parent_cumulative_logprobs,
     )
 
 
@@ -411,9 +413,9 @@ class TestTypesSerialization:
         assert decoded.beam_width == 0
 
     def test_constraint_step_roundtrip_and_legacy_default(self) -> None:
-        # The new field is appended last with default 0; msgspec's array_like
+        # constraint_step was appended with default 0; msgspec's array_like
         # decoder fills a missing trailing field with the declared default, so
-        # legacy code streams (encoded without constraint_step) still decode.
+        # legacy streams (without it or later parent scores) still decode.
         update = _make_beam_update(beam_tokens=[[50], [60]], beam_width=2)
         assert update.constraint_step == 0
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(update), type=BeamRequestStepUpdate)
@@ -451,6 +453,7 @@ class TestTypesSerialization:
             msgspec.msgpack.encode(legacy_array), type=BeamRequestStepUpdate
         )
         assert legacy.constraint_step == 0
+        assert legacy.parent_cumulative_logprobs is None
 
 
 # ===========================================================================
@@ -854,6 +857,7 @@ class TestBeamCache:
             parent_beam_ids=["old-0", "old-1"],
             child_beam_ids=["new-0", "new-1"],
             constraint_step=1,
+            parent_cumulative_logprobs=[-1.25, -2.5],
         )
         with (
             patch("vllm.v1.request.Request") as MockReq,
@@ -866,12 +870,14 @@ class TestBeamCache:
         assert mock_req.is_constrained is True
         assert mock_req.constraint_step == 1
         assert mock_req.beam_suffix == [[50], [60]]
+        assert mock_req.parent_cumulative_logprobs == [-1.25, -2.5]
         assert mock_req.is_constraint_prefill is False
 
         metadata = build_beam_request_metadata(mock_req, num_scheduled_tokens=3)
         assert metadata["is_constrained"] is True
         assert metadata["constraint_step"] == 1
         assert metadata["beam_suffix"] == [[50], [60]]
+        assert metadata["parent_cumulative_logprobs"] == [-1.25, -2.5]
 
     def test_handle_keeps_constraint_metadata_off_for_trie(self) -> None:
         eng = _make_engine_self(beam_cache={"session-0": _session_entry()})
@@ -1497,8 +1503,8 @@ class TestBeamSearchOrchestration:
         ec.beam_request_step_update = AsyncMock()
 
         all_beams = [
-            SimpleNamespace(tokens=[10, 20, 50]),
-            SimpleNamespace(tokens=[10, 20, 60]),
+            SimpleNamespace(tokens=[10, 20, 50], cum_logprob=-1.25),
+            SimpleNamespace(tokens=[10, 20, 60], cum_logprob=-2.5),
         ]
         fork_info = [(0, 50), (1, 60)]
 
@@ -1529,6 +1535,7 @@ class TestBeamSearchOrchestration:
         assert update.parent_beam_ids == ["prev-0", "prev-1"]
         assert update.child_beam_ids == ["batch-1-beam-0", "batch-1-beam-1"]
         assert update.beam_tokens == [[50], [60]]  # full_tokens[prefix_len:]
+        assert update.parent_cumulative_logprobs == [-1.25, -2.5]
         # Both parents used → nothing pruned
         assert update.pruned_ids == []
         assert update.eos_token_id == 2

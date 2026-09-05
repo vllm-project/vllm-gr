@@ -77,6 +77,7 @@ vllm-gr serve OpenOneRec/OneRec-1.7B \
   --max-logprobs 1024 \
   --max-num-seqs 1024 \
   --max-num-batched-tokens 16384 \
+  --beam-max-width 128 \
   --scheduling-policy priority \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```

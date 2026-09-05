@@ -10,6 +10,11 @@ from typing import cast
 
 import torch
 
+from vllm_gr.constraints.scoring import score_selected_tokens
+from vllm_gr.constraints.validity import (
+    constraint_candidate_counts,
+    valid_mask_from_counts,
+)
 from vllm_gr.ops.npu._xllm_loader import custom_ops as _custom_ops
 
 MAX_TOP_K = 256
@@ -79,7 +84,7 @@ def rec_constrained_topk_npu(
         )
     if logits.dtype == torch.bfloat16:
         logits = logits.to(torch.float32)
-    return cast(
+    token_ids, _ = cast(
         tuple[torch.Tensor, torch.Tensor],
         custom_ops.rec_constrained_topk(
             logits,
@@ -97,6 +102,24 @@ def rec_constrained_topk_npu(
             max_prefix2_degree,
         ),
     )
+    vocab_size = prefix1_offsets.numel() - 1
+    valid_counts = constraint_candidate_counts(
+        sequence_group,
+        first_token_ids,
+        prefix1_offsets,
+        prefix1_pair_keys,
+        prefix2_value_offsets,
+        current_step=current_step,
+        vocab_size=vocab_size,
+    )
+    valid_mask = valid_mask_from_counts(valid_counts, top_k)
+    logprobs = score_selected_tokens(
+        logits,
+        token_ids,
+        valid_mask,
+        temperatures,
+    )
+    return token_ids, logprobs
 
 
 __all__ = [

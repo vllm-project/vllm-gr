@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="misc,no-any-return"
 """Unit tests for EngineCore engine-driven chaining.
 
 Covers the chain that removes the per-step frontend RPC round-trip:
@@ -31,6 +32,7 @@ from vllm.v1.engine import (
     EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreRequestType,
+    FinishReason,
 )
 
 import vllm_gr.v1.engine.core as core_module
@@ -48,7 +50,7 @@ from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 
 def _sampling_params(**overrides: Any) -> SamplingParams:
-    defaults = dict(max_tokens=4, logprobs=2, temperature=0.0, detokenize=False)
+    defaults = {"max_tokens": 4, "logprobs": 2, "temperature": 0.0, "detokenize": False}
     defaults.update(overrides)
     return SamplingParams(**defaults)
 
@@ -607,7 +609,7 @@ class TestBeamSelfAdvance:
             assert eng.input_queue.qsize() == 2  # terminal adds nothing
             # Final ADD still carries the full 3-step suffixes.
             while not eng.input_queue.empty():
-                _req_type, payload = eng.input_queue.get_nowait()
+                _req_type, _payload = eng.input_queue.get_nowait()
             _, kwargs = MockReq.call_args
             assert kwargs["prompt_token_ids"] == [10, 20, 30, 62, 72]
             assert MockReq.return_value.beam_decode_steps == 3
@@ -776,6 +778,7 @@ class TestDecisionPayloadShapes:
         decision = {
             "out_token_ids": torch.tensor([[61, 71]], dtype=torch.int32),
             "out_token_index": torch.tensor([[1, 0]], dtype=torch.int32),
+            "out_log_probs": torch.tensor([[-1.0, -2.0]], dtype=torch.float32),
             "is_last_step": False,
         }
 
@@ -830,3 +833,86 @@ class TestDecisionPayloadShapes:
 
         assert eng.input_queue.empty()
         MockReq.assert_not_called()
+
+
+# ===========================================================================
+# Section — parent cumulative score guard (EOS-masked -inf beams)
+# ===========================================================================
+
+
+class TestApplyBeamStepParentScoreGuard:
+    """EOS-masked beams legitimately carry -inf cumulative scores.
+
+    The fixed-width candidate selection keeps EOS-masked (-inf) slots alive,
+    so the transported parent scores may contain -inf.  The guard must accept
+    those, reject only NaN/+inf/length mismatches, and every rejection must
+    publish ERROR outputs for the children — a bare rejection would leave the
+    frontend waiting on the session forever.
+    """
+
+    @staticmethod
+    def _update(parent_scores: Any) -> BeamRequestStepUpdate:
+        return BeamRequestStepUpdate(
+            session_id="s0",
+            parent_beam_ids=["p0", "p1"],
+            child_beam_ids=["c0", "c1"],
+            beam_tokens=[[50], [60]],
+            pruned_ids=[],
+            prefix_len=3,
+            beam_width=2,
+            sampling_params=_sampling_params(),
+            eos_token_id=9,
+            client_index=5,
+            max_decode_steps=7,
+            parent_cumulative_logprobs=parent_scores,
+        )
+
+    def _run(self, eng: Any, update: BeamRequestStepUpdate) -> bool:
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = MagicMock()
+            mock_req.block_hashes = []
+            mock_req.is_constrained = False
+            MockReq.return_value = mock_req
+            return core_module._apply_beam_step(eng, update)
+
+    @pytest.mark.parametrize(
+        "scores",
+        [
+            [-float("inf"), -1.25],
+            [-float("inf"), -float("inf")],
+        ],
+        ids=["mixed", "all-masked"],
+    )
+    def test_eos_masked_neg_inf_parents_are_accepted(self, scores: list[float]) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+
+        assert self._run(eng, self._update(scores)) is True
+
+        assert eng.input_queue.qsize() == 1
+        assert eng.output_queue.empty()
+
+    @pytest.mark.parametrize(
+        "scores",
+        [
+            [float("nan"), -1.25],
+            [float("inf"), -1.25],
+            [-1.0, -0.5, -3.0],
+        ],
+        ids=["nan", "plus-inf", "length-mismatch"],
+    )
+    def test_invalid_parent_scores_reject_and_publish_error(self, scores: list[float]) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+
+        assert self._run(eng, self._update(scores)) is False
+
+        assert eng.input_queue.empty()
+        published: list[tuple[str, Any]] = []
+        while not eng.output_queue.empty():
+            client_index, outputs = eng.output_queue.get_nowait()
+            assert client_index == 5
+            for out in outputs.outputs:
+                published.append((out.request_id, out.finish_reason))
+        assert published == [
+            ("c0", FinishReason.ERROR),
+            ("c1", FinishReason.ERROR),
+        ]

@@ -50,3 +50,6 @@ class BeamRequestStepUpdate(
     # Tables (issue #246).  Default 0 also means "not a constrained decode", so
     # omit_defaults keeps legacy code streams byte-identical.
     constraint_step: int = 0
+    # Appended after all existing fields to preserve msgspec's positional
+    # array wire compatibility with older EngineCore processes.
+    parent_cumulative_logprobs: list[float] | None = None

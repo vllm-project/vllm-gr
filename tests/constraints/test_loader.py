@@ -250,7 +250,7 @@ def test_readiness_accepts_normalized_reference_at_top_k_256(
 
 
 @pytest.mark.parametrize("failure_mode", ["raw", "ignore_temperature", "top_k_normalized"])
-def test_readiness_rejects_unnormalized_logprobs(
+def test_readiness_rescores_legacy_operator_logprobs(
     failure_mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -312,14 +312,16 @@ def test_readiness_rejects_unnormalized_logprobs(
     backend = _readiness_backend(broken_op, table=table, top_k=2)
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
     try:
-        with pytest.raises(RuntimeError, match="normalized reference"):
-            loader._run_npu_readiness(  # noqa: SLF001
-                backend,
-                cases=loader._readiness_cases(table, 2),  # noqa: SLF001
-                device=torch.device("cpu"),
-                dtype=torch.float32,
-                max_rows=2,
-            )
+        # Existing NPU extensions return legal-set-normalized scores.  The
+        # Python Backend deliberately ignores those values and rebuilds
+        # shared-domain model logprobs from raw logits and selected token IDs.
+        loader._run_npu_readiness(  # noqa: SLF001
+            backend,
+            cases=loader._readiness_cases(table, 2),  # noqa: SLF001
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            max_rows=2,
+        )
     finally:
         backend.close()
 

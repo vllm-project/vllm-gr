@@ -5,6 +5,7 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Any
@@ -208,7 +209,7 @@ def _handle_submit_session(self, requests, template) -> None:
     for req in requests:
         try:
             request = self.preprocess_add_request(req)
-        except Exception:
+        except Exception:  # noqa: BLE001 - one bad request must not kill the batch
             self._handle_request_preproc_error(req)
             continue
         self._cache_beam_request(request[0])
@@ -267,6 +268,39 @@ def _apply_beam_step(self, update) -> bool:
         or len(update.child_beam_ids) != beam_width
     ):
         logger.error("BEAM_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
+        for child_id in update.child_beam_ids:
+            self.output_queue.put_nowait(
+                (
+                    update.client_index,
+                    EngineCoreOutputs(
+                        engine_index=self.engine_index,
+                        finished_requests={child_id},
+                        outputs=[
+                            EngineCoreOutput(
+                                request_id=child_id,
+                                new_token_ids=[],
+                                finish_reason=FinishReason.ERROR,
+                            )
+                        ],
+                    ),
+                )
+            )
+        return False
+
+    parent_scores = update.parent_cumulative_logprobs
+    if parent_scores is not None and (
+        len(parent_scores) != beam_width
+        or any(math.isnan(float(score)) or float(score) == math.inf for score in parent_scores)
+    ):
+        logger.error(
+            "BEAM_REQUEST_STEP_UPDATE: session=%s invalid parent cumulative scores",
+            session_id,
+        )
+        # EOS-masked beams legitimately carry -inf cumulative scores and are
+        # accepted above; only NaN/+inf are protocol errors.  Either way a
+        # bare rejection would leave the frontend waiting on this session
+        # forever (serving: 120s timeout; offline: hang), so unblock the
+        # waiter with an ERROR result for every child.
         for child_id in update.child_beam_ids:
             self.output_queue.put_nowait(
                 (
@@ -380,19 +414,27 @@ def _apply_beam_step(self, update) -> bool:
     req.prefix_len = update.prefix_len
     # Store parent beam indices for incremental decode KV reordering
     req.parent_beam_indices = update.parent_beam_indices
+    req.parent_cumulative_logprobs = (
+        [float(score) for score in parent_scores] if parent_scores is not None else None
+    )
     # Store max decode steps for KV pool pre-allocation
     req.max_decode_steps = update.max_decode_steps
+
+    # Parent beam token sequences ride along for every beam decode request:
+    # the Worker seeds its beam-decision state from them when a session is
+    # (re)created (_seed_beam_decision_from_metadata), which rejects parent
+    # scores without suffixes.  Constraint Table decode additionally uses
+    # them to rebuild the operator's sequence_group.
+    req.beam_suffix = [list(t) for t in update.beam_tokens]
 
     if _engine_constraint_table_active(self):
         # Constraint Table decode: the Worker runs the constrained top-k
         # operator at raw-logits time.  constraint_step equals the number of
-        # generated tokens so far (1 or 2 under the 3-step cap); beam_suffix
-        # lets the Worker rebuild the sequence_group the operator reads.
+        # generated tokens so far (1 or 2 under the 3-step cap).
         # constraint_step 0 is reserved for the constrained prefill, so this
         # decode request clears is_constraint_prefill.
         req.is_constrained = True
         req.constraint_step = update.constraint_step if update.constraint_step > 0 else decode_steps
-        req.beam_suffix = [list(t) for t in update.beam_tokens]
         req.is_constraint_prefill = False
 
     _add_preprocessed_request(self, (req, update.current_wave))
@@ -410,6 +452,9 @@ def _apply_beam_step(self, update) -> bool:
         if cached is not None:
             cached["running_suffix"] = {
                 "beam_tokens": [list(t) for t in update.beam_tokens],
+                "parent_cumulative_logprobs": (
+                    [float(score) for score in parent_scores] if parent_scores is not None else None
+                ),
                 "prefix_len": update.prefix_len,
                 "beam_width": beam_width,
                 "sampling_params": update.sampling_params,
@@ -482,7 +527,7 @@ def _accelerator_beam_with_worker_decision(cfg: Any) -> bool:
         device_type = str(getattr(current_platform, "device_type", ""))
         if device_type not in ("cuda", "npu"):
             return False
-    except Exception:  # pragma: no cover - platform introspection is best-effort
+    except Exception:  # noqa: BLE001 - platform introspection is best-effort
         return False
     return bool(cfg.beam_worker_decision and cfg.beam_max_width is not None)
 
@@ -565,10 +610,11 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
 
     compact = unpack_beam_result_buffer(decision)
     if compact is not None:
-        tokens_flat, _, parents_flat = compact
+        tokens_flat, scores_flat, parents_flat = compact
     else:
         out_token_ids = decision.get("out_token_ids")
         out_token_index = decision.get("out_token_index")
+        out_log_probs = decision.get("out_log_probs")
         if out_token_ids is None or out_token_index is None:
             logger.debug(
                 "vllm-gr: beam self-advance skipped (no candidate tensors) for %s",
@@ -577,6 +623,7 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
             return
         tokens_flat = flatten_decision_value(out_token_ids)
         parents_flat = flatten_decision_value(out_token_index)
+        scores_flat = flatten_decision_value(out_log_probs) if out_log_probs is not None else None
     if tokens_flat is None or parents_flat is None:
         logger.debug(
             "vllm-gr: beam self-advance skipped (unflattenable candidate payload) for %s",
@@ -599,7 +646,12 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
     # host tensors (in-process) or nested lists (post-IPC normalization).
     parents = [int(p) for p in parents_flat]
     new_tokens = [int(t) for t in tokens_flat]
-    if len(parents) != len(new_tokens) or not parents:
+    parent_scores = [float(score) for score in scores_flat] if scores_flat is not None else None
+    if (
+        len(parents) != len(new_tokens)
+        or (parent_scores is not None and len(parent_scores) != len(new_tokens))
+        or not parents
+    ):
         logger.warning(
             "vllm-gr: beam self-advance skipped (malformed decision width %d) for %s",
             len(parents),
@@ -659,6 +711,19 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
         prev_suffixes = routing.beam_tokens
         step = None  # derived from the extended suffixes below
 
+    # A worker decision that contains EOS needs frontend lifecycle handling:
+    # the frontend records the completed candidates, removes them from the
+    # active set, and may continue with fewer than ``beam_width`` survivors.
+    # Chaining the fixed-width worker decision here would instead advance the
+    # EOS candidate before the frontend can split it from the live beams.
+    eos_token_id = getattr(routing, "eos_token_id", None)
+    if eos_token_id is not None and eos_token_id in new_tokens:
+        logger.debug(
+            "vllm-gr: beam self-advance skipped (decision contains EOS) for %s",
+            session_id,
+        )
+        return
+
     if any(p < 0 or p >= len(prev_suffixes) for p in parents):
         logger.warning(
             "vllm-gr: beam self-advance skipped (parent index out of range) for %s",
@@ -691,6 +756,7 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
         cache_salt=routing.cache_salt,
         trace_headers=routing.trace_headers,
         parent_beam_indices=parents,
+        parent_cumulative_logprobs=parent_scores,
         max_decode_steps=routing.max_decode_steps,
         # Prefill: the template carries the frontend's step-0 value directly
         # (=1 for constrained sessions, 0 otherwise).  Decode: derived from
@@ -740,7 +806,7 @@ def dispatch_gr_engine_core_input(self, request_type, payload) -> bool:
         for req in payload:
             try:
                 request = self.preprocess_add_request(req)
-            except Exception:
+            except Exception:  # noqa: BLE001 - one bad request must not kill the batch
                 self._handle_request_preproc_error(req)
                 continue
             self._cache_beam_request(request[0])
@@ -854,7 +920,7 @@ def process_input_sockets(
                     req: EngineCoreRequest = decoded_payload
                     try:
                         request = self.preprocess_add_request(req)
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - one bad request must not kill the loop
                         self._handle_request_preproc_error(req)
                         continue
 

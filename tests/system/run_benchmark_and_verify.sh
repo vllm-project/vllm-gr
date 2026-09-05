@@ -31,15 +31,27 @@ fi
 required_policy_variables=(
   BENCHMARK_POLICY_NAME
   BENCHMARK_DEVICE
-  ACCURACY_FAILURE_MODE
-  PASS_AT_1_THRESHOLD
-  PASS_AT_32_THRESHOLD
-  RECALL_AT_32_THRESHOLD
   ELAPSED_TIME_ONLINE_THRESHOLD
   ELAPSED_TIME_OFFLINE_THRESHOLD
   P99_TTFT_THRESHOLD
   P99_TPOT_THRESHOLD
 )
+legacy_accuracy_gate="${LEGACY_ONEREC_ACCURACY_GATE:-true}"
+case "$legacy_accuracy_gate" in
+  true | false) ;;
+  *)
+    echo "Error: LEGACY_ONEREC_ACCURACY_GATE must be true or false." >&2
+    exit 1
+    ;;
+esac
+if [[ "$legacy_accuracy_gate" == "true" ]]; then
+  required_policy_variables+=(
+    ACCURACY_FAILURE_MODE
+    PASS_AT_1_THRESHOLD
+    PASS_AT_32_THRESHOLD
+    RECALL_AT_32_THRESHOLD
+  )
+fi
 for variable_name in "${required_policy_variables[@]}"; do
   if [[ -z "${!variable_name:-}" ]]; then
     echo "Error: $variable_name must be set by the benchmark policy resolver." >&2
@@ -47,12 +59,15 @@ for variable_name in "${required_policy_variables[@]}"; do
   fi
 done
 
+if [[ "$legacy_accuracy_gate" == "true" ]]; then
+  validate_failure_mode "ACCURACY_FAILURE_MODE" "$ACCURACY_FAILURE_MODE" || exit $?
+fi
+
 p99_ttft_failure_mode="${P99_TTFT_FAILURE_MODE:-${PERFORMANCE_FAILURE_MODE:-}}"
 p99_tpot_failure_mode="${P99_TPOT_FAILURE_MODE:-${PERFORMANCE_FAILURE_MODE:-}}"
 online_elapsed_failure_mode="${ONLINE_ELAPSED_FAILURE_MODE:-${PERFORMANCE_FAILURE_MODE:-}}"
 offline_elapsed_failure_mode="${OFFLINE_ELAPSED_FAILURE_MODE:-${PERFORMANCE_FAILURE_MODE:-}}"
 for mode_name in \
-  ACCURACY_FAILURE_MODE \
   p99_ttft_failure_mode \
   p99_tpot_failure_mode \
   online_elapsed_failure_mode \
@@ -69,9 +84,11 @@ run_port="${VLLM_GR_BENCHMARK_PORT:-7000}"
 server_timeout="${VLLM_GR_BENCHMARK_SERVE_TIMEOUT:-600}"
 policy_name="$BENCHMARK_POLICY_NAME"
 device="$BENCHMARK_DEVICE"
-pass_1_th="$PASS_AT_1_THRESHOLD"
-pass_32_th="$PASS_AT_32_THRESHOLD"
-recall_32_th="$RECALL_AT_32_THRESHOLD"
+if [[ "$legacy_accuracy_gate" == "true" ]]; then
+  pass_1_th="$PASS_AT_1_THRESHOLD"
+  pass_32_th="$PASS_AT_32_THRESHOLD"
+  recall_32_th="$RECALL_AT_32_THRESHOLD"
+fi
 elapsed_time_online_th="$ELAPSED_TIME_ONLINE_THRESHOLD"
 elapsed_time_offline_th="$ELAPSED_TIME_OFFLINE_THRESHOLD"
 p99_ttft_th="$P99_TTFT_THRESHOLD"
@@ -115,7 +132,10 @@ echo "Using dataset: $DATASET_PATH"
 echo "Using catalog: $CATALOG_PATH"
 echo "Benchmark policy: $policy_name"
 echo "Device: $device"
-echo "Accuracy failures: $ACCURACY_FAILURE_MODE"
+echo "Legacy Video-100 accuracy gate: $legacy_accuracy_gate"
+if [[ "$legacy_accuracy_gate" == "true" ]]; then
+  echo "Accuracy failures: $ACCURACY_FAILURE_MODE"
+fi
 echo "P99 TTFT failures: $p99_ttft_failure_mode"
 echo "P99 TPOT failures: $p99_tpot_failure_mode"
 echo "Online elapsed failures: $online_elapsed_failure_mode"
@@ -176,17 +196,19 @@ if [[ "$offline_status" -ne 0 ]]; then
   exit "$offline_status"
 fi
 
-pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
-pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
-recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
 elapsed_time=$(extract_numeric_value "$output" "elapsed_time") || exit 1
 
-validate_accuracy_metric "offline pass@1" "$pass_1" "$pass_1_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
-validate_accuracy_metric "offline pass@32" "$pass_32" "$pass_32_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
-validate_accuracy_metric "offline recall@32" "$recall_32" "$recall_32_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+if [[ "$legacy_accuracy_gate" == "true" ]]; then
+  pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
+  pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
+  recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
+  validate_accuracy_metric "offline pass@1" "$pass_1" "$pass_1_th" \
+    "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+  validate_accuracy_metric "offline pass@32" "$pass_32" "$pass_32_th" \
+    "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+  validate_accuracy_metric "offline recall@32" "$recall_32" "$recall_32_th" \
+    "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+fi
 validate_performance_metric "offline elapsed_time" "$elapsed_time" \
   "$elapsed_time_offline_th" "$offline_elapsed_failure_mode" "$device" 89 || exit $?
 
@@ -298,9 +320,8 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --num-prompts 100 \
   --max-concurrency 1 \
   --use-beam-search \
-  --backend openai-chat \
   --task-type video \
-  --endpoint /v1/chat/completions \
+  --endpoint /v1/completions \
   --port "$run_port" \
   --n "$beam_width")
 online_accuracy_status=$?
@@ -310,16 +331,18 @@ if [[ "$online_accuracy_status" -ne 0 ]]; then
   exit "$online_accuracy_status"
 fi
 
-pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
-pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
-recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
 elapsed_time_online=$(extract_numeric_value "$output" "elapsed_time") || exit 1
-validate_accuracy_metric "online pass@1" "$pass_1" "$pass_1_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
-validate_accuracy_metric "online pass@32" "$pass_32" "$pass_32_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
-validate_accuracy_metric "online recall@32" "$recall_32" "$recall_32_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+if [[ "$legacy_accuracy_gate" == "true" ]]; then
+  pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
+  pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
+  recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
+  validate_accuracy_metric "online pass@1" "$pass_1" "$pass_1_th" \
+    "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+  validate_accuracy_metric "online pass@32" "$pass_32" "$pass_32_th" \
+    "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+  validate_accuracy_metric "online recall@32" "$recall_32" "$recall_32_th" \
+    "$ACCURACY_FAILURE_MODE" "$device" 86 || exit $?
+fi
 validate_performance_metric "online elapsed_time" "$elapsed_time_online" \
   "$elapsed_time_online_th" "$online_elapsed_failure_mode" "$device" 89 || exit $?
 

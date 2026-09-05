@@ -96,8 +96,11 @@ def extract_id_from_generation(generation: str) -> str:
             elif part.strip():  # No end marker, take the content after begin marker
                 return part.strip()
 
-    # Otherwise, return the stripped generation
-    return generation
+    # OneRec semantic IDs are generated after the pre-calculated
+    # <|sid_begin|> sentinel and terminated by <|sid_end|>.  Strip the
+    # sentinel tags so the prediction matches the answer-side SID format
+    # (e.g. "<s_a_3021><s_b_3805><s_c_6852>").
+    return generation.replace("<|sid_begin|>", "").replace("<|sid_end|>", "").strip()
 
 
 def compute_pass_at_k(predicted_sids: List[str], ground_truth_sids: Set[str], k: int) -> bool:

@@ -2,6 +2,8 @@ version: 2
 name: development
 
 thresholds:
+  # Absolute Video-100 smoke floors used by the main-branch decode gate.
+  # decode_graph uses the versioned five-task constrained golden instead.
   accuracy:
     pass_at_1_min: 0.09
     pass_at_32_min: 0.29
