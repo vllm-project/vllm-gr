@@ -921,3 +921,33 @@ No NPU hard counter, trace, numerical parity, memory stability, or performance
 claim is established by the entry inspection or CPU fake-operator tests.
 Step 6 cannot be committed as an accepted Step or marked PASS before the
 remaining required checks are completed.
+
+## 2026-09-05 explicit mask-aware NPU device stage
+
+The proposed mask-aware xllm operator symbols were not added: the installed
+xllm_ops ABI has only `beam_search_group` and
+`beam_search_rec_final_select`, and no local operator source is available in
+this workspace. `vllm_gr/v1/worker/npu_gr_masked_decision.py` instead
+implements the alternative already allowed by the review above: an explicit
+B=1 device tensor stage with fixed caller-owned outputs.
+
+The stage performs a stable score sort followed by a stable structural-validity
+sort. This makes a legal `-inf` candidate rank ahead of invalid `-inf` padding
+without replacing either value with a finite sentinel. Non-final winners are
+then stably grouped by parent and receive consistent prefix counts; final
+winners retain global score order. Insufficient or invalid candidates produce
+safe zero token/parent rows and a device status for the eventual single final
+D2H check. The canonical sequence and scores remain device tensors.
+
+CPU contract validation (not NPU hardware acceptance):
+
+```text
+146 passed
+```
+
+This includes the new legal-`-inf` counterexample, finite reference parity,
+unaligned final result width, safe error rows, fixed output addresses, and the
+existing NPU sampler/decision/workspace/KV contracts. NPU support and ACL Graph
+behavior of the selected `torch.sort(..., stable=True, out=...)` path remain a
+hardware acceptance item. The NPU factory remains disabled until the composite
+backend and final async transport are connected.
