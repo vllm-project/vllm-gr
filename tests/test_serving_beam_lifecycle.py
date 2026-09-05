@@ -17,11 +17,15 @@ from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
-from vllm_gr.entrypoints import gr as offline_gr
-from vllm_gr.entrypoints.openai import serving_engine
 from vllm_gr.constraints import BeamConstraintCoordinator
 from vllm_gr.constraints.strategies import ConstraintTableStrategy
-from vllm_gr.v1.engine.types import GR_REQUEST_METADATA_KEY, BeamRequestStepUpdate
+from vllm_gr.entrypoints import gr as offline_gr
+from vllm_gr.entrypoints.openai import serving_engine
+from vllm_gr.v1.engine.types import (
+    GR_REQUEST_METADATA_KEY,
+    BeamRequestStepUpdate,
+    GRRequestMetadata,
+)
 
 _DIGEST = "sha256:" + "a" * 64
 
@@ -523,6 +527,36 @@ def test_offline_persistent_live_target_keeps_waiting_for_final() -> None:
     assert calls == 2
 
 
+def test_offline_persistent_step_failure_aborts_live_native_request() -> None:
+    internal_id = "native-internal-0"
+    request_states = {internal_id: object()}
+    abort_calls: list[tuple[list[str], bool]] = []
+
+    def abort_request(request_ids: list[str], internal: bool = False) -> None:
+        abort_calls.append((list(request_ids), internal))
+        for request_id in request_ids:
+            request_states.pop(request_id)
+
+    llm_engine = SimpleNamespace(
+        step=Mock(side_effect=RuntimeError("step failed")),
+        abort_request=abort_request,
+        output_processor=SimpleNamespace(request_states=request_states),
+    )
+
+    with pytest.raises(RuntimeError, match="step failed"):
+        offline_gr._step_engine_and_collect_outputs(
+            llm_engine=llm_engine,
+            instances_batch=[SimpleNamespace(beams=[object()])],
+            token=0,
+            prompt_start=0,
+            instance_prefill_id={0: internal_id},
+            persistent_request=True,
+        )
+
+    assert abort_calls == [([internal_id], True)]
+    assert request_states == {}
+
+
 def test_offline_ordinary_output_collection_does_not_inspect_request_registry() -> None:
     class OrdinaryOutputProcessor:
         @property
@@ -875,6 +909,126 @@ def test_persistent_runner_state_uses_one_native_request(
     assert [choice.cumulative_logprob for choice in outputs[0].outputs] == [
         pytest.approx(-0.6),
         pytest.approx(-0.7),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persistent_online_collection_failure_aborts_and_marks_frontend_state() -> None:
+    class FailingQueue:
+        async def get(self):
+            raise RuntimeError("collector failed")
+
+    request_state = SimpleNamespace()
+    abort_calls: list[tuple[list[str], bool]] = []
+
+    class Client:
+        output_processor = SimpleNamespace(request_states={"native": request_state})
+
+        async def prepare_request(self, *_args, **_kwargs):
+            params = _args[2]
+            return FailingQueue(), SimpleNamespace(
+                request_id="native",
+                sampling_params=params,
+            )
+
+        async def _add_requests_batch(self, requests, *, use_batch_message):
+            assert [request.request_id for request in requests] == ["native"]
+            assert use_batch_message is False
+
+        async def abort(self, request_ids, internal=False):
+            abort_calls.append((list(request_ids), internal))
+            self.output_processor.request_states.pop("native")
+
+    params = SamplingParams(logprobs=2, max_tokens=1)
+    metadata = GRRequestMetadata(
+        request_id="external",
+        beam_width=2,
+        generation_steps=3,
+        prefix_len=1,
+        result_width=2,
+        constraint_digest=_DIGEST,
+    )
+
+    with pytest.raises(RuntimeError, match="collector failed"):
+        await serving_engine._add_batch_step(
+            Client(),
+            ({"prompt_token_ids": [10]},),
+            (None,),
+            "external-step",
+            params,
+            False,
+            None,
+            gr_metadata=metadata,
+        )
+
+    assert request_state.gr_persistent_request is True
+    assert abort_calls == [(["native"], True)]
+
+
+@pytest.mark.asyncio
+async def test_persistent_online_metadata_failure_aborts_prepared_request() -> None:
+    class BrokenSamplingParams:
+        @property
+        def extra_args(self):
+            return None
+
+        @extra_args.setter
+        def extra_args(self, _value):
+            raise RuntimeError("metadata failed")
+
+    abort_calls: list[tuple[list[str], bool]] = []
+
+    class Client:
+        async def prepare_request(self, *_args, **_kwargs):
+            return _OutputQueue(None), SimpleNamespace(
+                request_id="native",
+                sampling_params=BrokenSamplingParams(),
+            )
+
+        async def abort(self, request_ids, internal=False):
+            abort_calls.append((list(request_ids), internal))
+
+    metadata = GRRequestMetadata(
+        request_id="external",
+        beam_width=2,
+        generation_steps=3,
+        prefix_len=1,
+        result_width=2,
+        constraint_digest=_DIGEST,
+    )
+
+    with pytest.raises(RuntimeError, match="metadata failed"):
+        await serving_engine._add_batch_step(
+            Client(),
+            ({"prompt_token_ids": [10]},),
+            (None,),
+            "external-step",
+            SamplingParams(logprobs=2, max_tokens=1),
+            False,
+            None,
+            gr_metadata=metadata,
+        )
+
+    assert abort_calls == [(["native"], True)]
+
+
+@pytest.mark.asyncio
+async def test_persistent_online_abort_failure_preserves_original_context() -> None:
+    class Client:
+        async def abort(self, request_ids, internal=False):
+            assert request_ids == ["native"]
+            assert internal is True
+            raise RuntimeError("abort failed")
+
+    original = ValueError("collection failed")
+    with pytest.raises(RuntimeError, match="abort failed") as caught:
+        await serving_engine._abort_persistent_requests(
+            Client(), ["native"], original
+        )
+
+    assert caught.value.__cause__ is original
+    assert caught.value.__notes__ == [
+        "Persistent GR abort failed after ValueError: collection failed"
     ]
 
 

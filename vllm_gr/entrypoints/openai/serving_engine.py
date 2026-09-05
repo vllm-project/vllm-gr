@@ -160,6 +160,24 @@ async def _gather_beam_results(queues):
     return list(await asyncio.gather(*tasks))
 
 
+async def _abort_persistent_requests(engine_client, request_ids, cause) -> None:
+    """Abort prepared persistent requests and preserve cleanup failures."""
+    if not request_ids:
+        return
+    abort = getattr(engine_client, "abort", None)
+    if not callable(abort):
+        error = RuntimeError("persistent GR engine client has no abort boundary")
+        error.add_note(f"Original persistent GR failure: {cause!r}")
+        raise error from cause
+    try:
+        await abort(request_ids, internal=True)
+    except BaseException as cleanup_error:
+        cleanup_error.add_note(
+            f"Persistent GR abort failed after {cause.__class__.__name__}: {cause}"
+        )
+        raise cleanup_error from cause
+
+
 async def _add_batch_step(
     engine_client,
     prompts_batch,
@@ -186,29 +204,51 @@ async def _add_batch_step(
     """
     queues = []
     engine_core_requests = []
-    for i, (individual_prompt, lora_req) in enumerate(zip(prompts_batch, lora_req_batch)):
-        request_id_item = f"{request_id_batch}-beam-{i}"
-        q, ec_req = await engine_client.prepare_request(
-            request_id_item,
-            individual_prompt,
-            beam_search_params,
-            lora_request=lora_req,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-        )
-        if gr_metadata is not None:
-            metadata = {
-                field: getattr(gr_metadata, field)
-                for field in gr_metadata.__struct_fields__
-            }
-            metadata["request_id"] = ec_req.request_id
-            ec_req.sampling_params.extra_args = dict(
-                ec_req.sampling_params.extra_args or {}
+    persistent_ids = []
+    try:
+        for i, (individual_prompt, lora_req) in enumerate(
+            zip(prompts_batch, lora_req_batch)
+        ):
+            request_id_item = f"{request_id_batch}-beam-{i}"
+            q, ec_req = await engine_client.prepare_request(
+                request_id_item,
+                individual_prompt,
+                beam_search_params,
+                lora_request=lora_req,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
             )
-            ec_req.sampling_params.extra_args[GR_REQUEST_METADATA_KEY] = metadata
-        queues.append(q)
-        engine_core_requests.append(ec_req)
+            if gr_metadata is not None:
+                # prepare_request has already created the frontend state. Own
+                # its cleanup before any later metadata mutation can fail.
+                persistent_ids.append(ec_req.request_id)
+                metadata = {
+                    field: getattr(gr_metadata, field)
+                    for field in gr_metadata.__struct_fields__
+                }
+                metadata["request_id"] = ec_req.request_id
+                ec_req.sampling_params.extra_args = dict(
+                    ec_req.sampling_params.extra_args or {}
+                )
+                ec_req.sampling_params.extra_args[GR_REQUEST_METADATA_KEY] = metadata
+            queues.append(q)
+            engine_core_requests.append(ec_req)
+    except BaseException as error:
+        await _abort_persistent_requests(engine_client, persistent_ids, error)
+        raise
+
+    if persistent_ids:
+        # The custom beam frontend bypasses AsyncLLM.generate(), whose normal
+        # generator owns cancellation cleanup. Stamp the same explicit marker
+        # used by offline shutdown before EngineCore admission.
+        output_processor = getattr(engine_client, "output_processor", None)
+        request_states = getattr(output_processor, "request_states", None)
+        if request_states is not None:
+            for request_id in persistent_ids:
+                state = request_states.get(request_id)
+                if state is not None:
+                    state.gr_persistent_request = True
 
     # Track the session before EngineCore dispatch: engine-driven chaining
     # can emit the first decode output while this coroutine still awaits
@@ -223,29 +263,37 @@ async def _add_batch_step(
     # or as the fire-and-forget message right after ADD_BATCH; both precede
     # the _gather_beam_results await, and anything later would be too late.
     submit_session = getattr(engine_client, "submit_session", None)
-    if (
-        session_template is not None
-        and use_beam_req
-        and engine_core_requests
-        and submit_session is not None
-    ):
-        session_template.session_id = engine_core_requests[0].request_id
-        await submit_session(engine_core_requests, session_template)
-    else:
-        await engine_client._add_requests_batch(
-            engine_core_requests, use_batch_message=use_beam_req
-        )
-
-        # Cache the session's step template now (same socket as ADD_BATCH,
-        # FIFO) so it is in beam_cache before the prefill output iteration
-        # runs its engine-driven hook.  The session id is stamped from the
-        # actual request ids instead of assuming the batch layout.
-        if session_template is not None and use_beam_req and engine_core_requests:
+    try:
+        if (
+            session_template is not None
+            and use_beam_req
+            and engine_core_requests
+            and submit_session is not None
+        ):
             session_template.session_id = engine_core_requests[0].request_id
-            await engine_client.beam_session_template(session_template)
+            await submit_session(engine_core_requests, session_template)
+        else:
+            await engine_client._add_requests_batch(
+                engine_core_requests, use_batch_message=use_beam_req
+            )
 
-    internal_ids = [r.request_id for r in engine_core_requests] if use_beam_req else []
-    output = await _gather_beam_results(queues)
+            # Cache the session's step template now (same socket as ADD_BATCH,
+            # FIFO) so it is in beam_cache before the prefill output iteration
+            # runs its engine-driven hook.  The session id is stamped from the
+            # actual request ids instead of assuming the batch layout.
+            if session_template is not None and use_beam_req and engine_core_requests:
+                session_template.session_id = engine_core_requests[0].request_id
+                await engine_client.beam_session_template(session_template)
+
+        output = await _gather_beam_results(queues)
+    except BaseException as error:
+        await _abort_persistent_requests(engine_client, persistent_ids, error)
+        raise
+    internal_ids = (
+        [request.request_id for request in engine_core_requests]
+        if use_beam_req or gr_metadata is not None
+        else []
+    )
     return output, internal_ids
 
 

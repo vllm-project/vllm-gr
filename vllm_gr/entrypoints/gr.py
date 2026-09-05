@@ -111,6 +111,24 @@ def _beam_request_cleanup(llm_engine, session_id: str, final_ids: list[str]) -> 
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
 
 
+def _abort_persistent_requests(llm_engine, request_ids: list[str], cause: BaseException) -> None:
+    """Abort admitted native requests when the synchronous frontend fails."""
+    if not request_ids:
+        return
+    abort = getattr(llm_engine, "abort_request", None)
+    if not callable(abort):
+        error = RuntimeError("persistent GR LLMEngine has no abort boundary")
+        error.add_note(f"Original persistent GR failure: {cause!r}")
+        raise error from cause
+    try:
+        abort(request_ids, internal=True)
+    except BaseException as cleanup_error:
+        cleanup_error.add_note(
+            f"Persistent GR abort failed after {cause.__class__.__name__}: {cause}"
+        )
+        raise cleanup_error from cause
+
+
 def _prepare_beam_step_requests(
     llm_engine,
     instances_batch: list["BeamSearchInstance"],
@@ -305,36 +323,46 @@ def _step_engine_and_collect_outputs(
     """Execute LLM engine step until outputs for all active instances are gathered."""
     active_indices = [j for j, instance in enumerate(instances_batch) if len(instance.beams) > 0]
     step_outputs_accumulated = []
-    while active_indices:
-        step_outputs = llm_engine.step()
-        step_outputs_accumulated.extend(step_outputs)
+    try:
+        while active_indices:
+            step_outputs = llm_engine.step()
+            step_outputs_accumulated.extend(step_outputs)
 
-        outputs_map = {out.request_id: out for out in step_outputs}
-        new_active_indices = []
-        for j in active_indices:
-            session_id = instance_prefill_id.get(j)
-            search_id = (
-                f"offline-beam-{prompt_start + j}-0"
-                if token == 0 or persistent_request
-                else session_id
-            )
-            if search_id not in outputs_map:
-                if persistent_request:
-                    # FINAL_ONLY output processing may remove request state in
-                    # the same step that returns the final result, so only
-                    # inspect the registry after checking this step's outputs.
-                    # The native/internal id is the lifecycle authority; an
-                    # unrelated request must not keep this wait loop alive.
-                    internal_id = instance_prefill_id[j]
-                    request_states = llm_engine.output_processor.request_states
-                    if internal_id not in request_states:
-                        raise RuntimeError(
-                            "persistent GR request terminated before final output "
-                            f"(internal_request_id={internal_id!r}, "
-                            f"external_request_id={search_id!r})"
-                        )
-                new_active_indices.append(j)
-        active_indices = new_active_indices
+            outputs_map = {out.request_id: out for out in step_outputs}
+            new_active_indices = []
+            for j in active_indices:
+                session_id = instance_prefill_id.get(j)
+                search_id = (
+                    f"offline-beam-{prompt_start + j}-0"
+                    if token == 0 or persistent_request
+                    else session_id
+                )
+                if search_id not in outputs_map:
+                    if persistent_request:
+                        # FINAL_ONLY output processing may remove request state
+                        # in the same step that returns the final result, so
+                        # inspect the registry only after this step's outputs.
+                        # The native/internal id is the lifecycle authority.
+                        internal_id = instance_prefill_id[j]
+                        request_states = llm_engine.output_processor.request_states
+                        if internal_id not in request_states:
+                            raise RuntimeError(
+                                "persistent GR request terminated before final output "
+                                f"(internal_request_id={internal_id!r}, "
+                                f"external_request_id={search_id!r})"
+                            )
+                    new_active_indices.append(j)
+            active_indices = new_active_indices
+    except BaseException as error:
+        if persistent_request:
+            active_ids = [
+                instance_prefill_id[j]
+                for j in active_indices
+                if j in instance_prefill_id
+                and instance_prefill_id[j] in llm_engine.output_processor.request_states
+            ]
+            _abort_persistent_requests(llm_engine, active_ids, error)
+        raise
 
     return {out.request_id: out for out in step_outputs_accumulated}
 
@@ -572,10 +600,19 @@ def _custom_beam_search_batch(
         )
 
         if engine_core_requests:
-            llm_engine.engine_core.add_requests(
-                engine_core_requests,
-                force_batch=not persistent_request,
-            )
+            try:
+                llm_engine.engine_core.add_requests(
+                    engine_core_requests,
+                    force_batch=not persistent_request,
+                )
+            except BaseException as error:
+                if persistent_request:
+                    _abort_persistent_requests(
+                        llm_engine,
+                        [request.request_id for request in engine_core_requests],
+                        error,
+                    )
+                raise
             for ec_req in engine_core_requests:
                 parts = ec_req.external_req_id.split("-")
                 j = int(parts[2]) - prompt_start
