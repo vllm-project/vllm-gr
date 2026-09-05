@@ -46,6 +46,7 @@ _RUNNER_CLASS_ALLOWLIST = {
 
 _TRACE_STAGE_MARKERS = {
     ("gpu", "eager"): ("prefill_beam_bootstrap", "decode_result_d2h"),
+    ("gpu", "compiled"): ("prefill_beam_bootstrap", "decode_result_d2h"),
     ("gpu", "graph"): ("prefill_beam_bootstrap", "decode_result_d2h"),
     ("npu", "eager"): ("gr_npu_prefill_stage", "gr_npu_decode_stage"),
     ("npu", "graph"): ("gr_npu_prefill_stage", "gr_npu_decode_stage"),
@@ -69,7 +70,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--backend", choices=("gpu", "npu"), required=True)
-    parser.add_argument("--execution", choices=("eager", "graph", "cascade"), required=True)
+    parser.add_argument(
+        "--execution",
+        choices=("eager", "compiled", "graph", "cascade"),
+        required=True,
+    )
     parser.add_argument("--prefix-cache", choices=("miss", "hit", "disabled"), required=True)
     parser.add_argument("--implementation", required=True)
     parser.add_argument("--base-sha", required=True)
@@ -102,6 +107,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("this frozen baseline only supports batch_size=1")
     if args.backend == "gpu" and args.execution == "cascade":
         raise ValueError("cascade execution is NPU-only")
+    if args.backend == "npu" and args.execution == "compiled":
+        raise ValueError("compiled execution is GPU-only")
     if args.persistent and not args.async_scheduling:
         raise ValueError("persistent profiling requires async scheduling")
     for name in ("input_len", "beam_width", "generation_steps", "runs"):
@@ -609,7 +616,7 @@ def _engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "disable_log_stats": False,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "async_scheduling": args.async_scheduling,
-        "enforce_eager": args.execution != "graph",
+        "enforce_eager": args.execution in {"eager", "cascade"},
         "seed": args.seed,
     }
     additional_config: dict[str, Any] = {}

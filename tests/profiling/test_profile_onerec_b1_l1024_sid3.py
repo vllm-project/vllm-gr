@@ -50,6 +50,8 @@ def test_backend_execution_validation() -> None:
     profile._validate_args(_args(backend="npu", execution="cascade"))
     with pytest.raises(ValueError, match="NPU-only"):
         profile._validate_args(_args(backend="gpu", execution="cascade"))
+    with pytest.raises(ValueError, match="GPU-only"):
+        profile._validate_args(_args(backend="npu", execution="compiled"))
     with pytest.raises(ValueError, match="batch_size=1"):
         profile._validate_args(_args(batch_size=2))
     with pytest.raises(ValueError, match="complete 40-hex"):
@@ -67,6 +69,7 @@ def test_source_shas_are_required_cli_arguments() -> None:
     ("backend", "execution", "expected_eager", "expected_npu_mode"),
     [
         ("gpu", "eager", True, None),
+        ("gpu", "compiled", False, None),
         ("gpu", "graph", False, None),
         ("npu", "eager", True, "xllm"),
         ("npu", "graph", False, "xllm"),
