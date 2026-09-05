@@ -52,6 +52,13 @@ _TRACE_STAGE_MARKERS = {
     ("npu", "graph"): ("gr_npu_prefill_stage", "gr_npu_decode_stage"),
     ("npu", "cascade"): ("gr_npu_prefill_stage", "gr_npu_decode_stage"),
 }
+_PERSISTENT_GPU_TRACE_MARKERS = (
+    "gr_async_schedule",
+    "gr_prefill_bootstrap",
+    "gr_progress_output",
+    "gr_final_output",
+    "gr_final_d2h",
+)
 
 
 class EnvironmentNotValidatedError(RuntimeError):
@@ -522,7 +529,11 @@ def _driver_accelerator_info(backend: str) -> dict:
 
 
 def _validate_trace_evidence(
-    trace_files: Sequence[Path], backend: str, execution: str
+    trace_files: Sequence[Path],
+    backend: str,
+    execution: str,
+    *,
+    persistent: bool = False,
 ) -> dict[str, Any]:
     """Require non-empty trace artifacts containing GR stage boundaries."""
     if not trace_files:
@@ -531,12 +542,15 @@ def _validate_trace_evidence(
     if empty:
         raise EvidenceUnavailableError(f"profiling produced empty trace artifacts: {empty}")
 
-    try:
-        required = _TRACE_STAGE_MARKERS[(backend, execution)]
-    except KeyError as error:
-        raise EvidenceUnavailableError(
-            f"no trace marker contract for backend={backend!r}, execution={execution!r}"
-        ) from error
+    if persistent and backend == "gpu":
+        required = _PERSISTENT_GPU_TRACE_MARKERS
+    else:
+        try:
+            required = _TRACE_STAGE_MARKERS[(backend, execution)]
+        except KeyError as error:
+            raise EvidenceUnavailableError(
+                f"no trace marker contract for backend={backend!r}, execution={execution!r}"
+            ) from error
     observed: set[str] = set()
     needles = {name: name.encode() for name in required}
     for path in trace_files:
@@ -617,8 +631,15 @@ def _memory_breakdown_gate(
     }
 
 
-def _trace_coverage_gate() -> dict[str, str]:
-    """State the known process boundary of the current Worker profiler."""
+def _trace_coverage_gate(trace_evidence: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Require one UniProc timeline to span Scheduler and final device copy."""
+    observed = set(trace_evidence.get("observed_stage_markers", ())) if trace_evidence else set()
+    if {"gr_async_schedule", "gr_prefill_bootstrap", "gr_final_d2h"} <= observed:
+        return {
+            "status": "PASS",
+            "scope": "single-process Scheduler-to-device persistent GR timeline",
+            "observed_stage_markers": sorted(observed),
+        }
     return {
         "status": "FAIL",
         "limitation": (
@@ -993,13 +1014,23 @@ def _run(args: argparse.Namespace) -> dict:
             for path in set(args.profile_dir.rglob("*")) - trace_files_before
             if path.is_file()
         )
-        trace_evidence = _validate_trace_evidence(trace_files, args.backend, args.execution)
+        trace_evidence = _validate_trace_evidence(
+            trace_files,
+            args.backend,
+            args.execution,
+            persistent=args.persistent,
+        )
     memory_breakdown = _memory_breakdown_gate(worker_before, worker_after)
-    trace_coverage = _trace_coverage_gate()
+    trace_coverage = _trace_coverage_gate(trace_evidence)
     result.update(
         {
             "status": "complete",
-            "exit_gate": "FAIL",
+            "exit_gate": (
+                "PASS"
+                if memory_breakdown["status"] == "PASS"
+                and trace_coverage["status"] == "PASS"
+                else "FAIL"
+            ),
             "completed_at_utc": datetime.now(timezone.utc).isoformat(),
             "effective_config": effective_config,
             "artifacts": {**result["artifacts"], "model": model_identity},

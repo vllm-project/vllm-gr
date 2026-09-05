@@ -247,6 +247,22 @@ def test_trace_evidence_requires_files_and_stage_markers(tmp_path: Path) -> None
     ]
 
 
+def test_persistent_gpu_trace_requires_scheduler_and_final_only_markers(
+    tmp_path: Path,
+) -> None:
+    trace = tmp_path / "persistent.json"
+    trace.write_text(
+        json.dumps({"events": list(profile._PERSISTENT_GPU_TRACE_MARKERS)}),
+        encoding="utf-8",
+    )
+    evidence = profile._validate_trace_evidence(
+        [trace], "gpu", "graph", persistent=True
+    )
+    assert evidence["required_stage_markers"] == list(
+        profile._PERSISTENT_GPU_TRACE_MARKERS
+    )
+
+
 @pytest.mark.parametrize("execution", ["eager", "graph", "cascade"])
 def test_trace_evidence_uses_npu_stage_markers(tmp_path: Path, execution: str) -> None:
     trace = tmp_path / f"npu-{execution}.json"
@@ -286,6 +302,20 @@ def test_worker_trace_coverage_is_an_explicit_failed_gate() -> None:
     gate = profile._trace_coverage_gate()
     assert gate["status"] == "FAIL"
     assert "EngineCore Scheduler/Request/metadata" in gate["limitation"]
+
+    passed = profile._trace_coverage_gate(
+        {
+            "observed_stage_markers": [
+                "gr_async_schedule",
+                "gr_prefill_bootstrap",
+                "gr_progress_output",
+                "gr_final_output",
+                "gr_final_d2h",
+            ]
+        }
+    )
+    assert passed["status"] == "PASS"
+    assert "Scheduler-to-device" in passed["scope"]
 
 
 class _FlatLogprobs:
