@@ -1648,6 +1648,11 @@ def test_gpu_named_profile_diagnostic_returns_runner_and_memory(
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 12)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 13)
     monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 14)
+    monkeypatch.setattr(
+        gpu_patch,
+        "get_gr_memory_stats",
+        lambda worker: {"native_kv_bytes": 15},
+    )
 
     result = gpu_patch.get_gr_profile_runtime_stats(SimpleNamespace(model_runner=FakeRunner()))
     assert result["backend"] == "gpu"
@@ -1659,6 +1664,7 @@ def test_gpu_named_profile_diagnostic_returns_runner_and_memory(
         "peak_allocated_bytes": 13,
         "peak_reserved_bytes": 14,
     }
+    assert result["memory_components"] == {"native_kv_bytes": 15}
     assert result["beam_graph"]["captured_widths"] == [128]
     assert result["beam_graph"]["full_dispatches"] == 7
     assert result["input_prep"] == {

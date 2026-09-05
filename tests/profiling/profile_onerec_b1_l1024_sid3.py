@@ -345,6 +345,8 @@ def _worker_diagnostics(llm: Any, backend: str) -> list[dict[str, Any]]:
             )
         if not isinstance(snapshot.get("memory"), dict):
             raise EvidenceUnavailableError("Worker diagnostic omitted device memory")
+        if not isinstance(snapshot.get("memory_components"), dict):
+            raise EvidenceUnavailableError("Worker diagnostic omitted memory components")
         if not isinstance(snapshot.get("beam_graph"), dict):
             raise EvidenceUnavailableError("Worker diagnostic omitted Beam graph state")
     return snapshots
@@ -560,24 +562,58 @@ def _validate_trace_evidence(
     return {"required_stage_markers": list(required), "observed_stage_markers": sorted(observed)}
 
 
-def _memory_breakdown_gate() -> dict[str, Any]:
-    """Describe unavailable allocator attribution without inventing values."""
+def _memory_breakdown_gate(
+    before: Sequence[Mapping[str, Any]],
+    after: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Require attributed device storage to plateau after warmup."""
     components = (
         "native_kv_bytes",
         "beam_kv_bytes",
         "workspace_bytes",
-        "graph_pool_bytes",
-        "gr_state_bytes",
+        "gr_state_peak_bytes",
+        "graph_pool_allocated_bytes",
+        "graph_pool_reserved_bytes",
     )
+    if not before or len(before) != len(after):
+        raise EvidenceUnavailableError(
+            "memory-component diagnostic cardinality changed during profiling"
+        )
+    before_values: list[dict[str, int]] = []
+    after_values: list[dict[str, int]] = []
+    for label, snapshots, target in (
+        ("before", before, before_values),
+        ("after", after, after_values),
+    ):
+        for index, snapshot in enumerate(snapshots):
+            values = snapshot.get("memory_components")
+            if not isinstance(values, Mapping):
+                raise EvidenceUnavailableError(
+                    f"Worker {index} {label} snapshot omitted memory components"
+                )
+            missing = [name for name in components if name not in values]
+            if missing:
+                raise EvidenceUnavailableError(
+                    f"Worker {index} {label} memory components omitted {missing}"
+                )
+            normalized = {name: int(values[name]) for name in components}
+            if any(value < 0 for value in normalized.values()):
+                raise EvidenceUnavailableError("memory components must be non-negative")
+            target.append(normalized)
+    if before_values != after_values:
+        raise EvidenceUnavailableError(
+            "attributed device memory changed after warmup: "
+            f"before={before_values}, after={after_values}"
+        )
+    totals = {
+        name: sum(values[name] for values in after_values) for name in components
+    }
     return {
-        "status": "FAIL",
-        "measurements": {name: None for name in components},
-        "limitation": (
-            "ModelRunner V1 currently exposes aggregate device allocator counters, "
-            "but no reliable per-owner attribution for Native KV, Beam KV, workspace, "
-            "Graph pool, and GR state. Step 0 cannot pass this evidence gate until "
-            "backend diagnostics expose those values."
-        ),
+        "status": "PASS",
+        "measurements": totals,
+        "per_worker_before": before_values,
+        "per_worker_after": after_values,
+        "stable_after_warmup": True,
     }
 
 
@@ -958,7 +994,7 @@ def _run(args: argparse.Namespace) -> dict:
             if path.is_file()
         )
         trace_evidence = _validate_trace_evidence(trace_files, args.backend, args.execution)
-    memory_breakdown = _memory_breakdown_gate()
+    memory_breakdown = _memory_breakdown_gate(worker_before, worker_after)
     trace_coverage = _trace_coverage_gate()
     result.update(
         {

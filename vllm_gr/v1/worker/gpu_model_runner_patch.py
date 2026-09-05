@@ -669,6 +669,7 @@ def get_gr_profile_runtime_stats(worker) -> dict:
             "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
             "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
         },
+        "memory_components": get_gr_memory_stats(worker),
         "beam_graph": get_beam_graph_runtime_stats(worker),
         "input_prep": {
             "ready_event_skips": int(getattr(runner, "_gr_input_prep_ready_skips", 0)),

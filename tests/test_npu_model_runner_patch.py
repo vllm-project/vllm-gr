@@ -109,6 +109,14 @@ def test_npu_named_profile_diagnostic_returns_runner_and_memory(
     assert result["runner_class"].endswith(".FakeRunner")
     assert result["device_name"] == "Ascend"
     assert result["memory"]["allocated_bytes"] == 21
+    assert result["memory_components"] == {
+        "native_kv_bytes": 0,
+        "beam_kv_bytes": 0,
+        "workspace_bytes": 0,
+        "gr_state_peak_bytes": 0,
+        "graph_pool_allocated_bytes": 0,
+        "graph_pool_reserved_bytes": 0,
+    }
     assert result["beam_graph"]["captured_widths"] == [128]
     assert result["beam_graph"]["full_dispatches"] == 5
 

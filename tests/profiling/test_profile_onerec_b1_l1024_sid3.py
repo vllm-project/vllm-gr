@@ -261,17 +261,25 @@ def test_trace_evidence_uses_npu_stage_markers(tmp_path: Path, execution: str) -
     ]
 
 
-def test_memory_component_breakdown_is_an_explicit_failed_gate() -> None:
-    gate = profile._memory_breakdown_gate()
-    assert gate["status"] == "FAIL"
-    assert set(gate["measurements"]) == {
+def test_memory_component_breakdown_requires_a_stable_plateau() -> None:
+    components = {
         "native_kv_bytes",
         "beam_kv_bytes",
         "workspace_bytes",
-        "graph_pool_bytes",
-        "gr_state_bytes",
+        "gr_state_peak_bytes",
+        "graph_pool_allocated_bytes",
+        "graph_pool_reserved_bytes",
     }
-    assert set(gate["measurements"].values()) == {None}
+    values = {name: index for index, name in enumerate(sorted(components), 1)}
+    snapshot = {"memory_components": values}
+    gate = profile._memory_breakdown_gate([snapshot], [snapshot])
+    assert gate["status"] == "PASS"
+    assert gate["measurements"] == values
+    assert gate["stable_after_warmup"] is True
+
+    changed = {"memory_components": {**values, "workspace_bytes": 999}}
+    with pytest.raises(profile.EvidenceUnavailableError, match="changed after warmup"):
+        profile._memory_breakdown_gate([snapshot], [changed])
 
 
 def test_worker_trace_coverage_is_an_explicit_failed_gate() -> None:
@@ -346,6 +354,14 @@ def _diagnostic(
         "backend": backend,
         "runner_class": runner_class,
         "memory": {},
+        "memory_components": {
+            "native_kv_bytes": 1,
+            "beam_kv_bytes": 2,
+            "workspace_bytes": 3,
+            "gr_state_peak_bytes": 4,
+            "graph_pool_allocated_bytes": 5,
+            "graph_pool_reserved_bytes": 6,
+        },
         "beam_graph": {
             "captured_widths": [128],
             "full_dispatches": dispatches,

@@ -119,6 +119,8 @@ def get_gr_profile_runtime_stats(worker) -> dict:
         raise RuntimeError(f"NPU profiling diagnostic requires an NPU runner, got {device!r}")
     properties = npu.get_device_properties(device)
     runner_class = type(runner)
+    from vllm_gr.v1.worker.gr_model_runner_state import get_gr_memory_stats
+
     return {
         "backend": "npu",
         "worker_class": f"{type(worker).__module__}.{type(worker).__qualname__}",
@@ -132,6 +134,7 @@ def get_gr_profile_runtime_stats(worker) -> dict:
             "peak_allocated_bytes": int(npu.max_memory_allocated(device)),
             "peak_reserved_bytes": int(npu.max_memory_reserved(device)),
         },
+        "memory_components": get_gr_memory_stats(worker),
         "beam_graph": get_beam_graph_runtime_stats(worker),
     }
 
