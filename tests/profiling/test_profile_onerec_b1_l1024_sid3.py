@@ -29,6 +29,7 @@ def _args(**overrides) -> argparse.Namespace:
         "catalog": Path("catalog.json"),
         "prefix_cache": "miss",
         "async_scheduling": False,
+        "persistent": False,
         "seed": 0,
         "base_sha": "b" * 40,
         "pr_324_sha": "c" * 40,
@@ -53,6 +54,8 @@ def test_backend_execution_validation() -> None:
         profile._validate_args(_args(batch_size=2))
     with pytest.raises(ValueError, match="complete 40-hex"):
         profile._validate_args(_args(base_sha="short"))
+    with pytest.raises(ValueError, match="requires async scheduling"):
+        profile._validate_args(_args(persistent=True))
 
 
 def test_source_shas_are_required_cli_arguments() -> None:
@@ -87,6 +90,33 @@ def test_engine_kwargs_encode_backend_and_execution(
         assert "additional_config" not in kwargs
     else:
         assert kwargs["additional_config"]["vllm_gr_npu_decode_execution"] == expected_npu_mode
+
+
+def test_persistent_engine_kwargs_enable_final_only_runtime() -> None:
+    kwargs = profile._engine_kwargs(_args(persistent=True, async_scheduling=True))
+    assert kwargs["async_scheduling"] is True
+    assert kwargs["additional_config"] == {
+        "vllm_gr_persistent_request": True,
+        "vllm_gr_persistent_runner_state": True,
+        "vllm_gr_scheduling_mode": "async",
+    }
+
+
+def test_persistent_npu_kwargs_preserve_decode_mode() -> None:
+    kwargs = profile._engine_kwargs(
+        _args(
+            backend="npu",
+            execution="cascade",
+            persistent=True,
+            async_scheduling=True,
+        )
+    )
+    assert kwargs["additional_config"] == {
+        "vllm_gr_npu_decode_execution": "cascade",
+        "vllm_gr_persistent_request": True,
+        "vllm_gr_persistent_runner_state": True,
+        "vllm_gr_scheduling_mode": "async",
+    }
 
 
 def test_disabled_prefix_cache_is_encoded_in_engine_config() -> None:

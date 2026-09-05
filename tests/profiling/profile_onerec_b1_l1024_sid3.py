@@ -28,7 +28,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-
 _DEPENDENCIES = (
     "vllm-gr",
     "vllm",
@@ -87,6 +86,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--persistent",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable the persistent final-only request and runner-state path",
+    )
     args = parser.parse_args(argv)
     _validate_args(args)
     return args
@@ -97,6 +102,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("this frozen baseline only supports batch_size=1")
     if args.backend == "gpu" and args.execution == "cascade":
         raise ValueError("cascade execution is NPU-only")
+    if args.persistent and not args.async_scheduling:
+        raise ValueError("persistent profiling requires async scheduling")
     for name in ("input_len", "beam_width", "generation_steps", "runs"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
@@ -535,10 +542,21 @@ def _engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "enforce_eager": args.execution != "graph",
         "seed": args.seed,
     }
+    additional_config: dict[str, Any] = {}
     if args.backend == "npu":
-        kwargs["additional_config"] = {
-            "vllm_gr_npu_decode_execution": ("cascade" if args.execution == "cascade" else "xllm")
-        }
+        additional_config["vllm_gr_npu_decode_execution"] = (
+            "cascade" if args.execution == "cascade" else "xllm"
+        )
+    if args.persistent:
+        additional_config.update(
+            {
+                "vllm_gr_persistent_request": True,
+                "vllm_gr_persistent_runner_state": True,
+                "vllm_gr_scheduling_mode": "async",
+            }
+        )
+    if additional_config:
+        kwargs["additional_config"] = additional_config
     return kwargs
 
 
