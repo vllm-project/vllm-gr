@@ -818,6 +818,89 @@ b50fa3dcca2d9a2f20a84410ea795f21d9031eba2ce74157a9247349d0ddd9f8
 a54329dc31a463c380a4b7458eeff7d8928d432108a59a76f3003dc11dcdff04
 ```
 
+## Shutdown ownership ordering and GPU validation
+
+The ModelRunner shutdown wrapper now treats cleanup as three ordered phases:
+persistent GR state and queued device ownership, the runner-owned constraint
+Backend, then native ModelRunner shutdown.  A failed GR release stops the
+sequence.  It leaves the constraint Backend attached and does not invoke
+native shutdown, so the same runner can retry cleanup without invalidating
+storage still reachable from queued work.  A successful retry releases GR
+state first, closes the constraint Backend once, and calls native shutdown
+once.  The synthetic no-native shutdown path follows the same ownership rule.
+
+This closes the previously identified shutdown hole around the two-phase
+`GRModelRunnerState.release()` contract.  The state contract already marks
+execution closed before calling the backend drain, retains the Beam session
+when that drain fails, and skips a completed backend drain if session cleanup
+needs a retry.  Unit coverage now verifies both native and synthetic shutdown
+failure paths and the successful retry ordering.
+
+The saved Step 6 CPU regression selection passed **514 tests**, with the same
+**5 environment skips** for missing `torch_npu` / `vllm-ascend`.  An expanded
+GPU-path CPU stability selection covering scheduling, frontend delivery,
+abort, terminal shutdown, late output, and Worker faults passed **666 tests**.
+The CUDA kernel regression was submitted through `gpu run` and passed all
+**16 tests** in `test_cuda_control_output.py` and
+`test_persistent_gr_cuda.py`.
+
+Four real OneRec-1.7B runs were then executed through `gpu run` with prefix
+caching disabled, W=128, input length 1024, and a Constraint Tables document
+compiled from 16,981 unique SID triples in RecIF `ad_test.parquet`.  Three
+persistent ASYNC probes covered eager decode-boundary shutdown, eager advance
+failure, and CUDA Graph decode-boundary shutdown.  A separate engine-driven
+ASYNC eager run completed the full three-token generation and returned all
+128 final sequences.  The native completion ABI v2 was built into an isolated
+`/tmp` runtime; neither the shared venv nor its other editable source checkout
+was modified.
+
+The decode-boundary shutdown probe stopped with one live Scheduler request,
+one frontend request, one Beam session, one occupied control slot, and an
+unfinished output future.  Shutdown restored all 54,704 native KV blocks,
+balanced the single persistent state, emptied both request registries and the
+Beam registry, drained control/pinned storage, released every native
+completion ticket, and passed all reported lifecycle gates.  The advance
+fault probe also passed: it quarantined the failed transport with both control
+entries retained, preserved the injected exception in the completed future,
+then drained the transport and restored all ownership during shutdown.
+The Graph probe captured W=128, recorded one FULL graph dispatch, restored its
+initial 54,677 KV blocks, and passed the same lifecycle gates.
+The full-output run completed the fixed generation contract and produced a
+stable final ABI fingerprint.  Its harness-level exit gate remains FAIL by
+design because no EngineCore host trace or per-owner memory attribution was
+requested; the run is functional evidence, not a Step 6 performance or trace
+acceptance result.
+
+```text
+/tmp/vllm-gr-step6-onerec-eager-shutdown.json SHA256:
+149ae01ec10bdaf0a515b62c63ef60f4b75238e2c551cf0c95c526478f48ad8d
+/tmp/vllm-gr-step6-onerec-advance-fault-shutdown.json SHA256:
+3f7d8189332c66a65c57bafbb40aa93d57f7031688257eb346963cd17ddfcfad
+/tmp/vllm-gr-step6-onerec-graph-shutdown.json SHA256:
+2f97110afd2266b71a1c6de0e5bf1cf5bc8e140646b21bc428fe3f8f3985a4d3
+/tmp/vllm-gr-step6-onerec-final-output.json SHA256:
+99a3caa3dcfcbb55bbe353f4532e4d241943692533d9b15056b946feeb00f7e4
+/tmp/vllm-gr-step6-ad-constraint-triples.json SHA256:
+bf8654c4291a73c0ec9a622fd21e8a58ebf636f9a10128b213744444c5d786ea
+```
+
+NPU hardware validation remains explicitly deferred because this environment
+has no NPU runtime.  The NPU backend factory continues to return `None` rather
+than enabling an incomplete path or falling back silently.  In particular,
+the mask-aware xllm decision ABI and full sampler/decision/KV/control/final-D2H
+composition remain prerequisites for enabling the factory.  The CPU module
+tests are design and composition evidence only, not NPU acceptance.
+
+```text
+Step: 6 — release-safety and GPU-stability checkpoint, NPU integration incomplete
+Commit: none; worktree over e87dac84f648
+Behavior change: shutdown stops after failed GR release and retains later-owned resources
+GPU validation: 16 CUDA tests; four real OneRec runs via gpu run
+CPU validation: 514 passed / 5 environment skips; expanded matrix 666 passed
+NPU validation: deferred; no NPU runtime, factory remains fail-fast disabled
+Exit gate: FAIL — Step 6 incomplete / NPU ENVIRONMENT NOT VALIDATED
+```
+
 ## Remaining integration and exit gate
 
 After the isolated decision and workspace contracts are verified, Step 6 still requires:

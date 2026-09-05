@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for active-platform ModelRunner patch dispatch."""
 
-from contextlib import contextmanager
 import sys
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -17,13 +17,13 @@ def test_dispatcher_selects_one_platform_module(
 ) -> None:
     # Fake vllm.platforms so the test runs without a real vLLM install.
     fake_platforms = ModuleType("vllm.platforms")
-    setattr(fake_platforms, "current_platform", SimpleNamespace(device_type="npu"))
+    fake_platforms.current_platform = SimpleNamespace(device_type="npu")
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
 
     assert model_runner_patch._active_platform_module_name() == (
         model_runner_patch._NPU_PATCH_MODULE
     )
-    getattr(fake_platforms, "current_platform").device_type = "cuda"
+    fake_platforms.current_platform.device_type = "cuda"
     assert model_runner_patch._active_platform_module_name() == (
         model_runner_patch._GPU_PATCH_MODULE
     )
@@ -111,7 +111,7 @@ def test_dispatcher_installs_three_wrappers_once(
     first_input_prep = Runner.synchronize_input_prep
     assert (first_input_prep is not original_input_prep) == has_input_prep_hook
     assert model_runner_patch.is_worker_runner_patched(Runner)
-    assert getattr(Runner, "_patched_for_beam_pos_ids") is True
+    assert Runner._patched_for_beam_pos_ids is True
     # No _sample on this Runner -> the Constraint Tables hook must not be added.
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
 
@@ -357,16 +357,20 @@ def test_gr_state_named_worker_hooks_install_on_any_backend() -> None:
     }
 
 
-def test_shutdown_runs_native_even_when_gr_release_fails(
+def test_shutdown_retains_later_resources_when_gr_release_fails_and_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm_gr.v1.worker import gr_model_runner_state
 
     events: list[str] = []
+    release_calls = 0
 
     def fail_release(runner: Any) -> None:
+        nonlocal release_calls
+        release_calls += 1
         events.append("release")
-        raise RuntimeError("release failed")
+        if release_calls == 1:
+            raise RuntimeError("release failed")
 
     monkeypatch.setattr(
         gr_model_runner_state,
@@ -377,8 +381,46 @@ def test_shutdown_runs_native_even_when_gr_release_fails(
     def native(runner: Any) -> None:
         events.append("native")
 
-    runner = SimpleNamespace(constraint_backend=None)
+    class Backend:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            events.append("close")
+
+    backend = Backend()
+    runner = SimpleNamespace(constraint_backend=backend)
     wrapped = model_runner_patch.make_shutdown_with_constraint_backend(native)
     with pytest.raises(RuntimeError, match="release failed"):
         wrapped(runner)
-    assert events == ["release", "native"]
+    assert events == ["release"]
+    assert runner.constraint_backend is backend
+    assert backend.close_calls == 0
+
+    wrapped(runner)
+    assert events == ["release", "release", "close", "native"]
+    assert runner.constraint_backend is None
+    assert backend.close_calls == 1
+
+
+def test_synthetic_shutdown_retains_constraint_backend_when_gr_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker import gr_model_runner_state
+
+    def fail_release(runner: Any) -> None:
+        raise RuntimeError("release failed")
+
+    monkeypatch.setattr(
+        gr_model_runner_state,
+        "release_gr_model_runner_states",
+        fail_release,
+    )
+
+    backend = SimpleNamespace(close=lambda: pytest.fail("constraint backend closed"))
+    runner = SimpleNamespace(constraint_backend=backend)
+    wrapped = model_runner_patch.make_shutdown_with_constraint_backend()
+    with pytest.raises(RuntimeError, match="release failed"):
+        wrapped(runner)
+    assert runner.constraint_backend is backend

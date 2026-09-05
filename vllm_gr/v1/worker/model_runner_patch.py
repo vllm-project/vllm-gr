@@ -73,7 +73,7 @@ def close_constraint_backend(runner: object) -> None:
     backend = getattr(runner, "constraint_backend", None)
     # Detach first so no concurrent observer can discover a Backend while it is
     # being closed, and so repeated shutdown/load calls are naturally idempotent.
-    setattr(runner, "constraint_backend", None)
+    runner.constraint_backend = None  # type: ignore[attr-defined]
     if backend is not None:
         backend.close()
 
@@ -163,7 +163,13 @@ def make_load_model_with_constraint_backend(original):
 
 
 def make_shutdown_with_constraint_backend(original=None):
-    """Release GR runner resources before native runner shutdown."""
+    """Release runner resources in ownership order before native shutdown.
+
+    Persistent GR state may still have queued device work that references the
+    runner-owned constraint Backend and native runner buffers.  Stop at the
+    first failed phase so a later shutdown call can retry cleanup without
+    closing storage that is still reachable by the failed GR release.
+    """
 
     if original is not None and getattr(original, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
         return original
@@ -176,10 +182,8 @@ def make_shutdown_with_constraint_backend(original=None):
                 release_gr_model_runner_states,
             )
 
-            try:
-                release_gr_model_runner_states(self)
-            finally:
-                close_constraint_backend(self)
+            release_gr_model_runner_states(self)
+            close_constraint_backend(self)
 
     else:
 
@@ -189,20 +193,9 @@ def make_shutdown_with_constraint_backend(original=None):
                 release_gr_model_runner_states,
             )
 
-            cleanup_error: BaseException | None = None
-            try:
-                release_gr_model_runner_states(self)
-            except BaseException as exc:
-                cleanup_error = exc
-            try:
-                close_constraint_backend(self)
-            except BaseException as exc:
-                if cleanup_error is None:
-                    cleanup_error = exc
-            result = original(self, *args, **kwargs)
-            if cleanup_error is not None:
-                raise cleanup_error
-            return result
+            release_gr_model_runner_states(self)
+            close_constraint_backend(self)
+            return original(self, *args, **kwargs)
 
     setattr(
         shutdown_with_constraint_backend,
@@ -308,17 +301,11 @@ def apply_worker_patches() -> None:
             if callable(platform_shutdown_patch):
                 runner_class.shutdown = platform_shutdown_patch(runner_class.shutdown)
 
-        platform_execute_patcher = getattr(
-            platform_module, "make_patched_execute_model", None
-        )
+        platform_execute_patcher = getattr(platform_module, "make_patched_execute_model", None)
         if callable(platform_execute_patcher):
-            runner_class.execute_model = platform_execute_patcher(
-                runner_class.execute_model
-            )
+            runner_class.execute_model = platform_execute_patcher(runner_class.execute_model)
         else:
-            runner_class.execute_model = make_patched_execute_model(
-                runner_class.execute_model
-            )
+            runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )
@@ -385,17 +372,18 @@ def apply_worker_patches() -> None:
         determine_patcher = getattr(
             platform_module, "make_patched_determine_batch_execution_and_padding", None
         )
-        if determine_patcher is not None and hasattr(
-            runner_class, "_determine_batch_execution_and_padding"
-        ):
-            if not getattr(
+        if (
+            determine_patcher is not None
+            and hasattr(runner_class, "_determine_batch_execution_and_padding")
+            and not getattr(
                 runner_class._determine_batch_execution_and_padding,
                 _WORKER_DETERMINE_PATCH_MARKER,
                 False,
-            ):
-                runner_class._determine_batch_execution_and_padding = determine_patcher(
-                    runner_class._determine_batch_execution_and_padding
-                )
+            )
+        ):
+            runner_class._determine_batch_execution_and_padding = determine_patcher(
+                runner_class._determine_batch_execution_and_padding
+            )
 
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)
