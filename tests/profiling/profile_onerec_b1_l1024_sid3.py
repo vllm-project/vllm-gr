@@ -372,7 +372,33 @@ def _validate_graph_evidence(
             )
 
 
-def _validate_prefix_evidence(cache_mode: str, delta: Mapping[str, float]) -> None:
+def _validate_prefix_evidence(
+    cache_mode: str,
+    delta: Mapping[str, float],
+    observed: Sequence[Mapping[str, Any]] | None = None,
+    expected_requests: int | None = None,
+) -> None:
+    if observed is not None:
+        if cache_mode == "disabled":
+            if observed:
+                raise EvidenceUnavailableError(
+                    f"disabled prefix cache made {len(observed)} direct queries"
+                )
+            return
+        if expected_requests is not None and len(observed) != expected_requests:
+            raise EvidenceUnavailableError(
+                "direct prefix observer request count mismatch: "
+                f"observed={len(observed)}, expected={expected_requests}"
+            )
+        if not observed:
+            raise EvidenceUnavailableError("direct prefix observer recorded no queries")
+        hits = [int(event["computed_tokens"]) for event in observed]
+        if cache_mode == "miss" and any(hits):
+            raise EvidenceUnavailableError(f"prefix miss returned computed tokens: {hits}")
+        if cache_mode == "hit" and any(hit <= 0 for hit in hits):
+            raise EvidenceUnavailableError(f"prefix hit was not observed: {hits}")
+        return
+
     queries = delta["vllm:prefix_cache_queries"]
     hits = delta["vllm:prefix_cache_hits"]
     if cache_mode == "disabled":
@@ -397,6 +423,42 @@ def _validate_prefix_evidence(cache_mode: str, delta: Mapping[str, float]) -> No
 def _prefix_hit_rate(delta: Mapping[str, float]) -> float | None:
     queries = delta["vllm:prefix_cache_queries"]
     return delta["vllm:prefix_cache_hits"] / queries if queries > 0 else None
+
+
+def _install_inproc_prefix_observer(llm: Any) -> list[dict[str, Any]]:
+    """Observe the actual UniProc KV lookup without changing its result."""
+    client = getattr(llm.llm_engine, "engine_core", None)
+    core = getattr(client, "engine_core", None)
+    manager = getattr(getattr(core, "scheduler", None), "kv_cache_manager", None)
+    original = getattr(manager, "get_computed_blocks", None)
+    if not callable(original):
+        raise EvidenceUnavailableError(
+            "persistent prefix observer requires an in-process KVCacheManager"
+        )
+    events: list[dict[str, Any]] = []
+
+    def observed(request):
+        blocks, computed_tokens = original(request)
+        query_tokens = getattr(request, "num_prompt_tokens", None)
+        if query_tokens is None:
+            query_tokens = request.num_tokens
+        events.append(
+            {
+                "request_id": str(request.request_id),
+                "query_tokens": int(query_tokens),
+                "computed_tokens": int(computed_tokens),
+                "num_computed_tokens_before": int(request.num_computed_tokens),
+                "gr_issued_steps": int(getattr(request, "gr_issued_steps", 0)),
+                "persistent": bool(
+                    getattr(request, "gr_persistent_request", False)
+                    or getattr(request, "gr_persistent_runner_state", False)
+                ),
+            }
+        )
+        return blocks, computed_tokens
+
+    manager.get_computed_blocks = observed
+    return events
 
 
 def _validate_v1_engine_config(config: Any) -> None:
@@ -732,6 +794,8 @@ def _run(args: argparse.Namespace) -> dict:
     model_identity: dict = {}
     prefix_before: dict[str, float] = {}
     prefix_after: dict[str, float] = {}
+    prefix_observer_events: list[dict[str, Any]] = []
+    measured_prefix_events: list[dict[str, Any]] = []
 
     with GRLLM(model=args.model, **kwargs) as llm:
         config = llm.llm_engine.vllm_config
@@ -756,6 +820,8 @@ def _run(args: argparse.Namespace) -> dict:
             args.model_digest,
             getattr(hf_config, "_commit_hash", None),
         )
+        if args.persistent:
+            prefix_observer_events = _install_inproc_prefix_observer(llm)
 
         prompts, end_token_id = _prepare_prompt(llm, args.prompt, args.input_len)
         params = BeamSearchParams(
@@ -793,6 +859,7 @@ def _run(args: argparse.Namespace) -> dict:
         for _ in range(args.warmups):
             run_one()
         prefix_before = _metric_totals(llm.get_metrics())
+        prefix_observer_start = len(prefix_observer_events)
         # Graph dispatch deltas must start immediately before measured runs;
         # startup capture, hit priming, and warmups are not measurement proof.
         worker_before = _worker_diagnostics(llm, args.backend)
@@ -801,6 +868,7 @@ def _run(args: argparse.Namespace) -> dict:
             samples_ms.append(elapsed_ms)
             fingerprints.append(output_fingerprints)
         prefix_after = _metric_totals(llm.get_metrics())
+        measured_prefix_events = prefix_observer_events[prefix_observer_start:]
 
         if args.profile_dir is not None:
             llm.start_profile(
@@ -814,7 +882,12 @@ def _run(args: argparse.Namespace) -> dict:
         host_after_runs = _process_rss_bytes()
 
     prefix_delta = _metric_delta(prefix_before, prefix_after)
-    _validate_prefix_evidence(args.prefix_cache, prefix_delta)
+    _validate_prefix_evidence(
+        args.prefix_cache,
+        prefix_delta,
+        measured_prefix_events if args.persistent else None,
+        args.runs if args.persistent else None,
+    )
     _validate_graph_evidence(worker_before, worker_after, args)
     unique_fingerprints = {
         json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
@@ -847,6 +920,21 @@ def _run(args: argparse.Namespace) -> dict:
                 "worker_after": worker_after,
                 "prefix_cache_metric_delta": prefix_delta,
                 "prefix_cache_hit_rate": _prefix_hit_rate(prefix_delta),
+                "prefix_cache_observer": (
+                    {
+                        "source": "inproc_kv_cache_manager.get_computed_blocks",
+                        "all_events": prefix_observer_events,
+                        "measured_events": measured_prefix_events,
+                        "measured_query_tokens": sum(
+                            event["query_tokens"] for event in measured_prefix_events
+                        ),
+                        "measured_hit_tokens": sum(
+                            event["computed_tokens"] for event in measured_prefix_events
+                        ),
+                    }
+                    if args.persistent
+                    else None
+                ),
             },
             "memory": {
                 "host_rss_before_engine_bytes": host_before_engine,

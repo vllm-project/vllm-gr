@@ -374,6 +374,67 @@ def test_prefix_evidence_accepts_observed_mode(mode: str, queries: float, hits: 
     )
 
 
+@pytest.mark.parametrize(
+    ("mode", "events"),
+    [
+        ("disabled", []),
+        ("miss", [{"computed_tokens": 0}]),
+        ("hit", [{"computed_tokens": 1008}]),
+    ],
+)
+def test_direct_prefix_observer_accepts_actual_cache_mode(mode, events) -> None:
+    profile._validate_prefix_evidence(
+        mode,
+        {"vllm:prefix_cache_queries": 0.0, "vllm:prefix_cache_hits": 0.0},
+        events,
+        len(events),
+    )
+
+
+def test_direct_prefix_observer_rejects_missing_or_wrong_evidence() -> None:
+    delta = {"vllm:prefix_cache_queries": 0.0, "vllm:prefix_cache_hits": 0.0}
+    with pytest.raises(profile.EvidenceUnavailableError, match="recorded no queries"):
+        profile._validate_prefix_evidence("hit", delta, [], 0)
+    with pytest.raises(profile.EvidenceUnavailableError, match="computed tokens"):
+        profile._validate_prefix_evidence("miss", delta, [{"computed_tokens": 16}], 1)
+    with pytest.raises(profile.EvidenceUnavailableError, match="count mismatch"):
+        profile._validate_prefix_evidence("hit", delta, [{"computed_tokens": 16}], 2)
+
+
+def test_inproc_prefix_observer_preserves_native_result() -> None:
+    blocks = object()
+    manager = SimpleNamespace(get_computed_blocks=lambda _request: (blocks, 1008))
+    llm = SimpleNamespace(
+        llm_engine=SimpleNamespace(
+            engine_core=SimpleNamespace(
+                engine_core=SimpleNamespace(
+                    scheduler=SimpleNamespace(kv_cache_manager=manager)
+                )
+            )
+        )
+    )
+    events = profile._install_inproc_prefix_observer(llm)
+    request = SimpleNamespace(
+        request_id="native-0",
+        num_prompt_tokens=1024,
+        num_computed_tokens=0,
+        gr_issued_steps=0,
+        gr_persistent_runner_state=True,
+    )
+
+    assert manager.get_computed_blocks(request) == (blocks, 1008)
+    assert events == [
+        {
+            "request_id": "native-0",
+            "query_tokens": 1024,
+            "computed_tokens": 1008,
+            "num_computed_tokens_before": 0,
+            "gr_issued_steps": 0,
+            "persistent": True,
+        }
+    ]
+
+
 def test_prefix_metrics_must_exist() -> None:
     with pytest.raises(profile.EvidenceUnavailableError, match="metrics are unavailable"):
         profile._metric_totals([])
