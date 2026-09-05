@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for active-platform ModelRunner patch dispatch."""
 
+from contextlib import contextmanager
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -60,8 +61,10 @@ def test_missing_optional_diagnostic_installer_does_not_block_runtime(
     assert model_runner_patch.install_active_worker_diagnostic_hook(type("Worker", (), {})) == 0
 
 
+@pytest.mark.parametrize("has_input_prep_hook", [False, True])
 def test_dispatcher_installs_three_wrappers_once(
     monkeypatch: pytest.MonkeyPatch,
+    has_input_prep_hook: bool,
 ) -> None:
     class Runner:
         def execute_model(self, scheduler_output: Any) -> None:
@@ -82,12 +85,21 @@ def test_dispatcher_installs_three_wrappers_once(
         ) -> None:
             return None
 
+        @contextmanager
+        def synchronize_input_prep(self):
+            yield
+
     platform_module = SimpleNamespace(
         discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
         make_patched_bookkeeping_sync=gpu_model_runner_patch.make_patched_bookkeeping_sync,
         make_patched_sample=gpu_model_runner_patch.make_patched_sample,
     )
+    original_input_prep = Runner.synchronize_input_prep
+    if has_input_prep_hook:
+        platform_module.make_patched_synchronize_input_prep = (
+            gpu_model_runner_patch.make_patched_synchronize_input_prep
+        )
     monkeypatch.setattr(
         model_runner_patch,
         "_get_active_platform_module",
@@ -96,6 +108,8 @@ def test_dispatcher_installs_three_wrappers_once(
 
     model_runner_patch.apply_worker_patches()
     first = (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync)
+    first_input_prep = Runner.synchronize_input_prep
+    assert (first_input_prep is not original_input_prep) == has_input_prep_hook
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert getattr(Runner, "_patched_for_beam_pos_ids") is True
     # No _sample on this Runner -> the Constraint Tables hook must not be added.
@@ -105,6 +119,7 @@ def test_dispatcher_installs_three_wrappers_once(
 
     model_runner_patch.apply_worker_patches()
     assert (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync) == first
+    assert Runner.synchronize_input_prep is first_input_prep
 
 
 def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(

@@ -20,7 +20,34 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam.decode_geometry import BeamDecodeGeometry
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
+
+
+def _persistent_prefix_binding() -> torch.Tensor | None:
+    """Return the backend-bound prefix row for the active B=1 session."""
+
+    beam_info = BEAM_DATA_VAR.get()
+    if not beam_info:
+        return None
+    beam_data = beam_info.get("beam_data") or {}
+    persistent = [
+        metadata
+        for metadata in beam_data.values()
+        if metadata.get("persistent_runner_state") and metadata.get("is_beam_decode")
+    ]
+    if not persistent:
+        return None
+    if len(persistent) != 1:
+        raise RuntimeError("persistent GR prefix binding requires exactly one B=1 request")
+    session = beam_info.get("beam_session")
+    binding = getattr(getattr(session, "context", None), "_gr_persistent_prefix_binding", None)
+    if not isinstance(binding, tuple) or len(binding) != 1:
+        raise RuntimeError("persistent GR prefix binding is missing or has multiple KV groups")
+    prefix_row = binding[0]
+    if not torch.is_tensor(prefix_row) or prefix_row.ndim != 1:
+        raise RuntimeError("persistent GR prefix binding must be one device block-table row")
+    return prefix_row
 
 
 def get_scheduler_metadata(*args, **kwargs):
@@ -346,49 +373,18 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             object.__setattr__(self, "_geom_cache", cache)
         return cache
 
-    def _evict_stale_geometry_entries(self, geom_key) -> None:
-        """Drop geometry-cache entries left behind by finished sessions.
+    def _invalidate_geometry_cache(self) -> None:
+        self._geometry_cache().clear()
+        self._resident_geometry_key = None
 
-        geom keys embed the request ids of their beam session.  When the ids
-        of the CURRENT key share no request with a cached key, that entry
-        belongs to a finished session (beam_finished_session_ids tore it down)
-        and its host lists / device views / schedule will never be read again.
-        Without eviction a long-running server accumulates one entry per
-        historical request in each sub-cache (cu_lists, views, layout,
-        schedule, block_table_copied), so the builder sweeps them whenever a
-        NEW geometry is admitted.  ``empty_slot_out`` is keyed by device and
-        is deliberately left alone.
-        """
-        if geom_key is None:
-            return
-        current_ids = {view[0] for view in geom_key[0]}
-        cache = self._geometry_cache()
-        for sub in ("cu_lists", "views", "layout", "schedule", "block_table_copied"):
-            bucket = cache.get(sub)
-            if not bucket:
-                continue
-            stale = [k for k in bucket if not ({v[0] for v in k[0]} & current_ids)]
-            for k in stale:
-                # ``block_table_copied`` stores its keys in a set (values are
-                # only membership markers); the other sub-caches are dicts.
-                if isinstance(bucket, set):
-                    bucket.discard(k)
-                else:
-                    del bucket[k]
-
-    def _empty_slot_out(self, device) -> torch.Tensor:
-        """Per-device cached empty slot-mapping tensor.
-
-        Incremental decode never produces a suffix slot mapping (the pool
-        slice replaces the gather), so every decode step would otherwise pay
-        a fresh ``torch.empty(0)`` allocation for the same shapeless tensor.
-        """
-        cache = self._geometry_cache().setdefault("empty_slot_out", {})
-        empty = cache.get(device)
-        if empty is None:
-            empty = torch.empty(0, dtype=torch.int32, device=device)
-            cache[device] = empty
-        return empty
+    def _select_geometry_cache(self, geom_key) -> dict:
+        # There is one physical set of fixed buffers, not one per key. An
+        # initialized bit for an older request cannot survive another layout
+        # overwriting those buffers (including Graph warmup/capture inputs).
+        if getattr(self, "_resident_geometry_key", None) != geom_key:
+            self._invalidate_geometry_cache()
+            self._resident_geometry_key = geom_key
+        return self._geometry_cache()
 
     def _cached_seqlens_views(
         self,
@@ -416,10 +412,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         """
         if geom_key is None:
             return None
-        views_cache = self._geometry_cache().setdefault("views", {})
+        views_cache = self._select_geometry_cache(geom_key).setdefault("views", {})
         cached = views_cache.get(geom_key)
         if cached is not None:
-            return cached
+            sizes = (n_pk, n_pc, n_sk, n_scq, n_sck)
+            if all(view.numel() == size for view, size in zip(cached, sizes)):
+                return cached
+            # A caller-provided key cannot authorize reusing incompatible
+            # slices. Rebuild the views and their static contents together.
+            self._invalidate_geometry_cache()
+            views_cache = self._select_geometry_cache(geom_key).setdefault("views", {})
         views = (
             self._prefix_seqlens_kv_buf[:n_pk],
             self._prefix_cu_seqlens_q_buf[:n_pc],
@@ -448,8 +450,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         Incremental decode: only ``suffix_seqlens_kv`` and
         ``suffix_cu_seqlens_k`` depend on ``decode_step``.  The three fixed
-        payloads are written to the address-stable buffers exactly once per
-        ``geom_key``; later steps skip them.  The step-derived suffix arrays
+        payloads are written once while ``geom_key`` remains resident in the
+        address-stable buffers; later steps skip them until another layout
+        overwrites the storage. The step-derived suffix arrays
         are rebuilt on device with ``fill_`` / ``arange`` from
         ``decode_step`` — no host list, no H2D.
 
@@ -459,15 +462,41 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         """
         if geom_key is None or decode_step is None:
             return False
-        cache = self._geometry_cache()
+        cache = self._select_geometry_cache(geom_key)
         if not cache.get(geom_key, False):
-            self._pack_int32_to_dev(
-                [
-                    (prefix_seqlens_kv_view, list(prefix_seqlens_kv_cpu)),
-                    (prefix_cu_seqlens_q_view, [0] + list(prefix_cu_seqlens_q_cpu)),
-                    (suffix_cu_seqlens_q_view, [0] + list(suffix_cu_seqlens_q_cpu)),
-                ]
-            )
+            if _persistent_prefix_binding() is not None:
+                # Admission/binding currently restricts persistent execution
+                # to B=1. Keep the writer itself request-group based: future
+                # multi-session support must not reuse a single-prefix layout.
+                offsets = [0] + list(prefix_cu_seqlens_q_cpu)
+                try:
+                    geometry = BeamDecodeGeometry(
+                        tuple(b - a for a, b in zip(offsets, offsets[1:])),
+                        tuple(prefix_seqlens_kv_cpu),
+                    )
+                except ValueError as exc:
+                    raise RuntimeError("persistent GR seqlens geometry mismatch") from exc
+                if (
+                    geometry.num_rows != suffix_seqlens_kv_view.numel()
+                    or list(suffix_cu_seqlens_q_cpu) != list(range(1, geometry.num_rows + 1))
+                ):
+                    raise RuntimeError("persistent GR seqlens geometry mismatch")
+                try:
+                    geometry.write_static_seqlens(
+                        prefix_seqlens_kv_view,
+                        prefix_cu_seqlens_q_view,
+                        suffix_cu_seqlens_q_view,
+                    )
+                except ValueError as exc:
+                    raise RuntimeError("persistent GR seqlens geometry mismatch") from exc
+            else:
+                self._pack_int32_to_dev(
+                    [
+                        (prefix_seqlens_kv_view, list(prefix_seqlens_kv_cpu)),
+                        (prefix_cu_seqlens_q_view, [0] + list(prefix_cu_seqlens_q_cpu)),
+                        (suffix_cu_seqlens_q_view, [0] + list(suffix_cu_seqlens_q_cpu)),
+                    ]
+                )
             cache[geom_key] = True
 
         # Device-side step update (no H2D):
@@ -1046,25 +1075,37 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # replays bit-identically for prefix_len=5120).
             prefix_max_seq_len = self._prefix_block_table_buf.shape[1] * self.block_size
             prefix_block_table = self._prefix_block_table_buf[: len(prefix_req_idxs_cpu)]
-            # The prefix block rows are frozen for the lifetime of an
-            # incremental beam session (decode KV goes to the beam pool, not
-            # the paged cache), so on a geometry hit the staged copy is
-            # already in the address-stable buffer and can be skipped.
-            copied = self._geometry_cache().setdefault("block_table_copied", set())
-            if geom_key is None or geom_key not in copied:
+            persistent_binding = _persistent_prefix_binding()
+            if persistent_binding is not None:
+                if len(prefix_req_idxs_cpu) != 1 or persistent_binding.numel() < (
+                    max_prefix_blocks_count
+                ):
+                    raise RuntimeError("persistent GR prefix binding geometry mismatch")
+                prefix_block_table[0, :max_prefix_blocks_count].copy_(
+                    persistent_binding[:max_prefix_blocks_count]
+                )
+            else:
                 prefix_block_table[:, :max_prefix_blocks_count].copy_(
                     common_attn_metadata.block_table_tensor[
                         prefix_req_idxs_cpu, :max_prefix_blocks_count
                     ]
                 )
-                if geom_key is not None:
-                    copied.add(geom_key)
         else:
             prefix_indices_tensor = torch.tensor(prefix_indices, dtype=torch.long, device=device)
             prefix_max_seq_len = max(prefix_seqlens_kv_cpu) if prefix_seqlens_kv_cpu else 0
-            prefix_block_table = common_attn_metadata.block_table_tensor[
-                prefix_req_idxs_cpu, :max_prefix_blocks_count
-            ].contiguous()
+            persistent_binding = _persistent_prefix_binding()
+            if persistent_binding is not None:
+                if len(prefix_req_idxs_cpu) != 1 or persistent_binding.numel() < (
+                    max_prefix_blocks_count
+                ):
+                    raise RuntimeError("persistent GR prefix binding geometry mismatch")
+                prefix_block_table = persistent_binding[
+                    :max_prefix_blocks_count
+                ].unsqueeze(0)
+            else:
+                prefix_block_table = common_attn_metadata.block_table_tensor[
+                    prefix_req_idxs_cpu, :max_prefix_blocks_count
+                ].contiguous()
 
         if suffix_slot_mapping_out_list:
             suffix_total_tokens = len(suffix_slot_mapping_out_list)
@@ -1134,6 +1175,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 # One pinned host->device transfer carries prefix + suffix
                 # seqlens and cu_seqlens payloads; D2D scatter then fills the
                 # fixed buffers.
+                self._invalidate_geometry_cache()
                 self._pack_int32_to_dev(
                     [
                         (prefix_seqlens_kv_device, list(prefix_seqlens_kv_cpu)),
@@ -1559,18 +1601,37 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             else:
                 new_metadata.std_block_table = blk_table[metadata.std_req_idxs_cpu].contiguous()
         if metadata.prefix_req_idxs_cpu:
+            persistent_binding = _persistent_prefix_binding()
             if self._fixed_buffers:
                 num_prefix = len(metadata.prefix_req_idxs_cpu)
                 # G1: full-width view (must match the view used at capture time
                 # so the replayed graph reads the same tensor geometry).
                 prefix_block_table = self._prefix_block_table_buf[:num_prefix]
-                prefix_block_table[:, : metadata.max_prefix_blocks_count].copy_(
-                    blk_table[metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count]
-                )
+                if persistent_binding is not None:
+                    if num_prefix != 1 or persistent_binding.numel() < (
+                        metadata.max_prefix_blocks_count
+                    ):
+                        raise RuntimeError("persistent GR prefix binding geometry mismatch")
+                    prefix_block_table[0, : metadata.max_prefix_blocks_count].copy_(
+                        persistent_binding[: metadata.max_prefix_blocks_count]
+                    )
+                else:
+                    prefix_block_table[:, : metadata.max_prefix_blocks_count].copy_(
+                        blk_table[
+                            metadata.prefix_req_idxs_cpu,
+                            : metadata.max_prefix_blocks_count,
+                        ]
+                    )
                 new_metadata.prefix_block_table = prefix_block_table
             else:
-                new_metadata.prefix_block_table = blk_table[
-                    metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count
-                ].contiguous()
+                if persistent_binding is not None:
+                    new_metadata.prefix_block_table = persistent_binding[
+                        : metadata.max_prefix_blocks_count
+                    ].unsqueeze(0)
+                else:
+                    new_metadata.prefix_block_table = blk_table[
+                        metadata.prefix_req_idxs_cpu,
+                        : metadata.max_prefix_blocks_count,
+                    ].contiguous()
 
         return new_metadata

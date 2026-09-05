@@ -33,6 +33,7 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
@@ -131,6 +132,27 @@ class BeamPostprocessWorkspace:
     host_prefill_staging_numpy: Any
     prefill_copy_event: Any | None
 
+    # Persistent-request-only CUDA storage.  Sequence/cumulative score state
+    # deliberately remains in ``BeamSearchSession.context.decision``; these
+    # buffers only retain the minimum lineage/per-token data required by the
+    # final public ABI plus the two O(B) control slots used by BatchQueue.
+    gr_control_output_0: torch.Tensor
+    gr_control_output_1: torch.Tensor
+    gr_parent_history: torch.Tensor
+    gr_logprob_history: torch.Tensor
+    gr_previous_scores: torch.Tensor
+    gr_parent_scores: torch.Tensor
+    gr_gather_indices: torch.Tensor
+    gr_backtrace_indices: torch.Tensor
+    gr_backtrace_parents: torch.Tensor
+    gr_backtrace_logprobs: torch.Tensor
+    gr_active_mask: torch.Tensor
+    gr_invalid_status: torch.Tensor
+    gr_final_result: torch.Tensor
+    gr_host_final_result: torch.Tensor
+    gr_host_final_result_numpy: Any
+    gr_final_copy_event: Any | None
+
     @classmethod
     def allocate(
         cls,
@@ -192,6 +214,12 @@ class BeamPostprocessWorkspace:
         host_result = host_empty((result_capacity,), torch.int32)
         prefill_capacity = max_batch + result_capacity
         host_prefill_staging = host_empty((prefill_capacity,), torch.int32)
+        gr_payload_capacity = (
+            3 * max_batch * beam_width * max_decode_steps
+            + max_batch * beam_width
+        )
+        gr_result_capacity = max_batch + gr_payload_capacity
+        gr_host_final_result = host_empty((gr_result_capacity,), torch.int32)
         copy_event = torch.Event(enable_timing=False) if resolved_device.type == "cuda" else None
         prefill_copy_event = (
             torch.Event(enable_timing=False) if resolved_device.type == "cuda" else None
@@ -235,6 +263,32 @@ class BeamPostprocessWorkspace:
             host_prefill_staging=host_prefill_staging,
             host_prefill_staging_numpy=host_prefill_staging.numpy(),
             prefill_copy_event=prefill_copy_event,
+            gr_control_output_0=device_empty((max_batch, 1), torch.int32),
+            gr_control_output_1=device_empty((max_batch, 1), torch.int32),
+            gr_parent_history=device_empty(
+                (max_batch, beam_width, max_decode_steps), torch.int32
+            ),
+            gr_logprob_history=device_empty(
+                (max_batch, beam_width, max_decode_steps), torch.float32
+            ),
+            gr_previous_scores=device_empty(beam_shape, torch.float32),
+            gr_parent_scores=device_empty(beam_shape, torch.float32),
+            gr_gather_indices=device_empty(beam_shape, torch.int64),
+            gr_backtrace_indices=device_empty(
+                (2, max_batch, beam_width), torch.int64
+            ),
+            gr_backtrace_parents=device_empty(beam_shape, torch.int32),
+            gr_backtrace_logprobs=device_empty(beam_shape, torch.float32),
+            gr_active_mask=device_empty(beam_shape, torch.bool),
+            gr_invalid_status=device_empty((max_batch,), torch.int32),
+            gr_final_result=device_empty((gr_result_capacity,), torch.int32),
+            gr_host_final_result=gr_host_final_result,
+            gr_host_final_result_numpy=gr_host_final_result.numpy(),
+            gr_final_copy_event=(
+                torch.Event(enable_timing=False)
+                if resolved_device.type == "cuda"
+                else None
+            ),
         )
 
     def _validate_batch_size(self, batch_size: int) -> None:
@@ -303,6 +357,19 @@ class BeamPostprocessWorkspace:
             scratch.merge_flat_indices,
             self.packed_result,
             self.prefill_staging,
+            self.gr_control_output_0,
+            self.gr_control_output_1,
+            self.gr_parent_history,
+            self.gr_logprob_history,
+            self.gr_previous_scores,
+            self.gr_parent_scores,
+            self.gr_gather_indices,
+            self.gr_backtrace_indices,
+            self.gr_backtrace_parents,
+            self.gr_backtrace_logprobs,
+            self.gr_active_mask,
+            self.gr_invalid_status,
+            self.gr_final_result,
         )
 
     @property
@@ -316,6 +383,7 @@ class BeamPostprocessWorkspace:
             self.host_temperatures,
             self.host_result,
             self.host_prefill_staging,
+            self.gr_host_final_result,
         )
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
@@ -912,8 +980,10 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
     the first W beam survivors (all with parent 0).  Publishing them through
     the canonical result channel avoids the remaining frontend NumPy select.
 
-    The decode session initializes independently from its first per-parent
-    candidate matrix; prefill scores must not seed its persistent buffers.
+    The persistent runner-state backend uses these winners to bootstrap its
+    sole device-resident sequence and cumulative-score state.  The state must
+    not be reconstructed from the first decode candidate matrix: doing so
+    would discard the prefill scores and count the current local score twice.
     """
     from vllm_gr.config import ConstraintBackend
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
@@ -1325,6 +1395,8 @@ def _run_cuda_decision_out(
     workspace: BeamPostprocessWorkspace,
     is_last_step: bool,
     result_width: int,
+    *,
+    reorder_kv: bool = True,
 ) -> dict[str, torch.Tensor] | None:
     """Run the fixed-address CUDA Group/KV/Final pipeline for one step."""
 
@@ -1459,7 +1531,8 @@ def _run_cuda_decision_out(
     # The current CUDA Beam context owns one active pool slot, so request row
     # zero's global parent ids are already request-local.  Keep them on device
     # and feed the existing duplicate-safe gather/scatter reorder directly.
-    _reorder_kv_same_step(session, selected_parents[0], selected_prefix[0])
+    if reorder_kv:
+        _reorder_kv_same_step(session, selected_parents[0], selected_prefix[0])
     return {
         "out_token_ids": selected_ids,
         "out_token_index": selected_parents,
@@ -1468,6 +1541,8 @@ def _run_cuda_decision_out(
         "_gr_deferred_cuda_status": deferred_status,
         "_gr_result_batch": batch,
         "_gr_result_width": beam_width,
+        "_gr_reorder_parents": selected_parents,
+        "_gr_reorder_prefix": selected_prefix,
     }
 
 
@@ -1521,6 +1596,8 @@ def run_beam_decision(
     sampler_output: Any,
     is_last_step: bool,
     result_width: int | None = None,
+    *,
+    reorder_kv: bool = True,
 ) -> dict[str, torch.Tensor] | None:
     """Run the worker-side beam decision for one decode step.
 
@@ -1569,8 +1646,8 @@ def run_beam_decision(
                 return None
 
     result_width = result_width or width
-    if result_width <= 0 or result_width < width:
-        result_width = width
+    if not 1 <= result_width <= width:
+        return None
 
     bufs = session.context.decision
     if bufs.worker_decode_steps == 0:
@@ -1589,6 +1666,7 @@ def run_beam_decision(
             workspace,
             is_last_step,
             result_width,
+            reorder_kv=reorder_kv,
         )
 
     try:
@@ -1643,7 +1721,8 @@ def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
             return True
         if gr_state is None:
             gr_state = _create_persistent_gr_state(runner, req_id, mdata)
-        gr_state.bootstrap_from_prefill(runner, sampler_output, mdata)
+        with record_function_or_nullcontext("gr_prefill_bootstrap"):
+            gr_state.bootstrap_from_prefill(runner, sampler_output, mdata)
         is_last_step = gr_state.step >= gr_state.max_tokens
         sampler_output._gr_model_runner_state = gr_state
         if is_last_step:
@@ -1651,7 +1730,8 @@ def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
                 release_gr_model_runner_states,
             )
 
-            payload = gr_state.finalize_output(runner)
+            with record_function_or_nullcontext("gr_final_output"):
+                payload = gr_state.finalize_output(runner)
             payload["gr_state_created"] = 1
             payload["gr_state_freed"] = release_gr_model_runner_states(runner, [req_id])
             runner._beam_decision_result = payload
@@ -1661,14 +1741,16 @@ def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
 
     if gr_state is None:
         raise RuntimeError(f"persistent GR state is missing for request {req_id!r}")
-    is_last_step = gr_state.advance_beam(runner, sampler_output, mdata)
+    with record_function_or_nullcontext("gr_beam_decision"):
+        is_last_step = gr_state.advance_beam(runner, sampler_output, mdata)
     sampler_output._gr_model_runner_state = gr_state
     if is_last_step:
         from vllm_gr.v1.worker.gr_model_runner_state import (
             release_gr_model_runner_states,
         )
 
-        payload = gr_state.finalize_output(runner)
+        with record_function_or_nullcontext("gr_final_output"):
+            payload = gr_state.finalize_output(runner)
         payload["gr_state_created"] = 1
         payload["gr_state_freed"] = release_gr_model_runner_states(runner, [req_id])
         runner._beam_decision_result = payload

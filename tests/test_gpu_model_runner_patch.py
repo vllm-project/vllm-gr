@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for GPU ModelRunner wrappers."""
 
+from contextlib import contextmanager
+import inspect
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,6 +12,226 @@ import torch
 
 from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
 from vllm_gr.v1.worker import model_runner_common as common
+from vllm_gr.v1.worker.gr_model_runner_state import GRDeviceBackend
+
+
+def test_gpu_backend_factory_returns_v1_protocol_implementation() -> None:
+    backend = gpu_patch.create_gr_device_backend(SimpleNamespace())
+    assert isinstance(backend, GRDeviceBackend)
+
+
+@pytest.mark.parametrize("stage", ["ordinary", "prefill", "decode"])
+def test_execute_failure_quarantines_before_any_later_forward(monkeypatch, stage):
+    calls = []
+
+    class Transport:
+        error = None
+        retained = object()
+
+        def check_live(self):
+            if self.error is not None:
+                raise RuntimeError("quarantined")
+
+        def quarantine(self, error):
+            self.error = error
+
+    transport = Transport()
+    retained = transport.retained
+    runner = SimpleNamespace(_gr_cuda_output_transport=transport)
+    metadata = {"persistent_runner_state": True, "beam_width": 4}
+    metadata["is_beam_decode" if stage == "decode" else "is_constraint_prefill"] = True
+    output = SimpleNamespace(
+        beam_data={} if stage == "ordinary" else {"gr": metadata},
+        num_scheduled_tokens={"gr": 1}, total_num_scheduled_tokens=1,
+        gr_outputs={"gr": SimpleNamespace(logical_token_count=1, physical_row_count=4)},
+    )
+
+    def original(*_args):
+        calls.append("forward")
+        raise ValueError("forward failed")
+
+    monkeypatch.setattr(gpu_patch, "_make_common_patched_execute_model", lambda fn: fn)
+    monkeypatch.setattr(gpu_patch, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(gpu_patch, "has_ec_transfer", lambda: False)
+    execute = gpu_patch.make_patched_execute_model_gpu(original)
+    with pytest.raises(ValueError, match="forward failed"):
+        execute(runner, output)
+    with pytest.raises(RuntimeError, match="quarantined"):
+        execute(runner, output)
+    assert calls == ["forward"] and transport.retained is retained
+    assert output.total_num_scheduled_tokens == 1
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_gpu_shutdown_drains_before_common_release(failure):
+    calls = []
+
+    def drain():
+        calls.append("drain")
+        if failure:
+            raise RuntimeError("drain failed")
+
+    shutdown = gpu_patch.make_patched_shutdown(lambda _runner: calls.append("release"))
+    runner = SimpleNamespace(_gr_cuda_output_transport=SimpleNamespace(shutdown=drain))
+    if failure:
+        with pytest.raises(RuntimeError, match="drain failed"):
+            shutdown(runner)
+        assert calls == ["drain"]
+    else:
+        shutdown(runner)
+        assert calls == ["drain", "release"]
+
+
+def _input_prep_fixture(*, ready=True, active=True, failure=None):
+    calls = []
+
+    class Event:
+        def query(self):
+            calls.append("query")
+            if failure == "query":
+                raise RuntimeError("query failed")
+            return ready
+
+        def synchronize(self):
+            calls.append("synchronize")
+            if failure == "synchronize":
+                raise RuntimeError("synchronize failed")
+
+        def record(self):
+            calls.append("record")
+
+    @contextmanager
+    def original(self):
+        calls.append("original")
+        if self.prepare_inputs_event is None:
+            yield
+            return
+        self.prepare_inputs_event.synchronize()
+        try:
+            yield
+        finally:
+            self.prepare_inputs_event.record()
+
+    output = SimpleNamespace(beam_data={"gr": {"persistent_runner_state": True}})
+    if active:
+        output._gr_cuda_logical_geometry = ("gr", 1, 128)
+    runner = SimpleNamespace(
+        prepare_inputs_event=Event(), _current_scheduler_output=output
+    )
+    return runner, original, calls
+
+
+@pytest.mark.parametrize("ready", [True, False])
+@pytest.mark.parametrize("body_error", [True, False])
+def test_input_prep_keeps_complete_guard_and_error_record(ready, body_error):
+    runner, original, calls = _input_prep_fixture(ready=ready)
+    event = runner.prepare_inputs_event
+    patched = gpu_patch.make_patched_synchronize_input_prep(original)
+    assert gpu_patch.make_patched_synchronize_input_prep(patched) is patched
+
+    def prepare():
+        with patched(runner):
+            # The guarded region starts before _update_states, not only at
+            # _prepare_inputs. Native zeroing/metadata/preprocess stay inside.
+            calls.extend(["update_states", "prepare_inputs", "metadata", "preprocess"])
+            if body_error:
+                raise ValueError("preparation failed")
+
+    if body_error:
+        with pytest.raises(ValueError, match="preparation failed"):
+            prepare()
+    else:
+        prepare()
+    assert calls == (
+        (["query"] if ready else ["query", "original", "synchronize"])
+        + ["update_states", "prepare_inputs", "metadata", "preprocess", "record"]
+    )
+    assert runner.prepare_inputs_event is event
+    assert getattr(runner, "_gr_input_prep_ready_skips", 0) == int(ready)
+    assert getattr(runner, "_gr_input_prep_waits", 0) == int(not ready)
+
+
+@pytest.mark.parametrize("failure", ["query", "synchronize"])
+def test_input_prep_failed_completion_never_grants_host_write(failure):
+    runner, original, calls = _input_prep_fixture(ready=False, failure=failure)
+    patched = gpu_patch.make_patched_synchronize_input_prep(original)
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        with patched(runner):
+            pytest.fail("failed completion must not release DMA ownership")
+    assert calls == (
+        ["query"] if failure == "query" else ["query", "original", "synchronize"]
+    )
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "prefill", "dummy", "no_event"])
+def test_input_prep_non_decode_delegates_without_query(mode):
+    runner, original, calls = _input_prep_fixture(active=mode == "no_event")
+    if mode == "ordinary":
+        runner._current_scheduler_output.beam_data = {}
+    elif mode == "dummy":
+        # Deliberately leave stale persistent beam metadata: the scoped
+        # physical-geometry marker, not this metadata, controls the fast path.
+        runner._current_beam_info = {"beam_data": {"gr": {"is_beam_decode": True}}}
+    elif mode == "no_event":
+        runner.prepare_inputs_event = None
+    with gpu_patch.make_patched_synchronize_input_prep(original)(runner):
+        calls.append("body")
+    assert calls == (
+        ["original", "body"]
+        if mode == "no_event"
+        else ["original", "synchronize", "body", "record"]
+    )
+    assert not hasattr(runner, "_gr_input_prep_ready_skips")
+    assert not hasattr(runner, "_gr_input_prep_waits")
+
+
+@pytest.mark.parametrize("execute_error", [True, False])
+def test_input_prep_execute_scope_and_mode_handoffs(monkeypatch, execute_error):
+    runner, original_prep, calls = _input_prep_fixture(active=False)
+    event = runner.prepare_inputs_event
+    guarded = gpu_patch.make_patched_synchronize_input_prep(original_prep)
+    output = SimpleNamespace(
+        num_scheduled_tokens={"gr": 1}, total_num_scheduled_tokens=1,
+        beam_data={"gr": {
+            "persistent_runner_state": True, "is_beam_decode": True, "beam_width": 4,
+        }},
+        gr_outputs={"gr": SimpleNamespace(logical_token_count=1, physical_row_count=4)},
+    )
+
+    def common_patcher(original_execute):
+        def common_execute(self, scheduler_output):
+            self._current_scheduler_output = scheduler_output
+            return original_execute(self, scheduler_output)
+        return common_execute
+
+    monkeypatch.setattr(gpu_patch, "_make_common_patched_execute_model", common_patcher)
+    monkeypatch.setattr(gpu_patch, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(gpu_patch, "has_ec_transfer", lambda: False)
+
+    def original_execute(self, scheduler_output):
+        with guarded(self):
+            calls.append("decode")
+            if execute_error:
+                raise RuntimeError("execute failed")
+
+    with guarded(runner):
+        calls.append("prefill")
+    execute = gpu_patch.make_patched_execute_model_gpu(original_execute)
+    if execute_error:
+        with pytest.raises(RuntimeError, match="execute failed"):
+            execute(runner, output)
+    else:
+        execute(runner, output)
+    assert runner._current_scheduler_output is output  # intentionally retained upstream context
+    assert not hasattr(output, "_gr_cuda_logical_geometry")
+    with guarded(runner):
+        calls.append("later_dummy")
+    assert runner.prepare_inputs_event is event
+    assert calls == [
+        "original", "synchronize", "prefill", "record",
+        "query", "decode", "record",
+        "original", "synchronize", "later_dummy", "record",
+    ]
 
 
 def test_gpu_prepare_preserves_order_and_two_item_contract(
@@ -108,6 +330,707 @@ def test_gpu_prepare_delegates_persistent_device_writes_to_backend_state(
 
     assert events == ["original", "backend-prepare"]
     assert runner.input_ids.gpu.tolist() == [9, 9, 9, 9]
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_gpu_execute_publishes_physical_geometry_only_inside_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    raises: bool,
+) -> None:
+    observations: list[tuple[int, int, tuple[str, int, int]]] = []
+
+    def original(self: Any, scheduler_output: Any) -> str:
+        del self
+        observations.append(
+            (
+                scheduler_output.num_scheduled_tokens["gr"],
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output._gr_cuda_logical_geometry,
+            )
+        )
+        if raises:
+            raise RuntimeError("worker failed")
+        return "ok"
+
+    monkeypatch.setattr(
+        gpu_patch,
+        "_make_common_patched_execute_model",
+        lambda received: received,
+    )
+    monkeypatch.setattr(gpu_patch, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(gpu_patch, "has_ec_transfer", lambda: False)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"gr": 1},
+        total_num_scheduled_tokens=1,
+        beam_data={
+            "gr": {
+                "persistent_runner_state": True,
+                "is_beam_decode": True,
+                "beam_width": 4,
+            }
+        },
+        gr_outputs={
+            "gr": SimpleNamespace(logical_token_count=1, physical_row_count=4)
+        },
+    )
+    wrapped = gpu_patch.make_patched_execute_model_gpu(original)
+    if raises:
+        with pytest.raises(RuntimeError, match="worker failed"):
+            wrapped(SimpleNamespace(), scheduler_output)
+    else:
+        assert wrapped(SimpleNamespace(), scheduler_output) == "ok"
+
+    assert observations == [(4, 4, ("gr", 1, 4))]
+    assert scheduler_output.num_scheduled_tokens == {"gr": 1}
+    assert scheduler_output.total_num_scheduled_tokens == 1
+    assert not hasattr(scheduler_output, "_gr_cuda_logical_geometry")
+
+
+@pytest.mark.parametrize(
+    ("kv_transfer", "ec_transfer", "message"),
+    [
+        (True, False, "active KV connector"),
+        (False, True, "active EC transfer"),
+    ],
+)
+def test_gpu_execute_rejects_persistent_transfer_modes_before_common_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_transfer: bool,
+    ec_transfer: bool,
+    message: str,
+) -> None:
+    calls: list[str] = []
+
+    def original(*_args: Any) -> None:
+        calls.append("common")
+
+    monkeypatch.setattr(
+        gpu_patch,
+        "_make_common_patched_execute_model",
+        lambda received: received,
+    )
+    monkeypatch.setattr(gpu_patch, "has_kv_transfer_group", lambda: kv_transfer)
+    monkeypatch.setattr(gpu_patch, "has_ec_transfer", lambda: ec_transfer)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"gr": 1},
+        total_num_scheduled_tokens=1,
+        beam_data={
+            "gr": {
+                "persistent_runner_state": True,
+                "is_beam_decode": True,
+                "beam_width": 4,
+            }
+        },
+        gr_outputs={
+            "gr": SimpleNamespace(logical_token_count=1, physical_row_count=4)
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        gpu_patch.make_patched_execute_model_gpu(original)(
+            SimpleNamespace(),
+            scheduler_output,
+        )
+
+    assert calls == []
+    assert scheduler_output.num_scheduled_tokens == {"gr": 1}
+    assert scheduler_output.total_num_scheduled_tokens == 1
+    assert not hasattr(scheduler_output, "_gr_cuda_logical_geometry")
+
+
+def test_gpu_execute_transfer_modes_do_not_affect_ordinary_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gpu_patch,
+        "_make_common_patched_execute_model",
+        lambda received: received,
+    )
+    monkeypatch.setattr(
+        gpu_patch,
+        "has_kv_transfer_group",
+        lambda: (_ for _ in ()).throw(AssertionError("must not query KV transfer")),
+    )
+    monkeypatch.setattr(
+        gpu_patch,
+        "has_ec_transfer",
+        lambda: (_ for _ in ()).throw(AssertionError("must not query EC transfer")),
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"ordinary": 1},
+        total_num_scheduled_tokens=1,
+        beam_data={},
+    )
+
+    result = gpu_patch.make_patched_execute_model_gpu(
+        lambda *_args: "ordinary"
+    )(SimpleNamespace(), scheduler_output)
+
+    assert result == "ordinary"
+
+
+def test_gpu_execute_rejects_mixed_persistent_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gpu_patch,
+        "_make_common_patched_execute_model",
+        lambda received: received,
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"gr": 1, "ordinary": 1},
+        total_num_scheduled_tokens=2,
+        beam_data={
+            "gr": {
+                "persistent_runner_state": True,
+                "is_beam_decode": True,
+                "beam_width": 4,
+            }
+        },
+        gr_outputs={
+            "gr": SimpleNamespace(logical_token_count=1, physical_row_count=4)
+        },
+    )
+    wrapped = gpu_patch.make_patched_execute_model_gpu(lambda *_args: None)
+    with pytest.raises(RuntimeError, match="isolated B=1"):
+        wrapped(SimpleNamespace(), scheduler_output)
+
+
+def test_cuda_backend_control_write_requires_active_lease() -> None:
+    workspace = SimpleNamespace(
+        gr_control_output_0=torch.empty((1, 1), dtype=torch.int32),
+        gr_control_output_1=torch.empty((1, 1), dtype=torch.int32),
+    )
+    with pytest.raises(RuntimeError, match="active persistent sampling lease"):
+        gpu_patch.CudaGRDeviceBackend._control_output(workspace, 1, 7)
+
+
+@pytest.fixture
+def isolated_control_transport(monkeypatch):
+    """Only algorithm-isolated CPU tests stub the separately tested transport."""
+    from vllm_gr.v1.worker import cuda_async_output
+
+    def fill(workspace, device_step, token_id):
+        slot = getattr(workspace, f"gr_control_output_{device_step % 2}")
+        slot.fill_(token_id)
+        return slot
+
+    monkeypatch.setattr(cuda_async_output, "fill_control", fill)
+
+
+def test_cuda_backend_bootstrap_initializes_authoritative_decision_without_d2h(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_control_transport,
+) -> None:
+    from vllm_gr.v1.beam import beam_decision
+
+    workspace = beam_decision.BeamPostprocessWorkspace.allocate(
+        max_batch=1,
+        beam_width=2,
+        top_k=2,
+        max_decode_steps=3,
+        device="cpu",
+        logits_dtype=torch.float16,
+        pin_host=False,
+    )
+    decision_state = SimpleNamespace(
+        sequence=torch.zeros((1, 2, 3), dtype=torch.int32),
+        beam_scores=torch.zeros((1, 2), dtype=torch.float32),
+        worker_decode_steps=0,
+    )
+    state = SimpleNamespace(
+        beam_width=2,
+        max_tokens=3,
+        finish_token_id=9,
+        continue_token_id=7,
+        session=SimpleNamespace(context=SimpleNamespace(decision=decision_state)),
+        backend_state=None,
+        prefix_binding=None,
+    )
+    sampler_output = SimpleNamespace(_gr_deferred_prefill_status=False)
+    token_ids = torch.tensor([[11, 12]], dtype=torch.int32)
+    scores = torch.tensor([[-0.1, -0.2]], dtype=torch.float32)
+    backend = gpu_patch.CudaGRDeviceBackend()
+    monkeypatch.setattr(backend, "_require_workspace", lambda *_args: workspace)
+    monkeypatch.setattr(backend, "_extract_prefix_binding", lambda *_args: (object(),))
+    monkeypatch.setattr(
+        beam_decision,
+        "_run_cuda_prefill_decision",
+        lambda *_args: {"out_token_ids": token_ids, "out_log_probs": scores},
+    )
+
+    step = backend.bootstrap_from_prefill(
+        SimpleNamespace(), state, sampler_output, {"generation_index": 0}
+    )
+
+    assert decision_state.worker_decode_steps == 1
+    assert decision_state.sequence.tolist() == [[[11, 0, 0], [12, 0, 0]]]
+    torch.testing.assert_close(decision_state.beam_scores, scores)
+    assert step.next_token_ids is token_ids
+    assert step.beam_scores.data_ptr() == decision_state.beam_scores.data_ptr()
+    assert step.control_output is workspace.gr_control_output_1
+    assert not any(
+        marker in inspect.getsource(gpu_patch.CudaGRDeviceBackend.bootstrap_from_prefill)
+        for marker in (".cpu(", ".tolist(", ".item(", "synchronize(")
+    )
+
+
+def test_cuda_persistent_bootstrap_then_advance_preserves_parent_scores_once(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_control_transport,
+) -> None:
+    """First decode ranks prefill parents plus one local score exactly once.
+
+    This is the adversarial precision case from 89f4178 expressed through the
+    new persistent state/backend boundary.  Parent 1 owns the best local
+    decode candidate, but its much worse prefill score means parent 0 must
+    still win globally.  Initializing from the decode matrix would instead
+    drop the prefill scores and count the local score twice.
+    """
+    from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession, beam_decision
+    from vllm_gr.v1.worker.gr_model_runner_state import (
+        GR_FINAL_OUTPUT_FORMAT,
+        GRModelRunnerState,
+        unpack_gr_final_output,
+    )
+
+    workspace = beam_decision.BeamPostprocessWorkspace.allocate(
+        max_batch=1,
+        beam_width=2,
+        top_k=2,
+        max_decode_steps=2,
+        device="cpu",
+        logits_dtype=torch.float16,
+        pin_host=False,
+    )
+    context = BeamAttentionContext(
+        max_batch=1,
+        max_beams=2,
+        num_kv_heads=1,
+        max_decode_steps=2,
+        head_dim=2,
+        num_layers=1,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+    )
+    slot = context.registry.allocate("gr", beam_width=2, prefix_len=8)
+    session = BeamSearchSession(session_id="gr", slot=slot, context=context)
+    session.begin_session(beam_width=2, prefix_len=8)
+    backend = gpu_patch.CudaGRDeviceBackend()
+    state = GRModelRunnerState(
+        request_id="gr",
+        session=session,
+        backend=backend,
+        beam_width=2,
+        max_tokens=2,
+        continue_token_id=7,
+        finish_token_id=9,
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(req_ids=["gr"]),
+        input_ids=SimpleNamespace(gpu=torch.full((2,), -1, dtype=torch.int32)),
+        _current_beam_info={
+            "beam_data": {"gr": {"is_beam_decode": True, "parent_beam_ids": None}}
+        },
+    )
+    prefill_tokens = torch.tensor([[10, 20]], dtype=torch.int32)
+    prefill_scores = torch.tensor([[-0.1, -5.0]], dtype=torch.float32)
+    monkeypatch.setattr(backend, "_require_workspace", lambda *_args: workspace)
+    monkeypatch.setattr(
+        backend,
+        "_extract_prefix_binding",
+        lambda *_args: (torch.tensor([31], dtype=torch.int32),),
+    )
+    monkeypatch.setattr(
+        beam_decision,
+        "_run_cuda_prefill_decision",
+        lambda *_args: {
+            "out_token_ids": prefill_tokens,
+            "out_log_probs": prefill_scores,
+        },
+    )
+
+    state.start_prefill()
+    state.bootstrap_from_prefill(
+        runner,
+        SimpleNamespace(_gr_deferred_prefill_status=False),
+        {"generation_index": 0},
+    )
+    scheduler_output = SimpleNamespace(
+        gr_outputs={
+            "gr": SimpleNamespace(logical_token_count=1, physical_row_count=2)
+        }
+    )
+    decode_metadata = {"generation_index": 1, "result_width": 2}
+    state.prepare_decode_inputs(runner, scheduler_output, [2], decode_metadata)
+    sampler_output = SimpleNamespace(
+        logprobs_tensors=SimpleNamespace(
+            logprob_token_ids=torch.tensor(
+                [[11, 12], [21, 22]], dtype=torch.int32
+            ),
+            logprobs=torch.tensor(
+                [[-4.0, -6.0], [-0.1, -1.0]], dtype=torch.float32
+            ),
+        )
+    )
+
+    assert state.advance_beam(runner, sampler_output, decode_metadata) is True
+
+    staging, payload_words, width = backend._pack_final_result(state, workspace)
+    payload = staging[workspace.max_batch : workspace.max_batch + payload_words]
+    decoded = unpack_gr_final_output(
+        {
+            "buffer_format": GR_FINAL_OUTPUT_FORMAT,
+            "shape": [width, state.step],
+            "buffer": payload.numpy().tobytes(),
+        }
+    )
+    assert decoded is not None
+    sequences, parents, per_token_logprobs, cumulative_scores = decoded
+    assert sequences == [[10, 11], [20, 21]]
+    assert parents == [[0, 0], [0, 1]]
+    torch.testing.assert_close(
+        torch.tensor(per_token_logprobs),
+        torch.tensor([[-0.1, -4.0], [-5.0, -0.1]]),
+    )
+    assert cumulative_scores == pytest.approx([-4.1, -5.1])
+
+
+def test_cuda_backend_does_not_reorder_whole_history_per_step() -> None:
+    source = inspect.getsource(gpu_patch.CudaGRDeviceBackend.advance_beam)
+    assert source.count("torch.index_select") == 1
+    assert "gr_parent_history[0, :result_width, state.step]" in source
+    assert "gr_logprob_history[0, :result_width, state.step]" in source
+
+
+def test_cuda_backend_extracts_stable_view_from_vllm_multigroup_block_table() -> None:
+    from vllm.v1.worker.block_table import MultiGroupBlockTable
+
+    block_table = MultiGroupBlockTable(
+        max_num_reqs=2,
+        max_model_len=128,
+        max_num_batched_tokens=32,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+    )
+    block_table.add_row(([31, 32, 33],), 0)
+    block_table.commit_block_table(1)
+    input_batch = SimpleNamespace(
+        req_id_to_index={"gr": 0},
+        block_table=block_table,
+        num_reqs=1,
+    )
+    runner = SimpleNamespace(input_batch=input_batch)
+    state = SimpleNamespace(
+        request_id="gr",
+        session=SimpleNamespace(_state=SimpleNamespace(prefix_len=31)),
+    )
+
+    binding = gpu_patch.CudaGRDeviceBackend._extract_prefix_binding(runner, state)
+
+    assert len(binding) == 1
+    assert binding[0].tolist() == [31, 32]
+    assert binding[0].data_ptr() == block_table[0].get_device_tensor(1)[0].data_ptr()
+    binding_ptr = binding[0].data_ptr()
+
+    # A later native block-table commit updates the same fixed storage; it
+    # neither reallocates nor invalidates the prefix-only row view retained by
+    # the persistent GR state.
+    block_table.append_row(([34],), 0)
+    block_table.commit_block_table(1)
+    assert binding[0].data_ptr() == binding_ptr
+    assert binding[0].tolist() == [31, 32]
+
+
+def test_cuda_backend_rejects_multiple_vllm_kv_cache_groups() -> None:
+    from vllm.v1.worker.block_table import MultiGroupBlockTable
+
+    block_table = MultiGroupBlockTable(
+        max_num_reqs=1,
+        max_model_len=128,
+        max_num_batched_tokens=32,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        block_sizes=[16, 32],
+        kernel_block_sizes=[16, 32],
+    )
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_id_to_index={"gr": 0},
+            block_table=block_table,
+            num_reqs=1,
+        )
+    )
+    state = SimpleNamespace(
+        request_id="gr",
+        session=SimpleNamespace(_state=SimpleNamespace(prefix_len=31)),
+    )
+
+    with pytest.raises(RuntimeError, match="one native KV-cache group"):
+        gpu_patch.CudaGRDeviceBackend._extract_prefix_binding(runner, state)
+
+
+def test_cuda_backend_prepare_writes_stable_input_and_publishes_prefix() -> None:
+    workspace = SimpleNamespace()
+    prefix = (torch.tensor([3, 4], dtype=torch.int32),)
+    context = SimpleNamespace(decode_step_buf=torch.full((1,), -1, dtype=torch.int32))
+    session = SimpleNamespace(decode_step=1, context=context)
+    state = SimpleNamespace(
+        request_id="gr",
+        beam_width=2,
+        step=2,
+        next_token_ids=torch.tensor([[41, 42]], dtype=torch.int32),
+        session=session,
+        prefix_binding=prefix,
+        backend_state=gpu_patch._CudaGRRequestState(workspace=workspace),
+    )
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["gr"]),
+        input_ids=SimpleNamespace(gpu=torch.full((4,), -1, dtype=torch.int32)),
+    )
+    sidecar = SimpleNamespace(logical_token_count=1, physical_row_count=2)
+    output = SimpleNamespace(gr_outputs={"gr": sidecar})
+
+    gpu_patch.CudaGRDeviceBackend().prepare_decode_inputs(
+        runner, state, output, [2], {"generation_index": 2}
+    )
+
+    assert runner.input_ids.gpu.tolist() == [41, 42, -1, -1]
+    assert context.decode_step_buf.tolist() == [1]
+    assert context._gr_persistent_prefix_binding is prefix
+
+    state.step = 3
+    session.decode_step = 2
+    state.next_token_ids = torch.tensor([[51, 52]], dtype=torch.int32)
+    gpu_patch.CudaGRDeviceBackend().prepare_decode_inputs(
+        runner, state, output, [2], {"generation_index": 3}
+    )
+    assert runner.input_ids.gpu.tolist() == [51, 52, -1, -1]
+    assert context._gr_persistent_prefix_binding is prefix
+
+
+def test_cuda_backend_release_clears_all_prefix_binding_owners() -> None:
+    prefix = object()
+    backend_state = gpu_patch._CudaGRRequestState(
+        workspace=object(),
+        prefix_binding=prefix,
+        pending_reorder_parents=object(),
+        pending_reorder_prefix=object(),
+    )
+    context = SimpleNamespace(_gr_persistent_prefix_binding=prefix)
+    state = SimpleNamespace(
+        backend_state=backend_state,
+        prefix_binding=prefix,
+        session=SimpleNamespace(context=context),
+    )
+
+    gpu_patch.CudaGRDeviceBackend().release(state)
+
+    assert state.prefix_binding is None
+    assert backend_state.prefix_binding is None
+    assert backend_state.pending_reorder_parents is None
+    assert backend_state.pending_reorder_prefix is None
+    assert context._gr_persistent_prefix_binding is None
+    assert backend_state.released is True
+
+
+def test_cuda_backend_advance_reorders_once_and_writes_one_raw_column(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_control_transport,
+) -> None:
+    from vllm_gr.v1.beam import beam_decision
+
+    workspace = beam_decision.BeamPostprocessWorkspace.allocate(
+        max_batch=1,
+        beam_width=2,
+        top_k=2,
+        max_decode_steps=3,
+        device="cpu",
+        logits_dtype=torch.float16,
+        pin_host=False,
+    )
+    decision_state = SimpleNamespace(
+        sequence=torch.zeros((1, 2, 3), dtype=torch.int32),
+        beam_scores=torch.tensor([[-0.1, -0.2]], dtype=torch.float32),
+        worker_decode_steps=1,
+    )
+    session_state = SimpleNamespace(is_last_step=False)
+    session = SimpleNamespace(
+        context=SimpleNamespace(decision=decision_state),
+        _state=session_state,
+    )
+    state = SimpleNamespace(
+        step=1,
+        device_step=1,
+        beam_width=2,
+        max_tokens=3,
+        continue_token_id=7,
+        finish_token_id=9,
+        session=session,
+        backend_state=gpu_patch._CudaGRRequestState(workspace=workspace),
+    )
+    tokens = torch.tensor([[20, 21]], dtype=torch.int32)
+    parents = torch.tensor([[1, 0]], dtype=torch.int32)
+    scores = torch.tensor([[-0.5, -0.6]], dtype=torch.float32)
+    prefix = torch.tensor([[1, 2]], dtype=torch.int32)
+
+    def decide(*_args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+        assert kwargs["reorder_kv"] is False
+        decision_state.beam_scores.copy_(scores)
+        decision_state.worker_decode_steps = 2
+        return {
+            "out_token_ids": tokens,
+            "out_token_index": parents,
+            "out_log_probs": scores,
+            "_gr_reorder_parents": parents,
+            "_gr_reorder_prefix": prefix,
+        }
+
+    reorder_calls: list[tuple[Any, Any]] = []
+    monkeypatch.setattr(beam_decision, "run_beam_decision", decide)
+    monkeypatch.setattr(
+        beam_decision,
+        "_reorder_kv_same_step",
+        lambda received_session, received_parent, received_prefix: reorder_calls.append(
+            (received_parent, received_prefix)
+        ),
+    )
+    backend = gpu_patch.CudaGRDeviceBackend()
+    result = backend.advance_beam(
+        SimpleNamespace(), state, SimpleNamespace(), {"result_width": 2}, is_last_step=False
+    )
+    backend.reorder_kv(SimpleNamespace(), state, result, is_last_step=False)
+
+    assert len(reorder_calls) == 1
+    assert reorder_calls[0][0].data_ptr() == parents.data_ptr()
+    assert reorder_calls[0][1].data_ptr() == prefix.data_ptr()
+    assert workspace.gr_parent_history[0, :, 1].tolist() == [1, 0]
+    torch.testing.assert_close(
+        workspace.gr_logprob_history[0, :, 1],
+        torch.tensor([-0.3, -0.5]),
+    )
+    assert result.control_output is workspace.gr_control_output_0
+
+
+def test_cuda_backend_terminal_advance_does_not_reorder(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_control_transport,
+) -> None:
+    from vllm_gr.v1.beam import beam_decision
+
+    workspace = beam_decision.BeamPostprocessWorkspace.allocate(
+        max_batch=1,
+        beam_width=2,
+        top_k=2,
+        max_decode_steps=2,
+        device="cpu",
+        logits_dtype=torch.float16,
+        pin_host=False,
+    )
+    scores = torch.tensor([[-0.1, -0.2]], dtype=torch.float32)
+    decision_state = SimpleNamespace(
+        sequence=torch.zeros((1, 2, 2), dtype=torch.int32),
+        beam_scores=scores.clone(),
+        worker_decode_steps=1,
+    )
+    state = SimpleNamespace(
+        step=1,
+        device_step=1,
+        beam_width=2,
+        max_tokens=2,
+        continue_token_id=7,
+        finish_token_id=9,
+        session=SimpleNamespace(
+            context=SimpleNamespace(decision=decision_state),
+            _state=SimpleNamespace(is_last_step=False),
+        ),
+        backend_state=gpu_patch._CudaGRRequestState(workspace=workspace),
+    )
+    final_scores = torch.tensor([[-0.4]], dtype=torch.float32)
+
+    def decide(*_args: Any, **_kwargs: Any) -> dict[str, torch.Tensor]:
+        decision_state.beam_scores[:, :1].copy_(final_scores)
+        decision_state.worker_decode_steps = 2
+        return {
+            "out_token_ids": torch.tensor([[22]], dtype=torch.int32),
+            "out_token_index": torch.tensor([[1]], dtype=torch.int32),
+            "out_log_probs": final_scores,
+        }
+
+    monkeypatch.setattr(beam_decision, "run_beam_decision", decide)
+    backend = gpu_patch.CudaGRDeviceBackend()
+    result = backend.advance_beam(
+        SimpleNamespace(), state, SimpleNamespace(), {"result_width": 1}, is_last_step=True
+    )
+    backend.reorder_kv(SimpleNamespace(), state, result, is_last_step=True)
+
+    assert result.next_token_ids.shape == (1, 1)
+    assert result.control_output is workspace.gr_control_output_0
+
+
+def test_cuda_backend_final_pack_backtraces_raw_history() -> None:
+    from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspace
+    from vllm_gr.v1.worker.gr_model_runner_state import (
+        GR_FINAL_OUTPUT_FORMAT,
+        unpack_gr_final_output,
+    )
+
+    workspace = BeamPostprocessWorkspace.allocate(
+        max_batch=1,
+        beam_width=2,
+        top_k=2,
+        max_decode_steps=3,
+        device="cpu",
+        logits_dtype=torch.float16,
+        pin_host=False,
+    )
+    workspace.gr_invalid_status.zero_()
+    workspace.gr_parent_history[0] = torch.tensor(
+        [[0, 1, 1], [0, 0, 0]], dtype=torch.int32
+    )
+    workspace.gr_logprob_history[0] = torch.tensor(
+        [[-0.1, -0.3, -0.5], [-0.2, -0.4, -0.6]], dtype=torch.float32
+    )
+    sequence = torch.tensor([[[10, 20, 30], [11, 21, 31]]], dtype=torch.int32)
+    scores = torch.tensor([[-1.0, -2.0]], dtype=torch.float32)
+    state = SimpleNamespace(
+        next_token_ids=torch.empty((1, 2), dtype=torch.int32),
+        step=3,
+        beam_scores=scores,
+        session=SimpleNamespace(
+            context=SimpleNamespace(decision=SimpleNamespace(sequence=sequence))
+        ),
+    )
+
+    staging, payload_words, width = gpu_patch.CudaGRDeviceBackend._pack_final_result(
+        state, workspace
+    )
+    payload = staging[workspace.max_batch : workspace.max_batch + payload_words]
+    decoded = unpack_gr_final_output(
+        {
+            "buffer_format": GR_FINAL_OUTPUT_FORMAT,
+            "shape": [width, state.step],
+            "buffer": payload.numpy().tobytes(),
+        }
+    )
+    assert decoded is not None
+    sequences, parents, logprobs, final_scores = decoded
+    assert sequences == [[10, 20, 30], [11, 21, 31]]
+    assert parents == [[0, 0, 1], [0, 1, 0]]
+    torch.testing.assert_close(
+        torch.tensor(logprobs),
+        torch.tensor([[-0.1, -0.4, -0.5], [-0.2, -0.3, -0.6]]),
+    )
+    assert final_scores == pytest.approx([-1.0, -2.0])
+
+
+def test_cuda_backend_invalid_status_is_checked_only_at_finalization() -> None:
+    gpu_patch.CudaGRDeviceBackend._check_final_status([0])
+    with pytest.raises(RuntimeError, match="no legal candidate"):
+        gpu_patch.CudaGRDeviceBackend._check_final_status([1])
 
 
 def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(
@@ -651,6 +1574,7 @@ def test_patched_determine_pure_beam_batch_grants_full(
     result = wrapped(runner, num_tokens=4)
     assert result[0] == CUDAGraphMode.FULL
     assert result[1].num_tokens == 4
+    assert result[1].num_reqs == 1
     assert result[1].uniform is True
     assert runner._beam_graph_full_dispatch_count == 1
     wrapped(runner, num_tokens=4)
@@ -715,6 +1639,8 @@ def test_gpu_named_profile_diagnostic_returns_runner_and_memory(
         _vllm_gr_config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
         _beam_graph_keys = {128}
         _beam_graph_full_dispatch_count = 7
+        _gr_input_prep_ready_skips = 6
+        _gr_input_prep_waits = 2
 
     fake_properties = SimpleNamespace(name="L20")
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: fake_properties)
@@ -735,6 +1661,10 @@ def test_gpu_named_profile_diagnostic_returns_runner_and_memory(
     }
     assert result["beam_graph"]["captured_widths"] == [128]
     assert result["beam_graph"]["full_dispatches"] == 7
+    assert result["input_prep"] == {
+        "ready_event_skips": 6,
+        "not_ready_upstream_waits": 2,
+    }
 
 
 def test_patched_determine_active_lora_downgrades_full() -> None:
@@ -941,15 +1871,19 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     monkeypatch.setattr(monitor, "set_cudagraph_capturing_enabled", lambda *_: None)
 
     side_stream = SimpleNamespace(wait_stream=lambda *_: None)
-    fake_cuda = SimpleNamespace(
-        Stream=lambda: side_stream, stream=lambda _s: contextlib.nullcontext()
+    # Keep the modules and Stream/Event types intact: capture performs lazy
+    # imports whose annotations and compiler setup inspect those symbols.
+    # Intercept allocation, not the Stream class, so this remains CPU-only
+    # and independent of which imports earlier tests happened to populate.
+    monkeypatch.setattr(
+        torch.cuda.Stream, "__new__", lambda cls, *args, **kwargs: side_stream
     )
-    fake_accelerator = SimpleNamespace(
-        current_stream=lambda: SimpleNamespace(wait_stream=lambda *_: None),
-        synchronize=lambda: None,
+    monkeypatch.setattr(torch.cuda, "stream", lambda _s: contextlib.nullcontext())
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream",
+        lambda: SimpleNamespace(wait_stream=lambda *_: None),
     )
-    monkeypatch.setattr(torch, "cuda", fake_cuda, raising=False)
-    monkeypatch.setattr(torch, "accelerator", fake_accelerator, raising=False)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     session = SimpleNamespace(end_session=lambda: None)
     monkeypatch.setattr(
@@ -1084,7 +2018,11 @@ def test_capture_create_dummy_context_creates_session_and_beam_info() -> None:
             # batch_descriptor matches width
             from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 
-            assert batch_descriptor == BatchDescriptor(num_tokens=4, uniform=True)
+            assert batch_descriptor == BatchDescriptor(
+                num_tokens=4,
+                num_reqs=1,
+                uniform=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1104,7 +2042,7 @@ def test_verify_and_record_captured_graph_records_on_match() -> None:
     mock_wrapper = MagicMock()
     mock_wrapper.runtime_mode = CUDAGraphMode.FULL
     mock_wrapper.concrete_cudagraph_entries = {
-        BatchDescriptor(num_tokens=4, uniform=True): mock_entry
+        BatchDescriptor(num_tokens=4, num_reqs=1, uniform=True): mock_entry
     }
 
     runner = SimpleNamespace()
@@ -1145,7 +2083,7 @@ def test_verify_and_record_captured_graph_appends_to_existing_keys() -> None:
     mock_wrapper = MagicMock()
     mock_wrapper.runtime_mode = CUDAGraphMode.FULL
     mock_wrapper.concrete_cudagraph_entries = {
-        BatchDescriptor(num_tokens=8, uniform=True): mock_entry
+        BatchDescriptor(num_tokens=8, num_reqs=1, uniform=True): mock_entry
     }
 
     runner = SimpleNamespace(_beam_graph_keys={4})
@@ -1155,6 +2093,36 @@ def test_verify_and_record_captured_graph_appends_to_existing_keys() -> None:
 
     assert result is True
     assert runner._beam_graph_keys == {4, 8}
+
+
+def test_beam_graph_descriptor_rejects_preexisting_native_full_graph() -> None:
+    from unittest.mock import MagicMock, patch
+
+    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
+
+    occupied_entry = MagicMock()
+    occupied_entry.cudagraph = MagicMock()
+    occupied = MagicMock()
+    occupied.runtime_mode = CUDAGraphMode.FULL
+    occupied.concrete_cudagraph_entries = {
+        BatchDescriptor(num_tokens=8, num_reqs=1, uniform=True): occupied_entry
+    }
+    unrelated = MagicMock()
+    unrelated.runtime_mode = CUDAGraphMode.FULL
+    unrelated.concrete_cudagraph_entries = {
+        BatchDescriptor(num_tokens=4, num_reqs=1, uniform=True): occupied_entry
+    }
+
+    with patch(
+        "vllm.compilation.cuda_graph.CUDAGraphWrapper._all_instances",
+        [unrelated],
+    ):
+        assert gpu_patch._beam_graph_descriptor_is_free(8) is True
+    with patch(
+        "vllm.compilation.cuda_graph.CUDAGraphWrapper._all_instances",
+        [unrelated, occupied],
+    ):
+        assert gpu_patch._beam_graph_descriptor_is_free(8) is False
 
 
 # ---------------------------------------------------------------------------

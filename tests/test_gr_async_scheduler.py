@@ -355,6 +355,7 @@ def test_schedule_marks_only_the_final_prefill_chunk() -> None:
 
     assert first.beam_data["gr-0"]["is_last_prefill"] is False
     assert first.beam_data["gr-0"]["generation_index"] is None
+    assert first.beam_data["gr-0"]["cache_len"] == 0
     assert request.gr_issued_steps == 0
 
     request.num_computed_tokens = request.gr_metadata.prefix_len
@@ -367,6 +368,11 @@ def test_schedule_marks_only_the_final_prefill_chunk() -> None:
 
     assert final.beam_data["gr-0"]["is_last_prefill"] is True
     assert final.beam_data["gr-0"]["generation_index"] == 0
+    # ``num_computed_tokens`` is the post-schedule cursor here.  The sidecar
+    # must expose the pre-schedule cached extent (2), exactly like an aligned
+    # 1024-token hit where vLLM reports 1008 cached and recomputes the final
+    # 16-token block to obtain logits.
+    assert final.beam_data["gr-0"]["cache_len"] == 2
     assert request.gr_issued_steps == 1
 
 

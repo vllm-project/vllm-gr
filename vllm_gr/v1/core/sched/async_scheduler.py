@@ -10,6 +10,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_gr.config import MAX_BEAM_WIDTH, GRConfig
 from vllm_gr.v1.beam.beam_decision import unpack_beam_result_buffer
@@ -97,6 +98,22 @@ class GRAsyncScheduler(AsyncScheduler):
     @staticmethod
     def _is_gr_request(request: Request) -> bool:
         return bool(getattr(request, "is_gr_request", False))
+
+    def shutdown(self) -> None:
+        """Finish persistent ownership after EngineCore shuts down Workers.
+
+        EngineCore invokes this only after executor shutdown returns, so a
+        failed device drain must leave Native KV/request ownership intact.
+        Ordinary and legacy GR requests retain upstream shutdown semantics.
+        """
+        request_ids = [
+            request_id for request_id, request in self.requests.items()
+            if self._is_gr_request(request)
+            and getattr(request, "gr_persistent_runner_state", False) is True
+        ]
+        if request_ids:
+            self.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        super().shutdown()
 
     def reset_prefix_cache(
         self,
@@ -330,6 +347,13 @@ class GRAsyncScheduler(AsyncScheduler):
 
     def schedule(self) -> SchedulerOutput:
         """Issue exactly one upstream SchedulerOutput and one GR stage."""
+        active_gr = any(
+            self._is_gr_request(request) for request in self.requests.values()
+        )
+        if not active_gr:
+            # Preserve the upstream AsyncScheduler path exactly for ordinary
+            # requests, including avoiding a GR-only profiling range.
+            return super().schedule()
         if any(
             self._is_gr_request(request)
             and int(getattr(request, "gr_issued_steps", 0))
@@ -341,8 +365,9 @@ class GRAsyncScheduler(AsyncScheduler):
             # executing+queued pair is full. Both non-blocking dispatches are
             # truthfully counted as issued; a third would exceed look-ahead 1.
             raise RuntimeError("persistent GR look-ahead depth exceeds one")
-        output = super().schedule()
-        self._decorate_gr_output(output)
+        with record_function_or_nullcontext("gr_async_schedule"):
+            output = super().schedule()
+            self._decorate_gr_output(output)
         return output
 
     def update_from_output(self, scheduler_output, model_runner_output):

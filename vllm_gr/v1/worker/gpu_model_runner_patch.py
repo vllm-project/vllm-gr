@@ -4,10 +4,16 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import wraps
+from typing import Any
 
 import torch
+from vllm.distributed.ec_transfer import has_ec_transfer
+from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.logger import init_logger
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_gr.v1.beam.beam_decision import (
     _create_persistent_gr_state,
@@ -27,6 +33,7 @@ from vllm_gr.v1.worker.constraint_hook import (
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
+    _WORKER_EXECUTE_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
@@ -48,6 +55,7 @@ from vllm_gr.v1.worker.model_runner_common import (
     _materialize_logits_indices,
     _reduce_sampler_output_for_worker_decision,
     get_beam_graph_runtime_stats,
+    make_patched_execute_model as _make_common_patched_execute_model,
 )
 
 logger = init_logger(__name__)
@@ -55,13 +63,557 @@ logger = init_logger(__name__)
 _BEAM_POSTPROCESS_LOAD_PATCH_MARKER = "_vllm_gr_beam_postprocess_load_patched"
 _PREFILL_COMPUTE_LOGITS_PATCH_MARKER = "_vllm_gr_prefill_compute_logits_patched"
 _PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
+_INPUT_PREP_READY_PATCH_MARKER = "_vllm_gr_cuda_input_prep_ready_patched"
+
+
+@dataclass(slots=True)
+class _CudaGRRequestState:
+    """Small request binding over runner-owned fixed CUDA workspace."""
+
+    workspace: Any
+    prefix_binding: Any = None
+    pending_reorder_parents: Any = None
+    pending_reorder_prefix: Any = None
+    released: bool = False
+    control_epoch: int | None = None
+    control_phase: int | None = None
+
+    @property
+    def device_memory_bytes(self) -> int:
+        # The storage is accounted once by the runner workspace pool.
+        return 0
+
+
+class CudaGRDeviceBackend:
+    """Persistent GR backend for the upstream GPU ModelRunner V1."""
+
+    def _require_workspace(self, runner: Any, state: Any) -> Any:
+        from vllm_gr.v1.beam.beam_decision import get_beam_postprocess_workspace
+
+        device = torch.device(getattr(runner, "device", "cpu"))
+        if device.type != "cuda":
+            raise RuntimeError(f"CUDA GR backend requires a CUDA runner, got {device}")
+        workspace = get_beam_postprocess_workspace(runner, state.beam_width)
+        if workspace is None:
+            raise RuntimeError(
+                "persistent CUDA GR requires an exact-width prewarmed Beam workspace"
+            )
+        if workspace.max_batch != 1:
+            raise RuntimeError("persistent CUDA GR backend requires a B=1 workspace")
+        if state.max_tokens > workspace.max_decode_steps:
+            raise RuntimeError(
+                "persistent CUDA GR generation length exceeds the prewarmed workspace: "
+                f"request={state.max_tokens}, workspace={workspace.max_decode_steps}"
+            )
+        return workspace
+
+    @staticmethod
+    def _extract_prefix_binding(runner: Any, state: Any) -> Any:
+        """Bind the native prefix block row once without a request-time clone."""
+
+        input_batch = getattr(runner.input_batch, "_obj", runner.input_batch)
+        req_index = input_batch.req_id_to_index[state.request_id]
+        # vLLM 0.22.1 exposes a non-iterable MultiGroupBlockTable here.
+        # Its public group collection is ``block_tables`` and integer access
+        # delegates to that collection; do not assume the container itself
+        # implements len()/iteration.
+        native_block_tables = input_batch.block_table
+        block_tables = native_block_tables.block_tables
+        if len(block_tables) != 1:
+            raise RuntimeError(
+                "persistent CUDA GR currently supports one native KV-cache group"
+            )
+        native_block_table = native_block_tables[0]
+        block_size = int(native_block_table.block_size)
+        num_blocks = (int(state.session._state.prefix_len) + block_size - 1) // block_size
+        table = native_block_table.get_device_tensor(input_batch.num_reqs)
+        return (table[req_index, :num_blocks],)
+
+    @staticmethod
+    def _control_output(workspace: Any, device_step: int, token_id: int) -> torch.Tensor:
+        from vllm_gr.v1.worker.cuda_async_output import fill_control
+
+        return fill_control(workspace, device_step, token_id)
+
+    def bootstrap_from_prefill(
+        self,
+        runner: Any,
+        state: Any,
+        sampler_output: Any,
+        metadata: dict[str, Any],
+    ):
+        from vllm_gr.v1.beam.beam_decision import _run_cuda_prefill_decision
+        from vllm_gr.v1.worker.gr_model_runner_state import GRBackendStep
+
+        workspace = self._require_workspace(runner, state)
+        decision = _run_cuda_prefill_decision(runner, sampler_output)
+        if decision is None:
+            raise RuntimeError("persistent CUDA GR prefill has no device Beam decision")
+        token_ids = decision["out_token_ids"]
+        scores = decision["out_log_probs"]
+        if tuple(token_ids.shape) != (1, state.beam_width):
+            raise RuntimeError("persistent CUDA GR prefill decision width mismatch")
+
+        backend_state = state.backend_state
+        if not isinstance(backend_state, _CudaGRRequestState):
+            backend_state = _CudaGRRequestState(workspace=workspace)
+            state.backend_state = backend_state
+        elif backend_state.workspace is not workspace:
+            raise RuntimeError("persistent CUDA GR workspace changed across state reuse")
+        backend_state.released = False
+        # Cached common states may retain backend_state across sessions. A
+        # phase/epoch belongs to this bootstrap, never to the cached object.
+        backend_state.control_epoch = None
+        backend_state.control_phase = None
+        backend_state.pending_reorder_parents = None
+        backend_state.pending_reorder_prefix = None
+        backend_state.prefix_binding = self._extract_prefix_binding(runner, state)
+        state.prefix_binding = backend_state.prefix_binding
+
+        width = state.beam_width
+        steps = state.max_tokens
+        parent_history = workspace.gr_parent_history[:1, :width, :steps]
+        logprob_history = workspace.gr_logprob_history[:1, :width, :steps]
+        parent_history.zero_()
+        logprob_history.zero_()
+        logprob_history[0, :, 0].copy_(scores[0])
+        if bool(getattr(sampler_output, "_gr_deferred_prefill_status", False)):
+            workspace.gr_invalid_status[:1].copy_(workspace.prefill_staging[:1])
+        else:
+            workspace.gr_invalid_status[:1].zero_()
+
+        decision_state = state.session.context.decision
+        decision_state.sequence[:1, :width, 0].copy_(token_ids[0])
+        decision_state.beam_scores[:1, :width].copy_(scores)
+        decision_state.worker_decode_steps = 1
+        torch.gt(
+            scores,
+            float("-inf"),
+            out=workspace.gr_active_mask[:1, :width],
+        )
+
+        finished = state.max_tokens == 1
+        control = self._control_output(
+            workspace,
+            1,
+            state.finish_token_id if finished else state.continue_token_id,
+        )
+        return GRBackendStep(
+            device_step=1,
+            next_token_ids=token_ids,
+            beam_scores=decision_state.beam_scores[:1, :width],
+            active_mask=workspace.gr_active_mask[:1, :width],
+            control_output=control,
+        )
+
+    def prepare_decode_inputs(
+        self,
+        runner: Any,
+        state: Any,
+        scheduler_output: Any,
+        num_scheduled_tokens: Any,
+        metadata: dict[str, Any],
+    ) -> None:
+        backend_state = state.backend_state
+        if not isinstance(backend_state, _CudaGRRequestState) or backend_state.released:
+            raise RuntimeError("persistent CUDA GR backend state is not active")
+        width = state.beam_width
+        gr_output = getattr(scheduler_output, "gr_outputs", {}).get(state.request_id)
+        if (
+            gr_output is None
+            or int(gr_output.logical_token_count) != 1
+            or int(gr_output.physical_row_count) != width
+        ):
+            raise RuntimeError("persistent CUDA GR physical-row sidecar is missing or invalid")
+        req_ids = list(getattr(runner.input_batch, "req_ids", ()))
+        if req_ids != [state.request_id]:
+            raise RuntimeError(
+                "persistent CUDA GR currently requires an isolated B=1 runner batch"
+            )
+        if len(num_scheduled_tokens) != 1 or int(num_scheduled_tokens[0]) != width:
+            raise RuntimeError(
+                "persistent CUDA GR adapter did not publish the physical Beam width"
+            )
+        input_ids = runner.input_ids.gpu
+        if input_ids.numel() < width:
+            raise RuntimeError("GPU ModelRunner input buffer is smaller than Beam width")
+        input_ids[:width].copy_(state.next_token_ids.reshape(-1)[:width])
+
+        expected_decode_step = state.step - 1
+        if state.session.decode_step != expected_decode_step:
+            raise RuntimeError(
+                "persistent CUDA GR Beam session/device step mismatch: "
+                f"session={state.session.decode_step}, expected={expected_decode_step}"
+            )
+        state.session.context.decode_step_buf.fill_(expected_decode_step)
+        state.session.context._gr_persistent_prefix_binding = state.prefix_binding
+
+    def advance_beam(
+        self,
+        runner: Any,
+        state: Any,
+        sampler_output: Any,
+        metadata: dict[str, Any],
+        *,
+        is_last_step: bool,
+    ):
+        from vllm_gr.v1.beam.beam_decision import run_beam_decision
+        from vllm_gr.v1.worker.gr_model_runner_state import GRBackendStep
+
+        backend_state = state.backend_state
+        if not isinstance(backend_state, _CudaGRRequestState) or backend_state.released:
+            raise RuntimeError("persistent CUDA GR backend state is not active")
+        workspace = backend_state.workspace
+        width = state.beam_width
+        decision_state = state.session.context.decision
+        if decision_state.worker_decode_steps != state.step:
+            raise RuntimeError(
+                "persistent CUDA GR decision/device step mismatch: "
+                f"decision={decision_state.worker_decode_steps}, state={state.step}"
+            )
+        workspace.gr_previous_scores[:1, :width].copy_(
+            decision_state.beam_scores[:1, :width]
+        )
+        state.session._state.is_last_step = is_last_step
+        decision = run_beam_decision(
+            runner,
+            state.session,
+            sampler_output,
+            is_last_step=is_last_step,
+            result_width=metadata.get("result_width"),
+            reorder_kv=False,
+        )
+        if decision is None:
+            raise RuntimeError("persistent CUDA GR decode has no device Beam decision")
+        if bool(getattr(sampler_output, "_gr_deferred_decode_status", False)):
+            torch.maximum(
+                workspace.gr_invalid_status[:1],
+                workspace.prefill_staging[:1],
+                out=workspace.gr_invalid_status[:1],
+            )
+
+        token_ids = decision["out_token_ids"]
+        parent_ids = decision["out_token_index"]
+        scores = decision["out_log_probs"]
+        result_width = int(token_ids.shape[1])
+        gather_indices = workspace.gr_gather_indices[0, :result_width]
+        gather_indices.copy_(parent_ids[0])
+        torch.index_select(
+            workspace.gr_previous_scores[0, :width],
+            0,
+            gather_indices,
+            out=workspace.gr_parent_scores[0, :result_width],
+        )
+        workspace.gr_parent_history[0, :result_width, state.step].copy_(parent_ids[0])
+        torch.sub(
+            scores[0],
+            workspace.gr_parent_scores[0, :result_width],
+            out=workspace.gr_logprob_history[0, :result_width, state.step],
+        )
+        backend_state.pending_reorder_parents = decision.get("_gr_reorder_parents")
+        backend_state.pending_reorder_prefix = decision.get("_gr_reorder_prefix")
+        workspace.gr_active_mask[:1, :width].fill_(False)
+        torch.gt(
+            scores,
+            float("-inf"),
+            out=workspace.gr_active_mask[:1, :result_width],
+        )
+
+        next_device_step = state.device_step + 1
+        control = self._control_output(
+            workspace,
+            next_device_step,
+            state.finish_token_id if is_last_step else state.continue_token_id,
+        )
+        runner._beam_decision_tensors = decision
+        return GRBackendStep(
+            device_step=next_device_step,
+            next_token_ids=token_ids,
+            beam_scores=decision_state.beam_scores[:1, :result_width],
+            active_mask=workspace.gr_active_mask[:1, :result_width],
+            control_output=control,
+        )
+
+    def reorder_kv(
+        self,
+        runner: Any,
+        state: Any,
+        step_result: Any,
+        *,
+        is_last_step: bool,
+    ) -> None:
+        del runner, step_result
+        backend_state = state.backend_state
+        if not isinstance(backend_state, _CudaGRRequestState):
+            raise RuntimeError("persistent CUDA GR backend state is missing")
+        parents = backend_state.pending_reorder_parents
+        prefix = backend_state.pending_reorder_prefix
+        backend_state.pending_reorder_parents = None
+        backend_state.pending_reorder_prefix = None
+        if is_last_step:
+            if parents is not None or prefix is not None:
+                raise RuntimeError("terminal CUDA GR decision unexpectedly requested KV reorder")
+            return
+        if parents is None or prefix is None:
+            raise RuntimeError("non-terminal CUDA GR decision is missing KV reorder data")
+        from vllm_gr.v1.beam.beam_decision import _reorder_kv_same_step
+
+        _reorder_kv_same_step(state.session, parents[0], prefix[0])
+
+    @staticmethod
+    def _pack_final_result(state: Any, workspace: Any) -> tuple[torch.Tensor, int, int]:
+        """Backtrace raw lineage once and pack the final device ABI."""
+
+        width = int(state.next_token_ids.shape[1])
+        steps = state.step
+        count = width * steps
+        staging = workspace.gr_final_result
+        staging[:1].copy_(workspace.gr_invalid_status[:1])
+        packed = staging[workspace.max_batch :]
+        sequences = state.session.context.decision.sequence[0, :width, :steps]
+        packed[:count].view(width, steps).copy_(sequences)
+        packed_parents = packed[count : 2 * count].view(width, steps)
+        packed_logprobs = packed[2 * count : 3 * count].view(width, steps).view(
+            torch.float32
+        )
+        current_indices = workspace.gr_backtrace_indices[0, 0, :width]
+        next_indices = workspace.gr_backtrace_indices[1, 0, :width]
+        torch.arange(width, dtype=torch.int64, device=workspace.device, out=current_indices)
+        for generation_step in range(steps - 1, -1, -1):
+            torch.index_select(
+                workspace.gr_parent_history[0, :, generation_step],
+                0,
+                current_indices,
+                out=workspace.gr_backtrace_parents[0, :width],
+            )
+            torch.index_select(
+                workspace.gr_logprob_history[0, :, generation_step],
+                0,
+                current_indices,
+                out=workspace.gr_backtrace_logprobs[0, :width],
+            )
+            packed_parents[:, generation_step].copy_(
+                workspace.gr_backtrace_parents[0, :width]
+            )
+            packed_logprobs[:, generation_step].copy_(
+                workspace.gr_backtrace_logprobs[0, :width]
+            )
+            next_indices.copy_(workspace.gr_backtrace_parents[0, :width])
+            current_indices, next_indices = next_indices, current_indices
+        packed[3 * count : 3 * count + width].copy_(
+            state.beam_scores[0, :width].view(torch.int32)
+        )
+        return staging, 3 * count + width, width
+
+    @staticmethod
+    def _check_final_status(host_status: Any) -> None:
+        if any(int(status) != 0 for status in host_status):
+            raise RuntimeError(
+                "constraint Backend returned no legal candidate for persistent CUDA GR"
+            )
+
+    def finalize_output(self, runner: Any, state: Any) -> dict[str, Any]:
+        from vllm_gr.v1.worker.gr_model_runner_state import GR_FINAL_OUTPUT_FORMAT
+
+        del runner
+        backend_state = state.backend_state
+        if not isinstance(backend_state, _CudaGRRequestState) or backend_state.released:
+            raise RuntimeError("persistent CUDA GR backend state is not active")
+        workspace = backend_state.workspace
+        steps = state.step
+        staging, payload_words, width = self._pack_final_result(state, workspace)
+        copy_words = workspace.max_batch + payload_words
+        host = workspace.gr_host_final_result[:copy_words]
+        event = workspace.gr_final_copy_event
+        if event is None or not host.is_pinned():
+            raise RuntimeError("persistent CUDA GR final staging must be pinned and event-backed")
+        stream = torch.cuda.current_stream(workspace.device)
+        with record_function_or_nullcontext("gr_final_d2h"):
+            host.copy_(staging[:copy_words], non_blocking=True)
+            event.record(stream)
+            event.synchronize()
+        host_numpy = workspace.gr_host_final_result_numpy[:copy_words]
+        self._check_final_status(host_numpy[: workspace.max_batch])
+        return {
+            "request_id": state.request_id,
+            "buffer_format": GR_FINAL_OUTPUT_FORMAT,
+            "shape": [width, steps],
+            "buffer": host_numpy[
+                workspace.max_batch : workspace.max_batch + payload_words
+            ].tobytes(),
+            "is_last_step": True,
+            "step": steps,
+            "device_step": state.device_step,
+        }
+
+    def release(self, state: Any) -> None:
+        backend_state = state.backend_state
+        if isinstance(backend_state, _CudaGRRequestState):
+            backend_state.pending_reorder_parents = None
+            backend_state.pending_reorder_prefix = None
+            backend_state.prefix_binding = None
+            state.prefix_binding = None
+            if hasattr(state.session.context, "_gr_persistent_prefix_binding"):
+                state.session.context._gr_persistent_prefix_binding = None
+            backend_state.released = True
 
 
 def create_gr_device_backend(runner):
-    """Step 4 selection point; the CUDA V1 implementation lands in Step 5."""
+    """Select the CUDA V1 backend once during ModelRunner initialization."""
 
-    del runner
-    return None
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    if bool(getattr(_get_gr_config(runner), "persistent_runner_state", False)):
+        if not getattr(runner, "use_async_scheduling", False):
+            raise RuntimeError("persistent CUDA GR requires ASYNC output transport")
+        from vllm_gr.v1.worker.cuda_async_output import CudaOutputTransport
+        from vllm_gr.v1.worker.cuda_completion import load_native_completion_api
+
+        runner._gr_cuda_output_transport = CudaOutputTransport(runner, load_native_completion_api())
+    return CudaGRDeviceBackend()
+
+
+def make_patched_shutdown(original):
+    @wraps(original)
+    def shutdown(self, *args, **kwargs):
+        transport = getattr(self, "_gr_cuda_output_transport", None)
+        if transport is not None:
+            transport.shutdown()
+        # A failed transport drain must not return the common Beam KV/session.
+        return original(self, *args, **kwargs)
+
+    return shutdown
+
+
+def _persistent_cuda_geometry(scheduler_output: Any) -> tuple[str, int] | None:
+    beam_data = getattr(scheduler_output, "beam_data", {}) or {}
+    persistent = [
+        req_id
+        for req_id, metadata in beam_data.items()
+        if metadata.get("persistent_runner_state") and metadata.get("is_beam_decode")
+    ]
+    if not persistent:
+        return None
+    if len(persistent) != 1 or set(scheduler_output.num_scheduled_tokens) != set(persistent):
+        raise RuntimeError(
+            "persistent CUDA GR decode currently requires one isolated B=1 request"
+        )
+    request_id = persistent[0]
+    sidecar = getattr(scheduler_output, "gr_outputs", {}).get(request_id)
+    if sidecar is None:
+        raise RuntimeError("persistent CUDA GR decode is missing its typed sidecar")
+    if int(sidecar.logical_token_count) != 1:
+        raise RuntimeError("persistent CUDA GR native accounting must remain one logical token")
+    physical_rows = int(sidecar.physical_row_count)
+    if physical_rows != int(beam_data[request_id]["beam_width"]):
+        raise RuntimeError("persistent CUDA GR physical row count must equal Beam width")
+    if scheduler_output.num_scheduled_tokens.get(request_id) != 1:
+        raise RuntimeError("persistent CUDA GR SchedulerOutput must carry logical count one")
+    if int(scheduler_output.total_num_scheduled_tokens) != 1:
+        raise RuntimeError("persistent CUDA GR total logical token count must be one")
+    return request_id, physical_rows
+
+
+def make_patched_execute_model_gpu(original):
+    """Expose physical W only inside the CUDA V1 execution frame."""
+
+    common_execute = _make_common_patched_execute_model(original)
+    if getattr(common_execute, "_vllm_gr_gpu_physical_execute_patched", False):
+        return common_execute
+
+    def guarded_execute(self, scheduler_output, *args, **kwargs):
+        try:
+            return common_execute(self, scheduler_output, *args, **kwargs)
+        except BaseException as error:
+            transport = getattr(self, "_gr_cuda_output_transport", None)
+            if transport is not None:
+                transport.quarantine(error)
+            raise
+
+    @wraps(common_execute)
+    def execute_with_physical_geometry(self, scheduler_output, *args, **kwargs):
+        transport = getattr(self, "_gr_cuda_output_transport", None)
+        if transport is not None:
+            transport.check_live()
+        geometry = _persistent_cuda_geometry(scheduler_output)
+        if geometry is None:
+            return guarded_execute(self, scheduler_output, *args, **kwargs)
+        if getattr(self, "speculative_config", None) is not None:
+            raise RuntimeError("persistent CUDA GR does not support speculative decode")
+        parallel_config = getattr(self, "parallel_config", None)
+        if getattr(parallel_config, "pipeline_parallel_size", 1) != 1:
+            raise RuntimeError("persistent CUDA GR does not support pipeline parallelism")
+        if has_kv_transfer_group():
+            raise RuntimeError(
+                "persistent CUDA GR does not support an active KV connector"
+            )
+        if has_ec_transfer():
+            raise RuntimeError(
+                "persistent CUDA GR does not support active EC transfer"
+            )
+        request_id, physical_rows = geometry
+        scheduler_output.num_scheduled_tokens[request_id] = physical_rows
+        scheduler_output.total_num_scheduled_tokens = physical_rows
+        scheduler_output._gr_cuda_logical_geometry = (request_id, 1, physical_rows)
+        try:
+            return guarded_execute(self, scheduler_output, *args, **kwargs)
+        finally:
+            scheduler_output.num_scheduled_tokens[request_id] = 1
+            scheduler_output.total_num_scheduled_tokens = 1
+            del scheduler_output._gr_cuda_logical_geometry
+
+    setattr(execute_with_physical_geometry, _WORKER_EXECUTE_PATCH_MARKER, True)
+    setattr(execute_with_physical_geometry, "_vllm_gr_gpu_physical_execute_patched", True)
+    return execute_with_physical_geometry
+
+
+def make_patched_synchronize_input_prep(original):
+    """Avoid waiting on an already-completed GR Decode input-preparation event.
+
+    Keep the upstream single-buffer ownership protocol, including its wait
+    when the previous H2D is not complete. The guard must enclose _update_states
+    as well as _prepare_inputs: native block zeroing and block-table updates
+    also reuse pinned sources. No buffer pointers or Event generations change.
+
+    The physical-geometry marker exists only inside a validated persistent
+    Decode execute frame. Unlike _current_beam_data it does not survive into
+    sample_tokens or a later dummy run. Ordinary/Prefill/dummy calls delegate.
+    """
+    if getattr(original, _INPUT_PREP_READY_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    @contextmanager
+    def input_prep_when_ready(self):
+        output = getattr(self, "_current_scheduler_output", None)
+        active_decode = getattr(output, "_gr_cuda_logical_geometry", None) is not None
+        event = getattr(self, "prepare_inputs_event", None)
+        if not active_decode or event is None:
+            with original(self):
+                yield
+            return
+
+        # A query error must propagate before any Host staging is modified.
+        # A false result is not a release of the previous DMA's ownership.
+        if not event.query():
+            self._gr_input_prep_waits = getattr(self, "_gr_input_prep_waits", 0) + 1
+            with original(self):
+                yield
+            return
+
+        self._gr_input_prep_ready_skips = getattr(self, "_gr_input_prep_ready_skips", 0) + 1
+        try:
+            yield
+        finally:
+            # Same end-of-region boundary as upstream, even on preparation
+            # failure. Leaving GR therefore hands ordinary requests the same
+            # event and the current contents of every original Host buffer.
+            event.record()
+
+    setattr(input_prep_when_ready, _INPUT_PREP_READY_PATCH_MARKER, True)
+    return input_prep_when_ready
+
+
 
 
 def get_gr_memory_stats(worker) -> dict[str, int]:
@@ -88,6 +640,8 @@ def get_gr_memory_stats(worker) -> dict[str, int]:
         reserved += int(segment.get("total_size", 0))
     stats["graph_pool_allocated_bytes"] = allocated
     stats["graph_pool_reserved_bytes"] = reserved
+    transport = getattr(runner, "_gr_cuda_output_transport", None)
+    stats["gr_control_pinned_bytes"] = transport.stats()["control_pinned_bytes"] if transport else 0
     return stats
 
 
@@ -116,6 +670,14 @@ def get_gr_profile_runtime_stats(worker) -> dict:
             "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
         },
         "beam_graph": get_beam_graph_runtime_stats(worker),
+        "input_prep": {
+            "ready_event_skips": int(getattr(runner, "_gr_input_prep_ready_skips", 0)),
+            "not_ready_upstream_waits": int(getattr(runner, "_gr_input_prep_waits", 0)),
+        },
+        "control_output": (
+            runner._gr_cuda_output_transport.stats()
+            if getattr(runner, "_gr_cuda_output_transport", None) is not None else None
+        ),
     }
 
 
@@ -217,6 +779,9 @@ def initialize_beam_postprocess_workspaces(
     pool = BeamPostprocessWorkspacePool()
     pool.add(workspace)
     runner._beam_postprocess_workspaces = pool
+    transport = getattr(runner, "_gr_cuda_output_transport", None)
+    if transport is not None:
+        transport.prepare_workspace(workspace)
     logger.info(
         "vllm-gr: prewarmed CUDA Beam postprocess workspace "
         "(batch=%d, width=%d, top_k=%d, dtype=%s, device_bytes=%d, pinned_bytes=%d)",
@@ -264,23 +829,24 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
         return _orig_prepare_inputs
 
-    @wraps(_orig_prepare_inputs)
-    def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+    def prepare_inputs(self, scheduler_output, num_scheduled_tokens):
         beam_data = getattr(scheduler_output, "beam_data", {})
         logits_indices, spec_decode_metadata = _orig_prepare_inputs(
             self, scheduler_output, num_scheduled_tokens
         )
 
         # Upstream GPU _prepare_inputs materializes the native logical token
-        # into self.input_ids.gpu.  Publish the persistent physical Beam rows
+        # into self.input_ids.gpu. Publish the persistent physical Beam rows
         # afterwards so the native write cannot overwrite the backend's D2D
-        # token update.  GPU attention metadata is built after this wrapper
+        # token update. GPU attention metadata is built after this wrapper
         # returns, while the NPU adapter intentionally uses the opposite order.
         for req_id, mdata in beam_data.items():
             if mdata.get("persistent_runner_state") and mdata.get("is_beam_decode"):
                 state = getattr(self, "_gr_model_runner_states", {}).get(req_id)
                 if state is None:
-                    raise RuntimeError(f"persistent GR state is missing for request {req_id!r}")
+                    raise RuntimeError(
+                        f"persistent GR state is missing for request {req_id!r}"
+                    )
                 state.prepare_decode_inputs(
                     self,
                     scheduler_output,
@@ -349,6 +915,22 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
             spec_decode_metadata,
         )
 
+    @wraps(_orig_prepare_inputs)
+    def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        persistent_decode = any(
+            metadata.get("persistent_runner_state") and metadata.get("is_beam_decode")
+            for metadata in getattr(scheduler_output, "beam_data", {}).values()
+        )
+        marker = (
+            record_function_or_nullcontext("gr_decode_prepare")
+            if persistent_decode
+            else nullcontext()
+        )
+        with marker:
+            # Include Beam row/sampling-metadata remapping, not just the
+            # upstream preparation and persistent input publication.
+            return prepare_inputs(self, scheduler_output, num_scheduled_tokens)
+
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
 
@@ -385,10 +967,26 @@ def make_patched_sample_tokens_gpu(_orig_sample_tokens):
     @wraps(_orig_sample_tokens)
     def patched_sample_tokens(self, grammar_output, *args, **kwargs):
         from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
+        from vllm_gr.v1.worker.cuda_async_output import (
+            install_async_output_adapter, sampling_scope,
+        )
+        from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
 
-        out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
-        _attach_beam_search_result(self, out)
-        return out
+        install_async_output_adapter(AsyncGPUModelRunnerOutput)
+        # The ephemeral native state is authoritative; _current_scheduler_output
+        # may still refer to a completed request or housekeeping dispatch.
+        state = getattr(self, "execute_model_state", None)
+        scheduler_output = getattr(state, "scheduler_output", None)
+        try:
+            with sampling_scope(self, scheduler_output):
+                out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
+                _attach_beam_search_result(self, out)
+                return out
+        except BaseException as error:
+            transport = getattr(self, "_gr_cuda_output_transport", None)
+            if transport is not None:
+                transport.quarantine(error)
+            raise
 
     setattr(patched_sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, True)
     return patched_sample_tokens
@@ -662,7 +1260,7 @@ def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
                         ) + result[2:]
                     return result
 
-                new_descriptor = BatchDescriptor(num_tokens=real_num_tokens, uniform=True)
+                new_descriptor = _beam_graph_batch_descriptor(real_num_tokens)
                 logger.debug(
                     "Beam decode: cudagraph_mode %s -> FULL, batch_descriptor %s -> %s",
                     result[0],
@@ -693,6 +1291,20 @@ def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
 _BEAM_DUMMY_REQ_ID = "vllm-gr-beam-graph-dummy"
 
 
+def _beam_graph_batch_descriptor(width: int):
+    """Return the exact FULL-graph shape for one logical GR request.
+
+    Physical Beam rows are tokens, not independent native requests.  vLLM's
+    FULL graph contract requires ``num_reqs`` to be exact (FA scheduler
+    metadata may specialize on it), so the previous ``None`` value was not a
+    valid way to distinguish the Beam graph from native decode graphs.
+    """
+
+    from vllm.v1.cudagraph_dispatcher import BatchDescriptor
+
+    return BatchDescriptor(num_tokens=width, num_reqs=1, uniform=True)
+
+
 def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     """Deprecated local alias — see model_runner_common._create_beam_context.
 
@@ -710,8 +1322,6 @@ def _capture_create_dummy_context(
         ``(context, session, beam_info, batch_descriptor)`` — all needed by
         ``_dummy_beam_forward`` and the capture orchestration loop.
     """
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor
-
     from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
     context = _create_beam_context(runner, gr_cfg, max_batch=1)
@@ -740,7 +1350,7 @@ def _capture_create_dummy_context(
         "beam_session": session,
     }
 
-    batch_descriptor = BatchDescriptor(num_tokens=width, uniform=True)
+    batch_descriptor = _beam_graph_batch_descriptor(width)
     return context, session, beam_info, batch_descriptor
 
 
@@ -850,16 +1460,17 @@ def _verify_and_record_captured_graph(runner, width: int) -> bool:
     """Walk CUDAGraphWrapper instances once to confirm a beam graph was captured.
 
     After capture, verify that vllm's CUDAGraphWrapper registered a graph for
-    the beam ``BatchDescriptor(num_tokens=width, uniform=True)``.  If found,
-    record ``width`` in ``runner._beam_graph_keys`` for O(1) runtime lookups.
+    the beam ``BatchDescriptor(num_tokens=width, num_reqs=1, uniform=True)``.
+    If found, record ``width`` in ``runner._beam_graph_keys`` for O(1) runtime
+    lookups.
 
     Returns:
         ``True`` if a matching graph was found and recorded.
     """
     from vllm.compilation.cuda_graph import CUDAGraphWrapper
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
+    from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
-    desc = BatchDescriptor(num_tokens=width, uniform=True)
+    desc = _beam_graph_batch_descriptor(width)
     for wrapper in CUDAGraphWrapper._all_instances:
         if wrapper.runtime_mode != CUDAGraphMode.FULL:
             continue
@@ -876,6 +1487,28 @@ def _verify_and_record_captured_graph(runner, width: int) -> bool:
     return False
 
 
+def _beam_graph_descriptor_is_free(width: int) -> bool:
+    """Reject a descriptor already owned by an earlier native FULL graph.
+
+    ``capture_beam_decode_graph`` runs after vLLM's native capture.  Calling a
+    CUDAGraphWrapper with an occupied key replays that graph; it does not
+    recapture it.  Treating the existing entry as our Beam graph would then
+    silently route persistent Beam decode through native attention.
+    """
+
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
+
+    descriptor = _beam_graph_batch_descriptor(width)
+    for wrapper in CUDAGraphWrapper._all_instances:
+        if wrapper.runtime_mode != CUDAGraphMode.FULL:
+            continue
+        entry = wrapper.concrete_cudagraph_entries.get(descriptor)
+        if entry is not None and entry.cudagraph is not None:
+            return False
+    return True
+
+
 def capture_beam_decode_graph(runner) -> bool:
     """Startup dummy capture of the beam-decode FULL CUDA graph.
 
@@ -885,7 +1518,8 @@ def capture_beam_decode_graph(runner) -> bool:
     vllm's own ``_warmup_and_capture`` pattern: N eager warmup forwards (mode
     NONE — primes the Triton JIT of cache_unshared_kv/copy_suffix_kv and FA2
     shape selection), then one FULL-mode forward which the CUDAGraphWrapper
-    captures.  The captured graph's shape is (num_tokens=width, uniform=True);
+    captures.  The captured graph's shape is
+    (num_tokens=width, num_reqs=1, uniform=True);
     every runtime-varying quantity (decode_step, effective KV lengths, prefix
     extent, block-table contents) is device-side data or a fixed-address
     buffer value, so the single graph serves every decode step and every
@@ -939,6 +1573,14 @@ def capture_beam_decode_graph(runner) -> bool:
     width = int(gr_cfg.beam_max_width)
     if _beam_full_graph_ready(runner, width):
         return True
+    if not _beam_graph_descriptor_is_free(width):
+        logger.warning(
+            "vllm-gr: Beam FULL-graph descriptor is already owned by a native "
+            "graph (num_tokens=%d, num_reqs=1, uniform=True); Beam decode "
+            "will run eager",
+            width,
+        )
+        return False
 
     steps_upper = int(gr_cfg.beam_max_decode_steps)
     # Dummy-capture constants:
@@ -1006,7 +1648,7 @@ def capture_beam_decode_graph(runner) -> bool:
     if captured:
         logger.info(
             "vllm-gr: startup dummy capture of beam decode graph succeeded "
-            "(num_tokens=%d, uniform=True); runtime is replay-only",
+            "(num_tokens=%d, num_reqs=1, uniform=True); runtime is replay-only",
             width,
         )
     else:
@@ -1035,6 +1677,7 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
 
 
 make_patched_prepare_inputs = make_patched_prepare_inputs_gpu
+make_patched_execute_model = make_patched_execute_model_gpu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_gpu
 make_patched_sample = make_patched_sample_gpu
 make_patched_sample_tokens = make_patched_sample_tokens_gpu

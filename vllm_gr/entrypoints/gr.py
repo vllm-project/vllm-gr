@@ -283,6 +283,12 @@ def _prepare_beam_step_requests(
                     ec_req.request_id
                 )
             llm_engine.output_processor.add_request(ec_req, None, None, 0)
+            if persistent_request:
+                # Attach ownership to the native frontend record before
+                # Scheduler admission. No separate per-session registry or
+                # request-id naming convention is needed for terminal cleanup.
+                request_state = llm_engine.output_processor.request_states[ec_req.request_id]
+                request_state.gr_persistent_request = True
             engine_core_requests.append(ec_req)
 
     return engine_core_requests
@@ -313,6 +319,20 @@ def _step_engine_and_collect_outputs(
                 else session_id
             )
             if search_id not in outputs_map:
+                if persistent_request:
+                    # FINAL_ONLY output processing may remove request state in
+                    # the same step that returns the final result, so only
+                    # inspect the registry after checking this step's outputs.
+                    # The native/internal id is the lifecycle authority; an
+                    # unrelated request must not keep this wait loop alive.
+                    internal_id = instance_prefill_id[j]
+                    request_states = llm_engine.output_processor.request_states
+                    if internal_id not in request_states:
+                        raise RuntimeError(
+                            "persistent GR request terminated before final output "
+                            f"(internal_request_id={internal_id!r}, "
+                            f"external_request_id={search_id!r})"
+                        )
                 new_active_indices.append(j)
         active_indices = new_active_indices
 
@@ -1275,16 +1295,32 @@ class GRLLM(LLM):
     def shutdown(self) -> None:
         if self._shutdown_complete:
             return
-        self._shutdown_complete = True
 
         from vllm_gr.utils.engine_lifecycle import shutdown_sync_engine
 
-        if hasattr(self, "llm_engine") and self.llm_engine is not None:
-            shutdown_sync_engine(self.llm_engine)
+        engine = getattr(self, "llm_engine", None)
+        if engine is not None:
+            processor = getattr(engine, "output_processor", None)
+            persistent_ids = (
+                [request_id for request_id, state in processor.request_states.items()
+                 if getattr(state, "gr_persistent_request", False) is True]
+                if processor is not None else []
+            )
+            if not getattr(self, "_engine_shutdown_complete", False):
+                # Worker/device drain precedes Scheduler Native KV release.
+                # Failure preserves the engine and all frontend records.
+                shutdown_sync_engine(engine)
+                self._engine_shutdown_complete = True
+            if persistent_ids:
+                # The core is already closed. Use only the local native API,
+                # never enqueue another Worker release RPC during teardown.
+                processor.abort_requests(persistent_ids, internal=True)
             self.llm_engine = None
+        del engine
 
         gc.collect()
         release_accelerator_memory()
+        self._shutdown_complete = True
         logger.info("GRLLM shutdown complete")
 
     def __enter__(self):

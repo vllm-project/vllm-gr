@@ -127,8 +127,10 @@ class TestPanguGrllmShutdown(unittest.TestCase):
 
         llm = GRLLM.__new__(GRLLM)
         llm._shutdown_complete = False
-        engine = mock.Mock()
-        engine.shutdown = mock.Mock()
+        engine = SimpleNamespace(
+            shutdown=mock.Mock(),
+            output_processor=SimpleNamespace(request_states={}),
+        )
         llm.llm_engine = engine
 
         with mock.patch(

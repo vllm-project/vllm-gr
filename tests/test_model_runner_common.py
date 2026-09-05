@@ -375,167 +375,69 @@ def test_sampling_metadata_batched_gather_mixed_presence() -> None:
     assert meta.top_k is None
 
 
-def test_logits_idx_tensor_shared_cache_reused_across_proxies() -> None:
-    """Consecutive proxies with the same logits_map share one idx tensor.
-
-    Per-frame InputBatchProxy instances are rebuilt every decode step, so the
-    instance-level cache would rebuild the host->device logits-row index tensor
-    each frame.  The runner-owned shared cache dedups that for the steady-state
-    (unchanged beam geometry) case.
-    """
-    shared: dict[Any, Any] = {}
+def test_persistent_sampling_metadata_uses_device_constant_index(monkeypatch) -> None:
     sampling_metadata = SimpleNamespace(
-        temperature=torch.tensor([0.5], dtype=torch.float32),
-        top_p=None,
-        top_k=None,
-        min_p=None,
-        frequency_penalties=None,
-        presence_penalties=None,
-        repetition_penalties=None,
+        temperature=torch.tensor([0.5]), top_k=torch.tensor([32], dtype=torch.int32)
+    )
+    batch = SimpleNamespace(req_ids=["gr"], sampling_metadata=sampling_metadata)
+    proxy = common.InputBatchProxy(
+        batch, ["gr"] * 4, [0] * 4, [0] * 4,
+        persistent_geometry=common.BeamDecodeGeometry((4,), (7,)),
     )
 
-    def make_proxy() -> common.InputBatchProxy:
-        input_batch = SimpleNamespace(req_ids=["a"], sampling_metadata=sampling_metadata)
-        return common.InputBatchProxy(
-            input_batch, ["a", "a"], [0, 0], [0, 0], shared_idx_cache=shared
+    def no_host_tensor(*args, **kwargs):
+        pytest.fail("persistent logits map must be generated on device")
+
+    monkeypatch.setattr(torch, "tensor", no_host_tensor)
+    meta = proxy.sampling_metadata
+    assert meta.temperature.tolist() == [0.5] * 4
+    assert meta.top_k.tolist() == [32] * 4
+    assert meta.temperature.is_contiguous() and meta.top_k.is_contiguous()
+    first = proxy._logits_idx_tensor(torch.device("cpu"))
+    assert first.dtype == torch.long and first.tolist() == [0] * 4
+    assert proxy._logits_idx_tensor(torch.device("cpu")) is first
+
+
+@pytest.mark.parametrize("req_ids,logits_map", [(["gr"], []), (["gr"], [1]), (["a", "b"], [0, 1])])
+def test_persistent_sampling_metadata_rejects_geometry_mismatch(req_ids, logits_map) -> None:
+    with pytest.raises(RuntimeError, match="request geometry"):
+        common.InputBatchProxy(
+            SimpleNamespace(req_ids=req_ids), req_ids, logits_map, logits_map,
+            persistent_geometry=common.BeamDecodeGeometry((2,), (7,)),
         )
 
-    p1 = make_proxy()
-    meta = p1.sampling_metadata
-    assert meta.temperature.tolist() == [0.5, 0.5]
-    assert len(shared) == 1
 
-    # Second frame: identical logits_map -> same cached idx tensor, no rebuild.
-    p2 = make_proxy()
-    meta2 = p2.sampling_metadata
-    assert meta2.temperature.tolist() == [0.5, 0.5]
-    assert len(shared) == 1
-
-    # A different logits_map replaces the single-slot entry.
-    fresh_meta = SimpleNamespace(
-        temperature=torch.tensor([1.0, 2.0], dtype=torch.float32),
-        top_p=None,
-        top_k=None,
-        min_p=None,
-        frequency_penalties=None,
-        presence_penalties=None,
-        repetition_penalties=None,
+def test_persistent_sampling_geometry_can_describe_multiple_request_groups(monkeypatch) -> None:
+    """Layout-only check: runtime admission must still reject B>1 in Phase A."""
+    metadata = SimpleNamespace(
+        temperature=torch.tensor([0.5, 0.75]), top_k=torch.tensor([16, 32])
     )
-    p3 = common.InputBatchProxy(
-        SimpleNamespace(req_ids=["a", "b"], sampling_metadata=fresh_meta),
-        ["a", "a", "b"],
-        [0, 0, 1],
-        [0, 0, 1],
-        shared_idx_cache=shared,
+    batch = SimpleNamespace(req_ids=["a", "b"], sampling_metadata=metadata)
+    indices = [0, 0, 1, 1, 1]
+    proxy = common.InputBatchProxy(
+        batch, ["a", "a", "b", "b", "b"], indices, indices,
+        persistent_geometry=common.BeamDecodeGeometry((2, 3), (7, 11)),
     )
-    meta3 = p3.sampling_metadata
-    assert meta3.temperature.tolist() == [1.0, 1.0, 2.0]
-    assert len(shared) == 1
+
+    def no_host_tensor(*args, **kwargs):
+        pytest.fail("request-group indices must be generated on device")
+
+    monkeypatch.setattr(torch, "tensor", no_host_tensor)
+    assert proxy.sampling_metadata.temperature.tolist() == [0.5, 0.5, 0.75, 0.75, 0.75]
+    assert proxy.sampling_metadata.top_k.tolist() == [16, 16, 32, 32, 32]
+    assert proxy.sampling_metadata.top_k.is_contiguous()
 
 
-def test_sampling_remap_shared_cache_skips_gather_on_hit() -> None:
-    """A second frame's proxy reuses the beam-row expansion of sampling attrs.
-
-    Per-frame ``refresh_metadata`` builds a NEW SamplingMetadata object with
-    fresh per-request tensors, so the instance-level identity cache always
-    misses.  The runner-owned shared cache keys on (device, orig_req_len,
-    logits_map): an unchanged beam geometry hits and attaches the previously
-    gathered beam-row tensors without re-running stack/index_select/unbind.
-    """
-    shared_idx: dict[Any, Any] = {}
-    shared_sampling: dict[Any, Any] = {}
-
-    def make_proxy(temp_value: float, req_ids: list[str]) -> common.InputBatchProxy:
-        meta = SimpleNamespace(
-            temperature=torch.tensor([temp_value], dtype=torch.float32),
-            top_p=torch.tensor([0.9], dtype=torch.float32),
-            top_k=None,
-            min_p=None,
-            frequency_penalties=None,
-            presence_penalties=None,
-            repetition_penalties=None,
-        )
-        batch = SimpleNamespace(req_ids=req_ids, sampling_metadata=meta)
-        return common.InputBatchProxy(
-            batch,
-            ["a", "a"],
-            [0, 0],
-            [0, 0],
-            shared_idx_cache=shared_idx,
-            shared_sampling_cache=shared_sampling,
-            req_ids_key=tuple(req_ids),
-        )
-
-    # First frame (geometry miss): gather runs and populates the cache.
-    p1 = make_proxy(0.5, ["a"])
-    m1 = p1.sampling_metadata
-    assert m1.temperature.tolist() == [0.5, 0.5]
-    assert m1.top_p.tolist() == pytest.approx([0.9, 0.9])
-    assert len(shared_sampling) == 1
-
-    # Second frame: NEW metadata object (refresh_metadata rebuild) with the
-    # same per-request VALUES — a hit attaches the cached beam-row tensors.
-    p2 = make_proxy(0.5, ["a"])
-    m2 = p2.sampling_metadata
-    assert m2 is not m1
-    assert m2.temperature.tolist() == [0.5, 0.5]
-    assert m2.top_p.tolist() == pytest.approx([0.9, 0.9])
-    # The attached tensors are the SAME objects (no second gather).
-    assert m2.temperature is m1.temperature
-    assert m2.top_p is m1.top_p
-    assert len(shared_sampling) == 1
-
-
-def test_sampling_remap_cache_isolated_across_requests() -> None:
-    """A later request with the same layout must NOT inherit the previous
-    request's gathered sampling tensors.
-
-    The cache key includes the request ids: request B (same beam width, same
-    logits_map, DIFFERENT temperature) misses request A's entry and gathers
-    from its own per-request params.  Without the ids in the key, B would
-    silently sample with A's temperature.
-    """
-    shared_idx: dict[Any, Any] = {}
-    shared_sampling: dict[Any, Any] = {}
-
-    def make_proxy(temp_value: float, req_id: str) -> common.InputBatchProxy:
-        meta = SimpleNamespace(
-            temperature=torch.tensor([temp_value], dtype=torch.float32),
-            top_p=torch.tensor([0.9], dtype=torch.float32),
-            top_k=None,
-            min_p=None,
-            frequency_penalties=None,
-            presence_penalties=None,
-            repetition_penalties=None,
-        )
-        batch = SimpleNamespace(req_ids=[req_id], sampling_metadata=meta)
-        return common.InputBatchProxy(
-            batch,
-            [req_id, req_id],
-            [0, 0],
-            [0, 0],
-            shared_idx_cache=shared_idx,
-            shared_sampling_cache=shared_sampling,
-            req_ids_key=(req_id,),
-        )
-
-    # Request A: temperature 0.5.
-    pa = make_proxy(0.5, "req-a")
-    ma = pa.sampling_metadata
-    assert ma.temperature.tolist() == [0.5, 0.5]
-
-    # Request B (sequential, same layout, temperature 1.5): must use ITS OWN
-    # params — a geometry-only key would return A's [0.5, 0.5] here.
-    pb = make_proxy(1.5, "req-b")
-    mb = pb.sampling_metadata
-    assert mb.temperature.tolist() == [1.5, 1.5]
-    assert mb.temperature is not ma.temperature
-    # Single-slot cache: B's entry replaced A's.
-    assert len(shared_sampling) == 1
-
-    # Request A returns (e.g. re-issued request id): re-gathers A's values.
-    pa2 = make_proxy(0.5, "req-a")
-    assert pa2.sampling_metadata.temperature.tolist() == [0.5, 0.5]
+def test_persistent_decode_runtime_still_rejects_multi_request_admission() -> None:
+    runner = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["a", "b"]))
+    output = SimpleNamespace(
+        beam_data={
+            "a": {"persistent_runner_state": True, "is_beam_decode": True},
+            "b": {"persistent_runner_state": True, "is_beam_decode": True},
+        }
+    )
+    with pytest.raises(RuntimeError, match="currently requires B=1"):
+        common._beam_remap_inputs(runner, output, [2, 2])
 
 
 def test_materialize_logits_indices_reuses_runner_buffer() -> None:
@@ -689,11 +591,23 @@ def test_worker_decision_reduces_sampler_payload_before_host_copy() -> None:
     assert sampler_output.logprobs_tensors.logprobs.shape == (1, width)
 
 
-def test_persistent_control_transport_uses_backend_ping_pong_slot() -> None:
+@pytest.mark.parametrize("step,expected_markers", [(1, ["gr_progress_output"]), (3, [])])
+def test_persistent_control_transport_uses_backend_ping_pong_slot(
+    monkeypatch: pytest.MonkeyPatch, step: int, expected_markers: list[str]
+) -> None:
+    from contextlib import nullcontext
+
     from vllm.v1.outputs import SamplerOutput
 
+    markers = []
+
+    def scope(name):
+        markers.append(name)
+        return nullcontext()
+
+    monkeypatch.setattr(common, "record_function_or_nullcontext", scope)
     control = torch.tensor([[7]], dtype=torch.int32)
-    state = SimpleNamespace(control_token_ids=control)
+    state = SimpleNamespace(control_token_ids=control, step=step, max_tokens=3)
     runner = SimpleNamespace(use_async_scheduling=True)
     sampler_output = SamplerOutput(
         sampled_token_ids=torch.tensor([[99]], dtype=torch.int32),
@@ -705,6 +619,7 @@ def test_persistent_control_transport_uses_backend_ping_pong_slot() -> None:
     assert sampler_output.sampled_token_ids.tolist() == [[7]]
     assert sampler_output.sampled_token_ids is control
     assert sampler_output._gr_persistent_state_transport is True
+    assert markers == expected_markers
 
 
 def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
@@ -945,6 +860,61 @@ def test_stale_persistent_session_releases_state_owner_before_slot_reuse() -> No
     assert runner._gr_state_freed_count == 1
 
 
+def test_persistent_session_progression_is_owned_only_by_backend() -> None:
+    runner = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(beam_max_width=4, beam_max_decode_steps=3),
+        model_config=SimpleNamespace(
+            dtype=torch.float16,
+            get_num_kv_heads=lambda config: 2,
+            get_head_size=lambda: 8,
+            get_num_layers=lambda config: 1,
+        ),
+        parallel_config=object(),
+        device=torch.device("cpu"),
+    )
+    initial = {
+        "gr": {
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_decode_steps": 1,
+            "beam_width": 2,
+            "prefix_len": 4,
+            "max_decode_steps": 3,
+        }
+    }
+    session = common._get_or_create_beam_session(
+        runner, initial, SimpleNamespace(beam_finished_session_ids=[])
+    )
+    assert session is not None
+    session._gr_prefill_prearmed = True
+    runner._gr_model_runner_states = {"gr": SimpleNamespace(step=1)}
+
+    persistent = {
+        "gr": {
+            **initial["gr"],
+            "persistent_runner_state": True,
+            "generation_index": 1,
+        }
+    }
+    assert (
+        common._get_or_create_beam_session(
+            runner, persistent, SimpleNamespace(beam_finished_session_ids=[])
+        )
+        is session
+    )
+    assert session.decode_step == 0
+
+    # Simulate the backend's same-step SelectUnsharedKV + step advance.
+    session._state.decode_step = 1
+    runner._gr_model_runner_states["gr"].step = 2
+    persistent["gr"]["decode_step"] = 1
+    persistent["gr"]["generation_index"] = 2
+    common._get_or_create_beam_session(
+        runner, persistent, SimpleNamespace(beam_finished_session_ids=[])
+    )
+    assert session.decode_step == 1
+
+
 # ---------------------------------------------------------------------------
 # M2: inlined sample_tokens (merge the second collective_rpc into
 # execute_model; upstream core.py None short-circuit does the skipping)
@@ -1181,3 +1151,87 @@ def test_execute_wrapper_does_not_inline_mixed_beam_plus_structured() -> None:
     assert out is None
     assert runner._sample_tokens_calls == []
     assert runner.execute_model_state == "state"
+
+
+def test_execute_wrapper_failure_releases_only_current_persistent_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TrackedState:
+        def __init__(self) -> None:
+            self.released = False
+
+        def release(self) -> bool:
+            self.released = True
+            return True
+
+    current = TrackedState()
+    unrelated = TrackedState()
+    current_session = object()
+    unrelated_session = object()
+    runner = _m2_runner(use_async_scheduling=True)
+    runner._gr_model_runner_states = {
+        "current": current,
+        "unrelated": unrelated,
+    }
+    runner._beam_sessions = {
+        "current": current_session,
+        "unrelated": unrelated_session,
+    }
+    scheduler_output = SimpleNamespace(
+        beam_data={
+            "current": {"persistent_runner_state": True},
+            # A non-persistent sidecar in the same frame is not an owner.
+            "ordinary": {"persistent_runner_state": False},
+        }
+    )
+    monkeypatch.setattr(
+        common,
+        "_get_or_create_beam_session",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("session failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="session failed"):
+        common.make_patched_execute_model(lambda *_args: None)(
+            runner,
+            scheduler_output,
+        )
+
+    assert current.released is True
+    assert unrelated.released is False
+    assert runner._gr_model_runner_states == {"unrelated": unrelated}
+    assert runner._beam_sessions == {"unrelated": unrelated_session}
+
+
+def test_execute_wrapper_cleanup_failure_does_not_mask_worker_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker import gr_model_runner_state
+
+    root_error = KeyboardInterrupt("worker interrupted")
+    cleanup_calls: list[tuple[str, ...]] = []
+
+    def execute(*_args: Any) -> None:
+        raise root_error
+
+    def fail_cleanup(_runner: Any, request_ids: tuple[str, ...]) -> None:
+        cleanup_calls.append(request_ids)
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(common, "_get_or_create_beam_session", lambda *_args: None)
+    monkeypatch.setattr(
+        gr_model_runner_state,
+        "release_gr_model_runner_states",
+        fail_cleanup,
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={"current": {"persistent_runner_state": True}}
+    )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        common.make_patched_execute_model(execute)(
+            _m2_runner(use_async_scheduling=True),
+            scheduler_output,
+        )
+
+    assert caught.value is root_error
+    assert cleanup_calls == [("current",)]

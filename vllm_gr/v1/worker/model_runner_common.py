@@ -4,13 +4,16 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from functools import wraps
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+from vllm_gr.v1.beam.decode_geometry import BeamDecodeGeometry
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 logger = init_logger(__name__)
@@ -345,50 +348,17 @@ def _first_device_of(s_meta) -> Any:
 
 
 class InputBatchProxy:
-    def __init__(
-        self,
-        obj,
-        req_map,
-        idx_map,
-        logits_map,
-        shared_idx_cache=None,
-        shared_sampling_cache=None,
-        req_ids_key=None,
-    ):
+    def __init__(self, obj, req_map, idx_map, logits_map, *, persistent_geometry=None):
+        if persistent_geometry is not None and (
+            len(obj.req_ids) != persistent_geometry.num_requests
+            or not persistent_geometry.matches_request_indices(logits_map)
+        ):
+            raise RuntimeError("persistent GR sampling metadata does not match request geometry")
         object.__setattr__(self, "_obj", obj)
         object.__setattr__(self, "_req_id_map", req_map)
         object.__setattr__(self, "_batch_idx_map", idx_map)
         object.__setattr__(self, "_logit_idx_map", logits_map)
-        # Frozen tuple of the logits map, computed once per proxy and shared
-        # by the idx-tensor and sampling-remap cache keys (two keys per frame
-        # would otherwise materialize the 128-element tuple twice).
-        object.__setattr__(
-            self, "_logit_idx_tuple", tuple(logits_map) if logits_map is not None else None
-        )
-        # Frozen tuple of the batch's request ids — the request-identity
-        # component of the sampling-remap cache key.  Beam-row expansions of
-        # the sampling attributes are only reusable WITHIN one request's
-        # decode session; a later request with the same beam width and batch
-        # layout would otherwise silently inherit the previous request's
-        # temperature/top-p/penalty tensors.
-        object.__setattr__(
-            self, "_req_ids_key", tuple(req_ids_key) if req_ids_key is not None else None
-        )
-        # Runner-owned single-slot cache shared across per-frame proxy
-        # instances.  Consecutive incremental decode steps carry the same
-        # logits_map (e.g. ``[0]*beam_width`` for a single beam request), so
-        # the host->device logits-row index tensor is rebuilt once per
-        # geometry instead of once per frame.
-        object.__setattr__(self, "_shared_idx_cache", shared_idx_cache)
-        # Runner-owned single-slot cache for the REMAPPED sampling tensors.
-        # vLLM v1 per-request sampling params are immutable for a request's
-        # lifetime (written once by add_request), and a beam decode session is
-        # one request, so the beam-row expansion of the 7 sampling attrs is a
-        # per-geometry constant WITHIN that request.  The cache key carries
-        # the request ids so a different request with the same layout always
-        # misses and re-gathers from its own params.  A hit skips the
-        # per-frame stack + index_select + unbind gather chain entirely.
-        object.__setattr__(self, "_shared_sampling_cache", shared_sampling_cache)
+        object.__setattr__(self, "_persistent_geometry", persistent_geometry)
         # Remapped sampling metadata, cached for this proxy's lifetime.
         # Holds the underlying ``sampling_metadata`` object after its
         # per-request tensors were remapped onto logits rows; validated by
@@ -401,23 +371,13 @@ class InputBatchProxy:
         cache = object.__getattribute__(self, "_logits_idx_tensor_cache")
         if cache is not None and cache[0] == device:
             return cache[1]
-        shared = object.__getattribute__(self, "_shared_idx_cache")
-        key = (device, object.__getattribute__(self, "_logit_idx_tuple"))
-        if shared is not None:
-            hit = shared.get(key)
-            if hit is not None:
-                object.__setattr__(self, "_logits_idx_tensor_cache", (device, hit))
-                return hit
-        idx = torch.tensor(
-            object.__getattribute__(self, "_logit_idx_map"),
-            dtype=torch.long,
-            device=device,
-        )
-        if shared is not None:
-            # Keep only the current geometry's entry; the hot path is
-            # frame-to-frame reuse within one beam session.
-            shared.clear()
-            shared[key] = idx
+        logits_map = object.__getattribute__(self, "_logit_idx_map")
+        geometry = object.__getattribute__(self, "_persistent_geometry")
+        if geometry is not None:
+            idx = torch.empty(geometry.num_rows, dtype=torch.long, device=device)
+            geometry.write_request_indices(idx)
+        else:
+            idx = torch.tensor(logits_map, dtype=torch.long, device=device)
         object.__setattr__(self, "_logits_idx_tensor_cache", (device, idx))
         return idx
 
@@ -549,6 +509,23 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
         The new per-beam logits-index list (caller converts to a tensor).
     """
     beam_data = getattr(scheduler_output, "beam_data", {})
+
+    persistent_decode = any(
+        metadata.get("persistent_runner_state") and metadata.get("is_beam_decode")
+        for metadata in beam_data.values()
+    )
+    persistent_geometry = None
+    if persistent_decode:
+        # Phase A admission is B=1. The layout generator is deliberately not
+        # restricted to B=1; lifting this gate requires multi-session ownership
+        # and backend validation, not replacing an all-zero sampling map.
+        native_req_ids = runner.input_batch.req_ids
+        if len(native_req_ids) != 1:
+            raise RuntimeError("persistent GR Decode currently requires B=1")
+        persistent_geometry = BeamDecodeGeometry(
+            tuple(beam_data[req_id]["beam_width"] for req_id in native_req_ids),
+            tuple(beam_data[req_id]["prefix_len"] for req_id in native_req_ids),
+        )
 
     runner.input_batch.logprob_token_ids = {}
     orig_req_ids = runner.input_batch.req_ids
@@ -702,9 +679,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
         row_to_req_id,
         row_to_batch_idx,
         logits_to_batch_idx,
-        shared_idx_cache=shared_idx_cache,
-        shared_sampling_cache=shared_sampling_cache,
-        req_ids_key=tuple(orig_req_ids),
+        persistent_geometry=persistent_geometry,
     )
     scheduler_output._gr_request_row_configs = request_row_configs
 
@@ -978,13 +953,23 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
     """
     gr_state = getattr(sampler_output, "_gr_model_runner_state", None)
     if gr_state is not None:
-        control_token_ids = gr_state.control_token_ids
-        # The backend publishes alternating fixed control slots. BatchQueue
-        # permits one look-ahead frame, so an in-flight D2H source cannot be
-        # overwritten and no per-step clone is required.
-        sampler_output.sampled_token_ids = control_token_ids
-        sampler_output.logprobs_tensors = None
-        sampler_output._gr_persistent_state_transport = True
+        is_intermediate = int(gr_state.step) < int(gr_state.max_tokens)
+        # The final native control token is still required for request
+        # accounting, but it is not an intermediate progress output. The
+        # compact Beam payload is traced separately by gr_final_output.
+        trace_scope = (
+            record_function_or_nullcontext("gr_progress_output")
+            if is_intermediate
+            else nullcontext()
+        )
+        with trace_scope:
+            control_token_ids = gr_state.control_token_ids
+            # The backend publishes alternating fixed control slots. BatchQueue
+            # permits one look-ahead frame, so an in-flight D2H source cannot be
+            # overwritten and no per-step clone is required.
+            sampler_output.sampled_token_ids = control_token_ids
+            sampler_output.logprobs_tensors = None
+            sampler_output._gr_persistent_state_transport = True
         return True
 
     decision = getattr(runner, "_beam_decision_tensors", None)
@@ -1469,6 +1454,23 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         planned_decode_steps = loop_len - 1 if loop_len > 0 else gr_cfg.beam_max_decode_steps
         is_last_step = mdata_step >= planned_decode_steps - 1
 
+        if session is not None and mdata.get("persistent_runner_state"):
+            # The selected device backend is the sole owner of persistent
+            # Beam/KV progression.  In particular, parent_beam_ids is absent
+            # by design and must not enter the legacy fallback below, whose
+            # ``decode_step += 1`` would race the same-step backend reorder.
+            if getattr(session, "_gr_prefill_prearmed", False):
+                del session._gr_prefill_prearmed
+            if session.decode_step != mdata_step:
+                raise RuntimeError(
+                    "persistent GR Beam session is out of sequence: "
+                    f"session={session.decode_step}, metadata={mdata_step}"
+                )
+            session._state.is_last_step = is_last_step
+            if active_session is None:
+                active_session = session
+            continue
+
         if session is not None:
             # Existing session: step_complete or reset
             if mdata_step == 0:
@@ -1597,45 +1599,53 @@ def make_patched_execute_model(_orig_execute_model):
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
-        # Clear the previous step's beam context at the START of the next
-        # execute_model, not in a finally: with async scheduling the sampled
-        # tokens are produced by ``sample_tokens`` AFTER execute_model returns,
-        # and the worker-side beam decision needs ``_current_beam_data`` /
-        # ``_current_beam_info`` (session + decision buffers) still alive there.
-        # A stale previous-step context is overwritten here before the new
-        # step's values are installed.
-        self._current_beam_data = getattr(scheduler_output, "beam_data", {})
-        self._current_beam_info = {"beam_data": self._current_beam_data, "req_ids": []}
-        beam_info = self._current_beam_info
-
-        # Worker-side beam decision output (NPU xllm path).  Reset each step so
-        # a stale result from a previous run can never leak into this step's
-        # ModelRunnerOutput.beam_search_result.
-        self._beam_decision_result = None
-        self._beam_decision_tensors = None
-        self._beam_result_host_ready = False
-        # CUDA Prefill prelaunch state is single-step and single-consumer.
-        # Reset it before upstream input preparation may publish this run's
-        # prepared descriptor.
-        self._gr_prepared_cuda_prefill_constraint = None
-        self._gr_prelaunched_cuda_prefill = None
-
-        # Manage BeamSearchSession for incremental decode
-        beam_session = _get_or_create_beam_session(self, self._current_beam_data, scheduler_output)
-        if beam_session is not None:
-            beam_info["beam_session"] = beam_session
-
-        token = BEAM_DATA_VAR.set(beam_info)
-        self._current_beam_info = beam_info
-        # Published for the optional Constraint Tables ``_sample`` hook
-        # (constraint_hook): it reads ``_gr_request_row_configs`` to locate the
-        # constrained logits rows.  Lives until the next execute_model (which
-        # overwrites it at the top); with async scheduling the constraint hook
-        # and worker beam decision run in ``sample_tokens`` AFTER
-        # execute_model returns, so the context must stay alive past the
-        # execute_model frame.
-        self._current_scheduler_output = scheduler_output
+        token = None
         try:
+            # Clear the previous step's beam context at the START of the next
+            # execute_model, not in a finally: with async scheduling the sampled
+            # tokens are produced by ``sample_tokens`` AFTER execute_model returns,
+            # and the worker-side beam decision needs ``_current_beam_data`` /
+            # ``_current_beam_info`` (session + decision buffers) still alive there.
+            # A stale previous-step context is overwritten here before the new
+            # step's values are installed.
+            self._current_beam_data = getattr(scheduler_output, "beam_data", {})
+            self._current_beam_info = {
+                "beam_data": self._current_beam_data,
+                "req_ids": [],
+            }
+            beam_info = self._current_beam_info
+
+            # Worker-side beam decision output (NPU xllm path).  Reset each step so
+            # a stale result from a previous run can never leak into this step's
+            # ModelRunnerOutput.beam_search_result.
+            self._beam_decision_result = None
+            self._beam_decision_tensors = None
+            self._beam_result_host_ready = False
+            # CUDA Prefill prelaunch state is single-step and single-consumer.
+            # Reset it before upstream input preparation may publish this run's
+            # prepared descriptor.
+            self._gr_prepared_cuda_prefill_constraint = None
+            self._gr_prelaunched_cuda_prefill = None
+
+            # Manage BeamSearchSession for incremental decode.
+            beam_session = _get_or_create_beam_session(
+                self,
+                self._current_beam_data,
+                scheduler_output,
+            )
+            if beam_session is not None:
+                beam_info["beam_session"] = beam_session
+
+            token = BEAM_DATA_VAR.set(beam_info)
+            self._current_beam_info = beam_info
+            # Published for the optional Constraint Tables ``_sample`` hook
+            # (constraint_hook): it reads ``_gr_request_row_configs`` to locate the
+            # constrained logits rows.  Lives until the next execute_model (which
+            # overwrites it at the top); with async scheduling the constraint hook
+            # and worker beam decision run in ``sample_tokens`` AFTER
+            # execute_model returns, so the context must stay alive past the
+            # execute_model frame.
+            self._current_scheduler_output = scheduler_output
             out = _orig_execute_model(self, scheduler_output, *args, **kwargs)
             if out is None:
                 # GPU-only helper; all non-CUDA and unsupported cases are a
@@ -1666,13 +1676,49 @@ def make_patched_execute_model(_orig_execute_model):
                     )
                     out = None
             _attach_beam_search_result(self, out)
-            return out
-        finally:
+        except BaseException:
+            # Failure ownership is frame-local: an execute for request A must
+            # never tear down a persistent state belonging to an unrelated
+            # request B that merely happens to be resident on this runner.
+            persistent_ids = tuple(
+                request_id
+                for request_id, metadata in (
+                    getattr(scheduler_output, "beam_data", {}) or {}
+                ).items()
+                if metadata.get("persistent_runner_state")
+            )
+            if persistent_ids:
+                try:
+                    from vllm_gr.v1.worker.gr_model_runner_state import (
+                        release_gr_model_runner_states,
+                    )
+
+                    release_gr_model_runner_states(self, persistent_ids)
+                except BaseException:
+                    # Cleanup is best-effort here.  Preserve the worker error
+                    # that caused teardown so EngineCore reports the true root
+                    # cause instead of a secondary backend-release failure.
+                    logger.exception(
+                        "vllm-gr: failed to release persistent GR state after "
+                        "execute_model failure"
+                    )
+            if token is not None:
+                try:
+                    BEAM_DATA_VAR.reset(token)
+                except BaseException:
+                    logger.exception(
+                        "vllm-gr: failed to reset Beam context after "
+                        "execute_model failure"
+                    )
+            raise
+        else:
             # Deliberately keep ``_current_beam_data`` / ``_current_beam_info``
             # / ``_current_scheduler_output`` alive for the async sampling
             # phase (sample_tokens runs after execute_model returns).  They are
             # overwritten at the top of the next execute_model call.
-            BEAM_DATA_VAR.reset(token)
+            if token is not None:
+                BEAM_DATA_VAR.reset(token)
+            return out
 
     setattr(patched_execute_model, _WORKER_EXECUTE_PATCH_MARKER, True)
     return patched_execute_model

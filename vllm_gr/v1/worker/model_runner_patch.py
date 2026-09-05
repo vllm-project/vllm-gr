@@ -304,11 +304,29 @@ def apply_worker_patches() -> None:
             runner_class.shutdown = make_shutdown_with_constraint_backend(
                 shutdown if callable(shutdown) else None
             )
+            platform_shutdown_patch = getattr(platform_module, "make_patched_shutdown", None)
+            if callable(platform_shutdown_patch):
+                runner_class.shutdown = platform_shutdown_patch(runner_class.shutdown)
 
-        runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
+        platform_execute_patcher = getattr(
+            platform_module, "make_patched_execute_model", None
+        )
+        if callable(platform_execute_patcher):
+            runner_class.execute_model = platform_execute_patcher(
+                runner_class.execute_model
+            )
+        else:
+            runner_class.execute_model = make_patched_execute_model(
+                runner_class.execute_model
+            )
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )
+        input_prep_patch = getattr(platform_module, "make_patched_synchronize_input_prep", None)
+        if callable(input_prep_patch) and hasattr(runner_class, "synchronize_input_prep"):
+            runner_class.synchronize_input_prep = input_prep_patch(
+                runner_class.synchronize_input_prep
+            )
         runner_class._bookkeeping_sync = platform_module.make_patched_bookkeeping_sync(
             runner_class._bookkeeping_sync
         )

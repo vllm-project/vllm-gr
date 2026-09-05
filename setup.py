@@ -14,7 +14,7 @@ import sys
 import warnings
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import Extension, setup
 from setuptools_scm import get_version
 
 logger = logging.getLogger("vllm_gr.setup")
@@ -162,6 +162,24 @@ def load_requirements(file_path: Path) -> list[str]:
     return requirements
 
 
+def get_ext_modules() -> list[Extension]:
+    """Build the native completion ABI only for CUDA installation targets.
+
+    This is a host C++ extension, not a CUDA kernel: it needs a C++17 compiler
+    and pthread, but no CUDA headers, NVCC, pybind, or Worker-time compilation.
+    CPU/NPU installs do not build or load it.
+    """
+    if detect_target_device() != "cuda":
+        return []
+    return [Extension(
+        "vllm_gr.ops.cuda._completion",
+        sources=["vllm_gr/ops/cuda/native/gr_completion_ticket.cc"],
+        language="c++",
+        extra_compile_args=["-std=c++17", "-pthread"],
+        extra_link_args=["-pthread"],
+    )]
+
+
 def get_install_requires() -> list[str]:
     """Get dependencies based on detected platform."""
     warn_deprecated_extra_install()
@@ -186,4 +204,5 @@ if __name__ == "__main__":
     setup(
         version=get_vllm_gr_version(),
         install_requires=get_install_requires(),
+        ext_modules=get_ext_modules(),
     )

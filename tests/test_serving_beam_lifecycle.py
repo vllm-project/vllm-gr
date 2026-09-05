@@ -327,7 +327,15 @@ def _persistent_final_decision(*, width: int = 2, steps: int = 3) -> dict[str, A
 
 def test_offline_persistent_prefill_builds_one_final_only_request() -> None:
     actual_request_id = "offline-beam-0-0-native"
-    output_processor = SimpleNamespace(add_request=Mock())
+    request_states: dict[str, SimpleNamespace] = {}
+
+    def add_output_request(request, *_args: Any) -> None:
+        request_states[request.request_id] = SimpleNamespace()
+
+    output_processor = SimpleNamespace(
+        add_request=Mock(side_effect=add_output_request),
+        request_states=request_states,
+    )
 
     def process_inputs(**kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(
@@ -397,6 +405,7 @@ def test_offline_persistent_prefill_builds_one_final_only_request() -> None:
         "protocol_version",
     }
     output_processor.add_request.assert_called_once_with(request, None, None, 0)
+    assert request_states[actual_request_id].gr_persistent_request is True
 
     decode_requests = offline_gr._prepare_beam_step_requests(
         llm_engine=llm_engine,
@@ -419,6 +428,124 @@ def test_offline_persistent_prefill_builds_one_final_only_request() -> None:
 
     assert decode_requests == []
     output_processor.add_request.assert_called_once_with(request, None, None, 0)
+
+
+def test_offline_persistent_terminated_target_fails_without_empty_step_loop() -> None:
+    internal_id = "native-internal-0"
+    calls = 0
+
+    def bounded_step() -> list[Any]:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AssertionError("empty step loop exceeded its bound")
+        return []
+
+    llm_engine = SimpleNamespace(
+        step=bounded_step,
+        output_processor=SimpleNamespace(
+            # An unrelated ordinary request must not keep this GR wait alive.
+            request_states={"ordinary-request": object()}
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "persistent GR request terminated before final output.*"
+            "native-internal-0.*offline-beam-4-0"
+        ),
+    ):
+        offline_gr._step_engine_and_collect_outputs(
+            llm_engine=llm_engine,
+            instances_batch=[SimpleNamespace(beams=[object()])],
+            token=0,
+            prompt_start=4,
+            instance_prefill_id={0: internal_id},
+            persistent_request=True,
+        )
+
+    assert calls == 1
+
+
+def test_offline_persistent_final_wins_after_output_registry_removal() -> None:
+    final = SimpleNamespace(request_id="offline-beam-4-0")
+    llm_engine = SimpleNamespace(
+        step=Mock(return_value=[final]),
+        # FINAL_ONLY processing may remove the state before step() returns.
+        output_processor=SimpleNamespace(request_states={}),
+    )
+
+    outputs = offline_gr._step_engine_and_collect_outputs(
+        llm_engine=llm_engine,
+        instances_batch=[SimpleNamespace(beams=[object()])],
+        token=0,
+        prompt_start=4,
+        instance_prefill_id={0: "native-internal-0"},
+        persistent_request=True,
+    )
+
+    assert outputs == {final.request_id: final}
+    llm_engine.step.assert_called_once_with()
+
+
+def test_offline_persistent_live_target_keeps_waiting_for_final() -> None:
+    internal_id = "native-internal-0"
+    request_states = {internal_id: object()}
+    final = SimpleNamespace(request_id="offline-beam-4-0")
+    calls = 0
+
+    def step_until_final() -> list[Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return []
+        if calls == 2:
+            request_states.pop(internal_id)
+            return [final]
+        raise AssertionError("persistent wait exceeded its bound")
+
+    llm_engine = SimpleNamespace(
+        step=step_until_final,
+        output_processor=SimpleNamespace(request_states=request_states),
+    )
+
+    outputs = offline_gr._step_engine_and_collect_outputs(
+        llm_engine=llm_engine,
+        instances_batch=[SimpleNamespace(beams=[object()])],
+        token=0,
+        prompt_start=4,
+        instance_prefill_id={0: internal_id},
+        persistent_request=True,
+    )
+
+    assert outputs == {final.request_id: final}
+    assert calls == 2
+
+
+def test_offline_ordinary_output_collection_does_not_inspect_request_registry() -> None:
+    class OrdinaryOutputProcessor:
+        @property
+        def request_states(self):
+            raise AssertionError("ordinary path inspected persistent registry")
+
+    final = SimpleNamespace(request_id="offline-beam-4-0")
+    steps = iter(([], [final]))
+    llm_engine = SimpleNamespace(
+        step=lambda: next(steps),
+        output_processor=OrdinaryOutputProcessor(),
+    )
+
+    outputs = offline_gr._step_engine_and_collect_outputs(
+        llm_engine=llm_engine,
+        instances_batch=[SimpleNamespace(beams=[object()])],
+        token=0,
+        prompt_start=4,
+        instance_prefill_id={0: "ordinary-internal-0"},
+        persistent_request=False,
+    )
+
+    assert outputs == {final.request_id: final}
 
 
 def test_offline_persistent_rejects_multiple_prompts_before_batch_split() -> None:

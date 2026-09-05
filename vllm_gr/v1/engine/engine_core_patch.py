@@ -61,14 +61,41 @@ def make_patched_engine_core_init(original_init):
     return patched_init
 
 
+def _retire_engine_after_gr_release_failure(engine, error):
+    """Fail closed without adding work to healthy scheduling/dispatch paths.
+
+    Multiproc release failure may leave a partially consumed response FIFO.
+    Reusing it (even for an ordinary request or utility RPC) is unsafe. Keep
+    shutdown reachable: pinned upstream UniProc/Multiproc shutdown does not
+    use collective_rpc. Only the EngineCore owner thread mutates these entries.
+    """
+    engine._gr_lifecycle_error = error
+
+    def reject(*args, **kwargs):
+        raise RuntimeError(
+            "EngineCore retired after persistent GR release failure; shutdown required"
+        ) from error
+
+    # step_fn may already contain a bound method captured before plugin loading.
+    # Replace that entry too, not just the class's step methods.
+    for name in ("add_request", "step", "step_with_batch_queue", "step_fn"):
+        setattr(engine, name, reject)
+    engine.model_executor.collective_rpc = reject
+
+
 def make_patched_abort_requests(original_abort):
-    """Release Worker-owned GR state when its logical request is aborted."""
+    """Observe the terminal GR release RPC; this is not a GPU drain barrier."""
 
     if getattr(original_abort, _GR_ABORT_PATCH_MARKER, False) is True:
         return original_abort
 
     @wraps(original_abort)
     def patched_abort_requests(self, request_ids):
+        lifecycle_error = getattr(self, "_gr_lifecycle_error", None)
+        if isinstance(lifecycle_error, BaseException):
+            raise RuntimeError(
+                "EngineCore retired after persistent GR release failure; shutdown required"
+            ) from lifecycle_error
         ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
         requests = getattr(getattr(self, "scheduler", None), "requests", {})
         gr_ids = [
@@ -80,11 +107,20 @@ def make_patched_abort_requests(original_abort):
         ]
         result = original_abort(self, ids)
         if gr_ids:
-            self.model_executor.collective_rpc(
-                "release_gr_model_runner_states",
-                args=(gr_ids,),
-                non_block=True,
-            )
+            try:
+                release_future = self.model_executor.collective_rpc(
+                    "release_gr_model_runner_states",
+                    args=(gr_ids,),
+                    non_block=True,
+                )
+                # UniProc returns an already completed Future, including on
+                # failure. Multiproc's lazy Future drives its existing FIFO.
+                # Do not add a callback thread/queue or an unsupported timeout.
+                release_future.result()
+            except BaseException as error:
+                _retire_engine_after_gr_release_failure(self, error)
+                error.add_note(f"Persistent GR abort release failed for {gr_ids!r}")
+                raise
         return result
 
     setattr(patched_abort_requests, _GR_ABORT_PATCH_MARKER, True)
