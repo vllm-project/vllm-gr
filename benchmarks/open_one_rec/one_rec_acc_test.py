@@ -373,9 +373,19 @@ def main():
             params.end_token = "<|sid_end|>"
         prompts_dict = [{"prompt": prompt} for prompt in prompts]
         gen_start = time.perf_counter()
-        raw_offline_outputs = llm.beam_search(
-            prompts_dict, params, concurrency_limit=args.max_concurrency
-        )
+        if args.persistent:
+            # Persistent GR currently has one native Scheduler request and one
+            # device-resident Beam session per call. A concurrency limit does
+            # not split a multi-prompt beam_search call into independent B=1
+            # sessions, so submit each RecIF sample explicitly.
+            raw_offline_outputs = [
+                llm.beam_search([prompt], params, concurrency_limit=1)[0]
+                for prompt in prompts_dict
+            ]
+        else:
+            raw_offline_outputs = llm.beam_search(
+                prompts_dict, params, concurrency_limit=args.max_concurrency
+            )
         assert len(raw_offline_outputs) == len(prompts)
         gen_end = time.perf_counter()
 
