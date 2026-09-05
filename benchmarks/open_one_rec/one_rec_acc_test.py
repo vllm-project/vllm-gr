@@ -218,7 +218,33 @@ def main():
     parser.add_argument(
         "--max-concurrency", type=int, default=None, help="maximum prompts to run concurrently"
     )
+    parser.add_argument(
+        "--async-scheduling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable vLLM asynchronous scheduling for offline inference",
+    )
+    parser.add_argument(
+        "--persistent",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="use the persistent final-only vLLM-GR request path",
+    )
+    parser.add_argument(
+        "--prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable native Prefix Cache for offline inference",
+    )
+    parser.add_argument(
+        "--beam-graph-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable the FULL Beam CUDA/ACL Graph path",
+    )
     args = parser.parse_args()
+    if args.persistent and not args.async_scheduling:
+        parser.error("--persistent requires --async-scheduling")
 
     # 1. Load Configuration
     if args.gr:
@@ -263,6 +289,13 @@ def main():
             beam_max_width = gen_config.get("num_beams", 1)
         logger.info(f"Beam KV pool upper bound (beam_max_width): {beam_max_width}")
         logger.info(f"\nInitializing vLLM with model: {args.model}")
+        additional_config = None
+        if args.persistent:
+            additional_config = {
+                "vllm_gr_persistent_request": True,
+                "vllm_gr_persistent_runner_state": True,
+                "vllm_gr_scheduling_mode": "async",
+            }
         try:
             llm = GRLLM(
                 model=args.model,
@@ -271,10 +304,18 @@ def main():
                 catalog_path=args.catalog_path if args.catalog_path is not None else None,
                 constraint_backend=args.constraint_backend,
                 beam_max_width=beam_max_width,
+                beam_max_decode_steps=max(
+                    1, int(gen_config.get("max_new_tokens", 5)) - 2
+                ),
+                beam_graph_enabled=args.beam_graph_enabled,
                 attention_config={
                     "backend": args.backend if args.backend is not None else "CUSTOM"
                 },
                 gpu_memory_utilization=0.7,
+                max_num_seqs=1 if args.persistent else 256,
+                async_scheduling=args.async_scheduling,
+                enable_prefix_caching=args.prefix_caching,
+                additional_config=additional_config,
             )
         except Exception as e:
             logger.error(f"Failed to initialize vLLM: {e}")
