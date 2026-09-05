@@ -379,20 +379,26 @@ def _validate_prefix_evidence(
     expected_requests: int | None = None,
 ) -> None:
     if observed is not None:
-        if cache_mode == "disabled":
-            if observed:
-                raise EvidenceUnavailableError(
-                    f"disabled prefix cache made {len(observed)} direct queries"
-                )
-            return
+        if not observed:
+            raise EvidenceUnavailableError("direct prefix observer recorded no queries")
         if expected_requests is not None and len(observed) != expected_requests:
             raise EvidenceUnavailableError(
                 "direct prefix observer request count mismatch: "
                 f"observed={len(observed)}, expected={expected_requests}"
             )
-        if not observed:
-            raise EvidenceUnavailableError("direct prefix observer recorded no queries")
         hits = [int(event["computed_tokens"]) for event in observed]
+        enabled = [bool(event["cache_enabled"]) for event in observed]
+        if cache_mode == "disabled":
+            if any(enabled) or any(hits):
+                raise EvidenceUnavailableError(
+                    "disabled prefix cache returned effective queries: "
+                    f"enabled={enabled}, computed={hits}"
+                )
+            return
+        if not all(enabled):
+            raise EvidenceUnavailableError(
+                f"cache-enabled case observed disabled lookups: {enabled}"
+            )
         if cache_mode == "miss" and any(hits):
             raise EvidenceUnavailableError(f"prefix miss returned computed tokens: {hits}")
         if cache_mode == "hit" and any(hit <= 0 for hit in hits):
@@ -436,6 +442,7 @@ def _install_inproc_prefix_observer(llm: Any) -> list[dict[str, Any]]:
             "persistent prefix observer requires an in-process KVCacheManager"
         )
     events: list[dict[str, Any]] = []
+    cache_enabled = bool(llm.llm_engine.vllm_config.cache_config.enable_prefix_caching)
 
     def observed(request):
         blocks, computed_tokens = original(request)
@@ -453,6 +460,7 @@ def _install_inproc_prefix_observer(llm: Any) -> list[dict[str, Any]]:
                     getattr(request, "gr_persistent_request", False)
                     or getattr(request, "gr_persistent_runner_state", False)
                 ),
+                "cache_enabled": cache_enabled,
             }
         )
         return blocks, computed_tokens

@@ -377,9 +377,9 @@ def test_prefix_evidence_accepts_observed_mode(mode: str, queries: float, hits: 
 @pytest.mark.parametrize(
     ("mode", "events"),
     [
-        ("disabled", []),
-        ("miss", [{"computed_tokens": 0}]),
-        ("hit", [{"computed_tokens": 1008}]),
+        ("disabled", [{"computed_tokens": 0, "cache_enabled": False}]),
+        ("miss", [{"computed_tokens": 0, "cache_enabled": True}]),
+        ("hit", [{"computed_tokens": 1008, "cache_enabled": True}]),
     ],
 )
 def test_direct_prefix_observer_accepts_actual_cache_mode(mode, events) -> None:
@@ -387,18 +387,22 @@ def test_direct_prefix_observer_accepts_actual_cache_mode(mode, events) -> None:
         mode,
         {"vllm:prefix_cache_queries": 0.0, "vllm:prefix_cache_hits": 0.0},
         events,
-        len(events),
+        1,
     )
 
 
 def test_direct_prefix_observer_rejects_missing_or_wrong_evidence() -> None:
     delta = {"vllm:prefix_cache_queries": 0.0, "vllm:prefix_cache_hits": 0.0}
     with pytest.raises(profile.EvidenceUnavailableError, match="recorded no queries"):
-        profile._validate_prefix_evidence("hit", delta, [], 0)
+        profile._validate_prefix_evidence("hit", delta, [], 1)
     with pytest.raises(profile.EvidenceUnavailableError, match="computed tokens"):
-        profile._validate_prefix_evidence("miss", delta, [{"computed_tokens": 16}], 1)
+        profile._validate_prefix_evidence(
+            "miss", delta, [{"computed_tokens": 16, "cache_enabled": True}], 1
+        )
     with pytest.raises(profile.EvidenceUnavailableError, match="count mismatch"):
-        profile._validate_prefix_evidence("hit", delta, [{"computed_tokens": 16}], 2)
+        profile._validate_prefix_evidence(
+            "hit", delta, [{"computed_tokens": 16, "cache_enabled": True}], 2
+        )
 
 
 def test_inproc_prefix_observer_preserves_native_result() -> None:
@@ -406,6 +410,9 @@ def test_inproc_prefix_observer_preserves_native_result() -> None:
     manager = SimpleNamespace(get_computed_blocks=lambda _request: (blocks, 1008))
     llm = SimpleNamespace(
         llm_engine=SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                cache_config=SimpleNamespace(enable_prefix_caching=True)
+            ),
             engine_core=SimpleNamespace(
                 engine_core=SimpleNamespace(
                     scheduler=SimpleNamespace(kv_cache_manager=manager)
@@ -431,6 +438,7 @@ def test_inproc_prefix_observer_preserves_native_result() -> None:
             "num_computed_tokens_before": 0,
             "gr_issued_steps": 0,
             "persistent": True,
+            "cache_enabled": True,
         }
     ]
 
