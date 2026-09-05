@@ -312,10 +312,57 @@ def test_worker_trace_coverage_is_an_explicit_failed_gate() -> None:
                 "gr_final_output",
                 "gr_final_d2h",
             ]
-        }
+        },
+        {"status": "PASS", "d2h_count": 4},
     )
     assert passed["status"] == "PASS"
     assert "Scheduler-to-device" in passed["scope"]
+
+
+def test_persistent_gpu_trace_proves_one_final_only_bulk_d2h(tmp_path: Path) -> None:
+    trace = tmp_path / "worker.pt.trace.json"
+    trace.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {
+                        "name": "Memcpy DtoH (Device -> Pinned)",
+                        "cat": "gpu_memcpy",
+                        "ts": 10,
+                        "dur": 1,
+                        "args": {"bytes": 4, "stream": 13},
+                    },
+                    {
+                        "name": "Memcpy DtoH (Device -> Pinned)",
+                        "cat": "gpu_memcpy",
+                        "ts": 20,
+                        "dur": 2,
+                        "args": {"bytes": 5124, "stream": 7},
+                    },
+                    {
+                        "name": "gr_final_d2h",
+                        "cat": "gpu_user_annotation",
+                        "ts": 19,
+                        "dur": 4,
+                        "args": {},
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence = profile._persistent_gpu_transfer_evidence([trace])
+    assert evidence["status"] == "PASS"
+    assert evidence["d2h_count"] == 2
+    assert evidence["d2h_bytes"] == 5128
+    assert evidence["control_d2h_count"] == 1
+    assert evidence["final_payload_d2h"]["bytes"] == 5124
+
+    broken = json.loads(trace.read_text(encoding="utf-8"))
+    broken["traceEvents"][1]["ts"] = 30
+    trace.write_text(json.dumps(broken), encoding="utf-8")
+    with pytest.raises(profile.EvidenceUnavailableError, match="final-only bulk D2H"):
+        profile._persistent_gpu_transfer_evidence([trace])
 
 
 class _FlatLogprobs:

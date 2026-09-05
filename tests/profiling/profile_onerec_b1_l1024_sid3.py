@@ -576,6 +576,109 @@ def _validate_trace_evidence(
     return {"required_stage_markers": list(required), "observed_stage_markers": sorted(observed)}
 
 
+def _iter_chrome_trace_events(path: Path):
+    """Yield Chrome trace events without loading the complete trace into RAM."""
+    decoder = json.JSONDecoder()
+    marker = '"traceEvents"'
+    buffer = ""
+    array_started = False
+    with path.open(encoding="utf-8") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            buffer += chunk
+            if not array_started:
+                marker_at = buffer.find(marker)
+                if marker_at < 0:
+                    buffer = buffer[-len(marker) :]
+                    continue
+                array_at = buffer.find("[", marker_at + len(marker))
+                if array_at < 0:
+                    buffer = buffer[marker_at:]
+                    continue
+                buffer = buffer[array_at + 1 :]
+                array_started = True
+
+            while True:
+                buffer = buffer.lstrip(" \t\r\n,")
+                if not buffer or buffer.startswith("]"):
+                    break
+                try:
+                    event, end = decoder.raw_decode(buffer)
+                except json.JSONDecodeError:
+                    break
+                if isinstance(event, dict):
+                    yield event
+                buffer = buffer[end:]
+            if array_started and buffer.lstrip().startswith("]"):
+                return
+    if not array_started:
+        raise EvidenceUnavailableError(f"Chrome trace omitted traceEvents: {path}")
+    if buffer.strip() and not buffer.lstrip().startswith("]"):
+        raise EvidenceUnavailableError(f"Chrome trace ended inside an event: {path}")
+
+
+def _persistent_gpu_transfer_evidence(trace_files: Sequence[Path]) -> dict[str, Any]:
+    """Prove final-only D2H from device events in a persistent GPU trace."""
+    chrome_traces = [path for path in trace_files if path.name.endswith(".pt.trace.json")]
+    if not chrome_traces:
+        raise EvidenceUnavailableError("persistent GPU profile omitted a Chrome device trace")
+
+    transfers: list[dict[str, Any]] = []
+    final_ranges: list[tuple[float, float]] = []
+    for path in chrome_traces:
+        for event in _iter_chrome_trace_events(path):
+            if event.get("cat") == "gpu_user_annotation" and event.get("name") == "gr_final_d2h":
+                start = float(event["ts"])
+                final_ranges.append((start, start + float(event.get("dur", 0))))
+            if event.get("cat") != "gpu_memcpy":
+                continue
+            name = str(event.get("name", ""))
+            args = event.get("args", {})
+            transfers.append(
+                {
+                    "name": name,
+                    "bytes": int(args.get("bytes", 0)),
+                    "timestamp_us": float(event.get("ts", 0)),
+                    "duration_us": float(event.get("dur", 0)),
+                    "stream": args.get("stream"),
+                }
+            )
+
+    d2h = [event for event in transfers if event["name"].startswith("Memcpy DtoH")]
+    payload = [event for event in d2h if event["bytes"] > 4]
+    payload_in_final_range = [
+        event
+        for event in payload
+        if any(start <= event["timestamp_us"] <= end for start, end in final_ranges)
+    ]
+    if len(final_ranges) != 1:
+        raise EvidenceUnavailableError(
+            f"expected one gr_final_d2h GPU range, observed {len(final_ranges)}"
+        )
+    if len(payload) != 1 or len(payload_in_final_range) != 1:
+        raise EvidenceUnavailableError(
+            "persistent GPU trace did not prove one final-only bulk D2H: "
+            f"payload_copies={payload}, final_range_matches={payload_in_final_range}"
+        )
+    directions: dict[str, dict[str, int]] = {}
+    for event in transfers:
+        bucket = directions.setdefault(event["name"], {"count": 0, "bytes": 0})
+        bucket["count"] += 1
+        bucket["bytes"] += event["bytes"]
+    return {
+        "status": "PASS",
+        "trace_files": [str(path) for path in chrome_traces],
+        "transfers_by_kind": directions,
+        "d2h_count": len(d2h),
+        "d2h_bytes": sum(event["bytes"] for event in d2h),
+        "control_d2h_count": sum(event["bytes"] <= 4 for event in d2h),
+        "final_payload_d2h": payload[0],
+        "bulk_d2h_outside_final_range": 0,
+    }
+
+
 def _memory_breakdown_gate(
     before: Sequence[Mapping[str, Any]],
     after: Sequence[Mapping[str, Any]],
@@ -631,14 +734,22 @@ def _memory_breakdown_gate(
     }
 
 
-def _trace_coverage_gate(trace_evidence: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _trace_coverage_gate(
+    trace_evidence: Mapping[str, Any] | None = None,
+    transfer_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Require one UniProc timeline to span Scheduler and final device copy."""
     observed = set(trace_evidence.get("observed_stage_markers", ())) if trace_evidence else set()
-    if {"gr_async_schedule", "gr_prefill_bootstrap", "gr_final_d2h"} <= observed:
+    if (
+        {"gr_async_schedule", "gr_prefill_bootstrap", "gr_final_d2h"} <= observed
+        and transfer_evidence is not None
+        and transfer_evidence.get("status") == "PASS"
+    ):
         return {
             "status": "PASS",
             "scope": "single-process Scheduler-to-device persistent GR timeline",
             "observed_stage_markers": sorted(observed),
+            "final_only_device_to_host": dict(transfer_evidence),
         }
     return {
         "status": "FAIL",
@@ -1008,6 +1119,7 @@ def _run(args: argparse.Namespace) -> dict:
     output_fingerprints = json.loads(next(iter(unique_fingerprints)))
     trace_files: list[Path] = []
     trace_evidence: dict[str, Any] | None = None
+    transfer_evidence: dict[str, Any] | None = None
     if args.profile_dir is not None:
         trace_files = sorted(
             path.resolve()
@@ -1020,8 +1132,10 @@ def _run(args: argparse.Namespace) -> dict:
             args.execution,
             persistent=args.persistent,
         )
+        if args.persistent and args.backend == "gpu":
+            transfer_evidence = _persistent_gpu_transfer_evidence(trace_files)
     memory_breakdown = _memory_breakdown_gate(worker_before, worker_after)
-    trace_coverage = _trace_coverage_gate(trace_evidence)
+    trace_coverage = _trace_coverage_gate(trace_evidence, transfer_evidence)
     result.update(
         {
             "status": "complete",
@@ -1077,6 +1191,7 @@ def _run(args: argparse.Namespace) -> dict:
                 "directory": str(args.profile_dir.resolve()) if args.profile_dir else None,
                 "trace_files": [str(path) for path in trace_files],
                 "stage_marker_evidence": trace_evidence,
+                "device_transfer_evidence": transfer_evidence,
                 "coverage_gate": trace_coverage,
             },
         }
