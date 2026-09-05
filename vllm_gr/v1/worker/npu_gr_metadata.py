@@ -5,9 +5,9 @@
 The helpers mutate only backend-owned/fixed runner buffers and the Beam
 context binding consumed by attention metadata.  They never query Prefix
 Cache during Decode, rebuild a Native block table, copy Beam state to Host,
-overwrite input tokens, or advance either lifecycle cursor.  The NPU backend
-factory remains disabled until decision, KV-reorder, transport, and hardware
-contracts are complete.
+overwrite input tokens, or advance either lifecycle cursor.  The composite
+NPU backend now calls these bindings; their device behavior still requires the
+deferred NPU hardware acceptance matrix.
 """
 
 from __future__ import annotations

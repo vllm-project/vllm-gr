@@ -30,8 +30,18 @@ class NPUMaskedDecisionStep:
     scores: torch.Tensor
     sequence: torch.Tensor
     active_mask: torch.Tensor
+    valid_mask: torch.Tensor
+    local_scores: torch.Tensor
     parent_prefix: torch.Tensor | None
     status: torch.Tensor
+
+    @property
+    def reorder_parents(self) -> torch.Tensor | None:
+        return self.parent_ids if self.parent_prefix is not None else None
+
+    @property
+    def reorder_prefix(self) -> torch.Tensor | None:
+        return self.parent_prefix
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -97,14 +107,17 @@ class NPUMaskedBeamDecision:
         self._winner_columns = torch.empty((width,), dtype=torch.int64, device=resolved)
         self._winner_tokens = torch.empty((width,), dtype=torch.int32, device=resolved)
         self._winner_scores = torch.empty((width,), dtype=torch.float32, device=resolved)
+        self._winner_local_scores = torch.empty((width,), dtype=torch.float32, device=resolved)
         self._safe_parents = torch.empty((width,), dtype=torch.int64, device=resolved)
         self._safe_tokens = torch.empty((width,), dtype=torch.int32, device=resolved)
         self._safe_scores = torch.empty((width,), dtype=torch.float32, device=resolved)
+        self._safe_local_scores = torch.empty((width,), dtype=torch.float32, device=resolved)
         self._group_parents = torch.empty((width,), dtype=torch.int64, device=resolved)
         self._group_order = torch.empty((width,), dtype=torch.int64, device=resolved)
         self._selected_tokens = torch.empty((1, width), dtype=torch.int32, device=resolved)
         self._selected_parents = torch.empty((1, width), dtype=torch.int32, device=resolved)
         self._selected_scores = torch.empty((1, width), dtype=torch.float32, device=resolved)
+        self._selected_local_scores = torch.empty((1, width), dtype=torch.float32, device=resolved)
         self._selected_active = torch.empty((1, width), dtype=torch.bool, device=resolved)
         self._selected_valid = torch.empty((1, width), dtype=torch.bool, device=resolved)
         self._parent_counts = torch.empty((1, width), dtype=torch.int32, device=resolved)
@@ -252,6 +265,12 @@ class NPUMaskedBeamDecision:
             self._winner_flat,
             out=self._winner_scores,
         )
+        torch.index_select(
+            candidate_scores.view(-1),
+            0,
+            self._winner_flat,
+            out=self._winner_local_scores,
+        )
         torch.where(
             self._winner_valid,
             self._winner_parents,
@@ -270,15 +289,18 @@ class NPUMaskedBeamDecision:
             self._negative_infinity,
             out=self._safe_scores,
         )
+        torch.where(
+            self._winner_valid,
+            self._winner_local_scores,
+            self._negative_infinity,
+            out=self._safe_local_scores,
+        )
 
         if is_last_step:
-            order = self._valid_order[:width]
-            # ``_valid_order`` indexes score-ordered entries rather than the
-            # winner arrays; final output already has the desired order.
-            del order
             self._selected_tokens[0].copy_(self._safe_tokens)
             self._selected_parents[0].copy_(self._safe_parents)
             self._selected_scores[0].copy_(self._safe_scores)
+            self._selected_local_scores[0].copy_(self._safe_local_scores)
             self._selected_valid[0].copy_(self._winner_valid)
             torch.gt(
                 self._safe_scores,
@@ -306,6 +328,12 @@ class NPUMaskedBeamDecision:
                 0,
                 self._group_order,
                 out=self._selected_scores[0],
+            )
+            torch.index_select(
+                self._safe_local_scores,
+                0,
+                self._group_order,
+                out=self._selected_local_scores[0],
             )
             torch.index_select(
                 self._winner_valid,
@@ -355,6 +383,8 @@ class NPUMaskedBeamDecision:
             scores=cumulative[:, :selected_width],
             sequence=sequence[:, :selected_width],
             active_mask=self._selected_active[:, :selected_width],
+            valid_mask=self._selected_valid[:, :selected_width],
+            local_scores=self._selected_local_scores[:, :selected_width],
             parent_prefix=parent_prefix,
             status=self._status,
         )

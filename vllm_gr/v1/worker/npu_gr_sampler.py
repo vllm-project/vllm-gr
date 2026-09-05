@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Device-only constrained sampling boundary for persistent NPU GR requests.
 
-This helper is deliberately not wired into ``NPUModelRunner`` yet.  It owns
-the request's fixed metadata and public sampler scratch, calls the canonical
-NPU constraint Backend directly, and leaves both raw candidates and their
-structural validity on device.  It never reconstructs Beam state on the Host.
+The persistent NPU composite backend wires this helper into ``NPUModelRunner``
+for final Prefill and Decode.  It owns the request's fixed metadata and public
+sampler scratch, calls the canonical NPU constraint Backend directly, and
+leaves both raw candidates and their structural validity on device.  It never
+reconstructs Beam state on the Host.
 
 The Backend currently allocates its raw ``ConstraintOutput`` tensors.  Those
 tensors are retained by :class:`NPUConstrainedCandidates` without copying.

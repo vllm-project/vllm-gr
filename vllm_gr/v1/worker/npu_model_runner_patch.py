@@ -45,10 +45,55 @@ _PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
 
 
 def create_gr_device_backend(runner):
-    """Step 4 selection point; the NPU V1 implementation lands in Step 6."""
+    """Select the persistent NPU V1 backend during ModelRunner setup."""
 
-    del runner
-    return None
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+    from vllm_gr.v1.worker.npu_gr_backend import NPUGRDeviceBackend
+
+    if bool(getattr(_get_gr_config(runner), "persistent_runner_state", False)) and not getattr(
+        runner, "use_async_scheduling", False
+    ):
+        raise RuntimeError("persistent NPU GR requires ASYNC output transport")
+    return NPUGRDeviceBackend()
+
+
+def _try_persistent_npu_sampler(
+    runner,
+    logits: torch.Tensor | None,
+    spec_decode_metadata,
+):
+    """Run the request-owned persistent sampler for final Prefill/Decode."""
+    beam_info = getattr(runner, "_current_beam_info", None)
+    beam_data = (beam_info.get("beam_data") or {}) if beam_info else {}
+    persistent = [
+        (request_id, metadata)
+        for request_id, metadata in beam_data.items()
+        if metadata.get("persistent_runner_state")
+        and (
+            metadata.get("is_beam_decode")
+            or (metadata.get("is_constraint_prefill") and metadata.get("is_last_prefill", False))
+        )
+    ]
+    if not persistent:
+        return None
+    if len(persistent) != 1:
+        raise RuntimeError("persistent NPU sampler requires one isolated B=1 request")
+    if spec_decode_metadata is not None:
+        raise RuntimeError("persistent NPU sampler does not support speculative decoding")
+    if logits is None:
+        raise RuntimeError("persistent NPU sampler requires raw logits")
+    request_id, metadata = persistent[0]
+    states = getattr(runner, "_gr_model_runner_states", None)
+    state = states.get(request_id) if isinstance(states, dict) else None
+    if state is None:
+        from vllm_gr.v1.beam.beam_decision import _create_persistent_gr_state
+
+        state = _create_persistent_gr_state(runner, request_id, metadata)
+    backend = state.backend
+    sample = getattr(backend, "sample", None)
+    if not callable(sample):
+        raise TypeError("persistent NPU GR backend has no sampler boundary")
+    return sample(runner, state, logits, metadata)
 
 
 def _npu_beam_stage_trace_marker(runner) -> str | None:
@@ -198,11 +243,13 @@ def make_patched_sample_npu(_orig_sample):
     def patched_sample(self, *args, **kwargs):
         logits = args[0] if args else kwargs.get("logits")
         spec_decode_metadata = args[1] if len(args) > 1 else kwargs.get("spec_decode_metadata")
-        sampler_output = try_sample_with_constraint_backend(
-            self,
-            logits,
-            spec_decode_metadata,
-        )
+        sampler_output = _try_persistent_npu_sampler(self, logits, spec_decode_metadata)
+        if sampler_output is None:
+            sampler_output = try_sample_with_constraint_backend(
+                self,
+                logits,
+                spec_decode_metadata,
+            )
         if sampler_output is None:
             sampler_output = _try_constrained_sampler_shortcut(self, args, kwargs)
         if sampler_output is None:

@@ -10,7 +10,80 @@ import pytest
 import torch
 
 from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
+from vllm_gr.v1.worker.gr_model_runner_state import GRDeviceBackend
 from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
+
+
+def test_npu_backend_factory_returns_protocol_and_requires_async_when_enabled() -> None:
+    backend = npu_patch.create_gr_device_backend(
+        SimpleNamespace(
+            _vllm_gr_config=SimpleNamespace(persistent_runner_state=False),
+            use_async_scheduling=False,
+        )
+    )
+    assert isinstance(backend, GRDeviceBackend)
+    with pytest.raises(RuntimeError, match="ASYNC"):
+        npu_patch.create_gr_device_backend(
+            SimpleNamespace(
+                _vllm_gr_config=SimpleNamespace(persistent_runner_state=True),
+                use_async_scheduling=False,
+            )
+        )
+
+
+def test_persistent_npu_sampler_uses_existing_state_and_rejects_spec_decode() -> None:
+    calls: list[tuple[Any, ...]] = []
+    output = object()
+
+    class Backend:
+        def sample(self, *args: Any) -> object:
+            calls.append(args)
+            return output
+
+    state = SimpleNamespace(backend=Backend())
+    metadata = {"persistent_runner_state": True, "is_beam_decode": True}
+    runner = SimpleNamespace(
+        _current_beam_info={"beam_data": {"gr": metadata}},
+        _gr_model_runner_states={"gr": state},
+    )
+    logits = torch.zeros((4, 8))
+    assert npu_patch._try_persistent_npu_sampler(runner, logits, None) is output
+    assert calls == [(runner, state, logits, metadata)]
+    with pytest.raises(RuntimeError, match="speculative"):
+        npu_patch._try_persistent_npu_sampler(runner, logits, object())
+
+
+def test_persistent_npu_sampler_precreates_state_on_final_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.beam import beam_decision
+
+    output = object()
+    metadata = {
+        "persistent_runner_state": True,
+        "is_constraint_prefill": True,
+        "is_last_prefill": True,
+    }
+
+    class Backend:
+        def sample(self, *_args: Any) -> object:
+            return output
+
+    state = SimpleNamespace(backend=Backend())
+    created: list[tuple[Any, ...]] = []
+
+    def create(*args: Any) -> Any:
+        created.append(args)
+        return state
+
+    monkeypatch.setattr(beam_decision, "_create_persistent_gr_state", create)
+    runner = SimpleNamespace(
+        _current_beam_info={"beam_data": {"gr": metadata}},
+        _gr_model_runner_states={},
+    )
+    logits = torch.zeros((1, 8))
+    assert npu_patch._try_persistent_npu_sampler(runner, logits, None) is output
+    assert created == [(runner, "gr", metadata)]
 
 
 def test_npu_named_profile_diagnostic_returns_runner_and_memory(

@@ -3,9 +3,9 @@
 """NPU-backend-owned fixed storage for persistent GR Beam result lineage.
 
 This module owns only device tensors.  It deliberately has no NPU stream,
-Event, page-locked Host buffer, D2H transport, or ModelRunner hook.  Explicit
-CPU allocation exists solely for contract tests; a future NPU V1 adapter must
-require an NPU device before acquiring a workspace.
+Event, page-locked Host buffer, D2H transport, or ModelRunner hook; those live
+in the composite NPU backend. Explicit CPU allocation exists solely for
+contract tests, while the production adapter requires an NPU device.
 
 The session's ``context.decision.sequence`` and ``beam_scores`` remain the
 only canonical Beam state.  This workspace retains only raw parent lineage,
@@ -13,13 +13,11 @@ FP32 cumulative-score deltas, final-pack scratch, and two control-storage
 slots.  The delta is the current GPU ABI semantics; it is not raw sampler
 logprob and can differ because of FP32 rounding.
 
-Prefill validity comes from the constraint backend's structural candidate
-mask, separately from Beam activity: legal padding and inactive ``-inf``
-scores are preserved. NaN/+inf and inconsistent masks fail closed. Decode
-validation is still finite-only and must be reconciled with GPU deferred
-status/safe-sentinel semantics before enabling runtime. The final transport
-must reject nonzero device status after its one final D2H; this helper alone
-does not establish completed NPU parity.
+Validity comes from the constraint backend's structural candidate mask,
+separately from Beam activity: legal padding and inactive ``-inf`` scores are
+preserved. NaN/+inf and inconsistent masks fail closed. The final transport
+rejects nonzero device status after its one final D2H. This helper alone does
+not establish NPU hardware parity.
 """
 
 from __future__ import annotations
@@ -325,6 +323,8 @@ class NPUWorkspace:
         active_mask: torch.Tensor,
         *,
         expected_device_step: int,
+        selected_valid_mask: torch.Tensor | None = None,
+        selected_local_scores: torch.Tensor | None = None,
     ) -> bool:
         self._require_lease(lease)
         if isinstance(expected_device_step, bool) or not isinstance(expected_device_step, int):
@@ -355,6 +355,32 @@ class NPUWorkspace:
             dtype=torch.bool,
             device=self.device,
         )
+        explicit_structural = selected_valid_mask is not None or selected_local_scores is not None
+        if explicit_structural and (selected_valid_mask is None or selected_local_scores is None):
+            raise ValueError(
+                "selected_valid_mask and selected_local_scores must be provided together"
+            )
+        if explicit_structural:
+            structural = _tensor(
+                selected_valid_mask,
+                name="selected valid_mask",
+                shape=(1, decision_width),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            local_scores = _tensor(
+                selected_local_scores,
+                name="selected local_scores",
+                shape=(1, decision_width),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            # Compatibility for the isolated finite-only xllm contract.  The
+            # production composite backend always supplies structural
+            # validity and exact selected local scores.
+            structural = mask
+            local_scores = None
 
         parent_valid = torch.logical_and(parents >= 0, parents < self.beam_width)
         indices = self.gather_indices[:, :decision_width]
@@ -367,9 +393,18 @@ class NPUWorkspace:
             out=self.parent_scores[:, :decision_width],
         )
         parent_scores = self.parent_scores[:, :decision_width]
-        finite = torch.logical_and(torch.isfinite(selected), torch.isfinite(parent_scores))
-        valid = torch.logical_and(mask, torch.logical_and(parent_valid, finite))
-        self._accumulate_invalid(torch.logical_not(valid))
+        selected_numeric = ~torch.isnan(selected) & ~torch.isposinf(selected)
+        parent_numeric = ~torch.isnan(parent_scores) & ~torch.isposinf(parent_scores)
+        finite_pair = torch.logical_and(torch.isfinite(selected), torch.isfinite(parent_scores))
+        valid = structural & parent_valid & selected_numeric & parent_numeric
+        if local_scores is not None:
+            local_numeric = ~torch.isnan(local_scores) & ~torch.isposinf(local_scores)
+            valid &= local_numeric
+            expected_active = structural & (selected > float("-inf")) & valid
+            self._accumulate_invalid(~valid | (mask != expected_active))
+        else:
+            valid &= finite_pair
+            self._accumulate_invalid(torch.logical_not(valid))
 
         zero_scores = self._zero_scores[:, :decision_width]
         local_deltas = self.backtrace_deltas[:, :decision_width]
@@ -377,13 +412,19 @@ class NPUWorkspace:
         safe_parents = torch.where(torch.isfinite(parent_scores), parent_scores, zero_scores)
         torch.sub(safe_selected, safe_parents, out=local_deltas)
         delta_finite = torch.isfinite(local_deltas)
-        self._accumulate_invalid(torch.logical_not(delta_finite))
-        torch.where(delta_finite, local_deltas, zero_scores, out=local_deltas)
-        valid = torch.logical_and(valid, delta_finite)
+        if local_scores is None:
+            self._accumulate_invalid(torch.logical_not(delta_finite))
+            torch.where(delta_finite, local_deltas, zero_scores, out=local_deltas)
+            valid = torch.logical_and(valid, delta_finite)
+        else:
+            # Finite cumulative values retain the CUDA ABI's FP32 delta.
+            # When either cumulative value is legal -inf, subtraction is NaN;
+            # the explicit selector supplies the exact local score instead.
+            torch.where(finite_pair, local_deltas, local_scores, out=local_deltas)
         self.parent_history[:, :decision_width, expected_device_step].copy_(parents)
         self.cumulative_delta_history[:, :decision_width, expected_device_step].copy_(local_deltas)
         self.active_mask.zero_()
-        self.active_mask[:, :decision_width].copy_(valid)
+        self.active_mask[:, :decision_width].copy_(mask & valid)
         self._recorded_steps += 1
         self._snapshot_step = None
         return self._recorded_steps == lease.generation_steps

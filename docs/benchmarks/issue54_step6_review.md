@@ -951,3 +951,52 @@ existing NPU sampler/decision/workspace/KV contracts. NPU support and ACL Graph
 behavior of the selected `torch.sort(..., stable=True, out=...)` path remain a
 hardware acceptance item. The NPU factory remains disabled until the composite
 backend and final async transport are connected.
+
+## 2026-09-05 composite NPU backend software integration
+
+`vllm_gr/v1/worker/npu_gr_backend.py` now implements the shared
+`GRDeviceBackend` lifecycle and `npu_model_runner_patch.py` returns it from the
+NPU factory. For a persistent final-Prefill or Decode frame, the patched NPU
+sampler creates the common state before sampling and routes raw logits through
+the request-owned `NPUPersistentConstraintSampler`. The backend then connects:
+
+```text
+constraint sampler -> explicit masked decision -> lineage workspace
+                   -> xllm/cascade KV reorder -> alternating O(B) control
+                   -> one packed final D2H -> common two-phase release
+```
+
+The decision stage copies its non-final parent prefix into the canonical Beam
+buffers consumed by KV/attention. The workspace now accepts structural selected
+validity and exact local scores, so a legal `-inf` remains a valid result while
+its active bit is false; finite paths preserve the existing CUDA FP32-delta ABI.
+No new xllm_ops symbols are assumed. The old mask-free xllm decision helper is
+retained only as an isolated legacy/hardware comparison path.
+
+The production final path owns a pinned Host staging buffer and NPU Event,
+enqueues exactly one packed final copy, waits for that event, validates deferred
+status, and publishes the common `gr_final_i32_f32_v1` payload. Intermediate
+control remains two fixed int32 `[1,1]` device slots and is handed to the pinned
+vllm-ascend async output object, which retains the source tensor through copy
+completion. Backend release synchronizes NPU work before releasing sampler, KV,
+workspace and session ownership; a drain failure leaves all ownership intact for
+the common release retry.
+
+The composite path currently requires B=1 and request width equal to the fixed
+Beam pool width. That matches the exact-width primary path; smaller eager widths
+remain a Step 8 matrix item. NPU runtime execution, stable-sort support/perf,
+ACL Graph capture, pinned-copy behavior and HBM accounting remain deferred
+hardware acceptance, as requested.
+
+CPU integration validation after wiring:
+
+```text
+333 passed, 3 environment skips
+full repository CPU-only regression: 1929 passed, 3121 skipped
+```
+
+The integration tests drive the real common state machine across Prefill, two
+Decode decisions, KV calls, alternating control identities, final
+packing/unpacking and ordered release. They also cover cached common-state
+reuse with fresh backend ownership and a failed device drain that retains every
+resource until a successful retry.

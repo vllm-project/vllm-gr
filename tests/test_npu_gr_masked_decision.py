@@ -16,6 +16,7 @@ from vllm_gr.ops.onerec_decode import (
 )
 from vllm_gr.v1.beam.beam_attention_context import BeamDecisionBuffers
 from vllm_gr.v1.worker.npu_gr_masked_decision import NPUMaskedBeamDecision
+from vllm_gr.v1.worker.npu_gr_workspace import NPUWorkspace
 
 
 def _session(width: int = 4, steps: int = 3):
@@ -175,6 +176,59 @@ def test_insufficient_valid_candidates_emit_safe_rows_and_deferred_status() -> N
     assert result.parent_prefix is not None
     assert result.parent_prefix.tolist() == [[3, 3, 4, 4]]
     assert result.active_mask.tolist() == [[False, False, False, True]]
+
+
+def test_workspace_records_legal_negative_infinity_without_false_error() -> None:
+    width = 4
+    session = _session(width, steps=2)
+    selector = _selector(width, steps=2)
+    workspace = NPUWorkspace.allocate(beam_width=width, max_steps=2, device="cpu")
+    lease = workspace.acquire(
+        "gr",
+        generation_steps=2,
+        result_width=width,
+        canonical_sequence=session.context.decision.sequence,
+        canonical_scores=session.context.decision.beam_scores,
+    )
+    workspace.reset(lease)
+    assert not workspace.record_bootstrap(
+        lease,
+        session.context.decision.beam_scores,
+        torch.ones((1, width), dtype=torch.bool),
+        candidate_valid_mask=torch.ones((1, width), dtype=torch.bool),
+    )
+    workspace.before_decision(
+        lease,
+        session.context.decision.beam_scores,
+        expected_device_step=1,
+    )
+    tokens = torch.zeros((width, width), dtype=torch.int32)
+    tokens[:, 0].copy_(torch.arange(20, 20 + width, dtype=torch.int32))
+    local_scores = torch.full((width, width), float("-inf"), dtype=torch.float32)
+    valid = torch.zeros((width, width), dtype=torch.bool)
+    valid[:, 0] = True
+    result = selector.select(
+        session,
+        tokens,
+        local_scores,
+        valid,
+        expected_device_step=1,
+        is_last_step=True,
+        result_width=width,
+    )
+
+    assert workspace.record_decision(
+        lease,
+        result.parent_ids,
+        session.context.decision.beam_scores,
+        result.active_mask,
+        expected_device_step=1,
+        selected_valid_mask=result.valid_mask,
+        selected_local_scores=result.local_scores,
+    )
+    assert workspace.status.tolist() == [0]
+    assert torch.isneginf(workspace.cumulative_delta_history[0, :, 1]).all()
+    assert not workspace.active_mask.any()
 
 
 def test_outputs_reuse_fixed_storage_and_source_has_no_host_materialization() -> None:

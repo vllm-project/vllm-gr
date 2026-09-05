@@ -25,6 +25,9 @@ from typing import Any, Literal
 import torch
 
 from vllm_gr.v1.worker.npu_gr_decision import NPUDecisionStep
+from vllm_gr.v1.worker.npu_gr_masked_decision import NPUMaskedDecisionStep
+
+_DecisionStep = NPUDecisionStep | NPUMaskedDecisionStep
 
 
 def _int(value: Any, name: str, *, minimum: int = 0) -> int:
@@ -260,7 +263,7 @@ class NPUKVReorder:
         self._next_expected_step = (
             _int(getattr(session, "decode_step", None), "initial decode step") + 1
         )
-        self._last_decision: NPUDecisionStep | None = None
+        self._last_decision: _DecisionStep | None = None
         self._terminal = False
         self._poisoned = False
         self._poison_error: BaseException | None = None
@@ -323,7 +326,7 @@ class NPUKVReorder:
     def reorder(
         self,
         session: Any,
-        decision: NPUDecisionStep,
+        decision: _DecisionStep,
         *,
         expected_device_step: int,
         is_final: bool,
@@ -332,8 +335,8 @@ class NPUKVReorder:
         expected = _int(expected_device_step, "expected device step", minimum=1)
         if not isinstance(is_final, bool):
             raise TypeError("is_final must be a boolean")
-        if not isinstance(decision, NPUDecisionStep):
-            raise TypeError("decision must be an NPUDecisionStep")
+        if not isinstance(decision, (NPUDecisionStep, NPUMaskedDecisionStep)):
+            raise TypeError("decision must be a persistent NPU decision step")
         if decision is self._last_decision:
             raise RuntimeError("persistent NPU KV decision was already consumed")
         if expected != self._next_expected_step:
