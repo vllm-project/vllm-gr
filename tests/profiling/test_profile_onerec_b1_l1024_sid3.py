@@ -146,6 +146,52 @@ def test_digests_and_atomic_json_output(tmp_path: Path) -> None:
     assert not output.with_suffix(".json.tmp").exists()
 
 
+def test_catalog_triples_are_resolved_to_token_ids(tmp_path: Path) -> None:
+    catalog = tmp_path / "triples.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "triples": [
+                    {"a": "a1", "b": "b2", "c": "c3"},
+                    {"a": "a1", "b": "b2", "c": "c3"},
+                    {"a": "a4", "b": "b5", "c": "c6"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda token: {
+            "a1": 1,
+            "b2": 2,
+            "c3": 3,
+            "a4": 4,
+            "b5": 5,
+            "c6": 6,
+        }[token]
+    )
+
+    assert profile._catalog_triple_token_ids(catalog, tokenizer) == {
+        (1, 2, 3),
+        (4, 5, 6),
+    }
+
+
+def test_catalog_triple_validation_rejects_unknown_tokens(tmp_path: Path) -> None:
+    catalog = tmp_path / "triples.json"
+    catalog.write_text(
+        json.dumps({"triples": [{"a": "a", "b": "b", "c": "unknown"}]}),
+        encoding="utf-8",
+    )
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda token: -1 if token == "unknown" else 1
+    )
+
+    with pytest.raises(profile.EvidenceUnavailableError, match="unknown tokenizer token"):
+        profile._catalog_triple_token_ids(catalog, tokenizer)
+
+
 def test_metric_delta_is_stable_for_missing_keys() -> None:
     assert profile._metric_delta({"queries": 3.0}, {"queries": 8.0, "hits": 2.0}) == {
         "hits": 2.0,

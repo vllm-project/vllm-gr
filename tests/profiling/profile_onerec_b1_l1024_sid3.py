@@ -734,6 +734,27 @@ def _prepare_prompt(llm: Any, prompt_path: Path, input_len: int) -> tuple[list[d
     return [{"prompt_token_ids": prompt_ids}], end_token_id
 
 
+def _catalog_triple_token_ids(catalog_path: Path, tokenizer: Any) -> set[tuple[int, int, int]]:
+    document = json.loads(catalog_path.read_text(encoding="utf-8"))
+    triples = document.get("triples") if isinstance(document, dict) else None
+    if not isinstance(triples, list) or not triples:
+        raise EvidenceUnavailableError("constraint catalog has no triples")
+    result: set[tuple[int, int, int]] = set()
+    for index, triple in enumerate(triples):
+        if not isinstance(triple, dict) or set(triple) != {"a", "b", "c"}:
+            raise EvidenceUnavailableError(f"invalid constraint triple #{index}")
+        token_ids = tuple(
+            int(tokenizer.convert_tokens_to_ids(triple[field]))
+            for field in ("a", "b", "c")
+        )
+        if any(token_id < 0 for token_id in token_ids):
+            raise EvidenceUnavailableError(
+                f"constraint triple #{index} contains an unknown tokenizer token"
+            )
+        result.add(token_ids)
+    return result
+
+
 def _run(args: argparse.Namespace) -> dict:
     _require_v1_model_runner()
     # This must precede every vllm_gr/vllm import so missing accelerator
@@ -832,6 +853,7 @@ def _run(args: argparse.Namespace) -> dict:
             prefix_observer_events = _install_inproc_prefix_observer(llm)
 
         prompts, end_token_id = _prepare_prompt(llm, args.prompt, args.input_len)
+        valid_triple_ids = _catalog_triple_token_ids(args.catalog, llm.get_tokenizer())
         params = BeamSearchParams(
             beam_width=args.beam_width,
             max_tokens=args.generation_steps + 2,
@@ -858,7 +880,23 @@ def _run(args: argparse.Namespace) -> dict:
                 for sequence in outputs[0].sequences
             ):
                 raise AssertionError("OneRec output violated the fixed generation contract")
-            return elapsed_ms, _output_fingerprints(outputs)
+            invalid = [
+                tuple(int(token) for token in sequence.tokens[-4:-1])
+                for sequence in outputs[0].sequences
+                if tuple(int(token) for token in sequence.tokens[-4:-1])
+                not in valid_triple_ids
+            ]
+            if invalid:
+                raise AssertionError(
+                    f"OneRec output contains {len(invalid)} triples outside the constraint catalog"
+                )
+            fingerprint = _output_fingerprints(outputs)
+            fingerprint["constraint_validation"] = {
+                "catalog_triples": len(valid_triple_ids),
+                "valid_sequences": len(outputs[0].sequences),
+                "invalid_sequences": 0,
+            }
+            return elapsed_ms, fingerprint
 
         if args.prefix_cache == "hit":
             if not llm.reset_prefix_cache():
