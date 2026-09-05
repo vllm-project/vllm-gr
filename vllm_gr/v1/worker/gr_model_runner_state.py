@@ -11,6 +11,7 @@ references the single authoritative ``BeamSearchSession``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Protocol, runtime_checkable
 
 from vllm_gr.v1.engine.types import GRRequestStage
@@ -81,7 +82,10 @@ class GRDeviceBackend(Protocol):
         state: "GRModelRunnerState",
     ) -> dict[str, Any]: ...
 
-    def release(self, state: "GRModelRunnerState") -> None: ...
+    def release(self, state: "GRModelRunnerState") -> None:
+        """Make session storage safe to reclaim; support retry after failure."""
+
+        ...
 
 
 def require_gr_device_backend(runner: Any) -> GRDeviceBackend:
@@ -122,18 +126,25 @@ class GRModelRunnerState:
     _control_outputs: list[Any] = field(default_factory=lambda: [None, None])
     _control_slot: int = -1
     _prepared_step: int | None = None
+    _release_started: bool = False
+    _backend_release_completed: bool = False
+    _release_lock: Any = field(default_factory=Lock, repr=False, compare=False)
+
+    def _ensure_active(self) -> None:
+        if self._release_started or self.released:
+            raise RuntimeError("persistent GR state release has started; execution is closed")
 
     def _transition(self, next_stage: GRRequestStage) -> None:
+        if next_stage is not GRRequestStage.RELEASED:
+            self._ensure_active()
         if not self.stage.can_transition_to(next_stage):
             raise RuntimeError(
-                f"illegal persistent GR state transition: {self.stage.value} -> "
-                f"{next_stage.value}"
+                f"illegal persistent GR state transition: {self.stage.value} -> {next_stage.value}"
             )
         self.stage = next_stage
 
     def start_prefill(self) -> None:
-        if self.released:
-            raise RuntimeError("cannot start a released persistent GR state")
+        self._ensure_active()
         self._transition(GRRequestStage.PREFILL_RUNNING)
 
     @property
@@ -155,9 +166,8 @@ class GRModelRunnerState:
         value = getattr(self.backend_state, "device_memory_bytes", 0)
         return int(value() if callable(value) else value)
 
-    def _validate_step_result(
-        self, result: GRBackendStep, next_stage: GRRequestStage
-    ) -> None:
+    def _validate_step_result(self, result: GRBackendStep, next_stage: GRRequestStage) -> None:
+        self._ensure_active()
         expected = self.device_step + 1
         if result.device_step != expected:
             raise RuntimeError(
@@ -170,8 +180,7 @@ class GRModelRunnerState:
         existing = self._control_outputs[slot]
         if existing is not None and result.control_output is not existing:
             raise RuntimeError(
-                "persistent GR backend replaced a fixed control buffer slot: "
-                f"slot={slot}"
+                f"persistent GR backend replaced a fixed control buffer slot: slot={slot}"
             )
         other = self._control_outputs[1 - slot]
         if other is not None and result.control_output is other:
@@ -180,8 +189,7 @@ class GRModelRunnerState:
             )
         if not self.stage.can_transition_to(next_stage):
             raise RuntimeError(
-                f"illegal persistent GR state transition: {self.stage.value} -> "
-                f"{next_stage.value}"
+                f"illegal persistent GR state transition: {self.stage.value} -> {next_stage.value}"
             )
 
     def _accept_step(self, result: GRBackendStep, next_stage: GRRequestStage) -> None:
@@ -203,6 +211,7 @@ class GRModelRunnerState:
         sampler_output: Any,
         metadata: dict[str, Any],
     ) -> None:
+        self._ensure_active()
         if self.stage is not GRRequestStage.PREFILL_RUNNING or self.step != 0:
             raise RuntimeError("persistent GR prefill bootstrap is out of sequence")
         result = self.backend.bootstrap_from_prefill(runner, self, sampler_output, metadata)
@@ -220,6 +229,7 @@ class GRModelRunnerState:
         num_scheduled_tokens: Any,
         metadata: dict[str, Any],
     ) -> None:
+        self._ensure_active()
         if self.stage not in (
             GRRequestStage.PREFILL_BOOTSTRAPPED,
             GRRequestStage.DECODE_RUNNING,
@@ -233,8 +243,7 @@ class GRModelRunnerState:
             )
         if self._prepared_step is not None:
             raise RuntimeError(
-                "persistent GR decode step is already prepared: "
-                f"step={self._prepared_step}"
+                f"persistent GR decode step is already prepared: step={self._prepared_step}"
             )
         self.backend.prepare_decode_inputs(
             runner,
@@ -243,6 +252,7 @@ class GRModelRunnerState:
             num_scheduled_tokens,
             metadata,
         )
+        self._ensure_active()
         self._prepared_step = self.step
 
     def advance_beam(
@@ -251,6 +261,7 @@ class GRModelRunnerState:
         sampler_output: Any,
         metadata: dict[str, Any],
     ) -> bool:
+        self._ensure_active()
         if self.stage not in (
             GRRequestStage.PREFILL_BOOTSTRAPPED,
             GRRequestStage.DECODE_RUNNING,
@@ -277,9 +288,7 @@ class GRModelRunnerState:
             metadata,
             is_last_step=is_last_step,
         )
-        next_stage = (
-            GRRequestStage.FINAL_READY if is_last_step else GRRequestStage.DECODE_RUNNING
-        )
+        next_stage = GRRequestStage.FINAL_READY if is_last_step else GRRequestStage.DECODE_RUNNING
         self._validate_step_result(result, next_stage)
         self.backend.reorder_kv(
             runner,
@@ -295,36 +304,44 @@ class GRModelRunnerState:
         return is_last_step
 
     def finalize_output(self, runner: Any) -> dict[str, Any]:
+        self._ensure_active()
         if self.stage is not GRRequestStage.FINAL_READY:
             raise RuntimeError("persistent GR final output requested before FINAL_READY")
         output = self.backend.finalize_output(runner, self)
+        self._ensure_active()
         if output.get("request_id") != self.request_id:
             raise RuntimeError("persistent GR backend returned a mismatched request_id")
         return output
 
     def release(self) -> bool:
-        if self.released:
-            return False
-        self._transition(GRRequestStage.RELEASED)
-        self.released = True
-        backend_error: BaseException | None = None
+        """Drain backend ownership before making the Beam session reusable.
+
+        A failed drain leaves execution closed and the session retained for an
+        explicit retry. Backends must support retry after partial cleanup; a
+        successful backend release is never repeated when session cleanup fails.
+        Concurrent/reentrant cleanup fails immediately instead of double-freeing.
+        """
+
+        if not self._release_lock.acquire(blocking=False):
+            raise RuntimeError("persistent GR state release is already in progress")
         try:
-            self.backend.release(self)
-        except BaseException as exc:
-            backend_error = exc
-        try:
-            self.session.end_session()
-        except KeyError:
-            # A defensive compatibility path may already have removed the
-            # registry slot. Ownership is still terminal and must not trigger
-            # a second backend/session release.
-            pass
-        except BaseException:
-            if backend_error is None:
-                raise
-        if backend_error is not None:
-            raise backend_error
-        return True
+            if self.released:
+                return False
+            self._release_started = True
+            if not self._backend_release_completed:
+                self.backend.release(self)
+                self._backend_release_completed = True
+            try:
+                self.session.end_session()
+            except KeyError:
+                # A compatibility path already removed the registry slot.
+                # This is safe only after backend ownership was drained.
+                pass
+            self._transition(GRRequestStage.RELEASED)
+            self.released = True
+            return True
+        finally:
+            self._release_lock.release()
 
     def reset_for_request(
         self,
@@ -336,24 +353,31 @@ class GRModelRunnerState:
     ) -> None:
         """Rebind inactive backend storage without duplicating Beam history."""
 
-        if not self.released:
-            raise RuntimeError("cannot reuse an active persistent GR state")
-        self.request_id = request_id
-        self.session = session
-        self.continue_token_id = continue_token_id
-        self.finish_token_id = finish_token_id
-        self.stage = GRRequestStage.NEW
-        self.step = 0
-        self.device_step = 0
-        self.next_token_ids = None
-        self.beam_scores = None
-        self.active_mask = None
-        self.prefix_binding = None
-        self._control_outputs[:] = [None, None]
-        self._control_slot = -1
-        self._prepared_step = None
-        self.released = False
-        self.start_prefill()
+        if not self._release_lock.acquire(blocking=False):
+            raise RuntimeError("cannot reuse a persistent GR state during release")
+        try:
+            if not self.released:
+                raise RuntimeError("cannot reuse an active persistent GR state")
+            self.request_id = request_id
+            self.session = session
+            self.continue_token_id = continue_token_id
+            self.finish_token_id = finish_token_id
+            self.stage = GRRequestStage.NEW
+            self.step = 0
+            self.device_step = 0
+            self.next_token_ids = None
+            self.beam_scores = None
+            self.active_mask = None
+            self.prefix_binding = None
+            self._control_outputs[:] = [None, None]
+            self._control_slot = -1
+            self._prepared_step = None
+            self._release_started = False
+            self._backend_release_completed = False
+            self.released = False
+            self.start_prefill()
+        finally:
+            self._release_lock.release()
 
 
 def acquire_gr_model_runner_state(
@@ -370,7 +394,12 @@ def acquire_gr_model_runner_state(
     """Acquire one semantic state, reusing only backend-compatible storage."""
 
     runner = getattr(worker_or_runner, "model_runner", worker_or_runner)
+    states = getattr(runner, "_gr_model_runner_states", None) or {}
+    if any(state._release_started and not state.released for state in states.values()):
+        raise RuntimeError("cannot acquire persistent GR state while release is incomplete")
     state = getattr(runner, "_gr_model_runner_state_cache", None)
+    if state is not None and not state.released:
+        raise RuntimeError("cannot reuse an active persistent GR state cache")
     runner._gr_model_runner_state_cache = None
     if (
         state is not None
@@ -415,15 +444,19 @@ def release_gr_model_runner_states(
     freed = 0
     first_error: BaseException | None = None
     for request_id in ids:
-        state = states.pop(request_id, None)
+        state = states.get(request_id)
         if state is not None:
             try:
                 released = state.release()
             except BaseException as exc:
-                released = state.released
                 if first_error is None:
                     first_error = exc
+                # Retain both registry ownerships: queued device work may still
+                # reference session storage. Other requests can still be drained.
+                continue
             freed += int(released)
+            if state.released and states.get(request_id) is state:
+                states.pop(request_id)
             if released and first_error is None:
                 runner._gr_model_runner_state_cache = state
         if sessions is not None:
@@ -478,9 +511,7 @@ def get_gr_memory_stats(worker_or_runner: Any) -> dict[str, int]:
         "beam_kv_bytes": tensor_bytes(beam_kv_tensors),
         "workspace_bytes": int(getattr(workspaces, "device_memory_bytes", 0)),
         "gr_state_peak_bytes": int(getattr(runner, "_gr_state_peak_bytes", 0)),
-        "graph_pool_allocated_bytes": int(
-            getattr(runner, "_gr_graph_pool_allocated_bytes", 0)
-        ),
+        "graph_pool_allocated_bytes": int(getattr(runner, "_gr_graph_pool_allocated_bytes", 0)),
         "graph_pool_reserved_bytes": int(getattr(runner, "_gr_graph_pool_reserved_bytes", 0)),
     }
 

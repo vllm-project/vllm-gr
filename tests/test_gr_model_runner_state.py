@@ -226,7 +226,7 @@ def test_release_is_idempotent_and_already_ended_session_is_tolerated() -> None:
     assert [event[0] for event in backend.events] == ["release"]
 
 
-def test_backend_release_failure_still_releases_session_and_all_worker_states() -> None:
+def test_backend_release_failure_retains_unsafe_state_but_releases_healthy_siblings() -> None:
     failing = _state(backend=_FakeBackend(fail_release=True))
     healthy = GRModelRunnerState(
         request_id="gr-1",
@@ -246,15 +246,125 @@ def test_backend_release_failure_still_releases_session_and_all_worker_states() 
     with pytest.raises(RuntimeError, match="backend release failed"):
         release_gr_model_runner_states(runner)
 
-    assert runner._gr_model_runner_states == {}
-    assert runner._beam_sessions == {}
-    assert failing.session.end_calls == healthy.session.end_calls == 1
-    assert failing.released is healthy.released is True
+    assert runner._gr_model_runner_states == {"gr-0": failing}
+    assert runner._beam_sessions == {"gr-0": failing.session}
+    assert failing.session.end_calls == 0
+    assert healthy.session.end_calls == 1
+    assert failing.released is False
+    assert healthy.released is True
     assert get_gr_model_runner_state_stats(runner) == {
         "created": 0,
-        "freed": 2,
-        "active": 0,
+        "freed": 1,
+        "active": 1,
     }
+    assert runner._gr_model_runner_state_cache is None
+
+    failing.backend.fail_release = False
+    assert release_gr_model_runner_states(runner, ["gr-0"]) == 1
+    assert failing.session.end_calls == 1
+    assert failing.released
+    assert runner._gr_model_runner_states == {}
+    assert runner._beam_sessions == {}
+    assert release_gr_model_runner_states(runner, ["gr-0"]) == 0
+    assert get_gr_model_runner_state_stats(runner)["freed"] == 2
+
+
+def test_failed_backend_drain_keeps_real_beam_slot_unavailable_until_retry() -> None:
+    from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+    from vllm_gr.v1.beam.beam_session_registry import BeamSessionRegistry
+
+    registry = BeamSessionRegistry(max_batch=1)
+    slot = registry.allocate("gr-0", beam_width=2, prefix_len=16)
+    session = BeamSearchSession("gr-0", slot, SimpleNamespace(registry=registry))
+    backend = _FakeBackend(fail_release=True)
+    state = _state(backend=backend, session=session)
+    runner = SimpleNamespace(
+        _gr_model_runner_states={"gr-0": state},
+        _beam_sessions={"gr-0": session},
+    )
+    with pytest.raises(RuntimeError, match="backend release failed"):
+        release_gr_model_runner_states(runner, ["gr-0"])
+    assert registry.has_session("gr-0")
+    assert session.is_active
+    assert registry.get_slot("gr-0") == slot
+    with pytest.raises(RuntimeError, match="No free beam session slots"):
+        registry.allocate("gr-1", beam_width=2, prefix_len=16)
+    with pytest.raises(RuntimeError, match="release"):
+        acquire_gr_model_runner_state(
+            runner,
+            request_id="gr-1",
+            session=_Session(),
+            backend=backend,
+            beam_width=2,
+            max_tokens=3,
+            continue_token_id=7,
+            finish_token_id=8,
+        )
+    backend.fail_release = False
+    assert release_gr_model_runner_states(runner, ["gr-0"]) == 1
+    assert not registry.has_session("gr-0")
+    assert registry.allocate("gr-1", beam_width=2, prefix_len=16) == slot
+
+
+def test_session_release_retry_does_not_repeat_completed_backend_release() -> None:
+    class RetryingSession(_Session):
+        def end_session(self):
+            self.end_calls += 1
+            if self.end_calls == 1:
+                raise RuntimeError("session cleanup failed")
+
+    backend = _FakeBackend()
+    session = RetryingSession()
+    state = _state(backend=backend, session=session)
+    with pytest.raises(RuntimeError, match="session cleanup failed"):
+        state.release()
+    assert not state.released
+    assert [event[0] for event in backend.events] == ["release"]
+    assert state.release()
+    assert not state.release()
+    assert session.end_calls == 2
+    assert [event[0] for event in backend.events] == ["release"]
+
+
+@pytest.mark.parametrize("stage", ["prefill", "decode", "final"])
+def test_failed_release_closes_all_execution_and_reuse_before_backend_calls(stage) -> None:
+    backend = _FakeBackend(fail_release=True)
+    state = _state(backend=backend, max_tokens=1 if stage == "final" else 3)
+    if stage in ("decode", "final"):
+        state.bootstrap_from_prefill(None, None, {})
+    with pytest.raises(RuntimeError, match="backend release failed"):
+        state.release()
+    prior_events = tuple(backend.events)
+    actions = (
+        lambda: state.start_prefill(),
+        lambda: state.bootstrap_from_prefill(None, None, {}),
+        lambda: state.prepare_decode_inputs(None, None, None, {"generation_index": state.step}),
+        lambda: state.advance_beam(None, None, {"generation_index": state.step}),
+        lambda: state.finalize_output(None),
+        lambda: state.reset_for_request(
+            request_id="new", session=_Session(), continue_token_id=7, finish_token_id=8
+        ),
+    )
+    for action in actions:
+        with pytest.raises(RuntimeError):
+            action()
+    assert tuple(backend.events) == prior_events
+    assert state.session.end_calls == 0
+
+
+def test_reentrant_release_does_not_end_session_or_call_backend_twice() -> None:
+    class ReentrantBackend(_FakeBackend):
+        def release(self, state):
+            super().release(state)
+            state.release()
+
+    backend = ReentrantBackend()
+    state = _state(backend=backend)
+    with pytest.raises(RuntimeError, match="release"):
+        state.release()
+    assert not state.released
+    assert state.session.end_calls == 0
+    assert [event[0] for event in backend.events] == ["release"]
 
 
 def test_released_state_is_reused_only_with_same_backend_and_shape() -> None:

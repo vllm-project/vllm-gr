@@ -122,6 +122,68 @@ def test_dispatcher_installs_three_wrappers_once(
     assert Runner.synchronize_input_prep is first_input_prep
 
 
+@pytest.mark.parametrize("has_copy_hook", [False, True])
+@pytest.mark.parametrize("has_copy_method", [False, True])
+def test_dispatcher_installs_optional_input_copy_hook_on_selected_subclass_only(
+    monkeypatch: pytest.MonkeyPatch, has_copy_hook: bool, has_copy_method: bool
+) -> None:
+    calls = []
+    result = object()
+
+    class Base:
+        pass
+
+    def original_copy(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return result
+
+    if has_copy_method:
+        Base._prepare_input_ids = original_copy
+
+    class Runner(Base):
+        def execute_model(self, scheduler_output):
+            return None
+
+        def _prepare_inputs(self, scheduler_output, counts):
+            return None, None, 1
+
+        def _bookkeeping_sync(self, scheduler_output, *args, **kwargs):
+            return None
+
+    installed = []
+
+    def patch_copy(original):
+        installed.append(original)
+
+        def copy(self, *args, **kwargs):
+            return original(self, *args, **kwargs)
+
+        return copy
+
+    platform = SimpleNamespace(
+        discover_worker_runners=lambda: (("SelectedV1", Runner),),
+        make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
+        make_patched_bookkeeping_sync=gpu_model_runner_patch.make_patched_bookkeeping_sync,
+    )
+    if has_copy_hook:
+        platform.make_patched_prepare_input_ids = patch_copy
+    monkeypatch.setattr(model_runner_patch, "_get_active_platform_module", lambda: platform)
+    monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
+    model_runner_patch.apply_worker_patches()
+    first = getattr(Runner, "_prepare_input_ids", None)
+    model_runner_patch.apply_worker_patches()
+    assert getattr(Runner, "_prepare_input_ids", None) is first
+    assert installed == ([original_copy] if has_copy_hook and has_copy_method else [])
+    assert ("_prepare_input_ids" in Runner.__dict__) == (has_copy_hook and has_copy_method)
+    if has_copy_method:
+        assert Base._prepare_input_ids is original_copy
+        assert Runner()._prepare_input_ids("output", rows=8) is result
+        assert calls == [(("output",), {"rows": 8})]
+    else:
+        assert not hasattr(Base, "_prepare_input_ids")
+        assert not hasattr(Runner, "_prepare_input_ids")
+
+
 def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

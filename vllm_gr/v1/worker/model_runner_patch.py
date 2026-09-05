@@ -322,6 +322,12 @@ def apply_worker_patches() -> None:
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )
+        # Some V1 adapters need a narrower device-token copy boundary inside
+        # upstream preparation. Install on the selected runner class only;
+        # never mutate an inherited upstream base method globally.
+        input_ids_patch = getattr(platform_module, "make_patched_prepare_input_ids", None)
+        if callable(input_ids_patch) and hasattr(runner_class, "_prepare_input_ids"):
+            runner_class._prepare_input_ids = input_ids_patch(runner_class._prepare_input_ids)
         input_prep_patch = getattr(platform_module, "make_patched_synchronize_input_prep", None)
         if callable(input_prep_patch) and hasattr(runner_class, "synchronize_input_prep"):
             runner_class.synchronize_input_prep = input_prep_patch(

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from functools import wraps
+from numbers import Integral
 
 import torch
 from vllm.logger import init_logger
@@ -27,6 +28,15 @@ from vllm_gr.v1.worker.model_runner_common import (
     _create_beam_context,
     _materialize_logits_indices,
     get_beam_graph_runtime_stats,
+)
+from vllm_gr.v1.worker.npu_gr_inputs import (
+    make_patched_execute_model as make_patched_execute_model,
+    make_patched_prepare_input_ids as make_patched_prepare_input_ids,
+    suspend_native_slot_mapping,
+)
+from vllm_gr.v1.worker.npu_gr_metadata import (
+    finish_decode_metadata,
+    prepare_decode_metadata,
 )
 
 logger = init_logger(__name__)
@@ -91,7 +101,12 @@ def install_worker_diagnostic_hook(worker_cls: type) -> int:
 
 
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
-    """Wrap the NPU four-item ``_prepare_inputs`` contract."""
+    """Preserve the NPU V1 prepare result while replacing Beam logits rows.
+
+    The supported Ascend 0.22.1rc1 source baseline (f528cdd) returns three
+    items. Keep the previously supported four-item extension's opaque tail
+    unchanged as well; do not invent a compressed-count item for upstream.
+    """
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
         return _orig_prepare_inputs
 
@@ -101,14 +116,17 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         if isinstance(self.input_batch, InputBatchProxy):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
 
-        # NPU builds attention metadata inside the original _prepare_inputs.
+        # Publish request identities before native input preparation. The
+        # pinned V1 runner builds attention metadata later in execute_model.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        # NPU constructs attention metadata inside the original method, so
-        # backend state (token ids, device step and physical block mapping)
-        # must be published before entering it.
+        # Publish backend state before native preparation. This call-order
+        # hook alone does not prevent native _prepare_input_ids from copying
+        # control tokens over the device inputs; the persistent NPU backend
+        # must also adapt that input-copy boundary before it can be enabled.
         beam_data = getattr(scheduler_output, "beam_data", {})
+        prepared_states = []
         for req_id, mdata in beam_data.items():
             if mdata.get("persistent_runner_state") and mdata.get("is_beam_decode"):
                 state = getattr(self, "_gr_model_runner_states", {}).get(req_id)
@@ -120,28 +138,27 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
                     num_scheduled_tokens,
                     mdata,
                 )
+                prepare_decode_metadata(self, state, scheduler_output, mdata)
+                prepared_states.append((state, mdata))
 
-        out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
+        with suspend_native_slot_mapping(self, scheduler_output):
+            out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
 
         if not beam_data:
             return out
 
-        (
-            logits_indices,
-            spec_decode_metadata,
-            total_num_scheduled_tokens,
-            num_scheduled_tokens_compressed_list,
-        ) = out
+        if not isinstance(out, tuple) or len(out) not in (3, 4):
+            raise RuntimeError(
+                "unsupported NPU V1 _prepare_inputs result: expected a "
+                "three-item upstream tuple or four-item legacy extension"
+            )
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = _materialize_logits_indices(self, new_logits_indices)
+        for state, metadata in prepared_states:
+            finish_decode_metadata(self, state, metadata)
 
-        return (
-            logits_indices,
-            spec_decode_metadata,
-            total_num_scheduled_tokens,
-            num_scheduled_tokens_compressed_list,
-        )
+        return (logits_indices, *out[1:])
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
@@ -408,6 +425,13 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
         if not beam_keys:
             return result
 
+        # Ascend f528cdd uses force_eager as positional argument 6 (excluding
+        # self). A captured Beam graph must never override an explicit eager
+        # request or the model's enforce_eager setting.
+        force_eager = kwargs.get("force_eager", args[6] if len(args) > 6 else False)
+        if force_eager or getattr(getattr(self, "model_config", None), "enforce_eager", False):
+            return _downgrade_to_none(result)
+
         # Beam decode FULL requires an active BeamSearchSession — the xllm
         # execution path reads the pool slot and context buffers from it.
         session = beam_info.get("beam_session")
@@ -451,9 +475,15 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
         num_tokens_arg = kwargs.get("num_tokens")
         if num_tokens_arg is None and args:
             num_tokens_arg = args[0]
-        real_num_tokens = (
-            int(num_tokens_arg) if num_tokens_arg is not None else result[1].num_tokens
-        )
+        # A padded descriptor does not prove exact width. Accept only a Host
+        # integral count, never int(device_tensor) or a missing-count fallback.
+        if (
+            isinstance(num_tokens_arg, bool)
+            or not isinstance(num_tokens_arg, Integral)
+            or num_tokens_arg < 1
+        ):
+            return _downgrade_to_none(result)
+        real_num_tokens = int(num_tokens_arg)
 
         # FULL iff a beam graph for this exact width exists in the captured
         # set; otherwise eager (and never a native FULL graph for beam rows).
