@@ -172,6 +172,8 @@ def extract_and_dedup_flat_logprobs(flat: Any, logprobs_num: int):
     duplicate is position 0 (sampled token) when it also appears in the
     top-K (positions 1..K).  Returns exactly ``logprobs_num`` entries.
     """
+    if not flat.start_indices:
+        return [], [], None, None
     return extract_and_dedup_segment(
         flat.token_ids,
         flat.logprobs,
@@ -246,6 +248,8 @@ def extract_constrained_flat_logprobs(flat: Any, logprobs_num: int):
     The constrained prefill produces a single wide flat segment (W valid
     candidates followed by padding); no sampled-token dedup applies.
     """
+    if not flat.start_indices:
+        return [], [], None, None
     return extract_constrained_segment(
         flat.token_ids,
         flat.logprobs,

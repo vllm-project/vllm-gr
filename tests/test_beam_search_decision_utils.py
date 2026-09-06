@@ -14,6 +14,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
     configure_persistent_sampling_params,
+    extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
     extract_constrained_flat_logprobs,
     extract_constrained_segment,
@@ -270,6 +271,23 @@ def test_extract_constrained_flat_logprobs_prefill_wide_segment() -> None:
     assert logprobs == [-0.1, -0.2, -0.3]
     assert ranks == [0, 0, 0]
     assert decoded == [None, None, None]
+
+
+@pytest.mark.parametrize(
+    "extract_fn",
+    [extract_and_dedup_flat_logprobs, extract_constrained_flat_logprobs],
+)
+def test_extract_flat_logprobs_empty_output_returns_no_candidates(extract_fn) -> None:
+    flat = SimpleNamespace(
+        token_ids=[],
+        logprobs=[],
+        ranks=None,
+        decoded_tokens=None,
+        start_indices=[],
+        end_indices=[],
+    )
+
+    assert extract_fn(flat, 5) == ([], [], None, None)
 
 
 def test_mask_candidate_logprobs_keeps_candidate_geometry() -> None:

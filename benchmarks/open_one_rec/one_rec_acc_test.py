@@ -90,6 +90,19 @@ class MockRequestOutput:
         self.outputs = outputs
 
 
+def frame_sid_generation(text: str, begin_token: str | None) -> str:
+    """Restore the SID begin marker that GRLLM injects into the prompt.
+
+    ``decode_prompt_in_text=False`` deliberately returns only tokens generated
+    after the augmented prompt. OneRec's begin marker is part of that prompt,
+    while its end marker is generated during finalization. The evaluator
+    expects the complete framed SID, so add the omitted marker exactly once.
+    """
+    if begin_token and not text.startswith(begin_token):
+        return begin_token + text
+    return text
+
+
 def run_api_inference(
     prompts: list[str],
     model: str,
@@ -385,12 +398,20 @@ def main():
             # not split a multi-prompt beam_search call into independent B=1
             # sessions, so submit each RecIF sample explicitly.
             raw_offline_outputs = [
-                llm.beam_search([prompt], params, concurrency_limit=1)[0]
+                llm.beam_search(
+                    [prompt],
+                    params,
+                    concurrency_limit=1,
+                    decode_prompt_in_text=False,
+                )[0]
                 for prompt in prompts_dict
             ]
         else:
             raw_offline_outputs = llm.beam_search(
-                prompts_dict, params, concurrency_limit=args.max_concurrency
+                prompts_dict,
+                params,
+                concurrency_limit=args.max_concurrency,
+                decode_prompt_in_text=False,
             )
         assert len(raw_offline_outputs) == len(prompts)
         gen_end = time.perf_counter()
@@ -401,12 +422,10 @@ def main():
             # beam_search returns BeamSearchOutput with .outputs containing BeamSearchSequence objects
             # Each BeamSearchSequence has .text attribute
             mock_completions = []
-            prompt_len = len(prompts[i])
             if hasattr(raw_output, "sequences"):
                 for beam_seq in raw_output.sequences:
-                    text = (
-                        beam_seq.text[prompt_len:] if hasattr(beam_seq, "text") else str(beam_seq)
-                    )
+                    text = beam_seq.text if hasattr(beam_seq, "text") else str(beam_seq)
+                    text = frame_sid_generation(text, getattr(params, "begin_token", None))
                     logprobs = getattr(beam_seq, "cum_logprob", None)
                     mock_completions.append(MockCompletionOutput(text, logprobs))
             else:

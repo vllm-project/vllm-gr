@@ -401,6 +401,7 @@ class GRLLM(LLM):
         lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
+        decode_prompt_in_text: bool = True,
     ) -> list["BeamSearchOutput"]:
         """
         Generate sequences using beam search.
@@ -413,6 +414,8 @@ class GRLLM(LLM):
             use_tqdm: Whether to use tqdm to display the progress bar.
             concurrency_limit: The maximum number of concurrent requests.
                 If None, the number of concurrent requests is unlimited.
+            decode_prompt_in_text: Include the decoded prompt before the
+                generated tail in each returned sequence's ``text``.
         """
         # Lazy imports for beam search dependencies
         import itertools
@@ -525,7 +528,7 @@ class GRLLM(LLM):
         cached_prompts = []
         for instance in instances:
             prompt_tokens = instance.beams[0].tokens
-            prompt_text = tokenizer.decode(prompt_tokens)
+            prompt_text = tokenizer.decode(prompt_tokens) if decode_prompt_in_text else None
             cached_prompts.append({"text": prompt_text, "len": len(prompt_tokens)})
 
         pre_calc = 0 if sid_begin_token_id is None else 1
@@ -761,7 +764,7 @@ class GRLLM(LLM):
             else:
                 decoded_gen_texts = [tokenizer.decode(tokens) for tokens in beam_token_lists]
             for beam, gen_text in zip(best_beams, decoded_gen_texts):
-                beam.text = prompt_text + gen_text
+                beam.text = gen_text if prompt_text is None else prompt_text + gen_text
             outputs.append(BeamSearchOutput(sequences=best_beams))
 
         return outputs
