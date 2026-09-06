@@ -148,6 +148,37 @@ not be used for a strict current-vs-native T0 gate:
 | label_cond | 0.006334 | 0.043220 | 0.018398 |
 | interactive | 0.067000 | 0.314000 | 0.193785 |
 
+The matching persistent BW32/T0.6 full-dataset run completed through `gpu run`
+on 2026-09-06. It used asynchronous scheduling, disabled prefix caching, Beam
+Graph, the complete constraint tables, and the same five immutable evaluation
+inputs as the T0 run:
+
+| Task | Persistent PID pass@1 | Native PID pass@1 | Persistent PID pass@32 | Native PID pass@32 | Persistent PID recall@32 | Native PID recall@32 | Recall delta | Mean ms/sample |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| video | 0.049870 | 0.048787 | 0.170805 | 0.169877 | 0.027075 | 0.027009 | +0.000066 | 46.608 |
+| ad | 0.013260 | 0.016512 | 0.187195 | 0.202515 | 0.063115 | 0.069695 | -0.006580 | 27.902 |
+| product | 0.012433 | 0.013579 | 0.147402 | 0.156503 | 0.032419 | 0.035247 | -0.002829 | 28.073 |
+| label_cond | 0.005703 | 0.006334 | 0.042504 | 0.043220 | 0.018000 | 0.018398 | -0.000398 | 23.758 |
+| interactive | 0.056000 | 0.067000 | 0.315000 | 0.314000 | 0.192368 | 0.193785 | -0.001416 | 53.500 |
+
+The T0.6 result is lower than the saved native observation on four of five
+PID recall@32 values, with the largest difference on `ad`. Because T0.6 Beam
+selection samples from the score distribution, these independently generated
+outputs are not a deterministic parity oracle. The difference still warrants
+a paired seed and sampling-path investigation before using T0.6 as a precision
+gate.
+
+Persistent T0.6 result SHA256 values, in task order interactive, label_cond,
+ad, product, and video:
+
+```text
+1a8cb15c061c1798215cd5398a73fd46769449a4d27d5ab83d3686c0bf01269e
+d0a8729cc119deba1b2b303901e1f89cb4cf09709e6337df76c63a6ac389ff2c
+ac908d5879dec8e0f413bbbd50d05fd69f4b00e83606dd6849e755a6c011c8bc
+3fd47fb995055ea18ae31c3f7db3da231d0e3fb637d1920130d84b82be4645cf
+5712e525eb7e096417099e9ca5d473180e5087e9b0b81a95653387a1df2809aa
+```
+
 A strict scheduler comparison still requires regenerating unmodified native
 vLLM outputs at T0 from the same immutable inputs. The paper values are
 rounded to four decimals and do not provide raw predictions, so they cannot
