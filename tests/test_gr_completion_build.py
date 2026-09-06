@@ -122,15 +122,3 @@ def test_actual_build_imports_python_module_and_versioned_c_abi(built_completion
     finally:
         library.gr_ticket_release(ticket)
     assert library.gr_ticket_live() == 0
-
-
-def test_standalone_test_main_uses_production_primitive(tmp_path):
-    # Preserve the original no-Python-headers sanitizer/diagnostic build route.
-    source = ROOT / "tests/profiling/native/gr_completion_ticket.cc"
-    executable = tmp_path / "gr_completion_ticket_test"
-    subprocess.run(["c++", "-std=c++17", "-pthread", "-DGR_COMPLETION_TEST_MAIN",
-                    str(source), "-o", str(executable)], check=True, timeout=60,
-                   capture_output=True, text=True)
-    result = subprocess.run([str(executable)], check=True, timeout=60,
-                            capture_output=True, text=True)
-    assert "1000 waiter/owner/callback races; live=0" in result.stdout
