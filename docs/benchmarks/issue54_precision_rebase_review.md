@@ -111,46 +111,53 @@ domain constraint tables. The five task sizes themselves sum to 130,259; the
 
 ### Native vLLM and published OneRec comparison
 
-The OpenOneRec OneRec-1.7B model card publishes only Recall@32 for these five
-tasks. The native vLLM values below come from the completed full-split
-`vllm.LLM.beam_search` runs in the sibling checkout, with all vllm-gr plugins
-disabled. The raw native JSON files are under `/tmp/onerec_native_<task>/`.
+The official evaluator calculates both SID and PID metrics. The published
+paper values are PID-level item metrics: its OneRec-1.7B values align with the
+evaluator's `pid_*` output after generated SIDs are mapped through `sid2pid.json`
+(`sid2iid.json` for product), rather than with the higher SID-level metrics.
 
-| Task | Persistent PID pass@1 | Native PID pass@1 | Persistent PID pass@32 | Native PID pass@32 | Persistent PID recall@32 | Native PID recall@32 | Published Recall@32 |
+The effective official Beam temperature is 0. Although the recommendation
+task config contains `temperature=0.6`, the official Beam branch serializes
+only `beam_width` and `max_tokens` into `BeamSearchParams`. The pinned official
+vLLM 0.7.3 default for `BeamSearchParams.temperature` is 0.0. The official
+launcher overrides the configured Beam width to 32 but does not change this
+Beam parameter construction.
+
+The current persistent run therefore matches the published BW32/T0 and
+three-semantic-token generation settings. The paper reports PID Pass@1,
+Pass@32, and Recall@32 as follows:
+
+| Task | Persistent PID pass@1 | Official PID pass@1 | Persistent PID pass@32 | Official PID pass@32 | Persistent PID recall@32 | Official PID recall@32 | Recall delta |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| video | 0.056290 | 0.048787 | 0.175266 | 0.169877 | 0.028031 | 0.027009 | 0.0272 |
-| ad | 0.016729 | 0.016512 | 0.202804 | 0.202515 | 0.069996 | 0.069695 | 0.0707 |
-| product | 0.013687 | 0.013579 | 0.157327 | 0.156503 | 0.035343 | 0.035247 | 0.0360 |
-| label_cond | 0.007394 | 0.006334 | 0.045685 | 0.043220 | 0.019301 | 0.018398 | 0.0184 |
-| interactive | 0.065000 | 0.067000 | 0.345000 | 0.314000 | 0.209358 | 0.193785 | 0.1941 |
+| video | 0.056290 | 0.0496 | 0.175266 | 0.1710 | 0.028031 | 0.0272 | +0.000831 |
+| ad | 0.016729 | 0.0169 | 0.202804 | 0.2037 | 0.069996 | 0.0707 | -0.000704 |
+| product | 0.013687 | 0.0144 | 0.157327 | 0.1571 | 0.035343 | 0.0360 | -0.000657 |
+| label_cond | 0.007394 | 0.0064 | 0.045685 | 0.0431 | 0.019301 | 0.0184 | +0.000901 |
+| interactive | 0.065000 | 0.0660 | 0.345000 | 0.3170 | 0.209358 | 0.1941 | +0.015258 |
 
-The observed Recall@32 deltas are:
+The previously saved native vLLM runs are not the T0 official baseline. The
+sibling adapter explicitly forwarded the imported 0.6 value, unlike the
+official runner which drops it. They remain useful T0.6 observations but must
+not be used for a strict current-vs-native T0 gate:
 
-| Task | Persistent - native | Persistent - published | Relative to published |
+| Task | Saved native PID pass@1 (T0.6) | Saved native PID pass@32 (T0.6) | Saved native PID recall@32 (T0.6) |
 | --- | ---: | ---: | ---: |
-| video | +0.001022 | +0.000831 | +3.055% |
-| ad | +0.000301 | -0.000704 | -0.995% |
-| product | +0.000096 | -0.000657 | -1.825% |
-| label_cond | +0.000903 | +0.000901 | +4.897% |
-| interactive | +0.015573 | +0.015258 | +7.861% |
+| video | 0.048787 | 0.169877 | 0.027009 |
+| ad | 0.016512 | 0.202515 | 0.069695 |
+| product | 0.013579 | 0.156503 | 0.035247 |
+| label_cond | 0.006334 | 0.043220 | 0.018398 |
+| interactive | 0.067000 | 0.314000 | 0.193785 |
 
-The persistent constrained result is above native vLLM on PID Recall@32 for
-all five tasks. Against the published model-card values, it is above on video,
-label_cond, and interactive, and below by 0.000704 on ad and 0.000657 on
-product. Those two gaps are smaller than 0.001 absolute. PID pass@32 is also
-above native on all five tasks. PID pass@1 is above native on four tasks and
-is 0.002 lower on interactive (0.065 versus 0.067).
+A strict scheduler comparison still requires regenerating unmodified native
+vLLM outputs at T0 from the same immutable inputs. The paper values are
+rounded to four decimals and do not provide raw predictions, so they cannot
+replace that paired oracle.
 
-This is an observed full-dataset comparison, not a strict zero-tolerance
-paired oracle. The saved native jobs inherited the imported task temperature
-of 0.6; the persistent jobs explicitly used temperature 0. The model, complete
-test splits, beam width 32, SID-to-PID evaluator, and cutoff are otherwise the
-same. A future strict paired gate should regenerate native outputs at T0 from
-the same immutable input manifest. The published values have four-decimal
-precision and do not include pass metrics or raw predictions.
+Official sources (accessed 2026-09-06):
 
-Official source (accessed 2026-09-06):
-<https://huggingface.co/OpenOneRec/OneRec-1.7B>
+- <https://github.com/Kuaishou-OneRec/OpenOneRec/tree/a969edcadd579a06c1966ae1db5984e02f48beff>
+- <https://arxiv.org/pdf/2512.24762>
+- <https://huggingface.co/OpenOneRec/OneRec-1.7B>
 
 Native result SHA256 values, in task order interactive, label_cond, ad,
 product, and video:
