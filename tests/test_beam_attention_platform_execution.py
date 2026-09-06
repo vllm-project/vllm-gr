@@ -113,7 +113,9 @@ def test_npu_prefill_attention_consumes_common_metadata(
         seq_lens_cpu=[7, 4, 0],
     )
     output = torch.zeros(7, 8, 64)
-    query = torch.zeros(7, 8, 64)
+    # Padded batch: 8 query rows vs 7 actual tokens (vllm-ascend pads to
+    # num_tokens_padded) — the fast path must slice to the real rows.
+    query = torch.zeros(8, 8, 64)
     key_cache = torch.zeros(8, 16, 8, 64)
     value_cache = torch.zeros(8, 16, 8, 64)
 
@@ -129,6 +131,7 @@ def test_npu_prefill_attention_consumes_common_metadata(
         vllm_flash_attn_version=0,
     )
 
+    assert fia_kwargs["query"].shape == (7, 8, 64)
     assert fia_kwargs["actual_seq_qlen"] == [3, 7]
     assert fia_kwargs["actual_seq_kvlen"] == [7, 4]
     assert fia_kwargs["block_table"] is block_table

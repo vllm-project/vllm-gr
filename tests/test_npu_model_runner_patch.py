@@ -250,7 +250,7 @@ def test_npu_model_forward_intercepts_pure_prefill(
     result = wrapped(runner, 64, input_ids="ids", positions="pos")
     assert result is output_buf
     assert replay["bucket"] == 128
-    assert replay["token_counts"] == [30, 34]
+    assert replay["token_counts"] == {"r1": 30, "r2": 34}
     assert original_calls == []
 
     # Missing forward-context metadata falls back to eager.

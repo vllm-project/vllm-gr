@@ -39,6 +39,56 @@ logger = init_logger(__name__)
 NPU_DEVICE = is_npu_available()
 CUDA_DEVICE = is_cuda_available()
 
+_ASCEND_FULL_GRAPH_UPDATE: Any | None = None
+_ASCEND_FULL_GRAPH_UPDATE_RESOLVED = False
+_NPU_PREFILL_ENTRY_CLS: Any | None = None
+
+
+def _get_npu_prefill_entry_cls() -> Any | None:
+    """Lazily resolve the vllm-gr prefill entry type (contract-test safe).
+
+    Must NOT be imported at module scope: the facade-import contract test
+    asserts ``beam_attn_npu`` is not loaded when ``beam_attn`` is imported,
+    and ``beam_attn_npu`` imports ``torch_npu`` (absent on CUDA/CPU CI).
+    Resolved lazily once, only ever reached on NPU; None on failure.
+    """
+    global _NPU_PREFILL_ENTRY_CLS
+    if _NPU_PREFILL_ENTRY_CLS is None:
+        try:
+            from vllm_gr.v1.attention.backends.beam_attn_npu import NPUPrefillGraphEntry
+
+            _NPU_PREFILL_ENTRY_CLS = NPUPrefillGraphEntry
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Beam attention: prefill entry type unavailable (%r).", e)
+    return _NPU_PREFILL_ENTRY_CLS
+
+
+def _get_ascend_full_graph_update() -> Any | None:
+    """vllm-ascend's canonical decode full-graph (ACL) task-update function.
+
+    The vllm-gr backend replacement intercepts vllm-ascend's
+    ``update_full_graph_params`` hook (it resolves the attention impl class
+    to ``BeamAttentionImpl``). Decode full-graph updates must be delegated
+    back to vllm-ascend's own paged-attention task-update logic, which is
+    stateless. Resolved lazily once; None when vllm-ascend is unavailable.
+    """
+    global _ASCEND_FULL_GRAPH_UPDATE, _ASCEND_FULL_GRAPH_UPDATE_RESOLVED
+    if not _ASCEND_FULL_GRAPH_UPDATE_RESOLVED:
+        _ASCEND_FULL_GRAPH_UPDATE_RESOLVED = True
+        try:
+            from vllm_ascend.attention.attention_v1 import (  # type: ignore[import-not-found]
+                AscendAttentionBackend,
+            )
+
+            _ASCEND_FULL_GRAPH_UPDATE = AscendAttentionBackend.get_impl_cls().update_graph_params
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Beam attention: vllm-ascend full-graph update unavailable (%r); "
+                "decode full-graph parameter updates will be skipped.",
+                e,
+            )
+    return _ASCEND_FULL_GRAPH_UPDATE
+
 
 def _get_platform_execution_module() -> ModuleType:
     if NPU_DEVICE and not CUDA_DEVICE:
@@ -125,11 +175,38 @@ class BeamAttentionImpl(AttentionImpl):
     def update_graph_params(cls, *args: Any, **kwargs: Any) -> None:
         """Update ACL graph parameters for NPU graph compilation mode.
 
-        Delegates to platform execution if supported, or acts as a safe no-op.
+        Two contracts reach this shim, discriminated by TYPE (not arity):
+          - the vllm-gr prefill update passes an ``NPUPrefillGraphEntry``
+            (second positional arg or ``entry`` kwarg); it is delegated to
+            the platform execution module (the prefill runner normally
+            calls it directly, so this branch is defense-in-depth).
+          - vllm-ascend's decode full-graph hook
+            (``acl_graph.update_full_graph_params``) passes a
+            ``forward_context`` second — never an ``NPUPrefillGraphEntry``.
+            Those calls are forwarded transparently (args AND kwargs) to
+            vllm-ascend's own paged-attention task-update, so upstream
+            contract changes (extra args or kwargs-style calls) pass
+            through untouched.
+
+        On NPU every recognized shape ALWAYS returns here: falling through
+        to the platform execution module with the vllm-ascend contract
+        would call the 5-arg prefill update with a mismatched call shape.
         """
         if not args and not kwargs:
             # API-contract callers (e.g. tests) may invoke without arguments;
             # the NPU platform function requires the full parameter set.
+            return
+        if NPU_DEVICE:
+            entry = kwargs.get("entry") or (args[1] if len(args) > 1 else None)
+            entry_cls = _get_npu_prefill_entry_cls()
+            if entry_cls is not None and isinstance(entry, entry_cls):
+                platform_execution = _get_platform_execution_module()
+                if hasattr(platform_execution, "update_graph_params"):
+                    platform_execution.update_graph_params(*args, **kwargs)
+                return
+            ascend_update = _get_ascend_full_graph_update()
+            if ascend_update is not None:
+                ascend_update(*args, **kwargs)
             return
         platform_execution = _get_platform_execution_module()
         if hasattr(platform_execution, "update_graph_params"):

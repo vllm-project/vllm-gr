@@ -99,9 +99,9 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             slot_mappings_by_group = {0: buf.slot_mapping_buf}
             # Per-layer mapping for vllm's unified KV-cache update op. Point
             # every attention layer at the static buffer: the graph bakes the
-            # pointer and populate_buffers() refreshes the contents before
-            # each replay. Without this the op silently skips KV writes and
-            # replays read an empty KV cache.
+            # pointer and execute_model_prefill() refreshes the contents
+            # before each replay. Without this the op silently skips KV
+            # writes and replays read an empty KV cache.
             slot_mappings_by_layer: dict[str, torch.Tensor] = {}
             kv_cache_config = getattr(runner, "kv_cache_config", None)
             if kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) > 0:
@@ -150,8 +150,47 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     # whose KV length (num_computed + scheduled) fits within
                     # 2x the bucket. Requests beyond that bound fall back to
                     # eager (checked in execute_model_prefill).
-                    self._apply_max_seq_len_bound(attn_metadata, bucket * 2)
-                    buf.max_seq_len_bounds[num_reqs] = bucket * 2
+                    bound = 2 * bucket
+                    self._apply_max_seq_len_bound(attn_metadata, bound)
+                    buf.max_seq_len_bounds[num_reqs] = bound
+
+                    # Rebind the block table, seq_lens, and query_start_loc
+                    # to static per-bucket buffers: a captured graph bakes the
+                    # pointer address, so the tensor at that address must stay
+                    # stable for the lifetime of the graph. The runner's live
+                    # per-batch tensors are overwritten (or reallocated) for
+                    # the next batch, so the graph must never bake them.
+                    bt_metas = (
+                        list(attn_metadata.values())
+                        if isinstance(attn_metadata, dict)
+                        else [attn_metadata]
+                    )
+                    for meta in bt_metas:
+                        if not hasattr(meta, "block_table"):
+                            continue
+                        bt_shape = meta.block_table.shape
+                        # Pre-allocated at init from the model config; re-size
+                        # only if the metadata's width exceeds it (should not
+                        # happen — config-derived widths match).
+                        if (
+                            buf.block_table_buf is None
+                            or bt_shape[1] > buf.block_table_buf.shape[1]
+                        ):
+                            buf.block_table_buf = torch.zeros(
+                                (SUPPORTED_NUM_REQS[-1], bt_shape[1]),
+                                dtype=meta.block_table.dtype,
+                                device=runner.device,
+                            )
+                        meta.block_table = buf.block_table_buf[: bt_shape[0], : bt_shape[1]]
+                        # Rebind seq_lens / query_start_loc to the static
+                        # buffers pre-allocated at init: the replay refreshes
+                        # them before every execution (see execute_model_prefill).
+                        if hasattr(meta, "seq_lens") and meta.seq_lens is not None:
+                            meta.seq_lens = buf.seq_lens_buf[: meta.seq_lens.shape[0]]
+                        if hasattr(meta, "query_start_loc") and meta.query_start_loc is not None:
+                            meta.query_start_loc = buf.query_start_loc_buf[
+                                : meta.query_start_loc.shape[0]
+                            ]
 
                     if hasattr(attn_metadata, "is_prefill_graph_exec"):
                         attn_metadata.is_prefill_graph_exec = True
@@ -270,12 +309,12 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             else list(num_scheduled_tokens)
         )
         num_reqs = len(token_counts)
+        total_actual = sum(token_counts)
         buf = self.buffers.get(bucket)
         if buf is None or not buf.has_captured_graph(num_reqs):
             return None
 
-        # Never replay with a missing slot mapping: populate_buffers would
-        # leave the static buffer with stale (or -1) slots, so the captured
+        # Never replay with a missing slot mapping: the captured
         # reshape-and-cache would skip or misdirect the current KV writes.
         if slot_mapping is None:
             logger.warning(
@@ -289,7 +328,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         bound = buf.max_seq_len_bounds.get(num_reqs)
         max_kvlen = self._max_scheduled_kvlen(num_scheduled_tokens)
         if bound is not None and max_kvlen is not None and max_kvlen > bound:
-            logger.warning(
+            logger.debug(
                 "GPU prefill graph replay: batch max KV length %d exceeds the "
                 "captured bound %d; falling back to eager prefill.",
                 max_kvlen,
@@ -297,16 +336,83 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             )
             return None
 
-        # 1. In-place copy to static buffers
-        self.populate_buffers(
-            bucket=bucket,
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            num_scheduled_tokens=num_scheduled_tokens,
-        )
+        if input_ids is None or positions is None:
+            logger.warning(
+                "GPU prefill graph replay: missing live inputs; falling back to eager prefill."
+            )
+            return None
 
-        # 2. Replay captured graph for num_reqs
+        # Refresh the static buffers with plain on-stream D2D copies from the
+        # live per-batch tensors. _prepare_inputs has already computed all of
+        # them (positions, slot mapping, seq_lens, query start loc) for THIS
+        # batch on the current stream, and the next batch's writes are
+        # enqueued strictly after these copies on the same stream (a CUDA
+        # stream is FIFO), so reading the live tensors here can never observe
+        # the next batch's data. No host-side recomputation or allocations.
+        if total_actual < bucket:
+            buf.input_ids_buf[total_actual:].fill_(buf.pad_token_id)
+            buf.positions_buf[..., total_actual:].fill_(0)
+            buf.slot_mapping_buf[total_actual:].fill_(-1)
+        buf.input_ids_buf[:total_actual].copy_(input_ids[:total_actual], non_blocking=True)
+        if positions.ndim == buf.positions_buf.ndim == 1:
+            buf.positions_buf[:total_actual].copy_(positions[:total_actual], non_blocking=True)
+        else:
+            buf.positions_buf[..., :total_actual].copy_(
+                positions[..., :total_actual], non_blocking=True
+            )
+        buf.slot_mapping_buf[:total_actual].copy_(slot_mapping[:total_actual], non_blocking=True)
+
+        # Per-request attention metadata: copy the live GPU tensors
+        # _prepare_inputs just computed, in the InputBatch row order.
+        qsl_gpu = getattr(self.model_runner, "query_start_loc", None)
+        if qsl_gpu is None or not hasattr(qsl_gpu, "gpu"):
+            logger.warning(
+                "GPU prefill graph replay: live query_start_loc unavailable; "
+                "falling back to eager prefill."
+            )
+            return None
+        buf.query_start_loc_buf[: num_reqs + 1].copy_(
+            qsl_gpu.gpu[: num_reqs + 1], non_blocking=True
+        )
+        seq_gpu = getattr(self.model_runner, "seq_lens", None)
+        if seq_gpu is None:
+            logger.warning(
+                "GPU prefill graph replay: live seq_lens unavailable; "
+                "falling back to eager prefill."
+            )
+            return None
+        buf.seq_lens_buf[:num_reqs].copy_(seq_gpu[:num_reqs], non_blocking=True)
+
+        # Refresh the static block table (baked pointer) from the live GPU
+        # block table, which the runner keeps current for the batch. vLLM
+        # pre-allocates the block table at a fixed width (max_model_len /
+        # block_size), so the live and capture widths are equal in practice;
+        # the explicit column slice keeps the copy correct if that ever
+        # changes upstream (copy_ requires matching shapes).
+        if buf.block_table_buf is not None:
+            try:
+                live_bt = self.model_runner.input_batch.block_table[0].block_table.gpu
+                if live_bt is None:
+                    raise AttributeError("live block table is None")
+            except (AttributeError, IndexError, TypeError):
+                logger.warning(
+                    "GPU prefill graph replay: live block table unavailable; "
+                    "falling back to eager prefill."
+                )
+                return None
+            if live_bt.shape[0] < num_reqs or live_bt.shape[1] > buf.block_table_buf.shape[1]:
+                logger.warning(
+                    "GPU prefill graph replay: block table shape %s exceeds the "
+                    "staged buffer; falling back to eager prefill.",
+                    tuple(live_bt.shape),
+                )
+                return None
+            num_cols = min(live_bt.shape[1], buf.block_table_buf.shape[1])
+            buf.block_table_buf[:num_reqs, :num_cols].copy_(
+                live_bt[:num_reqs, :num_cols], non_blocking=True
+            )
+
+        # Replay the captured graph for num_reqs.
         graph = buf.captured_graphs[num_reqs]
         graph.replay()
 

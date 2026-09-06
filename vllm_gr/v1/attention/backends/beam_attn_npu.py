@@ -68,7 +68,6 @@ class NPUGraphLayerTask:
     """
 
     handle: Any
-    event: Any
     output: Any
     query: Any
     key: Any
@@ -188,6 +187,9 @@ def prefill_attention(
     qsl = attn_metadata.query_start_loc_cpu
     sl = attn_metadata.seq_lens_cpu
     num_actual_tokens = attn_metadata.num_actual_tokens
+    # vllm-ascend pads the batch to num_tokens_padded; the FIA-v2 TND layout
+    # requires queryT == last(actual_seq_qlen), so compute only the real rows.
+    query = query[:num_actual_tokens]
     # Skip the leading zero of the cu-style query_start_loc (matches the
     # std_cu_seqlens_q_cpu convention: np.cumsum without the leading 0) and
     # trim the zero padding beyond num_reqs.
@@ -253,13 +255,10 @@ def _prefill_attention_graph(
     reshape_and_cache) stay plain-captured; only the FIA call is task-grouped
     so ``update_graph_params`` can rewrite the host lists per replay.
 
-    Per-layer event chain (vllm-ascend recipe): an ``event.wait`` and an
-    ``event.reset`` are recorded INTO the graph before each task group, and
-    the update records the same event after its layer's update. Every replay
-    therefore starts layer i only after layer i's update, and the update
-    never rewrites a task while the previous replay's kernels (CANN internal
-    stream) are still executing — plain stream-level waits cannot order the
-    internal graph machinery in successive replays of the same bucket.
+    No per-layer events: the runner orders the WHOLE update after the
+    previous replay's completion and the WHOLE replay after the update's
+    completion with stream-level waits (``wait_stream`` pairs), which makes
+    per-layer event granularity redundant.
     """
     entry = _GRAPH_CAPTURE_STATE["entry"]
     assert entry is not None, "NPU prefill graph capture requires an active entry"
@@ -302,9 +301,6 @@ def _prefill_attention_graph(
     workspace = entry.workspace
     lse = torch.empty(1, dtype=output.dtype, device=output.device)
     stream = torch.npu.current_stream()
-    event = torch.npu.ExternalEvent()
-    event.wait(stream)
-    event.reset(stream)
     torch.npu.graph_task_group_begin(stream)
     torch_npu.npu_fused_infer_attention_score_v2.out(**kw, workspace=workspace, out=[output, lse])
     handle = torch.npu.graph_task_group_end(stream)
@@ -316,7 +312,6 @@ def _prefill_attention_graph(
     entry.layers.append(
         NPUGraphLayerTask(
             handle=handle,
-            event=event,
             output=_make_weak_graph_tensor(output),
             query=_make_weak_graph_tensor(query),
             key=_make_weak_graph_tensor(key),
@@ -347,8 +342,8 @@ def update_graph_params(
     update may change the request count and re-bind the block table).
 
     Returns True on success. The caller MUST NOT replay the graph on False:
-    every capture-time event recorded a ``wait`` inside the graph, and a
-    skipped layer would leave its event unrecorded, deadlocking the replay.
+    a partially-updated graph would execute with stale per-layer params and
+    the output would be silently wrong.
 
     Deliberately ignores non-prefill-graph callers (e.g. vllm-ascend's
     full-graph update hook, which passes different arguments).
@@ -379,7 +374,7 @@ def update_graph_params(
             if output is None or query is None or key is None or value is None or lse is None:
                 logger.warning(
                     "NPU prefill graph update: layer tensors are missing; "
-                    "aborting the update (replay would deadlock on unrecorded events)."
+                    "aborting the update (the replay would execute with stale params)."
                 )
                 return False
             mask = task.mask
@@ -402,7 +397,6 @@ def update_graph_params(
                 out=[output, lse],
             )
             torch.npu.graph_task_update_end(update_stream)
-            task.event.record(update_stream)
     return True
 
 

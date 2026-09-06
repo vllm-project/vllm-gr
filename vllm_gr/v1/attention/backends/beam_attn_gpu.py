@@ -111,6 +111,12 @@ def prefill_attention(
     assert cu_seqlens_q is not None, "query_start_loc must not be None for prefill attention"
     assert seqused_k is not None, "seq_lens must not be None for prefill attention"
 
+    # Compute only the real rows: FA2 silently ignores query rows beyond
+    # cu_seqlens_q[-1], but slicing keeps the fast path aligned with the NPU
+    # FIA convention (queryT == last(actual_seq_qlen)).
+    num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
+    query = query[:num_actual_tokens]
+
     std_out = flash_attn_varlen_func(
         q=query,
         k=key_cache,

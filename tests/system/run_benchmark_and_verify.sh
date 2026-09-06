@@ -402,7 +402,8 @@ stop_server
 
 # Run beam star check
 start_server "beam-star" 5 \
-    --max_num_seqs 2048 \
+    --max_num_seqs 128 \
+    --gpu-memory-utilization 0.8 \
     --max_num_batched_tokens 16384
 
 output=$(python -m benchmarks.open_one_rec.one_rec_main \
