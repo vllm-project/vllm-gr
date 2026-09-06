@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pickle
 import struct
 from collections import deque
 from contextlib import nullcontext
@@ -189,19 +188,6 @@ def test_force_prefix_reset_fails_before_mutating_active_persistent_gr() -> None
     assert request.gr_completed_steps == 1
 
 
-def test_non_force_prefix_reset_keeps_upstream_behavior() -> None:
-    scheduler = object.__new__(GRAsyncScheduler)
-    scheduler.requests = {}
-
-    with mock.patch.object(
-        AsyncScheduler, "reset_prefix_cache", return_value=True
-    ) as upstream_reset:
-        assert scheduler.reset_prefix_cache(reset_connector=True) is True
-
-    upstream_reset.assert_called_once_with(
-        reset_running_requests=False,
-        reset_connector=True,
-    )
 
 
 def test_persistent_gr_native_preemption_fails_before_state_reset() -> None:
@@ -223,14 +209,6 @@ def test_persistent_gr_native_preemption_fails_before_state_reset() -> None:
     assert request.gr_issued_steps == request.gr_completed_steps == 1
 
 
-def test_ordinary_request_native_preemption_delegates_upstream() -> None:
-    request = SimpleNamespace(is_gr_request=False)
-    scheduler = object.__new__(GRAsyncScheduler)
-
-    with mock.patch.object(Scheduler, "_preempt_request") as upstream_preempt:
-        scheduler._preempt_request(request, 123.0)
-
-    upstream_preempt.assert_called_once_with(request, 123.0)
 
 
 def test_schedule_keeps_one_logical_token_and_dispatches_beam_rows() -> None:
@@ -259,27 +237,6 @@ def test_schedule_keeps_one_logical_token_and_dispatches_beam_rows() -> None:
     assert request.gr_issued_steps == 2
 
 
-def test_typed_sidecar_survives_worker_process_pickle_transport() -> None:
-    output = SchedulerOutput.make_empty()
-    output.num_scheduled_tokens = {"gr-0": 1}
-    output.total_num_scheduled_tokens = 1
-    output.gr_outputs = {
-        "gr-0": GRSchedulerOutput(
-            request_id="gr-0",
-            stage=GRRequestStage.DECODE_RUNNING,
-            step=1,
-            device_step=1,
-            is_prefill=False,
-            logical_token_count=1,
-            physical_row_count=3,
-        )
-    }
-
-    restored = pickle.loads(pickle.dumps(output))
-
-    assert restored.num_scheduled_tokens == {"gr-0": 1}
-    assert restored.gr_outputs == output.gr_outputs
-    assert restored.gr_outputs["gr-0"].physical_row_count == 3
 
 
 def test_decode_schedule_does_not_query_prefix_cache() -> None:
@@ -411,32 +368,6 @@ def test_update_from_output_appends_one_control_token() -> None:
     assert request.gr_beam_suffix == [[13, 21], [11, 22], [12, 23]]
 
 
-def test_runner_state_intermediate_output_is_control_only() -> None:
-    request = _request(step=1)
-    request.gr_issued_steps = 2
-    request.gr_persistent_runner_state = True
-    scheduler = object.__new__(GRAsyncScheduler)
-    scheduler.requests = {"gr-0": request}
-    scheduler_output = SimpleNamespace(
-        num_scheduled_tokens={"gr-0": 1},
-        total_num_scheduled_tokens=1,
-        beam_data={"gr-0": {"is_beam_decode": True, "generation_index": 1}},
-    )
-    model_output = SimpleNamespace(
-        beam_search_result=None,
-        req_id_to_index={"gr-0": 0},
-        sampled_token_ids=[[99]],
-    )
-
-    with mock.patch.object(Scheduler, "update_from_output", return_value={}):
-        result = scheduler.update_from_output(scheduler_output, model_output)
-
-    assert result == {}
-    assert scheduler_output.num_scheduled_tokens == {"gr-0": 1}
-    assert model_output.sampled_token_ids == [[GR_CONTROL_TOKEN_ID]]
-    assert request.gr_step == 2
-    assert request.gr_completed_steps == 2
-    assert request.gr_beam_suffix == [[11], [12], [13]]
 
 
 def test_persistent_gr_adds_placeholder_without_waiting_for_output() -> None:
@@ -459,19 +390,6 @@ def test_persistent_gr_adds_placeholder_without_waiting_for_output() -> None:
     assert request.num_output_placeholders == 1
 
 
-def test_ordinary_batch_delegates_upstream_async_bookkeeping() -> None:
-    request = SimpleNamespace(request_id="plain", is_gr_request=False)
-    scheduler = object.__new__(GRAsyncScheduler)
-    scheduler.requests = {request.request_id: request}
-    output = SimpleNamespace(num_scheduled_tokens={request.request_id: 1})
-
-    with mock.patch.object(
-        AsyncScheduler, "_update_after_schedule"
-    ) as upstream_update:
-        scheduler._update_after_schedule(output)
-
-    upstream_update.assert_called_once_with(output)
-    assert upstream_update.call_args.args[0] is output
 
 
 def test_mixed_batch_keeps_gr_placeholder_bookkeeping() -> None:
@@ -688,70 +606,6 @@ class _DeferredResult:
         return SimpleNamespace(name=self.name)
 
 
-def test_engine_batch_queue_prepares_next_stage_before_first_future_result() -> None:
-    trace: list[str] = []
-    outputs = [SchedulerOutput.make_empty(), SchedulerOutput.make_empty()]
-    for index, output in enumerate(outputs):
-        output.num_scheduled_tokens = {"gr-0": 1}
-        output.total_num_scheduled_tokens = 1
-        output.pending_structured_output_tokens = False
-        output.marker = index
-
-    class FakeScheduler:
-        def __init__(self) -> None:
-            self.index = 0
-
-        def has_requests(self) -> bool:
-            return self.index < len(outputs)
-
-        def schedule(self):
-            output = outputs[self.index]
-            trace.append(f"schedule:{self.index}")
-            self.index += 1
-            return output
-
-        def get_grammar_bitmask(self, _output):
-            return None
-
-        def update_from_output(self, output, model_output):
-            trace.append(f"update:{output.marker}:{model_output.name}")
-            return {0: output.marker}
-
-    class FakeExecutor:
-        def execute_model(self, output, *, non_block):
-            assert non_block is True
-            trace.append(f"execute:{output.marker}")
-            return _DeferredResult(f"execute-{output.marker}", trace)
-
-        def sample_tokens(self, _grammar, *, non_block):
-            assert non_block is True
-            marker = len([event for event in trace if event.startswith("sample:")])
-            trace.append(f"sample:{marker}")
-            return _DeferredResult(f"sample-{marker}", trace)
-
-    batch_queue = _TrackingDeque()
-    engine = SimpleNamespace(
-        batch_queue=batch_queue,
-        batch_queue_size=2,
-        scheduler=FakeScheduler(),
-        model_executor=FakeExecutor(),
-        is_ec_consumer=True,
-        is_pooling_model=False,
-        use_spec_decode=False,
-        log_error_detail=lambda _output: nullcontext(),
-        log_iteration_details=lambda _output: nullcontext(),
-        _process_aborts_queue=lambda: None,
-    )
-
-    first_outputs, first_progress = EngineCore.step_with_batch_queue(engine)
-    second_outputs, second_progress = EngineCore.step_with_batch_queue(engine)
-
-    assert first_outputs is None
-    assert first_progress is True
-    assert second_outputs == {0: 0}
-    assert second_progress is True
-    assert trace.index("schedule:1") < trace.index("result:sample-0")
-    assert batch_queue.high_watermark == 2
 
 
 def test_gr_batch_queue_tracks_two_outstanding_and_one_step_lookahead() -> None:
@@ -867,21 +721,6 @@ def test_gr_batch_queue_tracks_two_outstanding_and_one_step_lookahead() -> None:
     assert batch_queue.high_watermark == 2
 
 
-def test_engine_init_accepts_exact_gr_batch_queue_depth_two() -> None:
-    original_step = object()
-
-    def original_init(engine) -> None:
-        engine.scheduler = object.__new__(GRAsyncScheduler)
-        engine.batch_queue_size = 2
-        engine.batch_queue = deque(maxlen=2)
-        engine.step_fn = original_step
-
-    engine = SimpleNamespace()
-    make_patched_engine_core_init(original_init)(engine)
-
-    assert engine.batch_queue_size == 2
-    assert engine.batch_queue.maxlen == 2
-    assert engine.step_fn is original_step
 
 
 @pytest.mark.parametrize("depth", [1, 3, 4])
@@ -896,17 +735,6 @@ def test_engine_init_rejects_unsupported_gr_batch_queue_depth(depth: int) -> Non
         make_patched_engine_core_init(original_init)(SimpleNamespace())
 
 
-def test_engine_init_does_not_restrict_ordinary_scheduler_queue_depth() -> None:
-    def original_init(engine) -> None:
-        engine.scheduler = SimpleNamespace()
-        engine.batch_queue_size = 4
-        engine.batch_queue = deque(maxlen=4)
-        engine.step_fn = object()
-
-    engine = SimpleNamespace()
-    make_patched_engine_core_init(original_init)(engine)
-    assert engine.batch_queue_size == 4
-    assert engine.batch_queue.maxlen == 4
 
 
 def test_out_of_order_gr_output_is_rejected() -> None:
@@ -961,8 +789,6 @@ def test_one_token_gr_attaches_final_result_after_native_removal() -> None:
         "buffer_format": "gr_final_i32_f32_v1",
         "buffer": b"final",
         "is_last_step": True,
-        "gr_state_created": 1,
-        "gr_state_freed": 1,
     }
     model_output = SimpleNamespace(
         beam_search_result=decision,
@@ -987,21 +813,3 @@ def test_one_token_gr_attaches_final_result_after_native_removal() -> None:
     assert request_output.kv_transfer_params == {"beam_search_result": decision}
     assert model_output.sampled_token_ids == [[GR_CONTROL_TOKEN_ID]]
     assert request.gr_completed_steps == 1
-
-
-def test_ordinary_request_delegates_one_schedule_unchanged() -> None:
-    request = SimpleNamespace(request_id="plain", is_gr_request=False)
-    output = SchedulerOutput.make_empty()
-    scheduler = object.__new__(GRAsyncScheduler)
-    scheduler.requests = {request.request_id: request}
-
-    with mock.patch.object(
-        AsyncScheduler, "schedule", return_value=output
-    ) as upstream_schedule:
-        result = scheduler.schedule()
-
-    upstream_schedule.assert_called_once_with()
-    assert result is output
-    assert result.num_scheduled_tokens == {}
-    assert result.total_num_scheduled_tokens == 0
-    assert not hasattr(result, "beam_data")

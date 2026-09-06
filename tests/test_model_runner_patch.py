@@ -50,15 +50,6 @@ def test_dispatcher_selects_one_platform_module(
     assert imported == [model_runner_patch._NPU_PATCH_MODULE]
 
 
-def test_missing_optional_diagnostic_installer_does_not_block_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        model_runner_patch,
-        "_get_active_platform_module",
-        lambda: SimpleNamespace(),
-    )
-    assert model_runner_patch.install_active_worker_diagnostic_hook(type("Worker", (), {})) == 0
 
 
 @pytest.mark.parametrize("has_input_prep_hook", [False, True])
@@ -342,7 +333,7 @@ def test_runner_init_selects_gr_backend_once_and_not_after_failed_init() -> None
     assert not hasattr(failed, "_gr_device_backend_initialized")
 
 
-def test_gr_state_named_worker_hooks_install_on_any_backend() -> None:
+def test_gr_state_release_hook_installs_on_any_backend() -> None:
     class Worker:
         pass
 
@@ -350,11 +341,7 @@ def test_gr_state_named_worker_hooks_install_on_any_backend() -> None:
     assert model_runner_patch.install_gr_state_worker_hooks(Worker) == 0
     worker = Worker()
     worker.model_runner = SimpleNamespace(_gr_model_runner_states={})
-    assert worker.get_gr_model_runner_state_stats() == {
-        "created": 0,
-        "freed": 0,
-        "active": 0,
-    }
+    assert worker.release_gr_model_runner_states() == 0
 
 
 def test_shutdown_retains_later_resources_when_gr_release_fails_and_retries(

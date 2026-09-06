@@ -458,61 +458,11 @@ def release_gr_model_runner_states(
                 runner._gr_model_runner_state_cache = state
         if sessions is not None:
             sessions.pop(request_id, None)
-    runner._gr_state_freed_count = int(getattr(runner, "_gr_state_freed_count", 0)) + freed
     if request_ids is None:
         runner._gr_model_runner_state_cache = None
     if first_error is not None:
         raise first_error
     return freed
-
-
-def get_gr_model_runner_state_stats(worker_or_runner: Any) -> dict[str, int]:
-    runner = getattr(worker_or_runner, "model_runner", worker_or_runner)
-    states = getattr(runner, "_gr_model_runner_states", {})
-    return {
-        "created": int(getattr(runner, "_gr_state_created_count", 0)),
-        "freed": int(getattr(runner, "_gr_state_freed_count", 0)),
-        "active": len(states),
-    }
-
-
-def get_gr_memory_stats(worker_or_runner: Any) -> dict[str, int]:
-    """Return generic pool accounting without importing accelerator APIs."""
-
-    runner = getattr(worker_or_runner, "model_runner", worker_or_runner)
-
-    def tensor_bytes(tensors: Any) -> int:
-        seen: set[int] = set()
-        total = 0
-        for tensor in tensors or ():
-            storage_fn = getattr(tensor, "untyped_storage", None)
-            if not callable(storage_fn):
-                continue
-            storage = storage_fn()
-            pointer = int(storage.data_ptr())
-            if pointer in seen:
-                continue
-            seen.add(pointer)
-            total += int(storage.nbytes())
-        return total
-
-    native_kv_bytes = tensor_bytes(getattr(runner, "kv_caches", ()))
-    context = getattr(runner, "_beam_context", None)
-    beam_kv_tensors = []
-    if context is not None:
-        for pool in getattr(context, "pools", ()):
-            beam_kv_tensors.extend((pool.unshared_key, pool.unshared_value))
-    workspaces = getattr(runner, "_beam_postprocess_workspaces", None)
-    return {
-        "native_kv_bytes": native_kv_bytes,
-        "beam_kv_bytes": tensor_bytes(beam_kv_tensors),
-        "workspace_bytes": int(getattr(workspaces, "device_memory_bytes", 0)),
-        "gr_state_peak_bytes": int(getattr(runner, "_gr_state_peak_bytes", 0)),
-        "graph_pool_allocated_bytes": int(getattr(runner, "_gr_graph_pool_allocated_bytes", 0)),
-        "graph_pool_reserved_bytes": int(getattr(runner, "_gr_graph_pool_reserved_bytes", 0)),
-    }
-
-
 def unpack_gr_final_output(
     output: Any,
 ) -> tuple[list[list[int]], list[list[int]], list[list[float]], list[float]] | None:

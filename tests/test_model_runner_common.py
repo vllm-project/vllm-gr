@@ -772,7 +772,6 @@ def test_stale_persistent_session_releases_state_owner_before_slot_reuse() -> No
     assert new_session.session_id == "new"
     assert old_state.released is True
     assert runner._gr_model_runner_states == {}
-    assert runner._gr_state_freed_count == 1
 
 
 def test_persistent_session_progression_is_owned_only_by_backend() -> None:

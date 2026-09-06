@@ -212,17 +212,17 @@ def test_real_cuda_control_survives_uniproc_abort_and_shutdown(
             abort(engine, ["old"])
             # Release acknowledgement does not consume the old control Future.
             assert not requests and not runner._gr_model_runner_states
-            assert pool.occupied_slots == 1 and output_transport.consumed == 0
+            assert pool.occupied_slots == 1
             new = publish("new", 11)
             assert pool.occupied_slots == 2
             assert old.result().sampled_token_ids == [[7]]
             assert new.result().sampled_token_ids == [[11]]
-            assert pool.occupied_slots == 0 and output_transport.consumed == 2
+            assert pool.occupied_slots == 0
     finally:
         # Actual UniProc teardown still reaches the GPU adapter after retirement.
         executor.shutdown()
     assert calls == [("release", ("old",)), "common_shutdown"]
-    assert output_transport.stats()["control_slots_occupied"] == 0
+    assert all(pool.occupied_slots == 0 for _, pool in output_transport._pools.values())
     if release_error:
         from vllm_gr.v1.worker import cuda_async_output as adapter
 
@@ -230,6 +230,5 @@ def test_real_cuda_control_survives_uniproc_abort_and_shutdown(
         # fail before reading the old Host slot, without restoring its owner.
         with pytest.raises(RuntimeError, match="control pool is closed"):
             old.result()
-        assert output_transport.consumed == 0
         assert output_transport not in adapter._QUARANTINED
         assert api.lib.gr_ticket_live() == 0

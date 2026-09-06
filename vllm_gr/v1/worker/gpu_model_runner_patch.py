@@ -41,7 +41,6 @@ from vllm_gr.v1.worker.model_runner_common import (
     _beam_remap_inputs,
     _materialize_logits_indices,
     _reduce_sampler_output_for_worker_decision,
-    get_beam_graph_runtime_stats,
 )
 from vllm_gr.v1.worker.model_runner_common import (  # noqa: E402,F401
     _beam_full_graph_ready as _common_beam_full_graph_ready,
@@ -60,7 +59,6 @@ logger = init_logger(__name__)
 
 _BEAM_POSTPROCESS_LOAD_PATCH_MARKER = "_vllm_gr_beam_postprocess_load_patched"
 _PREFILL_COMPUTE_LOGITS_PATCH_MARKER = "_vllm_gr_prefill_compute_logits_patched"
-_PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
 _INPUT_PREP_READY_PATCH_MARKER = "_vllm_gr_cuda_input_prep_ready_patched"
 
 
@@ -594,12 +592,10 @@ def make_patched_synchronize_input_prep(original):
         # A query error must propagate before any Host staging is modified.
         # A false result is not a release of the previous DMA's ownership.
         if not event.query():
-            self._gr_input_prep_waits = getattr(self, "_gr_input_prep_waits", 0) + 1
             with original(self):
                 yield
             return
 
-        self._gr_input_prep_ready_skips = getattr(self, "_gr_input_prep_ready_skips", 0) + 1
         try:
             yield
         finally:
@@ -610,84 +606,6 @@ def make_patched_synchronize_input_prep(original):
 
     setattr(input_prep_when_ready, _INPUT_PREP_READY_PATCH_MARKER, True)
     return input_prep_when_ready
-
-
-
-
-def get_gr_memory_stats(worker) -> dict[str, int]:
-    """Add CUDA graph-pool accounting to the shared device-neutral totals."""
-
-    from vllm_gr.v1.worker.gr_model_runner_state import get_gr_memory_stats as common_stats
-
-    stats = common_stats(worker)
-    runner = getattr(worker, "model_runner", worker)
-    device = getattr(runner, "device", None)
-    if getattr(device, "type", None) != "cuda":
-        return stats
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    allocated = 0
-    reserved = 0
-    for segment in torch.cuda.memory._snapshot().get("segments", ()):
-        if segment.get("device") != device_index:
-            continue
-        if tuple(segment.get("segment_pool_id", (0, 0))) == (0, 0):
-            continue
-        allocated += int(segment.get("allocated_size", 0))
-        reserved += int(segment.get("total_size", 0))
-    stats["graph_pool_allocated_bytes"] = allocated
-    stats["graph_pool_reserved_bytes"] = reserved
-    transport = getattr(runner, "_gr_cuda_output_transport", None)
-    stats["gr_control_pinned_bytes"] = transport.stats()["control_pinned_bytes"] if transport else 0
-    return stats
-
-
-def get_gr_profile_runtime_stats(worker) -> dict:
-    """Named, read-only CUDA Worker RPC for attributable profiling."""
-    runner = getattr(worker, "model_runner", None)
-    if runner is None:
-        raise RuntimeError("GPU worker has no model_runner for profiling diagnostics")
-    device = getattr(runner, "device", None)
-    device_type = getattr(device, "type", str(device).split(":", 1)[0])
-    if device is None or device_type != "cuda":
-        raise RuntimeError(f"GPU profiling diagnostic requires a CUDA runner, got {device!r}")
-    properties = torch.cuda.get_device_properties(device)
-    runner_class = type(runner)
-    return {
-        "backend": "gpu",
-        "worker_class": f"{type(worker).__module__}.{type(worker).__qualname__}",
-        "runner_class": f"{runner_class.__module__}.{runner_class.__qualname__}",
-        "device": str(device),
-        "device_name": str(getattr(properties, "name", properties)),
-        "device_properties": repr(properties),
-        "memory": {
-            "allocated_bytes": int(torch.cuda.memory_allocated(device)),
-            "reserved_bytes": int(torch.cuda.memory_reserved(device)),
-            "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
-            "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
-        },
-        "memory_components": get_gr_memory_stats(worker),
-        "beam_graph": get_beam_graph_runtime_stats(worker),
-        "input_prep": {
-            "ready_event_skips": int(getattr(runner, "_gr_input_prep_ready_skips", 0)),
-            "not_ready_upstream_waits": int(getattr(runner, "_gr_input_prep_waits", 0)),
-        },
-        "control_output": (
-            runner._gr_cuda_output_transport.stats()
-            if getattr(runner, "_gr_cuda_output_transport", None) is not None else None
-        ),
-    }
-
-
-def install_worker_diagnostic_hook(worker_cls: type) -> int:
-    """Install the CUDA diagnostic as a safe named utility RPC."""
-    if getattr(worker_cls, _PROFILE_DIAGNOSTIC_HOOK_MARKER, False):
-        return 0
-    worker_cls.get_gr_profile_runtime_stats = get_gr_profile_runtime_stats  # type: ignore[attr-defined]
-    setattr(worker_cls, _PROFILE_DIAGNOSTIC_HOOK_MARKER, True)
-    return 1
-
 
 def _install_cuda_prefill_compute_logits_hook(runner) -> bool:
     """Place the prepared TopK chain immediately after LM-Head returns."""
@@ -1270,15 +1188,6 @@ def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
                     result[0],
                     result[1],
                     new_descriptor,
-                )
-                # Count only real runtime dispatches.  Startup beam capture
-                # calls ``_dummy_beam_forward`` directly and therefore never
-                # reaches this branch.  The counter gives integration tests
-                # and profiling harnesses an authoritative, worker-local
-                # assertion that a request selected the captured FULL graph;
-                # it is deliberately outside the graph and has no CUDA work.
-                self._beam_graph_full_dispatch_count = (
-                    int(getattr(self, "_beam_graph_full_dispatch_count", 0)) + 1
                 )
                 result = (CUDAGraphMode.FULL, new_descriptor) + result[2:]
 

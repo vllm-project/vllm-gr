@@ -1723,8 +1723,7 @@ def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
 
             with record_function_or_nullcontext("gr_final_output"):
                 payload = gr_state.finalize_output(runner)
-            payload["gr_state_created"] = 1
-            payload["gr_state_freed"] = release_gr_model_runner_states(runner, [req_id])
+            release_gr_model_runner_states(runner, [req_id])
             runner._beam_decision_result = payload
         else:
             runner._beam_decision_result = None
@@ -1742,8 +1741,7 @@ def _run_persistent_gr_state(runner: Any, sampler_output: Any) -> bool:
 
         with record_function_or_nullcontext("gr_final_output"):
             payload = gr_state.finalize_output(runner)
-        payload["gr_state_created"] = 1
-        payload["gr_state_freed"] = release_gr_model_runner_states(runner, [req_id])
+        release_gr_model_runner_states(runner, [req_id])
         runner._beam_decision_result = payload
     else:
         runner._beam_decision_result = None
@@ -1797,14 +1795,6 @@ def _create_persistent_gr_state(runner: Any, req_id: str, mdata: dict[str, Any])
         raise
     runner._beam_sessions[req_id] = session
 
-    active_state_bytes = gr_state.device_memory_bytes + sum(
-        state.device_memory_bytes for state in states.values()
-    )
-    runner._gr_state_peak_bytes = max(
-        int(getattr(runner, "_gr_state_peak_bytes", 0)),
-        active_state_bytes,
-    )
-    runner._gr_state_created_count = int(getattr(runner, "_gr_state_created_count", 0)) + 1
     states[req_id] = gr_state
     return gr_state
 

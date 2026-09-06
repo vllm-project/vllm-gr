@@ -70,9 +70,6 @@ class CudaOutputTransport:
         self._terminal_drained = False
         self._notification_stream = None
         self._epoch = 0
-        self.copies = 0
-        self.consumed = 0
-        self.high_watermark = 0
 
     def check_live(self):
         if self._failure is not None:
@@ -137,7 +134,6 @@ class CudaOutputTransport:
         frame.pool, frame.lease = pool, lease
         frame.storage = pool.begin_device_use(lease)
         frame.producer_active = True
-        self.high_watermark = max(self.high_watermark, pool.occupied_slots)
         return frame.storage.device
 
     def quarantine(self, error):
@@ -171,17 +167,6 @@ class CudaOutputTransport:
             self._terminal_drained = True
             self._pools.clear()
             _QUARANTINED[:] = [transport for transport in _QUARANTINED if transport is not self]
-
-    def stats(self):
-        return {
-            "control_d2h_count": self.copies,
-            "control_d2h_bytes": self.copies * 4,
-            "control_consumed": self.consumed,
-            "control_slots_high_watermark": self.high_watermark,
-            "control_slots_occupied": sum(pool.occupied_slots for _, pool in self._pools.values()),
-            "control_pinned_bytes": len(self._pools) * 8,
-        }
-
 
 @dataclass(slots=True)
 class _SamplingFrame:
@@ -286,7 +271,6 @@ def install_async_output_adapter(cls):
         finally:
             frame.producer_active = False
         frame.constructed = True
-        frame.transport.copies += 1
         self._gr_control_frame = frame
         self._gr_control_consumed = False
 
@@ -312,7 +296,6 @@ def install_async_output_adapter(cls):
         output.logprobs = None
         self._gr_control_consumed = True
         del self._sampled_token_ids
-        frame.transport.consumed += 1
         return output
 
     cls.__init__, cls.get_output = initialize, get_output

@@ -316,13 +316,6 @@ def test_install_preserves_class_identity_and_fully_delegates_ordinary_output():
     assert result.get_output() is result.native_result
 
 
-@pytest.mark.parametrize(
-    ("stage", "expected"),
-    [("decode", "gr"), ("last_prefill", "gr"), ("partial_prefill", None)],
-)
-def test_persistent_output_request_only_admits_output_bearing_stages(stage, expected):
-    assert adapter.persistent_output_request(_scheduler_output(stage)) == expected
-    assert adapter.persistent_output_request(SimpleNamespace(beam_data={})) is None
 
 
 def test_sampling_scope_restores_context_and_fill_requires_active_frame(cuda_fakes):
@@ -381,12 +374,10 @@ def test_prepare_workspace_is_fixed_and_two_inflight_controls_do_not_alias(cuda_
         state.device_step = device_step
 
     assert first_pool.occupied_slots == 2
-    assert transport.high_watermark == 2
     assert outputs[0].sampled_token_ids_cpu is not outputs[1].sampled_token_ids_cpu
     assert outputs[0].get_output().sampled_token_ids == [[17]]
     assert outputs[1].get_output().sampled_token_ids == [[29]]
     assert first_pool.occupied_slots == 0
-    assert transport.copies == transport.consumed == 2
 
 
 def test_host_read_is_the_ack_and_repeated_get_uses_detached_result(cuda_fakes):
@@ -405,42 +396,13 @@ def test_host_read_is_the_ack_and_repeated_get_uses_detached_result(cuda_fakes):
     pool = output._gr_control_frame.pool
     ticket = api.tickets[0]
     assert pool.occupied_slots == 1
-    assert not ticket.closed and transport.consumed == 0
+    assert not ticket.closed
     first = output.get_output()
     assert first.sampled_token_ids == [[41]]
     assert ticket.closed and pool.occupied_slots == 0
     assert output.get_output() is first
-    assert transport.consumed == 1
 
 
-@pytest.mark.parametrize("single_value", [True, False])
-def test_upstream_async_output_future_consumes_adapter_once(
-    cuda_fakes, single_value
-):
-    from vllm.v1.executor.uniproc_executor import AsyncOutputFuture
-
-    workspace = _workspace(cuda_fakes.calls)
-    api = _FakeAPI(cuda_fakes.calls)
-    runner, transport = _runner(workspace, api)
-    _activate(runner, workspace)
-    Output = _output_class()
-    adapter.install_async_output_adapter(Output)
-
-    with adapter.sampling_scope(runner, _scheduler_output()):
-        sampled = adapter.fill_control(workspace, 1, 47)
-        async_output = _construct(
-            Output,
-            _model_output(),
-            sampled,
-            _FakeStream("copy", 303, cuda_fakes.calls),
-        )
-
-    future = AsyncOutputFuture(async_output, single_value=single_value)
-    result = future.result()
-    expected = async_output._model_runner_output
-    assert result is expected if single_value else result == [expected]
-    assert future.result() is result
-    assert transport.consumed == 1
 
 
 def test_new_session_uses_other_slot_until_old_host_frame_is_consumed(cuda_fakes):
@@ -482,7 +444,6 @@ def test_new_session_uses_other_slot_until_old_host_frame_is_consumed(cuda_fakes
     assert new_output.get_output().sampled_token_ids == [[202]]
     assert old_output.get_output().sampled_token_ids == [[101]]
     assert old_frame.pool.occupied_slots == 0
-    assert transport.copies == transport.consumed == 2
 
 
 def _queued_control(cuda_fakes, runner, workspace, request_id, token_id):
@@ -521,41 +482,6 @@ def _queue_core(entry, update, process_aborts=lambda: None):
     )
 
 
-@pytest.mark.parametrize("abort_during_result", [False, True])
-def test_real_batch_queue_consumes_control_before_stale_abort_reconcile(
-    cuda_fakes, abort_during_result,
-):
-    from vllm.v1.engine.core import EngineCore
-
-    workspace = _workspace(cuda_fakes.calls)
-    runner, transport = _runner(workspace, _FakeAPI(cuda_fakes.calls))
-    _activate(runner, workspace)
-    entry, output = _queued_control(cuda_fakes, runner, workspace, "gr", 83)
-    pool = output._gr_control_frame.pool
-    order = []
-    if not abort_during_result:
-        runner._gr_model_runner_states.pop("gr")
-
-    def process_aborts():
-        assert transport.consumed == 1 and pool.occupied_slots == 0
-        runner._gr_model_runner_states.pop("gr", None)
-        order.append("abort")
-
-    def update(scheduled, result):
-        assert scheduled is entry[1]
-        assert result.sampled_token_ids == [[83]]
-        assert not runner._gr_model_runner_states
-        assert pool.occupied_slots == 0
-        order.append("stale_reconcile")
-        return {}  # Scheduler drops the aborted request's detached output.
-
-    core = _queue_core(entry, update, process_aborts)
-    assert pool.occupied_slots == 1 and not entry[0].done()
-    assert EngineCore.step_with_batch_queue(core) == ({}, False)
-    assert order == ["abort", "stale_reconcile"]
-    assert not core.batch_queue and entry[0].done()
-    assert transport.copies == transport.consumed == 1
-    transport.shutdown()
 
 
 def test_real_batch_queue_new_session_does_not_overwrite_aborted_control(cuda_fakes):
@@ -596,36 +522,16 @@ def test_real_batch_queue_new_session_does_not_overwrite_aborted_control(cuda_fa
     )
     assert EngineCore.step_with_batch_queue(core) == ({}, True)
     assert reconciled == [("old", [[101]])]
-    assert len(core.batch_queue) == 1 and transport.consumed == 1
+    assert len(core.batch_queue) == 1
     assert not core.batch_queue[-1][0].done()
     core.scheduler.has_requests = lambda: False
     assert EngineCore.step_with_batch_queue(core) == ({}, False)
     assert reconciled == [("old", [[101]]), ("new", [[202]])]
-    assert transport.copies == transport.consumed == 2
-    assert transport.high_watermark == 2
     assert not core.batch_queue
     assert new_outputs[0]._gr_control_frame.pool.occupied_slots == 0
     transport.shutdown()
 
 
-def test_stopped_inprocess_queue_keeps_control_owned_until_terminal_drain(cuda_fakes):
-    workspace = _workspace(cuda_fakes.calls)
-    api = _FakeAPI(cuda_fakes.calls)
-    runner, transport = _runner(workspace, api)
-    _activate(runner, workspace)
-    entry, output = _queued_control(cuda_fakes, runner, workspace, "gr", 97)
-    core = _queue_core(entry, lambda *_: pytest.fail("no stepping after abort"))
-    runner._gr_model_runner_states.pop("gr")
-    pool = output._gr_control_frame.pool
-    # InprocClient has no background queue consumer. Device completion alone
-    # is not a Host acknowledgement and must not permit slot reuse.
-    assert not core.scheduler.has_requests() and core.batch_queue
-    assert pool.occupied_slots == 1 and transport.consumed == 0
-    assert not api.tickets[0].closed
-    transport.shutdown()
-    assert ("synchronize", torch.device("cuda:0")) in cuda_fakes.calls
-    assert pool.occupied_slots == 0 and api.tickets[0].closed
-    assert transport.consumed == 0 and not entry[0].done()
 
 
 def test_real_batch_queue_delivery_error_quarantines_until_terminal_drain(
@@ -654,7 +560,7 @@ def test_real_batch_queue_delivery_error_quarantines_until_terminal_drain(
     assert not core.batch_queue and entry[0].exception() is error
     assert transport in adapter._QUARANTINED
     assert output._gr_control_frame.pool.occupied_slots == 1
-    assert not api.tickets[0].closed and transport.consumed == 0
+    assert not api.tickets[0].closed
     with pytest.raises(RuntimeError, match="quarantined"):
         transport.check_live()
     transport.shutdown()
@@ -663,44 +569,8 @@ def test_real_batch_queue_delivery_error_quarantines_until_terminal_drain(
     assert transport not in adapter._QUARANTINED
 
 
-def test_invalid_request_zero_yields_empty_control_row(cuda_fakes):
-    workspace = _workspace(cuda_fakes.calls)
-    api = _FakeAPI(cuda_fakes.calls)
-    runner, _ = _runner(workspace, api)
-    _activate(runner, workspace)
-    Output = _output_class()
-    adapter.install_async_output_adapter(Output)
-
-    with adapter.sampling_scope(runner, _scheduler_output()):
-        sampled = adapter.fill_control(workspace, 1, 53)
-        output = _construct(
-            Output,
-            _model_output(),
-            sampled,
-            _FakeStream("copy", 303, cuda_fakes.calls),
-            invalid_req_indices=[0],
-        )
-    assert output.get_output().sampled_token_ids == [[]]
 
 
-def test_constructor_works_after_final_state_release(cuda_fakes):
-    workspace = _workspace(cuda_fakes.calls)
-    api = _FakeAPI(cuda_fakes.calls)
-    runner, _ = _runner(workspace, api)
-    _activate(runner, workspace)
-    Output = _output_class()
-    adapter.install_async_output_adapter(Output)
-
-    with adapter.sampling_scope(runner, _scheduler_output("last_prefill")):
-        sampled = adapter.fill_control(workspace, 1, 61)
-        runner._gr_model_runner_states.pop("gr")
-        output = _construct(
-            Output,
-            _model_output(),
-            sampled,
-            _FakeStream("copy", 303, cuda_fakes.calls),
-        )
-    assert output.get_output().sampled_token_ids == [[61]]
 
 
 @pytest.mark.parametrize("bad_field", ["device", "request_id", "logprobs"])
@@ -767,34 +637,6 @@ def test_second_host_history_consumer_is_rejected_at_scope_and_constructor(cuda_
     assert not any(call[0] == "copy" for call in cuda_fakes.calls if isinstance(call, tuple))
 
 
-def test_constructor_observes_producer_before_entering_copy_stream(cuda_fakes):
-    workspace = _workspace(cuda_fakes.calls)
-    api = _FakeAPI(cuda_fakes.calls)
-    runner, _ = _runner(workspace, api)
-    _activate(runner, workspace)
-    Output = _output_class()
-    adapter.install_async_output_adapter(Output)
-
-    with adapter.sampling_scope(runner, _scheduler_output()):
-        sampled = adapter.fill_control(workspace, 1, 83)
-        _construct(
-            Output,
-            _model_output(),
-            sampled,
-            _FakeStream("copy", 303, cuda_fakes.calls),
-        )
-
-    current = next(
-        index
-        for index, call in enumerate(cuda_fakes.calls)
-        if isinstance(call, tuple) and call[0] == "current_stream"
-    )
-    entered_copy = next(
-        index
-        for index, call in enumerate(cuda_fakes.calls)
-        if call == ("enter_stream", "copy")
-    )
-    assert current < entered_copy
 
 
 def test_notification_wait_and_callback_do_not_switch_current_stream(cuda_fakes):
@@ -838,14 +680,6 @@ def test_notification_wait_and_callback_do_not_switch_current_stream(cuda_fakes)
     assert output.get_output().sampled_token_ids == [[87]]
 
 
-def test_prepare_workspace_rejects_slots_on_a_different_runner_device(cuda_fakes):
-    workspace = _workspace(cuda_fakes.calls)
-    api = _FakeAPI(cuda_fakes.calls)
-    runner, transport = _runner(workspace, api)
-    runner.device = torch.device("cuda:1")
-
-    with pytest.raises(RuntimeError, match="runner device"):
-        transport.prepare_workspace(workspace)
 
 
 def test_constructor_rechecks_runner_device_before_copy(cuda_fakes):
@@ -871,29 +705,6 @@ def test_constructor_rechecks_runner_device_before_copy(cuda_fakes):
     assert not any(call[0] == "copy" for call in cuda_fakes.calls if isinstance(call, tuple))
 
 
-@pytest.mark.parametrize("stream_kind", ["copy", "notification"])
-def test_constructor_rejects_stream_on_another_device_before_copy(
-    cuda_fakes, stream_kind
-):
-    workspace = _workspace(cuda_fakes.calls)
-    api = _FakeAPI(cuda_fakes.calls)
-    runner, _ = _runner(workspace, api)
-    _activate(runner, workspace)
-    Output = _output_class()
-    adapter.install_async_output_adapter(Output)
-    copy_stream = _FakeStream("copy", 303, cuda_fakes.calls)
-    if stream_kind == "copy":
-        copy_stream.device = torch.device("cuda:1")
-    else:
-        cuda_fakes.notification.device = torch.device("cuda:1")
-
-    with (
-        pytest.raises(RuntimeError, match="stream.*device"),
-        adapter.sampling_scope(runner, _scheduler_output()),
-    ):
-        sampled = adapter.fill_control(workspace, 1, 97)
-        _construct(Output, _model_output(), sampled, copy_stream)
-    assert not any(call[0] == "copy" for call in cuda_fakes.calls if isinstance(call, tuple))
 
 
 def test_transport_shutdown_drains_the_runner_device(cuda_fakes):

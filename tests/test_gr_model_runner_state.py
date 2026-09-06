@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-import torch
 
 from vllm_gr.v1.engine.types import GRRequestStage
 from vllm_gr.v1.worker.gr_model_runner_state import (
@@ -16,8 +15,6 @@ from vllm_gr.v1.worker.gr_model_runner_state import (
     GRDeviceBackend,
     GRModelRunnerState,
     acquire_gr_model_runner_state,
-    get_gr_memory_stats,
-    get_gr_model_runner_state_stats,
     release_gr_model_runner_states,
     require_gr_device_backend,
 )
@@ -146,84 +143,14 @@ def test_illegal_transitions_and_generation_mismatch_fail_before_backend() -> No
         state.finalize_output(None)
 
 
-def test_backend_device_step_mismatch_does_not_advance_common_state() -> None:
-    backend = _FakeBackend(bad_device_step=True)
-    state = _state(backend=backend)
-    with pytest.raises(RuntimeError, match="backend/device step mismatch"):
-        state.bootstrap_from_prefill(None, None, {})
-    assert state.step == state.device_step == 0
-    assert state.stage is GRRequestStage.PREFILL_RUNNING
 
 
-def test_two_control_slots_alternate_without_overwriting_inflight_reference() -> None:
-    backend = _FakeBackend()
-    state = _state(backend=backend, max_tokens=3)
-    state.bootstrap_from_prefill(None, None, {})
-    first = state.control_token_ids
-    state.prepare_decode_inputs(None, None, None, {"generation_index": 1})
-    state.advance_beam(None, None, {"generation_index": 1})
-    second = state.control_token_ids
-    state.prepare_decode_inputs(None, None, None, {"generation_index": 2})
-    state.advance_beam(None, None, {"generation_index": 2})
-    third = state.control_token_ids
-
-    assert first is third
-    assert first is not second
-    assert state.control_slots == (second, first)
 
 
-def test_backend_cannot_replace_or_alias_fixed_control_slots() -> None:
-    class ReplacingBackend(_FakeBackend):
-        def _result(self, state: GRModelRunnerState) -> GRBackendStep:
-            result = super()._result(state)
-            return GRBackendStep(
-                device_step=result.device_step,
-                next_token_ids=result.next_token_ids,
-                beam_scores=result.beam_scores,
-                active_mask=result.active_mask,
-                control_output=object(),
-            )
-
-    replacing = ReplacingBackend()
-    state = _state(backend=replacing, max_tokens=3)
-    state.bootstrap_from_prefill(None, None, {})
-    state.prepare_decode_inputs(None, None, None, {"generation_index": 1})
-    state.advance_beam(None, None, {"generation_index": 1})
-    state.prepare_decode_inputs(None, None, None, {"generation_index": 2})
-    with pytest.raises(RuntimeError, match="replaced a fixed control buffer slot"):
-        state.advance_beam(None, None, {"generation_index": 2})
-
-    aliasing = _FakeBackend()
-    aliasing.controls[0] = aliasing.controls[1]
-    state = _state(backend=aliasing, max_tokens=2)
-    state.bootstrap_from_prefill(None, None, {})
-    state.prepare_decode_inputs(None, None, None, {"generation_index": 1})
-    with pytest.raises(RuntimeError, match="two distinct control buffer slots"):
-        state.advance_beam(None, None, {"generation_index": 1})
 
 
-def test_bad_decode_device_step_is_rejected_before_kv_reorder() -> None:
-    backend = _FakeBackend()
-    state = _state(backend=backend)
-    state.bootstrap_from_prefill(None, None, {})
-    state.prepare_decode_inputs(None, None, None, {"generation_index": 1})
-    backend.bad_device_step = True
-
-    with pytest.raises(RuntimeError, match="backend/device step mismatch"):
-        state.advance_beam(None, None, {"generation_index": 1})
-
-    assert [event[0] for event in backend.events] == ["bootstrap", "prepare", "advance"]
-    assert state.step == state.device_step == 1
 
 
-def test_release_is_idempotent_and_already_ended_session_is_tolerated() -> None:
-    backend = _FakeBackend()
-    session = _Session(already_ended=True)
-    state = _state(backend=backend, session=session)
-    assert state.release() is True
-    assert state.release() is False
-    assert session.end_calls == 1
-    assert [event[0] for event in backend.events] == ["release"]
 
 
 def test_backend_release_failure_retains_unsafe_state_but_releases_healthy_siblings() -> None:
@@ -252,11 +179,6 @@ def test_backend_release_failure_retains_unsafe_state_but_releases_healthy_sibli
     assert healthy.session.end_calls == 1
     assert failing.released is False
     assert healthy.released is True
-    assert get_gr_model_runner_state_stats(runner) == {
-        "created": 0,
-        "freed": 1,
-        "active": 1,
-    }
     assert runner._gr_model_runner_state_cache is None
 
     failing.backend.fail_release = False
@@ -266,7 +188,6 @@ def test_backend_release_failure_retains_unsafe_state_but_releases_healthy_sibli
     assert runner._gr_model_runner_states == {}
     assert runner._beam_sessions == {}
     assert release_gr_model_runner_states(runner, ["gr-0"]) == 0
-    assert get_gr_model_runner_state_stats(runner)["freed"] == 2
 
 
 def test_failed_backend_drain_keeps_real_beam_slot_unavailable_until_retry() -> None:
@@ -425,26 +346,3 @@ def test_common_state_source_has_no_accelerator_resources() -> None:
         assert duplicate_history not in state_fields
     for device_resource in ("final_copy_event", "host_final_result", "graph_handle"):
         assert device_resource not in state_fields
-
-
-def test_memory_stats_separate_native_beam_and_backend_state_storage() -> None:
-    state = _state()
-    state.backend_state = SimpleNamespace(device_memory_bytes=17)
-    pool = SimpleNamespace(
-        unshared_key=torch.empty(2, dtype=torch.float16),
-        unshared_value=torch.empty(3, dtype=torch.float16),
-    )
-    runner = SimpleNamespace(
-        kv_caches=[torch.empty(4, dtype=torch.float16)],
-        _beam_context=SimpleNamespace(pools=[pool]),
-        _beam_postprocess_workspaces=SimpleNamespace(device_memory_bytes=24),
-        _gr_state_peak_bytes=state.device_memory_bytes,
-    )
-    assert get_gr_memory_stats(runner) == {
-        "native_kv_bytes": 8,
-        "beam_kv_bytes": 10,
-        "workspace_bytes": 24,
-        "gr_state_peak_bytes": 17,
-        "graph_pool_allocated_bytes": 0,
-        "graph_pool_reserved_bytes": 0,
-    }

@@ -13,7 +13,6 @@ from vllm.logger import init_logger
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_CAPTURE_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
-    get_beam_graph_runtime_stats,
     is_worker_runner_patched,
     make_patched_execute_model,
 )
@@ -24,7 +23,6 @@ _GPU_PATCH_MODULE = "vllm_gr.v1.worker.gpu_model_runner_patch"
 _NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu_model_runner_patch"
 _CONSTRAINT_LOAD_PATCH_MARKER = "_vllm_gr_constraint_load_patched"
 _CONSTRAINT_SHUTDOWN_PATCH_MARKER = "_vllm_gr_constraint_shutdown_patched"
-_BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 _GR_STATE_RELEASE_HOOK_MARKER = "_vllm_gr_state_release_hook_installed"
 _GR_BACKEND_INIT_PATCH_MARKER = "_vllm_gr_backend_init_patched"
 
@@ -51,18 +49,9 @@ def install_gr_state_worker_hooks(worker_cls: type) -> int:
 
     if getattr(worker_cls, _GR_STATE_RELEASE_HOOK_MARKER, False):
         return 0
-    from vllm_gr.v1.worker.gr_model_runner_state import (
-        get_gr_memory_stats,
-        get_gr_model_runner_state_stats,
-        release_gr_model_runner_states,
-    )
+    from vllm_gr.v1.worker.gr_model_runner_state import release_gr_model_runner_states
 
     worker_cls.release_gr_model_runner_states = release_gr_model_runner_states
-    worker_cls.get_gr_model_runner_state_stats = get_gr_model_runner_state_stats
-    platform_memory_stats = getattr(
-        _get_active_platform_module(), "get_gr_memory_stats", get_gr_memory_stats
-    )
-    worker_cls.get_gr_memory_stats = platform_memory_stats
     setattr(worker_cls, _GR_STATE_RELEASE_HOOK_MARKER, True)
     return 1
 
@@ -223,18 +212,6 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
     return _get_active_platform_module().discover_worker_runners()
 
 
-def install_active_worker_diagnostic_hook(worker_cls: type) -> int:
-    """Install only the diagnostic supplied by the active backend adapter."""
-    installer = getattr(_get_active_platform_module(), "install_worker_diagnostic_hook", None)
-    if not callable(installer):
-        # Profiling diagnostics are observational, never a runtime dependency.
-        # The profiling harness calls the named RPC and fails its evidence gate
-        # if a backend does not provide it; ordinary patch initialization and
-        # third-party/fake adapters must retain their pre-diagnostic behavior.
-        return 0
-    return int(installer(worker_cls))
-
-
 def _install_active_worker_resource_hook() -> None:
     """Mount named vllm-gr utility RPCs on the active CUDA Worker class."""
 
@@ -247,15 +224,7 @@ def _install_active_worker_resource_hook() -> None:
     from vllm_gr.constraints.worker_inject import install_worker_resource_hook
 
     install_worker_resource_hook(Worker)
-    install_active_worker_diagnostic_hook(Worker)
     install_gr_state_worker_hooks(Worker)
-    if not getattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
-        # A named method is required here: vLLM's safe msgpack utility channel
-        # intentionally rejects callable serialization unless insecure pickle
-        # fallback is enabled.  The profiling contract must work under spawn
-        # without weakening that policy.
-        Worker.get_gr_beam_graph_runtime_stats = get_beam_graph_runtime_stats  # type: ignore[attr-defined]
-        setattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, True)
 
 
 def apply_worker_patches() -> None:

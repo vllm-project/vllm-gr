@@ -449,8 +449,6 @@ def test_persistent_cuda_final_lineage_matches_enumeration(
         assert state.control_slots[0] is workspace.gr_control_output_0
         assert state.control_slots[1] is workspace.gr_control_output_1
         assert state.backend_state.control_phase == 0
-        assert transport.copies == steps
-        assert transport.consumed == steps
     finally:
         try:
             transport.shutdown()

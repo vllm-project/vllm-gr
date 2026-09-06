@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import Future
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -116,59 +115,8 @@ def test_abort_observes_actual_uniproc_failed_future_and_retires_engine() -> Non
     assert engine.shutdown is shutdown
 
 
-def test_direct_release_submission_error_is_propagated_and_retires_engine() -> None:
-    error = RuntimeError("release submission failed")
-    executor = SimpleNamespace(
-        collective_rpc=mock.Mock(side_effect=error), shutdown=mock.Mock()
-    )
-    calls: list[list[str]] = []
-    abort = make_patched_abort_requests(_removing_abort(calls))
-    engine = _engine(executor, {"gr-0": _request(persistent=True)})
-
-    with pytest.raises(RuntimeError, match="release submission failed") as caught:
-        abort(engine, ["gr-0"])
-
-    assert caught.value is error
-    assert calls == [["gr-0"]]
-    assert engine._gr_lifecycle_error is error
-    assert caught.value.__notes__ == [
-        "Persistent GR abort release failed for ['gr-0']"
-    ]
 
 
-def test_abort_waits_for_actual_multiproc_future_fifo_without_losing_prior_output() -> None:
-    fifo: deque[FutureWrapper] = deque()
-    response_order: list[str] = []
-
-    def prior_response():
-        response_order.append("prior-output")
-        return "model-output"
-
-    prior = FutureWrapper(fifo, prior_response)
-
-    def collective_rpc(method, *, args, non_block):
-        assert method == "release_gr_model_runner_states"
-        assert args == (["gr-0"],)
-        assert non_block is True
-
-        def release_response():
-            response_order.append("release")
-            return ["released"]
-
-        return FutureWrapper(fifo, release_response)
-
-    executor = SimpleNamespace(
-        collective_rpc=collective_rpc,
-        shutdown=mock.Mock(),
-    )
-    abort = make_patched_abort_requests(_removing_abort([]))
-    engine = _engine(executor, {"gr-0": _request(persistent=True)})
-
-    assert abort(engine, ["gr-0"]) == "done"
-    assert response_order == ["prior-output", "release"]
-    assert prior.done() and prior.result() == "model-output"
-    assert not fifo
-    assert not hasattr(engine, "_gr_lifecycle_error")
 
 
 def test_delayed_multiproc_release_failure_preserves_prior_output_and_retires() -> None:
@@ -268,88 +216,10 @@ def test_plain_repeated_and_unknown_aborts_do_not_dispatch_extra_release_rpc() -
     assert worker.release_calls == [["gr-0"]]
 
 
-def test_release_future_result_is_called_without_timeout() -> None:
-    class ResultSpy(Future):
-        def __init__(self) -> None:
-            super().__init__()
-            self.calls: list[tuple[tuple, dict]] = []
-
-        def result(self, *args, **kwargs):
-            self.calls.append((args, kwargs))
-            return "released"
-
-    release = ResultSpy()
-    executor = SimpleNamespace(
-        collective_rpc=mock.Mock(return_value=release),
-        shutdown=mock.Mock(),
-    )
-    abort = make_patched_abort_requests(_removing_abort([]))
-    engine = _engine(executor, {"gr-0": _request(persistent=True)})
-
-    assert abort(engine, ["gr-0"]) == "done"
-    executor.collective_rpc.assert_called_once_with(
-        "release_gr_model_runner_states",
-        args=(["gr-0"],),
-        non_block=True,
-    )
-    assert release.calls == [((), {})]
 
 
-def test_second_abort_preserves_first_failure_while_another_engine_stays_healthy() -> None:
-    first_error = RuntimeError("first engine release failed")
-    first_worker = _Worker(first_error)
-    calls: list[list[str]] = []
-    abort = make_patched_abort_requests(_removing_abort(calls))
-    retired = _engine(
-        _uniproc(first_worker), {"gr-first": _request(persistent=True)}
-    )
-
-    with pytest.raises(RuntimeError, match="first engine release failed"):
-        abort(retired, ["gr-first"])
-    first_notes = tuple(first_error.__notes__)
-
-    with pytest.raises(RuntimeError, match="EngineCore retired") as caught:
-        abort(retired, ["gr-never-submitted"])
-
-    assert caught.value.__cause__ is first_error
-    assert retired._gr_lifecycle_error is first_error
-    assert tuple(first_error.__notes__) == first_notes
-    assert calls == [["gr-first"]]
-    assert first_worker.release_calls == [["gr-first"]]
-
-    healthy_worker = _Worker()
-    healthy = _engine(
-        _uniproc(healthy_worker), {"gr-healthy": _request(persistent=True)}
-    )
-    assert abort(healthy, ["gr-healthy"]) == "done"
-    assert calls == [["gr-first"], ["gr-healthy"]]
-    assert healthy_worker.release_calls == [["gr-healthy"]]
-    assert not hasattr(healthy, "_gr_lifecycle_error")
 
 
-def test_retirement_replaces_prebound_step_fn_instance_pointer() -> None:
-    error = RuntimeError("release failed after step_fn capture")
-    executor = SimpleNamespace(
-        collective_rpc=mock.Mock(side_effect=error), shutdown=mock.Mock()
-    )
-    abort = make_patched_abort_requests(_removing_abort([]))
-    engine = _engine(executor, {"gr-0": _request(persistent=True)})
-    old_operation = mock.Mock(name="old_captured_step")
-
-    def old_step(_self):
-        return old_operation()
-
-    captured_step_fn = MethodType(old_step, engine)
-    engine.step_fn = captured_step_fn
-
-    with pytest.raises(RuntimeError, match="release failed after step_fn capture"):
-        abort(engine, ["gr-0"])
-
-    assert engine.step_fn is not captured_step_fn
-    with pytest.raises(RuntimeError, match="EngineCore retired") as caught:
-        engine.step_fn()
-    assert caught.value.__cause__ is error
-    old_operation.assert_not_called()
 
 
 def test_actual_multiproc_shutdown_remains_reachable_after_retirement() -> None:

@@ -963,28 +963,6 @@ def _beam_graph_enabled_for_run(runner) -> bool:
     return _get_gr_config(runner).beam_graph_enabled
 
 
-def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
-    """Return capture/dispatch state through ``collective_rpc``.
-
-    vLLM utility RPC callables receive the Worker, while Beam graph state is
-    owned by its ModelRunner.  Keeping this probe in an importable module makes
-    it safe under both ``fork`` and ``spawn`` and lets profiling fail loudly
-    when startup capture succeeded but the measured request ran eager.
-    """
-
-    runner = getattr(worker, "model_runner", None)
-    if runner is None:
-        raise RuntimeError("worker has no model_runner for Beam graph diagnostics")
-    config = _get_gr_config(runner)
-    return {
-        "runner": type(runner).__name__,
-        "beam_graph_enabled": bool(config.beam_graph_enabled),
-        "beam_max_width": config.beam_max_width,
-        "captured_widths": sorted(int(width) for width in getattr(runner, "_beam_graph_keys", ())),
-        "full_dispatches": int(getattr(runner, "_beam_graph_full_dispatch_count", 0)),
-    }
-
-
 def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     """Create a BeamAttentionContext with sizing derived from model + GRConfig.
 

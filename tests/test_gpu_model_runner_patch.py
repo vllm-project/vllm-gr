@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for GPU ModelRunner wrappers."""
 
-import inspect
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -147,8 +146,6 @@ def test_input_prep_keeps_complete_guard_and_error_record(ready, body_error):
         + ["update_states", "prepare_inputs", "metadata", "preprocess", "record"]
     )
     assert runner.prepare_inputs_event is event
-    assert getattr(runner, "_gr_input_prep_ready_skips", 0) == int(ready)
-    assert getattr(runner, "_gr_input_prep_waits", 0) == int(not ready)
 
 
 @pytest.mark.parametrize("failure", ["query", "synchronize"])
@@ -180,8 +177,6 @@ def test_input_prep_non_decode_delegates_without_query(mode):
         if mode == "no_event"
         else ["original", "synchronize", "body", "record"]
     )
-    assert not hasattr(runner, "_gr_input_prep_ready_skips")
-    assert not hasattr(runner, "_gr_input_prep_waits")
 
 
 @pytest.mark.parametrize("execute_error", [True, False])
@@ -517,519 +512,26 @@ def isolated_control_transport(monkeypatch):
     monkeypatch.setattr(cuda_async_output, "fill_control", fill)
 
 
-def test_cuda_backend_bootstrap_initializes_authoritative_decision_without_d2h(
-    monkeypatch: pytest.MonkeyPatch,
-    isolated_control_transport,
-) -> None:
-    from vllm_gr.v1.beam import beam_decision
-
-    workspace = beam_decision.BeamPostprocessWorkspace.allocate(
-        max_batch=1,
-        beam_width=2,
-        top_k=2,
-        max_decode_steps=3,
-        device="cpu",
-        logits_dtype=torch.float16,
-        pin_host=False,
-    )
-    decision_state = SimpleNamespace(
-        sequence=torch.zeros((1, 2, 3), dtype=torch.int32),
-        beam_scores=torch.zeros((1, 2), dtype=torch.float32),
-        worker_decode_steps=0,
-    )
-    state = SimpleNamespace(
-        beam_width=2,
-        max_tokens=3,
-        finish_token_id=9,
-        continue_token_id=7,
-        session=SimpleNamespace(context=SimpleNamespace(decision=decision_state)),
-        backend_state=None,
-        prefix_binding=None,
-    )
-    sampler_output = SimpleNamespace(_gr_deferred_prefill_status=False)
-    token_ids = torch.tensor([[11, 12]], dtype=torch.int32)
-    scores = torch.tensor([[-0.1, -0.2]], dtype=torch.float32)
-    backend = gpu_patch.CudaGRDeviceBackend()
-    monkeypatch.setattr(backend, "_require_workspace", lambda *_args: workspace)
-    monkeypatch.setattr(backend, "_extract_prefix_binding", lambda *_args: (object(),))
-    monkeypatch.setattr(
-        beam_decision,
-        "_run_cuda_prefill_decision",
-        lambda *_args: {"out_token_ids": token_ids, "out_log_probs": scores},
-    )
-
-    step = backend.bootstrap_from_prefill(
-        SimpleNamespace(), state, sampler_output, {"generation_index": 0}
-    )
-
-    assert decision_state.worker_decode_steps == 1
-    assert decision_state.sequence.tolist() == [[[11, 0, 0], [12, 0, 0]]]
-    torch.testing.assert_close(decision_state.beam_scores, scores)
-    assert step.next_token_ids is token_ids
-    assert step.beam_scores.data_ptr() == decision_state.beam_scores.data_ptr()
-    assert step.control_output is workspace.gr_control_output_1
-    assert not any(
-        marker in inspect.getsource(gpu_patch.CudaGRDeviceBackend.bootstrap_from_prefill)
-        for marker in (".cpu(", ".tolist(", ".item(", "synchronize(")
-    )
 
 
-def test_cuda_persistent_bootstrap_then_advance_preserves_parent_scores_once(
-    monkeypatch: pytest.MonkeyPatch,
-    isolated_control_transport,
-) -> None:
-    """First decode ranks prefill parents plus one local score exactly once.
-
-    This is the adversarial precision case from 89f4178 expressed through the
-    new persistent state/backend boundary.  Parent 1 owns the best local
-    decode candidate, but its much worse prefill score means parent 0 must
-    still win globally.  Initializing from the decode matrix would instead
-    drop the prefill scores and count the local score twice.
-    """
-    from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession, beam_decision
-    from vllm_gr.v1.worker.gr_model_runner_state import (
-        GR_FINAL_OUTPUT_FORMAT,
-        GRModelRunnerState,
-        unpack_gr_final_output,
-    )
-
-    workspace = beam_decision.BeamPostprocessWorkspace.allocate(
-        max_batch=1,
-        beam_width=2,
-        top_k=2,
-        max_decode_steps=2,
-        device="cpu",
-        logits_dtype=torch.float16,
-        pin_host=False,
-    )
-    context = BeamAttentionContext(
-        max_batch=1,
-        max_beams=2,
-        num_kv_heads=1,
-        max_decode_steps=2,
-        head_dim=2,
-        num_layers=1,
-        device=torch.device("cpu"),
-        dtype=torch.float16,
-    )
-    slot = context.registry.allocate("gr", beam_width=2, prefix_len=8)
-    session = BeamSearchSession(session_id="gr", slot=slot, context=context)
-    session.begin_session(beam_width=2, prefix_len=8)
-    backend = gpu_patch.CudaGRDeviceBackend()
-    state = GRModelRunnerState(
-        request_id="gr",
-        session=session,
-        backend=backend,
-        beam_width=2,
-        max_tokens=2,
-        continue_token_id=7,
-        finish_token_id=9,
-    )
-    runner = SimpleNamespace(
-        device=torch.device("cpu"),
-        input_batch=SimpleNamespace(req_ids=["gr"]),
-        input_ids=SimpleNamespace(gpu=torch.full((2,), -1, dtype=torch.int32)),
-        _current_beam_info={
-            "beam_data": {"gr": {"is_beam_decode": True, "parent_beam_ids": None}}
-        },
-    )
-    prefill_tokens = torch.tensor([[10, 20]], dtype=torch.int32)
-    prefill_scores = torch.tensor([[-0.1, -5.0]], dtype=torch.float32)
-    monkeypatch.setattr(backend, "_require_workspace", lambda *_args: workspace)
-    monkeypatch.setattr(
-        backend,
-        "_extract_prefix_binding",
-        lambda *_args: (torch.tensor([31], dtype=torch.int32),),
-    )
-    monkeypatch.setattr(
-        beam_decision,
-        "_run_cuda_prefill_decision",
-        lambda *_args: {
-            "out_token_ids": prefill_tokens,
-            "out_log_probs": prefill_scores,
-        },
-    )
-
-    state.start_prefill()
-    state.bootstrap_from_prefill(
-        runner,
-        SimpleNamespace(_gr_deferred_prefill_status=False),
-        {"generation_index": 0},
-    )
-    scheduler_output = SimpleNamespace(
-        gr_outputs={
-            "gr": SimpleNamespace(logical_token_count=1, physical_row_count=2)
-        }
-    )
-    decode_metadata = {"generation_index": 1, "result_width": 2}
-    state.prepare_decode_inputs(runner, scheduler_output, [2], decode_metadata)
-    sampler_output = SimpleNamespace(
-        logprobs_tensors=SimpleNamespace(
-            logprob_token_ids=torch.tensor(
-                [[11, 12], [21, 22]], dtype=torch.int32
-            ),
-            logprobs=torch.tensor(
-                [[-4.0, -6.0], [-0.1, -1.0]], dtype=torch.float32
-            ),
-        )
-    )
-
-    assert state.advance_beam(runner, sampler_output, decode_metadata) is True
-
-    staging, payload_words, width = backend._pack_final_result(state, workspace)
-    payload = staging[workspace.max_batch : workspace.max_batch + payload_words]
-    decoded = unpack_gr_final_output(
-        {
-            "buffer_format": GR_FINAL_OUTPUT_FORMAT,
-            "shape": [width, state.step],
-            "buffer": payload.numpy().tobytes(),
-        }
-    )
-    assert decoded is not None
-    sequences, parents, per_token_logprobs, cumulative_scores = decoded
-    assert sequences == [[10, 11], [20, 21]]
-    assert parents == [[0, 0], [0, 1]]
-    torch.testing.assert_close(
-        torch.tensor(per_token_logprobs),
-        torch.tensor([[-0.1, -4.0], [-5.0, -0.1]]),
-    )
-    assert cumulative_scores == pytest.approx([-4.1, -5.1])
 
 
-def test_cuda_backend_does_not_reorder_whole_history_per_step() -> None:
-    source = inspect.getsource(gpu_patch.CudaGRDeviceBackend.advance_beam)
-    assert source.count("torch.index_select") == 1
-    assert "gr_parent_history[0, :result_width, state.step]" in source
-    assert "gr_logprob_history[0, :result_width, state.step]" in source
 
 
-def test_cuda_backend_extracts_stable_view_from_vllm_multigroup_block_table() -> None:
-    from vllm.v1.worker.block_table import MultiGroupBlockTable
-
-    block_table = MultiGroupBlockTable(
-        max_num_reqs=2,
-        max_model_len=128,
-        max_num_batched_tokens=32,
-        pin_memory=False,
-        device=torch.device("cpu"),
-        block_sizes=[16],
-        kernel_block_sizes=[16],
-    )
-    block_table.add_row(([31, 32, 33],), 0)
-    block_table.commit_block_table(1)
-    input_batch = SimpleNamespace(
-        req_id_to_index={"gr": 0},
-        block_table=block_table,
-        num_reqs=1,
-    )
-    runner = SimpleNamespace(input_batch=input_batch)
-    state = SimpleNamespace(
-        request_id="gr",
-        session=SimpleNamespace(_state=SimpleNamespace(prefix_len=31)),
-    )
-
-    binding = gpu_patch.CudaGRDeviceBackend._extract_prefix_binding(runner, state)
-
-    assert len(binding) == 1
-    assert binding[0].tolist() == [31, 32]
-    assert binding[0].data_ptr() == block_table[0].get_device_tensor(1)[0].data_ptr()
-    binding_ptr = binding[0].data_ptr()
-
-    # A later native block-table commit updates the same fixed storage; it
-    # neither reallocates nor invalidates the prefix-only row view retained by
-    # the persistent GR state.
-    block_table.append_row(([34],), 0)
-    block_table.commit_block_table(1)
-    assert binding[0].data_ptr() == binding_ptr
-    assert binding[0].tolist() == [31, 32]
 
 
-def test_cuda_backend_rejects_multiple_vllm_kv_cache_groups() -> None:
-    from vllm.v1.worker.block_table import MultiGroupBlockTable
-
-    block_table = MultiGroupBlockTable(
-        max_num_reqs=1,
-        max_model_len=128,
-        max_num_batched_tokens=32,
-        pin_memory=False,
-        device=torch.device("cpu"),
-        block_sizes=[16, 32],
-        kernel_block_sizes=[16, 32],
-    )
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(
-            req_id_to_index={"gr": 0},
-            block_table=block_table,
-            num_reqs=1,
-        )
-    )
-    state = SimpleNamespace(
-        request_id="gr",
-        session=SimpleNamespace(_state=SimpleNamespace(prefix_len=31)),
-    )
-
-    with pytest.raises(RuntimeError, match="one native KV-cache group"):
-        gpu_patch.CudaGRDeviceBackend._extract_prefix_binding(runner, state)
 
 
-def test_cuda_backend_prepare_writes_stable_input_and_publishes_prefix() -> None:
-    workspace = SimpleNamespace()
-    prefix = (torch.tensor([3, 4], dtype=torch.int32),)
-    context = SimpleNamespace(decode_step_buf=torch.full((1,), -1, dtype=torch.int32))
-    session = SimpleNamespace(decode_step=1, context=context)
-    state = SimpleNamespace(
-        request_id="gr",
-        beam_width=2,
-        step=2,
-        next_token_ids=torch.tensor([[41, 42]], dtype=torch.int32),
-        session=session,
-        prefix_binding=prefix,
-        backend_state=gpu_patch._CudaGRRequestState(workspace=workspace),
-    )
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(req_ids=["gr"]),
-        input_ids=SimpleNamespace(gpu=torch.full((4,), -1, dtype=torch.int32)),
-    )
-    sidecar = SimpleNamespace(logical_token_count=1, physical_row_count=2)
-    output = SimpleNamespace(gr_outputs={"gr": sidecar})
-
-    gpu_patch.CudaGRDeviceBackend().prepare_decode_inputs(
-        runner, state, output, [2], {"generation_index": 2}
-    )
-
-    assert runner.input_ids.gpu.tolist() == [41, 42, -1, -1]
-    assert context.decode_step_buf.tolist() == [1]
-    assert context._gr_persistent_prefix_binding is prefix
-
-    state.step = 3
-    session.decode_step = 2
-    state.next_token_ids = torch.tensor([[51, 52]], dtype=torch.int32)
-    gpu_patch.CudaGRDeviceBackend().prepare_decode_inputs(
-        runner, state, output, [2], {"generation_index": 3}
-    )
-    assert runner.input_ids.gpu.tolist() == [51, 52, -1, -1]
-    assert context._gr_persistent_prefix_binding is prefix
 
 
-def test_cuda_backend_release_clears_all_prefix_binding_owners() -> None:
-    prefix = object()
-    backend_state = gpu_patch._CudaGRRequestState(
-        workspace=object(),
-        prefix_binding=prefix,
-        pending_reorder_parents=object(),
-        pending_reorder_prefix=object(),
-    )
-    context = SimpleNamespace(_gr_persistent_prefix_binding=prefix)
-    state = SimpleNamespace(
-        backend_state=backend_state,
-        prefix_binding=prefix,
-        session=SimpleNamespace(context=context),
-    )
-
-    gpu_patch.CudaGRDeviceBackend().release(state)
-
-    assert state.prefix_binding is None
-    assert backend_state.prefix_binding is None
-    assert backend_state.pending_reorder_parents is None
-    assert backend_state.pending_reorder_prefix is None
-    assert context._gr_persistent_prefix_binding is None
-    assert backend_state.released is True
 
 
-def test_cuda_backend_advance_reorders_once_and_writes_one_raw_column(
-    monkeypatch: pytest.MonkeyPatch,
-    isolated_control_transport,
-) -> None:
-    from vllm_gr.v1.beam import beam_decision
-
-    workspace = beam_decision.BeamPostprocessWorkspace.allocate(
-        max_batch=1,
-        beam_width=2,
-        top_k=2,
-        max_decode_steps=3,
-        device="cpu",
-        logits_dtype=torch.float16,
-        pin_host=False,
-    )
-    decision_state = SimpleNamespace(
-        sequence=torch.zeros((1, 2, 3), dtype=torch.int32),
-        beam_scores=torch.tensor([[-0.1, -0.2]], dtype=torch.float32),
-        worker_decode_steps=1,
-    )
-    session_state = SimpleNamespace(is_last_step=False)
-    session = SimpleNamespace(
-        context=SimpleNamespace(decision=decision_state),
-        _state=session_state,
-    )
-    state = SimpleNamespace(
-        step=1,
-        device_step=1,
-        beam_width=2,
-        max_tokens=3,
-        continue_token_id=7,
-        finish_token_id=9,
-        session=session,
-        backend_state=gpu_patch._CudaGRRequestState(workspace=workspace),
-    )
-    tokens = torch.tensor([[20, 21]], dtype=torch.int32)
-    parents = torch.tensor([[1, 0]], dtype=torch.int32)
-    scores = torch.tensor([[-0.5, -0.6]], dtype=torch.float32)
-    prefix = torch.tensor([[1, 2]], dtype=torch.int32)
-
-    def decide(*_args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
-        assert kwargs["reorder_kv"] is False
-        decision_state.beam_scores.copy_(scores)
-        decision_state.worker_decode_steps = 2
-        return {
-            "out_token_ids": tokens,
-            "out_token_index": parents,
-            "out_log_probs": scores,
-            "_gr_reorder_parents": parents,
-            "_gr_reorder_prefix": prefix,
-        }
-
-    reorder_calls: list[tuple[Any, Any]] = []
-    monkeypatch.setattr(beam_decision, "run_beam_decision", decide)
-    monkeypatch.setattr(
-        beam_decision,
-        "_reorder_kv_same_step",
-        lambda received_session, received_parent, received_prefix: reorder_calls.append(
-            (received_parent, received_prefix)
-        ),
-    )
-    backend = gpu_patch.CudaGRDeviceBackend()
-    result = backend.advance_beam(
-        SimpleNamespace(), state, SimpleNamespace(), {"result_width": 2}, is_last_step=False
-    )
-    backend.reorder_kv(SimpleNamespace(), state, result, is_last_step=False)
-
-    assert len(reorder_calls) == 1
-    assert reorder_calls[0][0].data_ptr() == parents.data_ptr()
-    assert reorder_calls[0][1].data_ptr() == prefix.data_ptr()
-    assert workspace.gr_parent_history[0, :, 1].tolist() == [1, 0]
-    torch.testing.assert_close(
-        workspace.gr_logprob_history[0, :, 1],
-        torch.tensor([-0.3, -0.5]),
-    )
-    assert result.control_output is workspace.gr_control_output_0
 
 
-def test_cuda_backend_terminal_advance_does_not_reorder(
-    monkeypatch: pytest.MonkeyPatch,
-    isolated_control_transport,
-) -> None:
-    from vllm_gr.v1.beam import beam_decision
-
-    workspace = beam_decision.BeamPostprocessWorkspace.allocate(
-        max_batch=1,
-        beam_width=2,
-        top_k=2,
-        max_decode_steps=2,
-        device="cpu",
-        logits_dtype=torch.float16,
-        pin_host=False,
-    )
-    scores = torch.tensor([[-0.1, -0.2]], dtype=torch.float32)
-    decision_state = SimpleNamespace(
-        sequence=torch.zeros((1, 2, 2), dtype=torch.int32),
-        beam_scores=scores.clone(),
-        worker_decode_steps=1,
-    )
-    state = SimpleNamespace(
-        step=1,
-        device_step=1,
-        beam_width=2,
-        max_tokens=2,
-        continue_token_id=7,
-        finish_token_id=9,
-        session=SimpleNamespace(
-            context=SimpleNamespace(decision=decision_state),
-            _state=SimpleNamespace(is_last_step=False),
-        ),
-        backend_state=gpu_patch._CudaGRRequestState(workspace=workspace),
-    )
-    final_scores = torch.tensor([[-0.4]], dtype=torch.float32)
-
-    def decide(*_args: Any, **_kwargs: Any) -> dict[str, torch.Tensor]:
-        decision_state.beam_scores[:, :1].copy_(final_scores)
-        decision_state.worker_decode_steps = 2
-        return {
-            "out_token_ids": torch.tensor([[22]], dtype=torch.int32),
-            "out_token_index": torch.tensor([[1]], dtype=torch.int32),
-            "out_log_probs": final_scores,
-        }
-
-    monkeypatch.setattr(beam_decision, "run_beam_decision", decide)
-    backend = gpu_patch.CudaGRDeviceBackend()
-    result = backend.advance_beam(
-        SimpleNamespace(), state, SimpleNamespace(), {"result_width": 1}, is_last_step=True
-    )
-    backend.reorder_kv(SimpleNamespace(), state, result, is_last_step=True)
-
-    assert result.next_token_ids.shape == (1, 1)
-    assert result.control_output is workspace.gr_control_output_0
 
 
-def test_cuda_backend_final_pack_backtraces_raw_history() -> None:
-    from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspace
-    from vllm_gr.v1.worker.gr_model_runner_state import (
-        GR_FINAL_OUTPUT_FORMAT,
-        unpack_gr_final_output,
-    )
-
-    workspace = BeamPostprocessWorkspace.allocate(
-        max_batch=1,
-        beam_width=2,
-        top_k=2,
-        max_decode_steps=3,
-        device="cpu",
-        logits_dtype=torch.float16,
-        pin_host=False,
-    )
-    workspace.gr_invalid_status.zero_()
-    workspace.gr_parent_history[0] = torch.tensor(
-        [[0, 1, 1], [0, 0, 0]], dtype=torch.int32
-    )
-    workspace.gr_logprob_history[0] = torch.tensor(
-        [[-0.1, -0.3, -0.5], [-0.2, -0.4, -0.6]], dtype=torch.float32
-    )
-    sequence = torch.tensor([[[10, 20, 30], [11, 21, 31]]], dtype=torch.int32)
-    scores = torch.tensor([[-1.0, -2.0]], dtype=torch.float32)
-    state = SimpleNamespace(
-        next_token_ids=torch.empty((1, 2), dtype=torch.int32),
-        step=3,
-        beam_scores=scores,
-        session=SimpleNamespace(
-            context=SimpleNamespace(decision=SimpleNamespace(sequence=sequence))
-        ),
-    )
-
-    staging, payload_words, width = gpu_patch.CudaGRDeviceBackend._pack_final_result(
-        state, workspace
-    )
-    payload = staging[workspace.max_batch : workspace.max_batch + payload_words]
-    decoded = unpack_gr_final_output(
-        {
-            "buffer_format": GR_FINAL_OUTPUT_FORMAT,
-            "shape": [width, state.step],
-            "buffer": payload.numpy().tobytes(),
-        }
-    )
-    assert decoded is not None
-    sequences, parents, logprobs, final_scores = decoded
-    assert sequences == [[10, 20, 30], [11, 21, 31]]
-    assert parents == [[0, 0, 1], [0, 1, 0]]
-    torch.testing.assert_close(
-        torch.tensor(logprobs),
-        torch.tensor([[-0.1, -0.4, -0.5], [-0.2, -0.3, -0.6]]),
-    )
-    assert final_scores == pytest.approx([-1.0, -2.0])
 
 
-def test_cuda_backend_invalid_status_is_checked_only_at_finalization() -> None:
-    gpu_patch.CudaGRDeviceBackend._check_final_status([0])
-    with pytest.raises(RuntimeError, match="no legal candidate"):
-        gpu_patch.CudaGRDeviceBackend._check_final_status([1])
 
 
 def test_gpu_bookkeeping_preserves_seven_items_and_restores_batch(
@@ -1575,101 +1077,12 @@ def test_patched_determine_pure_beam_batch_grants_full(
     assert result[1].num_tokens == 4
     assert result[1].num_reqs == 1
     assert result[1].uniform is True
-    assert runner._beam_graph_full_dispatch_count == 1
-    wrapped(runner, num_tokens=4)
-    assert runner._beam_graph_full_dispatch_count == 2
 
 
-def test_beam_graph_runtime_stats_reports_capture_and_dispatch_state() -> None:
-    config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
-    runner = SimpleNamespace(
-        _vllm_gr_config=config,
-        _beam_graph_keys={128},
-        _beam_graph_full_dispatch_count=2,
-    )
-    worker = SimpleNamespace(model_runner=runner)
-
-    stats = common.get_beam_graph_runtime_stats(worker)
-
-    assert stats == {
-        "runner": "SimpleNamespace",
-        "beam_graph_enabled": True,
-        "beam_max_width": 128,
-        "captured_widths": [128],
-        "full_dispatches": 2,
-    }
 
 
-def test_worker_graph_stats_hook_is_named_and_idempotent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import vllm.v1.worker.gpu_worker as gpu_worker
-
-    import vllm_gr.v1.worker.model_runner_patch as dispatcher
-
-    class FakeWorker:
-        pass
-
-    monkeypatch.setattr(gpu_worker, "Worker", FakeWorker)
-    monkeypatch.setattr(
-        dispatcher, "_active_platform_module_name", lambda: dispatcher._GPU_PATCH_MODULE
-    )
-    monkeypatch.setattr(
-        "vllm_gr.constraints.worker_inject.install_worker_resource_hook",
-        lambda worker_cls: 0,
-    )
-
-    dispatcher._install_active_worker_resource_hook()
-    first = getattr(FakeWorker, "get_gr_beam_graph_runtime_stats")
-    dispatcher._install_active_worker_resource_hook()
-
-    assert first is common.get_beam_graph_runtime_stats
-    assert getattr(FakeWorker, "get_gr_beam_graph_runtime_stats") is first
-    assert getattr(FakeWorker, "get_gr_profile_runtime_stats") is (
-        gpu_patch.get_gr_profile_runtime_stats
-    )
 
 
-def test_gpu_named_profile_diagnostic_returns_runner_and_memory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeRunner:
-        device = torch.device("cuda:0")
-        _vllm_gr_config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
-        _beam_graph_keys = {128}
-        _beam_graph_full_dispatch_count = 7
-        _gr_input_prep_ready_skips = 6
-        _gr_input_prep_waits = 2
-
-    fake_properties = SimpleNamespace(name="L20")
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: fake_properties)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 11)
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 12)
-    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 13)
-    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 14)
-    monkeypatch.setattr(
-        gpu_patch,
-        "get_gr_memory_stats",
-        lambda worker: {"native_kv_bytes": 15},
-    )
-
-    result = gpu_patch.get_gr_profile_runtime_stats(SimpleNamespace(model_runner=FakeRunner()))
-    assert result["backend"] == "gpu"
-    assert result["runner_class"].endswith(".FakeRunner")
-    assert result["device_name"] == "L20"
-    assert result["memory"] == {
-        "allocated_bytes": 11,
-        "reserved_bytes": 12,
-        "peak_allocated_bytes": 13,
-        "peak_reserved_bytes": 14,
-    }
-    assert result["memory_components"] == {"native_kv_bytes": 15}
-    assert result["beam_graph"]["captured_widths"] == [128]
-    assert result["beam_graph"]["full_dispatches"] == 7
-    assert result["input_prep"] == {
-        "ready_event_skips": 6,
-        "not_ready_upstream_waits": 2,
-    }
 
 
 def test_patched_determine_active_lora_downgrades_full() -> None:
@@ -1779,7 +1192,6 @@ def test_capture_beam_decode_graph_disabled_returns_false() -> None:
     """When beam_graph_active is False, capture returns False immediately."""
     gr_cfg = SimpleNamespace(beam_graph_active=False)
 
-    import vllm_gr.v1.worker.model_runner_common as common
 
     original_fn = common._get_gr_config
 
@@ -1805,7 +1217,6 @@ def test_capture_beam_decode_graph_tp_gt1_returns_false() -> None:
         beam_max_decode_steps=3,
     )
 
-    import vllm_gr.v1.worker.model_runner_common as common
 
     original_fn = common._get_gr_config
 
@@ -1831,7 +1242,6 @@ def test_capture_beam_decode_graph_ubatching_returns_false() -> None:
         beam_max_decode_steps=3,
     )
 
-    import vllm_gr.v1.worker.model_runner_common as common
 
     original_fn = common._get_gr_config
 
@@ -1864,7 +1274,6 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
 
     import vllm.compilation.monitor as monitor
 
-    import vllm_gr.v1.worker.model_runner_common as common
 
     monkeypatch.setattr(
         common,

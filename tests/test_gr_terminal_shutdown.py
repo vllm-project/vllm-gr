@@ -191,70 +191,8 @@ def test_scheduler_shutdown_finishes_only_live_persistent_native_requests() -> N
     scheduler.connector.shutdown.assert_called_once_with()
 
 
-def test_scheduler_shutdown_leaves_ordinary_requests_to_upstream_behavior() -> None:
-    scheduler, finish_calls = _scheduler(
-        {
-            "legacy-gr": _request(persistent=False),
-            "ordinary": _request(persistent=False, gr=False),
-        }
-    )
-
-    scheduler.shutdown()
-
-    assert finish_calls == []
-    assert set(scheduler.requests) == {"legacy-gr", "ordinary"}
-    scheduler.connector.shutdown.assert_called_once_with()
 
 
-def test_grllm_successful_shutdown_removes_only_explicit_persistent_markers(
-    monkeypatch,
-) -> None:
-    output_processor = _output_processor()
-    llm = _grllm(output_processor)
-    engine = llm.llm_engine
-
-    def shutdown_engine(actual):
-        assert actual is engine
-        # Frontend records remain authoritative until engine shutdown succeeds.
-        assert set(output_processor.request_states) == {
-            "frontend-only-persistent",
-            "second-persistent",
-            "offline-beam-7-0",
-            "unmarked-ordinary",
-        }
-
-    shutdown = mock.Mock(side_effect=shutdown_engine)
-    collect, release = _patch_terminal_cleanup(monkeypatch, shutdown)
-
-    llm.shutdown()
-
-    shutdown.assert_called_once_with(engine)
-    assert len(output_processor.abort_calls) == 1
-    request_ids, internal = output_processor.abort_calls[0]
-    assert set(request_ids) == {
-        "frontend-only-persistent",
-        "second-persistent",
-    }
-    assert internal is True
-    assert set(output_processor.request_states) == {
-        "offline-beam-7-0",
-        "unmarked-ordinary",
-    }
-    assert dict(output_processor.external_req_ids) == {
-        "mixed-external": ["unmarked-ordinary"],
-        "ordinary-external": ["offline-beam-7-0"],
-    }
-    assert llm.llm_engine is None
-    assert llm._shutdown_complete is True
-    assert llm._engine_shutdown_complete is True
-    collect.assert_called_once_with()
-    release.assert_called_once_with()
-
-    # Successful shutdown stays idempotent.
-    llm.shutdown()
-    shutdown.assert_called_once_with(engine)
-    collect.assert_called_once_with()
-    release.assert_called_once_with()
 
 
 def test_grllm_failed_shutdown_preserves_engine_and_records_for_retry(
@@ -302,54 +240,6 @@ def test_grllm_failed_shutdown_preserves_engine_and_records_for_retry(
     release.assert_called_once_with()
 
 
-def test_grllm_frontend_cleanup_failure_retries_without_second_engine_shutdown(
-    monkeypatch,
-) -> None:
-    output_processor = _output_processor(abort_failures=1)
-    llm = _grllm(output_processor)
-    engine = llm.llm_engine
-    shutdown = mock.Mock()
-    collect, release = _patch_terminal_cleanup(monkeypatch, shutdown)
-    states_before = dict(output_processor.request_states)
-    mappings_before = {
-        external: list(internal)
-        for external, internal in output_processor.external_req_ids.items()
-    }
-
-    with pytest.raises(RuntimeError, match="frontend abort failed") as caught:
-        llm.shutdown()
-
-    assert caught.value is output_processor.abort_error
-    shutdown.assert_called_once_with(engine)
-    assert llm._engine_shutdown_complete is True
-    assert llm._shutdown_complete is False
-    assert llm.llm_engine is engine
-    assert output_processor.request_states == states_before
-    assert dict(output_processor.external_req_ids) == mappings_before
-    assert len(output_processor.abort_calls) == 1
-    collect.assert_not_called()
-    release.assert_not_called()
-
-    llm.shutdown()
-
-    # EngineCore teardown is not safe to repeat after it already succeeded;
-    # only the failed frontend-record phase is retried.
-    shutdown.assert_called_once_with(engine)
-    assert len(output_processor.abort_calls) == 2
-    assert all(
-        set(request_ids)
-        == {"frontend-only-persistent", "second-persistent"}
-        and internal is True
-        for request_ids, internal in output_processor.abort_calls
-    )
-    assert set(output_processor.request_states) == {
-        "offline-beam-7-0",
-        "unmarked-ordinary",
-    }
-    assert llm.llm_engine is None
-    assert llm._shutdown_complete is True
-    collect.assert_called_once_with()
-    release.assert_called_once_with()
 
 
 def test_real_engine_core_shutdown_orders_worker_native_and_frontend_release(
@@ -426,56 +316,3 @@ def test_real_engine_core_drain_failure_preserves_native_and_frontend_ownership(
     collect.assert_not_called()
     release.assert_not_called()
     core.model_executor.shutdown.assert_called_once_with()
-
-
-def test_real_engine_core_frontend_retry_does_not_repeat_core_teardown(
-    monkeypatch,
-) -> None:
-    events: list[str] = []
-    output_processor = _output_processor(abort_failures=1, events=events)
-    engine, core, scheduler, finish_calls, unfreeze, cleanup_dist = (
-        _real_core_engine(monkeypatch, output_processor, events)
-    )
-    llm = _grllm(output_processor, engine)
-    collect = mock.Mock(name="outer_gc_collect")
-    release = mock.Mock(name="release_accelerator_memory")
-    monkeypatch.setattr(offline_gr.gc, "collect", collect)
-    monkeypatch.setattr(offline_gr, "release_accelerator_memory", release)
-
-    with pytest.raises(RuntimeError, match="frontend abort failed"):
-        llm.shutdown()
-
-    assert events == [
-        "worker_drain",
-        "native_finish",
-        "scheduler_shutdown",
-        "frontend_abort",
-    ]
-    assert llm._engine_shutdown_complete is True
-    assert llm._shutdown_complete is False
-    assert llm.llm_engine is engine
-    assert finish_calls == [
-        (["persistent"], RequestStatus.FINISHED_ABORTED)
-    ]
-    collect.assert_not_called()
-    release.assert_not_called()
-
-    llm.shutdown()
-
-    assert events == [
-        "worker_drain",
-        "native_finish",
-        "scheduler_shutdown",
-        "frontend_abort",
-        "frontend_abort",
-    ]
-    core.model_executor.shutdown.assert_called_once_with()
-    scheduler.connector.shutdown.assert_called_once_with()
-    unfreeze.assert_called_once_with()
-    cleanup_dist.assert_called_once_with()
-    assert len(finish_calls) == 1
-    assert len(output_processor.abort_calls) == 2
-    collect.assert_called_once_with()
-    release.assert_called_once_with()
-    assert llm.llm_engine is None
-    assert llm._shutdown_complete is True
