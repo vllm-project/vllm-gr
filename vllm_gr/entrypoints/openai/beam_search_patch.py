@@ -43,9 +43,9 @@ def patch_engine_core_process_entrypoint() -> None:
     EngineCoreProc.run_engine_core = run_engine_core
 
 
-def patch_batch_and_fork() -> None:
-    """Compatibility helper that installs the complete grouped-beam pipeline."""
-    from vllm_gr.v1.engine.core_client_patch import apply_batch_fork_patches
+def patch_persistent_runtime() -> None:
+    """Install the persistent GR frontend and EngineCore hooks."""
+    from vllm_gr.v1.engine.core_client_patch import apply_persistent_runtime_patches
 
-    apply_batch_fork_patches()
+    apply_persistent_runtime_patches()
     patch_engine_core_process_entrypoint()

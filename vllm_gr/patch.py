@@ -140,60 +140,16 @@ def _validate_serving_models_patch() -> str | None:
     )
 
 
-def _validate_request_types_patch() -> str | None:
-    from vllm.v1.engine import EngineCoreRequestType
-
-    valid = (
-        getattr(getattr(EngineCoreRequestType, "ADD_BATCH", None), "value", None) == b"\x06"
-        and getattr(getattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE", None), "value", None)
-        == b"\x07"
-    )
-    return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
-
-
-def _validate_engine_clients_patch() -> str | None:
-    from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
-
-    from vllm_gr.v1.engine.core_client import (
-        add_requests_async,
-        beam_request_step_update_async,
-    )
-    from vllm_gr.v1.engine.core_client_patch import (
-        inproc_add_requests,
-        inproc_beam_request_step_update,
-        sync_mp_add_requests,
-        sync_mp_beam_request_step_update,
-    )
-
-    valid = (
-        AsyncMPClient.add_requests_async is add_requests_async
-        and AsyncMPClient.beam_request_step_update_async is beam_request_step_update_async
-        and SyncMPClient.add_requests is sync_mp_add_requests
-        and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
-        and InprocClient.add_requests is inproc_add_requests
-        and InprocClient.beam_request_step_update is inproc_beam_request_step_update
-        and getattr(InprocClient.get_output, "_vllm_gr_inproc_self_advance", False)
-    )
-    return _verified(valid, "EngineCore client methods are not fully installed")
-
-
 def _validate_async_llm_patch() -> str | None:
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    from vllm_gr.v1.engine.async_llm import (
-        _add_requests_batch_fn,
-        beam_request_step_update_fn,
-        prepare_request_fn,
-        register_beam_output_fn,
-    )
+    from vllm_gr.v1.engine.async_llm import _add_requests_batch_fn, prepare_request_fn
 
     valid = (
         AsyncLLM.prepare_request is prepare_request_fn
         and AsyncLLM._add_requests_batch is _add_requests_batch_fn
-        and AsyncLLM.register_beam_output is register_beam_output_fn
-        and AsyncLLM.beam_request_step_update is beam_request_step_update_fn
     )
-    return _verified(valid, "AsyncLLM grouped-beam methods are not fully installed")
+    return _verified(valid, "AsyncLLM persistent request helpers are not installed")
 
 
 def _validate_engine_core_entrypoint_patch() -> str | None:
@@ -210,48 +166,20 @@ def _validate_engine_core_entrypoint_patch() -> str | None:
 def _validate_engine_core_request_patch() -> str | None:
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
-    from vllm_gr.v1.engine.core import (
-        _apply_beam_step,
-        _beam_self_advance,
-        _cache_beam_request,
-        _handle_beam_request_step_update,
-        process_input_sockets,
-    )
     from vllm_gr.v1.engine.engine_core_patch import (
-        _BEAM_STATE_INIT_MARKER,
-        _CLIENT_REQUEST_PATCH_MARKER,
         _ENGINE_STEP_PATCH_MARKER,
-        _PIS_PATCH_MARKER,
+        _GR_ABORT_PATCH_MARKER,
+        _GR_STATE_INIT_MARKER,
     )
 
     valid = (
-        getattr(EngineCore.__init__, _BEAM_STATE_INIT_MARKER, False)
-        and getattr(EngineCoreProc.__init__, _BEAM_STATE_INIT_MARKER, False)
-        and EngineCore._cache_beam_request is _cache_beam_request
-        and EngineCoreProc._cache_beam_request is _cache_beam_request
-        and EngineCore._handle_beam_request_step_update is _handle_beam_request_step_update
-        and EngineCoreProc._handle_beam_request_step_update is _handle_beam_request_step_update
-        and EngineCore._apply_beam_step is _apply_beam_step
-        and EngineCoreProc._apply_beam_step is _apply_beam_step
-        and EngineCore._beam_self_advance is _beam_self_advance
-        and EngineCoreProc._beam_self_advance is _beam_self_advance
+        getattr(EngineCore.__init__, _GR_STATE_INIT_MARKER, False)
+        and getattr(EngineCoreProc.__init__, _GR_STATE_INIT_MARKER, False)
+        and getattr(EngineCore.abort_requests, _GR_ABORT_PATCH_MARKER, False)
+        and getattr(EngineCoreProc.abort_requests, _GR_ABORT_PATCH_MARKER, False)
         and getattr(EngineCoreProc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)
-        and getattr(EngineCoreProc._handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, False)
-        and EngineCoreProc.process_input_sockets is process_input_sockets
-        and getattr(EngineCoreProc.process_input_sockets, _PIS_PATCH_MARKER, False)
     )
-    return _verified(valid, "EngineCore beam request dispatch is not fully installed")
-
-
-def _validate_scheduler_patch() -> str | None:
-    from vllm.v1.core.sched.scheduler import Scheduler
-
-    from vllm_gr.v1.engine.engine_core_patch import _SCHEDULER_PATCH_MARKER
-
-    return _verified(
-        bool(getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False)),
-        "Scheduler beam metadata propagation is not installed",
-    )
+    return _verified(valid, "EngineCore persistent lifecycle hooks are not installed")
 
 
 def _validate_model_runner_patch() -> str | None:
@@ -273,29 +201,18 @@ def _validate_model_runner_patch() -> str | None:
 
 
 def _validate_engine_core_request_group() -> str | None:
-    failures = tuple(
-        detail
-        for detail in (
-            _validate_request_types_patch(),
-            _validate_engine_core_request_patch(),
-        )
-        if detail is not None
-    )
-    return "; ".join(failures) or None
+    return _validate_engine_core_request_patch()
 
 
-def _validate_batch_and_fork_patch() -> str | None:
-    """Verify every target mutated by the grouped Beam engine installer."""
+def _validate_persistent_runtime_patch() -> str | None:
+    """Verify every target required by the persistent GR installer."""
 
     failures = tuple(
         detail
         for detail in (
-            _validate_request_types_patch(),
-            _validate_engine_clients_patch(),
             _validate_async_llm_patch(),
             _validate_engine_core_entrypoint_patch(),
             _validate_engine_core_request_patch(),
-            _validate_scheduler_patch(),
             _validate_model_runner_patch(),
         )
         if detail is not None
@@ -304,7 +221,7 @@ def _validate_batch_and_fork_patch() -> str | None:
 
 
 def _required_beam_patches() -> tuple[BeamPatch, ...]:
-    """Return the six concrete Beam responsibilities used in production."""
+    """Return the concrete GR responsibilities used in production."""
 
     def patch(
         name: str,
@@ -350,10 +267,10 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
             _validate_serving_models_patch,
         ),
         patch(
-            "batch_and_fork",
+            "persistent_runtime",
             "vllm_gr.entrypoints.openai.beam_search_patch",
-            "patch_batch_and_fork",
-            _validate_batch_and_fork_patch,
+            "patch_persistent_runtime",
+            _validate_persistent_runtime_patch,
         ),
     )
 
@@ -375,16 +292,10 @@ def _engine_core_beam_patches() -> tuple[BeamPatch, ...]:
 
     return (
         patch(
-            "engine_core_requests",
+            "engine_core_lifecycle",
             "vllm_gr.v1.engine.engine_core_patch",
             "apply_engine_core_request_patches",
             _validate_engine_core_request_group,
-        ),
-        patch(
-            "scheduler",
-            "vllm_gr.v1.engine.engine_core_patch",
-            "apply_scheduler_patch",
-            _validate_scheduler_patch,
         ),
         patch(
             "model_runner",

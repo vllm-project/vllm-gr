@@ -19,8 +19,8 @@ This change includes:
 It does not add an EngineCore wire enum, change `process_input_sockets()`,
 implement Scheduler FCFS or atomic reservation, allocate Prompt KV, call a
 ModelRunner, load Constraint resources, implement Worker run-to-completion,
-remove `BEAM_REQUEST_STEP_UPDATE`, or modify the production Constraint Table
-path from RFC #287. Chunked Prefill, mixed ordinary Requests, and Decode
+restore the removed legacy GR step-update protocol, or modify the production
+persistent Constraint Table path. Chunked Prefill, mixed ordinary Requests, and Decode
 micro-batching are also out of scope.
 
 ## Vocabulary

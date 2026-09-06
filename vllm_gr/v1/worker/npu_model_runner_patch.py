@@ -31,7 +31,11 @@ from vllm_gr.v1.worker.model_runner_common import (
 )
 from vllm_gr.v1.worker.npu_gr_inputs import (
     make_patched_execute_model as make_patched_execute_model,
+)
+from vllm_gr.v1.worker.npu_gr_inputs import (
     make_patched_prepare_input_ids as make_patched_prepare_input_ids,
+)
+from vllm_gr.v1.worker.npu_gr_inputs import (
     suspend_native_slot_mapping,
 )
 from vllm_gr.v1.worker.npu_gr_metadata import (
@@ -900,9 +904,8 @@ make_patched_prepare_inputs = make_patched_prepare_inputs_npu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_npu
 make_patched_sample = make_patched_sample_npu
 # The dispatcher (model_runner_patch.py) looks up this exact name; without the
-# alias the sample_tokens hook is silently skipped and the worker beam decision
-# never reaches the ModelRunnerOutput (async scheduling keeps the decision path
-# broken end-to-end: engine-driven chaining no-ops and the frontend keeps its RPC loop).
+# alias the sample_tokens hook is silently skipped and the persistent scheduler
+# cannot consume the Worker decision.
 make_patched_sample_tokens = make_patched_sample_tokens_npu
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_npu

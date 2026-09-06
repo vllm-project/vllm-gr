@@ -20,7 +20,6 @@ import gc
 import time
 from typing import TYPE_CHECKING, Any, Union, cast
 
-import numpy as np
 from tqdm.auto import tqdm
 from transformers import PreTrainedTokenizerBase
 from vllm.entrypoints.generate.beam_search.utils import (
@@ -32,15 +31,11 @@ from vllm.entrypoints.llm import LLM
 from vllm.inputs import TokensPrompt
 from vllm.logprobs import FlatLogprobs
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
     configure_persistent_sampling_params,
     extract_and_dedup_flat_logprobs,
-    extract_and_dedup_segment,
-    extract_constrained_flat_logprobs,
-    extract_constrained_segment,
     materialize_final_beams,
     materialize_selected_beams,
     select_top_indices,
@@ -52,7 +47,6 @@ from vllm_gr.constraints import (
     ParentCandidateBuilder,
     create_constraint_strategy,
 )
-from vllm_gr.constraints.models import BeamCandidateCache, CandidateLayout
 from vllm_gr.constraints.startup import install_constraint_table
 from vllm_gr.constraints.strategies import (
     ConstraintTableStrategy,
@@ -65,17 +59,14 @@ from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     reconstruct_beam_logprobs,
 )
-from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import (
     GR_REQUEST_METADATA_KEY,
-    BeamRequestStepUpdate,
     GRRequestMetadata,
     canonicalize_constraint_digest,
 )
 
 if TYPE_CHECKING:
-    from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
     from vllm.inputs import TextPrompt, TokensPrompt
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
@@ -88,27 +79,6 @@ ForkInfo = list[tuple[int, int]]
 def _create_tokens_prompt_from_beam(beam: "BeamSearchSequence") -> "TokensPrompt":
     """Create a TokensPrompt payload from a BeamSearchSequence."""
     return beam.get_prompt()
-
-
-def _beam_request_cleanup(llm_engine, session_id: str, final_ids: list[str]) -> None:
-    """Clear beam_request cache for a finished/failed session."""
-    if not final_ids:
-        return
-    try:
-        llm_engine.engine_core.beam_request_step_update(
-            BeamRequestStepUpdate(
-                session_id=session_id,
-                parent_beam_ids=[],
-                child_beam_ids=[],
-                beam_tokens=[],
-                pruned_ids=final_ids,
-                prefix_len=0,
-                beam_width=0,
-                sampling_params=SamplingParams(),
-            )
-        )
-    except Exception as e:
-        logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
 
 
 def _abort_persistent_requests(llm_engine, request_ids: list[str], cause: BaseException) -> None:
@@ -129,385 +99,70 @@ def _abort_persistent_requests(llm_engine, request_ids: list[str], cause: BaseEx
         raise cleanup_error from cause
 
 
-def _prepare_beam_step_requests(
+def _prepare_persistent_request(
     llm_engine,
-    instances_batch: list["BeamSearchInstance"],
-    token: int,
-    prompt_start: int,
-    tokenizer,
-    beam_search_params: "SamplingParams",
-    sid_end_token_id: int | None,
-    instance_prefill_id: dict[int, str],
-    instance_prev_beam_internal_ids: dict[int, list[str]],
-    instance_fork_info: dict[int, ForkInfo],
-    instance_prefix_len: dict[int, int],
-    instance_completed_sessions: set[int],
-    max_decode_steps: int = 0,
-    is_constrained: bool = False,
-    constraint_digest: str | None = None,
-    instance_self_advance_chained: set[int] | None = None,
-    persistent_request: bool = False,
-) -> list["EngineCoreRequest"]:
-    """Prepare EngineCoreRequest items for active instances at this step."""
-    engine_core_requests = []
-    for j, instance in enumerate(instances_batch):
-        if len(instance.beams) == 0:
-            # This instance has no active beams (finished)
-            if j not in instance_completed_sessions and j in instance_prefill_id:
-                _beam_request_cleanup(
-                    llm_engine,
-                    instance_prefill_id[j],
-                    instance_prev_beam_internal_ids[j],
-                )
-                instance_completed_sessions.add(j)
-            continue
-
-        session_id = instance_prefill_id.get(j)
-        fork_info_j = instance_fork_info.get(j)
-        if persistent_request and token > 0:
-            # The initial native request remains registered for its complete
-            # lifecycle. GRAsyncScheduler advances it after each worker
-            # decision; there is no per-step Request construction or ADD.
-            continue
-        if token > 0 and fork_info_j is not None:
-            # BEAM_REQUEST path
-            parent_beam_ids = []
-            child_beam_ids = []
-            beam_tokens = []
-            W = len(fork_info_j)
-
-            for new_idx, (parent_beam_idx, tok) in enumerate(fork_info_j):
-                parent_id = instance_prev_beam_internal_ids[j][parent_beam_idx]
-                child_id = f"offline-beam-{prompt_start + j}-{token}-{new_idx}"
-                parent_beam_ids.append(parent_id)
-                child_beam_ids.append(child_id)
-
-                full_tokens = instance.beams[new_idx].tokens
-                prefix_len = instance_prefix_len[j]
-                beam_tokens.append(full_tokens[prefix_len:])
-
-            # One grouped-beam execution is one logical upstream request.
-            # Beam width travels separately in BeamRequestStepUpdate.
-            decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params)
-            eos_token_id = (
-                sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
-            )
-            decode_sampling_params.update_from_generation_config({}, eos_token_id)
-
-            # Register beam output
-            ec_req = EngineCoreRequest(
-                request_id=session_id,
-                prompt_token_ids=instance.beams[0].tokens,
-                mm_features=None,
-                sampling_params=decode_sampling_params,
-                pooling_params=None,
-                arrival_time=time.time(),
-                lora_request=instance.beams[0].lora_request,
-                cache_salt=None,
-                data_parallel_rank=None,
-            )
-            ec_req.external_req_id = session_id
-            llm_engine.output_processor.add_request(ec_req, None, None, 0)
-            used_parents = set(parent_beam_ids)
-            pruned_ids = [
-                pid for pid in instance_prev_beam_internal_ids[j] if pid not in used_parents
-            ]
-
-            # Collect numeric parent beam indices for incremental decode
-            parent_beam_indices = []
-            for new_idx, (parent_beam_idx, tok) in enumerate(fork_info_j):
-                parent_beam_indices.append(parent_beam_idx)
-
-            update = BeamRequestStepUpdate(
-                session_id=session_id,
-                parent_beam_ids=parent_beam_ids,
-                child_beam_ids=child_beam_ids,
-                beam_tokens=beam_tokens,
-                pruned_ids=pruned_ids,
-                prefix_len=prefix_len,
-                beam_width=W,
-                sampling_params=decode_sampling_params,
-                eos_token_id=sid_end_token_id
-                if sid_end_token_id is not None
-                else tokenizer.eos_token_id,
-                lora_request=instance.beams[0].lora_request,
-                parent_beam_indices=parent_beam_indices,
-                max_decode_steps=max_decode_steps,
-                # Constraint Tables: the Worker's raw-logits hook needs the
-                # step to run (1/2 for decode; 0 reserved for the prefill).
-                constraint_step=len(beam_tokens[0]) if is_constrained else 0,
-            )
-            # EngineCore already chained this decode step from the worker's
-            # beam decision (engine-driven). Re-sending the update would
-            # re-ADD the session's request while it is still running under
-            # the same session_id, crashing scheduler.add_request with
-            # "duplicate request id"; the output registration above already
-            # wired this instance to the chained step's output.
-            self_advance_chained = (
-                instance_self_advance_chained is not None and j in instance_self_advance_chained
-            )
-            if self_advance_chained:
-                # The chained step consumed this tracking entry; step 0-style
-                # re-registration must not run again for this step.
-                instance_self_advance_chained.discard(j)
-            else:
-                llm_engine.engine_core.beam_request_step_update(update)
-
-            # Update tracking variables
-            instance_prev_beam_internal_ids[j] = child_beam_ids
-
-        else:
-            # ADD_BATCH path (step 0)
-            request_id_batch = f"offline-beam-{prompt_start + j}"
-            instance_prefix_len[j] = len(instance.beams[0].tokens)
-
-            request_id_item = f"{request_id_batch}-0"
-            tokens_prompt = _create_tokens_prompt_from_beam(instance.beams[0])
-            request_params = beam_search_params
-            if persistent_request:
-                request_params = beam_search_params.clone()
-                configure_persistent_sampling_params(
-                    request_params,
-                    generation_steps=max_decode_steps,
-                )
-                execution_width = int(beam_search_params.logprobs or 1)
-                metadata = GRRequestMetadata(
-                    request_id=request_id_item,
-                    beam_width=execution_width,
-                    generation_steps=max_decode_steps,
-                    prefix_len=instance_prefix_len[j],
-                    result_width=execution_width,
-                    constraint_digest=canonicalize_constraint_digest(
-                        constraint_digest
-                    ),
-                )
-                request_params.extra_args = dict(request_params.extra_args or {})
-                request_params.extra_args[GR_REQUEST_METADATA_KEY] = {
-                    field: getattr(metadata, field) for field in metadata.__struct_fields__
-                }
-            ec_req = llm_engine.input_processor.process_inputs(
-                request_id=request_id_item,
-                prompt=tokens_prompt,
-                params=request_params,
-                supported_tasks=llm_engine.get_supported_tasks(),
-                arrival_time=time.time(),
-                lora_request=instance.beams[0].lora_request,
-            )
-            llm_engine.input_processor.assign_request_id(ec_req)
-            if persistent_request:
-                # assign_request_id adds vLLM's process-unique suffix. Keep
-                # the metadata keyed by that same stable native request id.
-                ec_req.sampling_params.extra_args[GR_REQUEST_METADATA_KEY]["request_id"] = (
-                    ec_req.request_id
-                )
-            llm_engine.output_processor.add_request(ec_req, None, None, 0)
-            if persistent_request:
-                # Attach ownership to the native frontend record before
-                # Scheduler admission. No separate per-session registry or
-                # request-id naming convention is needed for terminal cleanup.
-                request_state = llm_engine.output_processor.request_states[ec_req.request_id]
-                request_state.gr_persistent_request = True
-            engine_core_requests.append(ec_req)
-
-    return engine_core_requests
-
-
-def _step_engine_and_collect_outputs(
-    llm_engine,
-    instances_batch: list["BeamSearchInstance"],
-    token: int,
-    prompt_start: int,
-    instance_prefill_id: dict[int, str],
-    persistent_request: bool = False,
-) -> dict[str, Any]:
-    """Execute LLM engine step until outputs for all active instances are gathered."""
-    active_indices = [j for j, instance in enumerate(instances_batch) if len(instance.beams) > 0]
-    step_outputs_accumulated = []
-    try:
-        while active_indices:
-            step_outputs = llm_engine.step()
-            step_outputs_accumulated.extend(step_outputs)
-
-            outputs_map = {out.request_id: out for out in step_outputs}
-            new_active_indices = []
-            for j in active_indices:
-                session_id = instance_prefill_id.get(j)
-                search_id = (
-                    f"offline-beam-{prompt_start + j}-0"
-                    if token == 0 or persistent_request
-                    else session_id
-                )
-                if search_id not in outputs_map:
-                    if persistent_request:
-                        # FINAL_ONLY output processing may remove request state
-                        # in the same step that returns the final result, so
-                        # inspect the registry only after this step's outputs.
-                        # The native/internal id is the lifecycle authority.
-                        internal_id = instance_prefill_id[j]
-                        request_states = llm_engine.output_processor.request_states
-                        if internal_id not in request_states:
-                            raise RuntimeError(
-                                "persistent GR request terminated before final output "
-                                f"(internal_request_id={internal_id!r}, "
-                                f"external_request_id={search_id!r})"
-                            )
-                    new_active_indices.append(j)
-            active_indices = new_active_indices
-    except BaseException as error:
-        if persistent_request:
-            active_ids = [
-                instance_prefill_id[j]
-                for j in active_indices
-                if j in instance_prefill_id
-                and instance_prefill_id[j] in llm_engine.output_processor.request_states
-            ]
-            _abort_persistent_requests(llm_engine, active_ids, error)
-        raise
-
-    return {out.request_id: out for out in step_outputs_accumulated}
-
-
-def _parse_step_logprobs(
-    result,
     instance: "BeamSearchInstance",
-    token: int,
-    logprobs_num: int,
-    fork_info_j: ForkInfo | None,
-    catalog: Any | None = None,
-    catalog_strategy: str | None = None,
-    constraint_coordinator: BeamConstraintCoordinator | None = None,
-    return_arrays: bool = False,
-) -> tuple[bool, Any, Any, Any, list[BeamCandidateCache]]:
-    """Parse flat logprobs from engine step results.
-
-    Returns:
-        is_error: bool indicating if the engine returned an error
-        all_beams_token_id: candidate token ids across candidate beams
-        all_beams_logprob: cumulative logprobs
-        all_beams_beam_idx: parent index for each entry
-        beam_flat_cache: list of parsed segments for each parent beam
-    """
-    if result.outputs[0].finish_reason == "error":
-        if return_arrays:
-            return (
-                True,
-                np.empty(0, dtype=np.int64),
-                np.empty(0, dtype=np.float64),
-                np.empty(0, dtype=np.intp),
-                [],
-            )
-        return True, [], [], [], []
-
-    coordinator = constraint_coordinator or BeamConstraintCoordinator.from_catalog(catalog)
-    # Constraint Tables generate candidates in the Worker; the flat segments
-    # are the operator's fixed-width rows (no sampled-token slot, no dedup).
-    is_constrained = isinstance(coordinator.strategy, ConstraintTableStrategy)
-    candidate_builder = ParentCandidateBuilder(
-        layout=(
-            CandidateLayout.CONSTRAINED_TOPK if is_constrained else CandidateLayout.STANDARD_SAMPLER
-        )
+    prompt_index: int,
+    beam_search_params: "SamplingParams",
+    max_decode_steps: int,
+    constraint_digest: str,
+):
+    """Create and register the one native request that owns a GR session."""
+    request_id = f"offline-gr-{prompt_index}"
+    request_params = beam_search_params.clone()
+    configure_persistent_sampling_params(
+        request_params,
+        generation_steps=max_decode_steps,
     )
-
-    flat = result.outputs[0].logprobs
-    if flat is None:
-        raise ValueError(
-            "Beam search generation expected non-empty logprobs for each beam, but received 'None'."
-        )
-
-    raw_token_ids = flat.token_ids
-    raw_logprobs = flat.logprobs
-    raw_ranks = getattr(flat, "ranks", None)
-    raw_decoded = getattr(flat, "decoded_tokens", None)
-    total_logprobs = len(raw_token_ids)
-
-    if token > 0 and fork_info_j is not None:
-        stride_k = total_logprobs // len(fork_info_j)
-
-        for b_idx in range(len(fork_info_j)):
-            current_beam = instance.beams[b_idx]
-            start_offset = b_idx * stride_k
-            end_offset = start_offset + stride_k
-
-            if is_constrained:
-                token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_constrained_segment(
-                    raw_token_ids,
-                    raw_logprobs,
-                    raw_ranks,
-                    raw_decoded,
-                    start_offset,
-                    end_offset,
-                    logprobs_num,
-                )
-            else:
-                token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_segment(
-                    raw_token_ids,
-                    raw_logprobs,
-                    raw_ranks,
-                    raw_decoded,
-                    start_offset,
-                    end_offset,
-                    logprobs_num,
-                )
-            valid_token_ids = None
-            if coordinator.enabled and not is_constrained:
-                generated_tokens = current_beam.tokens[instance.prompt_len :]
-                valid_token_ids = coordinator.valid_next_token_ids(generated_tokens)
-
-            coordinator.add_parent_candidates(
-                candidate_builder,
-                parent_index=b_idx,
-                parent_cumulative_logprob=current_beam.cum_logprob,
-                token_ids=token_ids_pos,
-                logprobs=logprobs_pos,
-                ranks=ranks_pos,
-                decoded_tokens=decoded_pos,
-                valid_token_ids=valid_token_ids,
-                candidate_strategy=catalog_strategy,
-            )
-    else:
-        if is_constrained:
-            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_constrained_flat_logprobs(
-                flat, logprobs_num
-            )
-        else:
-            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_flat_logprobs(
-                flat, logprobs_num
-            )
-        valid_token_ids = None
-        if coordinator.enabled and not is_constrained:
-            current_beam = instance.beams[0]
-            generated_tokens = current_beam.tokens[instance.prompt_len :]
-            valid_token_ids = coordinator.valid_next_token_ids(generated_tokens)
-
-        coordinator.add_parent_candidates(
-            candidate_builder,
-            parent_index=0,
-            parent_cumulative_logprob=instance.beams[0].cum_logprob,
-            token_ids=token_ids_pos,
-            logprobs=logprobs_pos,
-            ranks=ranks_pos,
-            decoded_tokens=decoded_pos,
-            valid_token_ids=valid_token_ids,
-            candidate_strategy=catalog_strategy,
-        )
-
-    candidate_batch = candidate_builder.build()
-    if not return_arrays:
-        return (
-            False,
-            candidate_batch.token_ids.tolist(),
-            candidate_batch.cumulative_logprobs.tolist(),
-            candidate_batch.parent_indices.tolist(),
-            candidate_batch.parent_cache,
-        )
-    # Keep the arrays produced by the builder for the internal hot path.
-    return (
-        False,
-        candidate_batch.token_ids,
-        candidate_batch.cumulative_logprobs,
-        candidate_batch.parent_indices,
-        candidate_batch.parent_cache,
+    execution_width = int(beam_search_params.logprobs or 1)
+    metadata = GRRequestMetadata(
+        request_id=request_id,
+        beam_width=execution_width,
+        generation_steps=max_decode_steps,
+        prefix_len=len(instance.beams[0].tokens),
+        result_width=execution_width,
+        constraint_digest=canonicalize_constraint_digest(constraint_digest),
     )
+    request_params.extra_args = dict(request_params.extra_args or {})
+    request_params.extra_args[GR_REQUEST_METADATA_KEY] = {
+        field: getattr(metadata, field) for field in metadata.__struct_fields__
+    }
+    request = llm_engine.input_processor.process_inputs(
+        request_id=request_id,
+        prompt=_create_tokens_prompt_from_beam(instance.beams[0]),
+        params=request_params,
+        supported_tasks=llm_engine.get_supported_tasks(),
+        arrival_time=time.time(),
+        lora_request=instance.beams[0].lora_request,
+    )
+    llm_engine.input_processor.assign_request_id(request)
+    request.sampling_params.extra_args[GR_REQUEST_METADATA_KEY]["request_id"] = (
+        request.request_id
+    )
+    llm_engine.output_processor.add_request(request, None, None, 0)
+    llm_engine.output_processor.request_states[
+        request.request_id
+    ].gr_persistent_request = True
+    return request
+
+
+def _collect_persistent_output(llm_engine, request) -> Any:
+    """Step the synchronous engine until FINAL_ONLY publishes the result."""
+    try:
+        while True:
+            for output in llm_engine.step():
+                if output.request_id == request.external_req_id:
+                    return output
+            if request.request_id not in llm_engine.output_processor.request_states:
+                raise RuntimeError(
+                    "persistent GR request terminated before final output "
+                    f"(internal_request_id={request.request_id!r}, "
+                    f"external_request_id={request.external_req_id!r})"
+                )
+    except BaseException as error:
+        if request.request_id in llm_engine.output_processor.request_states:
+            _abort_persistent_requests(llm_engine, [request.request_id], error)
+        raise
 
 
 def _custom_beam_search_batch(
@@ -527,270 +182,52 @@ def _custom_beam_search_batch(
     constraint_coordinator: BeamConstraintCoordinator | None = None,
     max_decode_steps: int = 0,
 ) -> None:
-    """Run beam search in batch mode for custom attention backend."""
-    instance_prefill_id: dict[int, str] = {}
-    instance_prev_beam_internal_ids: dict[int, list[str]] = {}
-    instance_fork_info: dict[int, ForkInfo] = {}
-    instance_prefix_len: dict[int, int] = {}
-    instance_completed_sessions: set[int] = set()
-    # Per-instance: EngineCore chained this step's successor from the worker's
-    # beam decision (engine-driven); the next iteration must skip its own
-    # beam_request_step_update send (the session request is still running
-    # under the same session id — a second ADD trips the scheduler's
-    # "duplicate request id" assert).
-    instance_self_advance_chained: set[int] = set()
-
-    # Resolve the frontend catalog-strategy per backend (Trie: None → "fill";
-    # Constraint Tables: an explicit value is a contradiction and is rejected).
-    if constraint_coordinator is not None:
-        catalog_strategy = constraint_coordinator.resolve_catalog_strategy(catalog_strategy)
-
-    # Constraint Tables generate candidates in the Worker; the decode-step
-    # update must carry the constraint_step so the engine can route the raw
-    # logits through the constrained top-k operator.
-    _is_constrained = constraint_coordinator is not None and isinstance(
-        constraint_coordinator.strategy, ConstraintTableStrategy
-    )
+    """Run one Constraint Table request through persistent ASYNC scheduling."""
+    del token_iter, tokenizer, sid_end_token_id, ignore_eos, initial_logprobs
+    del logprobs_num, catalog, catalog_strategy
+    if len(instances_batch) != 1:
+        raise ValueError("persistent GR requests currently require B=1")
+    if not isinstance(
+        getattr(constraint_coordinator, "strategy", None), ConstraintTableStrategy
+    ):
+        raise ValueError(
+            "persistent GR requests require constraint_backend='constraint_table'"
+        )
     gr_config = GRConfig.from_vllm_config(getattr(llm_engine, "vllm_config", None))
-    persistent_request = bool(gr_config.persistent_request)
-    persistent_runner_state = bool(gr_config.persistent_runner_state)
-    persistent_final_ready = False
-    if persistent_request:
-        if len(instances_batch) != 1:
-            raise ValueError("persistent GR requests currently require B=1")
-        if not _is_constrained:
-            raise ValueError(
-                "persistent GR requests currently require constraint_backend='constraint_table'"
-            )
-    constraint_digest = getattr(
-        getattr(constraint_coordinator, "strategy", None),
-        "digest",
-        None,
+    if not (gr_config.persistent_request and gr_config.persistent_runner_state):
+        raise RuntimeError(
+            "constraint_table requires the persistent GR ASYNC scheduler"
+        )
+    constraint_digest = constraint_coordinator.strategy.digest
+    request = _prepare_persistent_request(
+        llm_engine,
+        instances_batch[0],
+        prompt_start,
+        beam_search_params,
+        max_decode_steps,
+        constraint_digest,
     )
+    try:
+        llm_engine.engine_core.add_request(request)
+    except BaseException as error:
+        _abort_persistent_requests(llm_engine, [request.request_id], error)
+        raise
 
-    for token in token_iter:
-        # Check if all instances are done
-        all_done = True
-        for instance in instances_batch:
-            if len(instance.beams) > 0:
-                all_done = False
-                break
-        if all_done:
-            break
+    result = _collect_persistent_output(llm_engine, request)
+    from vllm_gr.entrypoints.openai.serving_engine import _worker_decision_from_result
+    from vllm_gr.v1.worker.gr_model_runner_state import unpack_gr_final_output
 
-        # Step 1: Prepare and update requests
-        engine_core_requests = _prepare_beam_step_requests(
-            llm_engine=llm_engine,
-            instances_batch=instances_batch,
-            token=token,
-            prompt_start=prompt_start,
-            tokenizer=tokenizer,
-            beam_search_params=beam_search_params,
-            sid_end_token_id=sid_end_token_id,
-            instance_prefill_id=instance_prefill_id,
-            instance_prev_beam_internal_ids=instance_prev_beam_internal_ids,
-            instance_fork_info=instance_fork_info,
-            instance_prefix_len=instance_prefix_len,
-            instance_completed_sessions=instance_completed_sessions,
-            max_decode_steps=max_decode_steps,
-            is_constrained=_is_constrained,
-            constraint_digest=constraint_digest,
-            instance_self_advance_chained=instance_self_advance_chained,
-            persistent_request=persistent_request,
-        )
-
-        if engine_core_requests:
-            try:
-                llm_engine.engine_core.add_requests(
-                    engine_core_requests,
-                    force_batch=not persistent_request,
-                )
-            except BaseException as error:
-                if persistent_request:
-                    _abort_persistent_requests(
-                        llm_engine,
-                        [request.request_id for request in engine_core_requests],
-                        error,
-                    )
-                raise
-            for ec_req in engine_core_requests:
-                parts = ec_req.external_req_id.split("-")
-                j = int(parts[2]) - prompt_start
-                instance_prefill_id[j] = ec_req.request_id
-                instance_prev_beam_internal_ids[j] = [ec_req.request_id]
-
-        # Step 2: Step engine and collect outputs
-        outputs_map = _step_engine_and_collect_outputs(
-            llm_engine=llm_engine,
-            instances_batch=instances_batch,
-            token=token,
-            prompt_start=prompt_start,
-            instance_prefill_id=instance_prefill_id,
-            persistent_request=persistent_request,
-        )
-
-        # Step 3: Process outputs for each instance
-        for j, instance in enumerate(instances_batch):
-            if len(instance.beams) == 0:
-                continue
-
-            session_id = instance_prefill_id[j]
-            search_id = (
-                f"offline-beam-{prompt_start + j}-0"
-                if token == 0 or persistent_request
-                else session_id
-            )
-            result = outputs_map.get(search_id)
-
-            if result is None:
-                continue
-
-            # Worker-side beam decision: when the accelerator
-            # already selected the surviving beams, use its winners directly
-            # and skip the frontend flat-logprobs parsing + NumPy top-k.  The
-            # downstream EOS handling / beam materialisation is unchanged.
-            from vllm_gr.entrypoints.openai.serving_engine import (
-                _worker_decision_flatten,
-                _worker_decision_from_result,
-            )
-
-            worker_decision = _worker_decision_from_result(result)
-            worker_candidates = None
-            if worker_decision is not None:
-                if worker_decision.get("is_last_step") and worker_decision.get("counters"):
-                    logger.info(
-                        "vllm-gr request counters: %s",
-                        worker_decision["counters"],
-                    )
-                if persistent_runner_state:
-                    from vllm_gr.v1.worker.gr_model_runner_state import (
-                        unpack_gr_final_output,
-                    )
-
-                    final_output = unpack_gr_final_output(worker_decision)
-                    if final_output is None:
-                        raise RuntimeError("persistent GR final output is invalid")
-                    sequences, _, selected_logprobs, scores = final_output
-                    instance.beams = materialize_final_beams(
-                        instance.beams[0], sequences, selected_logprobs, scores
-                    )
-                    persistent_final_ready = True
-                    continue
-                worker_candidates = _worker_decision_flatten(
-                    worker_decision, beam_width, instance.beams
-                )
-            # EngineCore chained this step's successor from the worker's
-            # decision (engine-driven): the next iteration skips its
-            # beam_request_step_update send. A missing flag (terminal
-            # decision / skip path / engine-driven disabled) keeps the
-            # frontend-driven path in charge.
-            if worker_decision is not None and worker_decision.get("beam_self_advance_chained"):
-                instance_self_advance_chained.add(j)
-            else:
-                instance_self_advance_chained.discard(j)
-
-            if persistent_runner_state:
-                # Intermediate outputs contain one scalar control token only.
-                # Beam rows and scores remain owned by GRModelRunnerState.
-                continue
-
-            if worker_candidates is not None:
-                (
-                    all_beams_token_id,
-                    all_beams_logprob,
-                    all_beams_beam_idx_arr,
-                    beam_flat_cache,
-                ) = worker_candidates
-                if not all_beams_token_id:
-                    is_error = True
-                else:
-                    is_error = False
-                    all_beams_token_id = np.asarray(all_beams_token_id, dtype=np.int64)
-                    all_beams_logprob = np.asarray(all_beams_logprob, dtype=np.float64)
-                    all_beams_beam_idx_arr = np.asarray(all_beams_beam_idx_arr, dtype=np.intp)
-            else:
-                (
-                    is_error,
-                    all_beams_token_id,
-                    all_beams_logprob,
-                    all_beams_beam_idx,
-                    beam_flat_cache,
-                ) = _parse_step_logprobs(
-                    result=result,
-                    instance=instance,
-                    token=token,
-                    logprobs_num=logprobs_num,
-                    fork_info_j=instance_fork_info.get(j),
-                    catalog=catalog,
-                    catalog_strategy=catalog_strategy,
-                    constraint_coordinator=constraint_coordinator,
-                    return_arrays=True,
-                )
-                all_beams_beam_idx_arr = all_beams_beam_idx
-
-            if is_error:
-                _beam_request_cleanup(
-                    llm_engine,
-                    session_id,
-                    instance_prev_beam_internal_ids[j],
-                )
-                instance_completed_sessions.add(j)
-                instance.beams = []
-                continue
-
-            # _parse_step_logprobs returns the builder's NumPy arrays for the
-            # internal path; do not convert them through Python lists again.
-            if not ignore_eos:
-                eos_beams, all_beams_logprob = complete_eos_candidates(
-                    parents=instance.beams,
-                    token_ids=all_beams_token_id,
-                    scores=all_beams_logprob,
-                    beam_idx=all_beams_beam_idx_arr,
-                    beam_flat_cache=beam_flat_cache,
-                    stop_token_ids={tokenizer.eos_token_id},
-                    initial_logprobs=initial_logprobs,
-                    include_eos_token=True,
-                    inherit_lora_request=True,
-                )
-                instance.completed.extend(eos_beams)
-
-            # A worker decision already contains exactly W survivors in the
-            # order used by its device-resident KV state. Keep that order.
-            topn_idx = (
-                np.arange(all_beams_token_id.size, dtype=np.intp)
-                if worker_candidates is not None
-                else select_top_indices(all_beams_logprob, beam_width, catalog_strategy)
-            )
-            new_beams, fork_info = materialize_selected_beams(
-                parents=instance.beams,
-                selected_indices=topn_idx,
-                token_ids=all_beams_token_id,
-                scores=all_beams_logprob,
-                beam_idx=all_beams_beam_idx_arr,
-                beam_flat_cache=beam_flat_cache,
-                initial_logprobs=initial_logprobs,
-            )
-            instance.beams = new_beams
-            instance_fork_info[j] = fork_info
-
-        # The terminal persistent result finishes the native request. Do not
-        # enter another token-loop iteration after it has already finished.
-        if persistent_final_ready:
-            break
-
-    # Step 4: Cleanup completed sessions
-    for j, instance in enumerate(instances_batch):
-        if (
-            not persistent_request
-            and j not in instance_completed_sessions
-            and j in instance_prefill_id
-        ):
-            _beam_request_cleanup(
-                llm_engine,
-                instance_prefill_id[j],
-                instance_prev_beam_internal_ids[j],
-            )
-            instance_completed_sessions.add(j)
+    decision = _worker_decision_from_result(result)
+    final_output = unpack_gr_final_output(decision) if decision is not None else None
+    if final_output is None:
+        raise RuntimeError("persistent GR final output is missing or invalid")
+    sequences, _, selected_logprobs, scores = final_output
+    instance = instances_batch[0]
+    instance.beams = materialize_final_beams(
+        instance.beams[0], sequences, selected_logprobs, scores
+    )
+    if decision.get("counters"):
+        logger.info("vllm-gr request counters: %s", decision["counters"])
 
 
 class GRLLM(LLM):
@@ -829,7 +266,7 @@ class GRLLM(LLM):
 
         initialize_runtime()
         # Force the EngineCore process entrypoint swap: re_apply_patches may
-        # skip an already-marked batch_and_fork patch (e.g. when the general
+        # skip an already-installed persistent runtime patch (e.g. when the general
         # plugin ran first), and without the swap a spawn child re-imports the
         # original run_engine_core and loses every worker hook.
         from vllm_gr.entrypoints.openai.beam_search_patch import (

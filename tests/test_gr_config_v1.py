@@ -128,7 +128,7 @@ def test_canonical_self_advance_requires_worker_decision(tmp_path: Path) -> None
     assert isinstance(beam, dict)
     beam["engine_driven"] = True
 
-    with pytest.raises(ValueError, match="requires beam_worker_decision=True"):
+    with pytest.raises(ValueError, match="removed with the legacy GR scheduler"):
         gr_config_from_mapping(raw)
 
 
@@ -285,7 +285,13 @@ def test_engine_creation_writes_enabled_canonical_config(
 ) -> None:
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
-    vllm_config = SimpleNamespace(additional_config={})
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        scheduler_config=SimpleNamespace(
+            async_scheduling=None,
+            scheduler_cls=None,
+        ),
+    )
     engine_args = SimpleNamespace(
         _vllm_gr_config_input=_canonical_mapping(str(tmp_path / "table.safetensors")),
         catalog_path=None,
@@ -305,9 +311,14 @@ def test_engine_creation_writes_enabled_canonical_config(
         mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
     ):
         assert create_engine_config(engine_args) is vllm_config
-    assert vllm_config.additional_config[GR_CONFIG_KEY] == _canonical_mapping(
-        str(tmp_path / "table.safetensors")
-    )
+    written = vllm_config.additional_config[GR_CONFIG_KEY]
+    assert written["beam"]["worker_decision"] is True
+    assert written["beam"]["engine_driven"] is False
+    assert written["runtime"] == {
+        "persistent_request": True,
+        "persistent_runner_state": True,
+        "scheduling_mode": "async",
+    }
 
     conflicting_engine_args = SimpleNamespace(
         _vllm_gr_config_input=_canonical_mapping(
@@ -339,7 +350,13 @@ def test_engine_creation_serializes_cuda_decision_defaults(
 ) -> None:
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
-    vllm_config = SimpleNamespace(additional_config={})
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        scheduler_config=SimpleNamespace(
+            async_scheduling=None,
+            scheduler_cls=None,
+        ),
+    )
     raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
     engine_args = SimpleNamespace(
         _vllm_gr_config_input=raw,
@@ -361,9 +378,11 @@ def test_engine_creation_serializes_cuda_decision_defaults(
 
     payload = vllm_config.additional_config[GR_CONFIG_KEY]
     assert payload["beam"]["worker_decision"] is True
-    assert payload["beam"].get("engine_driven") is expected_engine_driven
+    assert payload["beam"].get("engine_driven") is False
+    assert payload["runtime"]["persistent_request"] is True
+    assert payload["runtime"]["persistent_runner_state"] is True
     assert parse_gr_config(vllm_config).beam_worker_decision is True
-    assert parse_gr_config(vllm_config).beam_engine_driven is expected_engine_driven
+    assert parse_gr_config(vllm_config).beam_engine_driven is False
 
 
 def test_persistent_request_selects_gr_async_scheduler(tmp_path: Path) -> None:
@@ -405,7 +424,7 @@ def test_persistent_request_selects_gr_async_scheduler(tmp_path: Path) -> None:
     )
 
 
-def test_persistent_request_rejects_disabled_async_scheduler(tmp_path: Path) -> None:
+def test_persistent_request_enables_async_scheduler(tmp_path: Path) -> None:
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
     scheduler_config = SimpleNamespace(async_scheduling=False, scheduler_cls=None)
@@ -435,6 +454,10 @@ def test_persistent_request_rejects_disabled_async_scheduler(tmp_path: Path) -> 
         ),
         mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
         mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
-        pytest.raises(ValueError, match="requires vLLM async scheduling"),
     ):
         create_engine_config(engine_args)
+
+    assert scheduler_config.async_scheduling is True
+    assert scheduler_config.scheduler_cls == (
+        "vllm_gr.v1.core.sched.async_scheduler.GRAsyncScheduler"
+    )

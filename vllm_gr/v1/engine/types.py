@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared types for vllm_gr engine patches.
-
-Defines BeamRequestStepUpdate
-"""
+"""Shared types for the persistent vLLM-GR engine path."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from enum import Enum
 import re
+from enum import Enum
 from typing import Final
 
 import msgspec
-from vllm.lora.request import LoRARequest
-from vllm.sampling_params import SamplingParams
 
 GR_PROTOCOL_VERSION: Final = 1
 GR_REQUEST_METADATA_KEY: Final = "vllm_gr"
@@ -280,41 +274,3 @@ class GRModelRunnerOutput(
                 "persistent GR final_ready control output requires finished=true "
                 "and a final output"
             )
-
-# ---------------------------------------------------------------------------
-# BeamRequestStepUpdate — Improved Beam handling by a single Beam request
-# ---------------------------------------------------------------------------
-
-
-class BeamRequestStepUpdate(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):  # type: ignore[call-arg]
-    """Single logical message for all branches of a decode step."""
-
-    session_id: str
-    parent_beam_ids: list[str]
-    child_beam_ids: list[str]
-    beam_tokens: list[list[int]]
-    pruned_ids: list[str]
-    prefix_len: int
-    beam_width: int
-    sampling_params: SamplingParams
-    eos_token_id: int | None = None
-    client_index: int = 0
-    current_wave: int = 0
-    priority: int = 0
-    data_parallel_rank: int | None = None
-    lora_request: LoRARequest | None = None
-    cache_salt: str | None = None
-    trace_headers: Mapping[str, str] | None = None
-    # Numeric parent beam indices for incremental decode KV reordering
-    parent_beam_indices: list[int] | None = None
-    # Maximum number of decode steps for KV pool pre-allocation
-    max_decode_steps: int = 0
-    # 0 = constrained prefill, 1/2 = constrained decode step for Constraint
-    # Tables (issue #246).  Default 0 also means "not a constrained decode", so
-    # omit_defaults keeps legacy code streams byte-identical.
-    constraint_step: int = 0

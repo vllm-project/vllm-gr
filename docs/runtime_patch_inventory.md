@@ -45,10 +45,8 @@ aligned with it.
 | GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; serving lifecycle tests | API server |
 | GR-PATCH-005 | `vllm_gr/engine/arg_utils_gr.py` | `patch_add_cli_args` | required frontend plan finds GR EngineArgs methods absent | `_validate_engine_args_patch`; attention backend configuration tests | main, API server |
 | GR-PATCH-006 | `entrypoints/openai/serving_models.py` | `patch_OpenAIServingModels_init` | required frontend plan finds the constructor absent | `_validate_serving_models_patch`; serving Catalog tests | API server |
-| GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds grouped client methods incomplete | `_validate_batch_and_fork_patch`; BeamRequest and DP tests | API server |
-| GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
-| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; BeamRequest tests | EngineCore |
-| GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `scheduler_metadata.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
+| GR-PATCH-007 | `v1/engine/core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_persistent_runtime` | required frontend plan finds persistent request helpers absent | `_validate_persistent_runtime_patch`; serving lifecycle tests | API server |
+| GR-PATCH-009 | `v1/engine/engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds persistent lifecycle hooks absent | lifecycle and abort tests | EngineCore |
 | GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active GPU runner hooks are incomplete | `_validate_model_runner_patch`; GPU and dispatcher tests | GPU worker |
 | GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
@@ -153,75 +151,20 @@ aligned with it.
 - Behavior: attaches the Catalog state required by GR serving.
 - Removal condition: Catalog state is injected through composition or a stable serving extension point.
 
-### GR-PATCH-007 — EngineCore Client and AsyncLLM Extensions
+### GR-PATCH-007 — AsyncLLM Request Preparation
 
-- Targets: GR extensions on `AsyncMPClient`, `SyncMPClient`, `InprocClient`, and `AsyncLLM`
-- Risk: Critical
-- Behavior:
-    - sends grouped Beam requests;
-    - sends Beam step updates;
-    - registers grouped output queues;
-    - preserves data-parallel affinity for Beam sessions.
-- Private/internal dependencies include:
-    - `_send_input`;
-    - `_ensure_output_queue_task`;
-    - `_ensure_stats_update_task`;
-    - `core_engines`;
-    - `reqs_in_flight`;
-    - `first_req_send_socket`;
-    - `engines_running`;
-    - `current_wave`.
-- Removal condition: vLLM exposes stable request batching, control-message, and routing extension points sufficient for the grouped Beam lifecycle.
+- Target: `AsyncLLM.prepare_request` and `_add_requests_batch`.
+- Risk: High.
+- Behavior: registers the final-only output collector before dispatch, then sends each prepared request through vLLM's native ADD protocol.
+- Removal condition: vLLM exposes request preparation without immediate EngineCore dispatch.
 
-### GR-PATCH-008 — EngineCoreRequestType Extension
+### GR-PATCH-009 — Persistent EngineCore Lifecycle
 
-- Target: `EngineCoreRequestType`
-- Mutation: Python Enum private-state mutation
-- Added values:
-    - `ADD_BATCH = b"\x06"`
-    - `BEAM_REQUEST_STEP_UPDATE = b"\x07"`
-- Risk: Critical
-- Current compatibility: upstream vLLM 0.22.1 uses values `0x00` through `0x05`.
-- Private dependencies:
-    - `_value2member_map_`;
-    - `_member_map_`;
-    - `_member_names_`.
-- Removal condition: grouped Beam messages can be carried through a stable upstream extension mechanism without mutating Enum internals.
-
-### GR-PATCH-009 — EngineCore Lifecycle and Socket Processing
-
-- Targets:
-    - `EngineCore.__init__`
-    - `EngineCoreProc.__init__`
-    - `EngineCoreProc.process_input_sockets`
-    - `EngineCoreProc.run_engine_core`
-    - GR Beam request handlers
-- Risk: Critical
-- Behavior: integrates grouped Beam request processing into EngineCore.
-- Compatibility-sensitive upstream behavior includes:
-    - ZMQ socket construction;
-    - READY and coordinator handshakes;
-    - Tensor IPC setup;
-    - Msgpack decoder setup;
-    - ADD and ABORT processing;
-    - input queue payload layout.
-- Removal condition: vLLM exposes a stable control-message or request-dispatch extension point that avoids replacing the complete socket loop.
-
-### GR-PATCH-010 — Scheduler Beam Override
-
-- Target: `Scheduler.schedule`
-- Mutation: scheduling hot-path wrapper or replacement
-- Risk: Critical
-- Behavior:
-    - adapts KV cache lookup for grouped Beam requests;
-    - builds Beam scheduling metadata;
-    - attaches GR metadata to the scheduler result.
-- Dependencies:
-    - `Scheduler.requests`;
-    - `Scheduler.kv_cache_manager`;
-    - `num_scheduled_tokens`;
-    - the ability to attach metadata to `SchedulerOutput`.
-- Removal condition: Beam metadata can be carried through an explicit upstream scheduler extension or wrapper without replacing `schedule()` or adding undeclared attributes.
+- Targets: `EngineCore.__init__`, `EngineCore.abort_requests`, `EngineCoreProc._process_engine_step`, and the spawned-process entrypoint.
+- Risk: Critical.
+- Behavior: validates BatchQueue depth, releases Worker-owned GR state after abort, retires an engine after release failure, and accounts for final-only control progress.
+- Ordinary request impact: no request protocol or `Scheduler.schedule` method is replaced.
+- Removal condition: vLLM exposes stable abort and final-only BatchQueue lifecycle hooks.
 
 ### GR-PATCH-011 — GPU ModelRunner Override
 

@@ -193,29 +193,6 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "of worker-side beam decision).",
     )
     model_group.add_argument(
-        "--beam-engine-driven",
-        action="store_true",
-        default=None,
-        help="Make EngineCore chain beam step updates in-process from the "
-        "worker's beam decision (prefill -> step0 and every decode step). "
-        "The frontend still consumes each step's output (EOS / materialize) "
-        "but skips the per-step RPC when the engine chained that step. "
-        "Requires --beam-worker-decision. Safe under async scheduling: the "
-        "advance runs in the busy-loop iteration that processes the step's "
-        "outputs. Accelerator beam deployments with worker decisions enable "
-        "it by default. Inlined sample_tokens (skipping the second "
-        "collective RPC) additionally requires synchronous scheduling and "
-        "PP=1.",
-    )
-    model_group.add_argument(
-        "--no-beam-engine-driven",
-        action="store_false",
-        dest="beam_engine_driven",
-        default=None,
-        help="Keep the frontend-driven beam step-update loop (opt out of "
-        "EngineCore in-process chaining).",
-    )
-    model_group.add_argument(
         "--enable-persistent-request",
         action="store_true",
         dest="persistent_request",
@@ -257,7 +234,6 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
         setattr(engine_args, attr, getattr(args, attr, None))
     engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
     engine_args.beam_worker_decision = getattr(args, "beam_worker_decision", None)
-    engine_args.beam_engine_driven = getattr(args, "beam_engine_driven", None)
     engine_args.persistent_request = getattr(args, "persistent_request", None)
     engine_args.persistent_runner_state = getattr(
         args, "persistent_runner_state", None
@@ -490,8 +466,8 @@ def create_engine_config(self, usage_context=None, headless=False):
         # Tables with worker-side beam decision by default.  Promotion requires
         # a catalog: the tokenizer auto-build sentinel would fail fast on
         # models whose s_a/s_b/s_c groups exceed max_valid_items (e.g. OneRec
-        # 8192 > 500), so a catalog-free beam deployment stays unconstrained
-        # (legacy) instead.  This only fires on a real NPU device with an
+        # 8192 > 500), so a catalog-free beam deployment stays unconstrained.
+        # This only fires on a real NPU device with an
         # active beam pool, so non-GR / non-beam configs and non-NPU platforms
         # are untouched.  beam_max_width is read from the parsed config (GRLLM
         # rides it in additional_config) or the EngineArgs attribute (serve
@@ -503,10 +479,6 @@ def create_engine_config(self, usage_context=None, headless=False):
         worker_decision_explicit = (
             getattr(self, "beam_worker_decision", None) is not None
             or existing_gr_config.beam_worker_decision is not None
-        )
-        engine_driven_explicit = (
-            getattr(self, "beam_engine_driven", None) is not None
-            or existing_gr_config.beam_engine_driven is not None
         )
         if (
             _is_npu_platform()
@@ -524,7 +496,7 @@ def create_engine_config(self, usage_context=None, headless=False):
             # NOT used here: a tokenizer whose s_a/s_b/s_c groups exceed
             # max_valid_items fails fast (e.g. OneRec 8192>500), and a
             # catalog-free GRLLM (no constraint data at all) must stay
-            # unconstrained (legacy) instead of force-building tables.  A
+            # unconstrained instead of force-building tables.  A
             # catalog document is therefore required for the promotion.
             effective_constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
         # Worker-side beam decision is enabled on accelerator backends by default for any beam
@@ -538,29 +510,6 @@ def create_engine_config(self, usage_context=None, headless=False):
         ):
             if effective_beam_worker_decision is None:
                 effective_beam_worker_decision = True
-        # Unified engine-driven sessions: accelerator beam default with
-        # worker decisions, NO async-scheduling and NO constraint-backend
-        # condition.  The advance runs in the busy-loop iteration that
-        # processes the step's outputs (no two-phase pipeline conflict), and
-        # the constraint-table requirement is enforced by the data (worker
-        # beam decisions only exist for constrained beam sessions).
-        if (
-            (_is_npu_platform() or _is_cuda_platform())
-            and beam_width_configured
-            and effective_beam_worker_decision
-            and not engine_driven_explicit
-            and effective_beam_engine_driven is None
-        ):
-            effective_beam_engine_driven = True
-        # Engine-driven chaining consumes the worker's beam_search_result.
-        # Validate after platform defaults so an explicit engine-driven
-        # choice can use the accelerator's default worker decision.
-        if effective_beam_engine_driven and not effective_beam_worker_decision:
-            raise ValueError(
-                "beam_engine_driven=True requires beam_worker_decision=True "
-                "(CLI --beam-worker-decision or additional_config "
-                "'vllm_gr_beam_worker_decision')"
-            )
         offset, slice_size = None, None
         # CUDA Constraint Tables support sliced logits while keeping global
         # table token ids (CUDAConstrainedTopKExecution._vocab_window).  The
@@ -635,18 +584,25 @@ def create_engine_config(self, usage_context=None, headless=False):
         and effective_gr_config.beam_worker_decision is None
     ):
         effective_gr_config = replace(effective_gr_config, beam_worker_decision=True)
-    # Canonical configs: engine-driven default mirrors the legacy rule above
-    # (accelerator beam + worker decisions; async scheduling and constraint
-    # backend are deliberately not conditions).  Unset stays unset until this
-    # promotion writes True.
+    # Constraint Tables have one supported runtime after the legacy scheduler
+    # removal: a stable native request, GRAsyncScheduler, Worker-side decisions,
+    # and device-resident Beam state. Normalize older configs at the engine
+    # boundary so callers cannot silently enter the removed per-step path.
     if (
-        canonical_source
-        and (_is_cuda_platform() or _is_npu_platform())
-        and effective_gr_config.beam_max_width is not None
-        and effective_gr_config.beam_worker_decision
-        and effective_gr_config.beam_engine_driven is None
+        effective_gr_config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
+        or (
+            effective_gr_config.constraint_table is not None
+            and effective_gr_config.constraint_table.enabled
+        )
     ):
-        effective_gr_config = replace(effective_gr_config, beam_engine_driven=True)
+        effective_gr_config = replace(
+            effective_gr_config,
+            beam_worker_decision=True,
+            beam_engine_driven=False,
+            persistent_request=True,
+            persistent_runner_state=True,
+            scheduling_mode=GRSchedulingMode.ASYNC,
+        )
 
     if effective_gr_config != existing_gr_config or canonical_input is not None:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
@@ -670,10 +626,6 @@ def create_engine_config(self, usage_context=None, headless=False):
                 "vllm-gr scheduling_mode='async'"
             )
         scheduler_config = config.scheduler_config
-        if scheduler_config.async_scheduling is False:
-            raise ValueError(
-                "persistent_request=True requires vLLM async scheduling"
-            )
         scheduler_config.async_scheduling = True
         scheduler_config.scheduler_cls = (
             "vllm_gr.v1.core.sched.async_scheduler.GRAsyncScheduler"

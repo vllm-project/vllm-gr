@@ -15,7 +15,6 @@ class GRRequestCounters:
     gr_state_created_per_session: int = 0
     gr_state_freed_per_session: int = 0
     decode_request_objects_created: int = 0
-    beam_request_step_update_calls: int = 0
     decode_prefix_cache_queries: int = 0
     intermediate_beam_state_d2h_bytes: int = 0
     decode_scheduler_calls: int = 0

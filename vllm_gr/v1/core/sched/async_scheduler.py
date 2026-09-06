@@ -104,7 +104,7 @@ class GRAsyncScheduler(AsyncScheduler):
 
         EngineCore invokes this only after executor shutdown returns, so a
         failed device drain must leave Native KV/request ownership intact.
-        Ordinary and legacy GR requests retain upstream shutdown semantics.
+        Ordinary requests retain upstream shutdown semantics.
         """
         request_ids = [
             request_id for request_id, request in self.requests.items()

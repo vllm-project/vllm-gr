@@ -129,6 +129,9 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
         def __init__(self, n: int = 1, **kwargs: Any) -> None:
             self.n = n
 
+    class RequestOutputKind(str, Enum):
+        FINAL_ONLY = "final_only"
+
     # vllm_gr.sampling_params subclasses the upstream BeamSearchParams, which is
     # a msgspec Struct (``dict=True, omit_defaults=True`` subclass kwargs).
     class BeamSearchParams(  # type: ignore[call-arg]
@@ -195,6 +198,7 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
         "vllm.sampling_params": _module(
             "vllm.sampling_params",
             SamplingParams=SamplingParams,
+            RequestOutputKind=RequestOutputKind,
             BeamSearchParams=BeamSearchParams,
         ),
         "vllm.lora": ModuleType("vllm.lora"),
@@ -240,7 +244,13 @@ def _isolated_vllm_imports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 def _fake_config() -> SimpleNamespace:
     """VllmConfig stand-in: additional_config is a plain mapping."""
-    return SimpleNamespace(additional_config={})
+    return SimpleNamespace(
+        additional_config={},
+        scheduler_config=SimpleNamespace(
+            async_scheduling=None,
+            scheduler_cls=None,
+        ),
+    )
 
 
 class TestEngineArgsGrInitPatch:

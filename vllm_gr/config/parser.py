@@ -472,8 +472,8 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
 
     beam_engine_driven = validate_beam_engine_driven(gr_config.beam_engine_driven)
     if beam_engine_driven is None:
-        # Unset stays out of the serialized config; the runtime applies the
-        # accelerator engine-driven default at flag-read time.
+        # Unset stays out of the serialized config. The field is retained only
+        # to decode older configuration documents.
         additional_config.pop(BEAM_ENGINE_DRIVEN_KEY, None)
     else:
         # Both explicit values round-trip (an opt-out must survive a write).

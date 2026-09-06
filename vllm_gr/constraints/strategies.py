@@ -46,21 +46,13 @@ def validate_constraint_table_protocol(
     required: str,
     hint: str = "",
 ) -> None:
-    """Fail fast when Constraint Tables cannot reach the beam-request path.
-
-    Both execution paths (offline ``GRLLM`` and OpenAI ``beam_search``) have a
-    degraded fallback that cannot express Constraint Table step0/1/2 and
-    ``beam_suffix``: the baseline ``generate()`` loop when CUSTOM attention is
-    absent, and ``_add_batch_step`` when the engine client lacks
-    ``beam_request_step_update``.  Under ``constraint_backend=constraint_table``
-    those fallbacks must fail fast, never silently produce uncorrected samples.
-    """
+    """Fail fast when Constraint Tables cannot use persistent scheduling."""
     if is_constraint_table and not beam_protocol_available:
         suffix = f" {hint}" if hint else ""
         raise RuntimeError(
-            "constraint_backend='constraint_table' requires the beam-request "
-            f"protocol path ({required}); the fallback path cannot express "
-            "Constraint Table step0/1/2 and beam_suffix." + suffix
+            "constraint_backend='constraint_table' requires "
+            f"{required}; the ordinary generation path cannot express "
+            "Constraint Table step0/1/2 and device-owned Beam state." + suffix
         )
 
 

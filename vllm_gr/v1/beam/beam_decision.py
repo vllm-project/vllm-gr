@@ -1054,10 +1054,8 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
         "out_token_ids": out_ids,
         "out_token_index": out_parents,
         "out_log_probs": out_scores,
-        # Ownership markers (review P5/P8): EngineCore's engine-driven prefill
-        # branch keys on stage="prefill" and validates session_id against the
-        # output it was attached to, so a mixed batch (A decode + B prefill)
-        # can never chain B's decision onto A's session.
+        # Ownership markers let the persistent scheduler validate that a
+        # prefill decision belongs to the request whose state it initializes.
         "stage": "prefill",
         "session_id": prefill_req_id,
     }

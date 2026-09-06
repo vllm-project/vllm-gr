@@ -96,58 +96,31 @@ patches:
     removal_condition: Catalog state uses composition or a stable serving extension point
 
   - id: GR-PATCH-007
-    owner: vllm_gr/v1/engine/core_client.py, core_client_patch.py, and async_llm.py
-    installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_batch_and_fork
-    activation: the required frontend patch plan detects grouped Beam client methods are incomplete
+    owner: vllm_gr/v1/engine/core_client_patch.py and async_llm.py
+    installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_persistent_runtime
+    activation: the required frontend plan detects persistent request helpers are absent
     validator_or_test:
-      - vllm_gr.patch._validate_batch_and_fork_patch
-      - tests/test_beam_request_unit.py
-      - tests/test_dp_beam_request_unit.py
+      - vllm_gr.patch._validate_persistent_runtime_patch
+      - tests/test_serving_beam_lifecycle.py
     process_roles: [api_server]
-    target: EngineCore clients and AsyncLLM
-    risk: critical
+    target: AsyncLLM
+    risk: high
     contract: null
-    removal_condition: vLLM exposes stable grouped request, control-message, and routing hooks
-
-  - id: GR-PATCH-008
-    owner: vllm_gr/v1/engine/wire.py
-    installer: vllm_gr.v1.engine.wire.register_engine_core_request_types
-    activation: frontend and EngineCore installers require the GR wire values
-    validator_or_test:
-      - vllm_gr.patch._validate_request_types_patch
-      - tests/contract/test_engine_core_protocol_contracts.py
-    process_roles: [api_server, engine_core]
-    target: vllm.v1.engine.EngineCoreRequestType
-    risk: critical
-    contract: engine-wire-values
-    removal_condition: stable upstream messages carry grouped Beam operations without Enum mutation
+    removal_condition: vLLM exposes request preparation without immediate EngineCore dispatch
 
   - id: GR-PATCH-009
-    owner: vllm_gr/v1/engine/core.py and engine_core_patch.py
+    owner: vllm_gr/v1/engine/engine_core_patch.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
-    activation: the EngineCore patch plan detects request dispatch is incomplete
+    activation: the EngineCore plan detects persistent lifecycle hooks are absent
     validator_or_test:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
-      - tests/test_beam_request_unit.py
+      - tests/test_engine_core_gr_abort.py
     process_roles: [engine_core]
-    target: vllm.v1.engine.core.EngineCoreProc
+    target: vllm.v1.engine.core.EngineCore and EngineCoreProc
     risk: critical
     contract: engine-core-signatures
-    removal_condition: vLLM exposes stable control-message and request-dispatch extension points
-
-  - id: GR-PATCH-010
-    owner: vllm_gr/v1/engine/engine_core_patch.py and scheduler_metadata.py
-    installer: vllm_gr.v1.engine.engine_core_patch.apply_scheduler_patch
-    activation: the EngineCore patch plan detects scheduler metadata propagation is absent
-    validator_or_test:
-      - vllm_gr.patch._validate_scheduler_patch
-      - tests/contract/test_engine_core_protocol_contracts.py
-    process_roles: [engine_core]
-    target: vllm.v1.core.sched.scheduler.Scheduler.schedule
-    risk: critical
-    contract: scheduler-contract
-    removal_condition: explicit upstream scheduler metadata hooks carry grouped Beam state
+    removal_condition: vLLM exposes stable request abort and final-only BatchQueue lifecycle hooks
 
   - id: GR-PATCH-011
     owner: vllm_gr/v1/worker/gpu_model_runner_patch.py

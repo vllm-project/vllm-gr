@@ -1093,95 +1093,6 @@ def _attach_beam_search_result(runner: Any, model_output: Any) -> None:
     target.beam_search_result = decision
 
 
-def _sampling_params_is_structured(params: Any) -> bool:
-    """True when the row carries guided / structured-output constraints."""
-    if params is None:
-        return False
-    if getattr(params, "structured_outputs", None) is not None:
-        return True
-    return getattr(params, "guided_decoding", None) is not None
-
-
-def _batch_has_non_beam_or_structured_row(scheduler_output: Any) -> bool:
-    """True when M2 must stay off: ordinary, mixed, or guided rows present."""
-    if scheduler_output is None:
-        return False
-    if getattr(scheduler_output, "pending_structured_output_tokens", False):
-        return True
-    beam_data = getattr(scheduler_output, "beam_data", None) or {}
-    scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
-    scheduled_ids = set(scheduled.keys()) if scheduled else set(beam_data.keys())
-    if not scheduled_ids:
-        # Ordinary empty/unknown batch: do not inline.
-        return True
-    for req_id in scheduled_ids:
-        meta = beam_data.get(req_id) or {}
-        if not (meta.get("is_beam_decode") or meta.get("is_constraint_prefill")):
-            return True
-        if meta.get("use_structured_output"):
-            return True
-    for req in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
-        if _sampling_params_is_structured(getattr(req, "sampling_params", None)):
-            return True
-    return False
-
-
-def _should_inline_sample_tokens(runner: Any, scheduler_output: Any = None) -> bool:
-    """Whether ``execute_model`` should finish sampling in-process (M2).
-
-    The upstream short-circuit (``vllm/v1/engine/core.py``: ``future.result()
-    is None`` → ``model_executor.sample_tokens``) only exists on the plain
-    ``step()`` path.  It therefore requires:
-
-    - the GRConfig opt-ins: ``beam_engine_driven`` (M2 rides the engine-
-      driven pipeline) and ``beam_worker_decision`` (its validation already
-      requires ``beam_engine_driven → beam_worker_decision``);
-    - ``use_async_scheduling`` off: with async scheduling the engine runs
-      ``step_with_batch_queue``, which issues the second ``sample_tokens``
-      RPC unconditionally (the returned Future is fed through the batch
-      queue); an inlined output would collide with that call;
-    - pipeline-parallel off: with PP>1 the worker contract (IntermediateTensors
-      handoff / per-rank responses) is undefined for an inlined output, and
-      the engine also switches to ``step_with_batch_queue``.
-    - per-request metadata: every scheduled row must be a beam decode or
-      constraint prefill.  Guided / structured-output rows need the engine
-      grammar bitmask computed *after* execute_model; inlining
-      ``sample_tokens(None)`` would sample them unmasked.  Mixed ordinary
-      batches keep the two-RPC path.
-
-    When ``scheduler_output`` is omitted the config/topology gates are
-    returned alone (unit tests of those flags).
-    """
-    gr_cfg = _get_gr_config(runner)
-    if not (gr_cfg.beam_engine_driven and gr_cfg.beam_worker_decision):
-        return False
-    if getattr(runner, "use_async_scheduling", False):
-        return False
-    parallel_config = getattr(runner, "parallel_config", None)
-    if parallel_config is not None and getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
-        return False
-    return not (
-        scheduler_output is not None and _batch_has_non_beam_or_structured_row(scheduler_output)
-    )
-
-
-def _inline_sample_tokens(runner: Any) -> Any:
-    """Run the runner's ``sample_tokens`` in-process and return its output.
-
-    Beam decode steps never carry grammar output (constraints run worker-side
-    via the Constraint Tables hook), so ``grammar_output=None`` matches the
-    engine's own second-RPC call.  ``sample_tokens`` consumes and clears the
-    runner's ephemeral ``execute_model_state`` itself; the defensive reset
-    below only guards runners whose ``sample_tokens`` returns early (e.g. a
-    pooling / non-final-PP edge) without consuming the state.
-    """
-    try:
-        out = runner.sample_tokens(None)
-    finally:
-        runner.execute_model_state = None
-    return out
-
-
 def _get_gr_config(runner) -> Any:
     """Return the worker's GRConfig, cached on the runner (frozen dataclass).
 
@@ -1294,21 +1205,9 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     BeamAttentionContext (runner._beam_context) which owns the pools and
     the BeamSessionRegistry.
 
-    Session lifecycle:
-    - Creation: on the first beam decode step (decode_step=0) for a req_id.
-    - Step progression: step_complete (select_unshared_kv + advance) on
-      subsequent steps.
-    - Teardown: the authoritative signal is
-      ``SchedulerOutput.beam_finished_session_ids``, populated by
-      ``patched_schedule`` from
-      ``Scheduler._beam_finished_session_ids`` which is written by
-      ``_handle_beam_request_step_update`` when it receives a
-      ``BeamRequestStepUpdate(beam_width=0)`` — the beam search loop's
-      explicit "generation finished" message.  This is distinct from
-      ``finished_req_ids`` which fires on every decode step.
-    - Fallback: if allocate fails and the registry is full, stale sessions
-      (whose req_ids are no longer in beam_data) are released as a safety
-      net for unexpected abort/error paths.
+    Persistent state owns creation, step progression, and terminal release.
+    If allocation finds the registry full, stale sessions are reclaimed as a
+    safety net for unexpected abort/error paths.
 
     Concurrency: the shared context is created with ``max_batch=1`` — a
     single active beam session by design (pool slots, suffix buffers and the
@@ -1318,24 +1217,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     """
     runner._beam_sessions = getattr(runner, "_beam_sessions", {})
 
-    # 1. Clean up finished sessions (beam_width=0 teardown signal)
-    finished_ids = getattr(scheduler_output, "beam_finished_session_ids", [])
-    for sid in finished_ids:
-        persistent_states = getattr(runner, "_gr_model_runner_states", {})
-        if sid in persistent_states:
-            # Persistent state owns the BeamSearchSession. Releasing the
-            # session first makes state.release() re-enter a missing registry
-            # slot. Keep success/abort/error teardown on one idempotent path.
-            from vllm_gr.v1.worker.gr_model_runner_state import (
-                release_gr_model_runner_states,
-            )
-
-            release_gr_model_runner_states(runner, [sid])
-        else:
-            session = runner._beam_sessions.pop(sid, None)
-            if session is not None:
-                session.end_session()
-    # 2. Check if we have any beam decode requests with decode_step
+    # Check if we have any beam decode requests with decode_step.
     incremental_ids = [
         req_id
         for req_id, mdata in beam_data.items()
@@ -1435,7 +1317,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         # decode-only ``decode_step`` tops out at ``loop_len - 2``.
         # Comparing against ``loop_len - 1`` fired the terminal flag
         # one step late: the 3-iteration constrained FSM never saw a
-        # terminal step, engine-driven chaining produced a 3rd decode, and
+        # terminal step, the scheduler produced a 3rd decode, and
         # its constraint_step=3 was rejected by
         # build_beam_request_metadata (decode steps are 1/2 only).
         # This matches the ACS reference (``current_step`` there is
@@ -1552,11 +1434,9 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                     req_id, mdata["beam_width"], mdata["prefix_len"]
                 )
             except RuntimeError:
-                # Fallback: release stale sessions whose req_ids are no
-                # longer in beam_data.  This handles unexpected abort/error
-                # paths where the beam_width=0 cleanup signal never arrived.
-                # The primary teardown path is beam_finished_session_ids
-                # (set by _handle_beam_request_step_update on beam_width=0).
+                # Release stale sessions whose request ids are no longer in
+                # this dispatch. Persistent terminal/abort cleanup remains the
+                # primary lifecycle path.
                 active_req_ids = set(beam_data.keys())
                 stale_ids = [
                     sid for sid in list(runner._beam_sessions.keys()) if sid not in active_req_ids
@@ -1660,21 +1540,6 @@ def make_patched_execute_model(_orig_execute_model):
                     "prefill_constraint_post_forward_enqueue"
                 ):
                     launch_prepared_cuda_prefill_constraint(self)
-            if out is None and _should_inline_sample_tokens(self, scheduler_output):
-                # M2: finish sampling in-process and return the
-                # ModelRunnerOutput through the execute_model channel, so the
-                # engine's None short-circuit (core.py ``future.result()``)
-                # skips the second collective_rpc.  Beam decode steps carry no
-                # grammar output (constraints run worker-side).  Failure falls
-                # back to the two-RPC path unchanged.
-                try:
-                    out = _inline_sample_tokens(self)
-                except Exception:
-                    logger.exception(
-                        "vllm-gr: inlined sample_tokens failed; falling back "
-                        "to the second sample_tokens RPC"
-                    )
-                    out = None
             _attach_beam_search_result(self, out)
         except BaseException:
             # Failure ownership is frame-local: an execute for request A must

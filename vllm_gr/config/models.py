@@ -148,15 +148,8 @@ class GRConfig:
     # CUDA beam deployments default to True; NPU requires xllm execution.
     # False explicitly keeps the frontend NumPy path.
     beam_worker_decision: bool | None = None
-    # None = unset (the Driver enables this by default for accelerator beam
-    # deployments with worker decisions).  True makes EngineCore chain both
-    # the prefill -> step0 transition AND every decode-step transition
-    # in-process from the worker's beam decision.  The frontend still
-    # consumes each step's output (EOS / materialize / streaming) but skips
-    # the per-step RPC when the engine chained that step.  Safe under async
-    # scheduling: the advance runs in the busy-loop iteration that processes
-    # the step's outputs.  Only valid with beam_worker_decision=True (the
-    # chain consumes worker beam decisions).
+    # Compatibility tombstone for pre-persistent configs. True is rejected;
+    # False/None decode older config files without restoring self-advance.
     beam_engine_driven: bool | None = None
     # Persistent execution is opt-in so existing request behavior is unchanged.
     persistent_request: bool = False
@@ -248,10 +241,10 @@ class GRConfig:
                 "vllm-gr scheduling_mode='multi_step' is not supported; "
                 "use scheduling_mode='async'"
             )
-        if self.beam_engine_driven and not self.beam_worker_decision:
+        if self.beam_engine_driven:
             raise ValueError(
-                "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "
-                "(the engine-driven session consumes worker beam decisions)"
+                "vllm-gr beam_engine_driven was removed with the legacy GR "
+                "scheduler; use persistent_request=True"
             )
         if self.persistent_runner_state and not self.persistent_request:
             raise ValueError(

@@ -30,7 +30,13 @@ from vllm_gr.config.parser import (
 
 def _vllm_config(additional_config: object | None = None) -> SimpleNamespace:
     normalized = {} if additional_config is None else additional_config
-    return SimpleNamespace(additional_config=normalized)
+    return SimpleNamespace(
+        additional_config=normalized,
+        scheduler_config=SimpleNamespace(
+            async_scheduling=None,
+            scheduler_cls=None,
+        ),
+    )
 
 
 class _OpaqueAdditionalConfig:
@@ -412,6 +418,10 @@ def test_engine_config_writes_constraint_backend_override() -> None:
     assert GRConfig.from_vllm_config(result) == GRConfig(
         catalog_path="/models/catalog.json",
         constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+        beam_worker_decision=True,
+        beam_engine_driven=False,
+        persistent_request=True,
+        persistent_runner_state=True,
     )
 
 
@@ -647,7 +657,9 @@ def test_npu_constraint_table_auto_promotion_respects_capacity(
     assert config.catalog_path == catalog_path
     assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
     assert config.beam_worker_decision is True
-    assert config.beam_engine_driven is True
+    assert config.beam_engine_driven is False
+    assert config.persistent_request is True
+    assert config.persistent_runner_state is True
 
 
 def test_beam_max_width_rejects_values_above_global_limit() -> None:
@@ -831,7 +843,7 @@ def test_cuda_beam_enables_worker_decision_by_default() -> None:
     # decisions regardless of backend; actual chaining is lazy-gated by
     # data availability (trie-catalog deployments never produce worker
     # decisions, unconstrained deployments chain decode from step 1).
-    assert config.beam_engine_driven is True
+    assert config.beam_engine_driven is None
     assert config.constraint_backend is ConstraintBackend.TRIE
 
 
@@ -932,6 +944,8 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
     assert config.vocab_offset == 151669
     assert config.vocab_slice_size == 24576
     assert config.beam_worker_decision is True
-    assert config.beam_engine_driven is expected_engine_driven
+    assert config.beam_engine_driven is False
+    assert config.persistent_request is True
+    assert config.persistent_runner_state is True
     slice_spy.assert_called_once()
     set_slice.assert_called_once_with(151669, 24576)

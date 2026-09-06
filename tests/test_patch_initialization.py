@@ -29,11 +29,10 @@ def test_patch_plans_preserve_process_responsibilities() -> None:
         "chat_sampling_conversion",
         "engine_args",
         "serving_models",
-        "batch_and_fork",
+        "persistent_runtime",
     ]
     assert engine_core_patches == [
-        "engine_core_requests",
-        "scheduler",
+        "engine_core_lifecycle",
         "model_runner",
     ]
     assert set(frontend_patches).isdisjoint(engine_core_patches)
