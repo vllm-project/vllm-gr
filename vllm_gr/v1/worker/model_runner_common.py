@@ -338,15 +338,6 @@ _SAMPLING_META_ATTRS = (
 )
 
 
-def _first_device_of(s_meta) -> Any:
-    """Return the device of the first tensor sampling attribute, or None."""
-    for attr in _SAMPLING_META_ATTRS:
-        val = getattr(s_meta, attr, None)
-        if isinstance(val, torch.Tensor) and val.numel() > 0:
-            return val.device
-    return None
-
-
 class InputBatchProxy:
     def __init__(self, obj, req_map, idx_map, logits_map, *, persistent_geometry=None):
         if persistent_geometry is not None and (
@@ -400,27 +391,6 @@ class InputBatchProxy:
                 return cached
 
             orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
-            shared_sampling = object.__getattribute__(self, "_shared_sampling_cache")
-            remap_key = None
-            if shared_sampling is not None and orig_req_len != len(logits_map):
-                # Beam-row expansion is a per-REQUEST constant: vLLM v1
-                # per-request sampling params are immutable once the request
-                # is admitted, and the logits_map pins the batch layout.  The
-                # request ids in the key prevent a LATER request with the
-                # same beam width and layout from inheriting this request's
-                # gathered tensors.
-                remap_key = (
-                    _first_device_of(s_meta),
-                    orig_req_len,
-                    object.__getattribute__(self, "_req_ids_key"),
-                    object.__getattribute__(self, "_logit_idx_tuple"),
-                )
-                hit = shared_sampling.get(remap_key)
-                if hit is not None:
-                    for attr_name, tensor in hit.items():
-                        object.__setattr__(s_meta, attr_name, tensor)
-                    object.__setattr__(self, "_sampling_metadata_cache", s_meta)
-                    return s_meta
             # Group per-request sampling tensors by dtype and remap each group
             # with a single device gather instead of one ``aten::index`` kernel
             # per attribute (7 kernels per decode step in profiling).  The
@@ -435,7 +405,6 @@ class InputBatchProxy:
             if pending:
                 first_val = next(iter(next(iter(pending.values()))))[1]
                 idx_tensor = self._logits_idx_tensor(first_val.device)
-                remapped: dict[str, torch.Tensor] = {}
                 for dtype, items in pending.items():
                     names = [n for n, _ in items]
                     # Stack attributes on dim 0 ([num_attrs, num_reqs]) and
@@ -450,19 +419,6 @@ class InputBatchProxy:
                     gathered = stacked.index_select(1, idx_tensor)
                     for attr_name, col in zip(names, gathered.unbind(dim=0)):
                         object.__setattr__(s_meta, attr_name, col)
-                        remapped[attr_name] = col
-                if shared_sampling is not None and remap_key is None:
-                    remap_key = (
-                        first_val.device,
-                        orig_req_len,
-                        object.__getattribute__(self, "_req_ids_key"),
-                        object.__getattribute__(self, "_logit_idx_tuple"),
-                    )
-                if shared_sampling is not None and remap_key is not None:
-                    # Single slot: the hot path is frame-to-frame reuse within
-                    # one beam session; a geometry change replaces the entry.
-                    shared_sampling.clear()
-                    shared_sampling[remap_key] = remapped
             object.__setattr__(self, "_sampling_metadata_cache", s_meta)
             return s_meta
 
@@ -528,85 +484,12 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
         )
 
     runner.input_batch.logprob_token_ids = {}
+    new_logits_indices: list[int] = []
     orig_req_ids = runner.input_batch.req_ids
 
-    # Fast path: a pure incremental-beam batch replays a cached row layout.
-    # When every scheduled request is an incremental beam decode with the same
-    # widths and token counts as the cached frame, the four host lists and the
-    # logits index list are identical frame to frame; only the position ids
-    # depend on decode_step.  The per-beam Python loop below is skipped
-    # entirely on the hot path.
-    layout_cache = getattr(runner, "_gr_remap_layout_cache", None)
-    if layout_cache is None:
-        layout_cache = {}
-        runner._gr_remap_layout_cache = layout_cache
-    try:
-        layout_key = (
-            tuple(orig_req_ids),
-            tuple(int(x) for x in num_scheduled_tokens[: len(orig_req_ids)]),
-        )
-        all_incremental = (
-            all(
-                (m := beam_data.get(rid)) is not None
-                and m.get("is_beam_decode", False)
-                and "decode_step" in m
-                for rid in orig_req_ids
-                if rid is not None
-            )
-            and len(orig_req_ids) > 0
-            and not any(rid is None for rid in orig_req_ids)
-        )
-    except (TypeError, ValueError):
-        layout_key = None
-        all_incremental = False
-    if layout_key is not None and all_incremental:
-        cached_layout = layout_cache.get(layout_key)
-        if cached_layout is not None:
-            (
-                row_to_req_id,
-                row_to_batch_idx,
-                logits_to_batch_idx,
-                request_row_configs,
-                new_logits_indices,
-                widths_offsets,
-            ) = cached_layout
-            # Refresh only the step-dependent position ids.
-            gpu_positions, cpu_positions = _get_positions_buffers(runner)
-            token_offset = 0
-            for req_id, width, prefix_len in widths_offsets:
-                mdata = beam_data[req_id]
-                pos_id = prefix_len + int(mdata.get("decode_step", 0))
-                if gpu_positions is not None:
-                    gpu_positions[token_offset : token_offset + width] = pos_id
-                if cpu_positions is not None:
-                    cpu_positions[token_offset : token_offset + width] = pos_id
-                token_offset += width
-            shared_idx_cache = getattr(runner, "_gr_logits_idx_cache", None)
-            if shared_idx_cache is None:
-                shared_idx_cache = {}
-                runner._gr_logits_idx_cache = shared_idx_cache
-            shared_sampling_cache = getattr(runner, "_gr_sampling_remap_cache", None)
-            if shared_sampling_cache is None:
-                shared_sampling_cache = {}
-                runner._gr_sampling_remap_cache = shared_sampling_cache
-            runner.input_batch = InputBatchProxy(
-                runner.input_batch,
-                row_to_req_id,
-                row_to_batch_idx,
-                logits_to_batch_idx,
-                shared_idx_cache=shared_idx_cache,
-                shared_sampling_cache=shared_sampling_cache,
-                req_ids_key=tuple(orig_req_ids),
-            )
-            scheduler_output._gr_request_row_configs = request_row_configs
-            _ = runner.input_batch.sampling_metadata
-            return new_logits_indices
-
-    new_logits_indices: list[int] = []
     token_offset = 0
     row_to_req_id, row_to_batch_idx, logits_to_batch_idx, request_row_configs = ([], [], [], [])
     input_row_idx = 0
-    incremental_widths: list[tuple[Any, int, int]] = []
 
     gpu_positions, cpu_positions = _get_positions_buffers(runner)
 
@@ -642,8 +525,6 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
                 (req_id, input_row_idx, beams_count_with_logits, active_beam_ids)
             )
             input_row_idx += beams_count
-            if is_incremental:
-                incremental_widths.append((req_id, mdata["beam_width"], mdata["prefix_len"]))
         else:
             num_computed_tokens = runner.input_batch.num_computed_tokens_cpu[batch_idx]
             num_prompt_tokens = runner.input_batch.num_prompt_tokens[batch_idx]
@@ -666,14 +547,6 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
 
         token_offset += seq_len
 
-    shared_idx_cache = getattr(runner, "_gr_logits_idx_cache", None)
-    if shared_idx_cache is None:
-        shared_idx_cache = {}
-        runner._gr_logits_idx_cache = shared_idx_cache
-    shared_sampling_cache = getattr(runner, "_gr_sampling_remap_cache", None)
-    if shared_sampling_cache is None:
-        shared_sampling_cache = {}
-        runner._gr_sampling_remap_cache = shared_sampling_cache
     runner.input_batch = InputBatchProxy(
         runner.input_batch,
         row_to_req_id,
@@ -682,24 +555,6 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
         persistent_geometry=persistent_geometry,
     )
     scheduler_output._gr_request_row_configs = request_row_configs
-
-    # Register the layout for the pure incremental fast path.  Only batches
-    # where EVERY scheduled request went through the incremental beam branch
-    # are eligible (mixed prefill/None rows keep the per-frame loop).
-    if (
-        layout_key is not None
-        and len(incremental_widths) == len(orig_req_ids)
-        and len(orig_req_ids) > 0
-    ):
-        layout_cache.clear()
-        layout_cache[layout_key] = (
-            row_to_req_id,
-            row_to_batch_idx,
-            logits_to_batch_idx,
-            request_row_configs,
-            new_logits_indices,
-            incremental_widths,
-        )
 
     # Warm the remapped sampling metadata now, in the prepare phase, instead
     # of lazily at the first ``_sample`` access: the per-request tensor remap

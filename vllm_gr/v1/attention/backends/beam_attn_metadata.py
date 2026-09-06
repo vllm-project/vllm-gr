@@ -665,7 +665,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         common_attn_metadata,
         is_incremental: bool = False,
         beam_decode_step_list: list | None = None,
-        geom_key=None,
     ):
         """Builds attention mapping metadata for all active beams in a batch.
 
@@ -692,12 +691,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
         out_slot = 0
-        # Incremental decode emits ``prefix_indices`` as a single contiguous
-        # ``range(q_start, q_start + w)`` per request, so the device-side
-        # strided-arange fast path in ``_create_beam_tensors`` is always valid
-        # and its per-element ``all()`` scan can be skipped.  The recompute
-        # path merges arbitrary prefix groups and must keep the scan.
-        incremental_only = True
         for idx, (req_idx, prefix_len, w, steps, cache_len, q_offset) in enumerate(
             zip(
                 beam_req_idxs,
@@ -740,7 +733,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 continue
 
             # --- Standard (recompute) path ---
-            incremental_only = False
             q_curr = q_start
             chunk_budget = q_len
             prefix_groups = []  # Elements: [group_q_start, group_q_len, group_cache_len]
@@ -786,71 +778,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         # Helper to compute prefix cumulative sums
         prefix_cu_seqlens_q_cpu = None
         prefix_cu_seqlens_kv_cpu = None
+        if prefix_seqlens_q_cpu:
+            prefix_cu_seqlens_q_cpu = np.cumsum(prefix_seqlens_q_cpu).tolist()
+            prefix_cu_seqlens_kv_cpu = np.cumsum(prefix_seqlens_kv_cpu).tolist()
+
+        # Helper to compute suffix cumulative sums
         suffix_cu_seqlens_q_cpu = None
         suffix_cu_seqlens_kv_cpu = None
-
-        # Pure incremental decode keeps the three non-step cumulative sums
-        # (prefix_cu_seqlens_q / prefix_cu_seqlens_kv / suffix_cu_seqlens_q)
-        # fixed per geometry, so a geom_key hit reuses them instead of paying a
-        # numpy cumsum + tolist on every decode step.  The step-dependent
-        # suffix_cu_seqlens_kv is always recomputed below.
-        fixed_cached = None
-        if geom_key is not None:
-            fixed_cached = self._geometry_cache().setdefault("cu_lists", {}).get(geom_key)
-        if fixed_cached is not None:
-            prefix_cu_seqlens_q_cpu, prefix_cu_seqlens_kv_cpu, suffix_cu_seqlens_q_cpu = (
-                fixed_cached
-            )
-        else:
-            if prefix_seqlens_q_cpu:
-                prefix_cu_seqlens_q_cpu = np.cumsum(prefix_seqlens_q_cpu).tolist()
-                prefix_cu_seqlens_kv_cpu = np.cumsum(prefix_seqlens_kv_cpu).tolist()
-            if suffix_seqlens_q_cpu:
-                suffix_cu_seqlens_q_cpu = np.cumsum(suffix_seqlens_q_cpu).tolist()
-            if geom_key is not None and suffix_seqlens_kv_cpu:
-                # Only cache when suffix_seqlens_kv is geometry-fixed (incremental
-                # decode would make it step-dependent and cache it wrongly).
-                cache = self._geometry_cache().setdefault("cu_lists", {})
-                cache[geom_key] = (
-                    prefix_cu_seqlens_q_cpu,
-                    prefix_cu_seqlens_kv_cpu,
-                    suffix_cu_seqlens_q_cpu,
-                )
-        if suffix_seqlens_kv_cpu:
-            if incremental_only and beam_decode_step_list:
-                # cumsum([s+1]*w) == [s+1, 2(s+1), ..., w(s+1)]: a strided
-                # range materializes it directly, skipping the numpy cumsum
-                # + tolist pair (the only step-dependent host list on the
-                # hot decode path).
-                s = beam_decode_step_list[0] + 1
-                w_kv = len(suffix_seqlens_kv_cpu)
-                suffix_cu_seqlens_kv_cpu = list(range(s, (w_kv + 1) * s, s))
-            else:
-                suffix_cu_seqlens_kv_cpu = np.cumsum(suffix_seqlens_kv_cpu).tolist()
-
-        # Scalar reductions for ``_create_beam_tensors``.  The incremental
-        # path knows them analytically (single prefix group of w tokens, one
-        # query token per beam); the recompute path falls back to the list
-        # max / contiguity scan (it is not the hot decode loop).
-        if incremental_only:
-            prefix_indices_contiguous = True
-            prefix_max_q_len = prefix_seqlens_q_cpu[0] if prefix_seqlens_q_cpu else 0
-            suffix_max_q_len = 1
-            # suffix_seqlens_kv is [decode_step+1]*w on this path, so the max
-            # is the step value itself (no list scan in _create_beam_tensors).
-            suffix_max_seq_len = (
-                beam_decode_step_list[0] + 1
-                if beam_decode_step_list and suffix_seqlens_kv_cpu
-                else 0
-            )
-        else:
-            prefix_indices_contiguous = bool(beam_prefix_indices) and all(
-                beam_prefix_indices[i] == beam_prefix_indices[0] + i
-                for i in range(len(beam_prefix_indices))
-            )
-            prefix_max_q_len = max(prefix_seqlens_q_cpu) if prefix_seqlens_q_cpu else 0
-            suffix_max_q_len = max(suffix_seqlens_q_cpu) if suffix_seqlens_q_cpu else 0
-            suffix_max_seq_len = max(suffix_seqlens_kv_cpu) if suffix_seqlens_kv_cpu else 0
+        if suffix_seqlens_q_cpu:
+            suffix_cu_seqlens_q_cpu = np.cumsum(suffix_seqlens_q_cpu).tolist()
+            suffix_cu_seqlens_kv_cpu = np.cumsum(suffix_seqlens_kv_cpu).tolist()
 
         return (
             beam_prefix_indices,
@@ -865,10 +802,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_cpu,
             suffix_cu_seqlens_kv_cpu,
             max_prefix_blocks_count,
-            prefix_indices_contiguous,
-            prefix_max_q_len,
-            suffix_max_q_len,
-            suffix_max_seq_len,
         )
 
     def _pack_int32_to_dev(self, entries: list[tuple[Any, list[int]]]) -> None:
@@ -994,10 +927,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         *,
         geom_key=None,
         decode_step: int | None = None,
-        prefix_indices_contiguous: bool | None = None,
-        prefix_max_q_len: int | None = None,
-        suffix_max_q_len: int | None = None,
-        suffix_max_seq_len: int | None = None,
     ):
         if not prefix_seqlens_q_cpu:
             # Full structured initializations for profiling warm-up model passes
@@ -1028,31 +957,20 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             )
 
         num_prefix = len(prefix_indices)
-        # Scalar reductions may arrive precomputed from _build_beam_mappings
-        # (the incremental path knows them analytically); fall back to the
-        # list max for callers that only pass the raw lists.
-        if prefix_max_q_len is None:
-            prefix_max_q_len = max(prefix_seqlens_q_cpu) if prefix_seqlens_q_cpu else 0
-        if suffix_max_q_len is None:
-            suffix_max_q_len = max(suffix_seqlens_q_cpu) if suffix_seqlens_q_cpu else 0
-        if suffix_max_seq_len is None:
-            suffix_max_seq_len = max(suffix_seqlens_kv_cpu) if suffix_seqlens_kv_cpu else 0
+        prefix_max_q_len = max(prefix_seqlens_q_cpu) if prefix_seqlens_q_cpu else 0
+        suffix_max_seq_len = max(suffix_seqlens_kv_cpu) if suffix_seqlens_kv_cpu else 0
+        suffix_max_q_len = max(suffix_seqlens_q_cpu) if suffix_seqlens_q_cpu else 0
 
         if self._fixed_buffers:
             prefix_indices_tensor = self._prefix_indices_buf[:num_prefix]
             # Incremental decode produces a contiguous prefix index range
             # (q_start .. q_start+w).  Emit it on device with a strided arange
             # instead of converting the Python list every step (no host list,
-            # no H2D).  ``prefix_indices_contiguous`` is the EXPLICIT verdict
-            # from _build_beam_mappings (True only on the incremental path,
-            # where each request contributes one ``range(q_start, q_start+w)``);
-            # callers that do not supply it fall back to the per-element scan,
-            # and anything non-contiguous (multi-request recompute layout)
-            # falls back to the host list transfer.
-            if num_prefix and (
-                prefix_indices_contiguous
-                if prefix_indices_contiguous is not None
-                else all(prefix_indices[i] == prefix_indices[0] + i for i in range(num_prefix))
+            # no H2D).  Only take this path when the whole list is verified
+            # contiguous; anything else (multi-request recompute layout) falls
+            # back to the host list transfer.
+            if num_prefix and all(
+                prefix_indices[i] == prefix_indices[0] + i for i in range(num_prefix)
             ):
                 torch.arange(
                     prefix_indices[0],
@@ -1118,10 +1036,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     global_chunk_token_indices
                 ].to(dtype=torch.int32)
             else:
-                suffix_slot_mapping_out = self._empty_slot_out(device)
+                suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
         else:
             suffix_total_tokens = 0
-            suffix_slot_mapping_out = self._empty_slot_out(device)
+            suffix_slot_mapping_out = torch.empty(0, dtype=torch.int32, device=device)
 
         if self._fixed_buffers:
             num_prefix_groups = len(prefix_seqlens_kv_cpu)
@@ -1213,25 +1131,15 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_device = None
             suffix_cu_seqlens_k_device = None
 
-        # The FA2 scheduler metadata is a pure function of geometry-fixed
-        # inputs on the incremental path (cached cu_seqlens views, constant
-        # max lens, constant beam-width token count), so it is cached per
-        # geom_key instead of being rebuilt every decode step.
-        schedule_cache = self._geometry_cache().setdefault("schedule", {})
-        if geom_key is not None and geom_key in schedule_cache:
-            prefix_scheduler_metadata = schedule_cache[geom_key]
-        else:
-            prefix_scheduler_metadata = self._get_schedule(
-                batch_size=len(prefix_seqlens_q_cpu),
-                cu_query_lens=prefix_cu_seqlens_q_device,
-                max_query_len=prefix_max_q_len,
-                seqlens=prefix_seqlens_kv_device,
-                max_seq_len=prefix_max_seq_len,
-                causal=False,
-                max_num_splits=max_num_splits,
-            )
-            if geom_key is not None:
-                schedule_cache[geom_key] = prefix_scheduler_metadata
+        prefix_scheduler_metadata = self._get_schedule(
+            batch_size=len(prefix_seqlens_q_cpu),
+            cu_query_lens=prefix_cu_seqlens_q_device,
+            max_query_len=prefix_max_q_len,
+            seqlens=prefix_seqlens_kv_device,
+            max_seq_len=prefix_max_seq_len,
+            causal=False,
+            max_num_splits=max_num_splits,
+        )
 
         return (
             prefix_indices_tensor,
@@ -1277,169 +1185,63 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         # Get beam_session early so _segment_requests can use it for slot lookup
         beam_session = beam_info.get("beam_session") if beam_info else None
 
-        # Check if we have an active beam session for incremental decode.
-        # Derived directly from the SCHEDULED requests' beam_data (not from
-        # _segment_requests output) so the geometry-hit fast path below can
-        # skip segmentation entirely.
-        is_incremental = (
-            beam_session is not None
-            and beam_session.is_active
-            and any(
-                (m := beam_data.get(rid)) is not None
-                and m.get("is_beam_decode", False)
-                and "decode_step" in m
-                for rid in req_ids
-            )
+        (
+            std_reqs,
+            beam_req_idxs,
+            beam_prefix_lens,
+            beam_widths,
+            beam_decode_steps,
+            beam_cache_lens,
+            beam_q_start_offsets,
+            beam_decode_step_list,
+            beam_pool_slots,
+        ) = self._segment_requests(
+            num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list, beam_session
         )
 
+        (
+            std_indices,
+            std_seqlens_q_cpu,
+            std_seqlens_kv_cpu,
+            std_req_idxs,
+            std_cu_seqlens_q_cpu,
+            std_cu_seqlens_kv_cpu,
+        ) = self._build_std_mappings(std_reqs, q_starts)
+
+        # Check if we have an active beam session for incremental decode
+        is_incremental = (
+            beam_session is not None and beam_session.is_active and len(beam_decode_step_list) > 0
+        )
         geom_key = self._geom_cache_key(
             num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list, is_incremental
         )
-        # Sweep entries left behind by finished sessions: keys whose request
-        # ids no longer overlap the current batch will never be read again.
-        self._evict_stale_geometry_entries(geom_key)
+        decode_step = beam_decode_step_list[0] if beam_decode_step_list else None
 
-        # Geometry-hit fast path: for a pure incremental beam batch the whole
-        # mapping layout (segmentation, std partition — always empty — and the
-        # beam mapping lists) is a per-geometry constant.  Only three things
-        # vary per step: the suffix step value s=decode_step+1 (analytic
-        # lists below), the query-start offsets (rebuilt from q_starts), and
-        # the device-side refresh in _create_beam_tensors.  A hit skips
-        # _segment_requests / _build_std_mappings / _build_beam_mappings
-        # entirely (the ACS pattern: decode steps replay a cached layout and
-        # only touch step-dependent scalars).
-        geom_layout_cache = self._geometry_cache().setdefault("layout", {})
-        cached_layout = geom_layout_cache.get(geom_key) if geom_key is not None else None
-        if cached_layout is not None:
-            (
-                beam_req_idxs,
-                beam_prefix_lens,
-                beam_widths,
-                beam_decode_steps,
-                beam_cache_lens,
-                beam_q_start_offsets,
-                beam_pool_slots,
-                prefix_seqlens_q_cpu,
-                prefix_seqlens_kv_cpu,
-                suffix_seqlens_q_cpu,
-                prefix_req_idxs_cpu,
-                prefix_cu_seqlens_q_cpu,
-                prefix_cu_seqlens_kv_cpu,
-                suffix_cu_seqlens_q_cpu,
-                max_prefix_blocks_count,
-                prefix_indices_contiguous,
-                prefix_max_q_len,
-                suffix_max_q_len,
-                w_total,
-            ) = cached_layout
-            # The CURRENT decode_step comes from this frame's beam_data (the
-            # cached layout only pins the geometry, never the step).  Rebuild
-            # the per-request step list for the cached beam requests.
-            beam_decode_step_list = [
-                beam_data[req_ids[beam_req_idxs[i]]]["decode_step"]
-                for i in range(len(beam_req_idxs))
-            ]
-            decode_step = beam_decode_step_list[0] if beam_decode_step_list else None
-            # Step-derived suffix lists (analytic; no numpy, no per-beam loop).
-            s = decode_step + 1 if decode_step is not None else 1
-            suffix_seqlens_kv_cpu = [s] * w_total
-            suffix_cu_seqlens_kv_cpu = list(range(s, (w_total + 1) * s, s))
-            suffix_max_seq_len = s if w_total else 0
-            # Query-start-dependent prefix indices (one range per request).
-            prefix_indices = []
-            for _b_idx, _req_idx in enumerate(beam_req_idxs):
-                q_offset = beam_q_start_offsets[_b_idx]
-                w = beam_widths[_b_idx]
-                q_start = q_starts[_req_idx] + q_offset
-                prefix_indices.extend(range(q_start, q_start + w))
-            std_indices = []
-            std_seqlens_q_cpu = []
-            std_seqlens_kv_cpu = []
-            std_req_idxs = []
-            std_cu_seqlens_q_cpu = None
-            std_cu_seqlens_kv_cpu = None
-            suffix_slot_mapping_out_list = []
-        else:
-            (
-                std_reqs,
-                beam_req_idxs,
-                beam_prefix_lens,
-                beam_widths,
-                beam_decode_steps,
-                beam_cache_lens,
-                beam_q_start_offsets,
-                beam_decode_step_list,
-                beam_pool_slots,
-            ) = self._segment_requests(
-                num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list, beam_session
-            )
-            decode_step = beam_decode_step_list[0] if beam_decode_step_list else None
-
-            (
-                std_indices,
-                std_seqlens_q_cpu,
-                std_seqlens_kv_cpu,
-                std_req_idxs,
-                std_cu_seqlens_q_cpu,
-                std_cu_seqlens_kv_cpu,
-            ) = self._build_std_mappings(std_reqs, q_starts)
-
-            (
-                prefix_indices,
-                prefix_seqlens_q_cpu,
-                prefix_seqlens_kv_cpu,
-                suffix_seqlens_q_cpu,
-                suffix_seqlens_kv_cpu,
-                prefix_req_idxs_cpu,
-                suffix_slot_mapping_out_list,
-                prefix_cu_seqlens_q_cpu,
-                prefix_cu_seqlens_kv_cpu,
-                suffix_cu_seqlens_q_cpu,
-                suffix_cu_seqlens_kv_cpu,
-                max_prefix_blocks_count,
-                prefix_indices_contiguous,
-                prefix_max_q_len,
-                suffix_max_q_len,
-                suffix_max_seq_len,
-            ) = self._build_beam_mappings(
-                beam_req_idxs,
-                beam_prefix_lens,
-                beam_widths,
-                beam_decode_steps,
-                beam_cache_lens,
-                beam_q_start_offsets,
-                q_starts,
-                common_attn_metadata,
-                is_incremental=is_incremental,
-                beam_decode_step_list=beam_decode_step_list,
-                geom_key=geom_key,
-            )
-            # Register the layout for the geometry-hit fast path.  Only the
-            # pure incremental case is eligible (mixed/recompute batches keep
-            # the per-frame reconstruction).
-            if geom_key is not None and is_incremental and not std_reqs:
-                geom_layout_cache.clear()
-                geom_layout_cache[geom_key] = (
-                    beam_req_idxs,
-                    beam_prefix_lens,
-                    beam_widths,
-                    beam_decode_steps,
-                    beam_cache_lens,
-                    beam_q_start_offsets,
-                    beam_pool_slots,
-                    prefix_seqlens_q_cpu,
-                    prefix_seqlens_kv_cpu,
-                    suffix_seqlens_q_cpu,
-                    prefix_req_idxs_cpu,
-                    prefix_cu_seqlens_q_cpu,
-                    prefix_cu_seqlens_kv_cpu,
-                    suffix_cu_seqlens_q_cpu,
-                    max_prefix_blocks_count,
-                    prefix_indices_contiguous,
-                    prefix_max_q_len,
-                    suffix_max_q_len,
-                    len(suffix_seqlens_q_cpu),
-                )
+        (
+            prefix_indices,
+            prefix_seqlens_q_cpu,
+            prefix_seqlens_kv_cpu,
+            suffix_seqlens_q_cpu,
+            suffix_seqlens_kv_cpu,
+            prefix_req_idxs_cpu,
+            suffix_slot_mapping_out_list,
+            prefix_cu_seqlens_q_cpu,
+            prefix_cu_seqlens_kv_cpu,
+            suffix_cu_seqlens_q_cpu,
+            suffix_cu_seqlens_kv_cpu,
+            max_prefix_blocks_count,
+        ) = self._build_beam_mappings(
+            beam_req_idxs,
+            beam_prefix_lens,
+            beam_widths,
+            beam_decode_steps,
+            beam_cache_lens,
+            beam_q_start_offsets,
+            q_starts,
+            common_attn_metadata,
+            is_incremental=is_incremental,
+            beam_decode_step_list=beam_decode_step_list,
+        )
 
         (
             std_indices_tensor,
@@ -1490,10 +1292,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             max_num_splits,
             geom_key=geom_key,
             decode_step=decode_step,
-            prefix_indices_contiguous=prefix_indices_contiguous,
-            prefix_max_q_len=prefix_max_q_len,
-            suffix_max_q_len=suffix_max_q_len,
-            suffix_max_seq_len=suffix_max_seq_len,
         )
 
         # Determine incremental decode metadata
