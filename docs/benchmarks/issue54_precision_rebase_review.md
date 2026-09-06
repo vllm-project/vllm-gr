@@ -109,6 +109,60 @@ domain constraint tables. The five task sizes themselves sum to 130,259; the
 | label_cond | 34,891 | 0.007710 | 0.046746 | 0.019830 | 0.007394 | 0.045685 | 0.019301 | 0.0184 | +0.000901 | 24.069 |
 | interactive | 1,000 | 0.068000 | 0.359000 | 0.219722 | 0.065000 | 0.345000 | 0.209358 | 0.1954 | +0.013958 | 52.766 |
 
+### Native vLLM and published OneRec comparison
+
+The OpenOneRec OneRec-1.7B model card publishes only Recall@32 for these five
+tasks. The native vLLM values below come from the completed full-split
+`vllm.LLM.beam_search` runs in the sibling checkout, with all vllm-gr plugins
+disabled. The raw native JSON files are under `/tmp/onerec_native_<task>/`.
+
+| Task | Persistent PID pass@1 | Native PID pass@1 | Persistent PID pass@32 | Native PID pass@32 | Persistent PID recall@32 | Native PID recall@32 | Published Recall@32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| video | 0.056290 | 0.048787 | 0.175266 | 0.169877 | 0.028031 | 0.027009 | 0.0272 |
+| ad | 0.016729 | 0.016512 | 0.202804 | 0.202515 | 0.069996 | 0.069695 | 0.0707 |
+| product | 0.013687 | 0.013579 | 0.157327 | 0.156503 | 0.035343 | 0.035247 | 0.0360 |
+| label_cond | 0.007394 | 0.006334 | 0.045685 | 0.043220 | 0.019301 | 0.018398 | 0.0184 |
+| interactive | 0.065000 | 0.067000 | 0.345000 | 0.314000 | 0.209358 | 0.193785 | 0.1941 |
+
+The observed Recall@32 deltas are:
+
+| Task | Persistent - native | Persistent - published | Relative to published |
+| --- | ---: | ---: | ---: |
+| video | +0.001022 | +0.000831 | +3.055% |
+| ad | +0.000301 | -0.000704 | -0.995% |
+| product | +0.000096 | -0.000657 | -1.825% |
+| label_cond | +0.000903 | +0.000901 | +4.897% |
+| interactive | +0.015573 | +0.015258 | +7.861% |
+
+The persistent constrained result is above native vLLM on PID Recall@32 for
+all five tasks. Against the published model-card values, it is above on video,
+label_cond, and interactive, and below by 0.000704 on ad and 0.000657 on
+product. Those two gaps are smaller than 0.001 absolute. PID pass@32 is also
+above native on all five tasks. PID pass@1 is above native on four tasks and
+is 0.002 lower on interactive (0.065 versus 0.067).
+
+This is an observed full-dataset comparison, not a strict zero-tolerance
+paired oracle. The saved native jobs inherited the imported task temperature
+of 0.6; the persistent jobs explicitly used temperature 0. The model, complete
+test splits, beam width 32, SID-to-PID evaluator, and cutoff are otherwise the
+same. A future strict paired gate should regenerate native outputs at T0 from
+the same immutable input manifest. The published values have four-decimal
+precision and do not include pass metrics or raw predictions.
+
+Official source (accessed 2026-09-06):
+<https://huggingface.co/OpenOneRec/OneRec-1.7B>
+
+Native result SHA256 values, in task order interactive, label_cond, ad,
+product, and video:
+
+```text
+7ebae5e56a2706eeae2d217e71580817951582a094a2129c7131bbc71c522b45
+188375835d8a4282bc74c9a9de0e23f60189293fc73f0fefd9ad7a4e6b190852
+dcdead07582a3c341e8a1e9264fccc4315f15b008c26e7ee03e77fd17904ac96
+79413c95641f68090d46051938cb6f6725aaf854aa64d077541f640b005a9e7c
+931cfa5092c083dd046e4bf6acde52dd2f1edae5fa86edddd88ca419af76ac22
+```
+
 No task regressed against the recorded full-dataset PID recall@32 values. A
 first full pass before the SID framing repair produced exactly the same PID
 metrics for every task, providing an independent repeat of the item-level
