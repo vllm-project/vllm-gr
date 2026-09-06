@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for NPU ModelRunner wrappers."""
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,124 +9,7 @@ import pytest
 import torch
 
 from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
-from vllm_gr.v1.worker.gr_model_runner_state import GRDeviceBackend
 from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
-
-
-def test_npu_backend_factory_returns_protocol_and_requires_async_when_enabled() -> None:
-    backend = npu_patch.create_gr_device_backend(
-        SimpleNamespace(
-            _vllm_gr_config=SimpleNamespace(persistent_runner_state=False),
-            use_async_scheduling=False,
-        )
-    )
-    assert isinstance(backend, GRDeviceBackend)
-    with pytest.raises(RuntimeError, match="ASYNC"):
-        npu_patch.create_gr_device_backend(
-            SimpleNamespace(
-                _vllm_gr_config=SimpleNamespace(persistent_runner_state=True),
-                use_async_scheduling=False,
-            )
-        )
-
-
-def test_persistent_npu_sampler_uses_existing_state_and_rejects_spec_decode() -> None:
-    calls: list[tuple[Any, ...]] = []
-    output = object()
-
-    class Backend:
-        def sample(self, *args: Any) -> object:
-            calls.append(args)
-            return output
-
-    state = SimpleNamespace(backend=Backend())
-    metadata = {"persistent_runner_state": True, "is_beam_decode": True}
-    runner = SimpleNamespace(
-        _current_beam_info={"beam_data": {"gr": metadata}},
-        _gr_model_runner_states={"gr": state},
-    )
-    logits = torch.zeros((4, 8))
-    assert npu_patch._try_persistent_npu_sampler(runner, logits, None) is output
-    assert calls == [(runner, state, logits, metadata)]
-    with pytest.raises(RuntimeError, match="speculative"):
-        npu_patch._try_persistent_npu_sampler(runner, logits, object())
-
-
-def test_persistent_npu_sampler_precreates_state_on_final_prefill(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm_gr.v1.beam import beam_decision
-
-    output = object()
-    metadata = {
-        "persistent_runner_state": True,
-        "is_constraint_prefill": True,
-        "is_last_prefill": True,
-    }
-
-    class Backend:
-        def sample(self, *_args: Any) -> object:
-            return output
-
-    state = SimpleNamespace(backend=Backend())
-    created: list[tuple[Any, ...]] = []
-
-    def create(*args: Any) -> Any:
-        created.append(args)
-        return state
-
-    monkeypatch.setattr(beam_decision, "_create_persistent_gr_state", create)
-    runner = SimpleNamespace(
-        _current_beam_info={"beam_data": {"gr": metadata}},
-        _gr_model_runner_states={},
-    )
-    logits = torch.zeros((1, 8))
-    assert npu_patch._try_persistent_npu_sampler(runner, logits, None) is output
-    assert created == [(runner, "gr", metadata)]
-
-
-def test_npu_named_profile_diagnostic_returns_runner_and_memory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeRunner:
-        device = SimpleNamespace(type="npu")
-        _vllm_gr_config = SimpleNamespace(beam_graph_enabled=True, beam_max_width=128)
-        _beam_graph_keys = {128}
-        _beam_graph_full_dispatch_count = 5
-
-    fake_npu = SimpleNamespace(
-        get_device_properties=lambda device: SimpleNamespace(name="Ascend"),
-        memory_allocated=lambda device: 21,
-        memory_reserved=lambda device: 22,
-        max_memory_allocated=lambda device: 23,
-        max_memory_reserved=lambda device: 24,
-    )
-    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
-
-    result = npu_patch.get_gr_profile_runtime_stats(SimpleNamespace(model_runner=FakeRunner()))
-    assert result["backend"] == "npu"
-    assert result["runner_class"].endswith(".FakeRunner")
-    assert result["device_name"] == "Ascend"
-    assert result["memory"]["allocated_bytes"] == 21
-    assert result["memory_components"] == {
-        "native_kv_bytes": 0,
-        "beam_kv_bytes": 0,
-        "workspace_bytes": 0,
-        "gr_state_peak_bytes": 0,
-        "graph_pool_allocated_bytes": 0,
-        "graph_pool_reserved_bytes": 0,
-    }
-    assert result["beam_graph"]["captured_widths"] == [128]
-    assert result["beam_graph"]["full_dispatches"] == 5
-
-
-def test_npu_profile_diagnostic_hook_is_named_and_idempotent() -> None:
-    class FakeWorker:
-        pass
-
-    assert npu_patch.install_worker_diagnostic_hook(FakeWorker) == 1
-    assert npu_patch.install_worker_diagnostic_hook(FakeWorker) == 0
-    assert FakeWorker.get_gr_profile_runtime_stats is npu_patch.get_gr_profile_runtime_stats
 
 
 def test_npu_prepare_unproxies_and_preserves_four_item_contract(
@@ -171,118 +53,6 @@ def test_npu_prepare_unproxies_and_preserves_four_item_contract(
     assert returned_spec is spec_metadata
     assert total == 7
     assert returned_compressed is compressed
-
-
-def test_npu_persistent_backend_prepares_before_native_attention_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-    monkeypatch.setattr(npu_patch, "suspend_native_slot_mapping", lambda *args: nullcontext())
-    monkeypatch.setattr(
-        npu_patch, "prepare_decode_metadata", lambda *args: events.append("publish-metadata")
-    )
-    monkeypatch.setattr(
-        npu_patch, "finish_decode_metadata", lambda *args: events.append("finish-metadata")
-    )
-    scheduler_output = SimpleNamespace(
-        beam_data={
-            "gr-0": {
-                "persistent_runner_state": True,
-                "is_beam_decode": True,
-                "generation_index": 1,
-            }
-        }
-    )
-
-    class State:
-        def prepare_decode_inputs(self, runner, output, counts, metadata) -> None:
-            assert output is scheduler_output
-            events.append("backend-prepare")
-
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(req_ids=["gr-0"]),
-        _current_beam_info={"req_ids": []},
-        _gr_model_runner_states={"gr-0": State()},
-        device=torch.device("cpu"),
-    )
-
-    def original(self, output, counts):
-        events.append("native-prepare")
-        return object(), object(), 1, object()
-
-    monkeypatch.setattr(npu_patch, "_beam_remap_inputs", lambda *args: [0])
-    wrapped = npu_patch.make_patched_prepare_inputs(original)
-    wrapped(runner, scheduler_output, [1])
-    assert events == ["backend-prepare", "publish-metadata", "native-prepare", "finish-metadata"]
-
-
-@pytest.mark.parametrize("persistent", [False, True])
-def test_npu_prepare_preserves_pinned_ascend_three_item_result(
-    monkeypatch: pytest.MonkeyPatch, persistent: bool
-) -> None:
-    """f528cdd's execute_model unpacks exactly three _prepare_inputs items.
-
-    This checks return arity and call order only, not whether native token
-    copies or real attention metadata consume the persistent device state.
-    """
-    events = []
-    # This test owns only the upstream return contract and ordering. The
-    # device metadata and native-slot boundary have separate composition tests.
-    monkeypatch.setattr(npu_patch, "suspend_native_slot_mapping", lambda *args: nullcontext())
-    monkeypatch.setattr(npu_patch, "prepare_decode_metadata", lambda *args: None)
-    monkeypatch.setattr(npu_patch, "finish_decode_metadata", lambda *args: None)
-    spec_metadata = object()
-    original_logits = object()
-    original_result = (original_logits, spec_metadata, 8)
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(req_ids=["gr"]),
-        _current_beam_info={},
-        device=torch.device("cpu"),
-    )
-
-    class State:
-        def prepare_decode_inputs(self, *args):
-            events.append("backend")
-
-    runner._gr_model_runner_states = {"gr": State()}
-
-    def original(self, output, counts):
-        events.append("native")
-        return original_result
-
-    def remap(*args):
-        events.append("remap")
-        return [0, 1, 2, 3, 4, 5, 6, 7]
-
-    monkeypatch.setattr(npu_patch, "_beam_remap_inputs", remap)
-    wrapped = npu_patch.make_patched_prepare_inputs_npu(original)
-    # Ordinary requests preserve even the tuple identity.
-    assert wrapped(runner, SimpleNamespace(beam_data={}), [8]) is original_result
-    assert events == ["native"]
-    events.clear()
-    output = SimpleNamespace(
-        beam_data={"gr": {"persistent_runner_state": persistent, "is_beam_decode": True}}
-    )
-    logits, returned_spec, total = wrapped(runner, output, [8])
-    assert logits.tolist() == list(range(8))
-    assert returned_spec is spec_metadata
-    assert total == 8
-    assert events == (["backend"] if persistent else []) + ["native", "remap"]
-
-
-@pytest.mark.parametrize("result", [(), (1, 2), (1, 2, 3, 4, 5), [1, 2, 3]])
-def test_npu_prepare_rejects_unknown_beam_return_contract_before_remap(
-    monkeypatch: pytest.MonkeyPatch, result: Any
-) -> None:
-    def forbidden(*args):
-        raise AssertionError("Beam remap must not run on an unknown native contract")
-
-    monkeypatch.setattr(npu_patch, "_beam_remap_inputs", forbidden)
-    runner = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["gr"]))
-    wrapped = npu_patch.make_patched_prepare_inputs_npu(lambda *args: result)
-    assert wrapped(runner, SimpleNamespace(beam_data={}), [1]) is result
-    with pytest.raises(RuntimeError, match="unsupported NPU V1 _prepare_inputs"):
-        wrapped(runner, SimpleNamespace(beam_data={"gr": {}}), [1])
 
 
 def test_npu_bookkeeping_preserves_six_items_and_restores_batch(
@@ -380,40 +150,6 @@ def test_npu_sample_patch_is_signature_agnostic(
     runner = SimpleNamespace()
     assert wrapped(runner, "logits", "extra") is sample_output
     assert events == ["sample", "override"]
-
-
-@pytest.mark.parametrize(
-    ("metadata", "expected_marker"),
-    [
-        ({"is_constraint_prefill": True}, "gr_npu_prefill_stage"),
-        ({"is_beam_decode": True}, "gr_npu_decode_stage"),
-    ],
-)
-def test_npu_sample_patch_records_backend_stage_marker(
-    monkeypatch: pytest.MonkeyPatch,
-    metadata: dict[str, bool],
-    expected_marker: str,
-) -> None:
-    markers: list[str] = []
-
-    class MarkerContext:
-        def __init__(self, marker: str) -> None:
-            markers.append(marker)
-
-        def __enter__(self) -> None:
-            return None
-
-        def __exit__(self, *_args: Any) -> None:
-            return None
-
-    monkeypatch.setattr(torch.autograd.profiler, "record_function", MarkerContext)
-    monkeypatch.setattr(npu_patch, "try_sample_with_constraint_backend", lambda *args: object())
-    monkeypatch.setattr(npu_patch, "_maybe_run_worker_beam_decision", lambda *args: None)
-    runner = SimpleNamespace(_current_beam_info={"beam_data": {"request": metadata}})
-
-    npu_patch.make_patched_sample_npu(lambda *_args: object())(runner, "logits")
-
-    assert markers == [expected_marker]
 
 
 def test_npu_sample_patch_parses_keyword_logits_and_spec_metadata(
@@ -879,53 +615,6 @@ def test_npu_determine_cascade_mode_downgrades_full() -> None:
         npu_patch._beam_graph_enabled_for_run = orig_enabled
 
 
-@pytest.mark.parametrize("reason", ["keyword", "positional", "model"])
-def test_npu_beam_graph_respects_explicit_eager_gates(
-    monkeypatch: pytest.MonkeyPatch, reason: str
-) -> None:
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
-
-    runner = SimpleNamespace(
-        _current_beam_info=_make_beam_info(SimpleNamespace(is_active=True, slot=0), ["gr"], ["gr"]),
-        _beam_graph_keys={128},
-        model_config=SimpleNamespace(enforce_eager=reason == "model"),
-    )
-    monkeypatch.setattr(npu_patch, "_beam_graph_enabled_for_run", lambda _: True)
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
-    native = (CUDAGraphMode.FULL, BatchDescriptor(num_tokens=128, uniform=True))
-    wrapped = _make_determine_wrapper(native)
-    if reason == "positional":
-        result = wrapped(runner, 128, 1, None, 128, False, False, True)
-    else:
-        result = wrapped(runner, num_tokens=128, force_eager=reason == "keyword")
-    assert result[0] == CUDAGraphMode.NONE
-    assert not getattr(runner, "_beam_graph_full_dispatch_count", 0)
-    # Ordinary requests are wholly upstream-owned, including this stub's
-    # deliberately inconsistent FULL/eager result.
-    runner._current_beam_info = None
-    assert wrapped(runner, num_tokens=128, force_eager=True) is native
-
-
-@pytest.mark.parametrize("num_tokens", [None, 127, True, 128.0, 0, torch.tensor(128)])
-def test_npu_beam_graph_never_infers_exact_width_from_padded_descriptor(
-    monkeypatch: pytest.MonkeyPatch, num_tokens: Any
-) -> None:
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
-
-    runner = SimpleNamespace(
-        _current_beam_info=_make_beam_info(SimpleNamespace(is_active=True, slot=0), ["gr"], ["gr"]),
-        _beam_graph_keys={128},
-    )
-    monkeypatch.setattr(npu_patch, "_beam_graph_enabled_for_run", lambda _: True)
-    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
-    wrapped = _make_determine_wrapper(
-        (CUDAGraphMode.FULL, BatchDescriptor(num_tokens=128, uniform=True))
-    )
-    result = wrapped(runner) if num_tokens is None else wrapped(runner, num_tokens=num_tokens)
-    assert result[0] == CUDAGraphMode.NONE
-    assert not getattr(runner, "_beam_graph_full_dispatch_count", 0)
-
-
 def test_npu_determine_pure_beam_batch_grants_full() -> None:
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
 
@@ -947,9 +636,6 @@ def test_npu_determine_pure_beam_batch_grants_full() -> None:
         assert result[0] == CUDAGraphMode.FULL
         assert result[1].num_tokens == 4
         assert result[1].uniform is True
-        assert runner._beam_graph_full_dispatch_count == 1
-        wrapped(runner, num_tokens=4)
-        assert runner._beam_graph_full_dispatch_count == 2
     finally:
         npu_patch._npu_xllm_decode_mode_active = orig_xllm
         npu_patch._beam_graph_enabled_for_run = orig_enabled

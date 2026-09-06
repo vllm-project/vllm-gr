@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from functools import wraps
-from numbers import Integral
 
 import torch
 from vllm.logger import init_logger
@@ -27,136 +26,13 @@ from vllm_gr.v1.worker.model_runner_common import (
     _beam_remap_inputs,
     _create_beam_context,
     _materialize_logits_indices,
-    get_beam_graph_runtime_stats,
-)
-from vllm_gr.v1.worker.npu_gr_inputs import (
-    make_patched_execute_model,
-    make_patched_prepare_input_ids,
-    suspend_native_slot_mapping,
-)
-from vllm_gr.v1.worker.npu_gr_metadata import (
-    finish_decode_metadata,
-    prepare_decode_metadata,
 )
 
 logger = init_logger(__name__)
 
-__all__ = ("make_patched_execute_model", "make_patched_prepare_input_ids")
-
-_PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
-
-
-def create_gr_device_backend(runner):
-    """Select the persistent NPU V1 backend during ModelRunner setup."""
-
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
-    from vllm_gr.v1.worker.npu_gr_backend import NPUGRDeviceBackend
-
-    if bool(getattr(_get_gr_config(runner), "persistent_runner_state", False)) and not getattr(
-        runner, "use_async_scheduling", False
-    ):
-        raise RuntimeError("persistent NPU GR requires ASYNC output transport")
-    return NPUGRDeviceBackend()
-
-
-def _try_persistent_npu_sampler(
-    runner,
-    logits: torch.Tensor | None,
-    spec_decode_metadata,
-):
-    """Run the request-owned persistent sampler for final Prefill/Decode."""
-    beam_info = getattr(runner, "_current_beam_info", None)
-    beam_data = (beam_info.get("beam_data") or {}) if beam_info else {}
-    persistent = [
-        (request_id, metadata)
-        for request_id, metadata in beam_data.items()
-        if metadata.get("persistent_runner_state")
-        and (
-            metadata.get("is_beam_decode")
-            or (metadata.get("is_constraint_prefill") and metadata.get("is_last_prefill", False))
-        )
-    ]
-    if not persistent:
-        return None
-    if len(persistent) != 1:
-        raise RuntimeError("persistent NPU sampler requires one isolated B=1 request")
-    if spec_decode_metadata is not None:
-        raise RuntimeError("persistent NPU sampler does not support speculative decoding")
-    if logits is None:
-        raise RuntimeError("persistent NPU sampler requires raw logits")
-    request_id, metadata = persistent[0]
-    states = getattr(runner, "_gr_model_runner_states", None)
-    state = states.get(request_id) if isinstance(states, dict) else None
-    if state is None:
-        from vllm_gr.v1.beam.beam_decision import _create_persistent_gr_state
-
-        state = _create_persistent_gr_state(runner, request_id, metadata)
-    backend = state.backend
-    sample = getattr(backend, "sample", None)
-    if not callable(sample):
-        raise TypeError("persistent NPU GR backend has no sampler boundary")
-    return sample(runner, state, logits, metadata)
-
-
-def _npu_beam_stage_trace_marker(runner) -> str | None:
-    """Return a stable NPU trace boundary for the active GR stage."""
-    beam_info = getattr(runner, "_current_beam_info", None)
-    beam_data = (beam_info.get("beam_data") or {}) if beam_info else {}
-    if any(metadata.get("is_constraint_prefill", False) for metadata in beam_data.values()):
-        return "gr_npu_prefill_stage"
-    if any(metadata.get("is_beam_decode", False) for metadata in beam_data.values()):
-        return "gr_npu_decode_stage"
-    return None
-
-
-def get_gr_profile_runtime_stats(worker) -> dict:
-    """Named, read-only NPU Worker RPC for attributable profiling."""
-    runner = getattr(worker, "model_runner", None)
-    if runner is None:
-        raise RuntimeError("NPU worker has no model_runner for profiling diagnostics")
-    device = getattr(runner, "device", None)
-    npu = getattr(torch, "npu", None)
-    device_type = getattr(device, "type", str(device).split(":", 1)[0])
-    if device is None or device_type != "npu" or npu is None:
-        raise RuntimeError(f"NPU profiling diagnostic requires an NPU runner, got {device!r}")
-    properties = npu.get_device_properties(device)
-    runner_class = type(runner)
-    from vllm_gr.v1.worker.gr_model_runner_state import get_gr_memory_stats
-
-    return {
-        "backend": "npu",
-        "worker_class": f"{type(worker).__module__}.{type(worker).__qualname__}",
-        "runner_class": f"{runner_class.__module__}.{runner_class.__qualname__}",
-        "device": str(device),
-        "device_name": str(getattr(properties, "name", properties)),
-        "device_properties": repr(properties),
-        "memory": {
-            "allocated_bytes": int(npu.memory_allocated(device)),
-            "reserved_bytes": int(npu.memory_reserved(device)),
-            "peak_allocated_bytes": int(npu.max_memory_allocated(device)),
-            "peak_reserved_bytes": int(npu.max_memory_reserved(device)),
-        },
-        "memory_components": get_gr_memory_stats(worker),
-        "beam_graph": get_beam_graph_runtime_stats(worker),
-    }
-
-
-def install_worker_diagnostic_hook(worker_cls: type) -> int:
-    """Install the NPU diagnostic as a safe named utility RPC."""
-    if getattr(worker_cls, _PROFILE_DIAGNOSTIC_HOOK_MARKER, False):
-        return 0
-    worker_cls.get_gr_profile_runtime_stats = get_gr_profile_runtime_stats  # type: ignore[attr-defined]
-    setattr(worker_cls, _PROFILE_DIAGNOSTIC_HOOK_MARKER, True)
-    return 1
-
 
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
-    """Preserve the NPU V1 prepare result while replacing Beam logits rows.
-
-    The supported Ascend 0.22.1rc1 source baseline (f528cdd) returns three
-    items. Keep the previously supported four-item extension's opaque tail
-    unchanged as well; do not invent a compressed-count item for upstream.
-    """
+    """Wrap the NPU four-item ``_prepare_inputs`` contract."""
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
         return _orig_prepare_inputs
 
@@ -166,49 +42,32 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         if isinstance(self.input_batch, InputBatchProxy):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
 
-        # Publish request identities before native input preparation. The
-        # pinned V1 runner builds attention metadata later in execute_model.
+        # NPU builds attention metadata inside the original _prepare_inputs.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        # Publish backend state before native preparation. This call-order
-        # hook alone does not prevent native _prepare_input_ids from copying
-        # control tokens over the device inputs; the persistent NPU backend
-        # must also adapt that input-copy boundary before it can be enabled.
+        out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
+
         beam_data = getattr(scheduler_output, "beam_data", {})
-        prepared_states = []
-        for req_id, mdata in beam_data.items():
-            if mdata.get("persistent_runner_state") and mdata.get("is_beam_decode"):
-                state = getattr(self, "_gr_model_runner_states", {}).get(req_id)
-                if state is None:
-                    raise RuntimeError(f"persistent GR state is missing for request {req_id!r}")
-                state.prepare_decode_inputs(
-                    self,
-                    scheduler_output,
-                    num_scheduled_tokens,
-                    mdata,
-                )
-                prepare_decode_metadata(self, state, scheduler_output, mdata)
-                prepared_states.append((state, mdata))
-
-        with suspend_native_slot_mapping(self, scheduler_output):
-            out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
-
         if not beam_data:
             return out
 
-        if not isinstance(out, tuple) or len(out) not in (3, 4):
-            raise RuntimeError(
-                "unsupported NPU V1 _prepare_inputs result: expected a "
-                "three-item upstream tuple or four-item legacy extension"
-            )
+        (
+            logits_indices,
+            spec_decode_metadata,
+            total_num_scheduled_tokens,
+            num_scheduled_tokens_compressed_list,
+        ) = out
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = _materialize_logits_indices(self, new_logits_indices)
-        for state, metadata in prepared_states:
-            finish_decode_metadata(self, state, metadata)
 
-        return (logits_indices, *out[1:])
+        return (
+            logits_indices,
+            spec_decode_metadata,
+            total_num_scheduled_tokens,
+            num_scheduled_tokens_compressed_list,
+        )
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
@@ -248,24 +107,17 @@ def make_patched_sample_npu(_orig_sample):
     def patched_sample(self, *args, **kwargs):
         logits = args[0] if args else kwargs.get("logits")
         spec_decode_metadata = args[1] if len(args) > 1 else kwargs.get("spec_decode_metadata")
-        sampler_output = _try_persistent_npu_sampler(self, logits, spec_decode_metadata)
-        if sampler_output is None:
-            sampler_output = try_sample_with_constraint_backend(
-                self,
-                logits,
-                spec_decode_metadata,
-            )
+        sampler_output = try_sample_with_constraint_backend(
+            self,
+            logits,
+            spec_decode_metadata,
+        )
         if sampler_output is None:
             sampler_output = _try_constrained_sampler_shortcut(self, args, kwargs)
         if sampler_output is None:
             sampler_output = _orig_sample(self, *args, **kwargs)
             apply_constrained_sample_override(self, logits, sampler_output)
-        trace_marker = _npu_beam_stage_trace_marker(self)
-        if trace_marker is None:
-            _maybe_run_worker_beam_decision(self, sampler_output)
-        else:
-            with torch.autograd.profiler.record_function(trace_marker):
-                _maybe_run_worker_beam_decision(self, sampler_output)
+        _maybe_run_worker_beam_decision(self, sampler_output)
         return sampler_output
 
     setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
@@ -367,13 +219,10 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-        if (
-            hasattr(self, "_beam_logprobs_cache")
-            and self._beam_logprobs_cache
-            and hasattr(scheduler_output, "finished_req_ids")
-        ):
-            for req_id in scheduler_output.finished_req_ids:
-                self._beam_logprobs_cache.pop(req_id, None)
+        if hasattr(self, "_beam_logprobs_cache") and self._beam_logprobs_cache:
+            if hasattr(scheduler_output, "finished_req_ids"):
+                for req_id in scheduler_output.finished_req_ids:
+                    self._beam_logprobs_cache.pop(req_id, None)
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
@@ -391,10 +240,10 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
         (
             logprobs_lists,
-            _valid_sampled_token_ids,
+            valid_sampled_token_ids,
             prompt_logprobs_dict,
-            _req_ids_output_copy,
-            _req_id_to_index_output_copy,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
             invalid_req_indices,
         ) = res
 
@@ -480,13 +329,6 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
         if not beam_keys:
             return result
 
-        # Ascend f528cdd uses force_eager as positional argument 6 (excluding
-        # self). A captured Beam graph must never override an explicit eager
-        # request or the model's enforce_eager setting.
-        force_eager = kwargs.get("force_eager", args[6] if len(args) > 6 else False)
-        if force_eager or getattr(getattr(self, "model_config", None), "enforce_eager", False):
-            return _downgrade_to_none(result)
-
         # Beam decode FULL requires an active BeamSearchSession — the xllm
         # execution path reads the pool slot and context buffers from it.
         session = beam_info.get("beam_session")
@@ -530,15 +372,9 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
         num_tokens_arg = kwargs.get("num_tokens")
         if num_tokens_arg is None and args:
             num_tokens_arg = args[0]
-        # A padded descriptor does not prove exact width. Accept only a Host
-        # integral count, never int(device_tensor) or a missing-count fallback.
-        if (
-            isinstance(num_tokens_arg, bool)
-            or not isinstance(num_tokens_arg, Integral)
-            or num_tokens_arg < 1
-        ):
-            return _downgrade_to_none(result)
-        real_num_tokens = int(num_tokens_arg)
+        real_num_tokens = (
+            int(num_tokens_arg) if num_tokens_arg is not None else result[1].num_tokens
+        )
 
         # FULL iff a beam graph for this exact width exists in the captured
         # set; otherwise eager (and never a native FULL graph for beam rows).
@@ -553,11 +389,6 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
             result[0],
             result[1],
             new_descriptor,
-        )
-        # Host-only diagnostic counter. Startup capture bypasses this runtime
-        # dispatch branch, so profiling deltas count real request replays.
-        self._beam_graph_full_dispatch_count = (
-            int(getattr(self, "_beam_graph_full_dispatch_count", 0)) + 1
         )
         return (CUDAGraphMode.FULL, new_descriptor) + result[2:]
 
@@ -905,8 +736,9 @@ make_patched_prepare_inputs = make_patched_prepare_inputs_npu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_npu
 make_patched_sample = make_patched_sample_npu
 # The dispatcher (model_runner_patch.py) looks up this exact name; without the
-# alias the sample_tokens hook is silently skipped and the persistent scheduler
-# cannot consume the Worker decision.
+# alias the sample_tokens hook is silently skipped and the worker beam decision
+# never reaches the ModelRunnerOutput (async scheduling keeps the decision path
+# broken end-to-end: engine-driven chaining no-ops and the frontend keeps its RPC loop).
 make_patched_sample_tokens = make_patched_sample_tokens_npu
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_npu
