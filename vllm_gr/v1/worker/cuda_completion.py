@@ -8,13 +8,12 @@ it is never permission to reuse DMA storage. No ModelRunner path uses this
 module until the output adapter and its resource leases are installed.
 """
 
-from contextlib import contextmanager
-from concurrent.futures import CancelledError
 import ctypes
+import threading
+from concurrent.futures import CancelledError
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import import_module
-import threading
-
 
 API_VERSION = 2
 _loaded_api = None

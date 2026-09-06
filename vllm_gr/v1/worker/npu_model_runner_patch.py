@@ -30,12 +30,8 @@ from vllm_gr.v1.worker.model_runner_common import (
     get_beam_graph_runtime_stats,
 )
 from vllm_gr.v1.worker.npu_gr_inputs import (
-    make_patched_execute_model as make_patched_execute_model,
-)
-from vllm_gr.v1.worker.npu_gr_inputs import (
-    make_patched_prepare_input_ids as make_patched_prepare_input_ids,
-)
-from vllm_gr.v1.worker.npu_gr_inputs import (
+    make_patched_execute_model,
+    make_patched_prepare_input_ids,
     suspend_native_slot_mapping,
 )
 from vllm_gr.v1.worker.npu_gr_metadata import (
@@ -44,6 +40,8 @@ from vllm_gr.v1.worker.npu_gr_metadata import (
 )
 
 logger = init_logger(__name__)
+
+__all__ = ("make_patched_execute_model", "make_patched_prepare_input_ids")
 
 _PROFILE_DIAGNOSTIC_HOOK_MARKER = "_vllm_gr_profile_diagnostic_hook_installed"
 
@@ -369,10 +367,13 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-        if hasattr(self, "_beam_logprobs_cache") and self._beam_logprobs_cache:
-            if hasattr(scheduler_output, "finished_req_ids"):
-                for req_id in scheduler_output.finished_req_ids:
-                    self._beam_logprobs_cache.pop(req_id, None)
+        if (
+            hasattr(self, "_beam_logprobs_cache")
+            and self._beam_logprobs_cache
+            and hasattr(scheduler_output, "finished_req_ids")
+        ):
+            for req_id in scheduler_output.finished_req_ids:
+                self._beam_logprobs_cache.pop(req_id, None)
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
@@ -390,10 +391,10 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
         (
             logprobs_lists,
-            valid_sampled_token_ids,
+            _valid_sampled_token_ids,
             prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
+            _req_ids_output_copy,
+            _req_id_to_index_output_copy,
             invalid_req_indices,
         ) = res
 

@@ -28,7 +28,6 @@ from vllm.entrypoints.generate.beam_search.utils import (
     BeamSearchSequence,
 )
 from vllm.entrypoints.llm import LLM
-from vllm.inputs import TokensPrompt
 from vllm.logprobs import FlatLogprobs
 from vllm.sampling_params import SamplingParams
 
@@ -226,9 +225,6 @@ def _custom_beam_search_batch(
     instance.beams = materialize_final_beams(
         instance.beams[0], sequences, selected_logprobs, scores
     )
-    if decision.get("counters"):
-        logger.info("vllm-gr request counters: %s", decision["counters"])
-
 
 class GRLLM(LLM):
     """LLM subclass with catalog-aware beam search.

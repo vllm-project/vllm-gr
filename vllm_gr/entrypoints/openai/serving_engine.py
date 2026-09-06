@@ -476,11 +476,6 @@ async def beam_search(
             all_beams = materialize_final_beams(
                 all_beams[0], sequences, selected_logprobs, scores
             )
-            if final_decision.get("counters"):
-                logger.info(
-                    "vllm-gr request counters: %s",
-                    final_decision["counters"],
-                )
             break
 
         valid_tokens_sets = None

@@ -267,12 +267,12 @@ def apply_worker_patches() -> None:
     _install_active_worker_resource_hook()
     platform_module = _get_active_platform_module()
     runners_to_patch = [
-        (runner_name, runner_class)
-        for runner_name, runner_class in platform_module.discover_worker_runners()
+        runner_class
+        for _, runner_class in platform_module.discover_worker_runners()
         if not is_worker_runner_patched(runner_class)
     ]
 
-    for runner_name, runner_class in runners_to_patch:
+    for runner_class in runners_to_patch:
         backend_factory = getattr(platform_module, "create_gr_device_backend", None)
         if callable(backend_factory):
             runner_class.__init__ = make_init_with_gr_device_backend(
@@ -386,4 +386,3 @@ def apply_worker_patches() -> None:
             )
 
         runner_class._patched_for_beam_pos_ids = True
-        logger.info("%s hooks patched successfully.", runner_name)

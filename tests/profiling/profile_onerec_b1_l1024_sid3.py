@@ -306,7 +306,7 @@ def _effective_config_snapshot(config: Any) -> dict:
 
 def _metric_totals(metrics: Sequence[Any]) -> dict[str, float]:
     wanted = {"vllm:prefix_cache_queries", "vllm:prefix_cache_hits"}
-    totals = {name: 0.0 for name in wanted}
+    totals = dict.fromkeys(wanted, 0.0)
     found: set[str] = set()
     for metric in metrics:
         name = getattr(metric, "name", None)

@@ -119,7 +119,7 @@ def run_api_inference(
     # Map generation config to API parameters
     api_params = {
         "model": model,
-        "use_beam_search": True if (gen_config.get("num_beams", 1) > 1) else False,
+        "use_beam_search": gen_config.get("num_beams", 1) > 1,
         "max_tokens": gen_config.get("max_new_tokens", 1024),
         "temperature": gen_config.get("temperature", 0.0),
         "top_p": gen_config.get("top_p", 1.0),
@@ -151,12 +151,11 @@ def run_api_inference(
                     mock_outputs.append(MockCompletionOutput(full_text))
                 return MockRequestOutput(prompt, mock_outputs)
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
-        except Exception as e:
+        except Exception as error:
             status_code = response.status_code if response is not None else "N/A"
             response_text = response.text if response is not None else "N/A"
-            logger.error(f"Request failed. Status code: {status_code}")
-            logger.error(f"[DEBUG] Response text: {response_text}")
-            logger.error(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
+            logger.error("Request failed with status %s: %.1000s", status_code, response_text)
+            logger.error("Request failed for prompt %.50s: %s", prompt, error)
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
 
     # Run in parallel. The BeamAttentionPool is max_batch=1: only one beam
@@ -482,7 +481,7 @@ def main():
         predictions_dir=args.result_dir,
         debug=args.debug,
     )
-    metrics, per_sample_metrics = evaluator.evaluate()
+    metrics, _per_sample_metrics = evaluator.evaluate()
     metrics["elapsed_time"] = gen_end - gen_start
 
     print(f"\n--- Evaluation Results for {args.task_type} on model {args.model} ---")

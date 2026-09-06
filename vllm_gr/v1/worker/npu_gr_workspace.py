@@ -97,7 +97,6 @@ class NPUWorkspace:
     backtrace_deltas: torch.Tensor
     status: torch.Tensor
     final_staging_i32: torch.Tensor
-    final_staging_f32: torch.Tensor
     control_storage_0: torch.Tensor
     control_storage_1: torch.Tensor
     _epoch: int = 0
@@ -144,7 +143,6 @@ class NPUWorkspace:
             backtrace_deltas=torch.empty(beam, dtype=torch.float32, device=resolved),
             status=torch.empty((1,), dtype=torch.int32, device=resolved),
             final_staging_i32=final_i32,
-            final_staging_f32=final_i32.view(torch.float32),
             control_storage_0=torch.empty((1, 1), dtype=torch.int32, device=resolved),
             control_storage_1=torch.empty((1, 1), dtype=torch.int32, device=resolved),
             _zero_scores=torch.zeros(beam, dtype=torch.float32, device=resolved),

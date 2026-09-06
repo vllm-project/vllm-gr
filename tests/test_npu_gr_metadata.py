@@ -20,7 +20,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     _persistent_prefix_binding,
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
-from vllm_gr.v1.engine.types import GRSchedulerOutput, GRRequestStage
+from vllm_gr.v1.engine.types import GRRequestStage, GRSchedulerOutput
 from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
 from vllm_gr.v1.worker.npu_gr_inputs import (
     _persistent_decode_frame,
@@ -509,7 +509,7 @@ def test_finish_validation_precedes_all_length_buffer_writes() -> None:
 def test_real_npu_prepare_wrapper_orders_prepare_native_and_finish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner, state, output, metadata, group = _bind_and_decode()
+    runner, state, output, _metadata, group = _bind_and_decode()
     events: list[str] = []
     runner._gr_model_runner_states = {"gr": state}
     runner._current_beam_info = {"req_ids": []}

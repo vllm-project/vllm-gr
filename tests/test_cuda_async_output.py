@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
+import ctypes
 from collections import deque
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
-import ctypes
 from types import SimpleNamespace
 from typing import Any
 
@@ -715,17 +715,19 @@ def test_constructor_rejects_mismatched_control_abi_without_starting_dma(
     adapter.install_async_output_adapter(Output)
     copy_stream = _FakeStream("copy", 303, cuda_fakes.calls)
 
-    with pytest.raises(RuntimeError, match="ABI mismatch|does not own"):
-        with adapter.sampling_scope(runner, _scheduler_output()):
-            sampled = adapter.fill_control(workspace, 1, 71)
-            model_output = _model_output("wrong" if bad_field == "request_id" else "gr")
-            _construct(
-                Output,
-                model_output,
-                object() if bad_field == "device" else sampled,
-                copy_stream,
-                logprobs_tensors=object() if bad_field == "logprobs" else None,
-            )
+    with (
+        pytest.raises(RuntimeError, match="ABI mismatch|does not own"),
+        adapter.sampling_scope(runner, _scheduler_output()),
+    ):
+        sampled = adapter.fill_control(workspace, 1, 71)
+        model_output = _model_output("wrong" if bad_field == "request_id" else "gr")
+        _construct(
+            Output,
+            model_output,
+            object() if bad_field == "device" else sampled,
+            copy_stream,
+            logprobs_tensors=object() if bad_field == "logprobs" else None,
+        )
 
     assert not any(call[0] == "copy" for call in cuda_fakes.calls if isinstance(call, tuple))
     assert not any(
@@ -741,23 +743,27 @@ def test_second_host_history_consumer_is_rejected_at_scope_and_constructor(cuda_
     api = _FakeAPI(cuda_fakes.calls)
     runner, _ = _runner(workspace, api, output_token_ids=[[1]])
     _activate(runner, workspace)
-    with pytest.raises(RuntimeError, match="Host output-token history"):
-        with adapter.sampling_scope(runner, _scheduler_output()):
-            pytest.fail("scope admitted a second Host consumer")
+    with (
+        pytest.raises(RuntimeError, match="Host output-token history"),
+        adapter.sampling_scope(runner, _scheduler_output()),
+    ):
+        pytest.fail("scope admitted a second Host consumer")
 
     runner.input_batch._obj.sampling_metadata.output_token_ids = []
     Output = _output_class()
     adapter.install_async_output_adapter(Output)
-    with pytest.raises(RuntimeError, match="Host output-token history"):
-        with adapter.sampling_scope(runner, _scheduler_output()):
-            sampled = adapter.fill_control(workspace, 1, 79)
-            runner.input_batch._obj.sampling_metadata.output_token_ids = [[1]]
-            _construct(
-                Output,
-                _model_output(),
-                sampled,
-                _FakeStream("copy", 303, cuda_fakes.calls),
-            )
+    with (
+        pytest.raises(RuntimeError, match="Host output-token history"),
+        adapter.sampling_scope(runner, _scheduler_output()),
+    ):
+        sampled = adapter.fill_control(workspace, 1, 79)
+        runner.input_batch._obj.sampling_metadata.output_token_ids = [[1]]
+        _construct(
+            Output,
+            _model_output(),
+            sampled,
+            _FakeStream("copy", 303, cuda_fakes.calls),
+        )
     assert not any(call[0] == "copy" for call in cuda_fakes.calls if isinstance(call, tuple))
 
 
@@ -850,16 +856,18 @@ def test_constructor_rechecks_runner_device_before_copy(cuda_fakes):
     Output = _output_class()
     adapter.install_async_output_adapter(Output)
 
-    with pytest.raises(RuntimeError, match="runner device"):
-        with adapter.sampling_scope(runner, _scheduler_output()):
-            sampled = adapter.fill_control(workspace, 1, 89)
-            runner.device = torch.device("cuda:1")
-            _construct(
-                Output,
-                _model_output(),
-                sampled,
-                _FakeStream("copy", 303, cuda_fakes.calls),
-            )
+    with (
+        pytest.raises(RuntimeError, match="runner device"),
+        adapter.sampling_scope(runner, _scheduler_output()),
+    ):
+        sampled = adapter.fill_control(workspace, 1, 89)
+        runner.device = torch.device("cuda:1")
+        _construct(
+            Output,
+            _model_output(),
+            sampled,
+            _FakeStream("copy", 303, cuda_fakes.calls),
+        )
     assert not any(call[0] == "copy" for call in cuda_fakes.calls if isinstance(call, tuple))
 
 
@@ -879,17 +887,19 @@ def test_constructor_rejects_stream_on_another_device_before_copy(
     else:
         cuda_fakes.notification.device = torch.device("cuda:1")
 
-    with pytest.raises(RuntimeError, match="stream.*device"):
-        with adapter.sampling_scope(runner, _scheduler_output()):
-            sampled = adapter.fill_control(workspace, 1, 97)
-            _construct(Output, _model_output(), sampled, copy_stream)
+    with (
+        pytest.raises(RuntimeError, match="stream.*device"),
+        adapter.sampling_scope(runner, _scheduler_output()),
+    ):
+        sampled = adapter.fill_control(workspace, 1, 97)
+        _construct(Output, _model_output(), sampled, copy_stream)
     assert not any(call[0] == "copy" for call in cuda_fakes.calls if isinstance(call, tuple))
 
 
 def test_transport_shutdown_drains_the_runner_device(cuda_fakes):
     workspace = _workspace(cuda_fakes.calls)
     api = _FakeAPI(cuda_fakes.calls)
-    runner, transport = _runner(workspace, api)
+    _unused_runner, transport = _runner(workspace, api)
     transport.prepare_workspace(workspace)
 
     assert transport.shutdown() is None

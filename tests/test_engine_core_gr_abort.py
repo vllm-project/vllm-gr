@@ -8,7 +8,6 @@ from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
-
 from vllm.v1.executor.multiproc_executor import FutureWrapper, MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 

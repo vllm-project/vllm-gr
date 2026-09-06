@@ -90,9 +90,11 @@ def test_ordinary_and_prefill_slot_path_delegates_original(case):
 def test_native_prepare_exception_restores_original_without_masking_error(case):
     runner, output, tables, _, _ = case
     error = ValueError("native prepare error")
-    with pytest.raises(ValueError) as caught:
-        with inputs.suspend_native_slot_mapping(runner, output):
-            raise error
+    with (
+        pytest.raises(ValueError) as caught,
+        inputs.suspend_native_slot_mapping(runner, output),
+    ):
+        raise error
     assert caught.value is error
     assert runner.input_batch.block_table is tables
     assert tables[0].slot_mapping.gpu.tolist() == [99] * 6
@@ -100,14 +102,18 @@ def test_native_prepare_exception_restores_original_without_masking_error(case):
 
 def test_missing_or_duplicate_slot_boundary_fails_and_restores(case):
     runner, output, tables, query, positions = case
-    with pytest.raises(RuntimeError, match="skipped slot boundary"):
-        with inputs.suspend_native_slot_mapping(runner, output):
-            pass
+    with (
+        pytest.raises(RuntimeError, match="skipped slot boundary"),
+        inputs.suspend_native_slot_mapping(runner, output),
+    ):
+        pass
     assert runner.input_batch.block_table is tables
-    with pytest.raises(RuntimeError, match="stale or repeated"):
-        with inputs.suspend_native_slot_mapping(runner, output):
-            runner.input_batch.block_table.compute_slot_mapping(1, query, positions)
-            runner.input_batch.block_table.compute_slot_mapping(1, query, positions)
+    with (
+        pytest.raises(RuntimeError, match="stale or repeated"),
+        inputs.suspend_native_slot_mapping(runner, output),
+    ):
+        runner.input_batch.block_table.compute_slot_mapping(1, query, positions)
+        runner.input_batch.block_table.compute_slot_mapping(1, query, positions)
     assert runner.input_batch.block_table is tables
 
 
@@ -164,9 +170,8 @@ def test_unsupported_native_layout_fails_before_any_slot_write(case, failure):
             tables, runner._gr_npu_input_frame, group.slot_mapping.gpu
         )
     original = runner.input_batch.block_table
-    with pytest.raises(RuntimeError):
-        with inputs.suspend_native_slot_mapping(runner, output):
-            pytest.fail("unsupported layout entered native preparation")
+    with pytest.raises(RuntimeError), inputs.suspend_native_slot_mapping(runner, output):
+        pytest.fail("unsupported layout entered native preparation")
     assert runner.input_batch.block_table is original
     assert torch.all(group.slot_mapping.gpu == 99)
     assert tables.calls == []
@@ -175,20 +180,19 @@ def test_unsupported_native_layout_fails_before_any_slot_write(case, failure):
 @pytest.mark.parametrize("failure", ["copy", "bool", "query", "positions", "draft", "compressed"])
 def test_slot_boundary_rejects_wrong_inputs_without_native_call(case, failure):
     runner, output, tables, query, positions = case
-    with pytest.raises(RuntimeError):
-        with inputs.suspend_native_slot_mapping(runner, output):
-            proxy = runner.input_batch.block_table
-            if failure == "copy":
-                runner._gr_npu_input_frame.input_copy_done = False
-            if failure == "draft":
-                proxy.compute_slot_mapping_draft(None, None)
-            else:
-                proxy.compute_slot_mapping(
-                    True if failure == "bool" else 1,
-                    query.to(torch.int64) if failure == "query" else query,
-                    positions[:3] if failure == "positions" else positions,
-                    positions_compressed_list=[] if failure == "compressed" else None,
-                )
+    with pytest.raises(RuntimeError), inputs.suspend_native_slot_mapping(runner, output):
+        proxy = runner.input_batch.block_table
+        if failure == "copy":
+            runner._gr_npu_input_frame.input_copy_done = False
+        if failure == "draft":
+            proxy.compute_slot_mapping_draft(None, None)
+        else:
+            proxy.compute_slot_mapping(
+                True if failure == "bool" else 1,
+                query.to(torch.int64) if failure == "query" else query,
+                positions[:3] if failure == "positions" else positions,
+                positions_compressed_list=[] if failure == "compressed" else None,
+            )
     assert runner.input_batch.block_table is tables
     assert tables[0].slot_mapping.gpu.tolist() == [99] * 6
     assert tables.calls == []

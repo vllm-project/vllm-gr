@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections import deque
-from contextlib import nullcontext
 import pickle
 import struct
+from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -25,7 +25,6 @@ from vllm_gr.v1.engine.types import (
     GRRequestStage,
     GRSchedulerOutput,
 )
-from vllm_gr.v1.metrics.stats import GRRequestCounters
 
 _DIGEST = "sha256:" + "a" * 64
 
@@ -66,7 +65,6 @@ def _request(step: int = 0):
         gr_completed_steps=step,
         gr_parent_ids=[0, 1, 2],
         gr_beam_suffix=[[11], [12], [13]] if step else [],
-        gr_counters=GRRequestCounters(),
         gr_persistent_runner_state=False,
         async_tokens_to_discard=0,
     )
@@ -90,8 +88,6 @@ def test_add_request_reads_metadata_once() -> None:
     assert request.gr_step == 0
     assert request.gr_issued_steps == 0
     assert request.gr_completed_steps == 0
-    assert request.gr_counters.native_request_created_per_session == 1
-    assert request.gr_counters.scheduler_add_request_per_session == 1
 
 
 @pytest.mark.parametrize(
@@ -118,9 +114,11 @@ def test_add_request_rejects_invalid_persistent_metadata_before_upstream_add(
     scheduler = object.__new__(GRAsyncScheduler)
     scheduler.requests = {}
 
-    with mock.patch.object(AsyncScheduler, "add_request") as upstream_add:
-        with pytest.raises(ValueError, match=message):
-            scheduler.add_request(request)
+    with (
+        mock.patch.object(AsyncScheduler, "add_request") as upstream_add,
+        pytest.raises(ValueError, match=message),
+    ):
+        scheduler.add_request(request)
 
     upstream_add.assert_not_called()
 
@@ -135,9 +133,11 @@ def test_add_request_rejects_second_persistent_request_before_upstream_add() -> 
     scheduler = object.__new__(GRAsyncScheduler)
     scheduler.requests = {"gr-0": _request()}
 
-    with mock.patch.object(AsyncScheduler, "add_request") as upstream_add:
-        with pytest.raises(ValueError, match="B=1"):
-            scheduler.add_request(request)
+    with (
+        mock.patch.object(AsyncScheduler, "add_request") as upstream_add,
+        pytest.raises(ValueError, match="B=1"),
+    ):
+        scheduler.add_request(request)
 
     upstream_add.assert_not_called()
 
@@ -164,9 +164,9 @@ def test_add_request_rejects_configured_constraint_digest_mismatch() -> None:
             return_value=configured,
         ),
         mock.patch.object(AsyncScheduler, "add_request") as upstream_add,
+        pytest.raises(ValueError, match="constraint_digest"),
     ):
-        with pytest.raises(ValueError, match="constraint_digest"):
-            scheduler.add_request(request)
+        scheduler.add_request(request)
 
     upstream_add.assert_not_called()
 
@@ -257,7 +257,6 @@ def test_schedule_keeps_one_logical_token_and_dispatches_beam_rows() -> None:
     assert result.beam_data["gr-0"]["decode_step"] == 0
     assert result.beam_data["gr-0"]["generation_index"] == 1
     assert request.gr_issued_steps == 2
-    assert request.gr_counters.decode_scheduler_calls == 1
 
 
 def test_typed_sidecar_survives_worker_process_pickle_transport() -> None:
@@ -291,7 +290,7 @@ def test_decode_schedule_does_not_query_prefix_cache() -> None:
     request.num_prompt_tokens = request.gr_metadata.prefix_len
     request.num_tokens = request.gr_metadata.prefix_len
     request.num_tokens_with_spec = request.gr_metadata.prefix_len
-    request.max_tokens = request.gr_metadata.max_tokens
+    request.max_tokens = request.gr_metadata.generation_steps
     request.has_encoder_inputs = False
     request.spec_token_ids = []
     request.use_structured_output = False
@@ -437,7 +436,6 @@ def test_runner_state_intermediate_output_is_control_only() -> None:
     assert model_output.sampled_token_ids == [[GR_CONTROL_TOKEN_ID]]
     assert request.gr_step == 2
     assert request.gr_completed_steps == 2
-    assert request.gr_counters.intermediate_beam_state_d2h_bytes == 0
     assert request.gr_beam_suffix == [[11], [12], [13]]
 
 

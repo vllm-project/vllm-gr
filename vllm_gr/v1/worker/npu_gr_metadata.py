@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from vllm_gr.v1.engine.types import GRSchedulerOutput, GRRequestStage
+from vllm_gr.v1.engine.types import GRRequestStage, GRSchedulerOutput
 
 
 def _integer(value: Any, name: str, *, minimum: int = 0) -> int:

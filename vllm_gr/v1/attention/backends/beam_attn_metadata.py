@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -601,10 +602,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 # Get pool slot for this request from the session registry
                 pool_slot = 0  # default for max_batch=1
                 if beam_session is not None and req_id is not None:
-                    try:
+                    with suppress(KeyError):
                         pool_slot = beam_session.context.registry.get_slot(req_id)
-                    except KeyError:
-                        pass  # session not yet registered, use default
                 beam_pool_slots.append(pool_slot)
             else:
                 kv_len = seq_lens_cpu_list[i]
@@ -744,7 +743,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 if chunk_budget <= 0:
                     break
 
-                b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+                b_uncached, b_suffix_len, _b_past_suffix, _b_physical = _compute_beam_bounds(
                     b, prefix_len, b_cache_len, steps, chunk_budget
                 )
 

@@ -38,6 +38,10 @@ from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_SAMPLE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
     _beam_collapse_bookkeeping,
+    _beam_remap_inputs,
+    _materialize_logits_indices,
+    _reduce_sampler_output_for_worker_decision,
+    get_beam_graph_runtime_stats,
 )
 from vllm_gr.v1.worker.model_runner_common import (  # noqa: E402,F401
     _beam_full_graph_ready as _common_beam_full_graph_ready,
@@ -46,15 +50,9 @@ from vllm_gr.v1.worker.model_runner_common import (
     _beam_graph_enabled_for_run as _common_beam_graph_enabled_for_run,
 )
 from vllm_gr.v1.worker.model_runner_common import (
-    _beam_remap_inputs,
-)
-from vllm_gr.v1.worker.model_runner_common import (
     _create_beam_context as _common_create_beam_context,
 )
 from vllm_gr.v1.worker.model_runner_common import (
-    _materialize_logits_indices,
-    _reduce_sampler_output_for_worker_decision,
-    get_beam_graph_runtime_stats,
     make_patched_execute_model as _make_common_patched_execute_model,
 )
 
@@ -967,11 +965,13 @@ def make_patched_sample_tokens_gpu(_orig_sample_tokens):
 
     @wraps(_orig_sample_tokens)
     def patched_sample_tokens(self, grammar_output, *args, **kwargs):
-        from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
-        from vllm_gr.v1.worker.cuda_async_output import (
-            install_async_output_adapter, sampling_scope,
-        )
         from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
+
+        from vllm_gr.v1.worker.cuda_async_output import (
+            install_async_output_adapter,
+            sampling_scope,
+        )
+        from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
 
         install_async_output_adapter(AsyncGPUModelRunnerOutput)
         # The ephemeral native state is authoritative; _current_scheduler_output
@@ -1000,10 +1000,13 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-        if hasattr(self, "_beam_logprobs_cache") and self._beam_logprobs_cache:
-            if hasattr(scheduler_output, "finished_req_ids"):
-                for req_id in scheduler_output.finished_req_ids:
-                    self._beam_logprobs_cache.pop(req_id, None)
+        if (
+            hasattr(self, "_beam_logprobs_cache")
+            and self._beam_logprobs_cache
+            and hasattr(scheduler_output, "finished_req_ids")
+        ):
+            for req_id in scheduler_output.finished_req_ids:
+                self._beam_logprobs_cache.pop(req_id, None)
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
@@ -1083,10 +1086,10 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         (
             num_nans_in_logits,
             logprobs_lists,
-            valid_sampled_token_ids,
+            _valid_sampled_token_ids,
             prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
+            _req_ids_output_copy,
+            _req_id_to_index_output_copy,
             invalid_req_indices,
         ) = res
 

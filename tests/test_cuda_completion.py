@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real native ticket tests with a CPU-only fake registration API, never CUDA."""
 
-from concurrent.futures import CancelledError, ThreadPoolExecutor
 import ctypes
 import threading
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest

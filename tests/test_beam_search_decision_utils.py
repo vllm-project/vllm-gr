@@ -16,15 +16,9 @@ from vllm_gr.beam_search_decision_utils import (
     configure_persistent_sampling_params,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
-    extract_constrained_flat_logprobs,
-    extract_constrained_segment,
-    mask_candidate_logprobs,
     materialize_selected_beams,
     select_top_indices,
 )
-
-# Padding sentinel shared with the constrained top-k operator (execution.py).
-INVALID_LOGIT = -1.0e20
 
 CandidateCache = tuple[
     list[int],
@@ -123,161 +117,7 @@ def test_extract_and_dedup_segment_preserves_candidate_order(
     assert all(len(values) == len(expected) for values in result)
 
 
-def test_extract_constrained_segment_filters_transport_padding() -> None:
-    # The Worker converts structurally invalid slots to -inf for transport.
-    token_ids, logprobs, ranks, decoded = extract_constrained_segment(
-        [11, 12, 13, 14],
-        [-0.1, -0.2, -float("inf"), -float("inf")],
-        [0, 0, 0, 0],
-        ["a", "b", None, None],
-        0,
-        4,
-        2,
-    )
-
-    assert token_ids == [11, 12]
-    assert logprobs == [-0.1, -0.2]
-    assert ranks == [0, 0]
-    assert decoded == ["a", "b"]
-
-
-def test_extract_constrained_segment_keeps_legal_sentinel_magnitude() -> None:
-    token_ids, logprobs, *_ = extract_constrained_segment(
-        [11, 12, 0],
-        [0.0, INVALID_LOGIT, -float("inf")],
-        None,
-        None,
-        0,
-        3,
-        2,
-    )
-
-    assert token_ids == [11, 12]
-    assert logprobs == [0.0, INVALID_LOGIT]
-
-
-def test_extract_constrained_segment_never_dedups() -> None:
-    # Unlike the sampled-token path, constrained rows are fixed-width operator
-    # output with no duplicate slot to strip; identical tokens survive.
-    token_ids, logprobs, *_ = extract_constrained_segment(
-        [5, 5, 9, 9],
-        [-0.1, -0.2, -float("inf"), -float("inf")],
-        None,
-        None,
-        0,
-        4,
-        2,
-    )
-
-    assert token_ids == [5, 5]
-
-
-def test_extract_constrained_segment_drops_inf_remux_padding() -> None:
-    # The beam remux pads short rows with -inf; the non-finite filter drops it.
-    token_ids, logprobs, *_ = extract_constrained_segment(
-        [11, 0, 0, 0],
-        [-0.1, -float("inf"), -float("inf"), -float("inf")],
-        None,
-        None,
-        0,
-        4,
-        2,
-    )
-
-    assert token_ids == [11]
-    assert logprobs == [-0.1]
-
-
-def test_extract_constrained_segment_empty_valid_set() -> None:
-    token_ids, logprobs, *_ = extract_constrained_segment(
-        [0, 0, 0, 0],
-        [-float("inf")] * 4,
-        None,
-        None,
-        0,
-        4,
-        2,
-    )
-
-    assert token_ids == []
-    assert logprobs == []
-
-
-def test_extract_constrained_segment_respects_slice_bounds() -> None:
-    # Slicing into a wider flat (e.g. one parent block of a grouped decode);
-    # the block is exactly ``logprobs_num`` wide so every entry survives.
-    token_ids, logprobs, *_ = extract_constrained_segment(
-        [99, 21, 22, 99, 23, 24],
-        [-9.0, -0.1, -0.2, -9.0, -float("inf"), -float("inf")],
-        None,
-        None,
-        1,
-        4,
-        2,
-    )
-
-    assert token_ids == [21, 22]
-    assert logprobs == [-0.1, -0.2]
-
-
-def test_extract_constrained_segment_truncates_to_logprobs_num() -> None:
-    # Prefill-style wide segment: more valid entries than logprobs_num must be
-    # capped (in practice there are never more than W valid per parent).
-    token_ids, logprobs, *_ = extract_constrained_segment(
-        [21, 22, 23, 24],
-        [-0.1, -0.2, -0.3, -float("inf")],
-        None,
-        None,
-        0,
-        4,
-        2,
-    )
-
-    assert token_ids == [21, 22]
-    assert logprobs == [-0.1, -0.2]
-
-
-def test_extract_constrained_segment_ignores_row_wide_rank_metadata() -> None:
-    token_ids, logprobs, ranks, decoded = extract_constrained_segment(
-        [10, 11, 12, 13],
-        [-0.1, -0.2, -0.3, -0.4],
-        [0],
-        None,
-        0,
-        4,
-        4,
-    )
-    assert token_ids == [10, 11, 12, 13]
-    assert logprobs == [-0.1, -0.2, -0.3, -0.4]
-    assert ranks == [None, None, None, None]
-    assert decoded is None
-
-
-def test_extract_constrained_flat_logprobs_prefill_wide_segment() -> None:
-    # Constrained prefill emits one wide flat segment: W valid candidates then
-    # structural transport padding.
-    flat = SimpleNamespace(
-        token_ids=[31, 32, 33, 0, 0, 0],
-        logprobs=[-0.1, -0.2, -0.3, -float("inf"), -float("inf"), -float("inf")],
-        ranks=[0, 0, 0, 0, 0, 0],
-        decoded_tokens=[None, None, None, None, None, None],
-        start_indices=[0],
-        end_indices=[6],
-    )
-
-    token_ids, logprobs, ranks, decoded = extract_constrained_flat_logprobs(flat, 3)
-
-    assert token_ids == [31, 32, 33]
-    assert logprobs == [-0.1, -0.2, -0.3]
-    assert ranks == [0, 0, 0]
-    assert decoded == [None, None, None]
-
-
-@pytest.mark.parametrize(
-    "extract_fn",
-    [extract_and_dedup_flat_logprobs, extract_constrained_flat_logprobs],
-)
-def test_extract_flat_logprobs_empty_output_returns_no_candidates(extract_fn) -> None:
+def test_extract_flat_logprobs_empty_output_returns_no_candidates() -> None:
     flat = SimpleNamespace(
         token_ids=[],
         logprobs=[],
@@ -287,17 +127,7 @@ def test_extract_flat_logprobs_empty_output_returns_no_candidates(extract_fn) ->
         end_indices=[],
     )
 
-    assert extract_fn(flat, 5) == ([], [], None, None)
-
-
-def test_mask_candidate_logprobs_keeps_candidate_geometry() -> None:
-    result = mask_candidate_logprobs(
-        [7, 3, 5, 9],
-        [-0.1, -0.2, -0.3, -0.4],
-        {3, 9},
-    )
-
-    assert result == [-float("inf"), -0.2, -float("inf"), -0.4]
+    assert extract_and_dedup_flat_logprobs(flat, 5) == ([], [], None, None)
 
 
 def test_complete_stop_candidates_uses_explicit_nonuniform_parent_mapping() -> None:

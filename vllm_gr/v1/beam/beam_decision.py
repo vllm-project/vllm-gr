@@ -129,7 +129,6 @@ class BeamPostprocessWorkspace:
     # remain unchanged. Layout is [status Bmax][token|parent|score_bits].
     prefill_staging: torch.Tensor
     host_prefill_staging: torch.Tensor
-    host_prefill_staging_numpy: Any
     prefill_copy_event: Any | None
 
     # Persistent-request-only CUDA storage.  Sequence/cumulative score state
@@ -261,7 +260,6 @@ class BeamPostprocessWorkspace:
             copy_event=copy_event,
             prefill_staging=device_empty((prefill_capacity,), torch.int32),
             host_prefill_staging=host_prefill_staging,
-            host_prefill_staging_numpy=host_prefill_staging.numpy(),
             prefill_copy_event=prefill_copy_event,
             gr_control_output_0=device_empty((max_batch, 1), torch.int32),
             gr_control_output_1=device_empty((max_batch, 1), torch.int32),
@@ -799,12 +797,10 @@ def worker_decision_enabled(runner: Any) -> bool:
     # Trie-catalog filtering runs frontend-side; Constraint Table candidates
     # are already filtered by the worker's rec_constrained_topk.  Only decide
     # worker-side when no frontend-side catalog pruning applies.
-    if (
+    return not (
         gr_cfg.catalog_path is not None
         and gr_cfg.constraint_backend != ConstraintBackend.CONSTRAINT_TABLE
-    ):
-        return False
-    return True
+    )
 
 
 def enqueue_cuda_prefill_workspace_result(
@@ -883,10 +879,7 @@ def enqueue_cuda_prefill_postprocess(runner: Any, sampler_output: Any) -> bool:
             workspace.prefill_copy_event,
             stream=stream,
         )
-    copy_words = workspace.max_batch + 3 * int(width)
     sampler_output._gr_prefill_result_enqueued = True
-    sampler_output._gr_prefill_result_width = int(width)
-    sampler_output._gr_prefill_result_copy_words = copy_words
     return True
 
 

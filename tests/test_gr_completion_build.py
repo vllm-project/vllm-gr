@@ -4,16 +4,15 @@
 
 import ctypes
 import importlib.util
-from pathlib import Path
 import runpy
 import subprocess
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 import setuptools_scm
 from setuptools import Distribution
 from setuptools.command.build_ext import build_ext
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "vllm_gr/ops/cuda/native/gr_completion_ticket.cc"

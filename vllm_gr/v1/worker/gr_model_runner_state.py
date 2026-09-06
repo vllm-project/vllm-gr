@@ -10,6 +10,7 @@ references the single authoritative ``BeamSearchSession``.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Protocol, runtime_checkable
@@ -331,12 +332,8 @@ class GRModelRunnerState:
             if not self._backend_release_completed:
                 self.backend.release(self)
                 self._backend_release_completed = True
-            try:
+            with suppress(KeyError):
                 self.session.end_session()
-            except KeyError:
-                # A compatibility path already removed the registry slot.
-                # This is safe only after backend ownership was drained.
-                pass
             self._transition(GRRequestStage.RELEASED)
             self.released = True
             return True

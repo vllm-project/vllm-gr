@@ -6,9 +6,9 @@ scoped persistent sampling stage intercepts its output constructor. Normal
 requests and partial Prefill delegate to the original implementation.
 """
 
-from contextlib import contextmanager
-from contextvars import ContextVar
 import ctypes
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from threading import Lock
@@ -200,12 +200,8 @@ class _SamplingFrame:
             if self.producer_active:
                 self.pool.fail_submission(self.lease, error)
                 self.producer_active = False
-            try:
+            with suppress(RuntimeError):
                 self.pool.discard(self.lease)
-            except RuntimeError:
-                # consume may have reaped this slot before discovering an
-                # error in the other slot. Never mask the original failure.
-                pass
 
 
 @contextmanager

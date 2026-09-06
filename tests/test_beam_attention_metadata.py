@@ -374,16 +374,16 @@ def test_persistent_seqlens_device_constants_without_host_staging(
     monkeypatch, invalid_field, invalid_value
 ) -> None:
     builder = _make_fixed_builder()
-    fields = dict(
-        prefix_seqlens_kv_view=builder._prefix_seqlens_kv_buf[:1],
-        prefix_cu_seqlens_q_view=builder._prefix_cu_seqlens_q_buf[:2],
-        suffix_seqlens_kv_view=builder._suffix_seqlens_kv_buf[:4],
-        suffix_cu_seqlens_q_view=builder._suffix_cu_seqlens_q_buf[:5],
-        suffix_cu_seqlens_k_view=builder._suffix_cu_seqlens_k_buf[:5],
-        prefix_seqlens_kv_cpu=[8],
-        prefix_cu_seqlens_q_cpu=[4],
-        suffix_cu_seqlens_q_cpu=[1, 2, 3, 4],
-    )
+    fields = {
+        "prefix_seqlens_kv_view": builder._prefix_seqlens_kv_buf[:1],
+        "prefix_cu_seqlens_q_view": builder._prefix_cu_seqlens_q_buf[:2],
+        "suffix_seqlens_kv_view": builder._suffix_seqlens_kv_buf[:4],
+        "suffix_cu_seqlens_q_view": builder._suffix_cu_seqlens_q_buf[:5],
+        "suffix_cu_seqlens_k_view": builder._suffix_cu_seqlens_k_buf[:5],
+        "prefix_seqlens_kv_cpu": [8],
+        "prefix_cu_seqlens_q_cpu": [4],
+        "suffix_cu_seqlens_q_cpu": [1, 2, 3, 4],
+    }
     if invalid_field:
         fields[invalid_field] = (
             torch.zeros(invalid_value, dtype=torch.int32)

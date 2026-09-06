@@ -12,9 +12,9 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import traceback
+from pathlib import Path
 
 from tests.profiling import profile_onerec_b1_l1024_sid3 as baseline
 
@@ -38,6 +38,7 @@ def _source():
 
 def _snapshot(engine, core, runner):
     import torch
+
     from vllm_gr.v1.worker.gr_model_runner_state import get_gr_model_runner_state_stats
     from vllm_gr.v1.worker.model_runner_common import get_beam_graph_runtime_stats
 

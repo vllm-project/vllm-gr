@@ -308,7 +308,7 @@ def test_npu_and_cuda_cpu_packers_emit_bit_identical_payload() -> None:
 
 
 def test_cumulative_fp32_delta_is_intentionally_not_raw_candidate_logprob() -> None:
-    workspace, lease, sequence, scores = _acquire(
+    workspace, lease, _sequence, scores = _acquire(
         width=8,
         steps=2,
         result_width=8,

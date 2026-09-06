@@ -397,8 +397,10 @@ class NPUKVReorder:
         self._poisoned = True
         try:
             if self._mode == "xllm":
-                assert self._xllm_select is not None
-                result = self._xllm_select(
+                select = self._xllm_select
+                if select is None:
+                    raise RuntimeError("persistent NPU KV xllm operator is unavailable")
+                result = select(
                     parents.view(-1),
                     self._keys,
                     self._values,
@@ -409,8 +411,10 @@ class NPUKVReorder:
                     len(self._keys),
                 )
             else:
-                assert self._cascade_select is not None
-                result = self._cascade_select(
+                select = self._cascade_select
+                if select is None:
+                    raise RuntimeError("persistent NPU KV cascade operator is unavailable")
+                result = select(
                     parents.view(-1),
                     self._slot,
                     self._keys,

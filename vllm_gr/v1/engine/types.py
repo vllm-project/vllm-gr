@@ -12,7 +12,6 @@ import msgspec
 
 GR_PROTOCOL_VERSION: Final = 1
 GR_REQUEST_METADATA_KEY: Final = "vllm_gr"
-GR_REQUEST_OUTPUT_KEY: Final = "vllm_gr_request_output"
 # Native vLLM requires an O(B) sampled-token result for every generation
 # stage. This placeholder is transport-only: persistent SamplingParams ignore
 # EOS/stops and expose FINAL_ONLY output, while the next real Beam token stays
@@ -127,25 +126,6 @@ class GRRequestMetadata(
         if canonicalize_constraint_digest(self.constraint_digest) != self.constraint_digest:
             raise ValueError("persistent GR constraint_digest must use canonical wire form")
 
-    # Compatibility names used by the scheduler while its per-step sidecar is
-    # migrated independently. They are derived, not serialized request state.
-    @property
-    def max_tokens(self) -> int:
-        return self.generation_steps
-
-    @property
-    def num_return_sequences(self) -> int:
-        return self.result_width
-
-    @property
-    def continue_token_id(self) -> int:
-        return GR_CONTROL_TOKEN_ID
-
-    @property
-    def finish_token_id(self) -> int:
-        return GR_CONTROL_TOKEN_ID
-
-
 class GRSchedulerOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -178,99 +158,4 @@ class GRSchedulerOutput(
         if type(self.physical_row_count) is not int or self.physical_row_count < 1:
             raise ValueError(
                 "persistent GR physical_row_count must be a positive integer"
-            )
-
-
-class GRSequenceOutput(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):
-    token_ids: list[int]
-    parent_ids: list[int]
-    score: float
-    logprobs: list[float] | None = None
-    finish_reason: str = "length"
-    stop_token_id: int | None = None
-
-
-class GRRequestOutput(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):
-    """Final output produced by the only Beam-state D2H copy."""
-
-    request_id: str
-    outputs: list[GRSequenceOutput]
-    step: int
-    device_step: int
-    stage: GRRequestStage = GRRequestStage.FINAL_READY
-    counters: dict[str, int] | None = None
-    protocol_version: int = GR_PROTOCOL_VERSION
-
-    def __post_init__(self) -> None:
-        _validate_protocol_version(self.protocol_version)
-        _require_non_empty_request_id(self.request_id)
-        _validate_non_negative_step(self.step, "step")
-        _validate_non_negative_step(self.device_step, "device_step")
-        if self.stage is not GRRequestStage.FINAL_READY:
-            raise ValueError("persistent GR final output stage must be final_ready")
-
-
-class GRModelRunnerOutput(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):
-    """O(B) control output; Beam data exists only in final_output."""
-
-    request_id: str
-    token_id: int
-    finished: bool
-    step: int
-    device_step: int
-    stage: GRRequestStage
-    final_output: GRRequestOutput | None = None
-    error: str | None = None
-    protocol_version: int = GR_PROTOCOL_VERSION
-
-    def __post_init__(self) -> None:
-        _validate_protocol_version(self.protocol_version)
-        _require_non_empty_request_id(self.request_id)
-        _validate_non_negative_step(self.step, "step")
-        _validate_non_negative_step(self.device_step, "device_step")
-        if self.final_output is not None:
-            if not self.finished:
-                raise ValueError("persistent GR final output requires finished=true")
-            if self.final_output.request_id != self.request_id:
-                raise ValueError(
-                    "persistent GR final output request_id does not match control output"
-                )
-            if self.final_output.protocol_version != self.protocol_version:
-                raise ValueError(
-                    "persistent GR final output protocol_version does not match "
-                    "control output"
-                )
-            if self.final_output.step != self.step:
-                raise ValueError(
-                    "persistent GR final output step does not match control output"
-                )
-            if self.final_output.device_step != self.device_step:
-                raise ValueError(
-                    "persistent GR final output device_step does not match control output"
-                )
-            if self.final_output.stage is not self.stage:
-                raise ValueError(
-                    "persistent GR final output stage does not match control output"
-                )
-        if self.stage is GRRequestStage.FINAL_READY and (
-            not self.finished or self.final_output is None
-        ):
-            raise ValueError(
-                "persistent GR final_ready control output requires finished=true "
-                "and a final output"
             )

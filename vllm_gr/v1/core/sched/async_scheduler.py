@@ -15,12 +15,12 @@ from vllm.v1.utils import record_function_or_nullcontext
 from vllm_gr.config import MAX_BEAM_WIDTH, GRConfig
 from vllm_gr.v1.beam.beam_decision import unpack_beam_result_buffer
 from vllm_gr.v1.engine.types import (
+    GR_CONTROL_TOKEN_ID,
     GR_REQUEST_METADATA_KEY,
     GRRequestMetadata,
     GRRequestStage,
     GRSchedulerOutput,
 )
-from vllm_gr.v1.metrics.stats import GRRequestCounters
 
 
 class GRAsyncScheduler(AsyncScheduler):
@@ -52,8 +52,6 @@ class GRAsyncScheduler(AsyncScheduler):
                 )
             if not 1 <= metadata.beam_width <= MAX_BEAM_WIDTH:
                 raise ValueError(f"persistent GR beam_width must be in [1, {MAX_BEAM_WIDTH}]")
-            if metadata.max_tokens < 1:
-                raise ValueError("persistent GR max_tokens must be at least 1")
             gr_config = GRConfig.from_vllm_config(
                 getattr(self, "vllm_config", None)
             )
@@ -88,11 +86,6 @@ class GRAsyncScheduler(AsyncScheduler):
             request.gr_persistent_runner_state = gr_config.persistent_runner_state
             request.gr_parent_ids = [0] * metadata.beam_width
             request.gr_beam_suffix = []
-            request.gr_counters = GRRequestCounters(
-                native_request_created_per_session=1,
-                scheduler_add_request_per_session=1,
-            )
-
         super().add_request(request)
 
     @staticmethod
@@ -185,7 +178,7 @@ class GRAsyncScheduler(AsyncScheduler):
                 if not bool(getattr(request, "gr_persistent_runner_state", False)):
                     continue
                 issued_steps = int(getattr(request, "gr_issued_steps", 0))
-                if issued_steps >= request.gr_metadata.max_tokens:
+                if issued_steps >= request.gr_metadata.generation_steps:
                     continue
                 # GR does not use speculative tokens. One placeholder represents
                 # the control token produced by this output-bearing stage.
@@ -265,11 +258,11 @@ class GRAsyncScheduler(AsyncScheduler):
                     "prefix_len": metadata.prefix_len,
                     "cache_len": request.num_computed_tokens - logical_tokens,
                     "decode_step": 0,
-                    "max_decode_steps": metadata.max_tokens,
+                    "max_decode_steps": metadata.generation_steps,
                     "persistent_request": True,
                     "persistent_runner_state": persistent_runner_state,
-                    "continue_token_id": metadata.continue_token_id,
-                    "finish_token_id": metadata.finish_token_id,
+                    "continue_token_id": GR_CONTROL_TOKEN_ID,
+                    "finish_token_id": GR_CONTROL_TOKEN_ID,
                     "is_last_prefill": is_last_prefill,
                     # Intermediate prefill chunks do not produce a GR token and
                     # therefore do not advance either lifecycle cursor.
@@ -284,15 +277,15 @@ class GRAsyncScheduler(AsyncScheduler):
                     device_step=0,
                     is_prefill=True,
                     is_last_prefill=is_last_prefill,
-                    is_final=is_last_prefill and metadata.max_tokens == 1,
+                    is_final=is_last_prefill and metadata.generation_steps == 1,
                     logical_token_count=1,
                     physical_row_count=1,
                 )
             else:
-                if step >= metadata.max_tokens:
+                if step >= metadata.generation_steps:
                     raise RuntimeError(
                         "persistent GR scheduled beyond max_tokens: "
-                        f"issued={step}, max_tokens={metadata.max_tokens}"
+                        f"issued={step}, max_tokens={metadata.generation_steps}"
                     )
                 if logical_tokens != 1:
                     raise RuntimeError(
@@ -309,14 +302,14 @@ class GRAsyncScheduler(AsyncScheduler):
                     "cache_len": metadata.prefix_len,
                     "decode_step": step - 1,
                     "parent_beam_ids": (None if persistent_runner_state else request.gr_parent_ids),
-                    "max_decode_steps": metadata.max_tokens,
-                    "result_width": metadata.num_return_sequences,
+                    "max_decode_steps": metadata.generation_steps,
+                    "result_width": metadata.result_width,
                     "persistent_request": True,
                     "persistent_runner_state": persistent_runner_state,
-                    "continue_token_id": metadata.continue_token_id,
-                    "finish_token_id": metadata.finish_token_id,
+                    "continue_token_id": GR_CONTROL_TOKEN_ID,
+                    "finish_token_id": GR_CONTROL_TOKEN_ID,
                     "generation_index": step,
-                    "is_last_step": step + 1 >= metadata.max_tokens,
+                    "is_last_step": step + 1 >= metadata.generation_steps,
                 }
                 if not persistent_runner_state:
                     beam_data[req_id]["next_token_ids"] = [
@@ -331,13 +324,11 @@ class GRAsyncScheduler(AsyncScheduler):
                     step=step,
                     device_step=step,
                     is_prefill=False,
-                    is_final=step + 1 >= metadata.max_tokens,
+                    is_final=step + 1 >= metadata.generation_steps,
                     logical_token_count=logical_tokens,
                     physical_row_count=metadata.beam_width,
                 )
                 request.gr_issued_steps = step + 1
-
-            request.gr_counters.decode_scheduler_calls += int(step > 0)
 
         # An ordinary request must observe the upstream SchedulerOutput
         # unchanged; only GR scheduling introduces this sidecar.
@@ -435,24 +426,7 @@ class GRAsyncScheduler(AsyncScheduler):
 
                 req_index = model_runner_output.req_id_to_index[req_id]
                 is_final = bool(decision.get("is_last_step"))
-                counters: GRRequestCounters = request.gr_counters
-                counters.decode_worker_dispatches += int(generation_index > 0)
-                payload = decision.get("buffer")
-                payload_bytes = (
-                    len(payload) if isinstance(payload, (bytes, bytearray, memoryview)) else 0
-                )
-                if is_final:
-                    counters.final_result_d2h_count += 1
-                    counters.final_result_d2h_bytes += payload_bytes
-                else:
-                    counters.intermediate_beam_state_d2h_bytes += payload_bytes
-                decision["counters"] = counters.to_dict()
-                token_id = (
-                    request.gr_metadata.finish_token_id
-                    if is_final
-                    else request.gr_metadata.continue_token_id
-                )
-                model_runner_output.sampled_token_ids[req_index] = [token_id]
+                model_runner_output.sampled_token_ids[req_index] = [GR_CONTROL_TOKEN_ID]
                 break
 
         if runner_state_enabled:
@@ -462,7 +436,9 @@ class GRAsyncScheduler(AsyncScheduler):
                     req_id, gr_outputs, beam_data
                 )
                 self._validate_gr_completion_order(request, generation_index)
-                is_final_dispatch = generation_index + 1 >= request.gr_metadata.max_tokens
+                is_final_dispatch = (
+                    generation_index + 1 >= request.gr_metadata.generation_steps
+                )
                 if is_final_dispatch and decision is None:
                     raise RuntimeError(
                         "persistent GR final worker output is missing the final result"
@@ -474,22 +450,7 @@ class GRAsyncScheduler(AsyncScheduler):
                         "persistent GR final marker does not match the scheduled generation"
                     )
                 req_index = model_runner_output.req_id_to_index[req_id]
-                model_runner_output.sampled_token_ids[req_index] = [
-                    request.gr_metadata.finish_token_id
-                    if is_final
-                    else request.gr_metadata.continue_token_id
-                ]
-                counters: GRRequestCounters = request.gr_counters
-                counters.decode_worker_dispatches += int(generation_index > 0)
-                if is_final:
-                    payload = decision.get("buffer")
-                    counters.gr_state_created_per_session = int(decision.get("gr_state_created", 0))
-                    counters.gr_state_freed_per_session = int(decision.get("gr_state_freed", 0))
-                    counters.final_result_d2h_count = 1
-                    counters.final_result_d2h_bytes = (
-                        len(payload) if isinstance(payload, (bytes, bytearray, memoryview)) else 0
-                    )
-                    decision["counters"] = counters.to_dict()
+                model_runner_output.sampled_token_ids[req_index] = [GR_CONTROL_TOKEN_ID]
                 break
 
         result = super().update_from_output(scheduler_output, model_runner_output)

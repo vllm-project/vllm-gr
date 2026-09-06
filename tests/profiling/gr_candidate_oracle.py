@@ -170,13 +170,13 @@ def evaluate(record):
     # claim coverage of underfilled/inactive cases from an unrelated smoke.
     assert all(mask[0]), "underfilled Prefill is outside this diagnostic case"
     expected = [
-        dict(
-            sequence=[token],
-            score=f32(score),
-            parents=[0],
-            local=[f32(score)],
-            transport=[f32(score)],
-        )
+        {
+            "sequence": [token],
+            "score": f32(score),
+            "parents": [0],
+            "local": [f32(score)],
+            "transport": [f32(score)],
+        }
         for token, score in zip(tokens[0], locals_[0])
     ]
     assert_production(stages[0], expected)
@@ -214,13 +214,13 @@ def evaluate(record):
         for score, _flat, parent, token, local in selected:
             previous = expected[parent]
             next_expected.append(
-                dict(
-                    sequence=previous["sequence"] + [token],
-                    score=score,
-                    parents=previous["parents"] + [parent],
-                    local=previous["local"] + [f32(local)],
-                    transport=previous["transport"] + [f32(score - previous["score"])],
-                )
+                {
+                    "sequence": previous["sequence"] + [token],
+                    "score": score,
+                    "parents": previous["parents"] + [parent],
+                    "local": previous["local"] + [f32(local)],
+                    "transport": previous["transport"] + [f32(score - previous["score"])],
+                }
             )
         expected = next_expected
         assert_production(stages[index], expected)

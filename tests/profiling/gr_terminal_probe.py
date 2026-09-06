@@ -13,12 +13,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import traceback
+from pathlib import Path
 
 from tests.profiling import profile_onerec_b1_l1024_sid3 as baseline
 from tests.profiling.gr_lifecycle_probe import _assert_graph_delta, _snapshot, _source
-from tests.profiling.gr_worker_fault import injected_failure_delivery, inject_first_decode_failure
+from tests.profiling.gr_worker_fault import inject_first_decode_failure, injected_failure_delivery
 
 
 class _CallerStopped(Exception):

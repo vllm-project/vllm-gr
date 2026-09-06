@@ -22,10 +22,10 @@ from vllm_gr.constraints.npu_backend import NPUConstraintBackend
 from vllm_gr.constraints.table import CONSTRAINT_TABLE_TENSOR_NAMES, validate_constraint_table
 from vllm_gr.ops.rec_constrained_topk import rec_constrained_topk_torch
 from vllm_gr.v1.worker.npu_gr_sampler import (
-    NPUConstrainedCandidates,
-    NPUPersistentConstraintSampler,
     NPU_SAMPLER_STATUS_EMPTY,
     NPU_SAMPLER_STATUS_OK,
+    NPUConstrainedCandidates,
+    NPUPersistentConstraintSampler,
 )
 
 

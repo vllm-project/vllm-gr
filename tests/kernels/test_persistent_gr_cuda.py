@@ -28,7 +28,6 @@ from vllm_gr.v1.worker.gr_model_runner_state import (
     unpack_gr_final_output,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 
 

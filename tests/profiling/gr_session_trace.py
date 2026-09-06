@@ -9,11 +9,10 @@ multiprocess workloads. API duration is Host time, not device stall time.
 """
 
 import argparse
-from collections import Counter, defaultdict
 import json
-from pathlib import Path
 import sqlite3
-
+from collections import Counter, defaultdict
+from pathlib import Path
 
 SCHEDULE = "gr_async_schedule"
 BOOTSTRAP = "gr_prefill_bootstrap"

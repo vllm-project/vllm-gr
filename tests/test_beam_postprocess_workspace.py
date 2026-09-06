@@ -50,9 +50,6 @@ def test_workspace_reserves_batch_dimension_and_fixed_protocol_buffers() -> None
     assert workspace.copy_event is None
     assert workspace.prefill_staging.shape == (26,)
     assert workspace.host_prefill_staging.shape == (26,)
-    assert workspace.host_prefill_staging_numpy.shape == (26,)
-    workspace.host_prefill_staging[1] = 23
-    assert int(workspace.host_prefill_staging_numpy[1]) == 23
     assert workspace.prefill_copy_event is None
 
 

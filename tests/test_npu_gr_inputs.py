@@ -16,9 +16,8 @@ import pytest
 import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_gr.v1.engine.types import GRSchedulerOutput, GRRequestStage
-from vllm_gr.v1.worker import npu_gr_inputs
-from vllm_gr.v1.worker import model_runner_common
+from vllm_gr.v1.engine.types import GRRequestStage, GRSchedulerOutput
+from vllm_gr.v1.worker import model_runner_common, npu_gr_inputs
 from vllm_gr.v1.worker.npu_gr_decision import bootstrap_from_constrained_prefill
 
 

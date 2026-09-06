@@ -12,8 +12,8 @@ import pytest
 from tests.profiling.gr_worker_fault import (
     InjectedWorkerError,
     _target,
-    injected_failure_delivery,
     inject_first_decode_failure,
+    injected_failure_delivery,
 )
 
 
@@ -159,9 +159,11 @@ def test_real_leaf_executes_before_the_one_shot_fault(fault) -> None:
     runner, scheduled, request_id, metadata, state, calls = _fixture()
     report = {}
 
-    with inject_first_decode_failure(runner, report, fault) as failure:
-        with pytest.raises(InjectedWorkerError) as caught:
-            _invoke(runner, scheduled, metadata, state, fault)
+    with (
+        inject_first_decode_failure(runner, report, fault) as failure,
+        pytest.raises(InjectedWorkerError) as caught,
+    ):
+        _invoke(runner, scheduled, metadata, state, fault)
 
     assert caught.value is failure
     leaf = "prepare_leaf" if fault == "prepare" else "advance_leaf"
@@ -213,9 +215,8 @@ def test_advance_rejects_nonidentical_metadata_before_calling_leaf() -> None:
     runner, scheduled, _, metadata, state, calls = _fixture()
     copied_metadata = deepcopy(metadata)
 
-    with inject_first_decode_failure(runner, {}, "advance"):
-        with pytest.raises(AssertionError):
-            _invoke(runner, scheduled, copied_metadata, state, "advance")
+    with inject_first_decode_failure(runner, {}, "advance"), pytest.raises(AssertionError):
+        _invoke(runner, scheduled, copied_metadata, state, "advance")
 
     assert calls == []
 
@@ -272,9 +273,8 @@ def test_advance_rejects_invalid_backend_result(device_step, control_output) -> 
     )
     report = {}
 
-    with inject_first_decode_failure(runner, report, "advance"):
-        with pytest.raises(AssertionError):
-            _invoke(runner, scheduled, metadata, state, "advance")
+    with inject_first_decode_failure(runner, report, "advance"), pytest.raises(AssertionError):
+        _invoke(runner, scheduled, metadata, state, "advance")
 
     assert calls == ["advance_leaf", "control_stats"]
     assert report["worker_fault"]["fired"] == 1
@@ -285,9 +285,11 @@ def test_unknown_fault_is_rejected_without_installing_an_override() -> None:
     runner, _, _, _, _, _ = _fixture()
     report = {}
 
-    with pytest.raises(ValueError, match="unknown Worker fault"):
-        with inject_first_decode_failure(runner, report, "unknown"):
-            pytest.fail("unknown fault entered context")
+    with (
+        pytest.raises(ValueError, match="unknown Worker fault"),
+        inject_first_decode_failure(runner, report, "unknown"),
+    ):
+        pytest.fail("unknown fault entered context")
 
     assert "_prepare_inputs" not in vars(runner)
     assert "advance_beam" not in vars(runner._gr_device_backend)

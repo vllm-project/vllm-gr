@@ -149,7 +149,7 @@ def extract_ids_from_answer(answer: List[int]) -> Set[int]:
         >>> extract_ids_from_answer([123, 456, 789])
         {123, 456, 789}
     """
-    return set([pid for pid in answer if pid != 0])
+    return {pid for pid in answer if pid != 0}
 
 
 def extract_first_id_from_answer(answer: List[int]) -> int:
@@ -230,12 +230,7 @@ def compute_pass_at_k(predicted_ids: List[int], ground_truth_ids: Set[int], k: i
     # Take first k predicted PIDs
     top_k_ids = predicted_ids[:k]
 
-    # Check if any matches ground truth
-    for pid in top_k_ids:
-        if pid != 0 and pid in ground_truth_ids:
-            return True
-
-    return False
+    return any(pid != 0 and pid in ground_truth_ids for pid in top_k_ids)
 
 
 def compute_position1_pass_at_k(
@@ -263,12 +258,7 @@ def compute_position1_pass_at_k(
     # Take first k predicted PIDs
     top_k_ids = predicted_ids[:k]
 
-    # Check if any matches the first ground truth
-    for pid in top_k_ids:
-        if pid != 0 and pid == first_ground_truth_id:
-            return True
-
-    return False
+    return any(pid != 0 and pid == first_ground_truth_id for pid in top_k_ids)
 
 
 def compute_recall_at_k(predicted_ids: List[int], ground_truth_ids: Set[int], k: int) -> float:
@@ -301,7 +291,7 @@ def compute_recall_at_k(predicted_ids: List[int], ground_truth_ids: Set[int], k:
     top_k_ids = predicted_ids[:k]
 
     # Convert to set and filter out zeros
-    predicted_ids_set = set(pid for pid in top_k_ids if pid != 0)
+    predicted_ids_set = {pid for pid in top_k_ids if pid != 0}
 
     # Count how many ground truth PIDs are hit
     hit_count = len(predicted_ids_set & ground_truth_ids)  # Set intersection

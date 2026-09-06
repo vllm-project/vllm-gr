@@ -7,11 +7,11 @@ No callback executes Python, calls CUDA or owns a torch tensor.
 """
 
 import argparse
-from contextlib import contextmanager
 import ctypes
 import json
-from pathlib import Path
 import threading
+from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 

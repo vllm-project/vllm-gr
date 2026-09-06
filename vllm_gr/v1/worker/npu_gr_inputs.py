@@ -24,9 +24,11 @@ from vllm.distributed.ec_transfer import has_ec_transfer
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
-from vllm_gr.v1.engine.types import GRSchedulerOutput, GRRequestStage
+from vllm_gr.v1.engine.types import GRRequestStage, GRSchedulerOutput
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_EXECUTE_PATCH_MARKER,
+)
+from vllm_gr.v1.worker.model_runner_common import (
     make_patched_execute_model as _make_common_patched_execute_model,
 )
 

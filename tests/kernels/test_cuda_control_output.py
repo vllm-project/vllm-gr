@@ -113,7 +113,10 @@ def test_real_cuda_control_survives_uniproc_abort_and_shutdown(
 
     from vllm_gr.v1.engine.engine_core_patch import make_patched_abort_requests
     from vllm_gr.v1.worker.cuda_async_output import (
-        CudaOutputTransport, fill_control, install_async_output_adapter, sampling_scope,
+        CudaOutputTransport,
+        fill_control,
+        install_async_output_adapter,
+        sampling_scope,
     )
     from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_shutdown
 

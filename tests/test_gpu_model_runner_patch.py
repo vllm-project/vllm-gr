@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for GPU ModelRunner wrappers."""
 
-from contextlib import contextmanager
 import inspect
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -155,9 +155,8 @@ def test_input_prep_keeps_complete_guard_and_error_record(ready, body_error):
 def test_input_prep_failed_completion_never_grants_host_write(failure):
     runner, original, calls = _input_prep_fixture(ready=False, failure=failure)
     patched = gpu_patch.make_patched_synchronize_input_prep(original)
-    with pytest.raises(RuntimeError, match=f"{failure} failed"):
-        with patched(runner):
-            pytest.fail("failed completion must not release DMA ownership")
+    with pytest.raises(RuntimeError, match=f"{failure} failed"), patched(runner):
+        pytest.fail("failed completion must not release DMA ownership")
     assert calls == (
         ["query"] if failure == "query" else ["query", "original", "synchronize"]
     )

@@ -144,7 +144,7 @@ def _process_beam_decode_request(
         if chunk_budget <= 0:
             break
 
-        b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+        b_uncached, _b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
             b, prefix_len, b_cache_len, decode_steps, chunk_budget
         )
 
@@ -267,11 +267,7 @@ class BeamReqIdsProxy(list):
         self.req_id_map = req_id_map
 
     def __getitem__(self, index):
-        try:
-            return self.req_id_map[index]
-        except IndexError as e:
-            logger.error("Out of bounds in BeamReqIdsProxy for index %s", index)
-            raise e
+        return self.req_id_map[index]
 
     def copy(self):
         return list(self.req_id_map)
@@ -283,18 +279,10 @@ class Mock1DArray:
         self.batch_idx_map = batch_idx_map
 
     def __getitem__(self, idx):
-        try:
-            return self.original[self.batch_idx_map[idx]]
-        except IndexError as e:
-            logger.error("Out of bounds in Mock1DArray getitem for index %s", idx)
-            raise e
+        return self.original[self.batch_idx_map[idx]]
 
     def __setitem__(self, idx, value):
-        try:
-            self.original[self.batch_idx_map[idx]] = value
-        except IndexError as e:
-            logger.error("Out of bounds in Mock1DArray setitem for index %s", idx)
-            raise e
+        self.original[self.batch_idx_map[idx]] = value
 
 
 class Mock2DArray:
@@ -304,22 +292,14 @@ class Mock2DArray:
 
     def __setitem__(self, key, value):
         idx, slc = key
-        try:
-            self.original[self.batch_idx_map[idx], slc] = value
-        except IndexError as e:
-            logger.error("Out of bounds in Mock2DArray setitem for key %s", key)
-            raise e
+        self.original[self.batch_idx_map[idx], slc] = value
 
     def __getattr__(self, name):
         return getattr(self.original, name)
 
     def __getitem__(self, key):
         idx, slc = key
-        try:
-            return self.original[self.batch_idx_map[idx], slc]
-        except IndexError as e:
-            logger.error("Out of bounds in Mock2DArray getitem for key %s", key)
-            raise e
+        return self.original[self.batch_idx_map[idx], slc]
 
 
 # Per-request sampling tensors remapped onto per-beam logits rows by
@@ -399,13 +379,17 @@ class InputBatchProxy:
             pending: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
             for attr in _SAMPLING_META_ATTRS:
                 val = getattr(s_meta, attr, None)
-                if isinstance(val, torch.Tensor) and val.numel() > 0:
-                    if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
-                        pending.setdefault(val.dtype, []).append((attr, val))
+                if (
+                    isinstance(val, torch.Tensor)
+                    and val.numel() > 0
+                    and val.shape[0] == orig_req_len
+                    and val.shape[0] != len(logits_map)
+                ):
+                    pending.setdefault(val.dtype, []).append((attr, val))
             if pending:
                 first_val = next(iter(next(iter(pending.values()))))[1]
                 idx_tensor = self._logits_idx_tensor(first_val.device)
-                for dtype, items in pending.items():
+                for items in pending.values():
                     names = [n for n, _ in items]
                     # Stack attributes on dim 0 ([num_attrs, num_reqs]) and
                     # gather on dim 1, so each remapped attribute comes out
@@ -506,7 +490,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
         if mdata and mdata.get("is_beam_decode", False):
             # Check if incremental decode is active
             is_incremental = "decode_step" in mdata
-            beams_count, beams_count_with_logits, next_offset, active_beam_ids = (
+            beams_count, beams_count_with_logits, _next_offset, active_beam_ids = (
                 _process_beam_decode_request(
                     mdata,
                     seq_len,
@@ -613,12 +597,7 @@ def _is_contiguous_range(indices: list[int]) -> bool:
     and covers the common (single-request) case; the full loop only runs when
     the tail matches.
     """
-    if not indices:
-        return True
-    for i, value in enumerate(indices):
-        if value != i:
-            return False
-    return True
+    return all(value == i for i, value in enumerate(indices))
 
 
 def _beam_collapse_bookkeeping(

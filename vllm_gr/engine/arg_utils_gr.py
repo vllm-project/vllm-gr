@@ -507,9 +507,9 @@ def create_engine_config(self, usage_context=None, headless=False):
             (_is_npu_platform() or _is_cuda_platform())
             and beam_width_configured
             and not worker_decision_explicit
+            and effective_beam_worker_decision is None
         ):
-            if effective_beam_worker_decision is None:
-                effective_beam_worker_decision = True
+            effective_beam_worker_decision = True
         offset, slice_size = None, None
         # CUDA Constraint Tables support sliced logits while keeping global
         # table token ids (CUDAConstrainedTopKExecution._vocab_window).  The

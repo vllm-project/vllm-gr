@@ -6,7 +6,11 @@ from threading import Event, Thread
 import pytest
 
 from tests.test_cuda_async_output import (
-    _FakeAPI, _activate, _queued_control, _runner, _workspace,
+    _activate,
+    _FakeAPI,
+    _queued_control,
+    _runner,
+    _workspace,
     cuda_fakes,  # noqa: F401
 )
 from vllm_gr.v1.worker import cuda_async_output as adapter

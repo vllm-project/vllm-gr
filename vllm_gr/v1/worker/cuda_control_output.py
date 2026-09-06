@@ -9,8 +9,8 @@ Future queue is implemented here; the GPU V1 adapter supplies those operations.
 This boundary is not yet installed in ModelRunner.
 """
 
-from dataclasses import dataclass
 import threading
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from vllm_gr.v1.worker.cuda_completion import (

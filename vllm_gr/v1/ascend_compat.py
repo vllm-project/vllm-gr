@@ -148,8 +148,8 @@ def patch_npu_worker_init_device() -> int:
             load_constraint_tables_on_worker,
         )
         from vllm_gr.v1.worker.model_runner_patch import (
-            install_gr_state_worker_hooks,
             install_active_worker_diagnostic_hook,
+            install_gr_state_worker_hooks,
         )
 
         install_worker_resource_hook(type(self))

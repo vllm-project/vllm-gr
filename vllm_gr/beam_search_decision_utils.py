@@ -10,7 +10,6 @@ an intermediate beam domain model.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -102,21 +101,6 @@ def materialize_final_beams(
     return beams
 
 
-def mask_candidate_logprobs(
-    token_ids: Sequence[int],
-    logprobs: Sequence[float],
-    allowed_token_ids: Collection[int] | None,
-) -> list[float]:
-    """Mask disallowed candidates without filtering or reordering them."""
-
-    if allowed_token_ids is None:
-        return list(logprobs)
-    return [
-        logprob if token_id in allowed_token_ids else -float("inf")
-        for token_id, logprob in zip(token_ids, logprobs)
-    ]
-
-
 def extract_and_dedup_segment(
     raw_token_ids: Sequence[int],
     raw_logprobs: Sequence[float],
@@ -183,88 +167,6 @@ def extract_and_dedup_flat_logprobs(flat: Any, logprobs_num: int):
         flat.end_indices[0],
         logprobs_num,
     )
-
-
-def extract_constrained_segment(
-    raw_token_ids: Sequence[int],
-    raw_logprobs: Sequence[float],
-    raw_ranks: Sequence[int | None] | None,
-    raw_decoded: Sequence[str | None] | None,
-    start_offset: int,
-    end_offset: int,
-    logprobs_num: int,
-) -> tuple[
-    list[int],
-    list[float],
-    list[int | None] | None,
-    list[str | None] | None,
-]:
-    """Extract one constrained candidate block with padding filtering.
-
-    Constraint Tables (issue #246) overwrite the sampler output with the
-    constrained top-k operator's fixed-width ``W`` rows. The Worker derives an
-    explicit validity mask from the table ranges and encodes only padding as
-    ``-inf`` at the transport boundary. Legal finite scores are retained
-    regardless of magnitude. Unlike the standard-sampler path there is no
-    sampled-token duplicate to remove, so no dedup runs: candidates are kept
-    in the operator's descending order, at most ``logprobs_num`` per parent.
-    """
-    token_ids_pos = list(raw_token_ids[start_offset:end_offset])
-    logprobs_pos = list(raw_logprobs[start_offset:end_offset])
-    ranks_pos = list(raw_ranks[start_offset:end_offset]) if raw_ranks is not None else None
-    decoded_pos = list(raw_decoded[start_offset:end_offset]) if raw_decoded is not None else None
-
-    # Direct constrained SamplerOutput has one selected-token rank per logits
-    # row, while its transported candidate block has ``beam_width`` entries.
-    # Candidate ranks/decoded strings are optional metadata; discard a partial
-    # remux segment instead of indexing it as though it were candidate-wide.
-    if ranks_pos is not None and len(ranks_pos) != len(logprobs_pos):
-        ranks_pos = [None] * len(logprobs_pos)
-    if decoded_pos is not None and len(decoded_pos) != len(logprobs_pos):
-        decoded_pos = [None] * len(logprobs_pos)
-
-    keep = [i for i, lp in enumerate(logprobs_pos) if math.isfinite(lp)][:logprobs_num]
-    token_ids_pos = [token_ids_pos[i] for i in keep]
-    logprobs_pos = [logprobs_pos[i] for i in keep]
-    if ranks_pos is not None:
-        # ranks is optional metadata; a length mismatch (e.g. the Constraint
-        # Table operator widens rows to W candidates while the sampler only
-        # tracks one rank per row) must not break candidate extraction.
-        if len(ranks_pos) < len(logprobs_pos):
-            ranks_pos = None
-        else:
-            ranks_pos = [ranks_pos[i] for i in keep]
-    if decoded_pos is not None:
-        if len(decoded_pos) < len(logprobs_pos):
-            decoded_pos = None
-        else:
-            decoded_pos = [decoded_pos[i] for i in keep]
-    return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
-
-
-def extract_constrained_flat_logprobs(flat: Any, logprobs_num: int):
-    """Extract constrained prefill logprobs from FlatLogprobs.
-
-    The constrained prefill produces a single wide flat segment (W valid
-    candidates followed by padding); no sampled-token dedup applies.
-    """
-    if not flat.start_indices:
-        return [], [], None, None
-    return extract_constrained_segment(
-        flat.token_ids,
-        flat.logprobs,
-        flat.ranks,
-        flat.decoded_tokens,
-        flat.start_indices[0],
-        flat.end_indices[0],
-        logprobs_num,
-    )
-
-
-def find_eos_indices(token_ids: np.ndarray, eos_token_id: int) -> np.ndarray:
-    """Return EOS positions using the legacy NumPy comparison."""
-
-    return np.where(token_ids == eos_token_id)[0]
 
 
 def complete_eos_candidates(

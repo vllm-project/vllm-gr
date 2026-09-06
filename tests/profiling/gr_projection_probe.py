@@ -11,8 +11,8 @@ import argparse
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
@@ -59,17 +59,16 @@ def main():
     assert capture["status"] == "complete" and capture["performance_evidence_valid"] is False
     assert len(capture["candidate_oracle_diagnostics"]) == 2
     # Decode only first-layer fields rather than the entire layerwise payload.
-    records = []
-    for encoded in capture["candidate_oracle_diagnostics"]:
-        records.append(
-            decode_record(
-                {
-                    "diagnostic_payload_base64": encoded["diagnostic_payload_base64"],
-                    "forward": encoded["forward"][0],
-                    "attention": encoded["prefill_attention"][0],
-                }
-            )
+    records = [
+        decode_record(
+            {
+                "diagnostic_payload_base64": encoded["diagnostic_payload_base64"],
+                "forward": encoded["forward"][0],
+                "attention": encoded["prefill_attention"][0],
+            }
         )
+        for encoded in capture["candidate_oracle_diagnostics"]
+    ]
     ids_full = torch.tensor(records[0]["forward"]["input_ids"], dtype=torch.int32, device="cuda")
     ids_hit = torch.tensor(records[1]["forward"]["input_ids"], dtype=torch.int32, device="cuda")
     assert len(ids_full) == 1024 and len(ids_hit) == 16, "probe requires the frozen 1024/16 case"

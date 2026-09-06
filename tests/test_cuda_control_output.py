@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU ownership tests using the real native Ticket completion primitive."""
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-import threading
 
 import pytest
 
@@ -296,7 +296,7 @@ def test_other_slot_quarantine_during_enqueue_does_not_strand_producer(pool_fact
                                          ("session_epoch", -1), ("device_step", 0)])
 def test_invalid_identity_fails_before_ticket_allocation(pool_factory, field, value):
     pool, _, _, _ = pool_factory()
-    values = dict(slot=1, request_id="request", session_epoch=1, device_step=1)
+    values = {"slot": 1, "request_id": "request", "session_epoch": 1, "device_step": 1}
     values[field] = value
     with pytest.raises(ValueError):
         pool.acquire(**values)

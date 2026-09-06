@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-from vllm.v1.request import RequestStatus
 from vllm.v1.engine.core import EngineCore
+from vllm.v1.request import RequestStatus
 
 from vllm_gr.entrypoints import gr as offline_gr
 from vllm_gr.v1.core.sched.async_scheduler import GRAsyncScheduler

@@ -7,12 +7,9 @@ import msgspec
 import pytest
 
 from vllm_gr.v1.engine.types import (
-    GRModelRunnerOutput,
     GRRequestMetadata,
-    GRRequestOutput,
     GRRequestStage,
     GRSchedulerOutput,
-    GRSequenceOutput,
     canonicalize_constraint_digest,
 )
 
@@ -98,16 +95,6 @@ def test_constraint_digest_is_required_and_canonical() -> None:
             False,
             protocol_version=99,
         ),
-        lambda: GRRequestOutput("request-0", [], 1, 1, protocol_version=99),
-        lambda: GRModelRunnerOutput(
-            "request-0",
-            0,
-            False,
-            1,
-            1,
-            GRRequestStage.DECODE_RUNNING,
-            protocol_version=99,
-        ),
     ],
 )
 def test_protocol_version_mismatch_fails_fast(factory) -> None:
@@ -134,11 +121,6 @@ def test_protocol_version_mismatch_fails_fast(factory) -> None:
                 None,
                 99,
             ],
-        ),
-        (GRRequestOutput, ["request-0", [], 1, 1, "final_ready", None, 99]),
-        (
-            GRModelRunnerOutput,
-            ["request-0", 0, False, 1, 1, "decode_running", None, None, 99],
         ),
     ],
 )
@@ -172,36 +154,6 @@ def test_scheduler_output_contains_no_beam_state() -> None:
     }
 
 
-def test_model_runner_output_is_lightweight_until_final() -> None:
-    intermediate = GRModelRunnerOutput(
-        request_id="request-0",
-        token_id=1,
-        finished=False,
-        step=1,
-        device_step=1,
-        stage=GRRequestStage.DECODE_RUNNING,
-    )
-    assert intermediate.final_output is None
-
-    final = GRRequestOutput(
-        request_id="request-0",
-        outputs=[GRSequenceOutput([10, 11], [0, 0], -0.25, [-0.1, -0.15])],
-        step=2,
-        device_step=2,
-    )
-    output = GRModelRunnerOutput(
-        request_id="request-0",
-        token_id=2,
-        finished=True,
-        step=2,
-        device_step=2,
-        stage=GRRequestStage.FINAL_READY,
-        final_output=final,
-    )
-    payload = msgspec.msgpack.encode(output)
-    assert msgspec.msgpack.decode(payload, type=GRModelRunnerOutput) == output
-
-
 @pytest.mark.parametrize(
     "factory",
     [
@@ -211,49 +163,8 @@ def test_model_runner_output_is_lightweight_until_final() -> None:
         lambda: GRSchedulerOutput(
             "request-0", GRRequestStage.DECODE_RUNNING, 0, -1, False
         ),
-        lambda: GRRequestOutput("request-0", [], -1, 0),
-        lambda: GRRequestOutput("request-0", [], 0, -1),
-        lambda: GRModelRunnerOutput(
-            "request-0", 0, False, -1, 0, GRRequestStage.DECODE_RUNNING
-        ),
-        lambda: GRModelRunnerOutput(
-            "request-0", 0, False, 0, -1, GRRequestStage.DECODE_RUNNING
-        ),
     ],
 )
 def test_wire_steps_must_be_non_negative(factory) -> None:
     with pytest.raises(ValueError, match="non-negative"):
         factory()
-
-
-@pytest.mark.parametrize(
-    ("override", "message"),
-    [
-        ({"request_id": "other"}, "request_id"),
-        ({"step": 3}, "step"),
-        ({"device_step": 3}, "device_step"),
-        ({"stage": GRRequestStage.DECODE_RUNNING}, "stage"),
-        ({"finished": False}, "finished"),
-    ],
-)
-def test_final_envelope_fields_must_match(override, message) -> None:
-    final = GRRequestOutput("request-0", [], 2, 2)
-    fields = {
-        "request_id": "request-0",
-        "token_id": 0,
-        "finished": True,
-        "step": 2,
-        "device_step": 2,
-        "stage": GRRequestStage.FINAL_READY,
-        "final_output": final,
-    }
-    fields.update(override)
-    with pytest.raises(ValueError, match=message):
-        GRModelRunnerOutput(**fields)
-
-
-def test_final_request_output_rejects_non_final_stage() -> None:
-    with pytest.raises(ValueError, match="final_ready"):
-        GRRequestOutput(
-            "request-0", [], 2, 2, stage=GRRequestStage.DECODE_RUNNING
-        )

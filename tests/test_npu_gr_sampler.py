@@ -23,11 +23,11 @@ from vllm_gr.constraints.backend import (
 )
 from vllm_gr.v1.worker import npu_gr_sampler
 from vllm_gr.v1.worker.npu_gr_sampler import (
-    NPUPersistentConstraintSampler,
     NPU_SAMPLER_STATUS_EMPTY,
     NPU_SAMPLER_STATUS_INVALID_NUMERIC,
     NPU_SAMPLER_STATUS_OK,
     NPU_SAMPLER_STATUS_VALIDITY_HOLE,
+    NPUPersistentConstraintSampler,
 )
 
 

@@ -1051,8 +1051,6 @@ def launch_prepared_cuda_prefill_constraint(
         deferred_prefill_status=True,
     )
     sampler_output._gr_prefill_result_enqueued = True
-    sampler_output._gr_prefill_result_width = width
-    sampler_output._gr_prefill_result_copy_words = workspace.max_batch + 3 * width
     runner._gr_prelaunched_cuda_prefill = (logits, sampler_output)
     runner._gr_prepared_cuda_prefill_constraint = None
     return True
