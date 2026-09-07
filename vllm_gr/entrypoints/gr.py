@@ -8,6 +8,7 @@ A thin subclass of vLLM's :class:`~vllm.entrypoints.llm.LLM` that adds:
 
 - optional catalog-constrained generation (``catalog_path``)
 - a catalog-aware :meth:`beam_search` implementation
+- an isolated :meth:`beam_search_v1` entry point for persistent execution work
 
 The previous GR adapter / recommend runtime has been removed; this class now
 always delegates construction to the standard vLLM ``LLM`` initializer so any
@@ -72,6 +73,8 @@ if TYPE_CHECKING:
     from vllm.inputs import TextPrompt, TokensPrompt
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
+
+    from vllm_gr.entrypoints.beam_search_v1 import BeamSearchV1Server
 
 logger = init_logger(__name__)
 
@@ -793,6 +796,39 @@ class GRLLM(LLM):
                     vocab_size=vocab_size,
                 )
                 self.constraint_strategy.digest = resource.digest
+
+    def beam_search_v1(
+        self,
+        prompts: list[Union["TokensPrompt", "TextPrompt"]],
+        params: "BeamSearchParams",
+        lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
+        use_tqdm: bool = False,
+        concurrency_limit: int | None = None,
+    ) -> list["BeamSearchOutput"]:
+        """Run Beam Search through the new EngineCore-owned V1 pipeline."""
+        from vllm_gr.entrypoints.beam_search_v1 import (
+            OfflineBeamSearchV1Call,
+            run_beam_search_v1,
+        )
+
+        call = OfflineBeamSearchV1Call(
+            prompts=prompts,
+            params=params,
+            lora_request=lora_request,
+            use_tqdm=use_tqdm,
+            concurrency_limit=concurrency_limit,
+        )
+        return cast(
+            list["BeamSearchOutput"],
+            run_beam_search_v1(self._create_beam_search_v1_server(), call),
+        )
+
+    def _create_beam_search_v1_server(self) -> "BeamSearchV1Server":
+        """Create the offline V1 server adapter implemented by follow-up tasks."""
+        raise NotImplementedError(
+            "beam_search_v1 server is not implemented yet; A2-A5 must provide "
+            "the EngineCore request, execution, result, and cleanup pipeline"
+        )
 
     def beam_search(
         self,

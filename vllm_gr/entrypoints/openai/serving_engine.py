@@ -3,6 +3,7 @@
 import asyncio
 import time
 from collections.abc import AsyncGenerator, Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
@@ -39,7 +40,47 @@ from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
+if TYPE_CHECKING:
+    from vllm_gr.entrypoints.beam_search_v1 import AsyncBeamSearchV1Server
+
 logger = init_logger(__name__)
+
+
+def create_online_beam_search_v1_server(self) -> "AsyncBeamSearchV1Server":
+    """Create the online V1 server adapter implemented by follow-up tasks."""
+    raise NotImplementedError(
+        "online beam_search_v1 server is not implemented yet; it must submit "
+        "the shared BeamBatchRequest to the EngineCore V1 entry"
+    )
+
+
+async def beam_search_v1(
+    self,
+    prompt: EngineInput,
+    request_id: str,
+    params: BeamSearchParams,
+    lora_request: LoRARequest | None = None,
+    trace_headers: Mapping[str, str] | None = None,
+) -> AsyncGenerator[RequestOutput, None]:
+    """Submit one online V1 request and yield terminal outputs only."""
+    from vllm_gr.entrypoints.beam_search_v1 import (
+        OnlineBeamSearchV1Call,
+        run_beam_search_v1_async,
+    )
+
+    call = OnlineBeamSearchV1Call(
+        prompt=prompt,
+        request_id=request_id,
+        params=params,
+        lora_request=lora_request,
+        trace_headers=trace_headers,
+    )
+    outputs = await run_beam_search_v1_async(
+        create_online_beam_search_v1_server(self),
+        call,
+    )
+    for output in outputs:
+        yield output
 
 
 def _worker_decision_flatten(
