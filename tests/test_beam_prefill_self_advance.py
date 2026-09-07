@@ -329,6 +329,17 @@ class TestPrefillSelfAdvanceChain:
         assert eng.input_queue.empty()
         MockReq.assert_not_called()
 
+    def test_prefill_decision_containing_eos_falls_back_to_frontend(self) -> None:
+        eng = self._engine_with_template()
+        decision = _prefill_decision(tokens=[61, 9])
+
+        with patch("vllm.v1.request.Request") as MockReq:
+            _beam_advance_from_decision(eng, "s0", decision)
+
+        assert eng.input_queue.empty()
+        MockReq.assert_not_called()
+        assert "beam_self_advance_chained" not in decision
+
     def test_cross_session_decision_is_noop(self) -> None:
         """Mixed batches: a decision owned by another session must never
         chain onto this one (review P5)."""
@@ -388,6 +399,17 @@ class TestDualFlagScoping:
             _beam_advance_from_decision(eng, "s0", decision)
 
         assert eng.input_queue.qsize() == 1
+
+    def test_decode_decision_containing_eos_falls_back_to_frontend(self) -> None:
+        eng = self._decode_seeded_engine(enabled=True)
+        decision = _decode_decision(parents=[0, 1], tokens=[61, 2])
+
+        with patch("vllm.v1.request.Request") as MockReq:
+            _beam_advance_from_decision(eng, "s0", decision)
+
+        assert eng.input_queue.empty()
+        MockReq.assert_not_called()
+        assert "beam_self_advance_chained" not in decision
 
     def test_decode_flag_still_chains_decode(self) -> None:
         eng = self._decode_seeded_engine(enabled=True)

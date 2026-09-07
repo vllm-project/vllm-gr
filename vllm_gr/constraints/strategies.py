@@ -64,6 +64,27 @@ def validate_constraint_table_protocol(
         )
 
 
+def validate_beam_request_prefix_cache(
+    *, beam_request_active: bool, prefix_caching_enabled: bool | None
+) -> None:
+    """Reject a beam-request path that cannot inherit the prefill KV.
+
+    Incremental Beam requests carry only the newest semantic token. Their
+    shared prompt KV is recovered through vLLM's prefix cache, including the
+    specially hashed trailing partial block. Explicitly disabling that cache
+    would otherwise make decode silently attend to an incomplete prefix.
+
+    ``None`` means the caller has no authoritative cache config (typically a
+    test double); runtime engines always expose the boolean setting.
+    """
+    if beam_request_active and prefix_caching_enabled is False:
+        raise RuntimeError(
+            "the beam-request decode path requires prefix caching to reuse "
+            "the complete prefill KV; enable_prefix_caching=False would "
+            "produce incorrect beam scores"
+        )
+
+
 class ConstraintStrategy(ABC):
     """Base class for request-independent generation constraints."""
 

@@ -97,6 +97,173 @@ def test_begin_session_resets_decision_buffers() -> None:
     assert torch.equal(bufs.group_token_num, torch.zeros_like(bufs.group_token_num))
 
 
+def test_first_decode_inherits_parent_cumulative_scores() -> None:
+    """The first decode adds local scores once to the prefill parent scores."""
+    context = _make_context(max_beams=2)
+    session = _make_session(context)
+    session.begin_session(beam_width=2, prefix_len=8)
+    beam_decision.init_beam_decision_from_parents(
+        session,
+        [[10], [20]],
+        [-0.1, -5.0],
+    )
+    sampler_output = _sampler_output(
+        torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+        torch.tensor([[-4.0, -6.0], [-0.1, -1.0]], dtype=torch.float32),
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _current_beam_info={
+            "beam_data": {"s": {"is_beam_decode": True, "parent_beam_ids": [0, 1]}}
+        },
+    )
+
+    decision = beam_decision.run_beam_decision(
+        runner,
+        session,
+        sampler_output,
+        is_last_step=False,
+    )
+
+    assert decision is not None
+    assert set(decision["out_token_ids"].reshape(-1).tolist()) == {11, 21}
+    assert sorted(decision["out_log_probs"].reshape(-1).tolist(), reverse=True) == pytest.approx(
+        [-4.1, -5.1]
+    )
+
+
+@pytest.mark.parametrize("width,prune_eos", [(4, True), (64, True), (4, False)])  # type: ignore[misc]
+def test_frontend_selection_resynchronizes_worker_after_fallback(
+    width: int, prune_eos: bool
+) -> None:
+    """Pruned/reordered winners and a frontend-only step cannot leave stale parents."""
+    context = _make_context(max_beams=width, max_decode_steps=8, num_layers=1)
+    session = _make_session(context)
+    session.begin_session(beam_width=width, prefix_len=8)
+    beam_decision.init_beam_decision_from_parents(
+        session, [[100 + i] for i in range(width)], [-float(i) for i in range(width)]
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _beam_sessions={"s": session},
+        _beam_context=context,
+        _vllm_gr_config=SimpleNamespace(beam_max_width=width, beam_max_decode_steps=8),
+        _current_beam_info={"beam_data": {}},
+    )
+    tokens = torch.arange(width * width, dtype=torch.int32).reshape(width, width) + 1000
+    tokens[0, 0] = 9  # EOS among the worker's winners.
+    scores = torch.full((width, width), -1000.0)
+    scores[:, 0] = -0.25
+    decision = beam_decision.run_beam_decision(
+        runner, session, _sampler_output(tokens, scores), is_last_step=False
+    )
+    assert decision is not None
+    parents = decision["out_token_index"][0].tolist()
+    session._state.kv_reorder = parents
+    selected = [
+        i
+        for i, token in enumerate(decision["out_token_ids"][0].tolist())
+        if not prune_eos or token != 9
+    ][::-1]
+    suffixes = context.decision.sequence[0, selected, :2].tolist()
+    parent_scores = context.decision.beam_scores[0, selected].tolist()
+    metadata = {
+        "is_beam_decode": True,
+        "beam_width": len(selected),
+        "prefix_len": 8,
+        "decode_step": 1,
+        "max_decode_steps": 8,
+        "parent_beam_ids": [parents[i] for i in selected],
+        "beam_suffix": suffixes,
+        "parent_cumulative_logprobs": parent_scores,
+    }
+    buffers = context.decision
+    addresses = (buffers.sequence.data_ptr(), buffers.beam_scores.data_ptr())
+    runner._current_beam_info = {"beam_data": {"s": metadata}}
+    common._get_or_create_beam_session(runner, {"s": metadata})
+    assert session.beam_width == len(selected)
+    assert buffers.sequence[0, : len(selected), :2].tolist() == suffixes
+    assert buffers.beam_scores[0, : len(selected)].tolist() == parent_scores
+    assert buffers.worker_decode_steps == 2
+
+    # Force a frontend-only decision via an unsupported candidate shape.
+    assert (
+        beam_decision.run_beam_decision(
+            runner,
+            session,
+            _sampler_output(tokens[: len(selected), :1], scores[: len(selected), :1]),
+            is_last_step=False,
+        )
+        is None
+    )
+    next_parents = [i % len(selected) for i in range(width)]
+    suffixes = [suffixes[p] + [2000 + i] for i, p in enumerate(next_parents)]
+    parent_scores = [parent_scores[p] - 10.0 - i for i, p in enumerate(next_parents)]
+    metadata.update(
+        beam_width=width,
+        decode_step=2,
+        parent_beam_ids=next_parents,
+        beam_suffix=suffixes,
+        parent_cumulative_logprobs=parent_scores,
+    )
+    common._get_or_create_beam_session(runner, {"s": metadata})
+    assert session.beam_width == width
+    assert buffers.worker_decode_steps == 3
+    assert (buffers.sequence.data_ptr(), buffers.beam_scores.data_ptr()) == addresses
+
+    # Compare resumed worker winners with exhaustive frontend scoring.
+    decision = beam_decision.run_beam_decision(
+        runner, session, _sampler_output(tokens, scores), is_last_step=False
+    )
+    assert decision is not None
+    expected = sorted(
+        (parent_scores[p] + float(scores[p, k]), suffixes[p] + [int(tokens[p, k])])
+        for p in range(width)
+        for k in range(width)
+    )[-width:]
+    actual = sorted(
+        zip(
+            decision["out_log_probs"][0].tolist(),
+            decision["out_sequence"][0, :, :4].tolist(),
+        )
+    )
+    assert actual == expected
+    assert buffers.worker_decode_steps == 4
+
+
+def test_missing_parent_scores_disable_previously_seeded_worker() -> None:
+    context = _make_context()
+    session = _make_session(context)
+    session.begin_session(beam_width=4, prefix_len=8)
+    beam_decision.init_beam_decision_from_parents(session, [[1]] * 4, [-1.0] * 4)
+    common._seed_beam_decision_from_metadata(session, {"beam_suffix": [[1, 2]] * 4})
+    assert context.decision.worker_decode_steps == 0
+
+
+def test_unseeded_first_decode_falls_back_instead_of_double_counting() -> None:
+    context = _make_context(max_beams=2)
+    session = _make_session(context)
+    session.begin_session(beam_width=2, prefix_len=8)
+    sampler_output = _sampler_output(
+        torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+        torch.tensor([[-4.0, -6.0], [-0.1, -1.0]], dtype=torch.float32),
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _current_beam_info={"beam_data": {}},
+    )
+
+    assert (
+        beam_decision.run_beam_decision(
+            runner,
+            session,
+            sampler_output,
+            is_last_step=False,
+        )
+        is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # G2: result_width defaults to the beam width
 # ---------------------------------------------------------------------------

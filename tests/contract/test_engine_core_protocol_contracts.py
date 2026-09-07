@@ -82,6 +82,7 @@ BEAM_STEP_UPDATE_FIELDS = (
     "parent_beam_indices",
     "max_decode_steps",
     "constraint_step",
+    "parent_cumulative_logprobs",
 )
 
 
@@ -164,6 +165,7 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
         # Non-default so omit_defaults keeps it on the wire; default 0 must
         # still decode on legacy streams (covered in test_beam_request_unit).
         constraint_step=2,
+        parent_cumulative_logprobs=[-1.0, -2.0],
     )
     raw_payload = msgspec.msgpack.decode(msgspec.msgpack.encode(update))
 
@@ -172,7 +174,7 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
     assert raw_payload[8:13] == [2, 3, 4, 5, 6]
     assert raw_payload[13] is None
     assert raw_payload[14:16] == ["cache-salt", {"traceparent": "trace-0"}]
-    assert raw_payload[16:] == [[0, 0], 4, 2]
+    assert raw_payload[16:] == [[0, 0], 4, 2, [-1.0, -2.0]]
 
 
 def test_scheduler_beam_metadata_shape() -> None:

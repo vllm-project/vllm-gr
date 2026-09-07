@@ -22,6 +22,7 @@ from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession, beam_decisi
 from vllm_gr.v1.beam.beam_decision import (
     BeamPostprocessWorkspace,
     BeamPostprocessWorkspacePool,
+    init_beam_decision_from_parents,
 )
 from vllm_gr.v1.worker import model_runner_common
 
@@ -157,6 +158,14 @@ def test_workspace_decode_pipeline_matches_allocating_group_and_reuses_addresses
     context, session, workspace, runner = _runtime(beam_width, max_steps)
     tokens, scores, sampler = _candidates(beam_width)
     cumulative, sequence = _seed_reference(tokens, scores, max_steps)
+    # Mirror the engine protocol: decode-step decisions require seeded parent
+    # state — run_beam_decision bails out when worker_decode_steps == 0
+    # (production seeds via request metadata at session creation).
+    init_beam_decision_from_parents(
+        session,
+        [tokens[i, :1].tolist() for i in range(beam_width)],
+        cumulative[:, 0].tolist(),
+    )
     expected = beam_search_group_cuda(
         cumulative,
         tokens,
@@ -213,6 +222,24 @@ def test_workspace_decode_pipeline_matches_allocating_group_and_reuses_addresses
     assert session.decode_step == 1
 
 
+def _seed_worker_decision(
+    session: BeamSearchSession,
+    tokens: torch.Tensor,
+    scores: torch.Tensor,
+) -> None:
+    """Mirror the engine protocol: seed the parent step-0 state.
+
+    ``run_beam_decision`` bails out when ``worker_decode_steps == 0``
+    (production seeds from request metadata at session creation), so every
+    decode/terminal decision test must seed before calling it.
+    """
+    init_beam_decision_from_parents(
+        session,
+        [tokens[i, :1].tolist() for i in range(tokens.shape[0])],
+        scores[:, 0].tolist(),
+    )
+
+
 def test_workspace_terminal_pipeline_matches_direct_final_and_skips_kv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -220,6 +247,7 @@ def test_workspace_terminal_pipeline_matches_direct_final_and_skips_kv(
     context, session, workspace, runner = _runtime(beam_width, max_steps)
     tokens, scores, sampler = _candidates(beam_width)
     cumulative, sequence = _seed_reference(tokens, scores, max_steps)
+    _seed_worker_decision(session, tokens, scores)
     expected = beam_search_rec_final_select_cuda(
         cumulative,
         tokens,
@@ -573,7 +601,8 @@ def test_prefix_cache_hit_or_miss_does_not_change_postprocess_result() -> None:
     for prefix_cache_hit in (False, True):
         _, session, workspace, runner = _runtime(64)
         runner._current_beam_info["beam_data"]["s"]["prefix_cache_hit"] = prefix_cache_hit
-        _, _, sampler = _candidates(64)
+        tokens, scores, sampler = _candidates(64)
+        _seed_worker_decision(session, tokens, scores)
         decision = beam_decision.run_beam_decision(
             runner,
             session,
@@ -781,7 +810,8 @@ def test_worker_publish_path_uses_fixed_pack_without_torch_cat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context, session, workspace, runner = _runtime(64)
-    _, _, sampler = _candidates(64)
+    tokens, scores, sampler = _candidates(64)
+    _seed_worker_decision(session, tokens, scores)
     runner._current_beam_info["beam_session"] = session
     runner._current_beam_info["beam_data"]["s"]["result_width"] = 64
     monkeypatch.setattr(beam_decision, "_run_cuda_prefill_decision", lambda *args: None)
@@ -813,6 +843,7 @@ def test_constraint_worker_publish_uses_deferred_staging_and_host_views(
     tokens = torch.gather(tokens, 1, order)
     valid_mask = torch.ones_like(tokens, dtype=torch.bool)
     counts = torch.full((beam_width,), beam_width, dtype=torch.int32, device="cuda")
+    _seed_worker_decision(session, tokens, scores)
     sampler.logprobs_tensors.logprob_token_ids = tokens
     sampler.logprobs_tensors.logprobs = scores
     sampler._gr_constraint_token_ids = tokens
@@ -869,6 +900,7 @@ def test_constraint_worker_deferred_zero_candidate_raises_before_publish(
     tokens, scores, sampler = _candidates(beam_width)
     scores, order = torch.sort(scores, dim=1, descending=True, stable=True)
     tokens = torch.gather(tokens, 1, order)
+    _seed_worker_decision(session, tokens, scores)
     sampler.logprobs_tensors.logprob_token_ids = tokens
     sampler.logprobs_tensors.logprobs = scores
     sampler._gr_constraint_token_ids = tokens

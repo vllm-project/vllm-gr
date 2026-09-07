@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="misc,no-any-return"
 """Unit tests for EngineCore engine-driven chaining.
 
 Covers the chain that removes the per-step frontend RPC round-trip:
@@ -18,11 +19,12 @@ Covers the chain that removes the per-step frontend RPC round-trip:
 
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
@@ -31,16 +33,21 @@ from vllm.v1.engine import (
     EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreRequestType,
+    FinishReason,
 )
 
 import vllm_gr.v1.engine.core as core_module
+from vllm_gr.entrypoints.openai.serving_engine import _beam_request_step
+from vllm_gr.v1.beam import BeamAttentionContext, beam_decision
 from vllm_gr.v1.engine.core import (
     _beam_advance_from_decision,
     _beam_self_advance,
     _handle_beam_request_step_update,
 )
 from vllm_gr.v1.engine.engine_core_patch import make_patched_process_engine_step
+from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.worker import model_runner_common
 
 # ---------------------------------------------------------------------------
 # Shared test helpers (mirrors test_beam_request_unit.py)
@@ -48,7 +55,7 @@ from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 
 def _sampling_params(**overrides: Any) -> SamplingParams:
-    defaults = dict(max_tokens=4, logprobs=2, temperature=0.0, detokenize=False)
+    defaults = {"max_tokens": 4, "logprobs": 2, "temperature": 0.0, "detokenize": False}
     defaults.update(overrides)
     return SamplingParams(**defaults)
 
@@ -171,6 +178,164 @@ def _outputs_with_decision(
             ],
         )
     }
+
+
+# ===========================================================================
+# Composed lifecycle continuity
+# ===========================================================================
+
+
+@pytest.mark.parametrize("transport", ["list", "compact"])
+def test_parent_scores_survive_two_worker_decisions_and_self_advance(transport: str) -> None:
+    """Exercise the score protocol as one continuous, multi-step lifecycle."""
+    frontend = MagicMock()
+    finished = SimpleNamespace(finished=True)
+    frontend.register_beam_output.return_value = SimpleNamespace(
+        get=AsyncMock(return_value=finished)
+    )
+    frontend.beam_request_step_update = AsyncMock()
+    parents = [
+        SimpleNamespace(tokens=[10, 20, 30, 50], cum_logprob=-0.1),
+        SimpleNamespace(tokens=[10, 20, 30, 60], cum_logprob=-5.0),
+    ]
+
+    asyncio.run(
+        _beam_request_step(
+            frontend,
+            session_id="s0",
+            fork_info=[(0, 50), (1, 60)],
+            prev_beam_internal_ids=["p0", "p1"],
+            all_beams=parents,
+            request_id_batch="batch-1",
+            beam_search_params=_sampling_params(),
+            eos_token_id=2,
+            lora_request=None,
+            trace_headers=None,
+            prefix_len=3,
+            max_decode_steps=4,
+        )
+    )
+    await_args = frontend.beam_request_step_update.await_args
+    assert await_args is not None
+    first_update = await_args.args[0]
+    assert first_update.parent_cumulative_logprobs == [-0.1, -5.0]
+
+    engine = _make_engine_self(beam_cache={"s0": _session_entry()})
+    with patch("vllm.v1.request.Request") as Request:
+        first_request = MagicMock()
+        first_request.block_hashes = []
+        first_request.is_constrained = False
+        first_request.is_constraint_prefill = False
+        first_request.result_width = None
+        Request.return_value = first_request
+        _handle_beam_request_step_update(engine, first_update)
+    engine.input_queue.get_nowait()
+    first_request.num_computed_tokens = 5
+    first_metadata = build_beam_request_metadata(first_request, num_scheduled_tokens=2)
+    assert first_metadata is not None
+    assert first_metadata["beam_suffix"] == [[50], [60]]
+    assert first_metadata["parent_cumulative_logprobs"] == [-0.1, -5.0]
+
+    context = BeamAttentionContext(
+        max_batch=1,
+        max_beams=2,
+        num_kv_heads=1,
+        max_decode_steps=4,
+        head_dim=2,
+        num_layers=1,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _beam_context=context,
+        _beam_sessions={},
+        _vllm_gr_config=SimpleNamespace(beam_max_width=2, beam_max_decode_steps=4),
+    )
+    beam_data = {"s0": first_metadata}
+    session = model_runner_common._get_or_create_beam_session(
+        runner,
+        beam_data,
+        SimpleNamespace(beam_finished_session_ids=[]),
+    )
+    assert session is not None
+    assert context.decision.beam_scores[0, :2].tolist() == pytest.approx([-0.1, -5.0])
+
+    runner._current_beam_info = {"beam_data": beam_data, "beam_session": session}
+    first_sampler = SimpleNamespace(
+        logprobs_tensors=SimpleNamespace(
+            logprob_token_ids=torch.tensor([[51, 52], [61, 62]], dtype=torch.int32),
+            logprobs=torch.tensor([[-0.1, -0.2], [-0.1, -0.2]], dtype=torch.float32),
+        )
+    )
+    first_decision = beam_decision.run_beam_decision(
+        runner, session, first_sampler, is_last_step=False
+    )
+    assert first_decision is not None
+    assert first_decision["out_log_probs"].reshape(-1).tolist() == pytest.approx([-0.2, -0.3])
+    parent_indices = first_decision["out_token_index"].reshape(-1).tolist()
+    assert parent_indices == [0, 0]
+    assert session.decode_step == 1
+    session._state.kv_reorder = [int(parent) for parent in parent_indices]
+
+    if transport == "compact":
+        encoded = beam_decision._encode_cuda_beam_result(first_decision, is_last_step=False)
+        assert encoded is not None
+        payload = encoded[0]
+    else:
+        payload = {
+            key: first_decision[key].detach().cpu().tolist()
+            for key in ("out_token_ids", "out_token_index", "out_log_probs")
+        }
+        payload["is_last_step"] = False
+    payload["stage"] = "decode"
+    payload["session_id"] = "s0"
+
+    with patch("vllm.v1.request.Request") as Request:
+        second_request = MagicMock()
+        second_request.block_hashes = []
+        second_request.is_constrained = False
+        second_request.is_constraint_prefill = False
+        second_request.result_width = None
+        Request.return_value = second_request
+        _beam_advance_from_decision(engine, "s0", payload)
+    assert payload["beam_self_advance_chained"] is True
+    _, (queued_request, _) = engine.input_queue.get_nowait()
+    assert queued_request is second_request
+    assert second_request.parent_cumulative_logprobs == pytest.approx([-0.2, -0.3])
+
+    second_request.num_computed_tokens = 5
+    second_metadata = build_beam_request_metadata(second_request, num_scheduled_tokens=2)
+    assert second_metadata is not None
+    assert second_metadata["beam_suffix"] == [[50, 51], [50, 52]]
+    assert second_metadata["parent_beam_ids"] == [0, 0]
+    assert second_metadata["parent_cumulative_logprobs"] == pytest.approx([-0.2, -0.3])
+    second_beam_data = {"s0": second_metadata}
+    same_session = model_runner_common._get_or_create_beam_session(
+        runner,
+        second_beam_data,
+        SimpleNamespace(beam_finished_session_ids=[]),
+    )
+    assert same_session is session
+    assert session._state.kv_reorder is None
+
+    runner._current_beam_info = {
+        "beam_data": second_beam_data,
+        "beam_session": session,
+    }
+    second_sampler = SimpleNamespace(
+        logprobs_tensors=SimpleNamespace(
+            logprob_token_ids=torch.tensor([[71, 72], [81, 82]], dtype=torch.int32),
+            logprobs=torch.tensor([[-0.5, -2.0], [-0.1, -3.0]], dtype=torch.float32),
+        )
+    )
+    second_decision = beam_decision.run_beam_decision(
+        runner, session, second_sampler, is_last_step=True
+    )
+    assert second_decision is not None
+    assert sorted(second_decision["out_log_probs"].reshape(-1).tolist()) == pytest.approx(
+        [-0.7, -0.4]
+    )
 
 
 # ===========================================================================
@@ -607,7 +772,7 @@ class TestBeamSelfAdvance:
             assert eng.input_queue.qsize() == 2  # terminal adds nothing
             # Final ADD still carries the full 3-step suffixes.
             while not eng.input_queue.empty():
-                _req_type, payload = eng.input_queue.get_nowait()
+                _req_type, _payload = eng.input_queue.get_nowait()
             _, kwargs = MockReq.call_args
             assert kwargs["prompt_token_ids"] == [10, 20, 30, 62, 72]
             assert MockReq.return_value.beam_decode_steps == 3
@@ -776,6 +941,7 @@ class TestDecisionPayloadShapes:
         decision = {
             "out_token_ids": torch.tensor([[61, 71]], dtype=torch.int32),
             "out_token_index": torch.tensor([[1, 0]], dtype=torch.int32),
+            "out_log_probs": torch.tensor([[-1.0, -2.0]], dtype=torch.float32),
             "is_last_step": False,
         }
 
@@ -830,3 +996,127 @@ class TestDecisionPayloadShapes:
 
         assert eng.input_queue.empty()
         MockReq.assert_not_called()
+
+
+# ===========================================================================
+# Section — parent cumulative score guard (EOS-masked -inf beams)
+# ===========================================================================
+
+
+class TestApplyBeamStepParentScoreGuard:
+    """EOS-masked beams legitimately carry -inf cumulative scores.
+
+    The protocol may transport the EOS-mask sentinel at its lifecycle
+    boundary. The guard must accept it, reject only NaN/+inf/length
+    mismatches, and publish ERROR outputs for the registered session — a bare
+    rejection would leave the frontend waiting on the session forever.
+    """
+
+    @staticmethod
+    def _update(parent_scores: Any) -> BeamRequestStepUpdate:
+        return BeamRequestStepUpdate(
+            session_id="s0",
+            parent_beam_ids=["p0", "p1"],
+            child_beam_ids=["c0", "c1"],
+            beam_tokens=[[50], [60]],
+            pruned_ids=[],
+            prefix_len=3,
+            beam_width=2,
+            sampling_params=_sampling_params(),
+            eos_token_id=9,
+            client_index=5,
+            max_decode_steps=7,
+            parent_cumulative_logprobs=parent_scores,
+        )
+
+    def _run(self, eng: Any, update: BeamRequestStepUpdate) -> bool:
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = MagicMock()
+            mock_req.block_hashes = []
+            mock_req.is_constrained = False
+            MockReq.return_value = mock_req
+            return core_module._apply_beam_step(eng, update)
+
+    @pytest.mark.parametrize(
+        "scores",
+        [
+            [-float("inf"), -1.25],
+            [-float("inf"), -float("inf")],
+        ],
+        ids=["mixed", "all-masked"],
+    )
+    def test_eos_masked_neg_inf_parents_are_accepted(self, scores: list[float]) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+
+        assert self._run(eng, self._update(scores)) is True
+
+        assert eng.input_queue.qsize() == 1
+        assert eng.output_queue.empty()
+
+    @pytest.mark.parametrize(
+        "scores",
+        [
+            [float("nan"), -1.25],
+            [float("inf"), -1.25],
+            [-1.0, -0.5, -3.0],
+        ],
+        ids=["nan", "plus-inf", "length-mismatch"],
+    )
+    def test_invalid_parent_scores_reject_and_publish_error(self, scores: list[float]) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+
+        assert self._run(eng, self._update(scores)) is False
+
+        assert eng.input_queue.empty()
+        published: list[tuple[str, Any]] = []
+        while not eng.output_queue.empty():
+            client_index, outputs = eng.output_queue.get_nowait()
+            assert client_index == 5
+            for out in outputs.outputs:
+                published.append((out.request_id, out.finish_reason))
+        assert published == [("s0", FinishReason.ERROR)]
+
+    @pytest.mark.parametrize("failure", ["nan", "inf", "score-count", "arrays", "cache"])
+    @pytest.mark.parametrize("with_collector", [True, False], ids=["serving", "offline"])
+    def test_validation_error_reaches_registered_session(
+        self, failure: str, with_collector: bool
+    ) -> None:
+        from vllm.v1.engine.output_processor import OutputProcessor
+
+        from vllm_gr.entrypoints.openai.serving_engine import _collect_beam_result
+        from vllm_gr.v1.engine.async_llm import register_beam_output_fn
+
+        processor = OutputProcessor(tokenizer=None, log_stats=False)
+        frontend = SimpleNamespace(output_processor=processor, _run_output_handler=lambda: None)
+        collector = register_beam_output_fn(
+            frontend, "s0", [10, 20, 30], _sampling_params(logprobs=None)
+        )
+        if not with_collector:
+            processor.request_states["s0"].queue = None
+        eng = _make_engine_self(beam_cache={} if failure == "cache" else {"s0": _session_entry()})
+        update = self._update([-1.0, -2.0])
+        if failure in {"nan", "inf"}:
+            update.parent_cumulative_logprobs = [float(failure), -2.0]
+        elif failure == "score-count":
+            update.parent_cumulative_logprobs = [-1.0]
+        elif failure == "arrays":
+            update.child_beam_ids = []  # Even zero child IDs must terminate the session.
+        assert self._run(eng, update) is False
+        client_index, outputs = eng.output_queue.get_nowait()
+        assert client_index == 5
+        assert outputs.finished_requests == {"s0"}
+        assert eng.output_queue.empty()
+        processed = processor.process_outputs(outputs.outputs)
+        if with_collector:
+
+            async def collect() -> Any:
+                return await asyncio.wait_for(_collect_beam_result(collector), timeout=1.0)
+
+            result = asyncio.run(collect())
+        else:
+            assert len(processed.request_outputs) == 1
+            result = processed.request_outputs[0]
+        assert result.request_id == "s0"
+        assert result.finished
+        assert result.outputs[0].finish_reason == "error"
+        assert "s0" not in processor.request_states

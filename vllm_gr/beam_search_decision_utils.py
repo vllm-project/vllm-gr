@@ -98,6 +98,11 @@ def extract_and_dedup_flat_logprobs(flat: Any, logprobs_num: int):
     duplicate is position 0 (sampled token) when it also appears in the
     top-K (positions 1..K).  Returns exactly ``logprobs_num`` entries.
     """
+    if not flat.start_indices:
+        # Aborted / empty output: no candidate block was transported, so
+        # there is nothing to extract (an IndexError here used to 500 the
+        # whole beam request).
+        return [], [], None, None
     return extract_and_dedup_segment(
         flat.token_ids,
         flat.logprobs,
@@ -172,6 +177,9 @@ def extract_constrained_flat_logprobs(flat: Any, logprobs_num: int):
     The constrained prefill produces a single wide flat segment (W valid
     candidates followed by padding); no sampled-token dedup applies.
     """
+    if not flat.start_indices:
+        # Aborted / empty output: no candidate block was transported.
+        return [], [], None, None
     return extract_constrained_segment(
         flat.token_ids,
         flat.logprobs,
@@ -230,14 +238,24 @@ def complete_eos_candidates(
 
 
 def select_top_indices(
-    scores: np.ndarray, beam_width: int, catalog_strategy: str | None = "fill"
+    scores: np.ndarray,
+    beam_width: int,
+    catalog_strategy: str | None = "fill",
+    *,
+    exclude_nonfinite: bool = False,
 ) -> np.ndarray:
-    """Return top candidate indices with the legacy ``argpartition`` order."""
+    """Return top candidate indices with the legacy ``argpartition`` order.
+
+    ``complete_eos_candidates`` masks stop-token scores to ``-inf``.  Callers
+    set ``exclude_nonfinite`` after completing stop candidates so those slots,
+    and any independently invalid catalog slots, cannot be materialized as
+    active beams.  Candidate identity arrays remain untouched and aligned.
+    """
     # For "null" strategy: only pick from finite (valid catalog) entries so that
     # -inf slots from catalog-filtered tokens are never selected.  None resolves
     # to the default "fill" branch (the constrained extractor already removed
     # its padding before selection).
-    if catalog_strategy == "null":
+    if catalog_strategy == "null" or exclude_nonfinite:
         finite_mask = np.isfinite(scores)
         finite_idx = np.where(finite_mask)[0]
         if finite_idx.size == 0:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="no-untyped-def"
 
 """Contract checks for the private upstream APIs patched by vllm-gr."""
 
@@ -64,6 +65,7 @@ def test_vllm_gpu_model_runner_patch_contract() -> None:
 def test_vllm_serving_and_client_patch_contract() -> None:
     from vllm.engine.arg_utils import EngineArgs
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
     from vllm.entrypoints.openai.engine.serving import OpenAIServing
     from vllm.entrypoints.openai.models.serving import OpenAIServingModels
     from vllm.logprobs import FlatLogprobs
@@ -80,11 +82,27 @@ def test_vllm_serving_and_client_patch_contract() -> None:
     assert callable(FlatLogprobs.append)
     assert isinstance(OpenAIServing, type)
     assert isinstance(ChatCompletionRequest, type)
+    assert isinstance(CompletionRequest, type)
     assert isinstance(AsyncLLM, type)
     assert callable(AsyncMPClient._send_input)
     assert callable(SyncMPClient._send_input)
     assert callable(SyncMPClient.add_request)
     assert callable(InprocClient.add_request)
+
+
+def test_sampling_patch_covers_both_openai_prompt_shapes(monkeypatch) -> None:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+
+    from vllm_gr.entrypoints.openai.beam_search_patch import patch_sampling
+    from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
+
+    monkeypatch.setattr(ChatCompletionRequest, "to_beam_search_params", None)
+    monkeypatch.setattr(CompletionRequest, "to_beam_search_params", None)
+    patch_sampling()
+
+    assert ChatCompletionRequest.to_beam_search_params is to_beam_search_params
+    assert CompletionRequest.to_beam_search_params is to_beam_search_params
 
 
 def test_vllm_ascend_model_runner_patch_contract() -> None:

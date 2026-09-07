@@ -1287,6 +1287,24 @@ def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     )
 
 
+def _seed_beam_decision_from_metadata(session: Any, mdata: dict[str, Any]) -> None:
+    """Synchronize decision state with the authoritative selected parents."""
+    parent_scores = mdata.get("parent_cumulative_logprobs")
+    if parent_scores is None:
+        # A frontend fallback can advance or reorder beams without a worker
+        # decision. Never resume from old buffers when their state is unknown.
+        session.context.decision.worker_decode_steps = 0
+        return
+    parent_sequences = mdata.get("beam_suffix")
+    if not parent_sequences:
+        raise RuntimeError(
+            "worker beam decision received parent scores without parent beam suffixes"
+        )
+    from vllm_gr.v1.beam.beam_decision import init_beam_decision_from_parents
+
+    init_beam_decision_from_parents(session, parent_sequences, parent_scores)
+
+
 def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) -> Any | None:
     """Get or create per-request BeamSearchSession for incremental decode.
 
@@ -1438,6 +1456,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 # (parent_beam_indices is non-None even on the first step, so it
                 # cannot be used to distinguish the first step — decode_step can.)
                 session.begin_session(mdata["beam_width"], mdata["prefix_len"])
+                _seed_beam_decision_from_metadata(session, mdata)
                 session._state.is_last_step = is_last_step
             else:
                 # Subsequent decode steps: apply the previous step's beam decision.
@@ -1498,6 +1517,13 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 else:
                     # No previous parent mapping: just advance decode_step.
                     state.decode_step += 1
+                # EOS pruning and frontend selection can change both width
+                # and row order. KV reconciliation above does not synchronize
+                # decision scores/sequences. Restore them on every update,
+                # including the first worker decision after a frontend fallback.
+                # Only change the active width; keep pool addresses and KV state.
+                state.beam_width = req_width
+                _seed_beam_decision_from_metadata(session, mdata)
         else:
             # New session
             from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
@@ -1525,6 +1551,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 )
             session = BeamSearchSession(session_id=req_id, slot=slot, context=runner._beam_context)
             session.begin_session(mdata["beam_width"], mdata["prefix_len"])
+            _seed_beam_decision_from_metadata(session, mdata)
             # Set initial decode_step from scheduler
             session._state.decode_step = mdata_step
             session._state.is_last_step = is_last_step

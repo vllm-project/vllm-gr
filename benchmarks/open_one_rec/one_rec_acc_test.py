@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import regex as re
 import requests
 
 try:
@@ -89,6 +90,30 @@ class MockRequestOutput:
         self.outputs = outputs
 
 
+# OneRec dataset prompts are stored as fully rendered chat transcripts
+# (Qwen format: "<|im_start|>role\ncontent<|im_end|>" turns). Sending such a
+# transcript as one user message makes the server's chat template wrap the
+# already-rendered turns a second time (a user turn embedding the original
+# system turn), which desynchronizes the online prompt from the offline
+# beam-search input. Parse the transcript back into structured messages so
+# the template is applied exactly once, server-side.
+_CHAT_TURN_RE = re.compile(r"<\|im_start\|>(system|user|assistant)\n(.*?)<\|im_end\|>", re.DOTALL)
+
+
+def _messages_for_prompt(prompt: str) -> list[dict[str, str]]:
+    """Return structured chat messages for a dataset prompt.
+
+    Falls back to a single user turn when the prompt is not a recognizable
+    chat transcript (coverage guard: parsed content must explain most of
+    the original text before structured form is trusted).
+    """
+    turns = _CHAT_TURN_RE.findall(prompt)
+    parsed_chars = sum(len(role) + len(content) for role, content in turns)
+    if turns and parsed_chars >= 0.5 * len(prompt):
+        return [{"role": role, "content": content.strip("\n")} for role, content in turns]
+    return [{"role": "user", "content": prompt}]
+
+
 def run_api_inference(
     prompts: list[str],
     model: str,
@@ -115,7 +140,7 @@ def run_api_inference(
 
     def _send_request(prompt):
         response = None
-        payload = {"messages": [{"role": "user", "content": prompt}], **api_params}
+        payload = {"messages": _messages_for_prompt(prompt), **api_params}
         try:
             response = requests.post(api_url, headers=headers, json=payload)
             response.raise_for_status()
