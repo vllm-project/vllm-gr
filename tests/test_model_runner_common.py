@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="no-untyped-def"
 """Focused tests for device-neutral ModelRunner Beam helpers."""
 
 from __future__ import annotations
@@ -687,6 +688,39 @@ def test_worker_decision_reduces_sampler_payload_before_host_copy() -> None:
     assert collapsed == (["beam"], {"beam": 0}, 1)
     # The later collapse must preserve O(W), never recreate W-by-W.
     assert sampler_output.logprobs_tensors.logprobs.shape == (1, width)
+
+
+def test_seed_worker_decision_uses_frontend_parent_state(monkeypatch) -> None:
+    captured = {}
+
+    def fake_init(session, sequences, scores):
+        captured["session"] = session
+        captured["sequences"] = sequences
+        captured["scores"] = scores
+
+    monkeypatch.setattr(
+        "vllm_gr.v1.beam.beam_decision.init_beam_decision_from_parents",
+        fake_init,
+    )
+    session = object()
+    common._seed_beam_decision_from_metadata(
+        session,
+        {
+            "beam_suffix": [[11], [22]],
+            "parent_cumulative_logprobs": [-0.5, -1.75],
+        },
+    )
+
+    assert captured == {
+        "session": session,
+        "sequences": [[11], [22]],
+        "scores": [-0.5, -1.75],
+    }
+
+
+def test_seed_worker_decision_rejects_scores_without_suffixes() -> None:
+    with pytest.raises(RuntimeError, match="parent scores without parent beam suffixes"):
+        common._seed_beam_decision_from_metadata(object(), {"parent_cumulative_logprobs": [-0.5]})
 
 
 def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:

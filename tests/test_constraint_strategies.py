@@ -21,6 +21,7 @@ from vllm_gr.constraints import (
     create_constraint_strategy,
 )
 from vllm_gr.constraints.strategies import (
+    validate_beam_request_prefix_cache,
     validate_constraint_generation_limits,
     validate_constraint_table_protocol,
 )
@@ -182,6 +183,14 @@ def test_constraint_table_protocol_appends_hint_when_given() -> None:
             required="the CUSTOM attention backend",
             hint="Configure attention_config={'backend': 'CUSTOM'}.",
         )
+
+
+def test_beam_request_requires_prefix_cache() -> None:
+    validate_beam_request_prefix_cache(beam_request_active=True, prefix_caching_enabled=True)
+    validate_beam_request_prefix_cache(beam_request_active=False, prefix_caching_enabled=False)
+    validate_beam_request_prefix_cache(beam_request_active=True, prefix_caching_enabled=None)
+    with pytest.raises(RuntimeError, match="complete prefill KV"):
+        validate_beam_request_prefix_cache(beam_request_active=True, prefix_caching_enabled=False)
 
 
 def test_coordinator_applies_fill_and_null_with_the_same_contract(

@@ -12,10 +12,12 @@ def patch_beam_search():
 
 def patch_sampling():
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 
     from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
 
     ChatCompletionRequest.to_beam_search_params = to_beam_search_params
+    CompletionRequest.to_beam_search_params = to_beam_search_params
 
 
 def patch_engine_core_process_entrypoint() -> None:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="misc,no-untyped-def"
 
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from vllm.lora.request import LoRARequest
 
 from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
+    extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
     extract_constrained_flat_logprobs,
     extract_constrained_segment,
@@ -61,7 +63,7 @@ def _candidate_cache(
     [
         ([7, 3, 7, 5], [3, 7, 5]),
     ],
-)  # type: ignore[misc]
+)
 def test_extract_and_dedup_segment_preserves_candidate_order(
     token_ids: list[int],
     expected: list[int],
@@ -230,6 +232,31 @@ def test_extract_constrained_flat_logprobs_prefill_wide_segment() -> None:
     assert decoded == [None, None, None]
 
 
+@pytest.mark.parametrize(
+    "extract_fn",
+    [extract_and_dedup_flat_logprobs, extract_constrained_flat_logprobs],
+)
+def test_extract_flat_logprobs_empty_output_returns_no_candidates(extract_fn) -> None:
+    # An aborted / mid-shutdown output can carry ``logprobs is not None`` with
+    # no transported candidate block; extraction must degrade to "no
+    # candidates", never raise IndexError.
+    flat = SimpleNamespace(
+        token_ids=[],
+        logprobs=[],
+        ranks=None,
+        decoded_tokens=None,
+        start_indices=[],
+        end_indices=[],
+    )
+
+    token_ids, logprobs, ranks, decoded = extract_fn(flat, 5)
+
+    assert token_ids == []
+    assert logprobs == []
+    assert ranks is None
+    assert decoded is None
+
+
 def test_mask_candidate_logprobs_keeps_candidate_geometry() -> None:
     result = mask_candidate_logprobs(
         [7, 3, 5, 9],
@@ -303,7 +330,7 @@ def test_complete_stop_candidates_preserves_openai_output_policy() -> None:
         ([-0.5, -float("inf"), -0.1, -0.2], 2),
         ([-0.1, -0.2], 2),
     ],
-)  # type: ignore[misc]
+)
 def test_fill_top_indices_preserves_legacy_argpartition(
     scores: list[float],
     beam_width: int,
@@ -327,7 +354,7 @@ def test_fill_top_indices_preserves_legacy_argpartition(
         ([-0.1, -float("inf"), -0.2], 4, [0, 2]),
         ([-float("inf"), -float("inf")], 2, []),
     ],
-)  # type: ignore[misc]
+)
 def test_null_top_indices_only_returns_finite_candidates(
     scores: list[float],
     beam_width: int,
@@ -362,3 +389,16 @@ def test_materialize_selected_beams_uses_explicit_nonuniform_parent_mapping() ->
     assert [beam._lp_parent for beam in new_beams] == [parents[2], parents[0]]
     assert [beam._lp_step_data for beam in new_beams] == [cache[2], cache[0]]
     assert fork_info == [(2, 32), (0, 11)]
+
+
+def test_top_indices_exclude_completed_and_invalid_candidates() -> None:
+    scores = np.array([-np.inf, -0.2, -np.inf, -0.4])
+
+    selected = select_top_indices(
+        scores,
+        beam_width=4,
+        catalog_strategy="fill",
+        exclude_nonfinite=True,
+    )
+
+    assert selected.tolist() == [1, 3]

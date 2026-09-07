@@ -55,6 +55,7 @@ from vllm_gr.constraints.startup import install_constraint_table
 from vllm_gr.constraints.strategies import (
     ConstraintTableStrategy,
     TrieConstraintStrategy,
+    validate_beam_request_prefix_cache,
     validate_constraint_generation_limits,
     validate_constraint_table_protocol,
 )
@@ -186,6 +187,12 @@ def _prepare_beam_step_requests(
             for new_idx, (parent_beam_idx, tok) in enumerate(fork_info_j):
                 parent_beam_indices.append(parent_beam_idx)
 
+            parent_cumulative_logprobs = (
+                [float(beam.cum_logprob) for beam in instance.beams]
+                if all(hasattr(beam, "cum_logprob") for beam in instance.beams)
+                else None
+            )
+
             update = BeamRequestStepUpdate(
                 session_id=session_id,
                 parent_beam_ids=parent_beam_ids,
@@ -200,6 +207,7 @@ def _prepare_beam_step_requests(
                 else tokenizer.eos_token_id,
                 lora_request=instance.beams[0].lora_request,
                 parent_beam_indices=parent_beam_indices,
+                parent_cumulative_logprobs=parent_cumulative_logprobs,
                 max_decode_steps=max_decode_steps,
                 # Constraint Tables: the Worker's raw-logits hook needs the
                 # step to run (1/2 for decode; 0 reserved for the prefill).
@@ -586,6 +594,7 @@ def _custom_beam_search_batch(
 
             # _parse_step_logprobs returns the builder's NumPy arrays for the
             # internal path; do not convert them through Python lists again.
+            eos_beams: list[BeamSearchSequence] = []
             if not ignore_eos:
                 eos_beams, all_beams_logprob = complete_eos_candidates(
                     parents=instance.beams,
@@ -604,8 +613,13 @@ def _custom_beam_search_batch(
             # order used by its device-resident KV state. Keep that order.
             topn_idx = (
                 np.arange(all_beams_token_id.size, dtype=np.intp)
-                if worker_candidates is not None
-                else select_top_indices(all_beams_logprob, beam_width, catalog_strategy)
+                if worker_candidates is not None and not eos_beams
+                else select_top_indices(
+                    all_beams_logprob,
+                    beam_width,
+                    catalog_strategy,
+                    exclude_nonfinite=bool(eos_beams),
+                )
             )
             new_beams, fork_info = materialize_selected_beams(
                 parents=instance.beams,
@@ -956,6 +970,11 @@ class GRLLM(LLM):
             self.constraint_coordinator.strategy, TrieConstraintStrategy
         ):
             use_custom_attn = False
+        cache_config = getattr(vllm_config, "cache_config", None)
+        validate_beam_request_prefix_cache(
+            beam_request_active=use_custom_attn,
+            prefix_caching_enabled=getattr(cache_config, "enable_prefix_caching", None),
+        )
         # Constraint Tables run in the Worker raw-logits hook, which is only
         # installed on the CUSTOM-attention beam-request path.  The baseline
         # generate() loop below cannot express constraint_step + beam_suffix,
@@ -1080,6 +1099,7 @@ class GRLLM(LLM):
                         all_beams_beam_idx_arr = candidate_batch.parent_indices
                         beam_flat_cache = candidate_batch.parent_cache
                         # Handle EOS tokens
+                        eos_beams: list[BeamSearchSequence] = []
                         if not ignore_eos:
                             eos_beams, all_beams_logprob = complete_eos_candidates(
                                 parents=all_beams[start:end],
@@ -1096,7 +1116,10 @@ class GRLLM(LLM):
 
                         # Select top beams
                         topn_idx = select_top_indices(
-                            all_beams_logprob, beam_width, catalog_strategy
+                            all_beams_logprob,
+                            beam_width,
+                            catalog_strategy,
+                            exclude_nonfinite=bool(eos_beams),
                         )
                         new_beams, _ = materialize_selected_beams(
                             parents=all_beams[start:end],

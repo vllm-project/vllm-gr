@@ -28,6 +28,7 @@ PyTorch reference path for parity tests.
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -1037,6 +1038,51 @@ def init_beam_decision_state(
     bufs.worker_decode_steps = 1
 
 
+def init_beam_decision_from_parents(
+    session: Any,
+    parent_sequences: Sequence[Sequence[int]],
+    parent_cumulative_logprobs: Sequence[float],
+) -> None:
+    """Restore persistent decision state from already-selected parents.
+
+    The first grouped decode evaluates candidates after the prefill winner
+    (for OneRec, ``s_b`` after ``s_a``).  Seeding from the current candidate
+    matrix would lose the prefill score and count the current local score
+    twice, changing beam rank order.
+    """
+    import math
+
+    width = session.beam_width
+    if len(parent_sequences) != width or len(parent_cumulative_logprobs) != width:
+        raise RuntimeError(
+            f"worker beam decision parent state must contain exactly beam_width={width} rows"
+        )
+    lengths = {len(sequence) for sequence in parent_sequences}
+    if len(lengths) != 1:
+        raise RuntimeError("worker beam decision parent sequences must have equal lengths")
+    steps = next(iter(lengths), 0)
+    bufs = session.context.decision
+    if steps < 1 or steps > bufs.sequence.shape[2]:
+        raise RuntimeError(
+            f"worker beam decision parent sequence length {steps} is outside "
+            f"[1, {bufs.sequence.shape[2]}]"
+        )
+    scores = [float(score) for score in parent_cumulative_logprobs]
+    # -inf is a legitimate parent-score sentinel at the EOS-mask protocol
+    # boundary. Only NaN/+inf are protocol errors.
+    if any(math.isnan(score) or score == math.inf for score in scores):
+        raise RuntimeError(
+            "worker beam decision parent scores must not be NaN or +inf; "
+            "-inf marks an EOS-masked beam and is a valid score"
+        )
+    device = bufs.sequence.device
+    sequence_tensor = torch.tensor(parent_sequences, dtype=torch.int32, device=device)
+    score_tensor = torch.tensor(scores, dtype=torch.float32, device=device)
+    bufs.sequence[0, :width, :steps].copy_(sequence_tensor)
+    bufs.beam_scores[0, :width].copy_(score_tensor)
+    bufs.worker_decode_steps = steps
+
+
 def _select_candidates(
     sampler_output: Any,
     width: int,
@@ -1572,10 +1618,11 @@ def run_beam_decision(
 
     bufs = session.context.decision
     if bufs.worker_decode_steps == 0:
-        # First candidate round: seed the persistent buffers from the
-        # prefill/initial sampler output so the decision starts from a
-        # device-resident cumulative state (ACS init_from_prefill equivalent).
-        init_beam_decision_state(session, top_tokens, top_probs)
+        # A decode candidate matrix cannot reconstruct the scores of its
+        # already-selected parents. Fall back to frontend selection instead
+        # of silently dropping prefill scores and counting this local score
+        # twice. Normal engine paths seed from request metadata at creation.
+        return None
 
     if device_type == "cuda" and workspace is not None:
         return _run_cuda_decision_out(
@@ -1749,6 +1796,7 @@ __all__ = [
     "enqueue_cuda_prefill_workspace_result",
     "flatten_decision_value",
     "get_beam_postprocess_workspace",
+    "init_beam_decision_from_parents",
     "init_beam_decision_state",
     "maybe_run_worker_beam_decision",
     "run_beam_decision",

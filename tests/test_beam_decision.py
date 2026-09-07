@@ -97,6 +97,65 @@ def test_begin_session_resets_decision_buffers() -> None:
     assert torch.equal(bufs.group_token_num, torch.zeros_like(bufs.group_token_num))
 
 
+def test_first_decode_inherits_parent_cumulative_scores() -> None:
+    """The first decode adds local scores once to the prefill parent scores."""
+    context = _make_context(max_beams=2)
+    session = _make_session(context)
+    session.begin_session(beam_width=2, prefix_len=8)
+    beam_decision.init_beam_decision_from_parents(
+        session,
+        [[10], [20]],
+        [-0.1, -5.0],
+    )
+    sampler_output = _sampler_output(
+        torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+        torch.tensor([[-4.0, -6.0], [-0.1, -1.0]], dtype=torch.float32),
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _current_beam_info={
+            "beam_data": {"s": {"is_beam_decode": True, "parent_beam_ids": [0, 1]}}
+        },
+    )
+
+    decision = beam_decision.run_beam_decision(
+        runner,
+        session,
+        sampler_output,
+        is_last_step=False,
+    )
+
+    assert decision is not None
+    assert set(decision["out_token_ids"].reshape(-1).tolist()) == {11, 21}
+    assert sorted(decision["out_log_probs"].reshape(-1).tolist(), reverse=True) == pytest.approx(
+        [-4.1, -5.1]
+    )
+
+
+def test_unseeded_first_decode_falls_back_instead_of_double_counting() -> None:
+    context = _make_context(max_beams=2)
+    session = _make_session(context)
+    session.begin_session(beam_width=2, prefix_len=8)
+    sampler_output = _sampler_output(
+        torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+        torch.tensor([[-4.0, -6.0], [-0.1, -1.0]], dtype=torch.float32),
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _current_beam_info={"beam_data": {}},
+    )
+
+    assert (
+        beam_decision.run_beam_decision(
+            runner,
+            session,
+            sampler_output,
+            is_last_step=False,
+        )
+        is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # G2: result_width defaults to the beam width
 # ---------------------------------------------------------------------------

@@ -97,6 +97,18 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
         # the request does not carry one).
         "result_width": getattr(req, "result_width", None),
     }
+    parent_scores = getattr(req, "parent_cumulative_logprobs", None)
+    if parent_scores is not None:
+        metadata["parent_cumulative_logprobs"] = parent_scores
+
+    if not getattr(req, "is_constrained", False):
+        # Plain beam decode also carries the parent sequences: the Worker
+        # seeds its beam-decision state from them when a session is
+        # (re)created and rejects parent scores without suffixes as a
+        # protocol cross-check.
+        beam_suffix = getattr(req, "beam_suffix", None)
+        if beam_suffix:
+            metadata["beam_suffix"] = beam_suffix
 
     if getattr(req, "is_constrained", False):
         # Constraint Table decode: carries the step the Worker's raw-logits
