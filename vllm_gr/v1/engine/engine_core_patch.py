@@ -204,6 +204,7 @@ def apply_engine_core_child_patches() -> None:
     from vllm_gr.v1.worker.model_runner_patch import apply_worker_patches
 
     apply_engine_core_request_patches()
+    apply_kv_hash_memo_patch()
     apply_scheduler_patch()
     apply_worker_patches()
 
@@ -347,42 +348,69 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
-        _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
-        _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
-        block_size = self.cache_config.block_size
+        # The two cache-manager wrappers depend only on constants resolved at
+        # patch-install time (original bound methods + block_size), so they
+        # are built ONCE and stashed on the scheduler instance; rebuilding
+        # the closures on every schedule call showed up in prefill-path
+        # profiling (~60us/request of pure closure + attribute churn).
+        cached_patches = getattr(self, "_beam_schedule_patches", None)
+        if (
+            cached_patches is None
+            # Guard against a swapped/undone cache manager (e.g. engine
+            # reset re-installs fresh managers): re-capture the originals.
+            or cached_patches[0] is not self.kv_cache_manager.get_computed_blocks
+            or cached_patches[1] is not self.kv_cache_manager.coordinator.cache_blocks
+        ):
+            _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
+            _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
+            block_size = self.cache_config.block_size
 
-        patch_get_computed_blocks = make_patch_get_computed_blocks(
+            patch_get_computed_blocks = make_patch_get_computed_blocks(
+                _original_get_computed_blocks,
+                self.kv_cache_manager.create_kv_cache_blocks,
+                block_size,
+            )
+
+            def patch_cache_blocks(request, num_computed_tokens):
+                # Extend the num_computed_tokens passed to cache_blocks to the next
+                # block boundary on the FINAL prefill chunk, so the trailing partial
+                # block (whose hash exists thanks to the padding in _cache_beam_request)
+                # is actually cached. Without this, vLLM would only cache full blocks
+                # and the beam-decode request could not prefix-cache-hit the remainder.
+                if (
+                    request
+                    and not getattr(request, "is_beam_decode", False)
+                    and hasattr(request, "block_hashes")
+                    and request.block_hashes
+                ):
+                    num_prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
+                    if num_computed_tokens >= num_prompt_tokens:
+                        chunk_padded_target = (
+                            (num_computed_tokens + block_size - 1) // block_size * block_size
+                        )
+                        num_hashes = len(request.block_hashes)
+                        padded_target = min(chunk_padded_target, num_hashes * block_size)
+                        if (
+                            num_computed_tokens < padded_target
+                            and num_computed_tokens % block_size != 0
+                        ):
+                            num_computed_tokens = padded_target
+                return _original_cache_blocks(request, num_computed_tokens)
+
+            cached_patches = (
+                _original_get_computed_blocks,
+                _original_cache_blocks,
+                patch_get_computed_blocks,
+                patch_cache_blocks,
+            )
+            self._beam_schedule_patches = cached_patches
+
+        (
             _original_get_computed_blocks,
-            self.kv_cache_manager.create_kv_cache_blocks,
-            block_size,
-        )
-
-        def patch_cache_blocks(request, num_computed_tokens):
-            # Extend the num_computed_tokens passed to cache_blocks to the next
-            # block boundary on the FINAL prefill chunk, so the trailing partial
-            # block (whose hash exists thanks to the padding in _cache_beam_request)
-            # is actually cached. Without this, vLLM would only cache full blocks
-            # and the beam-decode request could not prefix-cache-hit the remainder.
-            if (
-                request
-                and not getattr(request, "is_beam_decode", False)
-                and hasattr(request, "block_hashes")
-                and request.block_hashes
-            ):
-                num_prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
-                if num_computed_tokens >= num_prompt_tokens:
-                    chunk_padded_target = (
-                        (num_computed_tokens + block_size - 1) // block_size * block_size
-                    )
-                    num_hashes = len(request.block_hashes)
-                    padded_target = min(chunk_padded_target, num_hashes * block_size)
-                    if (
-                        num_computed_tokens < padded_target
-                        and num_computed_tokens % block_size != 0
-                    ):
-                        num_computed_tokens = padded_target
-            return _original_cache_blocks(request, num_computed_tokens)
-
+            _original_cache_blocks,
+            patch_get_computed_blocks,
+            patch_cache_blocks,
+        ) = cached_patches
         self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
         self.kv_cache_manager.coordinator.cache_blocks = patch_cache_blocks
         try:
@@ -504,3 +532,52 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
 
     setattr(patched_update_from_output, marker, True)
     scheduler_cls.update_from_output = patched_update_from_output
+
+
+_KV_HASH_MEMO_LIMIT = 65536
+
+
+def apply_kv_hash_memo_patch() -> None:
+    """Memoize vLLM's per-block prefix-cache hashing (EngineCore process).
+
+    ``vllm.v1.core.kv_cache_utils.hash_block_tokens`` is a pure function of
+    (hash_function, parent_block_hash, block token ids, extra keys): the same
+    inputs always produce the same ``BlockHash``.  Repeated prompts
+    (benchmark re-runs, popular prefixes) re-hash identical blocks on every
+    request — ~1.3ms of sha256 work per 1024-token prompt — so a bounded FIFO
+    memo turns those hits into dict lookups.  First-seen blocks pay one extra
+    tuple() key build (microseconds).  The wrapper is idempotent and installs
+    on the module attribute (``request_block_hasher`` resolves it as a module
+    global at call time, so every existing and future hasher picks it up).
+    """
+    from vllm.v1.core import kv_cache_utils
+
+    if getattr(kv_cache_utils.hash_block_tokens, "_gr_hash_memo", False):
+        return
+
+    original = kv_cache_utils.hash_block_tokens
+    memo: dict[tuple, object] = {}
+
+    def hash_block_tokens_memo(
+        hash_function, parent_block_hash, curr_block_token_ids, extra_keys=None
+    ):
+        key = (
+            hash_function,
+            parent_block_hash,
+            tuple(curr_block_token_ids),
+            extra_keys,
+        )
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        hit = original(hash_function, parent_block_hash, curr_block_token_ids, extra_keys)
+        if len(memo) >= _KV_HASH_MEMO_LIMIT:
+            # FIFO eviction keeps the memo bounded in long-running servers
+            # (dict preserves insertion order).
+            memo.pop(next(iter(memo)))
+        memo[key] = hit
+        return hit
+
+    hash_block_tokens_memo._gr_hash_memo = True  # type: ignore[attr-defined]
+    kv_cache_utils.hash_block_tokens = hash_block_tokens_memo
+    logger.info("[vllm-gr] kv block-hash memo patch applied.")

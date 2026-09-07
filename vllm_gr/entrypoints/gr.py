@@ -15,7 +15,6 @@ HuggingFace checkpoint (e.g. OneRec, Pangu) is supported via the regular vLLM
 LLM path.
 """
 
-import copy
 import gc
 import time
 from typing import TYPE_CHECKING, Any, Union, cast
@@ -883,7 +882,16 @@ class GRLLM(LLM):
             if prompt["type"] == "embeds":
                 raise NotImplementedError("Embedding prompt not supported for beam search")
 
-            engine_prompt = copy.deepcopy(prompt)
+            # Structural shallow copy instead of copy.deepcopy: the beam
+            # pipeline only REBINDS keys on this dict (prompt_token_ids is
+            # rebuilt via list(...) before append) and never mutates the
+            # original list in place, so deep-copying the 1024-token list
+            # paid ~6ms per request on the pre-prefill critical path for
+            # no semantic benefit.  Nested enc_dec dicts are copied one
+            # level for the same reason.
+            engine_prompt = dict(prompt)
+            if engine_prompt.get("type") == "enc_dec":
+                engine_prompt["decoder_prompt"] = dict(engine_prompt["decoder_prompt"])
             decoder_prompt = (
                 engine_prompt
                 if engine_prompt["type"] != "enc_dec"
@@ -913,12 +921,15 @@ class GRLLM(LLM):
             )
             instances.append(instance)
 
-        # Cache decoded prompt text and token length for each instance to optimize final decoding
+        # Cache prompt token references and lengths per instance.  The prompt
+        # TEXT is detokenized lazily at output assembly (below, after
+        # generation completes): decoding here would spend ~2.5ms of
+        # tokenizer time on the pre-prefill critical path, and the text is
+        # only ever consumed when concatenating beam.text at the very end.
         cached_prompts = []
         for instance in instances:
             prompt_tokens = instance.beams[0].tokens
-            prompt_text = tokenizer.decode(prompt_tokens)
-            cached_prompts.append({"text": prompt_text, "len": len(prompt_tokens)})
+            cached_prompts.append({"tokens": prompt_tokens, "len": len(prompt_tokens)})
 
         pre_calc = 0 if sid_begin_token_id is None else 1
         if sid_end_token_id is not None:
@@ -1122,7 +1133,10 @@ class GRLLM(LLM):
             best_beams = sorted_completed[:beam_width]
 
             prompt_cache = cached_prompts[idx]
-            prompt_text = prompt_cache["text"]
+            # Deferred prompt detokenization: the decode runs here (post
+            # generation) instead of on the pre-prefill critical path; same
+            # tokenizer, same tokens, identical text.
+            prompt_text = tokenizer.decode(prompt_cache["tokens"])
             prompt_len = prompt_cache["len"]
             # Reconstruct FlatLogprobs from parent pointers for the best beams.
             # Batching the detokenize below removes the per-beam Rust decode that

@@ -246,11 +246,40 @@ class GRConfig:
 
     @classmethod
     def from_vllm_config(cls, vllm_config: object | None) -> GRConfig:
+        """Parse the GR config from a ``VllmConfig``'s additional_config.
+
+        The parse is cached on the ``vllm_config`` object itself
+        (``_vllm_gr_parsed_config``): the same engine hands the SAME
+        ``vllm_config`` to this classmethod on every request/frame path
+        (``_engine_constraint_table_active``, ``_beam_graph_enabled_for_run``,
+        beam metadata construction, ...), and re-running the full
+        validator-suite + ``__post_init__`` each time costs ~0.13ms per
+        request.  ``write_to_vllm_config`` invalidates the cache so
+        write→read round trips observe the new state.  Hosts that reject
+        attribute writes (frozen mocks) silently fall back to per-call
+        parsing.
+        """
+        if vllm_config is None:
+            return GRConfig()
+        cached = getattr(vllm_config, "_vllm_gr_parsed_config", None)
+        if cached is not None:
+            return cached
         from vllm_gr.config.parser import parse_gr_config
 
-        return parse_gr_config(vllm_config)
+        parsed = parse_gr_config(vllm_config)
+        try:
+            object.__setattr__(vllm_config, "_vllm_gr_parsed_config", parsed)
+        except (AttributeError, TypeError):
+            pass
+        return parsed
 
     def write_to_vllm_config(self, vllm_config: object) -> None:
         from vllm_gr.config.parser import write_gr_config
 
         write_gr_config(vllm_config, self)
+        # Invalidate the parse cache so a subsequent from_vllm_config
+        # observes the freshly written state (round-trip semantics).
+        try:
+            object.__setattr__(vllm_config, "_vllm_gr_parsed_config", None)
+        except (AttributeError, TypeError):
+            pass

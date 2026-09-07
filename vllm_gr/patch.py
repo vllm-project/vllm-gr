@@ -272,6 +272,15 @@ def _validate_model_runner_patch() -> str | None:
     return "; ".join(failures) or None
 
 
+def _validate_kv_hash_memo_patch() -> str | None:
+    """Verify the bounded memo wrapper on hash_block_tokens."""
+    from vllm.v1.core import kv_cache_utils
+
+    if not getattr(kv_cache_utils.hash_block_tokens, "_gr_hash_memo", False):
+        return "hash_block_tokens memo wrapper not installed"
+    return None
+
+
 def _validate_engine_core_request_group() -> str | None:
     failures = tuple(
         detail
@@ -379,6 +388,12 @@ def _engine_core_beam_patches() -> tuple[BeamPatch, ...]:
             "vllm_gr.v1.engine.engine_core_patch",
             "apply_engine_core_request_patches",
             _validate_engine_core_request_group,
+        ),
+        patch(
+            "kv_hash_memo",
+            "vllm_gr.v1.engine.engine_core_patch",
+            "apply_kv_hash_memo_patch",
+            _validate_kv_hash_memo_patch,
         ),
         patch(
             "scheduler",

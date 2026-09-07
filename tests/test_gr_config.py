@@ -18,6 +18,7 @@ from vllm_gr.config import (
 from vllm_gr.config.parser import (
     ATTENTION_BACKEND_KEY,
     BEAM_MAX_DECODE_STEPS_KEY,
+    BEAM_MAX_WIDTH_KEY,
     CATALOG_PATH_KEY,
     CONSTRAINT_BACKEND_KEY,
     NPU_DECODE_EXECUTION_KEY,
@@ -795,3 +796,35 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
     assert config.beam_engine_driven is expected_engine_driven
     slice_spy.assert_called_once()
     set_slice.assert_called_once_with(151669, 24576)
+
+
+def test_from_vllm_config_caches_on_the_config_object() -> None:
+    """Repeated parses of the same vllm_config return the cached GRConfig.
+
+    Engine request/frame paths hand the SAME vllm_config to
+    from_vllm_config repeatedly; the parse (validators + __post_init__)
+    must run once per config object, not once per call.
+    """
+    vllm_config = _vllm_config({BEAM_MAX_WIDTH_KEY: 128})
+    first = GRConfig.from_vllm_config(vllm_config)
+    second = GRConfig.from_vllm_config(vllm_config)
+    assert first is second
+    assert first.beam_max_width == 128
+    # The cache travels on the host object.
+    assert getattr(vllm_config, "_vllm_gr_parsed_config") is first
+
+
+def test_write_to_vllm_config_invalidates_parse_cache() -> None:
+    """write_to_vllm_config drops the cached parse so round trips re-read.
+
+    Without invalidation a write→read sequence on the same config object
+    would keep returning the stale pre-write GRConfig.
+    """
+    vllm_config = _vllm_config()
+    before = GRConfig.from_vllm_config(vllm_config)
+    assert before.npu_decode_execution is None
+
+    GRConfig(npu_decode_execution=NPUDecodeExecution.CASCADE).write_to_vllm_config(vllm_config)
+    after = GRConfig.from_vllm_config(vllm_config)
+    assert after is not before
+    assert after.npu_decode_execution is NPUDecodeExecution.CASCADE

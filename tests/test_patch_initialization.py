@@ -33,6 +33,7 @@ def test_patch_plans_preserve_process_responsibilities() -> None:
     ]
     assert engine_core_patches == [
         "engine_core_requests",
+        "kv_hash_memo",
         "scheduler",
         "model_runner",
     ]
@@ -263,3 +264,51 @@ def test_plugin_exposes_simple_per_patch_status(
         "patch_count": 1,
         "patches": {"flat_logprobs": "applied"},
     }
+
+
+def test_kv_hash_memo_patch_equivalence_and_hits() -> None:
+    """The memo wrapper returns byte-identical hashes and serves repeats.
+
+    hash_block_tokens is pure in (hash_function, parent hash, tokens,
+    extra_keys), so a bounded memo must return the exact same BlockHash for
+    repeated inputs (dict hit) and fall through to the original for
+    first-seen blocks.  FIFO eviction keeps the memo bounded.
+    """
+    import hashlib
+
+    from vllm_gr.v1.engine import engine_core_patch
+    from vllm.v1.core import kv_cache_utils
+
+    # NONE_HASH is lazily initialized by init_none_hash; the hashing path
+    # needs it for first-block (parent=None) calls.
+    if "NONE_HASH" not in dir(kv_cache_utils) or kv_cache_utils.NONE_HASH is None:
+        kv_cache_utils.init_none_hash(
+            lambda payload: hashlib.sha256(str(payload).encode()).digest()
+        )
+    original = kv_cache_utils.hash_block_tokens
+    # Snapshot the module attribute so the test can restore even if the
+    # wrapper was already installed by an earlier plan run.
+    try:
+        engine_core_patch.apply_kv_hash_memo_patch()
+        wrapped = kv_cache_utils.hash_block_tokens
+        assert getattr(wrapped, "_gr_hash_memo", False)
+
+        def sha_fn(payload: object) -> bytes:
+            return hashlib.sha256(repr(payload).encode()).digest()
+
+        tokens = list(range(100, 116))
+        first = wrapped(sha_fn, None, tokens, None)
+        # Purity: identical inputs -> byte-identical hash (memo hit).
+        second = wrapped(sha_fn, None, tokens, None)
+        assert first == second
+        # Direct call to the original agrees bit-for-bit.
+        assert first == original(sha_fn, None, tokens, None)
+        # Different tokens -> different hash (no false hits).
+        assert wrapped(sha_fn, None, tokens[:-1] + [999], None) != first
+        # Parent hash participates in the key.
+        assert wrapped(sha_fn, first, tokens, None) != first
+        # Idempotent re-apply keeps the same wrapper.
+        engine_core_patch.apply_kv_hash_memo_patch()
+        assert kv_cache_utils.hash_block_tokens is wrapped
+    finally:
+        kv_cache_utils.hash_block_tokens = original
