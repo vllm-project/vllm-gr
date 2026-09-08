@@ -7,7 +7,6 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.logger import init_logger
 
@@ -22,11 +21,10 @@ DEFAULT_PREFILL_BUCKETS = list(
         PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
     )
 )
-# Kept as a public compatibility alias; both platforms now use the configured
-# bucket step and maximum.
+# Public compatibility alias. Both platforms use the configured bucket range.
 NPU_DEFAULT_PREFILL_BUCKETS = list(DEFAULT_PREFILL_BUCKETS)
-MAX_PAD_RATIO_DEFAULT = 0.20
-MAX_PAD_TOKENS_DEFAULT = 512
+MAX_PAD_RATIO_DEFAULT = 0.10
+MAX_PAD_TOKENS_DEFAULT = 128
 SUPPORTED_NUM_REQS = [1, 2, 3, 4, 5, 6, 7, 8]
 
 ENV_ENABLE_PREFILL_GRAPH = "VLLM_ENABLE_PREFILL_CUDAGRAPH"
@@ -45,6 +43,27 @@ def _read_positive_int_env(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer, got {raw!r}")
     return value
+
+
+def _read_env_flag(name: str, default: bool) -> bool:
+    """Parse a boolean-style env flag once (truthy/falsy strings, else default)."""
+    val = os.getenv(name, "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+class PrefillGraphEnv:
+    """Process-wide prefill-graph environment switch, read once at import.
+
+    Every process (main / EngineCore / worker) initializes this class at
+    plugin load with the environment it was spawned with, and the switch
+    never changes afterwards, so per-call ``os.getenv`` reads are wasted work.
+    """
+
+    enabled: bool = _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True)
 
 
 def get_default_buckets() -> list[int]:
@@ -81,15 +100,49 @@ def get_max_context_len(runner: Any) -> int:
     return int(max_model_len or 0)
 
 
+def _get_block_table_cols(runner: Any) -> int | None:
+    """Block-table column count for the pre-allocated staging buffers.
+
+    Matches vLLM's InputBatch width (max_model_len / block_size, rounded up)
+    so the staged block table never reallocates per batch. None when the
+    config is unavailable (the capture path then sizes from the metadata).
+    """
+    max_model_len = get_max_context_len(runner)
+    if not max_model_len:
+        return None
+    kv_cache_config = getattr(runner, "kv_cache_config", None)
+    groups = getattr(kv_cache_config, "kv_cache_groups", None) if kv_cache_config else None
+    if not groups:
+        return None
+    try:
+        block_size = groups[0].kv_cache_spec.block_size
+    except Exception:  # noqa: BLE001
+        return None
+    if not block_size:
+        return None
+    return int((max_model_len + block_size - 1) // block_size)
+
+
 def _get_gpu_dynamic_thresholds(total_tokens: int) -> tuple[float, int]:
-    """GPU padding thresholds by token volume."""
+    """GPU padding thresholds by token volume.
+    Returns (max_pad_ratio, max_pad_tokens).
+    A batch matches if pad_ratio <= max_pad_ratio OR pad_tokens <= max_pad_tokens.
+    """
     if total_tokens <= 512:
-        return 0.35, 512
+        # Highly dispatch-bound: 30-35% padding is profitable (wins by +35% to +47%)
+        return 0.35, 256
+    elif total_tokens <= 768:
+        # Highly dispatch-bound: 30-35% padding is profitable (wins by +35% to +47%)
+        return 0.30, 200
     elif total_tokens <= 1024:
-        return 0.30, 300
+        # Moderately dispatch-bound: profitable up to 10-20% padding (~150 tokens)
+        return 0.20, 150
     elif total_tokens <= 2048:
+        # Transitioning to compute-bound: keep padding tight (<= 5% or <= 100 tokens)
         return 0.05, 100
     else:
+        # Strictly compute-bound (> 2048 tokens): only near-exact matches (<= 2% or <= 64 tokens)
+        # to avoid the -5% to -10% padding compute penalty
         return 0.02, 64
 
 
@@ -107,8 +160,8 @@ def get_dynamic_thresholds(total_tokens: int) -> tuple[float, int]:
     """Returns (max_pad_ratio, max_pad_tokens) for the active platform.
 
     - Short prompts (<= 512): Highly dispatch-bound. Allow up to 35% padding or 512 tokens.
-    - Medium prompts (513..1024): Moderately dispatch-bound. GPU allows up to
-      30% padding or 300 tokens; NPU allows 10% padding or 10 tokens.
+    - Medium prompts (513..1024): Moderately dispatch-bound. GPU padding is
+      progressively tightened; NPU allows 10% padding or 10 tokens.
     - Transition prompts (1025..2048): Transitioning to compute-bound. Allow up to 5% padding or 100 tokens.
     - Long prompts (> 2048): Strictly compute-bound. Allow up to 2% padding or 64 tokens.
     """
@@ -125,9 +178,8 @@ def is_npu_platform() -> bool:
 
 
 def is_prefill_graph_enabled() -> bool:
-    """Return True if prefill CUDA/NPU graph capture is enabled via env var."""
-    val = os.getenv(ENV_ENABLE_PREFILL_GRAPH, "1").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    """Return True if prefill CUDA/NPU graph capture is enabled (cached env)."""
+    return PrefillGraphEnv.enabled
 
 
 def is_prefill_phase_batch(runner: Any, scheduler_output: Any) -> bool:
@@ -144,9 +196,7 @@ def is_prefill_phase_batch(runner: Any, scheduler_output: Any) -> bool:
     """
     beam_data = getattr(scheduler_output, "beam_data", {})
     for mdata in beam_data.values():
-        if mdata and (
-            mdata.get("is_beam_decode", False) or mdata.get("is_constraint_prefill", False)
-        ):
+        if mdata and mdata.get("is_beam_decode", False):
             return False
     if getattr(scheduler_output, "scheduled_spec_decode_tokens", None):
         return False
@@ -187,6 +237,7 @@ class PrefillBucketBuffers:
         max_num_seqs: int,
         device: torch.device,
         pad_token_id: int = 0,
+        block_table_cols: int | None = None,
     ) -> None:
         self.bucket_size = bucket_size
         self.max_num_seqs = max_num_seqs
@@ -200,13 +251,27 @@ class PrefillBucketBuffers:
         self.positions_buf = torch.zeros((bucket_size,), dtype=torch.int32, device=device)
         self.slot_mapping_buf = torch.full((bucket_size,), -1, dtype=torch.int64, device=device)
 
+        # Static per-request staging buffers, pre-allocated once here (the
+        # capture metadata is rebound to these and execute_model_prefill
+        # refreshes them before every replay).
+        self.seq_lens_buf = torch.zeros((SUPPORTED_NUM_REQS[-1],), dtype=torch.int32, device=device)
+        self.query_start_loc_buf = torch.zeros(
+            (SUPPORTED_NUM_REQS[-1] + 1,), dtype=torch.int32, device=device
+        )
+        # Static block-table staging buffer (prefill graph replay). Sized from
+        # the model config; None when the config is unavailable (mocks) — the
+        # capture path then allocates it from the metadata shape.
+        self.block_table_buf: torch.Tensor | None = None
+        if block_table_cols:
+            self.block_table_buf = torch.zeros(
+                (SUPPORTED_NUM_REQS[-1], block_table_cols), dtype=torch.int32, device=device
+            )
+
         # Captured graphs and metadata keyed by num_reqs (1..8)
         self.captured_graphs: dict[int, Any] = {}
         self.output_bufs: dict[int, torch.Tensor] = {}
         self.static_attn_metadatas: dict[int, Any] = {}
         self.max_seq_len_bounds: dict[int, int] = {}
-        # Static block-table staging buffer (NPU prefill graph replay).
-        self.block_table_buf: torch.Tensor | None = None
 
     def has_captured_graph(self, num_reqs: int = 1) -> bool:
         return num_reqs in self.captured_graphs
@@ -295,23 +360,33 @@ class BasePrefillGraphRunner:
         )
         max_seqs = getattr(max_num_seqs_cfg, "max_num_seqs", 256) if max_num_seqs_cfg else 256
 
+        # Block-table column count from the model config (used to pre-size the
+        # per-bucket staging buffers); None when the config is unavailable.
+        block_table_cols = _get_block_table_cols(model_runner)
+
         # Eager static-buffer allocation: a failure here must not abort
         # worker startup. Disable the runner instead — every replay then
         # falls back to eager and the capture loops become no-ops.
         try:
             self.buffers: dict[int, PrefillBucketBuffers] = {
-                b: PrefillBucketBuffers(b, max_seqs, self.device) for b in self.buckets
+                b: PrefillBucketBuffers(b, max_seqs, self.device, block_table_cols=block_table_cols)
+                for b in self.buckets
             }
         except Exception as e:  # noqa: BLE001
             logger.warning("Prefill Graph runner disabled: static buffer allocation failed: %r", e)
             self.buckets = []
             self.buffers = {}
 
-    def match_bucket(self, total_tokens: int) -> int | None:
-        """Finds the smallest captured bucket K >= total_tokens based on active policy."""
-        if total_tokens <= 0:
-            return None
+        # O(1) bucket-match lookup table (total_tokens is bounded by the
+        # largest bucket); built once with the same policy used at runtime.
+        self._bucket_lut: list[int | None] = []
+        if self.buckets:
+            self._bucket_lut = [None] * (self.buckets[-1] + 1)
+            for t in range(1, self.buckets[-1] + 1):
+                self._bucket_lut[t] = self._compute_match_bucket(t)
 
+    def _compute_match_bucket(self, total_tokens: int) -> int | None:
+        """Smallest captured bucket K >= total_tokens under the active policy."""
         # Fallback threshold evaluation
         if self.use_dynamic_thresholds and self.max_pad_ratio is None:
             max_pad_ratio, max_pad_tokens = get_dynamic_thresholds(total_tokens)
@@ -328,7 +403,7 @@ class BasePrefillGraphRunner:
                 pad_tokens = bucket - total_tokens
                 pad_ratio = pad_tokens / float(total_tokens)
                 if pad_ratio <= max_pad_ratio:
-                    logger.info(
+                    logger.debug(
                         "Prefill Graph Match: Total %d prompt tokens matched bucket %d (padding: %d tokens, ratio: %.2f <= max %.2f).",
                         total_tokens,
                         bucket,
@@ -338,7 +413,7 @@ class BasePrefillGraphRunner:
                     )
                     return bucket
                 if pad_tokens <= max_pad_tokens:
-                    logger.info(
+                    logger.debug(
                         "Prefill Graph Match: Total %d prompt tokens matched bucket %d (padding: %d tokens <= max %d).",
                         total_tokens,
                         bucket,
@@ -346,7 +421,7 @@ class BasePrefillGraphRunner:
                         max_pad_tokens,
                     )
                     return bucket
-                logger.info(
+                logger.debug(
                     "Prefill Graph Fallback: Total %d tokens matched bucket %d, but padding ratio %.2f exceeds max %.2f (or pad %d > %d). Reverting to Eager mode.",
                     total_tokens,
                     bucket,
@@ -357,98 +432,25 @@ class BasePrefillGraphRunner:
                 )
                 return None
 
-        logger.info(
+        logger.debug(
             "Prefill Graph Fallback: Total %d tokens exceeds maximum bucket size %d. Reverting to Eager mode.",
             total_tokens,
             self.buckets[-1],
         )
         return None
 
-    def populate_buffers(
-        self,
-        bucket: int,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor | None,
-        slot_mapping: torch.Tensor | None,
-        num_scheduled_tokens: list[int] | dict[Any, int],
-    ) -> PrefillBucketBuffers:
-        """Populates static device buffers for the given bucket before graph execution."""
-        buf = self.buffers[bucket]
-        token_counts = (
-            list(num_scheduled_tokens.values())
-            if isinstance(num_scheduled_tokens, dict)
-            else list(num_scheduled_tokens)
-        )
-        total_actual = sum(token_counts)
-        num_reqs = len(token_counts)
-
-        # 1. Copy input_ids
-        if input_ids is not None:
-            buf.input_ids_buf[:total_actual].copy_(input_ids[:total_actual], non_blocking=True)
-            if total_actual < bucket:
-                buf.input_ids_buf[total_actual:].fill_(buf.pad_token_id)
-
-        # 2. Copy positions (support 1D and 2D/3D mrope)
-        if positions is not None:
-            if positions.ndim == 2 and buf.positions_buf.ndim == 2:
-                buf.positions_buf[:, :total_actual].copy_(
-                    positions[:, :total_actual], non_blocking=True
-                )
-                if total_actual < bucket:
-                    last_pos = (
-                        positions[:, total_actual - 1 : total_actual] if total_actual > 0 else 0
-                    )
-                    pad_range = torch.arange(
-                        1, bucket - total_actual + 1, device=self.device
-                    ).unsqueeze(0)
-                    buf.positions_buf[:, total_actual:] = last_pos + pad_range
-            elif positions.ndim == 1 and buf.positions_buf.ndim == 1:
-                buf.positions_buf[:total_actual].copy_(positions[:total_actual], non_blocking=True)
-                if total_actual < bucket:
-                    last_pos = positions[total_actual - 1].item() if total_actual > 0 else 0
-                    pad_range = torch.arange(1, bucket - total_actual + 1, device=self.device)
-                    buf.positions_buf[total_actual:] = last_pos + pad_range
-
-        # 3. Copy slot_mapping
-        if slot_mapping is not None:
-            buf.slot_mapping_buf[:total_actual].copy_(
-                slot_mapping[:total_actual], non_blocking=True
+    def match_bucket(self, total_tokens: int) -> int | None:
+        """O(1) lookup of the smallest captured bucket K >= total_tokens."""
+        if total_tokens <= 0 or not self._bucket_lut:
+            return None
+        if total_tokens >= len(self._bucket_lut):
+            logger.debug(
+                "Prefill Graph Fallback: Total %d tokens exceeds maximum bucket size %d. Reverting to Eager mode.",
+                total_tokens,
+                self.buckets[-1],
             )
-            if total_actual < bucket:
-                buf.slot_mapping_buf[total_actual:].fill_(-1)
-        else:
-            buf.slot_mapping_buf.fill_(-1)
-
-        # 4. Synchronize model runner's query_start_loc and seq_lens for num_reqs sequences
-        runner = getattr(self, "model_runner", None)
-        if runner is not None:
-            if hasattr(runner, "query_start_loc"):
-                # The runner's CPU mirror is overwritten in place for the next
-                # batch while this batch's copy still waits behind the
-                # previous replay on the serving stream: source the copy from
-                # a fresh host tensor instead.
-                qsl = np.array(runner.query_start_loc.np[: num_reqs + 1], copy=True)
-                curr = 0
-                qsl[0] = 0
-                for i in range(num_reqs - 1):
-                    curr += token_counts[i]
-                    qsl[i + 1] = curr
-                qsl[num_reqs] = bucket
-                runner.query_start_loc.gpu[: num_reqs + 1].copy_(
-                    torch.from_numpy(qsl), non_blocking=True
-                )
-                runner.query_start_loc.gpu[num_reqs + 1 :].fill_(0)
-
-            if hasattr(runner, "seq_lens") and hasattr(runner, "optimistic_seq_lens_cpu"):
-                # Same race class: optimistic_seq_lens_cpu is overwritten
-                # in-place per batch, so the copy must not read it directly.
-                seq_np = np.array(runner.optimistic_seq_lens_cpu[:num_reqs], copy=True)
-                if total_actual < bucket and num_reqs > 0:
-                    seq_np[num_reqs - 1] += bucket - total_actual
-                runner.seq_lens[:num_reqs].copy_(torch.from_numpy(seq_np), non_blocking=True)
-                runner.seq_lens[num_reqs:].fill_(0)
-
-        return buf
+            return None
+        return self._bucket_lut[total_tokens]
 
     def get_prefill_logit_indices(
         self, num_scheduled_tokens: list[int] | dict[Any, int]
@@ -485,94 +487,3 @@ class BasePrefillGraphRunner:
     ) -> torch.Tensor | None:
         """Subclasses implement device-specific graph execution."""
         raise NotImplementedError
-
-
-def stage_stable_tensors(
-    model_runner: Any,
-    total_actual: int,
-    device: torch.device,
-    slot_dtype: torch.dtype,
-    input_ids: torch.Tensor | None,
-    positions: torch.Tensor | None,
-    slot_mapping: torch.Tensor | None,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """Rebuild the staged input tensors from host-side CPU mirrors.
-
-    The runner overwrites its live GPU tensors (input_ids, positions, slot
-    mapping) in place for the next batch while this batch's staged copies
-    still wait behind the previous replay on the serving stream — copying
-    from the live tensors would read the NEXT batch's data. The CPU mirrors
-    hold THIS batch's data, so copies sourced from them are race-free. The
-    slot mapping has no maintained mirror (vllm computes it with a device
-    kernel writing only the GPU buffer), so it is recomputed host-side from
-    the maintained block-table mirror and the reconstructed positions.
-
-    Falls back to the live tensor for any source that is unavailable.
-    """
-    stable_ids, stable_pos, stable_slots = input_ids, positions, slot_mapping
-    input_batch = getattr(model_runner, "input_batch", None)
-    if input_batch is None:
-        return stable_ids, stable_pos, stable_slots
-    try:
-        # When sampled-token recycling is active the runner fills input_ids
-        # on the device from the previous iteration, so the CPU mirror does
-        # not reflect the final contents.
-        if getattr(input_batch, "prev_sampled_token_ids", None) is None:
-            ids_mirror = getattr(getattr(model_runner, "input_ids", None), "np", None)
-            if ids_mirror is not None:
-                stable_ids = torch.from_numpy(np.array(ids_mirror[:total_actual], copy=True))
-        pos_np = None
-        req_idx_mirror = getattr(getattr(model_runner, "req_indices", None), "np", None)
-        if positions is not None and positions.ndim == 1:
-            qpos_mirror = getattr(getattr(model_runner, "query_pos", None), "np", None)
-            computed = getattr(input_batch, "num_computed_tokens_cpu", None)
-            if qpos_mirror is not None and req_idx_mirror is not None and computed is not None:
-                pos_np = np.array(computed, copy=False)[req_idx_mirror[:total_actual]] + np.array(
-                    qpos_mirror[:total_actual], copy=False
-                )
-                stable_pos = torch.from_numpy(pos_np.astype(np.int64))
-        bt_table = input_batch.block_table[0]
-        if getattr(bt_table, "cp_kv_cache_interleave_size", 1) <= 1:
-            bt_np = getattr(getattr(bt_table, "block_table", None), "np", None)
-            if bt_np is not None and req_idx_mirror is not None and pos_np is not None:
-                rows = req_idx_mirror[:total_actual].astype(np.int64, copy=False)
-                block_ids = bt_np[rows, pos_np // bt_table.block_size].astype(np.int64, copy=False)
-                slots_np = np.where(
-                    block_ids >= 0,
-                    block_ids * bt_table.block_size + (pos_np % bt_table.block_size),
-                    -1,
-                ).astype(np.int32)
-                stable_slots = torch.from_numpy(slots_np).to(dtype=slot_dtype)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "Prefill graph replay: stable-source staging failed (%r); "
-            "falling back to live tensors.",
-            e,
-        )
-    return stable_ids, stable_pos, stable_slots
-
-
-def stage_stable_block_table(
-    model_runner: Any,
-    num_reqs: int,
-    num_cols: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """Fresh block-table tensor copied from the host-side CPU mirror.
-
-    The block-table mirror is host-maintained per batch, while the live GPU
-    tensor is overwritten in place for the next batch. Returns None when the
-    mirror is unavailable (the caller falls back to eager prefill).
-    """
-    input_batch = getattr(model_runner, "input_batch", None)
-    if input_batch is None:
-        return None
-    bt_np = getattr(getattr(input_batch.block_table[0], "block_table", None), "np", None)
-    if bt_np is None:
-        return None
-    try:
-        arr = np.array(bt_np[:num_reqs, :num_cols], copy=True)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Prefill graph replay: block-table staging failed (%r).", e)
-        return None
-    return torch.from_numpy(arr)

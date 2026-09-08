@@ -3,6 +3,7 @@
 """Beam-Consecutive Suffix Gather Attention Backend."""
 
 from types import ModuleType
+from typing import Any
 
 import torch
 from vllm import envs
@@ -43,6 +44,9 @@ CUDA_DEVICE = is_cuda_available()
 # vLLM config is process-global and set once before model load, so the first
 # non-None read settles the mode for the lifetime of the process.
 _NPU_DECODE_EXECUTION_MODE: str | None = None
+_ASCEND_FULL_GRAPH_UPDATE: Any | None = None
+_ASCEND_FULL_GRAPH_UPDATE_RESOLVED = False
+_NPU_PREFILL_ENTRY_CLS: Any | None = None
 
 
 def _get_npu_decode_execution() -> str:
@@ -85,6 +89,39 @@ def _get_npu_decode_execution() -> str:
     return _NPU_DECODE_EXECUTION_MODE
 
 
+def _get_npu_prefill_entry_cls() -> Any | None:
+    """Lazily resolve the NPU prefill graph entry without importing torch_npu on CUDA."""
+    global _NPU_PREFILL_ENTRY_CLS
+    if _NPU_PREFILL_ENTRY_CLS is None:
+        try:
+            from vllm_gr.v1.attention.backends.beam_attn_npu import NPUPrefillGraphEntry
+
+            _NPU_PREFILL_ENTRY_CLS = NPUPrefillGraphEntry
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Beam attention: prefill entry type unavailable (%r).", e)
+    return _NPU_PREFILL_ENTRY_CLS
+
+
+def _get_ascend_full_graph_update() -> Any | None:
+    """Resolve vllm-ascend's canonical decode full-graph task updater once."""
+    global _ASCEND_FULL_GRAPH_UPDATE, _ASCEND_FULL_GRAPH_UPDATE_RESOLVED
+    if not _ASCEND_FULL_GRAPH_UPDATE_RESOLVED:
+        _ASCEND_FULL_GRAPH_UPDATE_RESOLVED = True
+        try:
+            from vllm_ascend.attention.attention_v1 import (  # type: ignore[import-not-found]
+                AscendAttentionBackend,
+            )
+
+            _ASCEND_FULL_GRAPH_UPDATE = AscendAttentionBackend.get_impl_cls().update_graph_params
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Beam attention: vllm-ascend full-graph update unavailable (%r); "
+                "decode full-graph parameter updates will be skipped.",
+                e,
+            )
+    return _ASCEND_FULL_GRAPH_UPDATE
+
+
 def _get_platform_execution_module() -> ModuleType:
     npu_decode_execution = _get_npu_decode_execution()
     if NPU_DEVICE and not CUDA_DEVICE:
@@ -113,41 +150,26 @@ def _get_platform_execution_module() -> ModuleType:
 class BeamAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
-    @staticmethod
-    def update_graph_params(
-        update_stream,
-        forward_context,
-        num_tokens,
-        vllm_config,
-        speculative_config=None,
-        num_dcp_pcp_tokens=None,
-        draft_attn_metadatas=None,
-    ):
-        """ACL Graph FULL-mode replay hook (vllm-ascend contract).
+    @classmethod
+    def update_graph_params(cls, *args: Any, **kwargs: Any) -> None:
+        """Dispatch NPU prefill and native decode full-graph update contracts."""
+        if not args and not kwargs:
+            return
+        if NPU_DEVICE:
+            entry = kwargs.get("entry") or (args[1] if len(args) > 1 else None)
+            entry_cls = _get_npu_prefill_entry_cls()
+            if entry_cls is not None and isinstance(entry, entry_cls):
+                from vllm_gr.v1.attention.backends import beam_attn_npu
 
-        Called by ``update_full_graph_params`` before every FULL replay
-        (``vllm_ascend/compilation/acl_graph.py``).  Deliberately a no-op:
-        unlike the native PA/FIA backends, whose launch parameters are
-        host-side Python values that freeze at capture, every runtime-varying
-        input of the beam attention path is a persistent fixed-address device
-        buffer refreshed outside the graph each step (metadata builder's
-        ``_fixed_buffers`` pool, the beam context's ``decode_step_buf`` /
-        ``decode_step_1based_buf`` / ``xllm_block_table_buf``), so the
-        captured graph reads fresh values at replay by construction.  The
-        method must exist — the vllm-ascend caller dispatches through
-        ``get_impl_cls().update_graph_params`` unconditionally and would
-        raise AttributeError on the first FULL decode step otherwise.
-        """
-        del (
-            update_stream,
-            forward_context,
-            num_tokens,
-            vllm_config,
-            speculative_config,
-            num_dcp_pcp_tokens,
-            draft_attn_metadatas,
-        )
-        return None
+                beam_attn_npu.update_graph_params(*args, **kwargs)
+                return
+            ascend_update = _get_ascend_full_graph_update()
+            if ascend_update is not None:
+                ascend_update(*args, **kwargs)
+            return
+        platform_execution = _get_platform_execution_module()
+        if hasattr(platform_execution, "update_graph_params"):
+            platform_execution.update_graph_params(*args, **kwargs)
 
     def __init__(
         self,

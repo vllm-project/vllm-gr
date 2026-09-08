@@ -17,8 +17,6 @@ from vllm_gr.v1.worker.prefill_graph_common import (
     PrefillBucketBuffers,
     get_max_context_len,
     is_prefill_graph_enabled,
-    stage_stable_block_table,
-    stage_stable_tensors,
 )
 
 logger = init_logger(__name__)
@@ -218,12 +216,14 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         # NPU's ATB ReshapeAndCache op requires int32 slot mappings (the GPU
         # shared buffer is int64). Capture with valid sequential slots: the
         # probe proved all-(-1) is a degenerate setup case, and the real
-        # slots are copied in by populate_buffers before every replay.
+        # slots are copied in by execute_model_prefill before every replay.
         buf.slot_mapping_buf = torch.arange(bucket, dtype=torch.int32, device=self.device)
-        # Static block-table staging buffer: the task update binds this
-        # pointer (contents refreshed before every replay) instead of the
-        # runner's live block table, which is overwritten in place for the
-        # next batch while the previous replay's FIA is still reading it.
+        # Static block-table staging buffer: a captured graph bakes the
+        # pointer address, so the tensor at that address must stay stable
+        # for the lifetime of the graph. The runner's live block table is
+        # overwritten (or reallocated) for the next batch, so the graph
+        # must never bake it; the task update binds this static buffer and
+        # execute_model_prefill refreshes its contents before every replay.
         block_size = 16
         kv_cache_config = getattr(runner, "kv_cache_config", None)
         if kv_cache_config is not None and len(kv_cache_config.kv_cache_groups) > 0:
@@ -234,9 +234,12 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             if (max_kvlen > 0)
             else (bucket // block_size + 1)
         )
-        buf.block_table_buf = torch.zeros(
-            (SUPPORTED_NUM_REQS[-1], max_blocks), dtype=torch.int32, device=self.device
-        )
+        # Reuse the init-pre-allocated buffer unless it is missing or too
+        # narrow for this bucket's sizing.
+        if buf.block_table_buf is None or buf.block_table_buf.shape[1] < max_blocks:
+            buf.block_table_buf = torch.zeros(
+                (SUPPORTED_NUM_REQS[-1], max_blocks), dtype=torch.int32, device=self.device
+            )
 
     def _build_dummy_metadata(self, bucket: int, builder: Any, buf: PrefillBucketBuffers) -> Any:
         from vllm_gr.v1.attention.backends.beam_attn_metadata import (
@@ -428,39 +431,39 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         ):
             return None
 
-        # The runner overwrites its live GPU tensors (input_ids, positions,
-        # slot mapping, block table) in place for the next batch while this
-        # batch's staged copies still wait behind the previous replay on the
-        # serving stream — copying from the live tensors would read the NEXT
-        # batch's data. Rebuild the staged sources from the host-side CPU
-        # mirrors (written for THIS batch) instead: fresh tensors the runner
-        # never touches, so the copies are race-free.
+        # Refresh the static buffers with plain on-stream D2D copies from the
+        # live per-batch tensors. _prepare_inputs has already computed all of
+        # them for THIS batch on the current stream, and the next batch's
+        # writes are enqueued strictly after these copies on the same stream
+        # (an NPU stream is FIFO), so reading the live tensors here can never
+        # observe the next batch's data. No host-side recomputation or
+        # allocations.
         total_actual = sum(token_counts)
-        stable_ids, stable_pos, stable_slots = stage_stable_tensors(
-            self.model_runner,
-            total_actual,
-            self.device,
-            torch.int32,
-            input_ids,
-            positions,
-            slot_mapping,
-        )
-
-        self.populate_buffers(
-            bucket=bucket,
-            input_ids=stable_ids,
-            positions=stable_pos,
-            slot_mapping=stable_slots,
-            num_scheduled_tokens=num_scheduled_tokens,
-        )
-
-        # Never replay with a missing block table or stale slot mapping: the
-        # graph writes the KV cache at the captured slot addresses.
+        if input_ids is None or positions is None:
+            logger.warning(
+                "NPU prefill graph replay: missing live inputs; falling back to eager prefill."
+            )
+            return None
+        # Never replay with a missing slot mapping: the graph writes the KV
+        # cache at the captured slot addresses.
         if slot_mapping is None:
             logger.warning(
                 "NPU prefill graph replay: no current slot mapping; falling back to eager prefill."
             )
             return None
+        if total_actual < bucket:
+            buf.input_ids_buf[total_actual:].fill_(buf.pad_token_id)
+            buf.positions_buf[..., total_actual:].fill_(0)
+            buf.slot_mapping_buf[total_actual:].fill_(-1)
+        buf.input_ids_buf[:total_actual].copy_(input_ids[:total_actual], non_blocking=True)
+        if positions.ndim == buf.positions_buf.ndim == 1:
+            buf.positions_buf[:total_actual].copy_(positions[:total_actual], non_blocking=True)
+        else:
+            buf.positions_buf[..., :total_actual].copy_(
+                positions[..., :total_actual], non_blocking=True
+            )
+        buf.slot_mapping_buf[:total_actual].copy_(slot_mapping[:total_actual], non_blocking=True)
+
         attn_metadata = None
         try:
             from vllm.forward_context import get_forward_context
@@ -487,14 +490,11 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         # task-update re-binds them along with the block table).
         qlen_list, kvlen_list = build_update_lists_from_metadata(meta, token_counts, bucket)
 
-        # Stage the block table into the static per-bucket buffer before the
-        # update. The graph's FIA tasks read it asynchronously during replay,
-        # and the runner overwrites the live block-table tensor in place for
-        # the next batch: binding the live tensor would race that overwrite.
-        # Copy from the host-side CPU mirror (written for THIS batch) instead;
-        # the copy is enqueued on the serving stream, so it is device-ordered
-        # after the previous replay's reads, and the update stream waits on
-        # the serving stream before reading it.
+        # Refresh the static block table (baked pointer) from the live
+        # metadata tensor with a plain on-stream D2D copy (see the stream-FIFO
+        # rationale above). The graph's FIA tasks read the static buffer
+        # during replay; the update stream waits on the serving stream before
+        # reading it, so the copy is ordered before the replay's reads.
         live_bt = meta.block_table
         bt_buf = buf.block_table_buf
         if bt_buf is None or live_bt.shape[1] > bt_buf.shape[1]:
@@ -504,17 +504,9 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                 tuple(live_bt.shape),
             )
             return None
-        bt_staged = bt_buf[: live_bt.shape[0], : live_bt.shape[1]]
-        bt_src = stage_stable_block_table(
-            self.model_runner, live_bt.shape[0], live_bt.shape[1], self.device
-        )
-        if bt_src is None:
-            logger.warning(
-                "NPU prefill graph replay: block-table mirror unavailable; "
-                "falling back to eager prefill."
-            )
-            return None
-        bt_staged.copy_(bt_src, non_blocking=True)
+        num_cols = min(live_bt.shape[1], bt_buf.shape[1])
+        bt_staged = bt_buf[: live_bt.shape[0], :num_cols]
+        bt_staged.copy_(live_bt[: live_bt.shape[0], :num_cols], non_blocking=True)
 
         from vllm_gr.v1.attention.backends.beam_attn_npu import update_graph_params
 
