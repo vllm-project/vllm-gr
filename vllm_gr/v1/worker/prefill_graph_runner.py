@@ -14,8 +14,6 @@ from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_ENABLE_PREFILL_GRAPH,
     ENV_PREFILL_GRAPH_BUCKET_STEP,
     ENV_PREFILL_GRAPH_MAX_BUCKET,
-    MAX_PAD_RATIO_DEFAULT,
-    MAX_PAD_TOKENS_DEFAULT,
     NPU_DEFAULT_PREFILL_BUCKETS,
     PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
     PREFILL_GRAPH_MAX_BUCKET_DEFAULT,
@@ -23,7 +21,6 @@ from vllm_gr.v1.worker.prefill_graph_common import (
     BasePrefillGraphRunner,
     PrefillBucketBuffers,
     get_default_buckets,
-    get_dynamic_thresholds,
     is_prefill_graph_enabled,
     is_prefill_phase_batch,
 )
@@ -35,8 +32,6 @@ __all__ = [
     "ENV_ENABLE_PREFILL_GRAPH",
     "ENV_PREFILL_GRAPH_BUCKET_STEP",
     "ENV_PREFILL_GRAPH_MAX_BUCKET",
-    "MAX_PAD_RATIO_DEFAULT",
-    "MAX_PAD_TOKENS_DEFAULT",
     "NPU_DEFAULT_PREFILL_BUCKETS",
     "PREFILL_GRAPH_BUCKET_STEP_DEFAULT",
     "PREFILL_GRAPH_MAX_BUCKET_DEFAULT",
@@ -46,7 +41,6 @@ __all__ = [
     "PrefillBucketBuffers",
     "get_active_prefill_graph_runner_class",
     "get_default_buckets",
-    "get_dynamic_thresholds",
     "get_prefill_graph_runner",
     "is_prefill_graph_enabled",
     "is_prefill_phase_batch",
@@ -68,8 +62,6 @@ def get_active_prefill_graph_runner_class() -> type[BasePrefillGraphRunner]:
 def BeamPrefillGraphRunner(
     model_runner: Any,
     buckets: list[int] | None = None,
-    max_pad_ratio: float | None = None,
-    max_pad_tokens: int | None = None,
     **kwargs: Any,
 ) -> BasePrefillGraphRunner:
     """Factory function returning the active platform's prefill graph runner."""
@@ -77,8 +69,6 @@ def BeamPrefillGraphRunner(
     instance: BasePrefillGraphRunner = runner_cls(
         model_runner=model_runner,
         buckets=buckets,
-        max_pad_ratio=max_pad_ratio,
-        max_pad_tokens=max_pad_tokens,
         **kwargs,
     )
     return instance

@@ -928,13 +928,17 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                 p_runner = get_prefill_graph_runner(self)
 
                 raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
-                token_counts = (
-                    list(raw_scheduled_tokens.values())
-                    if isinstance(raw_scheduled_tokens, dict)
-                    else list(raw_scheduled_tokens)
-                )
-                total_tokens = sum(token_counts) if token_counts else 0
-                num_reqs = len(token_counts)
+                # The scheduler already computed the batch's token total; only
+                # the request count is derived here (the runner re-derives the
+                # per-request counts it needs from the dict itself).
+                num_reqs = len(raw_scheduled_tokens)
+                total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
+                if not total_tokens and raw_scheduled_tokens:
+                    total_tokens = (
+                        sum(raw_scheduled_tokens.values())
+                        if isinstance(raw_scheduled_tokens, dict)
+                        else sum(raw_scheduled_tokens)
+                    )
 
                 if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
                     bucket = p_runner.match_bucket(total_tokens)
@@ -972,7 +976,6 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                                 total_tokens,
                             )
                             return output_buf
-
         return _orig_model_forward(self, input_ids=input_ids, positions=positions, *args, **kwargs)
 
     setattr(patched_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, True)

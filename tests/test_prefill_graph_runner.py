@@ -33,52 +33,21 @@ def test_match_bucket_standard() -> None:
     runner = MockModelRunner()
     graph_runner = BeamPrefillGraphRunner(runner, buckets=[512, 1024, 2048, 4096])
 
-    # 400 tokens -> fits 512 (pad 112 tokens = 28% <= 512 pad tokens threshold)
+    # Requests use the smallest captured bucket that can hold them.
     assert graph_runner.match_bucket(400) == 512
-
-    # 750 tokens -> fits 1024 (pad 274 tokens <= 512 pad tokens threshold)
     assert graph_runner.match_bucket(750) == 1024
-
-    # 2000 tokens -> fits 2048 (pad 48 tokens = 2.4% <= 20% threshold)
     assert graph_runner.match_bucket(2000) == 2048
+    assert graph_runner.match_bucket(4097) is None
 
 
-def test_match_bucket_excessive_padding_fallback() -> None:
-    runner = MockModelRunner()
+def test_match_bucket_dense_default_range() -> None:
+    graph_runner = BeamPrefillGraphRunner(MockModelRunner())
 
-    # Set small max_pad_tokens=100 and max_pad_ratio=0.10 to test fallback
-    graph_runner = BeamPrefillGraphRunner(
-        runner,
-        buckets=[1000, 10000],
-        max_pad_ratio=0.10,
-        max_pad_tokens=100,
-    )
-
-    # 5000 tokens trying to match 10000 (pad 5000 = 100% overhead > 10% limit) -> Fallback None
-    assert graph_runner.match_bucket(5000) is None
-
-
-def test_populate_buffers() -> None:
-    runner = MockModelRunner()
-    graph_runner = BeamPrefillGraphRunner(runner, buckets=[1024])
-
-    input_ids = torch.tensor(list(range(500)), dtype=torch.int32)
-    positions = torch.tensor(list(range(500)), dtype=torch.int32)
-    slot_mapping = torch.tensor(list(range(500)), dtype=torch.int64)
-
-    buf = graph_runner.populate_buffers(
-        bucket=1024,
-        input_ids=input_ids,
-        positions=positions,
-        slot_mapping=slot_mapping,
-        num_scheduled_tokens=[250, 250],
-    )
-
-    assert buf.input_ids_buf[:500].equal(input_ids)
-    assert (buf.input_ids_buf[500:] == 0).all()
-    assert buf.positions_buf[:500].equal(positions)
-    assert buf.slot_mapping_buf[:500].equal(slot_mapping)
-    assert (buf.slot_mapping_buf[500:] == -1).all()
+    assert graph_runner.match_bucket(1) == 128
+    assert graph_runner.match_bucket(128) == 128
+    assert graph_runner.match_bucket(129) == 256
+    assert graph_runner.match_bucket(8192) == 8192
+    assert graph_runner.match_bucket(8193) is None
 
 
 def test_get_prefill_logit_indices() -> None:
@@ -188,28 +157,34 @@ def test_is_prefill_phase_batch() -> None:
 
 
 def test_is_prefill_graph_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr.v1.worker.prefill_graph_common import (
+        PrefillGraphEnv,
+        _read_env_flag,
+    )
     from vllm_gr.v1.worker.prefill_graph_runner import (
         ENV_ENABLE_PREFILL_GRAPH,
         is_prefill_graph_enabled,
     )
 
-    # Default is enabled
+    # Parse the environment values independently; production caches the result
+    # once when PrefillGraphEnv is initialized.
     monkeypatch.delenv(ENV_ENABLE_PREFILL_GRAPH, raising=False)
-    assert is_prefill_graph_enabled() is True
+    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is True
+    assert _read_env_flag("VLLM_GR_OTHER_FLAG", default=False) is False
 
-    # Explicitly disabled via the env var
     monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "0")
-    assert is_prefill_graph_enabled() is False
-
+    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is False
     monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "false")
-    assert is_prefill_graph_enabled() is False
-
-    # Explicitly enabled
+    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is False
     monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "1")
-    assert is_prefill_graph_enabled() is True
-
+    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is True
     monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "true")
+    assert _read_env_flag(ENV_ENABLE_PREFILL_GRAPH, default=True) is True
+
+    monkeypatch.setattr(PrefillGraphEnv, "enabled", True)
     assert is_prefill_graph_enabled() is True
+    monkeypatch.setattr(PrefillGraphEnv, "enabled", False)
+    assert is_prefill_graph_enabled() is False
 
 
 def test_npu_gates_allow_prefill_graph(
@@ -219,21 +194,15 @@ def test_npu_gates_allow_prefill_graph(
 
     monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: True)
     from vllm_gr.v1.worker.prefill_graph_runner import (
-        ENV_ENABLE_PREFILL_GRAPH,
         is_prefill_graph_enabled,
         is_prefill_phase_batch,
     )
 
-    # NPU prefill graphs follow the env flag (task-group capture is supported).
-    monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "1")
+    # NPU prefill graphs follow the process-cached environment flag.
+    monkeypatch.setattr(prefill_graph_common.PrefillGraphEnv, "enabled", True)
     assert is_prefill_graph_enabled() is True
-
-    monkeypatch.setenv(ENV_ENABLE_PREFILL_GRAPH, "0")
+    monkeypatch.setattr(prefill_graph_common.PrefillGraphEnv, "enabled", False)
     assert is_prefill_graph_enabled() is False
-
-    # Enabled with default (unset) env.
-    monkeypatch.delenv(ENV_ENABLE_PREFILL_GRAPH, raising=False)
-    assert is_prefill_graph_enabled() is True
 
     # Prefill-phase batches classify as prefill-phase on NPU.
     import numpy as np
@@ -273,34 +242,6 @@ def test_multi_req_graph_buffers() -> None:
         assert graph_runner.has_captured_graph(1024, num_reqs=r)
     # > 8 requests not captured
     assert not graph_runner.has_captured_graph(1024, num_reqs=9)
-
-
-def test_dynamic_thresholds() -> None:
-    runner = MockModelRunner()
-    graph_runner = BeamPrefillGraphRunner(
-        runner,
-        buckets=[16, 128, 256, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096, 5192],
-    )
-
-    # 1. Short prompt (<= 256 tokens): generous padding allowed (up to 35% or 256 tokens)
-    # 200 tokens -> fits 256 (pad 56 = 28% <= 35%)
-    assert graph_runner.match_bucket(200) == 256
-
-    # 2. Medium prompt (257..1024 tokens): up to 20% or 256 tokens
-    # 850 tokens -> fits 1024 (pad 174 = 20.4% but <= 256 max_pad_tokens)
-    assert graph_runner.match_bucket(850) == 1024
-
-    # 3. Transition prompt (1025..2048 tokens): up to 5% or 100 tokens
-    # 1500 tokens -> fits 1536 (pad 36 = 2.4% <= 5%)
-    assert graph_runner.match_bucket(1500) == 1536
-    # 1100 tokens trying to match 1536 (pad 436 tokens = 39.6% > 5% and > 100 tokens) -> Fallback None
-    assert graph_runner.match_bucket(1100) is None
-
-    # 4. Strictly compute-bound (> 2048 tokens): up to 2% or 64 tokens
-    # 3550 tokens -> fits 3584 (pad 34 tokens <= 64 tokens)
-    assert graph_runner.match_bucket(3550) == 3584
-    # 3200 tokens trying to match 3584 (pad 384 tokens = 12% > 2% and > 64 tokens) -> Fallback None
-    assert graph_runner.match_bucket(3200) is None
 
 
 def test_platform_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -511,7 +452,7 @@ def test_bucket_clamp_to_max_num_batched_tokens() -> None:
     assert graph_runner.buckets == [256, 1024]
 
 
-def test_platform_bucket_and_threshold_dispatch(
+def test_platform_bucket_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm_gr.v1.worker.prefill_graph_runner import (
@@ -522,12 +463,9 @@ def test_platform_bucket_and_threshold_dispatch(
         PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
         PREFILL_GRAPH_MAX_BUCKET_DEFAULT,
         get_default_buckets,
-        get_dynamic_thresholds,
     )
 
-    # GPU (default fixture forces non-NPU): configured default buckets and the
-    # GPU threshold table. Derive the expected sequence so changing the default
-    # bucket geometry does not require updating this test.
+    # Both platforms use the configured dense bucket geometry.
     expected_default_buckets = list(
         range(
             PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
@@ -537,19 +475,10 @@ def test_platform_bucket_and_threshold_dispatch(
     )
     assert get_default_buckets() == DEFAULT_PREFILL_BUCKETS
     assert get_default_buckets() == expected_default_buckets
-    assert get_dynamic_thresholds(256) == (0.35, 512)
-    assert get_dynamic_thresholds(700) == (0.30, 300)
-    assert get_dynamic_thresholds(1500) == (0.05, 100)
-    assert get_dynamic_thresholds(3000) == (0.02, 64)
 
-    # NPU: the default bucket geometry is shared with GPU; <=512 tier is the
-    # same as GPU and the <=1024 padding threshold is tightened to (0.1, 10).
     monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: True)
     assert get_default_buckets() == NPU_DEFAULT_PREFILL_BUCKETS
     assert get_default_buckets() == expected_default_buckets
-    assert get_dynamic_thresholds(256) == (0.35, 512)
-    assert get_dynamic_thresholds(700) == (0.1, 10)
-    assert get_dynamic_thresholds(1024) == (0.1, 10)
 
     monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKET_STEP, "256")
     monkeypatch.setenv(ENV_PREFILL_GRAPH_MAX_BUCKET, "1024")
@@ -677,15 +606,17 @@ def test_gpu_replay_falls_back_when_kvlen_exceeds_bound() -> None:
     runner = SimpleNamespace(
         device=torch.device("cpu"),
         input_batch=SimpleNamespace(
-            req_id_to_index={"rA": 0, "rB": 1},
-            num_computed_tokens_cpu=np.array([1000, 0]),
+            req_id_to_index={"rA": 0},
+            num_computed_tokens_cpu=np.array([1000]),
         ),
+        query_start_loc=SimpleNamespace(gpu=torch.tensor([0, 64], dtype=torch.int32)),
+        seq_lens=torch.tensor([564], dtype=torch.int32),
     )
     gpu_runner = GPUPrefillGraphRunner(runner, buckets=[512])
     buf = gpu_runner.buffers[512]
-    buf.captured_graphs[2] = object()
-    buf.output_bufs[2] = torch.zeros(512, 8, 64)
-    buf.max_seq_len_bounds[2] = 1024  # 2 x bucket
+    buf.captured_graphs[1] = object()
+    buf.output_bufs[1] = torch.zeros(512, 8, 64)
+    buf.max_seq_len_bounds[1] = 1024  # 2 x bucket
 
     # A cached request whose KV length (1000 + 64) exceeds the bound must
     # fall back to eager before touching the buffers.
@@ -695,7 +626,7 @@ def test_gpu_replay_falls_back_when_kvlen_exceeds_bound() -> None:
             input_ids=torch.zeros(64, dtype=torch.int32),
             positions=torch.zeros(64, dtype=torch.int64),
             slot_mapping=torch.zeros(64, dtype=torch.int64),
-            num_scheduled_tokens={"rA": 64, "rB": 30},
+            num_scheduled_tokens={"rA": 64},
         )
         is None
     )
@@ -705,17 +636,17 @@ def test_gpu_replay_falls_back_when_kvlen_exceeds_bound() -> None:
         def replay(self) -> None:
             pass
 
-    runner.input_batch.num_computed_tokens_cpu = np.array([500, 0])
-    buf.captured_graphs[2] = FakeGraph()
+    runner.input_batch.num_computed_tokens_cpu = np.array([500])
+    buf.captured_graphs[1] = FakeGraph()
     assert (
         gpu_runner.execute_model_prefill(
             bucket=512,
-            input_ids=torch.zeros(94, dtype=torch.int32),
-            positions=torch.zeros(94, dtype=torch.int64),
-            slot_mapping=torch.zeros(94, dtype=torch.int64),
-            num_scheduled_tokens={"rA": 64, "rB": 30},
+            input_ids=torch.zeros(64, dtype=torch.int32),
+            positions=torch.zeros(64, dtype=torch.int64),
+            slot_mapping=torch.zeros(64, dtype=torch.int64),
+            num_scheduled_tokens={"rA": 64},
         )
-        is buf.output_bufs[2]
+        is buf.output_bufs[1]
     )
 
 
@@ -733,17 +664,3 @@ def test_prefill_runner_init_survives_allocation_failure(
     assert graph_runner.buckets == []
     assert graph_runner.buffers == {}
     assert graph_runner.has_captured_graph(512) is False
-
-
-def test_use_dynamic_thresholds() -> None:
-    from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
-
-    # Explicit padding thresholds disable dynamic matching.
-    graph_runner = BeamPrefillGraphRunner(
-        MockModelRunner(), buckets=[512], max_pad_ratio=0.1, max_pad_tokens=50
-    )
-    assert graph_runner.use_dynamic_thresholds is False
-
-    # No explicit thresholds: dynamic thresholds are always used.
-    graph_runner = BeamPrefillGraphRunner(MockModelRunner(), buckets=[512])
-    assert graph_runner.use_dynamic_thresholds is True

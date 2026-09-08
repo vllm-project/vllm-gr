@@ -123,20 +123,11 @@ class BeamAttentionImpl(AttentionImpl):
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
     ):
-        """ACL Graph FULL-mode replay hook (vllm-ascend contract).
+        """Keep Beam decode FULL replay updates a no-op.
 
-        Called by ``update_full_graph_params`` before every FULL replay
-        (``vllm_ascend/compilation/acl_graph.py``).  Deliberately a no-op:
-        unlike the native PA/FIA backends, whose launch parameters are
-        host-side Python values that freeze at capture, every runtime-varying
-        input of the beam attention path is a persistent fixed-address device
-        buffer refreshed outside the graph each step (metadata builder's
-        ``_fixed_buffers`` pool, the beam context's ``decode_step_buf`` /
-        ``decode_step_1based_buf`` / ``xllm_block_table_buf``), so the
-        captured graph reads fresh values at replay by construction.  The
-        method must exist — the vllm-ascend caller dispatches through
-        ``get_impl_cls().update_graph_params`` unconditionally and would
-        raise AttributeError on the first FULL decode step otherwise.
+        Beam decode refreshes persistent fixed-address device buffers before
+        replay. NPU prefill updates its native attention task groups directly
+        in ``NPUPrefillGraphRunner`` and does not use this shared hook.
         """
         del (
             update_stream,
