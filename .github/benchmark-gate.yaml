@@ -36,11 +36,31 @@ pangu1b:
         online_accuracy_min: 0.875
 
 device_overrides:
+  gpu:
+    boards:
+      decode_graph_gpu:
+        # Logical policy selector for every GPU on decode_graph, not a GPU model.
+        # A100 CI offline result + L20 correctness reference.
+        # A100 online uses the explicitly accepted offline-floor assumption.
+        # Measurement evidence and rollout order: docs/benchmarks/parent_score_gate.md.
+        thresholds:
+          accuracy: &decode_graph_accuracy
+            pass_at_1_min: 0.05
+            pass_at_32_min: 0.21
+            recall_at_32_min: 0.030
   npu:
     boards:
       Ascend910_9362:
         thresholds:
-          performance:
+          performance: &ascend910_9362_performance
             p99_ttft_max: 280
             online_elapsed_seconds_max: 20
             offline_elapsed_seconds_max: 25
+      decode_graph_npu:
+        thresholds:
+          accuracy: *decode_graph_accuracy
+      decode_graph_Ascend910_9362:
+        # Retain this board's performance overrides alongside the shared floors.
+        thresholds:
+          accuracy: *decode_graph_accuracy
+          performance: *ascend910_9362_performance

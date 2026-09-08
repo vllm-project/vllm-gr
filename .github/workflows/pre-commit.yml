@@ -152,6 +152,7 @@ jobs:
           POLICY_FILE: ${{ steps.benchmark-policy.outputs.policy-path }}
           POLICY_REF: ${{ steps.benchmark-policy.outputs.ref }}
           POLICY_RESOLVER: ${{ steps.benchmark-policy.outputs.resolver-path }}
+          POLICY_TARGET_BRANCH: ${{ github.base_ref || github.ref_name }}
         run: |
           device="gpu"
           board_id="unknown"
@@ -161,6 +162,15 @@ jobs:
               python -c 'import acl; print(acl.get_soc_name())' \
                 2>/dev/null || echo unknown
             )"
+          fi
+
+          if [[ "$POLICY_TARGET_BRANCH" == "decode_graph" ]]; then
+            # Share accuracy floors while retaining the known NPU performance profile.
+            if [[ "$device" == "npu" && "$board_id" == "Ascend910_9362" ]]; then
+              board_id="decode_graph_Ascend910_9362"
+            else
+              board_id="decode_graph_${device}"
+            fi
           fi
 
           args=(
