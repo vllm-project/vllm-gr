@@ -183,6 +183,12 @@ repos:
       language: python
       types: [python]
 
+    - id: check-binary-files
+      name: Check for binary files
+      entry: python tools/pre_commit/check_binary_files.py
+      language: python
+      types: [file]
+
     - id: check-characters
       name: Check valid characters in files
       entry: python tools/pre_commit/check_english.py
