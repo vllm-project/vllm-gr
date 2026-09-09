@@ -128,7 +128,7 @@ output=$( python -m benchmarks.open_one_rec.one_rec_acc_test \
 --dataset-path "$DATASET_PATH" \
 --dataset-name  onerec \
 --num-prompts 100 \
---max-concurrency 10 \
+--max-concurrency 16 \
 --use-beam-search \
 --task-type video \
 --catalog-path "$CATALOG_PATH" \
@@ -402,7 +402,7 @@ stop_server
 
 # Run beam star check
 start_server "beam-star" 5 \
-    --max_num_seqs 128 \
+    --max_num_seqs 256 \
     --gpu-memory-utilization 0.8 \
     --max_num_batched_tokens 16384
 
@@ -436,7 +436,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
 --task-type video \
 --endpoint /v1/chat/completions \
 --port $run_port \
---max-concurrency 1 \
+--max-concurrency 16 \
 --beam-star 2.2 \
 --n 128)
 

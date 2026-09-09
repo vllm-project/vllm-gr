@@ -96,6 +96,7 @@ def run_api_inference(
     api_key: str,
     gen_config: Dict[str, Any],
     beam_star: float | None = None,
+    max_concurrency: int | None = None,
 ) -> List[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
@@ -152,7 +153,13 @@ def run_api_inference(
 
     # Run in parallel
     logger.info(f"Sending {len(prompts)} requests to {api_url}...")
-    with ThreadPoolExecutor(max_workers=min(len(prompts), 16)) as executor:
+
+    num_workers = (
+        min(len(prompts), max_concurrency) if max_concurrency is not None else min(len(prompts), 16)
+    )
+    logger.info(f"Using API max concurrency: {num_workers}")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
         results = list(executor.map(_send_request, prompts))
 
     return results
@@ -209,6 +216,9 @@ def main():
         "--max-concurrency", type=int, default=None, help="maximum prompts to run concurrently"
     )
     args = parser.parse_args()
+
+    if args.max_concurrency is not None and args.max_concurrency < 1:
+        parser.error("--max-concurrency must be >= 1")
 
     # 1. Load Configuration
     if args.gr:
@@ -292,7 +302,13 @@ def main():
         gen_start = time.perf_counter()
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         outputs = run_api_inference(
-            prompts, args.model, api_url, args.api_key, gen_config, beam_star=args.beam_star
+            prompts,
+            args.model,
+            api_url,
+            args.api_key,
+            gen_config,
+            beam_star=args.beam_star,
+            max_concurrency=args.max_concurrency,
         )
         gen_end = time.perf_counter()
     else:
