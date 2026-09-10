@@ -27,9 +27,29 @@ def init_gr(
     tokenizer = self.input_processor.tokenizer
     vllm_config = getattr(engine_client, "vllm_config", None)
     catalog_path = GRConfig.from_vllm_config(vllm_config).catalog_path
+    self.catalog_path = catalog_path
     if catalog_path:
         self.catalog = Catalog(tokenizer)
         self.catalog.load(catalog_path)
+
+    # EngineCore has already inherited the BeamProc IPC configuration by the
+    # time OpenAIServingModels is created. The tokenizer and catalog are now
+    # available as well, so an explicitly enabled Rust sidecar can be fully
+    # prepared and started before the API server reports itself ready. This
+    # keeps sidecar startup out of the first benchmark/warmup request.
+    from vllm_gr.entrypoints.openai.beam_proc_manager import (
+        beam_proc_enabled,
+        ensure_beam_proc_started,
+        prepare_beam_proc_catalog,
+    )
+
+    if beam_proc_enabled():
+        prepare_beam_proc_catalog(
+            getattr(self, "model_config", None),
+            tokenizer,
+            catalog_path=catalog_path,
+        )
+        ensure_beam_proc_started()
 
 
 def patch_OpenAIServingModels_init():

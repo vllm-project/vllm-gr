@@ -5,8 +5,29 @@
 
 - Python 3.11+
 - Pip 23+
+- Rust 1.88.0+ and Cargo (required for source or editable installs; latest stable recommended)
 - CUDA 13.0 (for GPU inference)
 - 32GB+ RAM (recommended)
+
+Prebuilt vllm-gr wheels already contain the compiled BeamProc executable and
+do not require Rust on the target machine. Building from a source checkout or
+source distribution compiles BeamProc during installation and therefore
+requires both `rustc` and `cargo`. Rust 1.88.0 is the minimum version required
+by the locked Rust dependencies; the latest stable toolchain is recommended.
+
+Install the stable toolchain with the official `rustup` installer:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+  sh -s -- -y --profile minimal --default-toolchain stable
+source "$HOME/.cargo/env"
+rustc --version
+cargo --version
+```
+
+If `rustup` is already installed, update the toolchain with
+`rustup update stable`. See [Install Rust](https://www.rust-lang.org/tools/install)
+for platform-specific instructions.
 
 ## Setup
 
@@ -105,6 +126,8 @@ curl -X POST "http://localhost:8000/v1/chat/completions" -H "Content-Type: appli
 ```
 
 Or use the [benchmark](benchmarks/README.md) to run a more complete benchmark test.
+See [Rust BeamProc Coordinator](rust_beamproc.md) to enable and benchmark the
+optional Rust coordinator.
 
 ### Data Parallelism
 

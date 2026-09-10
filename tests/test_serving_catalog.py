@@ -76,6 +76,7 @@ async def _serving_catalog_generation_impl(loops: int) -> None:
             models = OpenAIServingModels(
                 engine_client=engine_client, base_model_paths=base_model_paths, lora_modules=None
             )
+            assert models.catalog_path == catalog_path
             serving = OpenAIServing(
                 engine_client=engine_client,
                 models=models,

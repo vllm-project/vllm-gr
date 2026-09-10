@@ -3,6 +3,11 @@
 
 ## Prerequisites
 
+- Rust 1.88.0+ and Cargo for source or editable installs; the latest stable
+  toolchain is recommended. Prebuilt wheels do not require Rust. Follow the
+  [Rust toolchain instructions](quickstart.md#prerequisites) before running
+  `pip install .` or `pip install -e .` from this repository.
+
 - Python 3.11 or 3.12
 - Pip 23+
 - CANN 9.0.0

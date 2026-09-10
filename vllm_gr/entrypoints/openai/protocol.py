@@ -14,7 +14,7 @@ def to_beam_search_params(self, max_tokens: int, default_sampling_params: dict) 
         temperature = default_sampling_params.get(
             "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
         )
-    return BeamSearchParams(
+    params = BeamSearchParams(
         beam_width=n,
         max_tokens=max_tokens,
         ignore_eos=self.ignore_eos,
@@ -25,4 +25,6 @@ def to_beam_search_params(self, max_tokens: int, default_sampling_params: dict) 
         end_token=extra_args.get("end_token"),
         beam_star=bool(extra_args.get("beam_star", False)),
         beam_star_coef=float(extra_args.get("beam_star_coef", 3.3)),
+        return_logprobs=bool(getattr(self, "logprobs", False)),
     )
+    return params

@@ -170,6 +170,8 @@ def _validate_engine_clients_patch() -> str | None:
         and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
         and InprocClient.add_requests is inproc_add_requests
         and InprocClient.beam_request_step_update is inproc_beam_request_step_update
+        and AsyncMPClient.supports_beamproc_transport is True
+        and InprocClient.supports_beamproc_transport is False
     )
     return _verified(valid, "EngineCore client methods are not fully installed")
 
@@ -182,6 +184,7 @@ def _validate_async_llm_patch() -> str | None:
         beam_request_step_update_fn,
         prepare_request_fn,
         register_beam_output_fn,
+        supports_beamproc_transport_fn,
     )
 
     valid = (
@@ -189,6 +192,8 @@ def _validate_async_llm_patch() -> str | None:
         and AsyncLLM._add_requests_batch is _add_requests_batch_fn
         and AsyncLLM.register_beam_output is register_beam_output_fn
         and AsyncLLM.beam_request_step_update is beam_request_step_update_fn
+        and isinstance(AsyncLLM.supports_beamproc_transport, property)
+        and AsyncLLM.supports_beamproc_transport.fget is supports_beamproc_transport_fn
     )
     return _verified(valid, "AsyncLLM grouped-beam methods are not fully installed")
 
@@ -212,11 +217,21 @@ def _validate_engine_core_request_patch() -> str | None:
         _handle_beam_request_step_update,
         process_input_sockets,
     )
-    from vllm_gr.v1.engine.engine_core_patch import _BEAM_STATE_INIT_MARKER
+    from vllm_gr.v1.engine.engine_core_patch import (
+        _BEAM_STATE_INIT_MARKER,
+        _BEAMPROC_BUSY_LOOP_MARKER,
+        _BEAMPROC_PROC_INIT_MARKER,
+    )
 
     valid = (
         getattr(EngineCore.__init__, _BEAM_STATE_INIT_MARKER, False)
         and getattr(EngineCoreProc.__init__, _BEAM_STATE_INIT_MARKER, False)
+        and getattr(EngineCoreProc.__init__, _BEAMPROC_PROC_INIT_MARKER, False)
+        and getattr(
+            EngineCoreProc.run_busy_loop,
+            _BEAMPROC_BUSY_LOOP_MARKER,
+            False,
+        )
         and EngineCore._cache_beam_request is _cache_beam_request
         and EngineCoreProc._cache_beam_request is _cache_beam_request
         and EngineCore._handle_beam_request_step_update is _handle_beam_request_step_update

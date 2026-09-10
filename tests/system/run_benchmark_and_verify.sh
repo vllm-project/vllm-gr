@@ -1,6 +1,7 @@
 #!/bin/bash
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=tools/ci/benchmark_gate_helpers.sh
 source "$SCRIPT_DIR/../../tools/ci/benchmark_gate_helpers.sh"
 
@@ -74,7 +75,8 @@ for failure_mode_name in \
   esac
 done
 
-run_port=7000
+run_port="${VLLM_GR_BENCHMARK_PORT:-7000}"
+unset VLLM_GR_BENCHMARK_PORT
 timeout=600 # time for waiting server to go up
 policy_name="$BENCHMARK_POLICY_NAME"
 device="$BENCHMARK_DEVICE"
@@ -85,6 +87,7 @@ elapsed_time_online_th="$ELAPSED_TIME_ONLINE_THRESHOLD"
 elapsed_time_offline_th="$ELAPSED_TIME_OFFLINE_THRESHOLD"
 p99_ttft_th="$P99_TTFT_THRESHOLD"
 p99_tpot_th="$P99_TPOT_THRESHOLD"
+rust_p99_ttft_th=250
 avg_decode_time_th=120
 pass32_th_bs=0.21 #Beam star is measured without catalog.
 online_accuracy_failure_status=86
@@ -121,6 +124,7 @@ extract_numeric_value() {
     fi
 }
 echo "offline test"
+echo "Using dataset root: $DATASET_PATH"
 
 output=$( python -m benchmarks.open_one_rec.one_rec_acc_test \
 --gr \
@@ -181,6 +185,11 @@ stop_server() {
         SERVER_PID=""
         sleep 3
     fi
+    if [ -n "${BEAMPROC_LOG_TAIL_PID:-}" ]; then
+        kill "$BEAMPROC_LOG_TAIL_PID" 2>/dev/null || true
+        wait "$BEAMPROC_LOG_TAIL_PID" 2>/dev/null || true
+        BEAMPROC_LOG_TAIL_PID=""
+    fi
 }
 
 trap stop_server EXIT
@@ -237,88 +246,122 @@ start_server() {
     fi
 }
 
+# Run the online latency workload and validate its request failures, P99 TTFT,
+# and P99 TPOT. Both Python and Rust use this helper so their benchmark
+# parameters remain identical.
+run_latency_benchmark() {
+    local implementation="$1"
+    local ttft_threshold="$2"
+    local metric_prefix=""
+    local output
+    local failed
+    local p99_ttft
+    local p99_tpot
+
+    if [[ -n "$implementation" ]]; then
+        metric_prefix="$implementation "
+    fi
+
+    echo "Running ${metric_prefix}latency benchmark..."
+    output=$(python -m benchmarks.open_one_rec.one_rec_main \
+      bench serve \
+      --endpoint /v1/chat/completions \
+      --backend openai-chat \
+      --model "$MODEL_PATH" \
+      --dataset-name onerec \
+      --dataset-path "$DATASET_PATH" \
+      --task-type video \
+      --num-prompts 10 \
+      --use-beam-search \
+      --port "$run_port" \
+      --request-rate 0.5 \
+      --n 128)
+
+    echo "$output"
+
+    failed=$(extract_numeric_value "$output" "Failed requests") || return 1
+    if [[ "$failed" -ne 0 ]]; then
+        echo "FAILURE: ${metric_prefix}latency benchmark had $failed failed requests."
+        return 1
+    fi
+
+    p99_ttft=$(extract_numeric_value "$output" "P99 TTFT") || return 1
+    p99_tpot=$(extract_numeric_value "$output" "P99 TPOT") || return 1
+
+    echo "Parsed ${metric_prefix}P99 TTFT: ${p99_ttft} ms"
+    validate_performance_metric "${metric_prefix}P99 TTFT" "$p99_ttft" "$ttft_threshold" \
+      "$PERFORMANCE_FAILURE_MODE" "$device" "$online_performance_failure_status" || return $?
+
+    echo "Parsed ${metric_prefix}P99 TPOT: ${p99_tpot} ms"
+    validate_performance_metric "${metric_prefix}P99 TPOT" "$p99_tpot" "$p99_tpot_th" \
+      "$PERFORMANCE_FAILURE_MODE" "$device" "$online_performance_failure_status" || return $?
+}
+
+# Run the online accuracy workload and validate request success, recommendation
+# accuracy, and elapsed time. Rust reuses the exact Python workload and gates.
+run_online_accuracy_benchmark() {
+    local implementation="$1"
+    local metric_prefix=""
+    local output
+    local request_failed
+    local pass_1
+    local pass_32
+    local recall_32
+    local elapsed_time_online
+
+    if [[ -n "$implementation" ]]; then
+        metric_prefix="$implementation "
+    fi
+
+    echo "Running ${metric_prefix}online accuracy benchmark..."
+    output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+      --model "$MODEL_PATH" \
+      --dataset-path "$DATASET_PATH" \
+      --dataset-name onerec \
+      --num-prompts 100 \
+      --use-beam-search \
+      --backend openai-chat \
+      --task-type video \
+      --endpoint /v1/chat/completions \
+      --port "$run_port" \
+      --n 128)
+
+    echo "$output"
+
+    request_failed=$(extract_numeric_value "$output" "request_failed") || return 1
+    if [[ "$request_failed" -ne 0 ]]; then
+        echo "FAILURE: ${metric_prefix}online accuracy benchmark had $request_failed failed requests."
+        return 1
+    fi
+
+    pass_1=$(extract_numeric_value "$output" "pass@1") || return 1
+    pass_32=$(extract_numeric_value "$output" "pass@32") || return 1
+    recall_32=$(extract_numeric_value "$output" "recall@32") || return 1
+    elapsed_time_online=$(extract_numeric_value "$output" "elapsed_time") || return 1
+
+    echo "Parsed ${metric_prefix}pass@1: $pass_1"
+    echo "Parsed ${metric_prefix}pass@32: $pass_32"
+    echo "Parsed ${metric_prefix}recall@32: $recall_32"
+    echo "Parsed ${metric_prefix}elapsed_time: $elapsed_time_online"
+
+    validate_accuracy_metric "${metric_prefix}pass@1" "$pass_1" "$pass_1_th" \
+      "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || return $?
+    validate_accuracy_metric "${metric_prefix}pass@32" "$pass_32" "$pass_32_th" \
+      "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || return $?
+    validate_accuracy_metric "${metric_prefix}recall@32" "$recall_32" "$recall_32_th" \
+      "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || return $?
+    validate_performance_metric "${metric_prefix}elapsed_time" "$elapsed_time_online" \
+      "$elapsed_time_online_th" "$PERFORMANCE_FAILURE_MODE" "$device" \
+      "$online_performance_failure_status" || return $?
+}
+
 start_server "primary" 5 \
-    --max_num_seqs 2048 \
+    --max_num_seqs 128 \
     --max_num_batched_tokens 16384 \
     --catalog-path "$CATALOG_PATH"
 
-
-output=$(python -m benchmarks.open_one_rec.one_rec_main \
-  bench serve \
-  --endpoint /v1/chat/completions \
-  --backend openai-chat  \
-  --model "$MODEL_PATH"  \
-  --dataset-name onerec \
-  --dataset-path "$DATASET_PATH" \
-  --task-type video  \
-  --num-prompts 10 \
-  --use-beam-search \
-  --port $run_port \
-  --request-rate 0.5 \
-  --n 128)
-
-echo "$output"
-
-# Extract P99 TTFT
-
-
-failed=$(extract_numeric_value "$output" "Failed requests")
-if [[ "$failed" -ne 0 ]]; then
-    echo "FAILURE: There were $failed failed requests."
-    exit 1
-fi
-
-p99_ttft=$(extract_numeric_value "$output" "P99 TTFT") || exit 1
-p99_tpot=$(extract_numeric_value "$output" "P99 TPOT") || exit 1
-
-echo "Parsed P99 TTFT: ${p99_ttft}"
-# Validate P99 ttft (Using awk to safely evaluate floating point comparison)
-validate_performance_metric "P99 TTFT" "$p99_ttft" "$p99_ttft_th" \
-  "$PERFORMANCE_FAILURE_MODE" "$device" "$online_performance_failure_status" || exit $?
-echo "Parsed P99 TPOT: ${p99_tpot} ms"
-
-# Validate P99 tpot (Using awk to safely evaluate floating point comparison)
-validate_performance_metric "P99 TPOT" "$p99_tpot" "$p99_tpot_th" \
-  "$PERFORMANCE_FAILURE_MODE" "$device" "$online_performance_failure_status" || exit $?
-
-output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
---model "$MODEL_PATH" \
---dataset-path "$DATASET_PATH" \
---dataset-name  onerec \
---num-prompts 100 \
---use-beam-search \
---backend openai-chat \
---task-type video \
---endpoint /v1/chat/completions \
---port $run_port \
---n 128)
-
-echo "$output"
-pass_1=$(extract_numeric_value "$output" "pass@1") || exit 1
-pass_32=$(extract_numeric_value "$output" "pass@32") || exit 1
-recall_32=$(extract_numeric_value "$output" "recall@32") || exit 1
-elapsed_time_online=$(extract_numeric_value "$output" "elapsed_time") || exit 1
-
-echo "Parsed pass@1: $pass_1"
-echo "Parsed pass@32: $pass_32"
-echo "Parsed recall@32: $recall_32"
-echo "Parsed elapsed_time: $elapsed_time_online"
-
-# Validate pass@1
-validate_accuracy_metric "pass@1" "$pass_1" "$pass_1_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || exit $?
-
-# Validate pass@32
-validate_accuracy_metric "pass@32" "$pass_32" "$pass_32_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || exit $?
-
-# Validate recall@32
-validate_accuracy_metric "recall@32" "$recall_32" "$recall_32_th" \
-  "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || exit $?
-
-# Validate elapsed_time
-validate_performance_metric "elapsed_time" "$elapsed_time_online" "$elapsed_time_online_th" \
-  "$PERFORMANCE_FAILURE_MODE" "$device" "$online_performance_failure_status" || exit $?
+run_latency_benchmark "" "$p99_ttft_th" || exit $?
+run_online_accuracy_benchmark "" || exit $?
 
 
 # Stop first server before starting chunked prefill server test
@@ -344,7 +387,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
 --backend openai-chat \
 --task-type video \
 --endpoint /v1/chat/completions \
---port $run_port \
+--port "$run_port" \
 --n 128)
 
 echo "$output"
@@ -377,7 +420,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
 --backend openai-chat \
 --task-type video \
 --endpoint /v1/chat/completions \
---port $run_port \
+--port "$run_port" \
 --n 128)
 
 echo "$output"
@@ -416,7 +459,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
       --task-type video \
       --num-prompts 100 \
       --use-beam-search \
-      --port $run_port \
+      --port "$run_port" \
       --max-concurrency 1 \
       --n 128 \
       --beam-star 2.2)
@@ -435,7 +478,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
 --backend openai-chat \
 --task-type video \
 --endpoint /v1/chat/completions \
---port $run_port \
+--port "$run_port" \
 --max-concurrency 16 \
 --beam-star 2.2 \
 --n 128)
@@ -445,6 +488,73 @@ validate_accuracy_metric "Beam Star pass@32" "$pass32" "$pass32_th_bs" \
   "$ACCURACY_FAILURE_MODE" "$device" "$online_accuracy_failure_status" || exit $?
 
 stop_server
+
+# Rust BeamProc latency and accuracy gates.
+if [[ "$device" == "gpu" || "$device" == "npu" ]]; then
+    rust_binary="$REPO_ROOT/rust/target/release/beam-proc"
+
+    echo "Building Rust BeamProc release binary for the latency and accuracy gates..."
+    rustc --version
+    cargo --version
+    if ! cargo build \
+      --release \
+      --locked \
+      --manifest-path "$REPO_ROOT/rust/Cargo.toml" \
+      --target-dir "$REPO_ROOT/rust/target" \
+      --bin beam-proc; then
+        echo "Rust BeamProc release build failed." >&2
+        exit 1
+    fi
+    if [[ ! -x "$rust_binary" ]]; then
+        echo "Rust BeamProc build did not produce an executable at $rust_binary." >&2
+        exit 1
+    fi
+
+    beamproc_log_dir="${RUNNER_TEMP:-/tmp}"
+    beamproc_log_file=$(mktemp "$beamproc_log_dir/vllm-gr-beam-proc.XXXXXX.log")
+    echo "Rust BeamProc binary: $rust_binary"
+    echo "Rust BeamProc log file: $beamproc_log_file (streaming to CI stderr)"
+
+    export VLLM_GR_BEAM_PROC_ENABLED=1
+    export VLLM_GR_BEAM_PROC_NUM_WORKERS=4
+    export VLLM_GR_BEAM_PROC_BINARY="$rust_binary"
+    export VLLM_GR_BEAM_PROC_LOG_LEVEL=warn
+    export VLLM_GR_BEAM_PROC_LOG_FILE="$beamproc_log_file"
+    export VLLM_GR_BEAM_PROC_FINAL_TIMEOUT_S=60
+
+    # Send Rust logs through an unbuffered stream to stderr so CI wrappers
+    # that capture command stdout still display BeamProc progress immediately.
+    echo "[CI] BeamProc log forwarding started: $beamproc_log_file" \
+        >> "$beamproc_log_file"
+    stdbuf -oL -eL tail -n +1 -F "$beamproc_log_file" >&2 &
+    BEAMPROC_LOG_TAIL_PID=$!
+    echo "BeamProc log tail PID: $BEAMPROC_LOG_TAIL_PID"
+
+    rust_device_args=()
+    if [[ "$device" == "npu" ]]; then
+        # Leave extra sampler headroom for the concurrent Rust accuracy run.
+        rust_device_args+=(--gpu-memory-utilization 0.8)
+    fi
+
+    start_server "Rust BeamProc" 5 \
+        "${rust_device_args[@]}" \
+        --max_num_seqs 128 \
+        --max_num_batched_tokens 16384 \
+        --catalog-path "$CATALOG_PATH"
+
+    run_latency_benchmark "Rust" "$rust_p99_ttft_th" || exit $?
+    run_online_accuracy_benchmark "Rust" || exit $?
+    stop_server
+
+    unset VLLM_GR_BEAM_PROC_ENABLED
+    unset VLLM_GR_BEAM_PROC_NUM_WORKERS
+    unset VLLM_GR_BEAM_PROC_BINARY
+    unset VLLM_GR_BEAM_PROC_LOG_LEVEL
+    unset VLLM_GR_BEAM_PROC_LOG_FILE
+    unset VLLM_GR_BEAM_PROC_FINAL_TIMEOUT_S
+else
+    echo "Skipping Rust BeamProc latency and accuracy gates on unsupported device: $device."
+fi
 )
 
 online_status=0

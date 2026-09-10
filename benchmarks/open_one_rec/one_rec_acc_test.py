@@ -78,15 +78,55 @@ def get_sampling_params(gen_config: Dict[str, Any]) -> SamplingParams:
 
 
 class MockCompletionOutput:
-    def __init__(self, text, logprobs=None):
+    def __init__(self, text, logprobs=None, finish_reason=None):
         self.text = text
         self.logprobs = logprobs
+        self.finish_reason = finish_reason
 
 
 class MockRequestOutput:
-    def __init__(self, prompt, outputs: List[MockCompletionOutput]):
+    def __init__(
+        self,
+        prompt,
+        outputs: List[MockCompletionOutput],
+        latency_s: float | None = None,
+    ):
         self.prompt = prompt
         self.outputs = outputs
+        self.latency_s = latency_s
+
+
+class ApiRequestError(RuntimeError):
+    """Raised when an API benchmark request does not produce a valid result."""
+
+
+def _api_request_metrics(
+    outputs: list[MockRequestOutput],
+    attempted: int,
+) -> dict[str, int | float]:
+    latencies_ms = sorted(
+        output.latency_s * 1000.0 for output in outputs if output.latency_s is not None
+    )
+
+    def percentile(percent: float) -> float:
+        if not latencies_ms:
+            return 0.0
+        position = (len(latencies_ms) - 1) * percent
+        lower = int(position)
+        upper = min(lower + 1, len(latencies_ms) - 1)
+        fraction = position - lower
+        return latencies_ms[lower] + (latencies_ms[upper] - latencies_ms[lower]) * fraction
+
+    succeeded = len(outputs)
+    return {
+        "request_attempted": attempted,
+        "request_succeeded": succeeded,
+        "request_failed": attempted - succeeded,
+        "request_success_rate": succeeded / attempted if attempted else 1.0,
+        "request_latency_mean_ms": (sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0),
+        "request_latency_p50_ms": percentile(0.50),
+        "request_latency_p99_ms": percentile(0.99),
+    }
 
 
 def run_api_inference(
@@ -97,6 +137,7 @@ def run_api_inference(
     gen_config: Dict[str, Any],
     beam_star: float | None = None,
     max_concurrency: int | None = None,
+    concurrency_limit: int | None = None,
 ) -> List[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
@@ -122,45 +163,82 @@ def run_api_inference(
     def _send_request(prompt):
         response = None
         payload = {"messages": [{"role": "user", "content": prompt}], **api_params}
+        request_started_at = time.perf_counter()
         try:
             response = requests.post(api_url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
-
-            # Extract content
-            if "choices" in data and data["choices"]:
-                mock_outputs = []
-                for choice in data["choices"]:
-                    message = choice.get("message", {})
-                    content = message.get("content", "")
-                    reasoning = message.get("reasoning_content", "")  # Support for reasoning models
-
-                    full_text = ""
-                    if reasoning:
-                        full_text += reasoning
-                    if content:
-                        full_text += content
-                    mock_outputs.append(MockCompletionOutput(full_text))
-                return MockRequestOutput(prompt, mock_outputs)
-            return MockRequestOutput(prompt, [MockCompletionOutput("")])
         except Exception as e:
             status_code = response.status_code if response is not None else "N/A"
             response_text = response.text if response is not None else "N/A"
-            logger.error(f"Request failed. Status code: {status_code}")
-            logger.error(f"[DEBUG] Response text: {response_text}")
-            logger.error(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
-            return MockRequestOutput(prompt, [MockCompletionOutput("")])
+            raise ApiRequestError(
+                f"Request failed for prompt {prompt[:50]!r}; "
+                f"status={status_code}, response={response_text[:500]!r}: {e}"
+            ) from e
+
+        if not isinstance(data, dict):
+            raise ApiRequestError(f"API response for prompt {prompt[:50]!r} is not an object")
+        choices = data.get("choices")
+        expected_choices = int(api_params["n"])
+        if not isinstance(choices, list) or len(choices) != expected_choices:
+            actual = len(choices) if isinstance(choices, list) else None
+            raise ApiRequestError(
+                f"API response for prompt {prompt[:50]!r} returned "
+                f"{actual} choices; expected {expected_choices}"
+            )
+
+        mock_outputs = []
+        for index, choice in enumerate(choices):
+            if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+                raise ApiRequestError(
+                    f"API response choice {index} for prompt {prompt[:50]!r} has no message object"
+                )
+            if "finish_reason" not in choice:
+                raise ApiRequestError(
+                    f"API response choice {index} for prompt {prompt[:50]!r} has no finish_reason"
+                )
+            message = choice["message"]
+            if "content" not in message and "reasoning_content" not in message:
+                raise ApiRequestError(
+                    f"API response choice {index} for prompt {prompt[:50]!r} "
+                    "has no generated content field"
+                )
+            content = message.get("content") or ""
+            reasoning = message.get("reasoning_content") or ""
+            if not isinstance(content, str) or not isinstance(reasoning, str):
+                raise ApiRequestError(
+                    f"API response choice {index} for prompt {prompt[:50]!r} "
+                    "contains non-string generated content"
+                )
+            mock_outputs.append(
+                MockCompletionOutput(
+                    reasoning + content,
+                    logprobs=choice.get("logprobs"),
+                    finish_reason=choice.get("finish_reason"),
+                )
+            )
+        return MockRequestOutput(
+            prompt,
+            mock_outputs,
+            latency_s=time.perf_counter() - request_started_at,
+        )
 
     # Run in parallel
     logger.info(f"Sending {len(prompts)} requests to {api_url}...")
-
+    requested_concurrency = max_concurrency if max_concurrency is not None else concurrency_limit
     num_workers = (
-        min(len(prompts), max_concurrency) if max_concurrency is not None else min(len(prompts), 16)
+        min(len(prompts), requested_concurrency)
+        if requested_concurrency is not None
+        else min(len(prompts), 16)
     )
     logger.info(f"Using API max concurrency: {num_workers}")
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         results = list(executor.map(_send_request, prompts))
+
+    if len(results) != len(prompts):
+        raise ApiRequestError(f"API benchmark completed {len(results)} of {len(prompts)} requests")
+    logger.info("API request success: %d/%d (100%%)", len(results), len(prompts))
 
     return results
 
@@ -216,6 +294,32 @@ def main():
         "--max-concurrency", type=int, default=None, help="maximum prompts to run concurrently"
     )
     args = parser.parse_args()
+    if args.dataset_path.endswith(".parquet"):
+        dataset_file = args.dataset_path
+        args.dataset_path = os.path.dirname(os.path.dirname(dataset_file))
+        if args.num_prompts is None:
+            sample_marker = "_sample_"
+            filename = os.path.basename(dataset_file)
+            if sample_marker in filename and filename.endswith(".parquet"):
+                sample_size = filename.rsplit(sample_marker, 1)[1].removesuffix(".parquet")
+                if sample_size.isdigit():
+                    args.num_prompts = int(sample_size)
+        logger.info(
+            "Using dataset file %s via dataset root %s and num_prompts=%s",
+            dataset_file,
+            args.dataset_path,
+            args.num_prompts,
+        )
+    elif os.path.basename(os.path.normpath(args.dataset_path)) == args.task_type and os.path.exists(
+        os.path.join(os.path.dirname(os.path.normpath(args.dataset_path)), "sid2pid.json")
+    ):
+        dataset_dir = os.path.normpath(args.dataset_path)
+        args.dataset_path = os.path.dirname(dataset_dir)
+        logger.info(
+            "Using task dataset directory %s via dataset root %s",
+            dataset_dir,
+            args.dataset_path,
+        )
 
     if args.max_concurrency is not None and args.max_concurrency < 1:
         parser.error("--max-concurrency must be >= 1")
@@ -298,6 +402,7 @@ def main():
     logger.info("\nStarting Inference...")
     gen_start = 0.0
     gen_end = 0.0
+    api_metrics: dict[str, int | float] = {}
     if args.endpoint:
         gen_start = time.perf_counter()
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
@@ -311,6 +416,7 @@ def main():
             max_concurrency=args.max_concurrency,
         )
         gen_end = time.perf_counter()
+        api_metrics = _api_request_metrics(outputs, len(prompts))
     else:
         params = BeamSearchParams(
             beam_width=gen_config["num_beams"],
@@ -411,6 +517,7 @@ def main():
     model_params["beam_width"] = gen_config.get("num_beams", 1)
     model_params["temperature"] = gen_config.get("temperature", 0.0)
     model_params["time_per_sample"] = (gen_end - gen_start) / len(prompts) if prompts else 0.0
+    model_params.update(api_metrics)
     metrics = {**model_params, **metrics}
     print(json.dumps(metrics, indent=2))
     if args.result_dir is not None:

@@ -1,0 +1,3 @@
+include rust/Cargo.lock
+include rust/Cargo.toml
+recursive-include rust/beam-proc/src *.rs

@@ -1,0 +1,11 @@
+{
+  "num_workers": 1,
+  "queue_capacity": 64,
+  "zmq_hwm": 64,
+  "log_level": "info",
+  "log_file": "beam-proc/logs/beam-proc.log",
+  "enginecore_beamproc_addr": "tcp://127.0.0.1:5558",
+  "enginecore_beamproc_tx_addr": "tcp://127.0.0.1:5558",
+  "enginecore_beamproc_rx_addr": "tcp://127.0.0.1:5559",
+  "apiserver_output_addr": "tcp://127.0.0.1:5557"
+}

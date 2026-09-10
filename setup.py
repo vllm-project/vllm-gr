@@ -10,22 +10,107 @@ dependencies (CUDA/NPU/CPU) without requiring extras like `[gpu]`.
 
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import warnings
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import Distribution, setup
+from setuptools.command.bdist_wheel import bdist_wheel
+from setuptools.command.build_py import build_py
 from setuptools_scm import get_version
 
 logger = logging.getLogger("vllm_gr.setup")
 
 _VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
 VLLM_GR_BASE_VERSION = "0.22.1"
+REPO_ROOT = Path(__file__).resolve().parent
+RUST_MANIFEST = REPO_ROOT / "rust" / "Cargo.toml"
+RUST_BINARY_NAME = "beam-proc.exe" if os.name == "nt" else "beam-proc"
+SKIP_RUST_BUILD_ENV = "VLLM_GR_SKIP_RUST_BUILD"
 
 # Module-level cache so that detect_target_device() is evaluated exactly once
 # per setup.py invocation, avoiding duplicate log output and potential
 # inconsistency if env vars change between calls.
 _cached_device: str | None = None
+
+
+class BinaryDistribution(Distribution):
+    """Install the bundled BeamProc executable into the platform library."""
+
+    def has_ext_modules(self) -> bool:
+        return True
+
+
+def build_rust_sidecar(build_lib: Path, target_dir: Path) -> Path | None:
+    """Compile BeamProc and copy it into the wheel's Python package."""
+    if os.getenv(SKIP_RUST_BUILD_ENV, "").lower() in {"1", "true", "yes", "on"}:
+        logger.warning("Skipping BeamProc compilation because %s is enabled", SKIP_RUST_BUILD_ENV)
+        return None
+
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise RuntimeError(
+            "Building vllm-gr requires Cargo so the BeamProc sidecar can be compiled. "
+            f"Install Rust/Cargo or set {SKIP_RUST_BUILD_ENV}=1 for a Python-only build."
+        )
+
+    target_dir = target_dir.resolve()
+    subprocess.run(
+        [
+            cargo,
+            "build",
+            "--release",
+            "--locked",
+            "--manifest-path",
+            str(RUST_MANIFEST),
+            "--bin",
+            "beam-proc",
+            "--target-dir",
+            str(target_dir),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    compiled_binary = target_dir / "release" / RUST_BINARY_NAME
+    if not compiled_binary.is_file():
+        raise RuntimeError(f"Cargo completed without producing {compiled_binary}")
+
+    packaged_binary = Path(build_lib) / "vllm_gr" / "bin" / RUST_BINARY_NAME
+    packaged_binary.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(compiled_binary, packaged_binary)
+    packaged_binary.chmod(packaged_binary.stat().st_mode | 0o111)
+    return packaged_binary
+
+
+class BuildPyWithRust(build_py):
+    """Build Python modules and the bundled BeamProc executable."""
+
+    def run(self) -> None:
+        super().run()
+        # Keep editable installs aligned with beam_proc_manager's source-tree
+        # fallback at rust/target/release/beam-proc. The compiled executable is
+        # still copied into build_lib for regular wheel builds.
+        target_dir = REPO_ROOT / "rust" / "target"
+        build_rust_sidecar(Path(self.build_lib), target_dir)
+
+
+class BdistWheelWithRust(bdist_wheel):
+    """Tag the bundled executable as Python-independent native code.
+
+    This produces the normal host-specific build tag. Release artifacts are
+    built on the supported manylinux baseline and tagged only after auditwheel
+    has validated and repaired their native dependencies.
+    """
+
+    def finalize_options(self) -> None:
+        super().finalize_options()
+        self.root_is_pure = False
+
+    def get_tag(self) -> tuple[str, str, str]:
+        _, _, platform_tag = super().get_tag()
+        return "py3", "none", platform_tag
 
 
 def warn_deprecated_extra_install() -> None:
@@ -186,4 +271,6 @@ if __name__ == "__main__":
     setup(
         version=get_vllm_gr_version(),
         install_requires=get_install_requires(),
+        distclass=BinaryDistribution,
+        cmdclass={"build_py": BuildPyWithRust, "bdist_wheel": BdistWheelWithRust},
     )

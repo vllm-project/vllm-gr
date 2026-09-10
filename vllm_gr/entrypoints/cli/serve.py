@@ -24,6 +24,17 @@ class GRServeSubcommand(ServeSubcommand):
 
     name = "serve"
 
+    @staticmethod
+    def cmd(args: argparse.Namespace) -> None:
+        from vllm_gr.entrypoints.openai.beam_proc_manager import (
+            ensure_beam_proc_config,
+        )
+
+        # Prepare BeamProc IPC addresses before vLLM spawns EngineCore so
+        # the child process inherits the TX/RX environment variables.
+        ensure_beam_proc_config()
+        ServeSubcommand.cmd(args)
+
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)
 

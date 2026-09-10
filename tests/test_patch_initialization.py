@@ -263,3 +263,112 @@ def test_plugin_exposes_simple_per_patch_status(
         "patch_count": 1,
         "patches": {"flat_logprobs": "applied"},
     }
+
+
+def test_beamproc_io_start_is_idempotent_across_engine_core_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.engine import core, engine_core_patch
+
+    calls: list[str] = []
+
+    class EngineCoreProc:
+        pass
+
+    def original_init(self: object) -> None:
+        calls.append("init")
+
+    def original_run_busy_loop(self: object) -> None:
+        calls.append("run_busy_loop")
+
+    monkeypatch.setattr(
+        core,
+        "_start_beamproc_io_thread",
+        lambda self: calls.append("start_beamproc_io"),
+    )
+
+    EngineCoreProc.__init__ = (  # type: ignore[method-assign]
+        engine_core_patch.make_patched_engine_core_proc_init(original_init)
+    )
+    EngineCoreProc.run_busy_loop = (  # type: ignore[attr-defined]
+        engine_core_patch.make_patched_engine_core_proc_run_busy_loop(original_run_busy_loop)
+    )
+
+    engine_core = EngineCoreProc()
+    engine_core.run_busy_loop()  # type: ignore[attr-defined]
+
+    assert calls == ["init", "start_beamproc_io", "run_busy_loop"]
+    assert (
+        engine_core_patch.make_patched_engine_core_proc_init(EngineCoreProc.__init__)
+        is EngineCoreProc.__init__
+    )
+    assert (
+        engine_core_patch.make_patched_engine_core_proc_run_busy_loop(
+            EngineCoreProc.run_busy_loop  # type: ignore[attr-defined]
+        )
+        is EngineCoreProc.run_busy_loop  # type: ignore[attr-defined]
+    )
+
+
+def test_beamproc_busy_loop_starts_io_when_constructor_hook_was_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.engine import core, engine_core_patch
+
+    calls: list[str] = []
+
+    class EngineCoreProc:
+        pass
+
+    def original_run_busy_loop(self: object) -> None:
+        calls.append("run_busy_loop")
+
+    monkeypatch.setattr(
+        core,
+        "_start_beamproc_io_thread",
+        lambda self: calls.append("start_beamproc_io"),
+    )
+    EngineCoreProc.run_busy_loop = (  # type: ignore[attr-defined]
+        engine_core_patch.make_patched_engine_core_proc_run_busy_loop(original_run_busy_loop)
+    )
+
+    engine_core = EngineCoreProc()
+    engine_core.run_busy_loop()  # type: ignore[attr-defined]
+
+    assert calls == ["start_beamproc_io", "run_busy_loop"]
+
+
+@pytest.mark.parametrize("use_busy_loop_fallback", [False, True])  # type: ignore
+def test_beamproc_plugin_loaded_during_constructor(
+    monkeypatch: pytest.MonkeyPatch, use_busy_loop_fallback: bool
+) -> None:
+    """Reproduce plugin installation after Python has entered the constructor."""
+    from vllm_gr.v1.engine import core, engine_core_patch
+
+    calls: list[str] = []
+    monkeypatch.setattr(core, "_start_beamproc_io_thread", lambda self: calls.append("start_io"))
+
+    class EngineCoreProc:
+        def __init__(self) -> None:
+            calls.append("load_plugins")
+            # Like load_general_plugins inside upstream EngineCore.__init__:
+            # replacing __init__ cannot wrap the invocation already in flight.
+            EngineCoreProc.__init__ = (  # type: ignore[method-assign]
+                engine_core_patch.make_patched_engine_core_proc_init(EngineCoreProc.__init__)
+            )
+            if use_busy_loop_fallback:
+                EngineCoreProc.run_busy_loop = (  # type: ignore[method-assign]
+                    engine_core_patch.make_patched_engine_core_proc_run_busy_loop(
+                        EngineCoreProc.run_busy_loop
+                    )
+                )
+
+        def run_busy_loop(self) -> None:
+            calls.append("run")
+
+    engine_core = EngineCoreProc()
+    assert calls == ["load_plugins"]
+    engine_core.run_busy_loop()
+    assert calls == (
+        ["load_plugins", "start_io", "run"] if use_busy_loop_fallback else ["load_plugins", "run"]
+    )

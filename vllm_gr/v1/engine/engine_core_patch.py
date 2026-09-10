@@ -5,16 +5,25 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
+import os
 from functools import wraps
 
 from vllm.logger import init_logger
 
 from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
+from vllm_gr.v1.worker import model_runner_common as _model_runner_common
 
 logger = init_logger(__name__)
 
+BEAM_PROC_ENGINECORE_ENV = "VLLM_GR_BEAM_PROC_ENGINECORE_ADDR"
+BEAM_PROC_ENGINECORE_TX_ENV = "VLLM_GR_BEAM_PROC_ENGINECORE_TX_ADDR"
+BEAM_PROC_ENGINECORE_RX_ENV = "VLLM_GR_BEAM_PROC_ENGINECORE_RX_ADDR"
+BEAM_PROC_ENABLED_ENV = "VLLM_GR_BEAM_PROC_ENABLED"
 _BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
+_BEAMPROC_PROC_INIT_MARKER = "_vllm_gr_initializes_beamproc_io"
+_BEAMPROC_BUSY_LOOP_MARKER = "_vllm_gr_ensures_beamproc_io"
+_BEAMPROC_IO_START_ATTEMPTED_ATTR = "_vllm_gr_beamproc_io_start_attempted"
 _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
 
 # ---------------------------------------------------------------------------
@@ -36,10 +45,60 @@ def make_patched_engine_core_init(original_init):
 
         _ensure_beam_state(self)
         original_init(self, *args, **kwargs)
+        self.beamproc_block_size = getattr(
+            getattr(getattr(self, "vllm_config", None), "cache_config", None),
+            "block_size",
+            None,
+        )
 
     setattr(patched_init, _BEAM_STATE_INIT_MARKER, True)
+    return patched_init
+
+
+def _ensure_beamproc_io_started(engine_core_proc) -> None:
+    """Start BeamProc I/O at most once for an EngineCoreProc instance."""
+    if getattr(engine_core_proc, _BEAMPROC_IO_START_ATTEMPTED_ATTR, False):
+        return
+
+    setattr(engine_core_proc, _BEAMPROC_IO_START_ATTEMPTED_ATTR, True)
+    from vllm_gr.v1.engine.core import _start_beamproc_io_thread
+
+    _start_beamproc_io_thread(engine_core_proc)
+
+
+def make_patched_engine_core_proc_init(original_init):
+    """Wrap EngineCoreProc.__init__ to add BeamProc I/O queues/thread."""
+    if getattr(original_init, _BEAMPROC_PROC_INIT_MARKER, False):
+        return original_init
+
+    @wraps(original_init)
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _ensure_beamproc_io_started(self)
+
+    setattr(patched_init, _BEAMPROC_PROC_INIT_MARKER, True)
 
     return patched_init
+
+
+def make_patched_engine_core_proc_run_busy_loop(original_run_busy_loop):
+    """Ensure BeamProc I/O exists before EngineCore begins processing work.
+
+    This is a fallback for spawned workers where EngineCoreProc.__init__ was
+    resolved before the constructor wrapper was installed. Attribute lookup
+    for run_busy_loop happens after construction, so this hook still observes
+    the patched class in that case.
+    """
+    if getattr(original_run_busy_loop, _BEAMPROC_BUSY_LOOP_MARKER, False):
+        return original_run_busy_loop
+
+    @wraps(original_run_busy_loop)
+    def patched_run_busy_loop(self, *args, **kwargs):
+        _ensure_beamproc_io_started(self)
+        return original_run_busy_loop(self, *args, **kwargs)
+
+    setattr(patched_run_busy_loop, _BEAMPROC_BUSY_LOOP_MARKER, True)
+    return patched_run_busy_loop
 
 
 # ---------------------------------------------------------------------------
@@ -48,16 +107,52 @@ def make_patched_engine_core_init(original_init):
 
 
 def apply_engine_core_request_patches() -> None:
-    """Install EngineCore request dispatch and beam-state support."""
+    """Install grouped-beam dispatch and the optional BeamProc transport."""
+    import vllm.v1.engine as engine_mod
+    import vllm.v1.engine.core as upstream_core
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
+        _enqueue_beamproc_abort,
+        _enqueue_beamproc_message,
+        _handle_beam_fork,
         _handle_beam_request_step_update,
+        make_patched_handle_client_request,
+        make_patched_process_engine_step,
+        make_patched_process_input_queue,
         process_input_sockets,
+        process_output_sockets,
     )
 
-    logger.info("[vllm-gr] apply_engine_core_child_patches called.")
+    logger.warning(
+        "[vllm-gr CE diagnostic] pid=%s patch_file=%s "
+        "upstream_core_file=%s enabled=%r binary=%r tx=%r rx=%r",
+        os.getpid(),
+        __file__,
+        upstream_core.__file__,
+        os.getenv(BEAM_PROC_ENABLED_ENV),
+        os.getenv("VLLM_GR_BEAM_PROC_BINARY"),
+        os.getenv(BEAM_PROC_ENGINECORE_TX_ENV),
+        os.getenv(BEAM_PROC_ENGINECORE_RX_ENV),
+    )
+
+    beam_proc_addr = os.getenv(BEAM_PROC_ENGINECORE_ENV)
+    beam_proc_tx_addr = os.getenv(BEAM_PROC_ENGINECORE_TX_ENV, beam_proc_addr or "")
+    beam_proc_rx_addr = os.getenv(BEAM_PROC_ENGINECORE_RX_ENV, beam_proc_addr or "")
+    if beam_proc_tx_addr:
+        engine_mod.BEAM_PROC_ENGINECORE_ZMQ_ADDR = beam_proc_tx_addr
+        EngineCore.BEAM_PROC_ENGINECORE_ZMQ_ADDR = beam_proc_tx_addr
+        EngineCoreProc.BEAM_PROC_ENGINECORE_ZMQ_ADDR = beam_proc_tx_addr
+        engine_mod.BEAM_PROC_ENGINECORE_TX_ZMQ_ADDR = beam_proc_tx_addr
+        EngineCore.BEAM_PROC_ENGINECORE_TX_ZMQ_ADDR = beam_proc_tx_addr
+        EngineCoreProc.BEAM_PROC_ENGINECORE_TX_ZMQ_ADDR = beam_proc_tx_addr
+        logger.info("EngineCore beam-proc TX address configured: %s", beam_proc_tx_addr)
+    if beam_proc_rx_addr:
+        engine_mod.BEAM_PROC_ENGINECORE_RX_ZMQ_ADDR = beam_proc_rx_addr
+        EngineCore.BEAM_PROC_ENGINECORE_RX_ZMQ_ADDR = beam_proc_rx_addr
+        EngineCoreProc.BEAM_PROC_ENGINECORE_RX_ZMQ_ADDR = beam_proc_rx_addr
+        logger.info("EngineCore beam-proc RX address configured: %s", beam_proc_rx_addr)
 
     register_engine_core_request_types()
 
@@ -66,14 +161,36 @@ def apply_engine_core_request_patches() -> None:
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
     EngineCoreProc.__init__ = make_patched_engine_core_init(EngineCoreProc.__init__)
 
-    # Bind request handlers explicitly on both classes.
+    # Wrap EngineCoreProc.__init__ to add BeamProc I/O queues/thread
+    EngineCoreProc.__init__ = make_patched_engine_core_proc_init(EngineCoreProc.__init__)
+    EngineCoreProc.run_busy_loop = make_patched_engine_core_proc_run_busy_loop(
+        EngineCoreProc.run_busy_loop
+    )
+
+    # Bind the upstream grouped update and the internal BeamProc plan handler.
     EngineCore._cache_beam_request = _cache_beam_request
+    EngineCore._handle_beam_fork = _handle_beam_fork
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCoreProc._cache_beam_request = _cache_beam_request
+    EngineCoreProc._handle_beam_fork = _handle_beam_fork
     EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
+    EngineCoreProc._enqueue_beamproc_message = _enqueue_beamproc_message
+    EngineCoreProc._enqueue_beamproc_abort = _enqueue_beamproc_abort
+
+    # Keep BeamProc plan queue processing on the EngineCore main thread.
+    EngineCoreProc._process_input_queue = make_patched_process_input_queue(
+        EngineCoreProc._process_input_queue
+    )
+    EngineCoreProc._process_engine_step = make_patched_process_engine_step(
+        EngineCoreProc._process_engine_step
+    )
+    EngineCoreProc._handle_client_request = make_patched_handle_client_request(
+        EngineCoreProc._handle_client_request
+    )
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
+    EngineCoreProc.process_output_sockets = process_output_sockets
 
     EngineCore._patched_for_beam_requests = True
     EngineCoreProc._patched_for_beam_requests = True
@@ -280,3 +397,19 @@ def apply_scheduler_patch():
     setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)
     Scheduler._patched_for_beam_requests = True
     logger.debug("Scheduler.schedule patched for beam-requests propagation.")
+
+
+# Preserve the historical import path while using upstream's extracted,
+# device-neutral model-runner implementation.
+BeamReqIdsProxy = _model_runner_common.BeamReqIdsProxy
+Mock1DArray = _model_runner_common.Mock1DArray
+Mock2DArray = _model_runner_common.Mock2DArray
+InputBatchProxy = _model_runner_common.InputBatchProxy
+_get_positions_buffers = _model_runner_common._get_positions_buffers
+_write_position_segments = _model_runner_common._write_position_segments
+_process_beam_decode_request = _model_runner_common._process_beam_decode_request
+_remux_logprobs_tensors = _model_runner_common._remux_logprobs_tensors
+_beam_remap_inputs = _model_runner_common._beam_remap_inputs
+_beam_collapse_bookkeeping = _model_runner_common._beam_collapse_bookkeeping
+make_patched_execute_model = _model_runner_common.make_patched_execute_model
+is_worker_runner_patched = _model_runner_common.is_worker_runner_patched

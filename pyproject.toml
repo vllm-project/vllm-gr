@@ -69,7 +69,7 @@ where = ["."]
 include = ["vllm_gr*"]
 
 [tool.setuptools.package-data]
-"vllm_gr" = ["_version.py", "*.json"]
+"vllm_gr" = ["_version.py", "*.json", "bin/beam-proc", "bin/beam-proc.exe"]
 
 [tool.setuptools_scm]
 fallback_version = "0.22.1"

@@ -10,7 +10,6 @@ on:
     paths-ignore:
       - 'docs/**'
       - 'examples/**'
-      - '.github/**'
       - '.buildkite/**'
       - '**.md'
       - '*.yml'
@@ -32,7 +31,6 @@ on:
     paths-ignore:
       - 'docs/**'
       - 'examples/**'
-      - '.github/**'
       - '.buildkite/**'
       - '*.yml'
       - '**.md'
@@ -54,32 +52,90 @@ jobs:
       github.event_name != 'pull_request' ||
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    container:
+      # Build against the oldest supported GNU/Linux ABI instead of whatever
+      # happens to be installed on ubuntu-latest.
+      image: quay.io/pypa/manylinux_2_28_x86_64
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - python-version: "3.11"
+            python-abi: cp311-cp311
+          - python-version: "3.12"
+            python-abi: cp312-cp312
+          - python-version: "3.13"
+            python-abi: cp313-cp313
+
+    env:
+      PYTHON: /opt/python/${{ matrix.python-abi }}/bin/python
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+      - name: Trust checked-out repository
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Install uv
+      - name: Set up Rust
         run: |
-          pip install uv
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Build Wheel
+      - name: Build native wheel
         env:
-          UV_SYSTEM_PYTHON: 1
           VLLM_GR_TARGET_DEVICE: cpu
         run: |
-          bash scripts/build_wheel.sh --python python
+          bash scripts/build_wheel.sh --python "$PYTHON"
+
+      - name: Repair and validate manylinux wheel
+        run: |
+          auditwheel show dist/*.whl
+          mkdir -p wheelhouse
+          auditwheel repair \
+            --plat manylinux_2_28_x86_64 \
+            --wheel-dir wheelhouse \
+            dist/*.whl
+          auditwheel show wheelhouse/*.whl
+
+          wheels=(wheelhouse/*.whl)
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "Expected exactly one repaired wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          if [[ "${wheels[0]}" != *manylinux_2_28_x86_64.whl ]]; then
+            echo "Repaired wheel has an unexpected platform tag: ${wheels[0]}" >&2
+            exit 1
+          fi
+
+      - name: Smoke-test installed BeamProc sidecar
+        run: |
+          smoke_dir="$(mktemp -d)"
+          "$PYTHON" -m pip install \
+            --no-deps \
+            --target "$smoke_dir" \
+            wheelhouse/*.whl
+
+          beamproc="$smoke_dir/vllm_gr/bin/beam-proc"
+          test -x "$beamproc"
+          ldd "$beamproc" | tee /tmp/beamproc-ldd.txt
+          if grep -q 'not found' /tmp/beamproc-ldd.txt; then
+            echo "BeamProc has unresolved shared-library dependencies" >&2
+            exit 1
+          fi
+
+          set +e
+          output="$($beamproc /tmp/nonexistent-beamproc-config.json 2>&1)"
+          status=$?
+          set -e
+          if [[ $status -eq 0 || "$output" != Error:* ]]; then
+            echo "BeamProc did not reach its configuration-loading entry point" >&2
+            echo "$output" >&2
+            exit 1
+          fi
 
       - name: Upload Wheel Artifact
         if: ${{ !env.ACT }}
         uses: actions/upload-artifact@v4
         with:
           name: vllm-gr-wheel-py${{ matrix.python-version }}
-          path: dist/*.whl
+          path: wheelhouse/*.whl

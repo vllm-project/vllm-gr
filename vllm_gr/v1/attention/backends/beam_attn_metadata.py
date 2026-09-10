@@ -384,13 +384,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                         b_suffix_start = b_cache_len
                     else:
                         b_suffix_start = prefix_len + b_physical * steps
-                    for i in range(b_past_suffix):
-                        beam_suffix_slot_mapping_out_list.append(
-                            ("past", req_idx, b_suffix_start + i)
-                        )
+                    beam_suffix_slot_mapping_out_list.extend(
+                        (req_idx, b_suffix_start + i) for i in range(b_past_suffix)
+                    )
 
-                for i in range(b_uncached):
-                    beam_suffix_slot_mapping_out_list.append(("current", q_curr + i))
+                beam_suffix_slot_mapping_out_list.extend(
+                    (-1, q_curr + i) for i in range(b_uncached)
+                )
 
                 # Invariant: Merge adjacent beams that share the exact same prefix length
                 # into a single prefix group to parallelize key/value lookup during attention.
@@ -514,30 +514,25 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
             if suffix_slot_mapping_out_list:
                 suffix_total_tokens = len(suffix_slot_mapping_out_list)
-                block_size = self.block_size
-
-                past_coords_list = []
-                curr_coords_list = []
-
-                for idx, item in enumerate(suffix_slot_mapping_out_list):
-                    if isinstance(item, tuple) and item[0] == "past":
-                        _, req_idx, t_past = item
-                        past_coords_list.append(
-                            (idx, req_idx, t_past // block_size, t_past % block_size)
-                        )
-                    else:
-                        q_idx = item[1] if isinstance(item, tuple) else item
-                        curr_coords_list.append((idx, q_idx))
-
-                suffix_past_coords = (
-                    torch.tensor(past_coords_list, dtype=torch.long, device=device)
-                    if past_coords_list
-                    else None
+                suffix_locations = torch.tensor(
+                    suffix_slot_mapping_out_list, dtype=torch.long, device=device
                 )
-                suffix_curr_coords = (
-                    torch.tensor(curr_coords_list, dtype=torch.long, device=device)
-                    if curr_coords_list
-                    else None
+                query_mask = suffix_locations[:, 0] == -1
+                block_size = self.block_size
+                output_indices = torch.arange(suffix_total_tokens, device=device)
+                cached_locations = suffix_locations[~query_mask]
+                cached_positions = cached_locations[:, 1]
+                suffix_past_coords = torch.stack(
+                    (
+                        output_indices[~query_mask],
+                        cached_locations[:, 0],
+                        cached_positions // block_size,
+                        cached_positions % block_size,
+                    ),
+                    dim=1,
+                )
+                suffix_curr_coords = torch.stack(
+                    (output_indices[query_mask], suffix_locations[query_mask, 1]), dim=1
                 )
 
                 suffix_slot_mapping_out = self._project_suffix_slot_mapping(

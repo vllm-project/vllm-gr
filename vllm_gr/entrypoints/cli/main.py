@@ -52,6 +52,9 @@ def main() -> None:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     import vllm_gr.entrypoints.cli.check_env as gr_check_env
+    from vllm_gr.plugin import initialize_runtime
+
+    initialize_runtime()
 
     _handle_gr_flags()
 

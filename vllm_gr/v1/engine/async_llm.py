@@ -18,6 +18,11 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+def supports_beamproc_transport_fn(self) -> bool:
+    """Report whether the underlying EngineCore client can reach BeamProc."""
+    return bool(getattr(self.engine_core, "supports_beamproc_transport", False))
+
+
 async def prepare_request_fn(
     self,
     request_id,

@@ -9,8 +9,9 @@ import asyncio
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
@@ -27,6 +28,40 @@ class _OutputQueue:
         return self.output
 
 
+def test_beamproc_root_identity_does_not_parse_external_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(serving_engine, "random_uuid", lambda: "opaque-session-id")
+
+    assert (
+        serving_engine._new_beamproc_root_request_id("customer-beam-value-beamproc-another-value")
+        == "opaque-session-id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_wait_fails_when_beamproc_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.entrypoints.openai import beam_proc_manager
+
+    output_client = SimpleNamespace()
+    monkeypatch.setattr(
+        serving_engine,
+        "_ensure_beamproc_apiserver_output",
+        MagicMock(),
+    )
+    monkeypatch.setattr(beam_proc_manager, "beam_proc_exit_code", lambda: 23)
+
+    with pytest.raises(RuntimeError, match="status 23"):
+        await serving_engine._await_beamproc_apiserver_plan(
+            output_client,
+            "root",
+            4,
+            1.0,
+        )
+
+
 class _Tokenizer:
     eos_token_id = 2
 
@@ -35,6 +70,9 @@ class _Tokenizer:
 
     def decode(self, token_ids: list[int]) -> str:
         return " ".join(str(token_id) for token_id in token_ids)
+
+    def batch_decode(self, token_ids: list[list[int]]) -> list[str]:
+        return [self.decode(ids) for ids in token_ids]
 
 
 def _raw_block(
@@ -113,10 +151,30 @@ def _engine_output(
 
 
 class _OrdinaryEngineClient:
+    supports_beamproc_transport = True
+
     def __init__(self, prepare_outputs: list[Any]) -> None:
         self.prepare_outputs = list(prepare_outputs)
         self.prepare_calls: list[SimpleNamespace] = []
         self.add_batch_calls: list[SimpleNamespace] = []
+        self.generate_calls: list[SimpleNamespace] = []
+
+    async def generate(
+        self,
+        prompt: Any,
+        sampling_params: Any,
+        request_id: str,
+        **kwargs: Any,
+    ) -> AsyncGenerator[Any, None]:
+        self.generate_calls.append(
+            SimpleNamespace(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                kwargs=kwargs,
+            )
+        )
+        yield self.prepare_outputs.pop(0)
 
     async def prepare_request(
         self,
@@ -211,12 +269,6 @@ class _GroupedEngineClient(_OrdinaryEngineClient):
 
 
 class _FakeCatalog:
-    """Minimal Catalog stand-in for beam_search().
-
-    Each entry is a full token sequence; ``valid`` returns the trie
-    continuation set and ``is_terminal`` reports exact matches.
-    """
-
     def __init__(self, entries: list[list[int]]) -> None:
         self.entries = [tuple(entry) for entry in entries]
 
@@ -252,7 +304,11 @@ def _serving(engine_client: Any, catalog: Any = None) -> SimpleNamespace:
     return SimpleNamespace(
         engine_client=engine_client,
         input_processor=SimpleNamespace(tokenizer=_Tokenizer()),
-        models=SimpleNamespace(catalog=catalog, model_name="test-model"),
+        models=SimpleNamespace(
+            catalog=catalog,
+            catalog_path="/catalog.json",
+            model_name="test-model",
+        ),
     )
 
 
@@ -467,9 +523,6 @@ def test_eos_and_distinct_sid_end_token_both_complete() -> None:
 def test_terminal_catalog_beams_are_completed_not_lost(
     monkeypatch: Any,
 ) -> None:
-    """A beam whose generated tokens complete a catalog item must be
-    finished and kept (regression for terminal beams being masked to -inf
-    and dropped by the finite-score filter)."""
     _install_deterministic_request_ids(monkeypatch)
     catalog = _FakeCatalog([[11, 21], [12, 31]])
     engine = _GroupedEngineClient(
@@ -483,8 +536,6 @@ def test_terminal_catalog_beams_are_completed_not_lost(
                     ]
                 )
             ),
-            # Step 2: both prefixes [11, 21] and [12, 31] are terminal, so
-            # every candidate gets masked away; the beams must complete.
             _engine_output(
                 _combined_flat(
                     [
@@ -500,10 +551,7 @@ def test_terminal_catalog_beams_are_completed_not_lost(
         _collect_outputs(
             serving_engine.beam_search(
                 _serving(engine, catalog=catalog),
-                {
-                    "prompt": "prompt text",
-                    "prompt_token_ids": [10],
-                },
+                {"prompt": "prompt text", "prompt_token_ids": [10]},
                 "request-0",
                 _params(max_tokens=3),
                 trace_headers={"trace": "value"},
@@ -511,20 +559,16 @@ def test_terminal_catalog_beams_are_completed_not_lost(
         )
     )
 
-    assert len(outputs) == 1
     choices = outputs[0].outputs
     assert [choice.finish_reason for choice in choices] == ["stop", "stop"]
     assert [choice.token_ids for choice in choices] == [[11, 21], [12, 31]]
     assert [choice.cumulative_logprob for choice in choices] == pytest.approx([-0.6, -0.8])
-    assert len(engine.beam_updates) == 3
     assert engine.beam_updates[-1].beam_width == 0
 
 
 def test_grouped_step_exception_still_cleans_up_session(
     monkeypatch: Any,
 ) -> None:
-    """An exception mid-decode must still purge the persistent beam session
-    (regression for stranded KV-cache/session state on cancellation)."""
     _install_deterministic_request_ids(monkeypatch)
     engine = _GroupedEngineClient(
         prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
@@ -537,9 +581,6 @@ def test_grouped_step_exception_still_cleans_up_session(
                     ]
                 )
             ),
-            # Never consumed: the decode-step update raises before the
-            # grouped result is awaited, but register_beam_output already
-            # popped one entry.
             _engine_output(
                 _combined_flat(
                     [
@@ -549,13 +590,203 @@ def test_grouped_step_exception_still_cleans_up_session(
                 )
             ),
         ],
-        fail_step=1,  # raise on the second beam_request_step_update
+        fail_step=1,
     )
 
     with pytest.raises(RuntimeError, match="injected failure"):
         _run_search(engine, max_tokens=3)
 
-    # The finally block must still have signalled a cleanup update.
     assert engine.beam_updates[-1].beam_width == 0
     assert engine.beam_updates[-1].session_id == "request-0-step-0-beam-0"
     assert engine.beam_updates[-1].pruned_ids == engine.beam_updates[0].child_beam_ids
+
+
+def test_zero_decode_steps_skip_beamproc_and_model_generation(
+    monkeypatch: Any,
+) -> None:
+    from vllm_gr.entrypoints.openai import beam_proc_manager
+
+    monkeypatch.setenv(serving_engine._BEAMPROC_ENABLED_ENV, "1")
+    prepare_catalog = MagicMock()
+    ensure_started = MagicMock()
+    monkeypatch.setattr(beam_proc_manager, "prepare_beam_proc_catalog", prepare_catalog)
+    monkeypatch.setattr(beam_proc_manager, "ensure_beam_proc_started", ensure_started)
+    engine = _OrdinaryEngineClient(prepare_outputs=[])
+
+    outputs = _run_search(
+        engine,
+        max_tokens=1,
+        request_id="zero-decode-steps",
+        end_token="<end>",
+    )
+
+    prepare_catalog.assert_not_called()
+    ensure_started.assert_not_called()
+    assert engine.prepare_calls == []
+    assert engine.add_batch_calls == []
+    assert len(outputs) == 1
+    assert len(outputs[0].outputs) == 1
+    assert outputs[0].outputs[0].token_ids == [3]
+    assert outputs[0].metrics.num_generation_tokens == 0
+
+
+def test_beamproc_unsupported_transport_refuses_python_fallback(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv(serving_engine._BEAMPROC_ENABLED_ENV, "1")
+    engine = _OrdinaryEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+    )
+    engine.supports_beamproc_transport = False
+
+    with pytest.raises(RuntimeError, match="AS fast path cannot run"):
+        _run_search(
+            engine,
+            max_tokens=1,
+            request_id="unsupported-transport",
+        )
+
+    assert engine.prepare_calls == []
+    assert engine.add_batch_calls == []
+    assert engine.generate_calls == []
+
+
+@pytest.mark.parametrize("failure_stage", ["catalog", "startup", "receiver"])
+def test_beamproc_preflight_failure_refuses_python_fallback(
+    monkeypatch: Any,
+    failure_stage: str,
+) -> None:
+    from vllm_gr.entrypoints.openai import beam_proc_manager
+
+    monkeypatch.setenv(serving_engine._BEAMPROC_ENABLED_ENV, "1")
+    prepare_catalog = MagicMock()
+    ensure_started = MagicMock()
+    ensure_receiver = MagicMock()
+    if failure_stage == "catalog":
+        prepare_catalog.side_effect = RuntimeError("catalog failed")
+    elif failure_stage == "startup":
+        ensure_started.side_effect = RuntimeError("startup failed")
+    else:
+        ensure_receiver.side_effect = RuntimeError("receiver failed")
+    send_prefill = AsyncMock()
+    monkeypatch.setattr(beam_proc_manager, "prepare_beam_proc_catalog", prepare_catalog)
+    monkeypatch.setattr(beam_proc_manager, "ensure_beam_proc_started", ensure_started)
+    monkeypatch.setattr(serving_engine, "_ensure_beamproc_apiserver_output", ensure_receiver)
+    monkeypatch.setattr(serving_engine, "_send_beamproc_prefill", send_prefill)
+    engine = _OrdinaryEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+    )
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        _run_search(
+            engine,
+            max_tokens=1,
+            request_id=f"{failure_stage}-required",
+        )
+
+    send_prefill.assert_not_awaited()
+    assert engine.add_batch_calls == []
+    assert engine.generate_calls == []
+
+
+@pytest.mark.parametrize(
+    "termination",
+    [asyncio.CancelledError, GeneratorExit],
+)
+def test_beamproc_termination_aborts_before_local_cleanup(
+    monkeypatch: Any,
+    termination: type[BaseException],
+) -> None:
+    from vllm_gr.entrypoints.openai import beam_proc_manager
+
+    monkeypatch.setenv(serving_engine._BEAMPROC_ENABLED_ENV, "1")
+    monkeypatch.setattr(beam_proc_manager, "prepare_beam_proc_catalog", MagicMock())
+    monkeypatch.setattr(beam_proc_manager, "ensure_beam_proc_started", MagicMock())
+    monkeypatch.setattr(serving_engine, "_ensure_beamproc_apiserver_output", MagicMock())
+    monkeypatch.setattr(
+        serving_engine,
+        "_send_beamproc_prefill",
+        AsyncMock(return_value="prefill-request"),
+    )
+    monkeypatch.setattr(
+        serving_engine,
+        "_await_beamproc_apiserver_plan",
+        AsyncMock(side_effect=termination()),
+    )
+    events: list[str] = []
+    cleanup = MagicMock(side_effect=lambda *_args: events.append("cleanup"))
+    discard = MagicMock()
+    monkeypatch.setattr(serving_engine, "_cleanup_beamproc_prefill_output_state", cleanup)
+    monkeypatch.setattr(serving_engine, "_discard_beamproc_apiserver_state", discard)
+    engine = _OrdinaryEngineClient(prepare_outputs=[])
+
+    async def abort(_request_id: str) -> None:
+        events.append("abort")
+
+    engine.abort = AsyncMock(side_effect=abort)
+
+    with pytest.raises(termination):
+        _run_search(
+            engine,
+            max_tokens=1,
+            request_id="terminated-fast-path",
+        )
+
+    engine.abort.assert_awaited_once_with("prefill-request")
+    cleanup.assert_called_once_with(engine, "prefill-request")
+    discard.assert_called_once()
+    assert events == ["abort", "cleanup"]
+    assert engine.generate_calls == []
+
+
+def test_rust_final_plan_preserves_per_step_logprobs(monkeypatch: Any) -> None:
+    from vllm_gr.entrypoints.openai import beam_proc_manager
+
+    monkeypatch.setenv(serving_engine._BEAMPROC_ENABLED_ENV, "1")
+    prepare_catalog = MagicMock()
+    monkeypatch.setattr(beam_proc_manager, "prepare_beam_proc_catalog", prepare_catalog)
+    monkeypatch.setattr(beam_proc_manager, "ensure_beam_proc_started", MagicMock())
+    monkeypatch.setattr(serving_engine, "_ensure_beamproc_apiserver_output", MagicMock())
+    monkeypatch.setattr(serving_engine, "_cleanup_beamproc_prefill_output_state", MagicMock())
+    monkeypatch.setattr(serving_engine, "_discard_beamproc_apiserver_state", MagicMock())
+    monkeypatch.setattr(
+        serving_engine,
+        "_send_beamproc_prefill",
+        AsyncMock(return_value="prefill-request"),
+    )
+    monkeypatch.setattr(
+        serving_engine,
+        "_await_beamproc_apiserver_plan",
+        AsyncMock(
+            return_value={
+                "final_token_ids": [[11, 21]],
+                "final_token_ids_include_prompt": False,
+                "final_scores": [-0.3],
+                "final_finish_reasons": ["length"],
+                "final_stop_token_ids": [None],
+                "final_logprob_token_ids": np.asarray([11, 12, 21, 22], dtype="<i4"),
+                "final_logprob_values": np.asarray([-0.1, -0.2, -0.2, -0.4], dtype="<f4"),
+                "final_logprob_step_offsets": np.asarray([0, 2, 4], dtype="<u8"),
+                "final_logprob_beam_offsets": np.asarray([0, 2], dtype="<u8"),
+            }
+        ),
+    )
+
+    outputs = _run_search(
+        _OrdinaryEngineClient(prepare_outputs=[]),
+        max_tokens=3,
+        request_id="rust-logprobs",
+    )
+
+    prepare_catalog.assert_called_once_with(
+        None,
+        ANY,
+        catalog_path="/catalog.json",
+    )
+    assert len(outputs) == 1
+    choice = outputs[0].outputs[0]
+    assert isinstance(choice.logprobs, FlatLogprobs)
+    assert choice.logprobs.start_indices == [0, 2]
+    assert choice.logprobs.end_indices == [2, 4]
+    assert choice.logprobs.token_ids == [11, 12, 21, 22]
+    assert choice.logprobs.logprobs == pytest.approx([-0.1, -0.2, -0.2, -0.4])

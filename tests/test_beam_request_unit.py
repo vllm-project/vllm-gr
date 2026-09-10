@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
+import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
@@ -33,12 +34,22 @@ from vllm.v1.engine import (
 )
 
 from vllm_gr.entrypoints.openai.serving_engine import (
+    _add_batch_step,
     _beam_request_cleanup,
     _beam_request_step,
+    _beamproc_fast_path_supported,
+    _materialize_beamproc_final_logprobs,
+    _send_beamproc_prefill,
+    _wake_beamproc_apiserver_waiters,
 )
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
-from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_request_step_update
+from vllm_gr.v1.engine.core import (
+    _cache_beam_request,
+    _handle_beam_request_step_update,
+    _publish_beam_children,
+)
 from vllm_gr.v1.engine.core_client import (
+    _decode_beamproc_final_frames,
     add_requests_async,
     beam_request_step_update_async,
 )
@@ -50,6 +61,7 @@ from vllm_gr.v1.engine.core_client_patch import (
     inproc_beam_request_step_update,
     prepare_request_fn,
     register_beam_output_fn,
+    supports_beamproc_transport_fn,
     sync_mp_add_requests,
     sync_mp_beam_request_step_update,
 )
@@ -316,6 +328,76 @@ class TestBeamDecodeSamplingParams:
 
 
 class TestTypesSerialization:
+    def test_decodes_v3_final_logprob_steps(self):
+        payload = {
+            "version": 3,
+            "final_beams": 2,
+            "final_token_ids_len": 3,
+            "final_token_offsets_len": 3,
+            "final_scores_len": 2,
+            "final_logprob_token_ids_len": 6,
+            "final_logprob_values_len": 6,
+            "final_logprob_step_offsets_len": 4,
+            "final_logprob_beam_offsets_len": 3,
+        }
+
+        def frame(value: bytes) -> SimpleNamespace:
+            return SimpleNamespace(buffer=memoryview(value))
+
+        frames = [
+            frame(b"BEAM_FINAL"),
+            frame(msgspec.msgpack.encode(payload)),
+            frame(np.asarray([10, 11, 20], dtype="<i4").tobytes()),
+            frame(np.asarray([0, 2, 3], dtype="<u8").tobytes()),
+            frame(np.asarray([-0.3, -0.4], dtype="<f4").tobytes()),
+            frame(np.asarray([1, 2, 3, 4, 5, 6], dtype="<i4").tobytes()),
+            frame(np.asarray([-0.1, -0.2, -0.3, -0.4, -0.5, -0.6], dtype="<f4").tobytes()),
+            frame(np.asarray([0, 2, 4, 6], dtype="<u8").tobytes()),
+            frame(np.asarray([0, 2, 3], dtype="<u8").tobytes()),
+        ]
+
+        decoded = _decode_beamproc_final_frames(frames)
+
+        assert decoded["final_token_ids"] == [[10, 11], [20]]
+        assert decoded["final_logprob_token_ids"].tolist() == [1, 2, 3, 4, 5, 6]
+        assert decoded["final_logprob_values"].tolist() == pytest.approx(
+            [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6]
+        )
+        assert decoded["final_logprob_step_offsets"].tolist() == [0, 2, 4, 6]
+        assert decoded["final_logprob_beam_offsets"].tolist() == [0, 2, 3]
+
+    def test_materializes_packed_logprobs_with_per_beam_offsets(self):
+        plan = {
+            "final_logprob_token_ids": np.asarray([10, 11, 20, 30, 31], dtype="<i4"),
+            "final_logprob_values": np.asarray([-0.1, -0.2, -0.3, -0.4, -0.5], dtype="<f4"),
+            "final_logprob_step_offsets": np.asarray([0, 2, 3, 5], dtype="<u8"),
+            "final_logprob_beam_offsets": np.asarray([0, 2, 3], dtype="<u8"),
+        }
+
+        first = _materialize_beamproc_final_logprobs(
+            plan,
+            0,
+            sid_begin_token_id=1,
+            sid_end_token_id=3,
+        )
+        second = _materialize_beamproc_final_logprobs(
+            plan,
+            1,
+            sid_begin_token_id=None,
+            sid_end_token_id=None,
+        )
+
+        assert first.start_indices == [0, 1, 3, 4]
+        assert first.end_indices == [1, 3, 4, 5]
+        assert first.token_ids == [1, 10, 11, 20, 3]
+        assert first.logprobs == pytest.approx([0.0, -0.1, -0.2, -0.3, 0.0])
+        assert first.ranks == [None] * 5
+        assert first.decoded_tokens == [None] * 5
+        assert second.start_indices == [0]
+        assert second.end_indices == [2]
+        assert second.token_ids == [30, 31]
+        assert second.logprobs == pytest.approx([-0.4, -0.5])
+
     def test_roundtrip_all_fields(self) -> None:
         sp = _sampling_params()
         original = BeamRequestStepUpdate(
@@ -640,6 +722,21 @@ class TestBeamCache:
         # Assert all 25 prompt tokens are matched from cache using real production code
         assert computed_tokens == 25
         assert sliced_blocks == (["block_0", "block_1"],)
+
+    def test_publish_internal_children_retains_live_requests_without_snapshot_copy(self) -> None:
+        eng = _make_engine_self(beam_cache={"parent": object()})
+        child = _make_mock_request(
+            request_id="child",
+            token_ids=[1, 2, 3],
+            block_hashes=[0xAA, 0xBB],
+        )
+
+        _publish_beam_children(eng, [child], {"parent"})
+
+        assert "parent" not in eng.beam_cache
+        cached_request, cached_block_hash_count = eng.beam_cache["child"]
+        assert cached_request is child
+        assert cached_block_hash_count == 2
 
     def test_handle_creates_single_add_request(self) -> None:
         eng = _make_engine_self(beam_cache={"session-0": _session_entry()})
@@ -1376,10 +1473,25 @@ class TestClientPatches:
         assert AsyncLLM._add_requests_batch is _add_requests_batch_fn
         assert AsyncLLM.register_beam_output is register_beam_output_fn
         assert AsyncLLM.beam_request_step_update is beam_request_step_update_fn
+        assert isinstance(AsyncLLM.supports_beamproc_transport, property)
+        assert AsyncLLM.supports_beamproc_transport.fget is supports_beamproc_transport_fn
+        assert AsyncMPClient.supports_beamproc_transport is True
+        assert InprocClient.supports_beamproc_transport is False
         assert SyncMPClient.add_requests is sync_mp_add_requests
         assert SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
         assert InprocClient.add_requests is inproc_add_requests
         assert InprocClient.beam_request_step_update is inproc_beam_request_step_update
+
+    def test_beamproc_transport_capability_delegates_to_core_client(self) -> None:
+        multiprocess = SimpleNamespace(
+            engine_core=SimpleNamespace(supports_beamproc_transport=True)
+        )
+        inprocess = SimpleNamespace(engine_core=SimpleNamespace(supports_beamproc_transport=False))
+        unknown = SimpleNamespace(engine_core=SimpleNamespace())
+
+        assert supports_beamproc_transport_fn(multiprocess) is True
+        assert supports_beamproc_transport_fn(inprocess) is False
+        assert supports_beamproc_transport_fn(unknown) is False
 
     def test_apply_batch_fork_patches_patches_engine_core_for_inproc(self) -> None:
         from vllm.v1.engine.core import EngineCore
@@ -1397,6 +1509,95 @@ class TestClientPatches:
 
 
 class TestBeamSearchOrchestration:
+    def test_beamproc_fast_path_requires_transport_capability(self) -> None:
+        assert not _beamproc_fast_path_supported(
+            batch_submission_supported=True,
+            beamproc_transport_supported=False,
+            total_decode_steps=3,
+        )
+        assert _beamproc_fast_path_supported(
+            batch_submission_supported=True,
+            beamproc_transport_supported=True,
+            total_decode_steps=3,
+        )
+
+    def test_wake_beamproc_waiter_tolerates_concurrent_cancellation(self) -> None:
+        async def run_test() -> None:
+            future = asyncio.get_running_loop().create_future()
+            engine_client = SimpleNamespace(
+                beamproc_apiserver_waiters_by_root={"root": [(2, future)]}
+            )
+            plan = {"root_request_id": "root", "beam_width": 2}
+
+            def pop_after_cancel(*_args):
+                future.cancel()
+                return plan
+
+            with patch(
+                "vllm_gr.entrypoints.openai.serving_engine._pop_beamproc_apiserver_plan",
+                side_effect=pop_after_cancel,
+            ):
+                _wake_beamproc_apiserver_waiters(engine_client, "root")
+
+            assert future.cancelled()
+            assert engine_client.beamproc_apiserver_waiters_by_root == {}
+
+        asyncio.run(run_test())
+
+    def test_add_batch_step_falls_back_to_public_generate(self) -> None:
+        outputs = [SimpleNamespace(finished=True), SimpleNamespace(finished=True)]
+
+        async def generate(_prompt, _params, request_id, **_kwargs):
+            index = int(request_id.rsplit("-", 1)[1])
+            yield outputs[index]
+
+        engine_client = SimpleNamespace(generate=generate)
+        result, internal_ids = asyncio.run(
+            _add_batch_step(
+                engine_client,
+                prompts_batch=([10], [20]),
+                lora_req_batch=(None, None),
+                request_id_batch="root",
+                beam_search_params=_sampling_params(),
+                use_beam_req=False,
+                trace_headers=None,
+            )
+        )
+
+        assert result == outputs
+        assert internal_ids == []
+
+    def test_send_beamproc_prefill_awaits_prepare_request(self) -> None:
+        ec_req = SimpleNamespace(request_id="root-beam-0")
+        lifecycle = MagicMock()
+
+        async def add_requests_batch(*_args, **_kwargs) -> None:
+            lifecycle.record_prefill.assert_called_once_with("root-beam-0")
+
+        engine_client = SimpleNamespace(
+            prepare_request=AsyncMock(return_value=(object(), ec_req)),
+            _add_requests_batch=AsyncMock(side_effect=add_requests_batch),
+        )
+        prompt = {"type": "token", "prompt_token_ids": [10, 20]}
+
+        request_id = asyncio.run(
+            _send_beamproc_prefill(
+                engine_client,
+                prompt,
+                "root",
+                _sampling_params(),
+                None,
+                None,
+                None,
+                lifecycle=lifecycle,
+            )
+        )
+
+        engine_client.prepare_request.assert_awaited_once()
+        engine_client._add_requests_batch.assert_awaited_once_with([ec_req], use_batch_message=True)
+        lifecycle.record_prefill.assert_called_once_with("root-beam-0")
+        assert request_id == "root-beam-0"
+
     def test_use_beam_request_true_when_client_has_method(self) -> None:
         ec = MagicMock(spec=["beam_request_step_update"])
         assert hasattr(ec, "beam_request_step_update")

@@ -14,10 +14,13 @@ from vllm_gr.v1.engine.async_llm import (
     beam_request_step_update_fn,
     prepare_request_fn,
     register_beam_output_fn,
+    supports_beamproc_transport_fn,
 )
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
     beam_request_step_update_async,
+    make_patched_background_resources_call,
+    make_patched_ensure_output_queue_task,
 )
 
 logger = init_logger(__name__)
@@ -79,14 +82,32 @@ def apply_request_type_patches() -> None:
 
 def apply_engine_client_patches() -> None:
     """Add batch and beam-update methods to EngineCore clients."""
-    from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
+    from vllm.v1.engine.core_client import (
+        AsyncMPClient,
+        BackgroundResources,
+        InprocClient,
+        SyncMPClient,
+    )
 
     AsyncMPClient.add_requests_async = add_requests_async
     AsyncMPClient.beam_request_step_update_async = beam_request_step_update_async
+    AsyncMPClient.supports_beamproc_transport = True
+    if not getattr(AsyncMPClient, "_vllm_gr_beamproc_output_patched", False):
+        AsyncMPClient._ensure_output_queue_task = make_patched_ensure_output_queue_task(
+            AsyncMPClient._ensure_output_queue_task
+        )
+        AsyncMPClient._vllm_gr_beamproc_output_patched = True
+
+    if not getattr(BackgroundResources, "_vllm_gr_beamproc_cleanup_patched", False):
+        BackgroundResources.__call__ = make_patched_background_resources_call(
+            BackgroundResources.__call__
+        )
+        BackgroundResources._vllm_gr_beamproc_cleanup_patched = True
     SyncMPClient.add_requests = sync_mp_add_requests
     SyncMPClient.beam_request_step_update = sync_mp_beam_request_step_update
     InprocClient.add_requests = inproc_add_requests
     InprocClient.beam_request_step_update = inproc_beam_request_step_update
+    InprocClient.supports_beamproc_transport = False
 
 
 def apply_async_llm_patches() -> None:
@@ -97,6 +118,7 @@ def apply_async_llm_patches() -> None:
     AsyncLLM._add_requests_batch = _add_requests_batch_fn
     AsyncLLM.register_beam_output = register_beam_output_fn
     AsyncLLM.beam_request_step_update = beam_request_step_update_fn
+    AsyncLLM.supports_beamproc_transport = property(supports_beamproc_transport_fn)
 
 
 def apply_batch_fork_patches() -> None:

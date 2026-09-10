@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from vllm.entrypoints.openai import api_server as openai_api_server
 
+from vllm_gr.entrypoints.openai.beam_proc_manager import (
+    ensure_beam_proc_config,
+)
 from vllm_gr.logger import init_logger
 
 logger = init_logger(__name__)
@@ -26,4 +29,9 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     vLLM general plugin loads the vllm-gr beam-search / NPU patches before
     this runs.
     """
+    # Prepare the IPC addresses before vLLM spawns EngineCore so the plugin
+    # can configure the BeamProc sockets in every child process. When enabled,
+    # the sidecar starts later in OpenAIServingModels initialization, after the
+    # tokenizer is available and the catalog has been exported.
+    ensure_beam_proc_config()
     await openai_api_server.run_server(args, **uvicorn_kwargs)

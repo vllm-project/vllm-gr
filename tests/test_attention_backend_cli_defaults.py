@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 import unittest
 from unittest import mock
@@ -59,3 +60,27 @@ class TestNonServeNoMutation(unittest.TestCase):
             _handle_gr_flags()
             self.assertNotIn("--attention-backend", sys.argv)
             self.assertEqual(sys.argv, original_argv)
+
+
+class TestServeStartup(unittest.TestCase):
+    def test_beamproc_config_is_prepared_before_server_start(self) -> None:
+        from vllm.entrypoints.cli.serve import ServeSubcommand
+
+        from vllm_gr.entrypoints.cli.serve import GRServeSubcommand
+
+        args = argparse.Namespace()
+        calls = mock.Mock()
+        with (
+            mock.patch(
+                "vllm_gr.entrypoints.openai.beam_proc_manager.ensure_beam_proc_config"
+            ) as ensure_config,
+            mock.patch.object(ServeSubcommand, "cmd") as serve_cmd,
+        ):
+            calls.attach_mock(ensure_config, "ensure_config")
+            calls.attach_mock(serve_cmd, "serve")
+            GRServeSubcommand.cmd(args)
+
+        self.assertEqual(
+            calls.mock_calls,
+            [mock.call.ensure_config(), mock.call.serve(args)],
+        )

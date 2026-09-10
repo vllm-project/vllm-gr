@@ -87,6 +87,24 @@ def test_vllm_serving_and_client_patch_contract() -> None:
     assert callable(InprocClient.add_request)
 
 
+def test_chat_beam_params_only_return_requested_logprobs() -> None:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+    from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
+
+    request = ChatCompletionRequest(
+        model="model",
+        messages=[{"role": "user", "content": "prompt"}],
+        n=2,
+        use_beam_search=True,
+        logprobs=False,
+    )
+    assert to_beam_search_params(request, 5, {}).return_logprobs is False
+
+    request.logprobs = True
+    assert to_beam_search_params(request, 5, {}).return_logprobs is True
+
+
 def test_vllm_ascend_model_runner_patch_contract() -> None:
     if importlib.util.find_spec("vllm_ascend") is None:
         pytest.skip("vllm-ascend is not installed")

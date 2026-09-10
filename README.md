@@ -28,6 +28,12 @@ The current implementation targets inference scenarios and does not aim for full
 dependencies are auto-detected by `setup.py` — no `[gpu]` / `[npu]` extras
 needed.
 
+Prebuilt wheels include the compiled Rust BeamProc executable. Source and
+editable installations require Cargo and Rust 1.88.0 or newer; the latest
+stable Rust toolchain is recommended. See the
+[quickstart prerequisites](docs/quickstart.md#prerequisites) for installation
+and verification commands.
+
 For detailed instructions, see [quickstart](docs/quickstart.md) or [quick start ascend](docs/quickstart-ascend.md).
 
 ## Unified self-validation

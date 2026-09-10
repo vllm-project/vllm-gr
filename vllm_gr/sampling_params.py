@@ -35,6 +35,9 @@ class BeamSearchParams(
     end_token: str | None = None
     beam_star: bool = False
     beam_star_coef: float = 3.3
+    # Materialize per-token logprobs in the final response. Beam scoring still
+    # requests its internal top-K candidates regardless of this flag.
+    return_logprobs: bool = True
 
     def __post_init__(self) -> None:
         if self.beam_star_coef <= 0:

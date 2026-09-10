@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 def patch_beam_search():
     from vllm.entrypoints.openai.engine.serving import OpenAIServing
@@ -8,6 +12,10 @@ def patch_beam_search():
     from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
     OpenAIServing.beam_search = beam_search
+    logger.info(
+        "vllm_gr patched OpenAIServing.beam_search with %s",
+        beam_search.__module__,
+    )
 
 
 def patch_sampling():
@@ -22,8 +30,12 @@ def patch_engine_core_process_entrypoint() -> None:
     """Wrap the EngineCore process entrypoint for spawn-based runtimes."""
     from vllm.v1.engine.core import EngineCoreProc
 
+    from vllm_gr.entrypoints.openai.beam_proc_manager import ensure_beam_proc_config
+    from vllm_gr.v1.engine.core_client_patch import apply_batch_fork_patches
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
+    ensure_beam_proc_config()
+    apply_batch_fork_patches()
     # Save the original so the wrapper can delegate without recursion
     # even if run_patch() is called again in a spawned child process.
     current_run_engine_core = EngineCoreProc.run_engine_core
