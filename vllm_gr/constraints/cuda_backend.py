@@ -30,7 +30,7 @@ class _BackendState(Enum):
 
 
 class CUDAConstraintBackend:
-    """Own GPU-resident canonical tables and dispatch CUDA constrained Top-K."""
+    """Dispatch candidate-normalized Top-K over GPU-resident canonical tables."""
 
     __slots__ = (
         "_first_token_ids",

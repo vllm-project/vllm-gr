@@ -16,6 +16,7 @@ from vllm_gr.constraints.backend import (
     build_constraint_output,
     validate_select_inputs,
 )
+from vllm_gr.constraints.scoring import score_selected_tokens
 from vllm_gr.constraints.validity import (
     constraint_candidate_counts,
     valid_mask_from_counts,
@@ -126,10 +127,26 @@ class NPUConstraintBackend:
             current_step=metadata.current_step,
             vocab_size=self._info.table_metadata.vocab_size,
         )
+        valid_mask = valid_mask_from_counts(valid_counts, metadata.top_k)
+        # Preserve strict validation of the extension's raw ABI before its
+        # legal-set scores are replaced by shared-domain model logprobs.
+        raw_output = build_constraint_output(
+            token_ids,
+            logprobs,
+            valid_mask,
+            logits=logits,
+            top_k=metadata.top_k,
+        )
+        logprobs = score_selected_tokens(
+            logits,
+            raw_output.token_ids,
+            valid_mask,
+            metadata.temperatures,
+        )
         return build_constraint_output(
             token_ids,
             logprobs,
-            valid_mask_from_counts(valid_counts, metadata.top_k),
+            valid_mask,
             logits=logits,
             top_k=metadata.top_k,
         )
