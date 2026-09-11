@@ -229,6 +229,9 @@ tmp/
 *.prof
 *.lprof
 
+# Benchmark results (A/B tests and daily benchmarks)
+results/
+
 # setuptools-scm generated version file
 vllm_gr/_version.py
 
