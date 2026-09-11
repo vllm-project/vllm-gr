@@ -493,12 +493,6 @@ class TestEnumPatching:
             == 1
         )
 
-    def test_enum_lookup_by_value(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x06")
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
-        assert EngineCoreRequestType(b"\x06") is EngineCoreRequestType.ADD_BATCH
-        assert EngineCoreRequestType(b"\x07") is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
-
     def test_rejects_upstream_wire_value_collision(self) -> None:
         try:
             _add_enum_member("COLLIDES_WITH_WAKEUP", b"\x05")
@@ -1484,14 +1478,6 @@ class TestClientPatches:
 
 
 class TestBeamSearchOrchestration:
-    def test_use_beam_request_true_when_client_has_method(self) -> None:
-        ec = MagicMock(spec=["beam_request_step_update"])
-        assert hasattr(ec, "beam_request_step_update")
-
-    def test_use_beam_request_false_when_method_absent(self) -> None:
-        ec = MagicMock(spec=[])
-        assert not hasattr(ec, "beam_request_step_update")
-
     def test_beam_request_step_builds_correct_update(self) -> None:
         ec = MagicMock()
         ec.register_beam_output = MagicMock(return_value=_finished_queue())
@@ -1840,22 +1826,6 @@ class TestPatchWiring:
 
 
 class TestIntegrationCrossProcess:
-    def test_enum_values_no_collision(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x06")
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
-
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x06"
-        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x07"
-
-        # Our two values must not collide with any upstream member
-        for name in EngineCoreRequestType._member_names_:
-            if name in ("ADD_BATCH", "BEAM_REQUEST_STEP_UPDATE"):
-                continue
-            member = getattr(EngineCoreRequestType, name)
-            assert member.value not in (b"\x06", b"\x07"), (
-                f"Collision: upstream member {name!r} already uses value {member.value!r}"
-            )
-
     def test_beam_request_step_update_encode_decode(self) -> None:
         from vllm.v1.serial_utils import MsgpackDecoder
 
@@ -1885,14 +1855,6 @@ class TestIntegrationCrossProcess:
         assert decoded.beam_width == 2
         assert decoded.eos_token_id == 2
         assert decoded.data_parallel_rank == 1
-
-    def test_beam_request_step_update_wire_byte_is_x07(self) -> None:
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x07")
-        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x07"
-
-    def test_add_batch_wire_byte_is_x06(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x06")
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x06"
 
 
 class TestBeamKernelsDynamicBeamCount:

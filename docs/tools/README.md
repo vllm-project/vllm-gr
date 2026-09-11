@@ -113,6 +113,16 @@ HF_HUB_OFFLINE=1 \
 ./tools/run_test.sh
 ```
 
+The pre-commit test gate excludes `pangu_st` model/API tests. CI runs them
+through the dedicated Pangu offline and online gates, avoiding another model
+load when the runner already has `PANGU1B_MODEL_PATH` set. Pangu's lightweight
+unit checks remain in pre-commit. To run the model/API tests directly:
+
+```bash
+PANGU1B_MODEL_PATH=/path/to/openPangu-Embedded-1B-V1.1 \
+python -m pytest -m pangu_st tests/st
+```
+
 ### Github Actions tester
 
 Execute a full workflows execution. Its create an empty environment via docker and perform all workflows define in .github/workflows.

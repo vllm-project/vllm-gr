@@ -80,6 +80,9 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v"
 timeout = 250
+markers = [
+    "pangu_st: Pangu model tests executed by the dedicated offline/online CI gates",
+]
 
 [tool.black]
 line-length = 100

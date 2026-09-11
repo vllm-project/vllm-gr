@@ -142,10 +142,14 @@ def _run_offline_gr_beam_search_target(loops: int, npu_decode_execution: str = "
 
 @pytest.mark.slow  # type: ignore
 @pytest.mark.timeout(600)  # spawn subprocess compiles + loads engine twice
-@pytest.mark.parametrize("npu_decode_execution", ["default", "cascade", "xllm"])  # type: ignore
+@pytest.mark.parametrize(  # type: ignore
+    "npu_decode_execution",
+    # NPU default aliases one of these backends; its resolution has separate
+    # unit coverage. Exercise each implementation's two lifecycles once.
+    # Keep explicit xllm so an unavailable operator library still fails.
+    ["cascade", "xllm"] if hasattr(torch, "npu") and torch.npu.is_available() else ["default"],
+)
 def test_offline_gr_beam_search(loops: int, npu_decode_execution: str) -> None:
-    if npu_decode_execution == "xllm" and not (hasattr(torch, "npu") and torch.npu.is_available()):
-        pytest.skip("xllm decode execution requires an Ascend NPU")
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(
         target=_run_offline_gr_beam_search_target,

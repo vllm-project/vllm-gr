@@ -272,9 +272,6 @@ def run_case(case: CaseSpec) -> dict[str, object]:
         device=DEVICE,
     )
 
-    # Reference first (pure torch, cannot fail the kernel).
-    ref = run_reference_attention_torch(inputs)
-
     # Backend under test — CANN may reject certain configs (missing tiling key,
     # wrong dtype, unsupported head dim …).  Catch those so the test reports a
     # skip instead of an unexpected failure.
@@ -284,6 +281,11 @@ def run_case(case: CaseSpec) -> dict[str, object]:
         row["verdict"] = classify_error(e)
         row["error"] = short_error(e)
         return row
+
+    # The backend reads query/KV and writes a separate output tensor. Compute
+    # the reference only after it succeeds, avoiding reference work for configs
+    # CANN cannot launch. Reference errors remain outside the backend handler.
+    ref = run_reference_attention_torch(inputs)
 
     max_abs, max_rel, mean_abs = _error_stats(backend_out, ref)
     row["max_abs_err"] = f"{max_abs:.4e}"

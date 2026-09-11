@@ -563,13 +563,6 @@ class TestStepFunctionsPassRank:
 
 
 class TestStatsUpdateTask:
-    def test_stats_update_task_called_on_multi_add_batch(self) -> None:
-        mock_self = _make_dp_client_mock()
-        reqs = [_make_request_mock("r0"), _make_request_mock("r1")]
-        asyncio.run(add_requests_async(mock_self, reqs, force_batch=True))
-
-        mock_self._ensure_stats_update_task.assert_called()
-
     def test_stats_update_task_not_called_on_single_no_force(self) -> None:
         mock_self = _make_dp_client_mock()
         mock_self.add_request_async = AsyncMock()

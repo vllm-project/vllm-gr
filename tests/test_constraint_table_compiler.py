@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import replace
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -242,59 +245,37 @@ def test_rejects_short_tokenizer_result() -> None:
 # --- P2-3: malformed document -> ValueError, not KeyError/AttributeError ---
 
 
-def test_rejects_triple_missing_field(tokenizer: MagicMock) -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "mutate_document,error",
+    [
+        (lambda doc: doc["triples"][0].pop("a"), "missing required field"),
+        (lambda doc: doc.update(triples=[[1, 2, 3]]), "must be an object"),
+        (lambda doc: doc.pop("relations"), "relations"),
+        (lambda doc: doc.update(relations=[1, 2]), "relations"),
+        (lambda doc: doc["relations"].update(first="abc"), "first must be a list"),
+        (lambda doc: doc["relations"].update(a_to_b=[1]), "a_to_b must be a dict"),
+        (lambda doc: doc["triples"][0].update(c=3), "must be a str"),
+        (lambda doc: doc["triples"].append({"a": "1", "b": "2", "c": "3"}), "Duplicate triple"),
+    ],
+    ids=[
+        "triple-missing-field",
+        "non-dict-triple",
+        "missing-relations",
+        "relations-not-dict",
+        "first-not-list",
+        "a-to-b-not-dict",
+        "non-string-token",
+        "duplicate-triples",
+    ],
+)
+def test_rejects_malformed_document(
+    tokenizer: MagicMock,
+    mutate_document: Callable[[dict[str, Any]], object],
+    error: str,
+) -> None:
     document = compile_relations_json([["1", "2", "3"]])
-    del document["triples"][0]["a"]
-    with pytest.raises(ValueError, match="missing required field"):
-        ConstraintTableCompiler(tokenizer, 10).compile(document)
-
-
-def test_rejects_non_dict_triple(tokenizer: MagicMock) -> None:
-    document = compile_relations_json([["1", "2", "3"]])
-    document["triples"][0] = [1, 2, 3]
-    with pytest.raises(ValueError, match="must be an object"):
-        ConstraintTableCompiler(tokenizer, 10).compile(document)
-
-
-def test_rejects_missing_relations(tokenizer: MagicMock) -> None:
-    document = compile_relations_json([["1", "2", "3"]])
-    del document["relations"]
-    with pytest.raises(ValueError, match="relations"):
-        ConstraintTableCompiler(tokenizer, 10).compile(document)
-
-
-def test_rejects_relations_not_dict(tokenizer: MagicMock) -> None:
-    document = compile_relations_json([["1", "2", "3"]])
-    document["relations"] = [1, 2]
-    with pytest.raises(ValueError, match="relations"):
-        ConstraintTableCompiler(tokenizer, 10).compile(document)
-
-
-def test_rejects_first_not_list(tokenizer: MagicMock) -> None:
-    document = compile_relations_json([["1", "2", "3"]])
-    document["relations"]["first"] = "abc"
-    with pytest.raises(ValueError, match="first must be a list"):
-        ConstraintTableCompiler(tokenizer, 10).compile(document)
-
-
-def test_rejects_a_to_b_not_dict(tokenizer: MagicMock) -> None:
-    document = compile_relations_json([["1", "2", "3"]])
-    document["relations"]["a_to_b"] = [1]
-    with pytest.raises(ValueError, match="a_to_b must be a dict"):
-        ConstraintTableCompiler(tokenizer, 10).compile(document)
-
-
-def test_rejects_non_string_token(tokenizer: MagicMock) -> None:
-    document = compile_relations_json([["1", "2", "3"]])
-    document["triples"][0]["c"] = 3
-    with pytest.raises(ValueError, match="must be a str"):
-        ConstraintTableCompiler(tokenizer, 10).compile(document)
-
-
-def test_rejects_duplicate_triples(tokenizer: MagicMock) -> None:
-    document = compile_relations_json([["1", "2", "3"]])
-    document["triples"].append({"a": "1", "b": "2", "c": "3"})
-    with pytest.raises(ValueError, match="Duplicate triple"):
+    mutate_document(document)
+    with pytest.raises(ValueError, match=error):
         ConstraintTableCompiler(tokenizer, 10).compile(document)
 
 
@@ -335,50 +316,20 @@ def _build_multi_degree(tokenizer: MagicMock, vocab_size: int = 1000) -> Constra
 def test_digest_covers_max_degrees(tokenizer: MagicMock) -> None:
     """Changing only a degree must change the digest (operator truncates on it)."""
     resource = _build_multi_degree(tokenizer)
-    tampered = ConstraintTableResource(
-        first_token_ids=resource.first_token_ids,
-        prefix1_offsets=resource.prefix1_offsets,
-        prefix1_values=resource.prefix1_values,
-        prefix1_pair_keys=resource.prefix1_pair_keys,
-        prefix2_value_offsets=resource.prefix2_value_offsets,
-        prefix2_values=resource.prefix2_values,
-        max_prefix1_degree=resource.max_prefix1_degree + 1,
-        max_prefix2_degree=resource.max_prefix2_degree,
-        vocab_size=resource.vocab_size,
-    )
+    tampered = replace(resource, max_prefix1_degree=resource.max_prefix1_degree + 1)
     assert tampered.digest != resource.digest
 
 
 def test_validate_resource_tables_rejects_derived_degree_mismatch(tokenizer: MagicMock) -> None:
     resource = _build_multi_degree(tokenizer)
-    tampered = ConstraintTableResource(
-        first_token_ids=resource.first_token_ids,
-        prefix1_offsets=resource.prefix1_offsets,
-        prefix1_values=resource.prefix1_values,
-        prefix1_pair_keys=resource.prefix1_pair_keys,
-        prefix2_value_offsets=resource.prefix2_value_offsets,
-        prefix2_values=resource.prefix2_values,
-        max_prefix1_degree=1,
-        max_prefix2_degree=resource.max_prefix2_degree,
-        vocab_size=resource.vocab_size,
-    )
+    tampered = replace(resource, max_prefix1_degree=1)
     with pytest.raises(ValueError, match="does not match"):
         validate_resource_tables(tampered)
 
 
 def test_validate_resource_tables_rejects_dtype_corruption(tokenizer: MagicMock) -> None:
     resource = _build_multi_degree(tokenizer)
-    bad = ConstraintTableResource(
-        first_token_ids=resource.first_token_ids,
-        prefix1_offsets=resource.prefix1_offsets.astype(np.int64),
-        prefix1_values=resource.prefix1_values,
-        prefix1_pair_keys=resource.prefix1_pair_keys,
-        prefix2_value_offsets=resource.prefix2_value_offsets,
-        prefix2_values=resource.prefix2_values,
-        max_prefix1_degree=resource.max_prefix1_degree,
-        max_prefix2_degree=resource.max_prefix2_degree,
-        vocab_size=resource.vocab_size,
-    )
+    bad = replace(resource, prefix1_offsets=resource.prefix1_offsets.astype(np.int64))
     with pytest.raises(ValueError, match="dtype must be"):
         validate_resource_tables(bad)
 
@@ -390,17 +341,7 @@ def test_validate_resource_tables_passes_valid_resource(tokenizer: MagicMock) ->
 
 def test_validate_rejects_empty_first_token_ids_directly(tokenizer: MagicMock) -> None:
     resource = _build_multi_degree(tokenizer)
-    tampered = ConstraintTableResource(
-        first_token_ids=np.array([], dtype=np.int32),
-        prefix1_offsets=resource.prefix1_offsets,
-        prefix1_values=resource.prefix1_values,
-        prefix1_pair_keys=resource.prefix1_pair_keys,
-        prefix2_value_offsets=resource.prefix2_value_offsets,
-        prefix2_values=resource.prefix2_values,
-        max_prefix1_degree=resource.max_prefix1_degree,
-        max_prefix2_degree=resource.max_prefix2_degree,
-        vocab_size=resource.vocab_size,
-    )
+    tampered = replace(resource, first_token_ids=np.array([], dtype=np.int32))
     with pytest.raises(ValueError, match="exactly match"):
         validate_resource_tables(tampered)
 
@@ -408,69 +349,31 @@ def test_validate_rejects_empty_first_token_ids_directly(tokenizer: MagicMock) -
 def test_digest_changes_when_shape_changes(tokenizer: MagicMock) -> None:
     """Reshaping a table must change the digest even though bytes are identical."""
     resource = _build_multi_degree(tokenizer)
-    reshaped = ConstraintTableResource(
-        first_token_ids=resource.first_token_ids,
-        prefix1_offsets=resource.prefix1_offsets,
-        prefix1_values=resource.prefix1_values,
-        prefix1_pair_keys=resource.prefix1_pair_keys,
-        prefix2_value_offsets=resource.prefix2_value_offsets,
-        prefix2_values=resource.prefix2_values.reshape(-1, 1),
-        max_prefix1_degree=resource.max_prefix1_degree,
-        max_prefix2_degree=resource.max_prefix2_degree,
-        vocab_size=resource.vocab_size,
-    )
+    reshaped = replace(resource, prefix2_values=resource.prefix2_values.reshape(-1, 1))
     assert reshaped.digest != resource.digest
 
 
-def _colliding_tokenizer(
-    collide_a: bool = False, collide_b: bool = False, collide_c: bool = False
-) -> MagicMock:
-    """A tokenizer whose get_vocab contains all tokens, but two distinct strings
-    share a token ID depending on which position is flagged.
-
-    All catalog tokens are members of get_vocab, so any rejection must come
-    from the ID-collision check, not the unknown-token check.
-    """
-    result = MagicMock()
-
-    # vocab: 1->1, 2->2, 3->3, 4->4, 5->5, plus collision aliases.
-    def convert(values: list[str]) -> list[int]:
-        out: list[int] = []
-        for v in values:
-            if collide_a and v == "4":
-                out.append(1)  # '4' collides with '1' (both s_a in this test)
-            elif collide_b and v == "3":
-                out.append(2)  # '3' collides with '2' (both s_b)
-            elif collide_c and v == "11":
-                out.append(10)  # '11' collides with '10' (both s_c)
-            else:
-                out.append(int(v))
-        return out
-
-    result.convert_tokens_to_ids.side_effect = convert
-    result.get_vocab.return_value = {str(i): i for i in range(1000)}
-    return result
-
-
-def test_rejects_colliding_s_a_token_ids() -> None:
-    """Two distinct s_a strings mapping to the same ID must be rejected."""
-    tokenizer = _colliding_tokenizer(collide_a=True)
-    document = compile_relations_json([["1", "2", "10"], ["4", "5", "12"]])
-    with pytest.raises(ValueError, match="maps distinct constraint tokens to ID 1"):
-        ConstraintTableCompiler(tokenizer, 100).compile(document)
-
-
-def test_rejects_colliding_s_b_token_ids() -> None:
-    tokenizer = _colliding_tokenizer(collide_b=True)
-    document = compile_relations_json([["1", "2", "10"], ["1", "3", "11"]])
-    with pytest.raises(ValueError, match="maps distinct constraint tokens to ID 2"):
-        ConstraintTableCompiler(tokenizer, 100).compile(document)
-
-
-def test_rejects_colliding_s_c_token_ids() -> None:
-    tokenizer = _colliding_tokenizer(collide_c=True)
-    document = compile_relations_json([["1", "2", "10"], ["1", "2", "11"]])
-    with pytest.raises(ValueError, match="maps distinct constraint tokens to ID 10"):
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "catalog,collision_token,collision_id",
+    [
+        pytest.param([["1", "2", "10"], ["4", "5", "12"]], "4", 1, id="s-a"),
+        pytest.param([["1", "2", "10"], ["1", "3", "11"]], "3", 2, id="s-b"),
+        pytest.param([["1", "2", "10"], ["1", "2", "11"]], "11", 10, id="s-c"),
+    ],
+)
+def test_rejects_colliding_token_ids(
+    tokenizer: MagicMock,
+    catalog: list[list[str]],
+    collision_token: str,
+    collision_id: int,
+) -> None:
+    # All catalog tokens are in get_vocab, so rejection must come from the
+    # ID-collision check rather than the unknown-token check.
+    tokenizer.convert_tokens_to_ids.side_effect = lambda values: [
+        collision_id if value == collision_token else int(value) for value in values
+    ]
+    document = compile_relations_json(catalog)
+    with pytest.raises(ValueError, match=f"maps distinct constraint tokens to ID {collision_id}"):
         ConstraintTableCompiler(tokenizer, 100).compile(document)
 
 

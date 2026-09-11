@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import IO, Any, Iterator
 from unittest import mock
 
+import pytest
 import requests
 
 from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
@@ -208,6 +209,7 @@ def _chat_completion(
     return body
 
 
+@pytest.mark.pangu_st
 class TestPangu1bOnlineServeST(unittest.TestCase):
     """End-to-end online ST for Pangu LLM passthrough via ``vllm-gr serve``."""
 

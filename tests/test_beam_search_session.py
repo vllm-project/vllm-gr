@@ -307,16 +307,34 @@ def test_step_complete_skips_select_on_last_step() -> None:
     assert session.decode_step == 1
 
 
-def test_suffix_buf_returns_slice_for_slot() -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "max_batch,num_layers,beam_width",
+    [(1, 1, 3), (2, 2, 2)],
+    ids=["single-batch-width-three", "multi-batch-width-two"],
+)
+def test_suffix_buf_returns_slice_for_slot(
+    max_batch: int, num_layers: int, beam_width: int
+) -> None:
     session = _make_session(
-        max_batch=2, max_beams=4, max_decode_steps=3, num_kv_heads=2, head_dim=8
+        max_batch=max_batch,
+        max_beams=4,
+        max_decode_steps=3,
+        num_kv_heads=2,
+        head_dim=8,
+        num_layers=num_layers,
     )
-    session.begin_session(beam_width=2, prefix_len=5)
+    session.begin_session(beam_width=beam_width, prefix_len=5)
 
     k_buf, v_buf = session.suffix_k_buf, session.suffix_v_buf
     # suffix_k_buf shape: [beam_width * max_decode_steps, num_kv_heads, head_dim]
-    assert k_buf.shape == (2 * 3, 2, 8)
-    assert v_buf.shape == (2 * 3, 2, 8)
+    assert k_buf.shape == (beam_width * 3, 2, 8)
+    assert v_buf.shape == (beam_width * 3, 2, 8)
+
+    # Both buffers must be views into the context's shared suffix storage.
+    offset = session.slot * 4 * 3
+    size = beam_width * 3
+    assert k_buf.data_ptr() == session.context.suffix_k_buf[offset : offset + size].data_ptr()
+    assert v_buf.data_ptr() == session.context.suffix_v_buf[offset : offset + size].data_ptr()
 
 
 def test_slot_property_matches_registry() -> None:

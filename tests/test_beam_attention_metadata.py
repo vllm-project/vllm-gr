@@ -14,7 +14,34 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
 )
+from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+
+
+def _make_session(
+    *,
+    beam_width: int = 3,
+    max_beams: int = 4,
+    num_kv_heads: int = 2,
+    max_decode_steps: int = 3,
+    head_dim: int = 8,
+    num_layers: int = 1,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.float16,
+    session_id: str = "test_session",
+) -> BeamSearchSession:
+    context = BeamAttentionContext(
+        max_batch=1,
+        max_beams=max_beams,
+        num_kv_heads=num_kv_heads,
+        max_decode_steps=max_decode_steps,
+        head_dim=head_dim,
+        num_layers=num_layers,
+        device=device,
+        dtype=dtype,
+    )
+    slot = context.registry.allocate(session_id, beam_width=0, prefix_len=0)
+    return BeamSearchSession(session_id=session_id, slot=slot, context=context)
 
 
 def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
@@ -831,3 +858,82 @@ def test_block_table_copied_set_eviction_survives_fixed_buffers() -> None:
     # Session B sweeps A's set entry without raising TypeError.
     run_build("req-b")
     assert not any("req-a" in str(k) for k in btc)
+
+
+def test_incremental_metadata_builder_uses_active_session_contract() -> None:
+    beam_width, prefix_len, block_size = 3, 5, 4
+    session = _make_session(
+        beam_width=beam_width, max_beams=4, num_kv_heads=2, max_decode_steps=3, head_dim=8
+    )
+    session.begin_session(beam_width, prefix_len)
+
+    # Build a minimal metadata builder using our 8ffc23d API
+
+    # Create a minimal builder instance
+    builder = object.__new__(BeamAttentionMetadataBuilder)
+    builder.device = torch.device("cpu")
+    builder.block_size = block_size
+    builder.aot_schedule = False
+    builder.aot_sliding_window = None
+    builder.use_full_cuda_graph = False
+    builder.max_cudagraph_size = None
+    builder.max_num_splits = 0
+    builder.num_heads_q = 4
+    builder.num_kv_heads = 2
+    builder._is_cuda = True
+    builder._is_npu = False
+    builder._fixed_buffers = False  # no pre-allocated buffers in test harness
+    builder.npu_causal_atten_mask = None
+
+    common = type(
+        "CommonMetadata",
+        (),
+        {
+            "num_reqs": 1,
+            "query_start_loc_cpu": torch.tensor([0, beam_width], dtype=torch.int32),
+            "query_start_loc": torch.tensor([0, beam_width], dtype=torch.int32),
+            "seq_lens": torch.tensor([prefix_len + 1], dtype=torch.int32),
+            "block_table_tensor": torch.tensor([[7, 8]], dtype=torch.int32),
+            "num_actual_tokens": beam_width,
+            "max_query_len": beam_width,
+            "max_seq_len": prefix_len + 1,
+            "causal": True,
+            "slot_mapping": torch.arange(beam_width, dtype=torch.int64),
+        },
+    )()
+    beam_info = {
+        "beam_data": {
+            "request": {
+                "is_beam_decode": True,
+                "is_incremental_decode": True,
+                "beam_width": beam_width,
+                "beam_decode_steps": 1,
+                "prefix_len": prefix_len,
+                "cache_len": prefix_len,
+                "decode_step": 0,
+            }
+        },
+        "req_ids": ["request"],
+        "beam_session": session,
+    }
+
+    token = BEAM_DATA_VAR.set(beam_info)
+    try:
+        metadata = builder.build(0, common)
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+    assert metadata.is_beam_decode
+    assert metadata.beam_session is session
+    assert metadata.incremental_suffix_kv_len == 1
+    assert metadata.prefix_indices.tolist() == [0, 1, 2]
+    assert metadata.prefix_cu_seqlens_q_device.tolist() == [0, 3]
+    assert metadata.prefix_block_table.tolist() == [[7, 8]]
+    assert metadata.suffix_cu_seqlens_q_device.tolist() == [0, 1, 2, 3]
+    # In our 8ffc23d implementation, suffix_total_tokens is 0 for incremental
+    # decode because the suffix slot mapping is not generated (pool slice is
+    # used instead of gather from paged cache).
+    assert metadata.suffix_total_tokens == 0
+    # suffix_slot_mapping_out is an empty tensor (not None) in incremental path
+    assert metadata.suffix_slot_mapping_out is not None
+    assert metadata.suffix_slot_mapping_out.numel() == 0

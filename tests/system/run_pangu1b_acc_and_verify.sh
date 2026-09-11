@@ -54,9 +54,21 @@ if [[ "$execution_status" -ne 0 ]]; then
   exit "$execution_status"
 fi
 
-accuracy=$(python -c \
-  'import json, math, sys; value=float(json.load(open(sys.argv[1], encoding="utf-8"))["accuracy"]); assert math.isfinite(value) and 0 <= value <= 1; print(value)' \
-  "$result_json")
+accuracy=$(python - "$result_json" "$NUM_PROMPTS" <<'PY'
+import json
+import math
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    summary = json.load(handle)
+if summary["num_samples"] != int(sys.argv[2]):
+    raise ValueError(f"Expected {sys.argv[2]} samples, got {summary['num_samples']}")
+value = float(summary["accuracy"])
+if not math.isfinite(value) or not 0 <= value <= 1:
+    raise ValueError(f"Invalid accuracy: {value}")
+print(value)
+PY
+)
 parse_status=$?
 if [[ "$parse_status" -ne 0 || -z "$accuracy" ]]; then
   echo "Pangu offline accuracy result could not be parsed." >&2

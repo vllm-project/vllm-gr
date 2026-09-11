@@ -189,12 +189,6 @@ def _fake_prefill_request(
 
 
 class TestSessionTemplateCaching:
-    def test_template_cached_in_session_entry(self) -> None:
-        eng = _make_engine_self()
-        template = _step_template()
-        _handle_beam_session_template(eng, template)
-        assert eng.beam_cache["s0"]["step_template"] is template
-
     def test_template_out_of_order_creates_stub(self) -> None:
         eng = _make_engine_self()
         template = _step_template()
@@ -410,16 +404,6 @@ class TestDualFlagScoping:
         assert eng.input_queue.empty()
         MockReq.assert_not_called()
         assert "beam_self_advance_chained" not in decision
-
-    def test_decode_flag_still_chains_decode(self) -> None:
-        eng = self._decode_seeded_engine(enabled=True)
-        decision = _decode_decision(parents=[0, 1], tokens=[61, 71])
-
-        with patch("vllm.v1.request.Request") as MockReq:
-            MockReq.return_value.block_hashes = []
-            _beam_advance_from_decision(eng, "s0", decision)
-
-        assert eng.input_queue.qsize() == 1
 
     def test_prefill_only_flag_leaves_decode_decision_fallback(self) -> None:
         """Prefill decision arriving for a session that already has

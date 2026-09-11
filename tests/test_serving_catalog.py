@@ -160,7 +160,7 @@ def test_compact_catalog_fixture_geometry() -> None:
     assert len({tuple(item) for item in catalog}) == len(catalog)
 
 
-async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "fill") -> None:
+async def _serving_catalog_generation_impl(loops: int) -> None:
     catalog_data = _build_catalog_data()
     print(f"catalog created with {len(catalog_data)} items")
 
@@ -211,82 +211,66 @@ async def _serving_catalog_generation_impl(loops: int, catalog_strategy: str = "
             if hasattr(BeamSearchParams, "begin_token"):
                 beam_search_params_dict["begin_token"] = "<|sid_begin|>"
                 beam_search_params_dict["end_token"] = "<|sid_end|>"
-            if hasattr(BeamSearchParams, "catalog_strategy"):
-                beam_search_params_dict["catalog_strategy"] = catalog_strategy
-
-            params = BeamSearchParams(**beam_search_params_dict)
-
-            print(f"Starting beam search (strategy={catalog_strategy}), loops={loops}...")
 
             catalog_set = set("".join(item) for item in catalog_data)
-            if loops <= 0:
-                loops = 1
-            for i in range(loops):
-                generator = serving.beam_search(prompt, f"req_id_catalog_{i}", params)
+            # Both request strategies share the same model, catalog and engine.
+            for catalog_strategy in ("fill", "null"):
+                params_dict = beam_search_params_dict.copy()
+                if hasattr(BeamSearchParams, "catalog_strategy"):
+                    params_dict["catalog_strategy"] = catalog_strategy
+                params = BeamSearchParams(**params_dict)
+                print(f"Starting beam search (strategy={catalog_strategy}), loops={loops}...")
 
-                final_output = None
-                async for output in generator:
-                    final_output = output
-
-                assert final_output is not None
-                # With catalog_strategy='null', dead-end beams are eliminated, so we may have fewer outputs
-                if catalog_strategy == "fill":
-                    assert len(final_output.outputs) == beam_width
-                else:  # "null" strategy
-                    assert len(final_output.outputs) > 0, (
-                        "No valid outputs generated with null strategy"
+                for i in range(max(1, loops)):
+                    generator = serving.beam_search(
+                        prompt, f"req_id_catalog_{catalog_strategy}_{i}", params
                     )
 
-                print(f"Loop {i}: Verifying {len(final_output.outputs)} generated choices...")
-                not_in_catalog = []
-                for choice in final_output.outputs:
-                    content = choice.text
-                    score = choice.cumulative_logprob
-                    if score > -1000 and content not in catalog_set:
-                        not_in_catalog.append(content)
-                if not_in_catalog:
-                    print("Generated content not found in catalog:")
-                    for i, content in enumerate(not_in_catalog):
-                        print(f"{i}: {content}")
-                    assert False, "Some Generated content not found in catalog."
+                    final_output = None
+                    async for output in generator:
+                        final_output = output
+
+                    assert final_output is not None
+                    # With catalog_strategy='null', dead-end beams are eliminated, so we may have fewer outputs
+                    if catalog_strategy == "fill":
+                        assert len(final_output.outputs) == beam_width
+                    else:  # "null" strategy
+                        assert len(final_output.outputs) > 0, (
+                            "No valid outputs generated with null strategy"
+                        )
+
+                    print(
+                        f"{catalog_strategy} loop {i}: Verifying {len(final_output.outputs)} generated choices..."
+                    )
+                    not_in_catalog = []
+                    for choice in final_output.outputs:
+                        content = choice.text
+                        score = choice.cumulative_logprob
+                        if score > -1000 and content not in catalog_set:
+                            not_in_catalog.append(content)
+                    if not_in_catalog:
+                        print("Generated content not found in catalog:")
+                        for i, content in enumerate(not_in_catalog):
+                            print(f"{i}: {content}")
+                        assert False, "Some Generated content not found in catalog."
 
     finally:
         if os.path.exists(catalog_path):
             os.remove(catalog_path)
 
 
-def _run_serving_catalog_generation_target(loops: int, catalog_strategy: str = "fill") -> None:
+def _run_serving_catalog_generation_target(loops: int) -> None:
     from vllm_gr.patch import re_apply_patches
 
     re_apply_patches()
-    asyncio.run(_serving_catalog_generation_impl(loops, catalog_strategy))
+    asyncio.run(_serving_catalog_generation_impl(loops))
 
 
 @pytest.mark.slow  # type: ignore
-def test_serving_catalog_generation(loops: int) -> None:
+def test_serving_catalog_dead_end_strategies(loops: int) -> None:
+    """Check fill and null outputs against the catalog using one engine."""
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_run_serving_catalog_generation_target, args=(loops,))
-    p.start()
-    p.join()
-    assert p.exitcode == 0
-
-
-@pytest.mark.slow  # type: ignore
-def test_serving_catalog_dead_end_fill(loops: int) -> None:
-    """catalog_strategy='fill': all outputs must be in the catalog."""
-    ctx = multiprocessing.get_context("spawn")
-    p = ctx.Process(target=_run_serving_catalog_generation_target, args=(loops, "fill"))
-    p.start()
-    p.join()
-    assert p.exitcode == 0
-
-
-@pytest.mark.slow  # type: ignore
-def test_serving_catalog_dead_end_null(loops: int) -> None:
-    """catalog_strategy='null': dead-end beams are dropped; all surviving outputs
-    must still be in the catalog."""
-    ctx = multiprocessing.get_context("spawn")
-    p = ctx.Process(target=_run_serving_catalog_generation_target, args=(loops, "null"))
     p.start()
     p.join()
     assert p.exitcode == 0

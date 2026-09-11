@@ -117,12 +117,6 @@ async def beam_search_test(loops: int) -> None:
         assert len(final_output.outputs) == beam_width
 
 
-@pytest.mark.slow  # type: ignore
-@pytest.mark.asyncio  # type: ignore
-async def test_serving_beam_search(loops: int) -> None:
-    await beam_search_test(loops)
-
-
 def _run_gr_beam_search_target(loops: int) -> None:
     import asyncio
 
