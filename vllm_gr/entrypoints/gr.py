@@ -20,7 +20,7 @@ import gc
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, Union, cast, overload
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -66,6 +66,7 @@ from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     reconstruct_beam_logprobs_batch,
 )
+from vllm_gr.outputs import CompactBeamSearchOutput, CompactBeamSearchSequence
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.tokenizer_fast import fast_decode
 from vllm_gr.utils.engine_lifecycle import frontend_request_scope
@@ -78,7 +79,7 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
 
-    from vllm_gr.entrypoints.beam_search_v1 import BeamSearchV1Server
+    from vllm_gr.entrypoints.beam_search_v1.protocol import BeamSearchFrontend
 
 logger = init_logger(__name__)
 
@@ -994,12 +995,10 @@ class GRLLM(LLM):
         concurrency_limit: int | None = None,
     ) -> list["BeamSearchOutput"]:
         """Run Beam Search through the new EngineCore-owned V1 pipeline."""
-        from vllm_gr.entrypoints.beam_search_v1 import (
-            OfflineBeamSearchV1Call,
-            run_beam_search_v1,
-        )
+        from vllm_gr.entrypoints.beam_search_v1 import run_beam_search_v1
+        from vllm_gr.entrypoints.beam_search_v1.protocol import OfflineBeamSearchRequest
 
-        call = OfflineBeamSearchV1Call(
+        call = OfflineBeamSearchRequest(
             prompts=prompts,
             params=params,
             lora_request=lora_request,
@@ -1008,15 +1007,42 @@ class GRLLM(LLM):
         )
         return cast(
             list["BeamSearchOutput"],
-            run_beam_search_v1(self._create_beam_search_v1_server(), call),
+            run_beam_search_v1(self._create_beam_search_v1_client(), call),
         )
 
-    def _create_beam_search_v1_server(self) -> "BeamSearchV1Server":
-        """Create the offline V1 server adapter implemented by follow-up tasks."""
-        raise NotImplementedError(
-            "beam_search_v1 server is not implemented yet; A2-A5 must provide "
-            "the EngineCore request, execution, result, and cleanup pipeline"
+    def _create_beam_search_v1_client(self) -> "BeamSearchFrontend":
+        """Create the offline A2 request/session adapter."""
+        from vllm_gr.entrypoints.beam_search_v1.client import (
+            BeamSearchClient,
         )
+
+        return BeamSearchClient(self)
+
+    @overload
+    def beam_search(
+        self,
+        prompts: list[Union["TokensPrompt", "TextPrompt"]],
+        params: "BeamSearchParams",
+        lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
+        use_tqdm: bool = False,
+        concurrency_limit: int | None = None,
+        decode_prompt_in_text: bool = True,
+        *,
+        output_mode: Literal["full"] = "full",
+    ) -> list["BeamSearchOutput"]: ...
+
+    @overload
+    def beam_search(
+        self,
+        prompts: list[Union["TokensPrompt", "TextPrompt"]],
+        params: "BeamSearchParams",
+        lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
+        use_tqdm: bool = False,
+        concurrency_limit: int | None = None,
+        decode_prompt_in_text: bool = True,
+        *,
+        output_mode: Literal["compact"],
+    ) -> list[CompactBeamSearchOutput]: ...
 
     @frontend_request_scope
     def beam_search(
@@ -1027,7 +1053,9 @@ class GRLLM(LLM):
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
         decode_prompt_in_text: bool = True,
-    ) -> list["BeamSearchOutput"]:
+        *,
+        output_mode: Literal["full", "compact"] = "full",
+    ) -> list["BeamSearchOutput"] | list[CompactBeamSearchOutput]:
         """
         Generate sequences using beam search.
 
@@ -1041,9 +1069,18 @@ class GRLLM(LLM):
                 If None, the number of concurrent requests is unlimited.
             decode_prompt_in_text: Include the original prompt in sequence text.
                 When False, return only generated text, including SID markers.
+                Ignored in compact mode, which does not produce text.
+            output_mode: "full" preserves the native, lazily materialized output.
+                "compact" returns CPU token_ids and cumulative_logprob
+                without reconstructing full tokens, detailed logprobs, or text.
+                Generated tokens include configured begin/end markers and match
+                the suffix after the original prompt in full mode.
         """
         # Lazy imports for beam search dependencies
         import itertools
+
+        if output_mode not in ("full", "compact"):
+            raise ValueError(f"output_mode must be 'full' or 'compact', got {output_mode!r}")
 
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?
@@ -1396,7 +1433,8 @@ class GRLLM(LLM):
                         )
                         instance.beams = new_beams
 
-        outputs = []
+        outputs: list[BeamSearchOutput] = []
+        compact_outputs: list[CompactBeamSearchOutput] = []
         for idx, instance in enumerate(instances):
             # Append sid_end_token_id only to active beams (not EOS-completed
             # beams that already terminated naturally).
@@ -1406,6 +1444,24 @@ class GRLLM(LLM):
             # Move remaining active beams into the completed list.
             instance.completed.extend(instance.beams)
             best_beams = select_top_beams(instance.completed, beam_width)
+
+            if output_mode == "compact":
+                # The begin marker seeds the shared prompt; beam.tokens already
+                # holds only the generated tail. Copy this small suffix before
+                # installing lazy fields, without retaining the search history.
+                begin_ids = (sid_begin_token_id,) if sid_begin_token_id is not None else ()
+                compact_outputs.append(
+                    CompactBeamSearchOutput(
+                        sequences=tuple(
+                            CompactBeamSearchSequence(
+                                token_ids=begin_ids + tuple(beam.tokens),
+                                cumulative_logprob=float(beam.cum_logprob),
+                            )
+                            for beam in best_beams
+                        )
+                    )
+                )
+                continue
 
             prompt_cache = cached_prompts[idx]
             prompt_len = prompt_cache["len"]
@@ -1447,7 +1503,7 @@ class GRLLM(LLM):
         from vllm_gr.utils.engine_lifecycle import schedule_frontend_gc_freeze
 
         schedule_frontend_gc_freeze()
-        return outputs
+        return compact_outputs if output_mode == "compact" else outputs
 
     def shutdown(self) -> None:
         if self._shutdown_complete:

@@ -32,8 +32,12 @@ class _BatchTokenizer(_Tokenizer):
         return [self.decode(row) for row in tokens]
 
 
-@pytest.mark.parametrize("batch_decode", [False, True])  # type: ignore[misc]
-@pytest.mark.parametrize("include_prompt", [None, False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "output_mode,batch_decode,include_prompt",
+    [("full", batch, prompt) for batch in (False, True) for prompt in (None, False, True)]
+    # Compact output never decodes text; one tokenizer/text configuration is enough.
+    + [("compact", False, None)],
+)
 @pytest.mark.parametrize("begin", [None, "<|sid_begin|>"])  # type: ignore[misc]
 @pytest.mark.parametrize("end", [None, "<|sid_end|>"])  # type: ignore[misc]
 @pytest.mark.parametrize("stop_at_eos", [False, True])  # type: ignore[misc]
@@ -43,6 +47,7 @@ def test_offline_output_uses_original_prompt_boundary(
     begin: str | None,
     end: str | None,
     stop_at_eos: bool,
+    output_mode: str,
 ) -> None:
     tokenizer = _BatchTokenizer() if batch_decode else _Tokenizer()
     original_tokens = [10, 11]
@@ -77,10 +82,19 @@ def test_offline_output_uses_original_prompt_boundary(
         begin_token=begin,
         end_token=end,
     )
-    kwargs = {} if include_prompt is None else {"decode_prompt_in_text": include_prompt}
+    kwargs: dict[str, Any] = (
+        {} if include_prompt is None else {"decode_prompt_in_text": include_prompt}
+    )
+    kwargs["output_mode"] = output_mode
     outputs = GRLLM.beam_search(runner, [{"prompt_token_ids": original_tokens}], params, **kwargs)
     beam = outputs[0].sequences[0]
     generated = ([1] if begin else []) + [next_token] + ([3] if end and not stop_at_eos else [])
+    if output_mode == "compact":
+        assert beam.token_ids == tuple(generated)
+        assert beam.cumulative_logprob == pytest.approx(-0.2)
+        assert tokenizer.decoded == []
+        assert prepared["prompt_token_ids"] == [10, 11]
+        return
     expected_tail = (begin or "") + f"[{next_token}]" + ((end or "") if not stop_at_eos else "")
     assert beam.tokens == original_tokens + generated
     # The output assembly restores full sequences in place and must drop the
@@ -191,3 +205,33 @@ def test_prompt_text_is_decoded_once_per_tokenizer() -> None:
     assert tokenizer.decoded.count(original_tokens) == 1  # still cached
     assert beam.tokens == [10, 11, 20]
     assert tokenizer.decoded[-1] == [20]
+
+
+def test_compact_output_matches_full_without_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_gr.entrypoints.gr as gr
+
+    tokenizer = _Tokenizer()
+    # More requested beams than distinct candidates also checks no padding.
+    params = _lazy_params(beam_width=4)
+    prompt = [{"prompt_token_ids": [10, 11]}]
+    full = GRLLM.beam_search(_lazy_runner(tokenizer, [10, 11]), prompt, params)
+    expected = [(tuple(seq.tokens[2:]), seq.cum_logprob) for seq in full[0].sequences]
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("compact output must not reconstruct logprobs or decode text")
+
+    monkeypatch.setattr(gr, "reconstruct_beam_logprobs_batch", forbidden)
+    monkeypatch.setattr(gr, "fast_decode", forbidden)
+    monkeypatch.setattr(gr, "_prompt_text_cached", forbidden)
+    compact = GRLLM.beam_search(
+        _lazy_runner(_Tokenizer(), [10, 11]), prompt, params, output_mode="compact"
+    )
+    assert len(compact[0].sequences) == 2
+    assert [(seq.token_ids, seq.cumulative_logprob) for seq in compact[0].sequences] == expected
+
+
+def test_invalid_output_mode_fails_before_inference() -> None:
+    with pytest.raises(ValueError, match="output_mode"):
+        GRLLM.beam_search(SimpleNamespace(), [], _lazy_params(), output_mode="invalid")

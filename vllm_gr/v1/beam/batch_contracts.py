@@ -53,6 +53,8 @@ class BeamBatchParams(
     stop_token_ids: tuple[int, ...]
     ignore_stop_tokens: bool
     constraint_resource_id: str = DEFAULT_CONSTRAINT_RESOURCE_ID
+    length_penalty: float = 1.0
+    catalog_strategy: Literal["fill", "null"] | None = None
 
 
 class BeamOutputOptions(
@@ -239,6 +241,14 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
             f"{params.temperature!r}"
         )
     _bool("beam_params.ignore_stop_tokens", params.ignore_stop_tokens)
+    if (
+        isinstance(params.length_penalty, bool)
+        or not isinstance(params.length_penalty, (int, float))
+        or not math.isfinite(float(params.length_penalty))
+    ):
+        _fail(f"beam_params.length_penalty must be a finite number, got {params.length_penalty!r}")
+    if params.catalog_strategy not in (None, "fill", "null"):
+        _fail("beam_params.catalog_strategy must be 'fill', 'null', or None")
     seen_stop_ids: set[int] = set()
     for index, token_id in enumerate(params.stop_token_ids):
         normalized = _non_negative_int(f"beam_params.stop_token_ids[{index}]", token_id)

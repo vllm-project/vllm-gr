@@ -362,7 +362,7 @@ def test_grouped_beam_request_lifecycle(
     assert all(update.data_parallel_rank == 1 for update in engine.beam_updates)
     assert engine.prepare_calls[0].data_parallel_rank == 1
     assert all(call.kwargs["data_parallel_rank"] == 1 for call in engine.register_calls)
-    rank_picker.assert_awaited_once_with(2)
+    rank_picker.assert_awaited_once_with(engine)
 
     assert len(outputs) == 1
     _assert_normal_output(outputs[0], "request-0")

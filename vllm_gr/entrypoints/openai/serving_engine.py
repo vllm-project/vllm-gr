@@ -45,17 +45,18 @@ from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
 if TYPE_CHECKING:
-    from vllm_gr.entrypoints.beam_search_v1 import AsyncBeamSearchV1Server
+    from vllm_gr.entrypoints.beam_search_v1.protocol import AsyncBeamSearchFrontend
 
 logger = init_logger(__name__)
 
 
-def create_online_beam_search_v1_server(self) -> "AsyncBeamSearchV1Server":
-    """Create the online V1 server adapter implemented by follow-up tasks."""
-    raise NotImplementedError(
-        "online beam_search_v1 server is not implemented yet; it must submit "
-        "the shared BeamBatchRequest to the EngineCore V1 entry"
+def create_online_beam_search_v1_client(self) -> "AsyncBeamSearchFrontend":
+    """Create the online A2 request/session adapter."""
+    from vllm_gr.entrypoints.beam_search_v1.client import (
+        AsyncBeamSearchClient,
     )
+
+    return AsyncBeamSearchClient(self)
 
 
 async def beam_search_v1(
@@ -67,20 +68,23 @@ async def beam_search_v1(
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
     """Submit one online V1 request and yield terminal outputs only."""
-    from vllm_gr.entrypoints.beam_search_v1 import (
-        OnlineBeamSearchV1Call,
-        run_beam_search_v1_async,
-    )
+    from vllm_gr.entrypoints.beam_search_v1 import run_beam_search_v1_async
+    from vllm_gr.entrypoints.beam_search_v1.protocol import OnlineBeamSearchRequest
 
-    call = OnlineBeamSearchV1Call(
+    priority = int(time.perf_counter() * 1_000_000)
+    rank = await _next_data_parallel_rank(self.engine_client)
+
+    call = OnlineBeamSearchRequest(
         prompt=prompt,
         request_id=request_id,
         params=params,
         lora_request=lora_request,
         trace_headers=trace_headers,
+        priority=priority,
+        data_parallel_rank=rank,
     )
     outputs = await run_beam_search_v1_async(
-        create_online_beam_search_v1_server(self),
+        create_online_beam_search_v1_client(self),
         call,
     )
     for output in outputs:
@@ -176,9 +180,17 @@ _dp_rank_counter = 0
 _dp_rank_lock = asyncio.Lock()
 
 
-# return rank for next beam search request in a round-robin manner across the data parallel ranks
-async def _next_data_parallel_rank(data_parallel_size: int) -> int:
+async def _next_data_parallel_rank(engine_client) -> int | None:
+    """Round-robin over the ranks accepted by the native input processor."""
     global _dp_rank_counter
+
+    vllm_config = getattr(engine_client, "vllm_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
+    if data_parallel_size is None or data_parallel_size <= 1:
+        return None
+    if getattr(parallel_config, "local_engines_only", False):
+        data_parallel_size = parallel_config.data_parallel_size_local
 
     async with _dp_rank_lock:
         rank = _dp_rank_counter % data_parallel_size
@@ -472,18 +484,7 @@ async def beam_search(
     # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
     MICROSECONDS = 1000000
     priority = int(time.perf_counter() * MICROSECONDS)  # us granularity
-    rank = None
-    if (
-        hasattr(self.engine_client, "vllm_config")
-        and self.engine_client.vllm_config.parallel_config is not None
-    ):
-        data_parallel_size = self.engine_client.vllm_config.parallel_config.data_parallel_size
-        if data_parallel_size is not None and data_parallel_size > 1:
-            # In DP mode, we assign ranks to beam search requests in a round-robin manner.
-            rank = await _next_data_parallel_rank(data_parallel_size)
-            logger.debug(
-                f"rank for beam search: {rank} out of data_parallel_size: {data_parallel_size}"
-            )
+    rank = await _next_data_parallel_rank(self.engine_client)
 
     include_stop_str_in_output = params.include_stop_str_in_output
     if (
