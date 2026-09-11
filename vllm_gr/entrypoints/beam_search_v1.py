@@ -35,14 +35,21 @@ class OnlineBeamSearchV1Call:
     params: Any
     lora_request: Any = None
     trace_headers: Any = None
+    priority: int = 0
+    data_parallel_rank: int | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class BeamSearchV1Session:
     """Frontend handle for one submitted EngineCore Beam batch."""
 
     batch_id: str
+    session_id: str
     handle: object
+    data_parallel_rank: int | None = None
+    terminal: bool = False
+    failed: bool = False
+    closed: bool = False
 
 
 class BeamSearchV1Server(Protocol):
@@ -86,7 +93,7 @@ class BeamSearchV1Server(Protocol):
 class AsyncBeamSearchV1Server(Protocol):
     """Asynchronous online adapter using the same EngineCore request type."""
 
-    def prepare_request(self, call: OnlineBeamSearchV1Call) -> BeamBatchRequest: ...
+    async def prepare_request(self, call: OnlineBeamSearchV1Call) -> BeamBatchRequest: ...
 
     async def submit_once(self, request: BeamBatchRequest) -> BeamSearchV1Session:
         """Same ownership contract as sync submit, including cancellation.
@@ -111,7 +118,7 @@ def run_beam_search_v1(
     call: OfflineBeamSearchV1Call,
 ) -> list[Any]:
     """Execute the permanent submit-once/wait-once V1 frontend flow."""
-    request = server.prepare_request(call)
+    request = await server.prepare_request(call)
     session = server.submit_once(request)
     try:
         result = server.wait_final(session)

@@ -893,11 +893,12 @@ class GRLLM(LLM):
         )
 
     def _create_beam_search_v1_server(self) -> "BeamSearchV1Server":
-        """Create the offline V1 server adapter implemented by follow-up tasks."""
-        raise NotImplementedError(
-            "beam_search_v1 server is not implemented yet; A2-A5 must provide "
-            "the EngineCore request, execution, result, and cleanup pipeline"
+        """Create the offline A2 request/session adapter."""
+        from vllm_gr.entrypoints.beam_search_v1_server import (
+            OfflineBeamSearchV1ServerImpl,
         )
+
+        return OfflineBeamSearchV1ServerImpl(self)
 
     def beam_search(
         self,

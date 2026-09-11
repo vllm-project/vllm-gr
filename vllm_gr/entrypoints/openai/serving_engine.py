@@ -48,11 +48,12 @@ logger = init_logger(__name__)
 
 
 def create_online_beam_search_v1_server(self) -> "AsyncBeamSearchV1Server":
-    """Create the online V1 server adapter implemented by follow-up tasks."""
-    raise NotImplementedError(
-        "online beam_search_v1 server is not implemented yet; it must submit "
-        "the shared BeamBatchRequest to the EngineCore V1 entry"
+    """Create the online A2 request/session adapter."""
+    from vllm_gr.entrypoints.beam_search_v1_server import (
+        AsyncBeamSearchV1ServerImpl,
     )
+
+    return AsyncBeamSearchV1ServerImpl(self)
 
 
 async def beam_search_v1(
@@ -69,12 +70,22 @@ async def beam_search_v1(
         run_beam_search_v1_async,
     )
 
+    priority = int(time.perf_counter() * 1_000_000)
+    rank = None
+    vllm_config = getattr(self.engine_client, "vllm_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
+    if data_parallel_size is not None and data_parallel_size > 1:
+        rank = await _next_data_parallel_rank(data_parallel_size)
+
     call = OnlineBeamSearchV1Call(
         prompt=prompt,
         request_id=request_id,
         params=params,
         lora_request=lora_request,
         trace_headers=trace_headers,
+        priority=priority,
+        data_parallel_rank=rank,
     )
     outputs = await run_beam_search_v1_async(
         create_online_beam_search_v1_server(self),

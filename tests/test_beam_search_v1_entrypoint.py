@@ -27,7 +27,11 @@ class _Server:
 
     def submit_once(self, request: BeamBatchRequest) -> BeamSearchV1Session:
         self.events.append("submit")
-        return BeamSearchV1Session(batch_id="batch-0", handle=request)
+        return BeamSearchV1Session(
+            batch_id="batch-0",
+            session_id="batch-0",
+            handle=request,
+        )
 
     def wait_final(self, session: BeamSearchV1Session) -> BeamBatchResult:
         self.events.append("wait")
@@ -87,14 +91,3 @@ def test_grllm_v1_entry_uses_new_server(monkeypatch: pytest.MonkeyPatch) -> None
     assert isinstance(result[0], OfflineBeamSearchV1Call)
     assert result[0].use_tqdm is True
     assert result[0].concurrency_limit == 4
-
-
-def test_grllm_v1_entry_is_unimplemented_without_server() -> None:
-    fake_llm = object.__new__(GRLLM)
-
-    with pytest.raises(NotImplementedError, match="A2-A5"):
-        GRLLM.beam_search_v1(
-            fake_llm,
-            [[1, 2]],
-            object(),
-        )
