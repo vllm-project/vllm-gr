@@ -224,7 +224,11 @@ def test_incremental_layout_cache_short_circuits_remap() -> None:
     )
     r3, so3 = make_frame(2, pos3)
     idx3 = common._beam_remap_inputs(r3, so3, [5])
-    assert idx3 == [0, 1, 2, 3]
+    # num_scheduled_tokens=5 with beam_width=4 means the scheduler packed a
+    # 1-token uncached tail before the beam rows: the beam logits/positions
+    # live at rows [1..4], not [0..3].
+    assert idx3 == [1, 2, 3, 4]
+    assert pos3.gpu.tolist() == [0, 12, 12, 12, 12]
     assert so3._gr_request_row_configs[0] is not so2._gr_request_row_configs[0]
 
 

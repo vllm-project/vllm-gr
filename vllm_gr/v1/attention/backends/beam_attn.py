@@ -352,6 +352,30 @@ class BeamAttentionImpl(AttentionImpl):
                     beam_session=beam_session,
                 )
 
+            # Commit the uncached tail rows' KV into the paged prompt blocks
+            # BEFORE the cascade pass.  A beam decode batch is packed as
+            # [uncached tail (chunked recompute), per-beam new tokens] whenever
+            # the prompt length is not block-aligned; the beam prefix FA reads
+            # prefix_len KV positions that include the tail, and nothing else
+            # writes the tail on this branch — skipping it lets every beam
+            # attend whatever the previous request left in those blocks
+            # (scattered garbage contexts).  Std rows are ordered before the
+            # beam rows on the same stream, so this is race-free.
+            std_indices = getattr(attn_metadata, "std_indices", None)
+            if std_indices is not None:
+                k_scale = None if NPU_DEVICE else layer._k_scale
+                v_scale = None if NPU_DEVICE else layer._v_scale
+                platform_execution.reshape_and_cache(
+                    key[std_indices],
+                    value[std_indices],
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping[std_indices],
+                    self.kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                )
+
             # The suffix pool stores unquantized model activations. Its dtype
             # follows the current attention K/V, independently of a possibly
             # FP8 paged prefix cache.

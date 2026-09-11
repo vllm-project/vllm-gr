@@ -567,8 +567,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 cache_len = mdata["cache_len"]
                 delta = prefix_len - cache_len
                 q_offset = 0
-                # if prefix was cached out - run standard attention till prefix size
-                if (delta > 0 and delta > self.block_size) or (cache_len == 0):
+                # if prefix was cached out - run standard attention till prefix size.
+                # Split whenever ANY tail is uncached (delta > 0), not only when it
+                # exceeds a block: the scheduler packs the packed input as
+                # [tail tokens, beam tokens], so with delta <= block_size the beam
+                # queries would otherwise land on the tail tokens — each row then
+                # scores a history-token position (prediction cycle
+                # s_b->s_c->end->begin) instead of its own beam token, which
+                # desyncs every constrained beam (RecIF video canary BW32/T0
+                # pid_recall@32 0.0104 vs 0.0281).
+                if delta > 0:
                     std_q_len = min(delta, q_len)
                     std_kv_len = cache_len + std_q_len
                     cache_len = cache_len + std_q_len

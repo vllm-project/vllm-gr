@@ -115,11 +115,22 @@ def _process_beam_decode_request(
     # --- Incremental decode path ---
     if is_incremental:
         decode_step = mdata.get("decode_step", 0)
+        # The scheduler packs an incremental step as [uncached tail (chunked
+        # recompute of prompt tokens the prefix cache cannot share), per-beam
+        # new tokens]: whenever the prompt length is not block-aligned,
+        # cache_len lags prefix_len and the tail is non-empty.  The beam rows
+        # are therefore the LAST beam_width rows of the request's token range;
+        # the tail rows keep the sequential positions the base prepare phase
+        # wrote for them (their KV is (re)committed at those absolute
+        # positions).  Indexing logits/positions from token_offset instead
+        # silently scores the tail tokens and desyncs every constrained beam.
+        head = max(seq_len - beam_width, 0)
+        beam_row_offset = token_offset + head
         # W identical single-token rows: contiguous logits rows and the full
         # beam set.  Built with C-level list ops instead of a per-beam Python
         # append loop (the loop dominated the host time of this function for
         # beam_width=128 on every decode step).
-        new_logits_indices.extend(range(token_offset, token_offset + beam_width))
+        new_logits_indices.extend(range(beam_row_offset, beam_row_offset + beam_width))
         active_beam_ids = list(range(beam_width))
 
         # All beams share one constant position id this step, so a scalar
@@ -127,11 +138,11 @@ def _process_beam_decode_request(
         # build, no H2D copy (matches the recompute path's no-stall goal).
         pos_id = prefix_len + decode_step
         if gpu_pos is not None:
-            gpu_pos[token_offset : token_offset + beam_width] = pos_id
+            gpu_pos[beam_row_offset : beam_row_offset + beam_width] = pos_id
         if cpu_pos is not None:
-            cpu_pos[token_offset : token_offset + beam_width] = pos_id
+            cpu_pos[beam_row_offset : beam_row_offset + beam_width] = pos_id
 
-        return beam_width, beam_width, token_offset + beam_width, active_beam_ids
+        return beam_width, beam_width, token_offset + seq_len, active_beam_ids
 
     # --- Standard (recompute) path ---
     chunk_budget = seq_len
@@ -600,14 +611,15 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
             # Refresh only the step-dependent position ids.
             gpu_positions, cpu_positions = _get_positions_buffers(runner)
             token_offset = 0
-            for req_id, width, prefix_len in widths_offsets:
+            for req_id, width, prefix_len, head in widths_offsets:
                 mdata = beam_data[req_id]
                 pos_id = prefix_len + int(mdata.get("decode_step", 0))
+                beam_row_offset = token_offset + head
                 if gpu_positions is not None:
-                    gpu_positions[token_offset : token_offset + width] = pos_id
+                    gpu_positions[beam_row_offset : beam_row_offset + width] = pos_id
                 if cpu_positions is not None:
-                    cpu_positions[token_offset : token_offset + width] = pos_id
-                token_offset += width
+                    cpu_positions[beam_row_offset : beam_row_offset + width] = pos_id
+                token_offset += width + head
             shared_idx_cache = getattr(runner, "_gr_logits_idx_cache", None)
             if shared_idx_cache is None:
                 shared_idx_cache = {}
@@ -633,7 +645,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
     token_offset = 0
     row_to_req_id, row_to_batch_idx, logits_to_batch_idx, request_row_configs = ([], [], [], [])
     input_row_idx = 0
-    incremental_widths: list[tuple[Any, int, int]] = []
+    incremental_widths: list[tuple[Any, int, int, int]] = []
 
     gpu_positions, cpu_positions = _get_positions_buffers(runner)
 
@@ -670,7 +682,14 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
             )
             input_row_idx += beams_count
             if is_incremental:
-                incremental_widths.append((req_id, mdata["beam_width"], mdata["prefix_len"]))
+                incremental_widths.append(
+                    (
+                        req_id,
+                        mdata["beam_width"],
+                        mdata["prefix_len"],
+                        max(seq_len - mdata["beam_width"], 0),
+                    )
+                )
         else:
             num_computed_tokens = runner.input_batch.num_computed_tokens_cpu[batch_idx]
             num_prompt_tokens = runner.input_batch.num_prompt_tokens[batch_idx]

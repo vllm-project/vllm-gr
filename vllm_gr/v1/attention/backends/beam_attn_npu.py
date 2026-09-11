@@ -145,6 +145,7 @@ def cascade_attention(
             softmax_scale=scale,
             return_softmax_lse=True,
             sparse_mode=0,
+            inner_precise=0,
         )
 
         # --- Incremental decode path: read suffix KV from pool slice ---
