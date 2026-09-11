@@ -9,6 +9,7 @@ from importlib import import_module
 from typing import Any
 
 _LAZY_EXPORTS = {
+    "GRBeamFinalOutput": "vllm_gr.v1.worker.gr_beam_output",
     "GRDecodeDeviceInputs": "vllm_gr.v1.worker.gr_persistent_beam",
     "GRFinalDeviceView": "vllm_gr.v1.worker.gr_persistent_beam",
     "GRModelRunnerState": "vllm_gr.v1.worker.gr_model_runner_state",
