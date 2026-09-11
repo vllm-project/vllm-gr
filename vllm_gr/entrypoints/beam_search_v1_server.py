@@ -63,9 +63,7 @@ class AsyncGRSessionClient(Protocol):
 
     def submit_gr_session(self, request: BeamBatchRequest) -> Awaitable[object]: ...
 
-    def wait_gr_session(
-        self, session_id: str, handle: object
-    ) -> Awaitable[BeamBatchResult]: ...
+    def wait_gr_session(self, session_id: str, handle: object) -> Awaitable[BeamBatchResult]: ...
 
     def abort_gr_session(self, session_id: str) -> Awaitable[None]: ...
 
@@ -93,6 +91,8 @@ def _sampling_and_batch_params(
     params: Any,
     tokenizer: Any,
 ) -> tuple[SamplingParams, BeamBatchParams, int | None]:
+    if not params.ignore_eos or getattr(params, "early_stopping", False):
+        raise BeamSearchV1RequestError("beam_search_v1 requires ignore_eos=True and fixed steps")
     begin_token_id = _token_id(tokenizer, getattr(params, "begin_token", None), "begin_token")
     end_token_id = _token_id(tokenizer, getattr(params, "end_token", None), "end_token")
     reserved_tokens = int(begin_token_id is not None) + int(end_token_id is not None)
@@ -102,14 +102,10 @@ def _sampling_and_batch_params(
             "max_tokens must leave at least one Decode step after begin/end tokens"
         )
 
-    stop_token_id = end_token_id
-    if stop_token_id is None:
-        stop_token_id = getattr(tokenizer, "eos_token_id", None)
-    stop_token_ids = () if stop_token_id is None else (int(stop_token_id),)
-    if params.ignore_eos:
-        stop_token_ids = ()
+    stop_token_ids: tuple[int, ...] = ()
     sampling_params = SamplingParams(
-        logprobs=params.beam_width,
+        # Beam scores arrive only in A5's terminal result, never in control tokens.
+        logprobs=None,
         max_tokens=decode_steps,
         temperature=params.temperature,
         ignore_eos=params.ignore_eos,
@@ -140,6 +136,27 @@ def _append_begin_token(request: EngineCoreRequest, begin_token_id: int | None) 
 
 
 def _validate_runtime_request(request: BeamBatchRequest, vllm_config: Any) -> None:
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        raise BeamSearchV1RequestError("persistent beam_search_v1 currently requires CUDA")
+    if vllm_config.compilation_config.mode != 0:
+        raise BeamSearchV1RequestError(
+            "beam_search_v1 precision baseline requires compilation_config.mode=0; "
+            "torch.compile precision is not accepted yet"
+        )
+    parallel = vllm_config.parallel_config
+    if any(
+        getattr(parallel, name, 1) != 1
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+        )
+    ):
+        raise BeamSearchV1RequestError("beam_search_v1 integration requires TP=PP=DP=1")
+    if vllm_config.speculative_config is not None or vllm_config.model_config.is_hybrid:
+        raise BeamSearchV1RequestError("beam_search_v1 does not support speculative/hybrid models")
     validate_beam_batch_request(request)
     if len(request.items) != 1:
         raise BeamSearchV1RequestError("beam_search_v1 currently requires exactly one prompt")
@@ -154,6 +171,12 @@ def _validate_runtime_request(request: BeamBatchRequest, vllm_config: Any) -> No
         raise BeamSearchV1RequestError(
             f"beam_width {request.beam_params.beam_width} exceeds runtime limit {max_width}"
         )
+    if request.beam_params.beam_width != max_width:
+        raise BeamSearchV1RequestError("beam_search_v1 requires the configured fixed Beam width")
+    if request.beam_params.max_tokens > 3:
+        raise BeamSearchV1RequestError(
+            "canonical SID constraints support at most three generation stages"
+        )
     if request.beam_params.max_tokens > gr_config.beam_max_decode_steps:
         raise BeamSearchV1RequestError(
             f"Decode steps {request.beam_params.max_tokens} exceed runtime limit "
@@ -161,6 +184,10 @@ def _validate_runtime_request(request: BeamBatchRequest, vllm_config: Any) -> No
         )
 
     engine_request = request.items[0].request
+    if engine_request.lora_request is not None or engine_request.mm_features:
+        raise BeamSearchV1RequestError(
+            "beam_search_v1 currently requires text-only, non-LoRA input"
+        )
     prompt_tokens = engine_request.prompt_token_ids
     if prompt_tokens is None:
         raise BeamSearchV1RequestError("embedding prompts are not supported by beam_search_v1")
@@ -172,6 +199,10 @@ def _validate_runtime_request(request: BeamBatchRequest, vllm_config: Any) -> No
             f"{model_config.max_model_len}"
         )
     scheduler_config = vllm_config.scheduler_config
+    if scheduler_config.max_num_seqs != 1:
+        raise BeamSearchV1RequestError("beam_search_v1 integration requires max_num_seqs=1")
+    if max_width > scheduler_config.max_num_batched_tokens:
+        raise BeamSearchV1RequestError("Beam width exceeds the Worker token buffer budget")
     if len(prompt_tokens) > scheduler_config.max_num_batched_tokens:
         raise BeamSearchV1RequestError(
             f"Prefill length {len(prompt_tokens)} exceeds max_num_batched_tokens "
@@ -188,9 +219,7 @@ def _make_batch_request(
     vllm_config: Any,
 ) -> BeamBatchRequest:
     if engine_request.request_id != session_id:
-        raise BeamSearchV1RequestError(
-            "EngineCoreRequest.request_id must equal the GR session ID"
-        )
+        raise BeamSearchV1RequestError("EngineCoreRequest.request_id must equal the GR session ID")
     output_options = BeamOutputOptions(
         num_return_sequences=batch_params.beam_width,
         include_stop_token=bool(getattr(params, "include_stop_str_in_output", False)),
@@ -229,6 +258,35 @@ def _raise_failure(result: BeamBatchResult) -> None:
         raise BeamSearchV1BackendError(result.failure)
 
 
+def _decode_beam_texts(
+    tokenizer: Any, prompt_token_ids: list[int], suffix_token_ids: list[list[int]]
+) -> list[str]:
+    """Decode the shared OneRec prompt once, without changing text boundaries."""
+    from tokenizers.decoders import ByteLevel
+    from transformers import Qwen2TokenizerFast
+
+    if not suffix_token_ids:
+        return []
+    # ByteLevel concatenates bytes before UTF-8 decoding. An ASCII-ending
+    # prompt token (including OneRec's SID begin marker) is a safe split:
+    # no partial UTF-8 character can join across it. Cleanup must be disabled
+    # because it can rewrite whitespace across the prompt/suffix boundary.
+    # Other tokenizers retain full-sequence decoding, not assumed additivity.
+    shared_prompt = False
+    if (
+        isinstance(tokenizer, Qwen2TokenizerFast)
+        and isinstance(tokenizer.backend_tokenizer.decoder, ByteLevel)
+        and not tokenizer.clean_up_tokenization_spaces
+        and prompt_token_ids
+    ):
+        last_token = tokenizer.convert_ids_to_tokens(prompt_token_ids[-1])
+        shared_prompt = bool(last_token) and last_token.isascii()
+    if shared_prompt:
+        prompt_text = tokenizer.decode(prompt_token_ids)
+        return [prompt_text + text for text in tokenizer.batch_decode(suffix_token_ids)]
+    return [tokenizer.decode(prompt_token_ids + suffix) for suffix in suffix_token_ids]
+
+
 class OfflineBeamSearchV1ServerImpl:
     """Offline A2 adapter. A3 supplies the EngineCore transport methods."""
 
@@ -257,10 +315,11 @@ class OfflineBeamSearchV1ServerImpl:
             lora_request=lora_requests[0],
         )
         _append_begin_token(engine_request, begin_token_id)
+        self._prompt_tokens = list(engine_request.prompt_token_ids)
+        self._original_prompt = engine_inputs[0]
         self.engine.input_processor.assign_request_id(engine_request)
-        session_id = engine_request.request_id
         return _make_batch_request(
-            session_id=session_id,
+            session_id=engine_request.request_id,
             engine_request=engine_request,
             batch_params=batch_params,
             params=call.params,
@@ -302,7 +361,35 @@ class OfflineBeamSearchV1ServerImpl:
 
     def build_output(self, call: OfflineBeamSearchV1Call, result: BeamBatchResult) -> list[Any]:
         _raise_failure(result)
-        raise NotImplementedError("A5 must convert BeamBatchResult to BeamSearchOutput")
+        from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput, BeamSearchSequence
+
+        tokenizer = self.llm.get_tokenizer()
+        end = _token_id(tokenizer, getattr(call.params, "end_token", None), "end_token")
+        sequences = []
+        for item in result.output.items:
+            for sequence in item.sequences:
+                tokens = (
+                    self._prompt_tokens + list(sequence.token_ids) + ([] if end is None else [end])
+                )
+                sequences.append(
+                    BeamSearchSequence(
+                        orig_prompt=self._original_prompt,
+                        tokens=tokens,
+                        logprobs=[],
+                        cum_logprob=sequence.cumulative_logprob or 0.0,
+                        text="",
+                        finish_reason=sequence.finish_reason,
+                        stop_reason=sequence.stop_token_id,
+                    )
+                )
+        texts = _decode_beam_texts(
+            tokenizer,
+            self._prompt_tokens,
+            [sequence.tokens[len(self._prompt_tokens) :] for sequence in sequences],
+        )
+        for sequence, text in zip(sequences, texts, strict=True):
+            sequence.text = text
+        return [BeamSearchOutput(sequences=sequences)]
 
     def abort(self, session: BeamSearchV1Session) -> None:
         if session.terminal or session.closed:
@@ -334,9 +421,7 @@ class AsyncBeamSearchV1ServerImpl:
     async def prepare_request(self, call: OnlineBeamSearchV1Call) -> BeamBatchRequest:
         tokenizer = self.serving.input_processor.tokenizer
         if tokenizer is None:
-            raise BeamSearchV1RequestError(
-                "beam_search_v1 requires tokenizer initialization"
-            )
+            raise BeamSearchV1RequestError("beam_search_v1 requires tokenizer initialization")
         sampling_params, batch_params, begin_token_id = _sampling_and_batch_params(
             call.params, tokenizer
         )
@@ -353,10 +438,11 @@ class AsyncBeamSearchV1ServerImpl:
             data_parallel_rank=call.data_parallel_rank,
         )
         _append_begin_token(engine_request, begin_token_id)
+        self._prompt_tokens = list(engine_request.prompt_token_ids)
+        self._begin_token_id = begin_token_id
         self.engine.input_processor.assign_request_id(engine_request)
-        session_id = engine_request.request_id
         return _make_batch_request(
-            session_id=session_id,
+            session_id=engine_request.request_id,
             engine_request=engine_request,
             batch_params=batch_params,
             params=call.params,
@@ -400,7 +486,37 @@ class AsyncBeamSearchV1ServerImpl:
 
     def build_output(self, call: OnlineBeamSearchV1Call, result: BeamBatchResult) -> list[Any]:
         _raise_failure(result)
-        raise NotImplementedError("A5 must convert BeamBatchResult to RequestOutput")
+        from vllm.outputs import CompletionOutput, RequestOutput
+
+        tokenizer = self.serving.input_processor.tokenizer
+        end = _token_id(tokenizer, getattr(call.params, "end_token", None), "end_token")
+        begin = [] if self._begin_token_id is None else [self._begin_token_id]
+        prompt = self._prompt_tokens if not begin else self._prompt_tokens[:-1]
+        completions = []
+        for item in result.output.items:
+            for sequence in item.sequences:
+                tokens = begin + list(sequence.token_ids) + ([] if end is None else [end])
+                completions.append(
+                    CompletionOutput(
+                        index=len(completions),
+                        text=tokenizer.decode(tokens),
+                        token_ids=tokens,
+                        cumulative_logprob=sequence.cumulative_logprob,
+                        logprobs=None,
+                        finish_reason=sequence.finish_reason,
+                        stop_reason=sequence.stop_token_id,
+                    )
+                )
+        return [
+            RequestOutput(
+                request_id=call.request_id,
+                prompt=tokenizer.decode(prompt),
+                prompt_token_ids=prompt,
+                prompt_logprobs=None,
+                outputs=completions,
+                finished=True,
+            )
+        ]
 
     async def abort(self, session: BeamSearchV1Session) -> None:
         if session.terminal or session.closed:

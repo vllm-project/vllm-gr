@@ -204,6 +204,12 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
         logits_indices, spec_decode_metadata = _orig_prepare_inputs(
             self, scheduler_output, num_scheduled_tokens
         )
+        integration = getattr(self, "_gr_beam_integration", None)
+        if integration is not None and integration.active is not None:
+            device_indices = integration.prepare_inputs()
+            if device_indices is not None:
+                return device_indices, spec_decode_metadata
+            return logits_indices, spec_decode_metadata
 
         # GPU attention metadata is built after _prepare_inputs returns.
         if getattr(self, "_current_beam_info", None) is not None:
@@ -258,6 +264,9 @@ def make_patched_sample_tokens_gpu(_orig_sample_tokens):
     def patched_sample_tokens(self, grammar_output, *args, **kwargs):
         from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
 
+        integration = getattr(self, "_gr_beam_integration", None)
+        if integration is not None and integration.pending is not None:
+            return integration.sample()
         out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
         _attach_beam_search_result(self, out)
         return out
@@ -910,6 +919,14 @@ make_patched_prepare_inputs = make_patched_prepare_inputs_gpu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_gpu
 make_patched_sample = make_patched_sample_gpu
 make_patched_sample_tokens = make_patched_sample_tokens_gpu
+
+
+def make_patched_execute_model_gpu(original):
+    from vllm_gr.v1.worker.gr_beam_integration import make_patched_execute_model_gpu as factory
+
+    return factory(original)
+
+
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_gpu
 )

@@ -21,10 +21,37 @@ _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
 _ENGINE_STEP_PATCH_MARKER = "_vllm_gr_beam_self_advance_step"
 _CLIENT_REQUEST_PATCH_MARKER = "_vllm_gr_gr_input_dispatch"
 _PIS_PATCH_MARKER = "_vllm_gr_process_input_sockets"
+_KV_CACHE_BLOCKS_PATCH_MARKER = "_vllm_gr_caps_gr_prefix_cache"
 
 # Upstream EngineCoreProc.process_input_sockets captured before the adapter
 # is installed.  Parity tests inspect this object against the pinned vLLM.
 UPSTREAM_PROCESS_INPUT_SOCKETS = None
+
+
+def _gr_cacheable_tokens(request, num_computed_tokens: int) -> int:
+    """Exclude GR control placeholders backed only by the private KV pool."""
+    if getattr(request, "gr_batch_request", None) is None:
+        return num_computed_tokens
+    return min(num_computed_tokens, request.num_prompt_tokens)
+
+
+def _patch_gr_kv_cache_publication() -> None:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    original = KVCacheManager.cache_blocks
+    if getattr(original, _KV_CACHE_BLOCKS_PATCH_MARKER, False):
+        return
+
+    @wraps(original)
+    def patched(self, request, num_computed_tokens):
+        return original(
+            self,
+            request,
+            _gr_cacheable_tokens(request, num_computed_tokens),
+        )
+
+    setattr(patched, _KV_CACHE_BLOCKS_PATCH_MARKER, True)
+    KVCacheManager.cache_blocks = patched
 
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
@@ -351,6 +378,7 @@ def apply_scheduler_patch():
     )
 
     install_gr_scheduler_methods(Scheduler)
+    _patch_gr_kv_cache_publication()
 
     if not getattr(Scheduler.add_request, "_vllm_gr_v1_add_request", False):
         original_add_request = Scheduler.add_request
@@ -426,6 +454,11 @@ def apply_scheduler_patch():
             )
 
             def patch_cache_blocks(request, num_computed_tokens):
+                num_computed_tokens = _gr_cacheable_tokens(
+                    request, num_computed_tokens
+                )
+                if getattr(request, "gr_batch_request", None) is not None:
+                    return _original_cache_blocks(request, num_computed_tokens)
                 # Extend the num_computed_tokens passed to cache_blocks to the next
                 # block boundary on the FINAL prefill chunk, so the trailing partial
                 # block (whose hash exists thanks to the padding in _cache_beam_request)

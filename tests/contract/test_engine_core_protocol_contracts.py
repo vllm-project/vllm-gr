@@ -13,6 +13,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
 from vllm.v1.serial_utils import MsgpackDecoder
 
+from vllm_gr.v1.engine.engine_core_patch import _gr_cacheable_tokens
 from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.engine.wire import (
@@ -208,6 +209,26 @@ def test_scheduler_beam_metadata_shape() -> None:
         # to beam_width on the worker when the request does not carry one.
         "result_width": None,
     }
+
+
+def test_gr_placeholders_never_publish_a_reusable_prefix_cache_block() -> None:
+    block_size = 16
+    gr_request = SimpleNamespace(
+        gr_batch_request=object(),
+        num_prompt_tokens=block_size - 1,
+    )
+    ordinary_request = SimpleNamespace(
+        gr_batch_request=None,
+        num_prompt_tokens=block_size - 1,
+    )
+
+    published = [
+        _gr_cacheable_tokens(gr_request, count) for count in (15, 16, 17)
+    ]
+
+    assert published == [15, 15, 15]
+    assert all(count // block_size == 0 for count in published)
+    assert _gr_cacheable_tokens(ordinary_request, 16) == 16
 
 
 def test_non_beam_request_has_no_scheduler_metadata() -> None:

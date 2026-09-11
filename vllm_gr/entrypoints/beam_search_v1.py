@@ -118,7 +118,7 @@ def run_beam_search_v1(
     call: OfflineBeamSearchV1Call,
 ) -> list[Any]:
     """Execute the permanent submit-once/wait-once V1 frontend flow."""
-    request = await server.prepare_request(call)
+    request = server.prepare_request(call)
     session = server.submit_once(request)
     try:
         result = server.wait_final(session)
@@ -132,7 +132,7 @@ async def run_beam_search_v1_async(
     call: OnlineBeamSearchV1Call,
 ) -> list[Any]:
     """Execute the online submit-once/wait-once flow without blocking its loop."""
-    request = server.prepare_request(call)
+    request = await server.prepare_request(call)
     session = await server.submit_once(request)
     try:
         result = await server.wait_final(session)

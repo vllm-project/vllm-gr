@@ -69,7 +69,7 @@ def sync_mp_submit_gr_session(self, batch_request):
     from vllm.v1.engine import EngineCoreRequestType
 
     request = batch_request.items[0].request
-    request.client_index = self.client_index
+    request.client_index = getattr(self, "client_index", 0)
     if hasattr(self, "current_wave"):
         request.current_wave = self.current_wave
     if getattr(self, "is_dp", False):

@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import msgspec
+
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchRequest,
     BeamBatchResult,
+    validate_beam_batch_result,
 )
 
 
@@ -26,7 +29,14 @@ class AsyncGRSessionHandle:
 def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
     params = getattr(output, "kv_transfer_params", None) or {}
     result = params.get("gr_batch_result")
+    # kv_transfer_params is an untyped IPC field: array-like msgspec structs
+    # arrive as lists when EngineCore runs in another process.
+    if isinstance(result, (list, tuple)):
+        result = msgspec.convert(result, type=BeamBatchResult)
     if isinstance(result, BeamBatchResult):
+        validate_beam_batch_result(result)
+        if result.batch_id != request.batch_id:
+            raise ValueError("terminal Beam result belongs to a different session")
         return result
     return BeamBatchResult(
         protocol_version=request.protocol_version,
@@ -52,9 +62,11 @@ def wait_gr_session_sync(
 ) -> BeamBatchResult:
     if handle.request.batch_id != session_id:
         raise ValueError("GR session handle does not match session_id")
+    native_request = handle.request.items[0].request
+    output_id = getattr(native_request, "external_req_id", None) or session_id
     while True:
         for output in engine.step():
-            if output.request_id == session_id and output.finished:
+            if output.request_id == output_id and output.finished:
                 return _terminal_result(handle.request, output)
 
 
@@ -67,15 +79,11 @@ def release_gr_session_sync(engine: Any, session_id: str) -> None:
     return None
 
 
-async def submit_gr_session_async(
-    engine: Any, request: BeamBatchRequest
-) -> AsyncGRSessionHandle:
+async def submit_gr_session_async(engine: Any, request: BeamBatchRequest) -> AsyncGRSessionHandle:
     from vllm.v1.engine.output_processor import RequestOutputCollector
 
     native_request = request.items[0].request
-    collector = RequestOutputCollector(
-        native_request.sampling_params.output_kind, request.batch_id
-    )
+    collector = RequestOutputCollector(native_request.sampling_params.output_kind, request.batch_id)
     engine.output_processor.add_request(native_request, None, queue=collector)
     engine._run_output_handler()
     await engine.engine_core.submit_gr_session_async(request)
