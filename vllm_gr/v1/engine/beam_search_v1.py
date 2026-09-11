@@ -17,7 +17,12 @@ from typing import Any, Protocol
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest, BeamBatchResult
+from vllm_gr.v1.beam.batch_contracts import (
+    BeamBatchParams,
+    BeamBatchRequest,
+    BeamBatchResult,
+    BeamOutputOptions,
+)
 
 
 class GRStageKind(str, Enum):
@@ -134,6 +139,10 @@ class GRStageMetadata:
     is_last_stage: bool
     input_device_state: GRDeviceStateRef | None
     output_device_state: GRDeviceStateRef
+    beam_params: BeamBatchParams
+    output_options: BeamOutputOptions
+    num_prompt_tokens: int
+    produces_output: bool = True
     session_init: BeamBatchRequest | None = None
 
 

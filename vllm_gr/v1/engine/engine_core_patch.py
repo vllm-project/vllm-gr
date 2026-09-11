@@ -138,6 +138,7 @@ def apply_engine_core_request_patches() -> None:
         _cache_beam_request,
         _handle_beam_request_step_update,
         _handle_beam_session_template,
+        _handle_submit_gr_session,
         _handle_submit_session,
         process_input_sockets,
     )
@@ -156,12 +157,14 @@ def apply_engine_core_request_patches() -> None:
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCore._handle_beam_session_template = _handle_beam_session_template
     EngineCore._handle_submit_session = _handle_submit_session
+    EngineCore._handle_submit_gr_session = _handle_submit_gr_session
     EngineCore._apply_beam_step = _apply_beam_step
     EngineCore._beam_self_advance = _beam_self_advance
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCoreProc._handle_beam_session_template = _handle_beam_session_template
     EngineCoreProc._handle_submit_session = _handle_submit_session
+    EngineCoreProc._handle_submit_gr_session = _handle_submit_gr_session
     EngineCoreProc._apply_beam_step = _apply_beam_step
     EngineCoreProc._beam_self_advance = _beam_self_advance
 
@@ -342,6 +345,56 @@ def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from vllm.v1.core.sched.scheduler import Scheduler
 
+    from vllm_gr.v1.engine.gr_async_scheduler import (
+        GR_STAGE_OUTPUT_ATTR,
+        install_gr_scheduler_methods,
+    )
+
+    install_gr_scheduler_methods(Scheduler)
+
+    if not getattr(Scheduler.add_request, "_vllm_gr_v1_add_request", False):
+        original_add_request = Scheduler.add_request
+
+        @wraps(original_add_request)
+        def patched_add_request(self, request):
+            batch_request = getattr(request, "gr_batch_request", None)
+            if batch_request is not None:
+                self.add_gr_session(batch_request)
+            return original_add_request(self, request)
+
+        setattr(patched_add_request, "_vllm_gr_v1_add_request", True)
+        Scheduler.add_request = patched_add_request
+
+    if not getattr(Scheduler.finish_requests, "_vllm_gr_v1_finish_requests", False):
+        original_finish_requests = Scheduler.finish_requests
+
+        @wraps(original_finish_requests)
+        def patched_finish_requests(self, request_ids, finished_status):
+            result = original_finish_requests(self, request_ids, finished_status)
+            ids = (request_ids,) if isinstance(request_ids, str) else request_ids
+            for req_id in ids or ():
+                session = getattr(self, "_gr_v1_sessions", {}).get(req_id)
+                if session is None:
+                    continue
+                status_name = getattr(finished_status, "name", "")
+                if status_name == "FINISHED_ABORTED":
+                    session.status = GRSessionStatus.ABORTED
+                elif status_name == "FINISHED_ERROR":
+                    session.status = GRSessionStatus.FAILED
+                elif session.status not in (
+                    GRSessionStatus.ABORTED,
+                    GRSessionStatus.FAILED,
+                ):
+                    session.status = GRSessionStatus.FINISHING
+                if session.in_flight_stages == 0:
+                    getattr(self, "_gr_v1_sessions", {}).pop(req_id, None)
+            return result
+
+        from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
+
+        setattr(patched_finish_requests, "_vllm_gr_v1_finish_requests", True)
+        Scheduler.finish_requests = patched_finish_requests
+
     if getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False):
         return
 
@@ -414,7 +467,17 @@ def apply_scheduler_patch():
         ) = cached_patches
         self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
         self.kv_cache_manager.coordinator.cache_blocks = patch_cache_blocks
+        blocked_gr_max_tokens = {}
         try:
+            # Keep at most two consecutive stages of one session outstanding.
+            # Temporarily making a saturated request length-capped lets native
+            # schedule() skip it while still scheduling other ready requests.
+            for req_id, session in getattr(self, "_gr_v1_sessions", {}).items():
+                request = self.requests.get(req_id)
+                if request is None or self.can_issue_gr_stage(session):
+                    continue
+                blocked_gr_max_tokens[req_id] = request.max_tokens
+                request.max_tokens = 0
             output = _original_schedule(self)
 
             # Propagate beam request attributes from Request objects to SchedulerOutput
@@ -443,8 +506,21 @@ def apply_scheduler_patch():
 
             output.beam_data = beam_data
             output.beam_finished_session_ids = beam_finished_session_ids
+            gr_stages = {}
+            for req_id in output.num_scheduled_tokens:
+                session = getattr(self, "_gr_v1_sessions", {}).get(req_id)
+                if session is None:
+                    continue
+                metadata = self.attach_gr_stage_metadata(output, session)
+                if metadata is not None:
+                    gr_stages[req_id] = metadata
+            setattr(output, GR_STAGE_OUTPUT_ATTR, gr_stages)
             return output
         finally:
+            for req_id, max_tokens in blocked_gr_max_tokens.items():
+                request = self.requests.get(req_id)
+                if request is not None:
+                    request.max_tokens = max_tokens
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
             self.kv_cache_manager.coordinator.cache_blocks = _original_cache_blocks
 
@@ -479,6 +555,31 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
     @wraps(_original_update)
     def patched_update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
         result = _original_update(self, scheduler_output, model_runner_output, *args, **kwargs)
+
+        from vllm_gr.v1.engine.gr_async_scheduler import (
+            GR_BATCH_RESULT_ATTR,
+            GR_STAGE_OUTPUT_ATTR,
+        )
+
+        gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {})
+        for session_id in gr_stages:
+            session = getattr(self, "_gr_v1_sessions", {}).get(session_id)
+            if session is not None:
+                self.update_gr_from_output(session, scheduler_output, model_runner_output)
+
+        # A5 publishes only the terminal BeamBatchResult. Carry it through the
+        # existing EngineCoreOutput channel so online and offline clients share
+        # the same asynchronous completion path and need no result-side RPC.
+        gr_batch_results = getattr(model_runner_output, GR_BATCH_RESULT_ATTR, None) or {}
+        if gr_batch_results:
+            for engine_outputs in result.values():
+                for engine_output in getattr(engine_outputs, "outputs", ()):
+                    batch_result = gr_batch_results.get(engine_output.request_id)
+                    if batch_result is None:
+                        continue
+                    kv_params = dict(engine_output.kv_transfer_params or {})
+                    kv_params["gr_batch_result"] = batch_result
+                    engine_output.kv_transfer_params = kv_params
 
         beam_search_result = getattr(model_runner_output, "beam_search_result", None)
         if beam_search_result is None:
