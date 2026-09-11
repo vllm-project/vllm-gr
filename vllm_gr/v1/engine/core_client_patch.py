@@ -24,6 +24,7 @@ from vllm_gr.v1.engine.core_client import (
     beam_request_step_update_async,
     beam_session_template_async,
     submit_session_async,
+    submit_gr_session_async,
 )
 
 logger = init_logger(__name__)
@@ -64,6 +65,18 @@ def sync_mp_submit_session(self, requests, template):
     self._send_input(EngineCoreRequestType.SUBMIT_SESSION, (requests, template))
 
 
+def sync_mp_submit_gr_session(self, batch_request):
+    from vllm.v1.engine import EngineCoreRequestType
+
+    request = batch_request.items[0].request
+    request.client_index = self.client_index
+    if hasattr(self, "current_wave"):
+        request.current_wave = self.current_wave
+    if getattr(self, "is_dp", False):
+        self.engines_running = True
+    self._send_input(EngineCoreRequestType.SUBMIT_GR_SESSION, batch_request)
+
+
 def inproc_add_requests(self, requests, force_batch=False):
     if not requests:
         return
@@ -91,6 +104,10 @@ def inproc_submit_session(self, requests, template):
     if not requests:
         return
     self.engine_core._handle_submit_session(requests, template)
+
+
+def inproc_submit_gr_session(self, batch_request):
+    self.engine_core._handle_submit_gr_session(batch_request)
 
 
 _INPROC_OUTPUT_MARKER = "_vllm_gr_inproc_self_advance"
@@ -151,20 +168,24 @@ def apply_engine_client_patches() -> None:
     AsyncMPClient.beam_request_step_update_async = beam_request_step_update_async
     AsyncMPClient.beam_session_template_async = beam_session_template_async
     AsyncMPClient.submit_session_async = submit_session_async
+    AsyncMPClient.submit_gr_session_async = submit_gr_session_async
     SyncMPClient.add_requests = sync_mp_add_requests
     SyncMPClient.beam_request_step_update = sync_mp_beam_request_step_update
     SyncMPClient.beam_session_template = sync_mp_beam_session_template
     SyncMPClient.submit_session = sync_mp_submit_session
+    SyncMPClient.submit_gr_session = sync_mp_submit_gr_session
     InprocClient.add_requests = inproc_add_requests
     InprocClient.beam_request_step_update = inproc_beam_request_step_update
     InprocClient.beam_session_template = inproc_beam_session_template
     InprocClient.submit_session = inproc_submit_session
+    InprocClient.submit_gr_session = inproc_submit_gr_session
     InprocClient.get_output = make_patched_inproc_get_output(InprocClient.get_output)
 
 
 def apply_async_llm_patches() -> None:
     """Add grouped request orchestration methods to AsyncLLM."""
     from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.v1.engine.llm_engine import LLMEngine
     from vllm.v1.engine.output_processor import OutputProcessor
 
     AsyncLLM.prepare_request = prepare_request_fn
@@ -175,6 +196,9 @@ def apply_async_llm_patches() -> None:
     AsyncLLM.submit_session = submit_session_fn
     AsyncLLM.track_beam_session = track_beam_session_fn
     OutputProcessor.process_outputs = make_patched_process_outputs(OutputProcessor.process_outputs)
+    from vllm_gr.v1.engine.gr_session_client import install_gr_frontend_methods
+
+    install_gr_frontend_methods(LLMEngine, AsyncLLM)
 
 
 def apply_batch_fork_patches() -> None:

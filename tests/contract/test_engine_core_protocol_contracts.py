@@ -19,6 +19,7 @@ from vllm_gr.v1.engine.wire import (
     ADD_BATCH_WIRE_VALUE,
     BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE,
     BEAM_SESSION_TEMPLATE_WIRE_VALUE,
+    SUBMIT_GR_SESSION_WIRE_VALUE,
     SUBMIT_SESSION_WIRE_VALUE,
     register_engine_core_request_types,
 )
@@ -37,6 +38,7 @@ GR_REQUEST_WIRE_VALUES = {
     "BEAM_REQUEST_STEP_UPDATE": b"\x07",
     "BEAM_SESSION_TEMPLATE": b"\x08",
     "SUBMIT_SESSION": b"\x09",
+    "SUBMIT_GR_SESSION": b"\x0a",
 }
 
 ENGINE_CORE_REQUEST_FIELDS = (
@@ -112,6 +114,7 @@ def test_engine_core_wire_value_inventory() -> None:
     assert BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE == b"\x07"
     assert BEAM_SESSION_TEMPLATE_WIRE_VALUE == b"\x08"
     assert SUBMIT_SESSION_WIRE_VALUE == b"\x09"
+    assert SUBMIT_GR_SESSION_WIRE_VALUE == b"\x0a"
     register_engine_core_request_types()
     register_engine_core_request_types()
 
