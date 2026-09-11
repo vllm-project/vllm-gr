@@ -224,6 +224,82 @@ def _readiness_backend(
     )
 
 
+def _candidate_domain_reference_op(*args: object) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mirror the fused operator's contract: candidate-set normalized scores.
+
+    Token selection/order come from the Torch reference (the stable oracle);
+    logprobs are re-expressed on the row's legal-candidate domain — the same
+    normalization the kernel applies (logit/T - logsumexp over the candidate
+    slice) and the NPU backend now passes through unmodified.
+    """
+    tokens, _ = rec_constrained_topk_torch(*args)
+    logits = cast(torch.Tensor, args[0]).float()
+    sequence_group = cast(torch.Tensor, args[1])
+    first_token_ids = cast(torch.Tensor, args[2])
+    prefix1_offsets = cast(torch.Tensor, args[3])
+    prefix1_values = cast(torch.Tensor, args[4])
+    prefix1_pair_keys = cast(torch.Tensor, args[5])
+    prefix2_value_offsets = cast(torch.Tensor, args[6])
+    prefix2_values = cast(torch.Tensor, args[7])
+    temperatures = cast(torch.Tensor, args[8])
+    current_step = cast(int, args[9])
+    top_k = cast(int, args[10])
+    vocab_size = prefix1_offsets.numel() - 1
+
+    out = torch.full(
+        (logits.shape[0], top_k), float(INVALID_LOGIT), dtype=torch.float32
+    )
+    valid_mask = valid_mask_from_counts(
+        constraint_candidate_counts(
+            sequence_group,
+            first_token_ids,
+            prefix1_offsets,
+            prefix1_pair_keys,
+            prefix2_value_offsets,
+            current_step=current_step,
+            vocab_size=vocab_size,
+        ),
+        top_k,
+    )
+    row_temperatures = temperatures.reshape(-1)
+    if row_temperatures.numel() == 1:
+        row_temperatures = row_temperatures.expand(logits.shape[0])
+    row_temperatures = torch.where(
+        row_temperatures == 0, torch.ones_like(row_temperatures), row_temperatures
+    )
+    flat = sequence_group.reshape(-1, sequence_group.size(-1))
+    for row in range(logits.shape[0]):
+        if current_step == 0:
+            candidates = first_token_ids.to(torch.long)
+        elif current_step == 1:
+            t0 = int(flat[row, 0])
+            begin, end = int(prefix1_offsets[t0]), int(prefix1_offsets[t0 + 1])
+            candidates = prefix1_values[begin:end].to(torch.long)
+        else:
+            t0, t1 = int(flat[row, 0]), int(flat[row, 1])
+            query = t0 * vocab_size + t1
+            keys = prefix1_pair_keys.to(torch.long)
+            pos = int(torch.searchsorted(keys, query).item())
+            if pos >= keys.numel() or int(keys[pos].item()) != query:
+                continue
+            begin, end = int(prefix2_value_offsets[pos]), int(prefix2_value_offsets[pos + 1])
+            candidates = prefix2_values[begin:end].to(torch.long)
+        candidates = candidates[
+            candidates.ge(0) & candidates.lt(min(vocab_size, logits.shape[1]))
+        ]
+        if candidates.numel() == 0:
+            continue
+        slice_logits = logits[row].index_select(0, candidates) / row_temperatures[row]
+        denominator = torch.logsumexp(slice_logits, dim=0)
+        selected = tokens[row].to(torch.long)
+        safe = selected.clamp(0, logits.shape[1] - 1)
+        scores = logits[row].index_select(0, safe) / row_temperatures[row] - denominator
+        out[row] = torch.where(
+            valid_mask[row], scores, torch.full_like(scores, float(INVALID_LOGIT))
+        )
+    return tokens.to(torch.int32), out
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_readiness_accepts_normalized_reference_at_top_k_256(
     dtype: torch.dtype,
@@ -231,11 +307,7 @@ def test_readiness_accepts_normalized_reference_at_top_k_256(
 ) -> None:
     table = make_table(first_token_ids=np.asarray([1, 3, 4], dtype=np.int32))
 
-    def reference_op(*args: object) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens, logprobs = rec_constrained_topk_torch(*args)
-        return tokens.to(torch.int32), logprobs
-
-    backend = _readiness_backend(reference_op, table=table, top_k=256)
+    backend = _readiness_backend(_candidate_domain_reference_op, table=table, top_k=256)
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
     try:
         loader._run_npu_readiness(  # noqa: SLF001
@@ -250,7 +322,7 @@ def test_readiness_accepts_normalized_reference_at_top_k_256(
 
 
 @pytest.mark.parametrize("failure_mode", ["raw", "ignore_temperature", "top_k_normalized"])
-def test_readiness_rescores_legacy_operator_logprobs(
+def test_readiness_rejects_off_domain_operator_logprobs(
     failure_mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -312,16 +384,18 @@ def test_readiness_rescores_legacy_operator_logprobs(
     backend = _readiness_backend(broken_op, table=table, top_k=2)
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
     try:
-        # Existing NPU extensions return legal-set-normalized scores.  The
-        # Python Backend deliberately ignores those values and rebuilds
-        # shared-domain model logprobs from raw logits and selected token IDs.
-        loader._run_npu_readiness(  # noqa: SLF001
-            backend,
-            cases=loader._readiness_cases(table, 2),  # noqa: SLF001
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            max_rows=2,
-        )
+        # The operator's legal-set-normalized scores are now the contract:
+        # the Backend passes them through, so readiness must reject values
+        # that are raw logits, ignore the temperature, or normalize over the
+        # selected top-k instead of the full candidate set.
+        with pytest.raises(RuntimeError):
+            loader._run_npu_readiness(  # noqa: SLF001
+                backend,
+                cases=loader._readiness_cases(table, 2),  # noqa: SLF001
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                max_rows=2,
+            )
     finally:
         backend.close()
 
@@ -341,8 +415,7 @@ def test_readiness_failure_closes_backend_and_preserves_exception(
     def op(*args: object) -> tuple[torch.Tensor, torch.Tensor]:
         if args[9] == failed_step:
             raise error
-        tokens, logprobs = rec_constrained_topk_torch(*args)
-        return tokens.to(torch.int32), logprobs
+        return _candidate_domain_reference_op(*args)
 
     backend = NPUConstraintBackend(
         **tensors,

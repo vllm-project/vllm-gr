@@ -36,9 +36,9 @@ class ConstraintMetadata:
     ``temperatures`` is a caller-validated tensor of finite, non-negative
     values.  Zero has the established constrained-operator meaning of one:
     logits are left unscaled, rather than divided by zero. Positive values
-    scale logits before normalization. The CUDA fused OneRec path normalizes
-    over each row's legal candidate set; CPU and NPU Backends normalize over
-    the complete shared logits window.
+    scale logits before normalization. The CUDA fused OneRec path and the
+    NPU fused operator both normalize over each row's legal candidate set
+    (the ACS reference domain).
 
     Value-domain validation intentionally remains at the request boundary.
     Inspecting a device tensor here would synchronize every NPU ``select``;

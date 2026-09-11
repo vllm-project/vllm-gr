@@ -16,7 +16,6 @@ from vllm_gr.constraints.backend import (
     build_constraint_output,
     validate_select_inputs,
 )
-from vllm_gr.constraints.scoring import score_selected_tokens
 from vllm_gr.constraints.validity import (
     constraint_candidate_counts,
     valid_mask_from_counts,
@@ -102,14 +101,13 @@ class NPUConstraintBackend:
 
         # The fused operator consumes [B, W, max_steps]. A singleton W is a
         # zero-copy view of the public flat [rows, 3] Backend metadata.
+        # ``self._op`` is the full wrapper (bf16->fp32 widening, the
+        # operator's own candidate-set normalized logprobs, deterministic
+        # oracle tie order), so the returned scores are already on the
+        # ACS/CUDA-oracle domain — no re-scoring here.
         sequence_group = metadata.prefix_token_ids.unsqueeze(1)
-        # The fused kernel's bf16 load path reads stale unified-buffer data on
-        # ascend910b and produces garbage logprobs, while its fp32 path is
-        # correct; bf16 -> fp32 is a lossless bit extension, so widen first.
-        # (Same normalization as vllm_gr.ops.npu.rec_constrained_topk.)
-        op_logits = logits.to(torch.float32) if logits.dtype == torch.bfloat16 else logits
         token_ids, logprobs = self._op(
-            op_logits,
+            logits,
             sequence_group,
             *tables,
             metadata.temperatures,
@@ -128,21 +126,6 @@ class NPUConstraintBackend:
             vocab_size=self._info.table_metadata.vocab_size,
         )
         valid_mask = valid_mask_from_counts(valid_counts, metadata.top_k)
-        # Preserve strict validation of the extension's raw ABI before its
-        # legal-set scores are replaced by shared-domain model logprobs.
-        raw_output = build_constraint_output(
-            token_ids,
-            logprobs,
-            valid_mask,
-            logits=logits,
-            top_k=metadata.top_k,
-        )
-        logprobs = score_selected_tokens(
-            logits,
-            raw_output.token_ids,
-            valid_mask,
-            metadata.temperatures,
-        )
         return build_constraint_output(
             token_ids,
             logprobs,

@@ -33,6 +33,7 @@ from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
 from vllm_gr.ops.npu.rec_constrained_topk import (
     MAX_TOP_K,
     NPUConstraintOp,
+    rec_constrained_topk_npu,
     resolve_rec_constrained_topk_npu,
 )
 
@@ -487,7 +488,7 @@ def _run_npu_readiness(
         dtype=dtype,
         max_rows=max_rows,
         synchronize=_synchronize_current_npu_stream,
-        normalize_over_candidates=False,
+        normalize_over_candidates=True,
     )
 
 
@@ -529,7 +530,12 @@ def load_constraint_backend(
             )
         if device.type != "npu":
             raise RuntimeError(f"NPU constraint backend requires an NPU device, got {device}")
-        op = resolve_rec_constrained_topk_npu()
+        # Fail fast with the resolver's explicit unavailability message, then
+        # inject the wrapper (not the raw op): it widens bf16 logits, keeps
+        # the operator's candidate-set normalized logprobs, and restores the
+        # deterministic oracle tie order.
+        resolve_rec_constrained_topk_npu()
+        op = rec_constrained_topk_npu
 
     table = load_constraint_table_artifact(
         config.path,
