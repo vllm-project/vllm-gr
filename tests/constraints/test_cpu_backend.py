@@ -84,14 +84,14 @@ def test_cpu_backend_step_zero_one_two(step: int, prefix: list[int], allowed: li
     )
 
 
-def test_cpu_backend_normalizes_over_shared_logits_window_before_topk() -> None:
+def test_cpu_backend_normalizes_over_all_legal_candidates_before_topk() -> None:
     logits = torch.tensor([[0.0, -100.0, 1.0, -100.0, 2.0, 100.0]])
     output = _select(_backend(), logits, [[1, 0, 0]], step=1, top_k=1)
 
-    # Token 5 is illegal and cannot be returned, but remains part of the
-    # model-probability denominator shared by every parent beam.
+    # Token 5 is the global maximum but is illegal. The denominator still
+    # contains both legal candidates 2 and 4 even though only token 4 returns.
     assert output.token_ids.item() == 4
-    expected = torch.tensor(2.0) - torch.logsumexp(logits[0], dim=0)
+    expected = torch.tensor(2.0) - torch.logsumexp(torch.tensor([1.0, 2.0]), dim=0)
     torch.testing.assert_close(output.logprobs.squeeze(), expected)
 
 

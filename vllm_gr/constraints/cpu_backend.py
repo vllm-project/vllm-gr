@@ -17,7 +17,6 @@ from vllm_gr.constraints.backend import (
     build_constraint_output,
     validate_select_inputs,
 )
-from vllm_gr.constraints.scoring import score_selected_tokens
 from vllm_gr.constraints.table import ConstraintTable
 from vllm_gr.constraints.validity import valid_mask_from_counts
 
@@ -114,13 +113,24 @@ class CPUConstraintBackend:
 
         candidate_ids = torch.from_numpy(host_ids).to(device=logits.device)
         candidate_mask = torch.from_numpy(host_mask).to(device=logits.device)
-        # The legal table controls selection only.  Beam scores are normalized
-        # over the shared logits domain so different parent rows are comparable.
-        # Temperature scaling is intentionally deferred to scoring: every
-        # supported temperature is non-negative, so it cannot change Top-K.
         candidate_logits = logits.gather(1, candidate_ids).float()
+        temperatures = metadata.temperatures.reshape(-1, 1)
+        temperatures = torch.where(
+            temperatures == 0,
+            torch.ones_like(temperatures),
+            temperatures,
+        )
+        candidate_logits = candidate_logits / temperatures
+
+        # Normalize across every legal candidate before truncating to Top-K.
         masked_logits = candidate_logits.masked_fill(~candidate_mask, float("-inf"))
-        _, top_indices = masked_logits.topk(
+        log_denom = torch.logsumexp(masked_logits, dim=1, keepdim=True)
+        candidate_logprobs = torch.where(
+            candidate_mask,
+            masked_logits - log_denom,
+            torch.full_like(masked_logits, float("-inf")),
+        )
+        top_logprobs, top_indices = candidate_logprobs.topk(
             metadata.top_k,
             dim=1,
             largest=True,
@@ -133,12 +143,10 @@ class CPUConstraintBackend:
             device=logits.device,
         )
         valid_mask = valid_mask_from_counts(valid_counts, metadata.top_k)
-        top_logprobs = score_selected_tokens(
-            logits,
-            top_ids,
+        top_logprobs = torch.where(
             valid_mask,
-            metadata.temperatures,
-            invalid_logprob=INVALID_LOGIT,
+            top_logprobs,
+            torch.full_like(top_logprobs, INVALID_LOGIT),
         )
         return build_constraint_output(
             top_ids.contiguous(),

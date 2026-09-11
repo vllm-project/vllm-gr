@@ -14,10 +14,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm_gr.constraints.scoring import INVALID_LOGIT as _INVALID_LOGIT
-from vllm_gr.constraints.scoring import (
-    score_selected_tokens,
-)
+_INVALID_LOGIT = -1.0e20
 
 
 def _range_candidates(
@@ -45,26 +42,34 @@ def _finish_topk(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     candidate_logits = logits.gather(1, candidate_tokens.to(torch.long)).float()
+    if temperatures.numel() > 0:
+        temps = temperatures.float().to(logits.device)
+        if temps.numel() == 1:
+            temps = temps.reshape(1, 1)
+        else:
+            temps = temps.reshape(-1, 1)
+        candidate_logits = candidate_logits / torch.where(temps == 0, torch.ones_like(temps), temps)
     candidate_logits = candidate_logits.masked_fill(~valid_candidates, float("-inf"))
+    log_denom = torch.logsumexp(candidate_logits, dim=1, keepdim=True)
     if candidate_logits.device.type == "npu":
         # Preserve the established NPU fallback path; the fused NPU operator
         # does not promise CUDA's strengthened exact-tie ordering.
-        _, top_indices = candidate_logits.topk(top_k, dim=1, largest=True, sorted=True)
+        top_values, top_indices = candidate_logits.topk(top_k, dim=1, largest=True, sorted=True)
     else:
         # Stable descending order freezes the lower constraint-table offset as
         # the exact-tie winner and serves as the deterministic CUDA oracle.
         top_indices = torch.argsort(candidate_logits, dim=1, descending=True, stable=True)[
             :, :top_k
         ]
+        top_values = candidate_logits.gather(1, top_indices)
+    top_logprobs = top_values - log_denom
     top_valid = valid_candidates.gather(1, top_indices)
-    top_tokens = candidate_tokens.gather(1, top_indices).to(torch.int64)
-    top_logprobs = score_selected_tokens(
-        logits,
-        top_tokens,
+    top_logprobs = torch.where(
         top_valid,
-        temperatures,
-        invalid_logprob=_INVALID_LOGIT,
+        top_logprobs,
+        torch.full_like(top_logprobs, _INVALID_LOGIT),
     )
+    top_tokens = candidate_tokens.gather(1, top_indices).to(torch.int64)
     return top_tokens, top_logprobs
 
 

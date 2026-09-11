@@ -8,12 +8,11 @@ import torch
 import triton
 import triton.language as tl
 
-from vllm_gr.constraints.scoring import INVALID_LOGIT
-
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
 
 
+INVALID_LOGIT = -1.0e20
 MAX_TOP_K = 256
 MAX_SORT_BLOCK = 65536
 

@@ -33,11 +33,11 @@ import torch
 # Single source of truth for the operator's legacy padding payload. Structural
 # validity is carried separately and never inferred from this numeric value.
 from vllm_gr.constraints.compiler import validate_resource_tables
-from vllm_gr.constraints.scoring import INVALID_LOGIT as _INVALID_LOGIT
 from vllm_gr.constraints.validity import (
     constraint_candidate_counts,
     valid_mask_from_counts,
 )
+from vllm_gr.ops.rec_constrained_topk import _INVALID_LOGIT
 
 INVALID_LOGIT = _INVALID_LOGIT
 
