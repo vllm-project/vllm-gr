@@ -119,6 +119,7 @@ class CUDAConstraintBackend:
                 metadata,
                 self._info,
                 expected_logits_vocab_size=expected_logits_vocab_size,
+                allow_strided_logits=True,
             )
             if logits.device.type != "cuda":
                 raise ValueError(

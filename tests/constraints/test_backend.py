@@ -57,6 +57,16 @@ def test_common_validation_accepts_supported_logits(dtype: torch.dtype) -> None:
     validate_select_inputs(torch.zeros(2, 6, dtype=dtype), _metadata(), _info())
 
 
+def test_strided_logits_validation_requires_explicit_backend_opt_in() -> None:
+    for logits in (torch.zeros(2, 12)[:, :6], torch.zeros(2, 12)[:, ::2]):
+        with pytest.raises(ValueError, match="contiguous"):
+            validate_select_inputs(logits, _metadata(), _info())
+        validate_select_inputs(logits, _metadata(), _info(), allow_strided_logits=True)
+    for logits in (torch.zeros(1, 6).expand(2, 6), torch.zeros(2, 1).expand(2, 6)):
+        with pytest.raises(ValueError, match="positive strides"):
+            validate_select_inputs(logits, _metadata(), _info(), allow_strided_logits=True)
+
+
 def test_common_validation_rejects_rows_shapes_dtypes_devices_and_topk() -> None:
     logits = torch.zeros(2, 6)
     with pytest.raises(ValueError, match="rows"):

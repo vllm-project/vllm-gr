@@ -23,11 +23,12 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchResult,
     BeamOutputOptions,
 )
-
-
-class GRStageKind(str, Enum):
-    PREFILL = "prefill"
-    DECODE = "decode"
+from vllm_gr.v1.beam.persistent_contracts import (
+    GRBeamSessionSpec,
+    GRStageAck,
+    GRStageKind,
+    GRWorkerStageSpec,
+)
 
 
 class GRSessionStatus(str, Enum):
@@ -97,6 +98,8 @@ class GRSessionState:
 
     @property
     def total_stages(self) -> int:
+        """Total generated-token stages, including the Prefill winner."""
+
         return 1 + self.max_decode_steps
 
     @property
@@ -119,7 +122,8 @@ class GRSessionState:
 class GRStageMetadata:
     """GR metadata attached to one native vLLM ``SchedulerOutput``.
 
-    Stage 0 is Prefill. Stages 1..N are Decode steps 0..N-1. A3 must issue
+    Stage 0 is Prefill and produces the first token. Stages 1..M-1 are Decode
+    for a ``max_tokens=M`` plan. A3 must issue
     each stage exactly once; A4 consumes this metadata from SchedulerOutput
     and keeps the dependency data on the device.
 
@@ -279,13 +283,16 @@ class GREngineCoreInterface(Protocol):
 
 __all__ = [
     "GRAsyncSchedulerInterface",
+    "GRBeamSessionSpec",
     "GRDeviceStateRef",
     "GREngineCoreInterface",
     "GRModelExecutorInterface",
     "GRSessionState",
     "GRSessionStatus",
     "GRStageCompletion",
+    "GRStageAck",
     "GRStageKind",
     "GRStageMetadata",
+    "GRWorkerStageSpec",
     "GRWorkerResult",
 ]

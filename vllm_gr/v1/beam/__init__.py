@@ -21,12 +21,22 @@ if TYPE_CHECKING:
     from vllm_gr.v1.beam.beam_session_registry import (
         BeamSessionRegistry as BeamSessionRegistry,
     )
+    from vllm_gr.v1.beam.persistent_contracts import (
+        GRBeamSessionSpec as GRBeamSessionSpec,
+        GRStageAck as GRStageAck,
+        GRStageKind as GRStageKind,
+        GRWorkerStageSpec as GRWorkerStageSpec,
+    )
 
 _LAZY_EXPORTS = {
     "BeamAttentionContext": "vllm_gr.v1.beam.beam_attention_context",
     "BeamAttentionPool": "vllm_gr.v1.beam.beam_attention_pool",
     "BeamSearchSession": "vllm_gr.v1.beam.beam_search_session",
     "BeamSessionRegistry": "vllm_gr.v1.beam.beam_session_registry",
+    "GRBeamSessionSpec": "vllm_gr.v1.beam.persistent_contracts",
+    "GRStageAck": "vllm_gr.v1.beam.persistent_contracts",
+    "GRStageKind": "vllm_gr.v1.beam.persistent_contracts",
+    "GRWorkerStageSpec": "vllm_gr.v1.beam.persistent_contracts",
 }
 
 __all__ = sorted(_LAZY_EXPORTS)

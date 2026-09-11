@@ -83,19 +83,25 @@ def validate_select_inputs(
     info: ConstraintBackendInfo,
     *,
     expected_logits_vocab_size: int | None = None,
+    allow_strided_logits: bool = False,
 ) -> None:
     """Validate the common structural ABI without copying or device sync.
 
     In particular, the caller must have already established that temperature
     values are finite and non-negative as documented by
     :class:`ConstraintMetadata`.
+    Strided logits require explicit backend opt-in; CPU/NPU callers retain
+    the contiguous ABI by default.
     """
 
     if not isinstance(metadata, ConstraintMetadata):
         raise ValueError("metadata must be ConstraintMetadata")
     if logits.dim() != 2:
         raise ValueError(f"logits must be [rows, vocab], got {tuple(logits.shape)}")
-    if not logits.is_contiguous():
+    if allow_strided_logits:
+        if logits.stride(0) <= 0 or logits.stride(1) <= 0:
+            raise ValueError("logits must have positive strides")
+    elif not logits.is_contiguous():
         raise ValueError("logits must be contiguous")
     if logits.dtype not in _LOGIT_DTYPES:
         raise ValueError(f"logits dtype must be fp16/bf16/fp32, got {logits.dtype}")
