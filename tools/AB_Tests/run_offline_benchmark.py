@@ -42,14 +42,14 @@ def distribution_ms(values: list[float]) -> dict[str, float | str]:
     }
 
 
-def measure_e2e(llm: Any, prompt: str, params: Any) -> dict[str, Any]:
+def measure_e2e(llm: Any, prompt_token_ids: list[int], params: Any) -> dict[str, Any]:
     """Measure the production trend with no internal monkeypatches or profiler.
 
     Keep the timed region deliberately small: one direct ``beam_search`` call.
     Any diagnostic decomposition is collected only after all canonical samples.
     """
     started = time.perf_counter_ns()
-    outputs = llm.beam_search([{"prompt": prompt}], params, concurrency_limit=1)
+    outputs = llm.beam_search([{"prompt_token_ids": prompt_token_ids}], params, concurrency_limit=1)
     finished = time.perf_counter_ns()
     if len(outputs) != 1:
         raise RuntimeError(f"expected one offline output, received {len(outputs)}")
@@ -61,7 +61,9 @@ def measure_e2e(llm: Any, prompt: str, params: Any) -> dict[str, Any]:
     }
 
 
-def measure_request_diagnostic(llm: Any, prompt: str, params: Any) -> dict[str, Any]:
+def measure_request_diagnostic(
+    llm: Any, prompt_token_ids: list[int], params: Any
+) -> dict[str, Any]:
     """Measure one offline request's prefill/decode boundary with a minimal patch.
 
     Only two boundary functions are wrapped with a one-line perf_counter
@@ -98,7 +100,9 @@ def measure_request_diagnostic(llm: Any, prompt: str, params: Any) -> dict[str, 
         mock.patch.object(gr_module, "_custom_beam_search_batch", timed_custom),
         mock.patch.object(gr_module, "_prepare_beam_step_requests", timed_prepare),
     ):
-        outputs = llm.beam_search([{"prompt": prompt}], params, concurrency_limit=1)
+        outputs = llm.beam_search(
+            [{"prompt_token_ids": prompt_token_ids}], params, concurrency_limit=1
+        )
     finished = time.perf_counter()
 
     e2e_ms = (finished - started) * 1000.0
@@ -160,9 +164,14 @@ def main() -> int:
             args.beam_engine_driven = False
         else:
             parser.error("--beam-engine-driven must be one of auto/true/false")
-    if min(args.num_prompts, args.beam_width, args.input_length) < 1 or args.warmup_requests < 0:
+    if (
+        min(args.num_prompts, args.beam_width) < 1
+        or args.input_length < 2
+        or args.warmup_requests < 0
+    ):
         parser.error(
-            "num-prompts, beam-width, and input-length must be positive; warmup must be non-negative"
+            "num-prompts and beam-width must be positive; input-length must be at least 2 "
+            "(one token is reserved for <|sid_begin|>); warmup must be non-negative"
         )
 
     from transformers import AutoTokenizer
@@ -178,7 +187,7 @@ def main() -> int:
         dataset_path=str(args.data_dir),
         task_types=[args.task],
         tokenizer=tokenizer,
-        custom_input_len=args.input_length,
+        custom_input_len=args.input_length - 1,
         sample_size=sample_size,
     )
     requests = dataset.sample(
@@ -188,6 +197,12 @@ def main() -> int:
     )
     if len(requests) < sample_size:
         raise RuntimeError(f"requested {sample_size} samples, dataset returned {len(requests)}")
+
+    # Pre-encode prompts outside the timed region so GRLLM.beam_search's
+    # _preprocess_cmpl does not re-encode inside the perf_counter window.
+    prompt_token_ids_list = [
+        tokenizer.encode(request.prompt, add_special_tokens=False) for request in requests
+    ]
 
     max_tokens = int(requests[0].expected_output_len)
     params = BeamSearchParams(beam_width=args.beam_width, max_tokens=max_tokens, temperature=0.0)
@@ -223,25 +238,32 @@ def main() -> int:
         gpu_memory_utilization=0.90,
         additional_config=additional_config or None,
     ) as llm:
-        for request in requests[: args.warmup_requests]:
+        for prompt_token_ids in prompt_token_ids_list[: args.warmup_requests]:
             llm.reset_prefix_cache()
-            measure_e2e(llm, request.prompt, params)
+            measure_e2e(llm, prompt_token_ids, params)
 
         measured_requests = requests[: args.num_prompts]
-        for index, request in enumerate(measured_requests, start=1):
+        for index, (request, prompt_token_ids) in enumerate(
+            zip(measured_requests, prompt_token_ids_list[: args.num_prompts]), start=1
+        ):
             if not llm.reset_prefix_cache():
                 raise RuntimeError(f"prefix cache reset failed before measured request {index}")
-            miss_samples.append(measure_e2e(llm, request.prompt, params))
-            hit_samples.append(measure_e2e(llm, request.prompt, params))
+            miss_samples.append(measure_e2e(llm, prompt_token_ids, params))
+            hit_samples.append(measure_e2e(llm, prompt_token_ids, params))
 
         # Diagnostic requests deliberately run after every canonical sample so
         # their monkeypatches cannot inflate the official daily E2E trend.
         diagnostic_count = min(max(0, args.diagnostic_prompts), len(measured_requests))
-        for index, request in enumerate(measured_requests[:diagnostic_count], start=1):
+        for index, (request, prompt_token_ids) in enumerate(
+            zip(measured_requests[:diagnostic_count], prompt_token_ids_list[:diagnostic_count]),
+            start=1,
+        ):
             if not llm.reset_prefix_cache():
                 raise RuntimeError(f"prefix cache reset failed before diagnostic request {index}")
-            diagnostic_miss_samples.append(measure_request_diagnostic(llm, request.prompt, params))
-            diagnostic_hit_samples.append(measure_request_diagnostic(llm, request.prompt, params))
+            diagnostic_miss_samples.append(
+                measure_request_diagnostic(llm, prompt_token_ids, params)
+            )
+            diagnostic_hit_samples.append(measure_request_diagnostic(llm, prompt_token_ids, params))
 
     finished_at = datetime.now(UTC)
     fields = (
