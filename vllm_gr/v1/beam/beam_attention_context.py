@@ -57,12 +57,25 @@ class BeamDecisionBuffers:
         # so the decision module owns it entirely and reset() clears it.
         self.worker_decode_steps = 0
 
-    def reset(self) -> None:
-        """Zero every decision buffer (device-side, in place)."""
-        self.sequence.zero_()
-        self.beam_scores.zero_()
-        self.group_token_num.zero_()
-        self.worker_decode_steps = 0
+    def reset(self, batch_index: int | None = None) -> None:
+        """Clear all legacy state, or only one physical device row.
+
+        A row reset leaves the legacy shared host counter untouched. The
+        persistent CUDA runner owns separate per-row device counters.
+        """
+        if batch_index is None:
+            self.sequence.zero_()
+            self.beam_scores.zero_()
+            self.group_token_num.zero_()
+            self.worker_decode_steps = 0
+        else:
+            if isinstance(batch_index, bool) or not isinstance(batch_index, int):
+                raise TypeError("batch_index must be an integer")
+            if not 0 <= batch_index < self.sequence.shape[0]:
+                raise ValueError("batch_index exceeds decision capacity")
+            self.sequence[batch_index : batch_index + 1].zero_()
+            self.beam_scores[batch_index : batch_index + 1].zero_()
+            self.group_token_num[batch_index : batch_index + 1].zero_()
 
 
 class BeamAttentionContext:

@@ -69,6 +69,7 @@ def _local_beam_topk_kernel(
     scratch_stride,
     HAS_VALID_MASK: tl.constexpr,
     BLOCK: tl.constexpr,
+    MASK_INVALID_INDICES: tl.constexpr = False,
 ):
     request = tl.program_id(0)
     tile = tl.program_id(1)
@@ -97,7 +98,7 @@ def _local_beam_topk_kernel(
         other=-float("inf"),
     )
     score = cumulative + candidate_score
-    packed = _pack_score_flat(score, flat, lane_valid)
+    packed = _pack_score_flat(score, flat, candidate_valid if MASK_INVALID_INDICES else lane_valid)
     sorted_pairs = tl.sort(packed, descending=False)
     selected_scores = _unpack_score(sorted_pairs)
     selected_flat = (sorted_pairs & 0x00000000FFFFFFFF).to(tl.int32)
@@ -820,6 +821,8 @@ def _hierarchical_topk_out(
     candidate_width: int,
     selection_width: int,
     scratch: BeamSelectionScratch,
+    *,
+    mask_invalid_indices: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     candidate_count = beam_width * candidate_width
     list_count = (candidate_count + LOCAL_TILE_SIZE - 1) // LOCAL_TILE_SIZE
@@ -844,6 +847,7 @@ def _hierarchical_topk_out(
         scratch_stride,
         HAS_VALID_MASK=candidate_valid_mask is not None,
         BLOCK=local_block,
+        MASK_INVALID_INDICES=mask_invalid_indices,
         num_warps=8 if local_block >= 128 else 4,
     )
     input_scores = scratch.local_scores

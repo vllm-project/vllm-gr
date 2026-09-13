@@ -42,8 +42,13 @@ class BeamSearchSession:
         self.slot = slot
         self.context = context  # shared ref, not owned
 
-    def begin_session(self, beam_width: int, prefix_len: int):
+    def begin_session(self, beam_width: int, prefix_len: int, *, decision_index: int | None = None):
         """Start a beam search session. Resets slot state (lazy KV reset).
+
+        ``decision_index`` selects a physical decision row for the independent
+        CUDA runner; it need not equal the KV slot. Omission preserves the
+        legacy full-buffer reset. Persistent state must be reset separately,
+        after final consumers, before its next Prefill initialization.
 
         Pool KV is NOT zeroed here. ``cache_unshared_kv_kernel`` is an exact
         overwrite (writes only ``pool[slot, beam, head, decode_step, :]`` per
@@ -70,7 +75,10 @@ class BeamSearchSession:
         # a corrupted cumulative state.
         decision = getattr(self.context, "decision", None)
         if decision is not None:
-            decision.reset()
+            if decision_index is None:
+                decision.reset()
+            else:
+                decision.reset(decision_index)
 
     def end_session(self):
         """End a beam search session. Releases slot from registry."""

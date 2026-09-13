@@ -30,12 +30,15 @@ from __future__ import annotations
 import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_gr.ops.cuda.beam_state import BeamStateScratch
 
 # Kernel tiling constraint: beam_search_rec_final_select requires result_width
 # to be a multiple of 32 (verified on device; see ops/npu/beam_ops.py ABI notes).
@@ -131,6 +134,10 @@ class BeamPostprocessWorkspace:
     host_prefill_staging: torch.Tensor
     host_prefill_staging_numpy: Any
     prefill_copy_event: Any | None
+
+    # Optional persistent-runner scratch, allocated once when the runner binds.
+    # Ordinary postprocess callers retain their existing allocations and ABI.
+    state_scratch: BeamStateScratch | None = None
 
     @classmethod
     def allocate(
@@ -278,7 +285,7 @@ class BeamPostprocessWorkspace:
 
     def device_tensors(self) -> tuple[torch.Tensor, ...]:
         scratch = self.selection_scratch
-        return (
+        tensors = (
             self.topk_token_ids,
             self.topk_scores,
             self.topk_valid_mask,
@@ -305,6 +312,9 @@ class BeamPostprocessWorkspace:
             self.packed_result,
             self.prefill_staging,
         )
+        if self.state_scratch is not None:
+            tensors += self.state_scratch.device_tensors()
+        return tensors
 
     @property
     def device_memory_bytes(self) -> int:
