@@ -21,6 +21,9 @@ _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
 _ENGINE_STEP_PATCH_MARKER = "_vllm_gr_beam_self_advance_step"
 _CLIENT_REQUEST_PATCH_MARKER = "_vllm_gr_gr_input_dispatch"
 _PIS_PATCH_MARKER = "_vllm_gr_process_input_sockets"
+_GR_FINALIZING_IDS_ATTR = "_gr_v1_finalizing_request_ids"
+_GR_NATIVE_UPDATE_IDS_ATTR = "_gr_v1_native_update_request_ids"
+_GR_RESET_PREFIX_CACHE_PATCH_MARKER = "_vllm_gr_v1_reset_prefix_cache"
 
 # Upstream EngineCoreProc.process_input_sockets captured before the adapter
 # is installed.  Parity tests inspect this object against the pinned vLLM.
@@ -138,6 +141,7 @@ def apply_engine_core_request_patches() -> None:
         _cache_beam_request,
         _handle_beam_request_step_update,
         _handle_beam_session_template,
+        _handle_submit_gr_session,
         _handle_submit_session,
         process_input_sockets,
     )
@@ -156,12 +160,14 @@ def apply_engine_core_request_patches() -> None:
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCore._handle_beam_session_template = _handle_beam_session_template
     EngineCore._handle_submit_session = _handle_submit_session
+    EngineCore._handle_submit_gr_session = _handle_submit_gr_session
     EngineCore._apply_beam_step = _apply_beam_step
     EngineCore._beam_self_advance = _beam_self_advance
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCoreProc._handle_beam_session_template = _handle_beam_session_template
     EngineCoreProc._handle_submit_session = _handle_submit_session
+    EngineCoreProc._handle_submit_gr_session = _handle_submit_gr_session
     EngineCoreProc._apply_beam_step = _apply_beam_step
     EngineCoreProc._beam_self_advance = _beam_self_advance
 
@@ -338,9 +344,101 @@ def make_patch_get_computed_blocks(
     return patch_get_computed_blocks
 
 
+def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished_status) -> None:
+    """Mirror native finish results into GR state using consumed request IDs."""
+    from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
+
+    status_name = getattr(finished_status, "name", "")
+    sessions = getattr(scheduler, "_gr_v1_sessions", {})
+    gr_finalizing_ids = getattr(scheduler, _GR_FINALIZING_IDS_ATTR, ())
+    gr_native_update_ids = getattr(scheduler, _GR_NATIVE_UPDATE_IDS_ATTR, ())
+    for req_id, _client_index in finished_requests:
+        session = sessions.get(req_id)
+        if session is None:
+            continue
+        # Native EOS/stop detection may finish a Request while processing a GR
+        # dispatch. The update wrapper reconciles that transition after GR has
+        # consumed the same output; it is not an external abort/error.
+        if req_id in gr_native_update_ids:
+            continue
+        gr_terminal_delivery = (
+            req_id in gr_finalizing_ids
+            and session.status == GRSessionStatus.FINISHING
+            and session.terminal_result_pending
+        )
+        if gr_terminal_delivery:
+            continue
+        if status_name == "FINISHED_ABORTED":
+            session.status = GRSessionStatus.ABORTED
+        elif status_name == "FINISHED_ERROR":
+            session.status = GRSessionStatus.FAILED
+        else:
+            session.status = GRSessionStatus.FINISHING
+        session.terminal_result_pending = False
+
+        # External finish/abort paths need no GR terminal result. Keep state
+        # only while already-dispatched device work still has to drain.
+        if not session._in_flight_dispatches:
+            sessions.pop(req_id, None)
+
+
+def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
+    original_reset = scheduler_cls.reset_prefix_cache
+    if getattr(original_reset, _GR_RESET_PREFIX_CACHE_PATCH_MARKER, False):
+        return
+
+    @wraps(original_reset)
+    def patched_reset_prefix_cache(self, *args, **kwargs):
+        reset_running_requests = kwargs.get("reset_running_requests", args[0] if args else False)
+        if reset_running_requests and getattr(self, "_gr_v1_sessions", {}):
+            logger.warning(
+                "Rejecting reset_prefix_cache(reset_running_requests=True) "
+                "while GR sessions are active"
+            )
+            return False
+        return original_reset(self, *args, **kwargs)
+
+    setattr(patched_reset_prefix_cache, _GR_RESET_PREFIX_CACHE_PATCH_MARKER, True)
+    scheduler_cls.reset_prefix_cache = patched_reset_prefix_cache
+
+
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
     from vllm.v1.core.sched.scheduler import Scheduler
+
+    from vllm_gr.v1.engine.gr_async_scheduler import (
+        GR_STAGE_OUTPUT_ATTR,
+        install_gr_scheduler_methods,
+    )
+
+    install_gr_scheduler_methods(Scheduler)
+
+    if not getattr(Scheduler.add_request, "_vllm_gr_v1_add_request", False):
+        original_add_request = Scheduler.add_request
+
+        @wraps(original_add_request)
+        def patched_add_request(self, request):
+            batch_request = getattr(request, "gr_batch_request", None)
+            if batch_request is not None:
+                self.add_gr_session(batch_request)
+            return original_add_request(self, request)
+
+        setattr(patched_add_request, "_vllm_gr_v1_add_request", True)
+        Scheduler.add_request = patched_add_request
+
+    if not getattr(Scheduler.finish_requests, "_vllm_gr_v1_finish_requests", False):
+        original_finish_requests = Scheduler.finish_requests
+
+        @wraps(original_finish_requests)
+        def patched_finish_requests(self, request_ids, finished_status):
+            result = original_finish_requests(self, request_ids, finished_status)
+            _sync_gr_sessions_after_native_finish(self, result, finished_status)
+            return result
+
+        setattr(patched_finish_requests, "_vllm_gr_v1_finish_requests", True)
+        Scheduler.finish_requests = patched_finish_requests
+
+    _patch_scheduler_reset_prefix_cache(Scheduler)
 
     if getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False):
         return
@@ -414,7 +512,17 @@ def apply_scheduler_patch():
         ) = cached_patches
         self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
         self.kv_cache_manager.coordinator.cache_blocks = patch_cache_blocks
+        blocked_gr_max_tokens = {}
         try:
+            # Keep at most two consecutive stages of one session outstanding.
+            # Temporarily making a saturated request length-capped lets native
+            # schedule() skip it while still scheduling other ready requests.
+            for req_id, session in getattr(self, "_gr_v1_sessions", {}).items():
+                request = self.requests.get(req_id)
+                if request is None or self.can_issue_gr_stage(session):
+                    continue
+                blocked_gr_max_tokens[req_id] = request.max_tokens
+                request.max_tokens = 0
             output = _original_schedule(self)
 
             # Propagate beam request attributes from Request objects to SchedulerOutput
@@ -443,8 +551,21 @@ def apply_scheduler_patch():
 
             output.beam_data = beam_data
             output.beam_finished_session_ids = beam_finished_session_ids
+            gr_stages = {}
+            for req_id in output.num_scheduled_tokens:
+                session = getattr(self, "_gr_v1_sessions", {}).get(req_id)
+                if session is None:
+                    continue
+                metadata = self.attach_gr_stage_metadata(output, session)
+                if metadata is not None:
+                    gr_stages[req_id] = metadata
+            setattr(output, GR_STAGE_OUTPUT_ATTR, gr_stages)
             return output
         finally:
+            for req_id, max_tokens in blocked_gr_max_tokens.items():
+                request = self.requests.get(req_id)
+                if request is not None:
+                    request.max_tokens = max_tokens
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
             self.kv_cache_manager.coordinator.cache_blocks = _original_cache_blocks
 
@@ -457,6 +578,154 @@ def apply_scheduler_patch():
     # (ModelRunnerOutput.beam_search_result) reaches the frontend via
     # EngineCoreOutput.kv_transfer_params (ACS-aligned save flow).
     _patch_scheduler_update_from_output(Scheduler)
+
+
+def _find_gr_output(result, request_id):
+    for engine_outputs in result.values():
+        for engine_output in engine_outputs.outputs:
+            if engine_output.request_id == request_id:
+                return engine_outputs, engine_output
+    return None, None
+
+
+def _native_request_terminated(scheduler, result, request_id) -> bool:
+    _, target_output = _find_gr_output(result, request_id)
+    if target_output is not None and target_output.finish_reason is not None:
+        return True
+    for engine_outputs in result.values():
+        if request_id in (engine_outputs.finished_requests or ()):
+            return True
+    return request_id not in scheduler.requests
+
+
+def _reconcile_native_gr_termination(scheduler, result, session) -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
+    from vllm_gr.v1.engine.gr_async_scheduler import _make_failure_result
+
+    if session.status not in (GRSessionStatus.WAITING, GRSessionStatus.RUNNING):
+        return
+    if not _native_request_terminated(scheduler, result, session.session_id):
+        return
+
+    session.status = GRSessionStatus.FINISHING
+    session.terminal_result_pending = True
+    if session._pending_terminal_result is None:
+        session._pending_terminal_result = _make_failure_result(
+            session,
+            "native_termination_without_gr_result",
+            "Native request terminated before GR produced a terminal result",
+        )
+
+
+def _suppress_native_terminal(result, request_id, target_output) -> None:
+    if target_output is not None:
+        target_output.finish_reason = None
+    for engine_outputs in result.values():
+        if engine_outputs.finished_requests is not None:
+            engine_outputs.finished_requests.discard(request_id)
+
+
+def _finish_native_gr_request(scheduler, request, request_id, request_status) -> None:
+    if request is None or request.is_finished():
+        return
+
+    # Every physical dispatch has drained. Any remaining placeholders are
+    # speculative reservations and no longer represent real outputs.
+    request.num_output_placeholders = 0
+    finalizing_ids = getattr(scheduler, _GR_FINALIZING_IDS_ATTR, None)
+    if finalizing_ids is None:
+        finalizing_ids = set()
+        setattr(scheduler, _GR_FINALIZING_IDS_ATTR, finalizing_ids)
+    finalizing_ids.add(request_id)
+    try:
+        scheduler.finish_requests(request_id, request_status)
+    finally:
+        finalizing_ids.discard(request_id)
+        if not finalizing_ids:
+            delattr(scheduler, _GR_FINALIZING_IDS_ATTR)
+
+
+def _discard_pending_native_finish(scheduler, client_index, request_id) -> None:
+    finished_by_client = getattr(scheduler, "finished_req_ids_dict", None)
+    if finished_by_client is None:
+        return
+    pending_finished = finished_by_client.get(client_index)
+    if pending_finished is None:
+        return
+    pending_finished.discard(request_id)
+    if not pending_finished:
+        finished_by_client.pop(client_index, None)
+
+
+def _finalize_ready_gr_session(scheduler, result, session) -> None:
+    """Publish one terminal native output after speculative work drains."""
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
+    from vllm.v1.request import RequestStatus
+
+    from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
+    from vllm_gr.v1.engine.gr_async_scheduler import (
+        _close_gr_session,
+        _gr_session_ready_to_finalize,
+        _gr_terminal_result,
+    )
+
+    request_id = session.session_id
+    target_outputs, target_output = _find_gr_output(result, request_id)
+
+    if not _gr_session_ready_to_finalize(session):
+        # Native stop detection can race ahead of a queued GR successor. Keep
+        # the request open at the frontend until the GR session has drained;
+        # the finalizer will synthesize the one authoritative terminal frame.
+        if session.status == GRSessionStatus.FINISHING and session.terminal_result_pending:
+            _suppress_native_terminal(result, request_id, target_output)
+        return
+
+    terminal_result = _gr_terminal_result(session)
+    native_request = scheduler.requests.get(request_id)
+    client_index = (
+        native_request.client_index
+        if native_request is not None
+        else session.request.items[0].request.client_index
+    )
+
+    request_status = (
+        RequestStatus.FINISHED_ERROR
+        if terminal_result.failure is not None
+        else RequestStatus.FINISHED_STOPPED
+    )
+    finish_reason = FinishReason.ERROR if terminal_result.failure is not None else FinishReason.STOP
+
+    _finish_native_gr_request(scheduler, native_request, request_id, request_status)
+
+    if target_outputs is None:
+        target_outputs = result.get(client_index)
+        if target_outputs is None:
+            target_outputs = EngineCoreOutputs(outputs=[])
+            result[client_index] = target_outputs
+    if target_output is None:
+        target_output = EngineCoreOutput(
+            request_id=request_id,
+            new_token_ids=[],
+            finish_reason=finish_reason,
+        )
+        target_outputs.outputs.append(target_output)
+    else:
+        # The GR result, rather than the native placeholder token, owns the
+        # externally visible terminal status.
+        target_output.finish_reason = finish_reason
+
+    kv_params = dict(target_output.kv_transfer_params or {})
+    kv_params["gr_batch_result"] = terminal_result
+    target_output.kv_transfer_params = kv_params
+    finished_requests = set(target_outputs.finished_requests or ())
+    finished_requests.add(request_id)
+    target_outputs.finished_requests = finished_requests
+
+    # finish_requests() ran after upstream assembled this step's outputs. Avoid
+    # publishing the same finished ID again on the next update.
+    _discard_pending_native_finish(scheduler, client_index, request_id)
+
+    _close_gr_session(scheduler, session)
 
 
 def _patch_scheduler_update_from_output(scheduler_cls) -> None:
@@ -478,7 +747,37 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
 
     @wraps(_original_update)
     def patched_update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
-        result = _original_update(self, scheduler_output, model_runner_output, *args, **kwargs)
+        from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+
+        gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {})
+        sessions = getattr(self, "_gr_v1_sessions", {})
+        dispatched_sessions = {
+            session_id: sessions[session_id] for session_id in gr_stages if session_id in sessions
+        }
+        native_update_ids = getattr(self, _GR_NATIVE_UPDATE_IDS_ATTR, None)
+        if native_update_ids is None:
+            native_update_ids = set()
+            setattr(self, _GR_NATIVE_UPDATE_IDS_ATTR, native_update_ids)
+        added_update_ids = set(dispatched_sessions).difference(native_update_ids)
+        native_update_ids.update(added_update_ids)
+        try:
+            result = _original_update(self, scheduler_output, model_runner_output, *args, **kwargs)
+        finally:
+            native_update_ids.difference_update(added_update_ids)
+            if not native_update_ids:
+                delattr(self, _GR_NATIVE_UPDATE_IDS_ATTR)
+
+        updated_sessions = []
+        for session in dispatched_sessions.values():
+            self.update_gr_from_output(session, scheduler_output, model_runner_output)
+            _reconcile_native_gr_termination(self, result, session)
+            updated_sessions.append(session)
+
+        # A terminal result may arrive before a look-ahead successor. Buffer it
+        # in GRSessionState and publish only after every physical dispatch has
+        # drained, together with a genuinely finished native output.
+        for session in updated_sessions:
+            _finalize_ready_gr_session(self, result, session)
 
         beam_search_result = getattr(model_runner_output, "beam_search_result", None)
         if beam_search_result is None:

@@ -11,6 +11,7 @@ from typing import Any
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
 from vllm.v1.serial_utils import MsgpackDecoder
 
+from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 
@@ -20,6 +21,7 @@ class EngineCoreDecoders:
     add_batch: MsgpackDecoder
     beam_step_update: MsgpackDecoder
     submit_session: MsgpackDecoder
+    submit_gr_session: MsgpackDecoder
     generic: MsgpackDecoder
 
 
@@ -36,6 +38,7 @@ def build_engine_core_decoders(oob_tensor_provider: Any) -> EngineCoreDecoders:
         submit_session=MsgpackDecoder(
             tuple[list[EngineCoreRequest], BeamRequestStepUpdate], **decoder_kwargs
         ),
+        submit_gr_session=MsgpackDecoder(BeamBatchRequest, **decoder_kwargs),
         generic=MsgpackDecoder(**decoder_kwargs),
     )
 
@@ -59,6 +62,8 @@ def decode_engine_core_payload(
         decoder = decoders.beam_step_update
     elif request_type == EngineCoreRequestType.SUBMIT_SESSION:
         decoder = decoders.submit_session
+    elif request_type == EngineCoreRequestType.SUBMIT_GR_SESSION:
+        decoder = decoders.submit_gr_session
     else:
         decoder = decoders.generic
     return decoder.decode(data_frames)

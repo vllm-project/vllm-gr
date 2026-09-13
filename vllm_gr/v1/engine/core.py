@@ -236,6 +236,33 @@ def _publish_beam_session_error(self, update) -> None:
     )
 
 
+def _handle_submit_gr_session(self, batch_request) -> None:
+    """Preprocess once, then let Scheduler register and run the persistent session."""
+    if not batch_request.items:
+        logger.error("Rejecting an empty beam_search_v1 batch")
+        return
+    engine_request = batch_request.items[0].request
+    try:
+        if len(batch_request.items) != 1:
+            raise ValueError("Beam Search V1 currently requires batch size B=1")
+        if not self.vllm_config.scheduler_config.async_scheduling:
+            raise RuntimeError("beam_search_v1 requires vLLM async_scheduling")
+        if self.batch_queue is None or self.batch_queue_size < 2:
+            raise RuntimeError("beam_search_v1 requires a non-blocking EngineCore batch queue")
+        preprocessed = self.preprocess_add_request(engine_request)
+    except Exception:
+        self._handle_request_preproc_error(engine_request)
+        return
+    native_request = preprocessed[0]
+    # GR owns stop-token/EOS handling. The native token is only a placeholder
+    # for an asynchronously maintained beam state and must not terminate the
+    # Request before GR has produced its authoritative terminal result.
+    native_request.sampling_params.ignore_eos = True
+    native_request.sampling_params.stop_token_ids = []
+    native_request.gr_batch_request = batch_request
+    _add_preprocessed_request(self, preprocessed)
+
+
 def _apply_beam_step(self, update) -> bool:
     """Reusable body of the BEAM_REQUEST_STEP_UPDATE handler.
 
@@ -793,6 +820,9 @@ def dispatch_gr_engine_core_input(self, request_type, payload) -> bool:
     if request_type == EngineCoreRequestType.SUBMIT_SESSION:
         submit_requests, submit_template = payload
         self._handle_submit_session(submit_requests, submit_template)
+        return True
+    if request_type == EngineCoreRequestType.SUBMIT_GR_SESSION:
+        self._handle_submit_gr_session(payload)
         return True
     return False
 

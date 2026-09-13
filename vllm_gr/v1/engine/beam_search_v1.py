@@ -10,14 +10,19 @@ request, scheduler, executor, Worker-state, and terminal-result implementations.
 from __future__ import annotations
 
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest, BeamBatchResult
+from vllm_gr.v1.beam.batch_contracts import (
+    BeamBatchParams,
+    BeamBatchRequest,
+    BeamBatchResult,
+    BeamOutputOptions,
+)
 
 
 class GRStageKind(str, Enum):
@@ -46,10 +51,11 @@ class GRDeviceStateRef:
 class GRSessionState:
     """EngineCore scheduling state for one B=1 GR session.
 
-    ``issued_stages`` advances when a Prefill/Decode stage is dispatched.
-    ``completed_stages`` advances when its Future is consumed. The difference
-    is the number of in-flight stages. ``output_placeholders`` reserves results
-    that have been scheduled but are not yet confirmed on the host.
+    ``issued_stages`` and ``completed_stages`` count only output-producing
+    logical stages. Physical dispatches, including no-output Prefill
+    recomputation, are tracked separately by private EngineCore state.
+    ``output_placeholders`` reserves results that have been scheduled but are
+    not yet confirmed on the host.
 
     beam_params.max_tokens is the effective sampling budget, including the
     first token produced by Prefill. A2 adjusts the public budget once for
@@ -69,6 +75,12 @@ class GRSessionState:
     pending_device_token_count: int = 0
     latest_device_state: GRDeviceStateRef | None = None
     terminal_result_pending: bool = False
+    # EngineCore-private lifecycle state. These fields are excluded from the
+    # constructor and never cross the Scheduler/Worker boundary.
+    _next_dispatch_id: int = field(default=0, init=False, repr=False)
+    _in_flight_dispatches: set[int] = field(default_factory=set, init=False, repr=False)
+    _pending_terminal_result: BeamBatchResult | None = field(default=None, init=False, repr=False)
+    _terminal_emitted: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -114,9 +126,10 @@ class GRSessionState:
 class GRStageMetadata:
     """GR metadata attached to one native vLLM ``SchedulerOutput``.
 
-    Stage 0 is Prefill. Stages 1..N are Decode steps 0..N-1. A3 must issue
-    each stage exactly once; A4 consumes this metadata from SchedulerOutput
-    and keeps the dependency data on the device.
+    Stage 0 is Prefill. Stages 1..N are Decode steps 0..N-1. ``dispatch_id``
+    identifies every physical invocation, including no-output recomputation;
+    ``stage_index`` advances only for output-producing logical stages. A4 must
+    echo both IDs in GRWorkerResult so A3 can reject stale or mismatched work.
 
     A3 attaches SchedulerOutput.gr_v1_stages: dict[str, GRStageMetadata], keyed
     by session_id; one native output may contain stages from several sessions.
@@ -128,12 +141,17 @@ class GRStageMetadata:
     """
 
     session_id: str
+    dispatch_id: int
     stage_index: int
     kind: GRStageKind
     decode_step: int | None
     is_last_stage: bool
     input_device_state: GRDeviceStateRef | None
     output_device_state: GRDeviceStateRef
+    beam_params: BeamBatchParams
+    output_options: BeamOutputOptions
+    num_prompt_tokens: int
+    produces_output: bool = True
     session_init: BeamBatchRequest | None = None
 
 
@@ -147,10 +165,11 @@ class GRWorkerResult:
     Intermediate token IDs, parents and scores remain device-resident.
     terminal_result is supplied once for the terminating stage, with batch_id
     matching session_init.batch_id. A3 retains it until successors are drained,
-    then delivers it through the Server's wait_final channel.
+    then delivers it through the frontend's wait_final channel.
     """
 
     session_id: str
+    dispatch_id: int
     stage_index: int
     produced_token_count: int
     device_state: GRDeviceStateRef

@@ -4,7 +4,30 @@
 import msgspec
 from vllm.v1.engine import EngineCoreRequestType
 
+from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+
+
+async def submit_gr_session_async(self, batch_request: BeamBatchRequest) -> None:
+    """Submit the whole GR session once; Decode stages stay inside EngineCore."""
+    request = batch_request.items[0].request
+    request.client_index = self.client_index
+    ensure_stats_task = getattr(self, "_ensure_stats_update_task", None)
+    if ensure_stats_task is not None:
+        ensure_stats_task()
+    if hasattr(self, "current_wave"):
+        request.current_wave = self.current_wave
+    engine = None
+    if hasattr(self, "get_core_engine_for_request"):
+        engine = self.get_core_engine_for_request(request)
+    to_await = self._send_input(EngineCoreRequestType.SUBMIT_GR_SESSION, batch_request, engine)
+    if hasattr(self, "first_req_send_socket") and not self.engines_running:
+        import msgspec
+
+        await self.first_req_send_socket.send(msgspec.msgpack.encode(("FIRST_REQ", engine)))
+    await to_await
+    self._ensure_output_queue_task()
+
 
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
