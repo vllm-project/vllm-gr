@@ -441,3 +441,10 @@ def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
             "additional_config key(s): " + ", ".join(repr(key) for key in legacy_keys)
         )
     additional_config[GR_CONFIG_KEY] = gr_config_to_mapping(gr_config)
+    # ``create_engine_config`` parses the pre-write config while resolving
+    # legacy/canonical inputs. Ensure Driver-side consumers do not keep that
+    # stale snapshot after the canonical payload is installed.
+    try:
+        object.__setattr__(vllm_config, "_vllm_gr_parsed_config", None)
+    except (AttributeError, TypeError):
+        pass

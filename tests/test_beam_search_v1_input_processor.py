@@ -14,6 +14,7 @@ from vllm.inputs import embeds_input, tokens_input
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 
+from vllm_gr.config import ConstraintTableBackendEnum
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search_v1.input_processor import BeamSearchInputProcessor
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
@@ -34,6 +35,12 @@ def _make_engine(parallel_config: Any = None) -> Any:
         or SimpleNamespace(
             data_parallel_size=1, data_parallel_size_local=1, local_engines_only=False
         ),
+    )
+    config._vllm_gr_parsed_config = SimpleNamespace(
+        constraint_table=SimpleNamespace(enabled=True, backend=ConstraintTableBackendEnum.CUDA),
+        catalog_path=None,
+        beam_max_width=2,
+        beam_max_decode_steps=3,
     )
     # Use native request construction/rank validation without loading a model.
     native: Any = object.__new__(InputProcessor)
@@ -124,7 +131,12 @@ def test_beam_metadata_uses_native_normalized_temperature(temperature: float) ->
 
 
 def _prepare_request(
-    engine: Any, prompt: Any, params: BeamSearchParams, *, online: bool
+    engine: Any,
+    prompt: Any,
+    params: BeamSearchParams,
+    *,
+    online: bool,
+    lora_request: Any = None,
 ) -> BeamBatchRequest:
     tokenizer = SimpleNamespace(
         eos_token_id=2,
@@ -135,7 +147,8 @@ def _prepare_request(
         serving = SimpleNamespace(input_processor=SimpleNamespace(tokenizer=tokenizer))
         return asyncio.run(
             processor.process_online_inputs(
-                serving, OnlineBeamSearchRequest(prompt, "request-1", params)
+                serving,
+                OnlineBeamSearchRequest(prompt, "request-1", params, lora_request=lora_request),
             )
         )
     engine.get_supported_tasks = lambda: ("generate",)
@@ -144,7 +157,123 @@ def _prepare_request(
         _preprocess_cmpl=lambda prompts: prompts,
         _lora_request_to_seq=lambda lora, size: [lora],
     )
-    return processor.process_offline_inputs(llm, OfflineBeamSearchRequest([prompt], params))
+    return processor.process_offline_inputs(
+        llm, OfflineBeamSearchRequest([prompt], params, lora_request=lora_request)
+    )
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "field",
+    [
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "decode_context_parallel_size",
+        "prefill_context_parallel_size",
+    ],
+)
+def test_parallel_capability_failure_is_reported_before_submission(field: str) -> None:
+    engine = _make_engine()
+    setattr(engine.vllm_config.parallel_config, field, 2)
+    with pytest.raises(BeamSearchRequestError, match="parallel sizes of 1"):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=3),
+            online=False,
+        )
+    engine.submit_gr_session.assert_not_called()
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("capability", "message"),
+    [
+        ("sync_scheduler", "requires async_scheduling"),
+        ("speculative", "does not support speculative decoding"),
+        ("encoder_decoder", "requires a decoder with uniform attention KV"),
+        ("hybrid", "requires a decoder with uniform attention KV"),
+        ("quantized", "does not support quantized models"),
+        ("lora", "does not support LoRA"),
+    ],
+)
+def test_unsupported_capability_is_rejected_before_submission(
+    capability: str, message: str
+) -> None:
+    engine = _make_engine()
+    lora_request = None
+    if capability == "sync_scheduler":
+        engine.vllm_config.scheduler_config.async_scheduling = False
+    elif capability == "speculative":
+        engine.vllm_config.speculative_config = object()
+    elif capability == "encoder_decoder":
+        engine.vllm_config.model_config.is_encoder_decoder = True
+    elif capability == "hybrid":
+        engine.vllm_config.model_config.is_hybrid = True
+    elif capability == "quantized":
+        engine.vllm_config.model_config.quantization = "test"
+    else:
+        lora_request = object()
+
+    with pytest.raises(BeamSearchRequestError, match=message):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=3),
+            online=False,
+            lora_request=lora_request,
+        )
+    engine.submit_gr_session.assert_not_called()
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("table", "max_tokens", "catalog_strategy", "message"),
+    [
+        (None, 3, None, "requires an enabled canonical CUDA constraint table"),
+        (
+            SimpleNamespace(enabled=True, backend=ConstraintTableBackendEnum.CPU),
+            3,
+            None,
+            "requires an enabled canonical CUDA constraint table",
+        ),
+        (
+            SimpleNamespace(enabled=True, backend=ConstraintTableBackendEnum.CUDA),
+            4,
+            None,
+            "generation budget exceeds constraint_table_v1 depth",
+        ),
+        (
+            SimpleNamespace(enabled=True, backend=ConstraintTableBackendEnum.CUDA),
+            3,
+            "fill",
+            "catalog_strategy is not applicable",
+        ),
+    ],
+)
+def test_constraint_configuration_is_rejected_before_submission(
+    table: Any,
+    max_tokens: int,
+    catalog_strategy: str | None,
+    message: str,
+) -> None:
+    engine = _make_engine()
+    engine.vllm_config._vllm_gr_parsed_config = SimpleNamespace(
+        constraint_table=table,
+        catalog_path="/tmp/legacy-catalog.json" if table is None else None,
+        beam_max_width=2,
+        beam_max_decode_steps=8,
+    )
+    with pytest.raises(BeamSearchRequestError, match=message):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(
+                beam_width=2,
+                max_tokens=max_tokens,
+                catalog_strategy=catalog_strategy,
+            ),
+            online=False,
+        )
+    engine.submit_gr_session.assert_not_called()
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
@@ -227,6 +356,7 @@ def test_online_entrypoint_uses_only_visible_dp_ranks(
     monkeypatch: pytest.MonkeyPatch, local_only: bool, local_size: int, expected_ranks: list[int]
 ) -> None:
     import vllm_gr.entrypoints.beam_search_v1 as entrypoint
+    from vllm_gr.entrypoints.beam_search_v1 import input_processor
     from vllm_gr.entrypoints.openai import serving_engine
 
     engine = _make_engine(
@@ -259,6 +389,8 @@ def test_online_entrypoint_uses_only_visible_dp_ranks(
     # This routing-only fixture supplies an explicit test final consumer.
     monkeypatch.setattr(BeamSearchOutputProcessor, "ensure_available", lambda: None)
     monkeypatch.setattr(entrypoint, "run_beam_search_v1_async", prepare_and_submit)
+    # The fixture deliberately models multiple DP ranks to test routing only.
+    monkeypatch.setattr(input_processor, "_validate_parallel_config", lambda _: None)
     monkeypatch.setattr(serving_engine, "_dp_rank_counter", 0)
 
     async def run() -> None:

@@ -73,6 +73,32 @@ _FINISH_LENGTH = tl.constexpr(FINISH_LENGTH)
 
 
 @triton.jit
+def _rank_final_beams_kernel(
+    scores,
+    lengths,
+    reasons,
+    ranking_scores,
+    CAPACITY: tl.constexpr,
+    PROMPT_LENGTH: tl.constexpr,
+    MAX_TOKENS: tl.constexpr,
+    LENGTH_PENALTY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    score = tl.load(scores + i, mask=i < CAPACITY, other=-float("inf"))
+    length = tl.load(lengths + i, mask=i < CAPACITY, other=0)
+    reason = tl.load(reasons + i, mask=i < CAPACITY, other=0)
+    # Match the public Beam score's total decoder length, excluding the
+    # terminal stop token. Keep raw cumulative scores for the output payload.
+    effective = tl.maximum(PROMPT_LENGTH + length - (reason == _FINISH_STOP), 1)
+    # The common scale preserves full-length scores exactly, avoiding new
+    # rounding ties for fixed-depth recommendation models.
+    ratio = (PROMPT_LENGTH + MAX_TOKENS) / effective.to(tl.float32)
+    ranked = score * tl.exp(tl.log(ratio) * LENGTH_PENALTY)
+    tl.store(ranking_scores + i, ranked, mask=i < CAPACITY)
+
+
+@triton.jit
 def _prepare_candidates_kernel(
     tokens,
     logprobs,
@@ -339,3 +365,56 @@ def _commit_step_kernel(
     tl.store(completed, tl.load(next_completed), mask=run)
     tl.store(initialized, True, mask=run)
     tl.store(finished, count == 0, mask=run)
+
+
+@triton.jit
+def _pack_final_beams_kernel(
+    selected_indices,
+    completed_count,
+    completed_tokens,
+    completed_scores,
+    completed_parents,
+    completed_lengths,
+    completed_reasons,
+    history_tokens,
+    history_parents,
+    output,
+    WIDTH: tl.constexpr,
+    STEPS: tl.constexpr,
+    RESULT_WIDTH: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+):
+    """Materialize selected completed paths directly into the final wire buffer."""
+
+    rank = tl.program_id(0)
+    count = tl.load(completed_count)
+    candidate = tl.load(selected_indices + rank)
+    valid = (rank < RESULT_WIDTH) & (candidate >= 0) & (candidate < count)
+    length = tl.load(completed_lengths + candidate, mask=valid, other=0)
+    token = tl.load(completed_tokens + candidate, mask=valid, other=0)
+    parent = tl.load(completed_parents + candidate, mask=valid, other=0)
+    score = tl.load(completed_scores + candidate, mask=valid, other=-float("inf"))
+    reason = tl.load(completed_reasons + candidate, mask=valid, other=0)
+    final_token = token
+    row = 1 + rank * ROW_STRIDE
+
+    tl.store(output, tl.minimum(count, RESULT_WIDTH), mask=rank == 0)
+    tl.store(output + row + 2 * STEPS, score.to(tl.int32, bitcast=True))
+    tl.store(output + row + 2 * STEPS + 1, length)
+    tl.store(output + row + 2 * STEPS + 2, reason)
+    tl.store(output + row + 2 * STEPS + 3, tl.where(reason == _FINISH_STOP, final_token, -1))
+
+    # Walk the append-only lineage backwards. Every row is initialized first,
+    # so short stop-completions cannot expose stale values from a previous run.
+    columns = tl.arange(0, ROW_BLOCK)
+    tl.store(output + row + columns, 0, mask=columns < 2 * STEPS)
+    for offset in range(STEPS):
+        position = length - 1 - offset
+        write = valid & (position >= 0)
+        tl.store(output + row + position, token, mask=write)
+        tl.store(output + row + STEPS + position, parent, mask=write)
+        previous = write & (position > 0)
+        history_offset = (position - 1) * WIDTH + parent
+        token = tl.load(history_tokens + history_offset, mask=previous, other=0)
+        parent = tl.load(history_parents + history_offset, mask=previous, other=0)

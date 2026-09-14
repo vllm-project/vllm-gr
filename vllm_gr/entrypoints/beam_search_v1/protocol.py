@@ -78,8 +78,13 @@ class BeamSearchFrontend(Protocol):
         """Wait for the terminal EngineCore result."""
         ...
 
-    def build_output(self, call: OfflineBeamSearchRequest, result: BeamBatchResult) -> list[Any]:
-        """Convert the terminal result to frontend BeamSearchOutput objects."""
+    def build_output(
+        self,
+        call: OfflineBeamSearchRequest,
+        request: BeamBatchRequest,
+        result: BeamBatchResult,
+    ) -> list[Any]:
+        """Convert the result using the exact request accepted by EngineCore."""
         ...
 
     def close(self, session: BeamSearchSession) -> None:
@@ -109,7 +114,12 @@ class AsyncBeamSearchFrontend(Protocol):
 
     async def wait_final(self, session: BeamSearchSession) -> BeamBatchResult: ...
 
-    def build_output(self, call: OnlineBeamSearchRequest, result: BeamBatchResult) -> list[Any]: ...
+    def build_output(
+        self,
+        call: OnlineBeamSearchRequest,
+        request: BeamBatchRequest,
+        result: BeamBatchResult,
+    ) -> list[Any]: ...
 
     async def close(self, session: BeamSearchSession) -> None:
         """Retain abort/release retries through errors and caller cancellation.

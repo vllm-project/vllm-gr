@@ -785,6 +785,44 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     assert runner._current_beam_info == {"beam_data": {}, "req_ids": []}
 
 
+def test_execute_wrapper_retires_previous_gr_owner_before_next_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker import gpu_beam_stage_runner
+
+    events: list[str] = []
+    binding = SimpleNamespace(native_request_id="old")
+    previous = SimpleNamespace(closed=False, binding=binding)
+
+    def request_release(released_binding: Any) -> None:
+        assert released_binding is binding
+        previous.closed = True
+        events.append("release")
+
+    previous.request_release = request_release
+
+    class NextStage:
+        def execute(self, *args: Any, **kwargs: Any) -> str:
+            assert events == ["release"]
+            return "next"
+
+    monkeypatch.setattr(
+        gpu_beam_stage_runner,
+        "get_stage_runner",
+        lambda runner, output: NextStage(),
+    )
+    runner = SimpleNamespace(device=torch.device("cuda"), _gr_gpu_stage_runner=previous)
+    scheduler_output = SimpleNamespace(
+        gr_stage_metadata={"new": object()},
+        finished_req_ids=["old"],
+    )
+
+    wrapped = common.make_patched_execute_model(lambda self, output: None)
+
+    assert wrapped(runner, scheduler_output) == "next"
+    assert previous.closed
+
+
 @pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
 def test_beam_context_pool_follows_model_activation_dtype(
     model_dtype: torch.dtype,

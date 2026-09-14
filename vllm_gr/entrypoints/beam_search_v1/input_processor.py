@@ -13,11 +13,16 @@ from vllm.utils import random_uuid
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import GRConfig
+from vllm_gr.config.models import (
+    CONSTRAINT_TABLE_MAX_DECODE_STEPS,
+    ConstraintTableBackendEnum,
+)
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
+from vllm_gr.entrypoints.beam_search_v1.token_utils import boundary_token_id
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
@@ -38,12 +43,10 @@ def _generate_request_id(external_request_id: str | None = None) -> str:
 
 
 def _get_token_id(tokenizer: Any, token: str | None, name: str) -> int | None:
-    if token is None:
-        return None
-    token_id = tokenizer.convert_tokens_to_ids(token)
-    if token_id is None or token_id == -1:
-        raise BeamSearchRequestError(f"{name} must be a valid tokenizer token")
-    return int(token_id)
+    try:
+        return boundary_token_id(tokenizer, token, name)
+    except ValueError as exc:
+        raise BeamSearchRequestError(str(exc)) from exc
 
 
 def _create_request_params(
@@ -87,12 +90,54 @@ def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> N
         request.prompt_token_ids = [*request.prompt_token_ids, begin_token_id]
 
 
+def _validate_parallel_config(parallel: Any) -> None:
+    if any(
+        getattr(parallel, name, 1) != 1
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "decode_context_parallel_size",
+            "prefill_context_parallel_size",
+        )
+    ):
+        raise BeamSearchRequestError(
+            "beam_search_v1 currently requires TP/PP/DP/context parallel sizes of 1"
+        )
+
+
 def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     validate_beam_batch_request(request)
     if len(request.items) != 1:
         raise BeamSearchRequestError("beam_search_v1 currently requires exactly one prompt")
 
     gr_config = GRConfig.from_vllm_config(vllm_config)
+    _validate_parallel_config(vllm_config.parallel_config)
+    if not getattr(vllm_config.scheduler_config, "async_scheduling", True):
+        raise BeamSearchRequestError("beam_search_v1 requires async_scheduling")
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        raise BeamSearchRequestError("beam_search_v1 does not support speculative decoding")
+    model = vllm_config.model_config
+    if getattr(model, "is_encoder_decoder", False) or getattr(model, "is_hybrid", False):
+        raise BeamSearchRequestError("beam_search_v1 requires a decoder with uniform attention KV")
+    if getattr(model, "quantization", None) is not None:
+        raise BeamSearchRequestError("beam_search_v1 does not support quantized models")
+    if request.items[0].request.lora_request is not None:
+        raise BeamSearchRequestError("beam_search_v1 does not support LoRA")
+    table = gr_config.constraint_table
+    if table is None or not table.enabled or table.backend is not ConstraintTableBackendEnum.CUDA:
+        raise BeamSearchRequestError(
+            "beam_search_v1 requires an enabled canonical CUDA constraint table"
+        )
+    if request.beam_params.max_tokens > CONSTRAINT_TABLE_MAX_DECODE_STEPS:
+        raise BeamSearchRequestError(
+            "generation budget exceeds constraint_table_v1 depth "
+            f"({CONSTRAINT_TABLE_MAX_DECODE_STEPS})"
+        )
+    if request.beam_params.catalog_strategy is not None:
+        raise BeamSearchRequestError(
+            "catalog_strategy is not applicable to the constraint_table backend"
+        )
     max_width = gr_config.beam_max_width
     if max_width is None:
         raise BeamSearchRequestError(

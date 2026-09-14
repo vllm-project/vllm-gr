@@ -24,7 +24,7 @@ def run_beam_search_v1(
     session = frontend.submit_once(request)
     try:
         result = frontend.wait_final(session)
-        return frontend.build_output(call, result)
+        return frontend.build_output(call, request, result)
     finally:
         frontend.close(session)
 
@@ -38,7 +38,7 @@ async def run_beam_search_v1_async(
     session = await frontend.submit_once(request)
     try:
         result = await frontend.wait_final(session)
-        return frontend.build_output(call, result)
+        return frontend.build_output(call, request, result)
     finally:
         await frontend.close(session)
 

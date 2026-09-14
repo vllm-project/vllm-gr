@@ -13,7 +13,6 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchRequest,
     BeamBatchResult,
-    validate_beam_batch_result,
 )
 
 
@@ -36,7 +35,6 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
     if isinstance(result, (list, tuple)):
         result = msgspec.convert(result, type=BeamBatchResult)
     if isinstance(result, BeamBatchResult):
-        validate_beam_batch_result(result)
         if result.batch_id != request.batch_id:
             raise ValueError("terminal Beam result belongs to a different session")
         return result

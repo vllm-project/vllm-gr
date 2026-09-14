@@ -250,6 +250,16 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
         assert kwargs["num_heads_kv"] == 4
         assert "num_kv_heads" not in kwargs
 
+    def test_batch_invariant_forces_single_flash_attention_split(self):
+        import vllm_gr.v1.attention.backends.beam_attn_gpu as beam_attn_gpu
+
+        with mock.patch.object(beam_attn_gpu.envs, "VLLM_BATCH_INVARIANT", True):
+            assert beam_attn_gpu._num_splits(0) == 1
+            assert beam_attn_gpu._num_splits(7) == 1
+        with mock.patch.object(beam_attn_gpu.envs, "VLLM_BATCH_INVARIANT", False):
+            assert beam_attn_gpu._num_splits(0) == 0
+            assert beam_attn_gpu._num_splits(7) == 7
+
 
 if __name__ == "__main__":
     unittest.main()

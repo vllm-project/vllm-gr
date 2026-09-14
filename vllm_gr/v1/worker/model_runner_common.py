@@ -1831,6 +1831,17 @@ def make_patched_execute_model(_orig_execute_model):
     def _patched_execute_model_step(self, scheduler_output, *args, **kwargs):
         from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
 
+        gr_stage = getattr(self, "_gr_gpu_stage_runner", None)
+        if (
+            gr_stage is not None
+            and not gr_stage.closed
+            and gr_stage.binding.native_request_id
+            in getattr(scheduler_output, "finished_req_ids", ())
+        ):
+            # A SchedulerOutput may retire the previous native request and
+            # admit the next GR session in the same frame. Release first: the
+            # persistent CUDA scratch has exactly one execution owner.
+            gr_stage.request_release(gr_stage.binding)
         if getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
             if str(self.device).split(":")[0] != "cuda":
                 raise ValueError("persistent GR stage execution requires GPU V1")
@@ -1839,14 +1850,9 @@ def make_patched_execute_model(_orig_execute_model):
             return get_stage_runner(self, scheduler_output).execute(
                 scheduler_output, _orig_execute_model, *args, **kwargs
             )
-        gr_stage = getattr(self, "_gr_gpu_stage_runner", None)
         if gr_stage is not None and not gr_stage.closed:
             if getattr(scheduler_output, "beam_data", {}):
                 raise ValueError("legacy Beam cannot use an active GR execution context")
-            if gr_stage.binding.native_request_id in getattr(
-                scheduler_output, "finished_req_ids", ()
-            ):
-                gr_stage.cancel(gr_stage.binding)
         # Clear the previous step's beam context at the START of the next
         # execute_model, not in a finally: with async scheduling the sampled
         # tokens are produced by ``sample_tokens`` AFTER execute_model returns,

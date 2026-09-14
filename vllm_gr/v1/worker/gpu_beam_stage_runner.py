@@ -41,6 +41,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
+from vllm_gr.v1.worker.beam_final_output import GPUBeamFinalOutput
 from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
 
 METADATA_ABI = 1
@@ -215,43 +216,63 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
             self.owner.copy_done[self.slot].synchronize()
             controls = self.owner.host_control[self.slot].tolist()
             req_ids, sampled, results = [], [], {}
-            for entry, (produced, finished, error) in zip(self.execution.entries, controls):
-                m = entry.metadata
-                terminal = None
-                if error:
-                    terminal = BeamBatchResult(
-                        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
-                        batch_id=m.session_id,
-                        output=None,
-                        failure=BeamBatchFailure(
-                            "beam_device_error",
-                            f"Beam device error {error}",
-                            entry.binding.item_index,
-                        ),
+            try:
+                for entry, (produced, finished, error) in zip(self.execution.entries, controls):
+                    m = entry.metadata
+                    terminal = None
+                    final_output = self.owner.final_output
+                    if error:
+                        failure = BeamBatchResult(
+                            protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                            batch_id=m.session_id,
+                            output=None,
+                            failure=BeamBatchFailure(
+                                "beam_device_error",
+                                f"Beam device error {error}",
+                                entry.binding.item_index,
+                            ),
+                        )
+                        terminal = final_output.failure(self.owner, failure)
+                    elif finished and not self.owner.cancelled:
+                        try:
+                            terminal = final_output.consume(self.owner)
+                        except Exception as exc:
+                            failure = BeamBatchResult(
+                                protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                                batch_id=m.session_id,
+                                output=None,
+                                failure=BeamBatchFailure(
+                                    "beam_final_output_error",
+                                    f"Failed to materialize final Beam output: {exc}",
+                                    entry.binding.item_index,
+                                ),
+                            )
+                            terminal = final_output.failure(self.owner, failure)
+                    req_ids.append(entry.binding.native_request_id)
+                    # These are scheduler placeholders. They must never be used as
+                    # model inputs or published as generated Beam sequences.
+                    sampled.append([0] if produced else [])
+                    results[m.session_id] = GRWorkerResult(
+                        m.session_id,
+                        m.dispatch_id,
+                        m.stage_index,
+                        produced,
+                        m.output_device_state,
+                        bool(finished),
+                        terminal,
                     )
-                req_ids.append(entry.binding.native_request_id)
-                # These are scheduler placeholders. They must never be used as
-                # model inputs or published as generated Beam sequences.
-                sampled.append([0] if produced else [])
-                results[m.session_id] = GRWorkerResult(
-                    m.session_id,
-                    m.dispatch_id,
-                    m.stage_index,
-                    produced,
-                    m.output_device_state,
-                    bool(finished),
-                    terminal,
+                out = ModelRunnerOutput(
+                    req_ids=req_ids,
+                    req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                    sampled_token_ids=sampled,
                 )
-            out = ModelRunnerOutput(
-                req_ids=req_ids,
-                req_id_to_index={r: i for i, r in enumerate(req_ids)},
-                sampled_token_ids=sampled,
-            )
-            setattr(out, GR_WORKER_RESULT_ATTR, results)
-            self._output = out
-            with self.owner.control_lock:
-                self.owner.control_busy[self.slot] = False
-            return out
+                setattr(out, GR_WORKER_RESULT_ATTR, results)
+                self._output = out
+                return out
+            finally:
+                with self.owner.control_lock:
+                    self.owner.control_busy[self.slot] = False
+                self.owner.output_consumed()
 
 
 class GPUBeamStageRunner:
@@ -282,6 +303,7 @@ class GPUBeamStageRunner:
         self.previous: GRStageMetadata | None = None
         self.pending: tuple[BeamDispatchExecution, int] | None = None
         self.control_lock = Lock()
+        self.lifecycle_lock = Lock()
         self.control_busy = [False] * CONTROL_CAPACITY
         self.device_control = torch.empty(
             (CONTROL_CAPACITY, 1, 3), device=beam.state.device, dtype=torch.int32
@@ -295,6 +317,8 @@ class GPUBeamStageRunner:
         self.last_work = torch.Event()
         self.closed = False
         self.cancelled = False
+        self.release_requested = False
+        self.final_output: GPUBeamFinalOutput
         self.host_static: torch.Tensor
         self.device_static: torch.Tensor
         self.metadata: Any = None
@@ -344,6 +368,14 @@ class GPUBeamStageRunner:
                 or state.ignore_stop_tokens_config != params.ignore_stop_tokens
             ):
                 raise ValueError("GR metadata configuration does not match persistent Beam state")
+        if not hasattr(self, "final_output"):
+            first = stages[0]
+            self.final_output = GPUBeamFinalOutput(
+                self, self.binding, first.beam_params, first.output_options
+            )
+        elif self.final_output.binding != self.binding:
+            first = stages[0]
+            self.final_output.reset(self.binding, first.beam_params, first.output_options)
         entries, offset = [], 0
         for m in stages:
             count = (
@@ -451,7 +483,12 @@ class GPUBeamStageRunner:
             prefix_cu_seqlens_q_device=prefix_offsets,
             prefix_seqlens_kv_device=prompt,
             prefix_max_q_len=width,
-            prefix_max_seq_len=m.num_prompt_tokens,
+            # Match the native metadata builder. FlashAttention derives its
+            # split/reduction geometry from this bound; the real KV extent is
+            # still carried independently by prefix_seqlens_kv_device.
+            prefix_max_seq_len=(
+                (worker.model_config.max_model_len + block_size - 1) // block_size * block_size
+            ),
             prefix_block_table=block_table,
             suffix_cu_seqlens_q_device=query_offsets,
             suffix_cu_seqlens_k_device=suffix_offsets,
@@ -615,6 +652,11 @@ class GPUBeamStageRunner:
                     self.beam.initialize_from_prefill(*candidates)
                 else:
                     self.beam.advance(*candidates)
+                # The common fixed-length terminal stage is known without a
+                # Host receipt. Queue final selection and D2H now so output
+                # consumption does not add another serialized GPU round trip.
+                if m.is_last_stage:
+                    self.final_output.enqueue(self)
             ops.latch_result[(1,)](
                 self.beam.state.num_generated_tokens,
                 self.beam.state.is_finished,
@@ -646,6 +688,7 @@ class GPUBeamStageRunner:
             if isinstance(value, torch.Tensor)
         }
 
+    @torch.inference_mode()
     def cancel(self, binding: BeamRequestBinding) -> None:
         if binding != self.binding:
             raise ValueError("cancel binding mismatch")
@@ -676,6 +719,37 @@ class GPUBeamStageRunner:
         self.beam.session.context._gr_execution_owner = None
         self.beam.workspace.execution_owner = None
         self.worker._beam_sessions.pop(binding.session_id, None)
+
+    def request_release(self, binding: BeamRequestBinding) -> None:
+        """Cancel if needed and retire resources after every output consumer drains."""
+        if binding != self.binding:
+            raise ValueError("release binding mismatch")
+        with self.lifecycle_lock:
+            if self.closed:
+                return
+            self.release_requested = True
+            # An already-sampled terminal receipt still owns final output
+            # materialization. Only suppress output when nothing is awaiting
+            # consumption; otherwise the receipt decides success vs drain.
+            with self.control_lock:
+                output_pending = any(self.control_busy)
+            if not output_pending:
+                self.final_output.abort(self)
+                self.cancel(binding)
+            self._try_release_locked()
+
+    def output_consumed(self) -> None:
+        """Complete a release deferred by an outstanding async receipt."""
+        with self.lifecycle_lock:
+            self._try_release_locked()
+
+    def _try_release_locked(self) -> None:
+        if self.closed or not self.release_requested or self.pending is not None:
+            return
+        with self.control_lock:
+            if any(self.control_busy):
+                return
+        self.release(self.binding, consumer_done=self.final_output.consumer_done(self))
 
 
 def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
@@ -822,6 +896,7 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         adapter.beam, adapter.binding, adapter.backend = beam, binding, backend
         adapter.previous, adapter.pending = None, None
         adapter.closed, adapter.cancelled = False, False
+        adapter.release_requested = False
         adapter.attention_needs_refresh = True
         context._gr_execution_owner = adapter
         workspace.execution_owner = adapter
