@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import triton
 
@@ -42,11 +44,16 @@ class BeamSearchRunner:
         workspace: BeamPostprocessWorkspace,
         *,
         state_index: int = 0,
+        workspace_index: int = 0,
     ) -> None:
         if isinstance(state_index, bool) or not isinstance(state_index, int):
             raise TypeError("state_index must be an integer")
         if not 0 <= state_index < state.max_batch_size:
             raise ValueError("state_index exceeds state capacity")
+        if isinstance(workspace_index, bool) or not isinstance(workspace_index, int):
+            raise TypeError("workspace_index must be an integer")
+        if not 0 <= workspace_index < workspace.max_batch:
+            raise ValueError("workspace_index exceeds workspace capacity")
         context = session.context
         width = state.beam_width
         if state.device.type != "cuda":
@@ -55,64 +62,24 @@ class BeamSearchRunner:
             raise ValueError("state must alias this session's decision buffers")
         if not session.is_active or session.beam_width != width:
             raise ValueError("session must be active with the configured beam width")
-        if (
-            workspace.key.beam_width != width
-            or workspace.key.top_k != width
-            or workspace.max_batch < 1
-            or workspace.topk_token_ids.device != state.device
-            or workspace.max_decode_steps < state.sequence.shape[2]
-        ):
-            raise ValueError("workspace geometry/device does not match Beam state")
-        if not context.pools:
-            raise ValueError("session must provide at least one KV layer")
-        first = context.pools[0].unshared_key
-        if (
-            first.ndim != 5
-            or first.dtype not in (torch.float16, torch.bfloat16)
-            or first.device != state.device
-            or first.shape[1] < width
-            or first.shape[3] < state.max_new_tokens - 1
-            or not first.is_contiguous()
-            or not 0 <= session.slot < first.shape[0]
-        ):
-            raise ValueError("KV pool capacity, dtype, device, or layout is incompatible")
-        for pool in context.pools:
-            for tensor in (pool.unshared_key, pool.unshared_value):
-                if (
-                    tensor.shape != first.shape
-                    or tensor.stride() != first.stride()
-                    or tensor.dtype != first.dtype
-                    or tensor.device != first.device
-                ):
-                    raise ValueError("all KV layers must have identical layouts")
-        layers = len(context.pools)
-        aux = context.aux_key_buf
-        expected_aux = (layers, first.shape[1], *first.shape[2:])
-        for tensor in (aux, context.aux_value_buf):
-            if (
-                tuple(tensor.shape) != expected_aux
-                or not tensor.is_contiguous()
-                or tensor.dtype != first.dtype
-                or tensor.device != first.device
-            ):
-                raise ValueError("KV reorder requires compatible per-layer scratch")
-        for ptrs in (context.pool_key_ptrs, context.pool_value_ptrs):
-            if (
-                ptrs is None
-                or ptrs.shape != (layers,)
-                or ptrs.dtype != torch.int64
-                or ptrs.device != first.device
-                or not ptrs.is_contiguous()
-            ):
-                raise ValueError("KV reorder requires persistent layer pointer tables")
+        self.validate_resources(
+            context,
+            workspace,
+            beam_width=width,
+            max_new_tokens=state.max_new_tokens,
+            kv_slot=session.slot,
+        )
 
         self.session = session
+        first = context.pools[0].unshared_key
+        layers, aux = len(context.pools), context.aux_key_buf
         self.state = state
         self.workspace = workspace
         self.state_index = state_index
+        self.workspace_index = workspace_index
         self._closed = False
         # Construct device views only once. State and workspace rows need not
-        # equal the KV slot; the workspace's first row serves this B=1 runner.
+        # equal the KV slot. Selection/KV scratch still requires exclusive use.
         self._state = {
             name: value[state_index : state_index + 1].view(*value.shape[1:])
             if value.ndim > 1
@@ -126,16 +93,16 @@ class BeamSearchRunner:
             )
         scratch = workspace.state_scratch
         self._scratch = {
-            name: getattr(scratch, name)[0]
+            name: getattr(scratch, name)[workspace_index]
             if getattr(scratch, name).ndim > 1
-            else getattr(scratch, name)[:1]
+            else getattr(scratch, name)[workspace_index : workspace_index + 1]
             for name in scratch.__dataclass_fields__
         }
-        self._selected_tokens = workspace.selected_token_ids[0]
-        self._selected_parents = workspace.selected_parent_ids[0]
-        self._selected_scores = workspace.selected_scores[0]
-        self._selected_flat = workspace.selected_flat_indices[0]
-        self._next_sequence = workspace.next_sequence[0]
+        self._selected_tokens = workspace.selected_token_ids[workspace_index]
+        self._selected_parents = workspace.selected_parent_ids[workspace_index]
+        self._selected_scores = workspace.selected_scores[workspace_index]
+        self._selected_flat = workspace.selected_flat_indices[workspace_index]
+        self._next_sequence = workspace.next_sequence[workspace_index]
         self._kv_capacity = first.shape[3]
         self._kv_grid = (layers * width * first.shape[2],)
         self._kv_args = (
@@ -186,6 +153,68 @@ class BeamSearchRunner:
             raise RuntimeError("Beam runner's session has been released")
         self.state.reset(self.state_index)
 
+    @staticmethod
+    def validate_resources(
+        context: Any,
+        workspace: BeamPostprocessWorkspace,
+        *,
+        beam_width: int,
+        max_new_tokens: int,
+        kv_slot: int,
+    ) -> None:
+        """Check storage without mutating state or allocating a registry slot."""
+        width, device = beam_width, context.decision.sequence.device
+        if (
+            workspace.key.beam_width != width
+            or workspace.key.top_k != width
+            or workspace.max_batch < 1
+            or workspace.topk_token_ids.device != device
+            or workspace.max_decode_steps < context.decision.sequence.shape[2]
+        ):
+            raise ValueError("workspace geometry/device does not match Beam state")
+        if not context.pools:
+            raise ValueError("session must provide at least one KV layer")
+        first = context.pools[0].unshared_key
+        if (
+            first.ndim != 5
+            or first.dtype not in (torch.float16, torch.bfloat16)
+            or first.device != device
+            or first.shape[1] < width
+            or first.shape[3] < max_new_tokens - 1
+            or not first.is_contiguous()
+            or not 0 <= kv_slot < first.shape[0]
+        ):
+            raise ValueError("KV pool capacity, dtype, device, or layout is incompatible")
+        for pool in context.pools:
+            for tensor in (pool.unshared_key, pool.unshared_value):
+                if (
+                    tensor.shape != first.shape
+                    or tensor.stride() != first.stride()
+                    or tensor.dtype != first.dtype
+                    or tensor.device != first.device
+                ):
+                    raise ValueError("all KV layers must have identical layouts")
+        layers = len(context.pools)
+        aux = context.aux_key_buf
+        expected_aux = (layers, first.shape[1], *first.shape[2:])
+        for tensor in (aux, context.aux_value_buf):
+            if (
+                tuple(tensor.shape) != expected_aux
+                or not tensor.is_contiguous()
+                or tensor.dtype != first.dtype
+                or tensor.device != first.device
+            ):
+                raise ValueError("KV reorder requires compatible per-layer scratch")
+        for ptrs in (context.pool_key_ptrs, context.pool_value_ptrs):
+            if (
+                ptrs is None
+                or ptrs.shape != (layers,)
+                or ptrs.dtype != torch.int64
+                or ptrs.device != first.device
+                or not ptrs.is_contiguous()
+            ):
+                raise ValueError("KV reorder requires persistent layer pointer tables")
+
     def end_session(self, consumer_done: torch.Event | None = None) -> None:
         """Release the existing slot only after device work and final consumers.
 
@@ -213,6 +242,12 @@ class BeamSearchRunner:
     ) -> None:
         if self._closed:
             raise RuntimeError("Beam runner's session has been released")
+        for owner in (
+            getattr(self.session.context, "_gr_execution_owner", None),
+            self.workspace.execution_owner,
+        ):
+            if owner is not None and getattr(owner, "beam", None) is not self:
+                raise RuntimeError("another runner owns the shared Beam execution scratch")
         width = self.state.beam_width
         rows = 1 if prefill else width
         for name, tensor, dtype in (

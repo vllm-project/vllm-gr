@@ -111,6 +111,7 @@ class BeamSearchClient:
         self.engine = llm.llm_engine
 
     def prepare_request(self, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
+        BeamSearchOutputProcessor.ensure_available()
         return BeamSearchInputProcessor(self.engine).process_offline_inputs(self.llm, call)
 
     def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
@@ -174,6 +175,7 @@ class AsyncBeamSearchClient:
         self._close_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def prepare_request(self, call: OnlineBeamSearchRequest) -> BeamBatchRequest:
+        BeamSearchOutputProcessor.ensure_available()
         return await BeamSearchInputProcessor(self.engine).process_online_inputs(self.serving, call)
 
     async def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:

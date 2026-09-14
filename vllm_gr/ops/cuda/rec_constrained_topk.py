@@ -94,12 +94,16 @@ def _fused_topk_kernel(
     WRITE_WIRE_LOGPROBS: tl.constexpr,
     PACK_PREFILL_RESULT: tl.constexpr,
     step: tl.constexpr,
+    device_step,
+    DEVICE_STEP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    if DEVICE_STEP:
+        step = tl.minimum(tl.maximum(tl.load(device_step), 0), 2)
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
-    begin = 0
-    degree = first_count
+    begin = tl.full((), 0, tl.int64)
+    degree = tl.cast(first_count, tl.int64)
     if step == 1:
         first = tl.load(prefixes + row * prefix_stride).to(tl.int64)
         prefix_valid = (first >= 0) & (first < table_vocab_size)
@@ -444,6 +448,7 @@ def _launch_rec_constrained_topk_cuda_out(
     out_prefill_status: torch.Tensor | None = None,
     out_prefill_payload: torch.Tensor | None = None,
     *,
+    device_step: torch.Tensor | None = None,
     rows: int,
     block: int,
     flat_prefixes: torch.Tensor,
@@ -481,6 +486,8 @@ def _launch_rec_constrained_topk_cuda_out(
         WRITE_WIRE_LOGPROBS=out_wire_logprobs is not None,
         PACK_PREFILL_RESULT=(out_prefill_status is not None and out_prefill_payload is not None),
         step=current_step,
+        device_step=device_step,
+        DEVICE_STEP=device_step is not None,
         BLOCK=block,
         num_warps=8 if block >= 2048 else 4,
     )
@@ -606,6 +613,7 @@ def _rec_constrained_topk_cuda_out_unchecked(
     out_wire_logprobs: torch.Tensor | None,
     out_prefill_status: torch.Tensor | None = None,
     out_prefill_payload: torch.Tensor | None = None,
+    device_step: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch on startup-validated CUDA prefill tensors (Worker-internal)."""
 
@@ -615,6 +623,8 @@ def _rec_constrained_topk_cuda_out_unchecked(
         if current_step == 0
         else (int(max_prefix1_degree) if current_step == 1 else int(max_prefix2_degree))
     )
+    if device_step is not None:
+        candidate_count = max(first_token_ids.numel(), max_prefix1_degree, max_prefix2_degree)
     block = triton.next_power_of_2(max(top_k, candidate_count, 1))
     flat_prefixes = sequence_group.view(rows, sequence_group.shape[-1])
     return _launch_rec_constrained_topk_cuda_out(
@@ -636,6 +646,7 @@ def _rec_constrained_topk_cuda_out_unchecked(
         out_wire_logprobs,
         out_prefill_status,
         out_prefill_payload,
+        device_step=device_step,
         rows=rows,
         block=block,
         flat_prefixes=flat_prefixes,

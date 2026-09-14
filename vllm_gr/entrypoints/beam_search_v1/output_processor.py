@@ -21,6 +21,11 @@ def _raise_failure(result: BeamBatchResult) -> None:
 class BeamSearchOutputProcessor:
     """A5 extension point for offline and online terminal output conversion."""
 
+    @classmethod
+    def ensure_available(cls) -> None:
+        """Reject full-result submission before accepting any Worker resources."""
+        raise NotImplementedError("A5 final-result consumer is not installed")
+
     def process_outputs(self, call: OfflineBeamSearchRequest, result: BeamBatchResult) -> list[Any]:
         _raise_failure(result)
         raise NotImplementedError("A5 must convert BeamBatchResult to BeamSearchOutput")

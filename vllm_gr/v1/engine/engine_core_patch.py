@@ -471,6 +471,12 @@ def apply_scheduler_patch():
             )
 
             def patch_cache_blocks(request, num_computed_tokens):
+                if getattr(request, "gr_batch_request", None) is not None:
+                    # Only complete prompt blocks are cacheable. Placeholder
+                    # hashes must never advertise generated Beam KV.
+                    return _original_cache_blocks(
+                        request, min(num_computed_tokens, request.num_prompt_tokens)
+                    )
                 # Extend the num_computed_tokens passed to cache_blocks to the next
                 # block boundary on the FINAL prefill chunk, so the trailing partial
                 # block (whose hash exists thanks to the padding in _cache_beam_request)

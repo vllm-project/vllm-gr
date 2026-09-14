@@ -252,6 +252,12 @@ def test_online_entrypoint_uses_only_visible_dp_ranks(
         assert session.data_parallel_rank == rank
         return []
 
+    from vllm_gr.entrypoints.beam_search_v1.output_processor import (
+        BeamSearchOutputProcessor,
+    )
+
+    # This routing-only fixture supplies an explicit test final consumer.
+    monkeypatch.setattr(BeamSearchOutputProcessor, "ensure_available", lambda: None)
     monkeypatch.setattr(entrypoint, "run_beam_search_v1_async", prepare_and_submit)
     monkeypatch.setattr(serving_engine, "_dp_rank_counter", 0)
 

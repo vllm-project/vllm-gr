@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# pytest decorators are untyped in the mypy-only pre-commit environments.
+# mypy: disable-error-code="misc"
 import asyncio
 from types import SimpleNamespace
 from typing import Any
 
 import msgspec
+import pytest
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.engine import (
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -612,3 +617,171 @@ def test_async_dp_submit_starts_stats_task_before_first_request() -> None:
     assert events[3] == ("output",)
     assert request.items[0].request.client_index == 2
     assert request.items[0].request.current_wave == 7
+
+
+def test_nonoutput_prefill_validates_worker_receipt_identity() -> None:
+    scheduler = _scheduler()
+    session = add_gr_session(scheduler, _batch_request())
+    scheduler.requests[session.session_id].is_prefill_chunk = True
+    scheduled = _scheduler_output()
+    metadata = attach_gr_stage_metadata(scheduler, scheduled, session)
+    assert metadata is not None
+    setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
+    result = GRWorkerResult(
+        session.session_id,
+        metadata.dispatch_id + 1,
+        metadata.stage_index,
+        0,
+        metadata.output_device_state,
+        False,
+    )
+    output = SimpleNamespace()
+    setattr(output, GR_WORKER_RESULT_ATTR, {session.session_id: result})
+    completion = update_gr_from_output(scheduler, session, scheduled, output)
+    assert completion.finished
+    assert "different dispatch" in completion.error
+    assert session.confirmed_token_count == session.completed_stages == 0
+
+
+def test_nonoutput_prefill_accepts_zero_without_finishing() -> None:
+    scheduler = _scheduler()
+    session = add_gr_session(scheduler, _batch_request())
+    scheduler.requests[session.session_id].is_prefill_chunk = True
+    scheduled = _scheduler_output()
+    metadata = attach_gr_stage_metadata(scheduler, scheduled, session)
+    assert metadata is not None
+    setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
+    output = SimpleNamespace()
+    setattr(
+        output,
+        GR_WORKER_RESULT_ATTR,
+        {
+            session.session_id: GRWorkerResult(
+                session.session_id,
+                metadata.dispatch_id,
+                metadata.stage_index,
+                0,
+                metadata.output_device_state,
+                False,
+            )
+        },
+    )
+    completion = update_gr_from_output(scheduler, session, scheduled, output)
+    assert not completion.finished and completion.error is None
+    assert session.confirmed_token_count == session.completed_stages == 0
+    assert not session._in_flight_dispatches
+
+
+def test_native_kv_dispatch_lease_survives_abort_until_receipt() -> None:
+    scheduler = _scheduler()
+    block = SimpleNamespace(ref_cnt=1)
+
+    def touch(blocks: Any) -> None:
+        for value in blocks:
+            value.ref_cnt += 1
+
+    def free(blocks: Any) -> None:
+        for value in blocks:
+            value.ref_cnt -= 1
+
+    scheduler.kv_cache_manager = SimpleNamespace(
+        get_blocks=lambda req_id: SimpleNamespace(blocks=((block,),)),
+        block_pool=SimpleNamespace(touch=touch, free_blocks=free),
+    )
+    session = add_gr_session(scheduler, _batch_request())
+    scheduled = _scheduler_output()
+    metadata = attach_gr_stage_metadata(scheduler, scheduled, session)
+    assert block.ref_cnt == 2
+    free((block,))  # Native abort/preemption drops its request reference.
+    session.status = GRSessionStatus.ABORTED
+    assert block.ref_cnt == 1
+    setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
+    update_gr_from_output(scheduler, session, scheduled, SimpleNamespace())
+    assert block.ref_cnt == 0
+    update_gr_from_output(scheduler, session, scheduled, SimpleNamespace())
+    assert block.ref_cnt == 0
+
+
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize("num_leases", [1, 2])
+@pytest.mark.parametrize("native_first", [False, True])
+@pytest.mark.parametrize("shared_prefix", [False, True])
+@pytest.mark.parametrize("status", [GRSessionStatus.ABORTED, GRSessionStatus.FINISHING])
+def test_dispatch_lease_preserves_native_eviction_order(
+    num_groups: int,
+    num_leases: int,
+    native_first: bool,
+    shared_prefix: bool,
+    status: GRSessionStatus,
+) -> None:
+    def resources() -> tuple[BlockPool, list[Any], list[Any]]:
+        pool = BlockPool(num_gpu_blocks=3 * num_groups + 2, enable_caching=True, hash_block_size=16)
+        blocks = pool.get_new_blocks(3 * num_groups)
+        # Physical block IDs deliberately differ from prompt order.
+        groups = [
+            [blocks[start + 2], blocks[start], blocks[start + 1]]
+            for start in range(0, len(blocks), 3)
+        ]
+        if shared_prefix:
+            pool.touch([groups[0][0]])
+        managers = [
+            SimpleNamespace(
+                req_to_blocks={"session-0": group}, num_cached_block={}, block_pool=pool
+            )
+            for group in groups
+        ]
+        return pool, groups, managers
+
+    def native_free(managers: list[Any]) -> None:
+        for manager in managers:
+            SingleTypeKVCacheManager.free(manager, "session-0")
+
+    reference, _, reference_managers = resources()
+    native_free(reference_managers)
+    expected = [block.block_id for block in reference.free_block_queue.get_all_free_blocks()]
+    pool, groups, managers = resources()
+    scheduler = _scheduler()
+    scheduler.kv_cache_manager = SimpleNamespace(
+        get_blocks=lambda _: SimpleNamespace(blocks=groups), block_pool=pool
+    )
+    session = add_gr_session(scheduler, _batch_request())
+    scheduled = []
+    for _ in range(num_leases):
+        output = _scheduler_output()
+        m = attach_gr_stage_metadata(scheduler, output, session)
+        setattr(output, GR_STAGE_OUTPUT_ATTR, {session.session_id: m})
+        scheduled.append(output)
+    session.status = status
+    if native_first:
+        native_free(managers)
+    for output in reversed(scheduled):
+        update_gr_from_output(scheduler, session, output, SimpleNamespace())
+    if not native_first:
+        native_free(managers)
+    assert [block.block_id for block in pool.free_block_queue.get_all_free_blocks()] == expected
+    assert not session._kv_dispatch_leases
+    before = [block.ref_cnt for block in pool.blocks]
+    for output in scheduled:
+        update_gr_from_output(scheduler, session, output, SimpleNamespace())
+    assert [block.ref_cnt for block in pool.blocks] == before
+    assert all(block.ref_cnt == 0 for block in pool.blocks if block.block_id in expected)
+    if shared_prefix:
+        assert groups[0][0].ref_cnt == 1
+    assert [block.block_id for block in pool.get_new_blocks(len(expected))] == expected
+
+
+def test_async_output_cache_never_hashes_generated_placeholders() -> None:
+    from vllm_gr.v1.engine.gr_async_scheduler import _install_gr_prompt_cache_guard
+
+    calls: list[int] = []
+    scheduler = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(cache_blocks=lambda request, count: calls.append(count))
+    )
+    _install_gr_prompt_cache_guard(scheduler)
+    _install_gr_prompt_cache_guard(scheduler)
+    cache = scheduler.kv_cache_manager.cache_blocks
+    gr = SimpleNamespace(gr_batch_request=object(), num_prompt_tokens=31)
+    cache(gr, 30)
+    cache(gr, 32)
+    cache(SimpleNamespace(), 32)
+    assert calls == [30, 31, 32]

@@ -172,7 +172,9 @@ def _validate_step_kernel(
     code = tl.full((), 0, tl.int32)
     if PREFILL:
         code = tl.where(init, _ERROR_ALREADY_INITIALIZED, code)
-        enabled = old_error == 0
+        # Cancellation may finish a row before its first output chunk.
+        # Preserve the duplicate-initialization error for initialized rows.
+        enabled = (old_error == 0) & (~done | init)
     else:
         code = tl.where(~init, _ERROR_NOT_INITIALIZED, code)
         enabled = (old_error == 0) & ~done

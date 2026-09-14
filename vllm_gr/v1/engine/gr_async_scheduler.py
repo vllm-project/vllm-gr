@@ -48,6 +48,26 @@ def _sessions(scheduler: Any) -> dict[str, GRSessionState]:
     return sessions
 
 
+def _install_gr_prompt_cache_guard(scheduler: Any) -> None:
+    """Cap native async output caching as well as schedule-time caching."""
+    manager = getattr(scheduler, "kv_cache_manager", None)
+    original = getattr(manager, "cache_blocks", None)
+    if (
+        manager is None
+        or not callable(original)
+        or getattr(manager, "_gr_prompt_cache_guard", False)
+    ):
+        return
+
+    def cache_prompt(request: Any, num_computed_tokens: int) -> Any:
+        if getattr(request, "gr_batch_request", None) is not None:
+            num_computed_tokens = min(num_computed_tokens, request.num_prompt_tokens)
+        return original(request, num_computed_tokens)
+
+    manager.cache_blocks = cache_prompt
+    manager._gr_prompt_cache_guard = True
+
+
 def add_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionState:
     """Register one B=1 session; EngineCore adds its native Request separately."""
     if not scheduler.scheduler_config.async_scheduling:
@@ -68,6 +88,7 @@ def add_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionState:
         # max_tokens - 1 invocations are Decode stages.
         max_decode_steps=max(0, request.beam_params.max_tokens - 1),
     )
+    _install_gr_prompt_cache_guard(scheduler)
     sessions[session_id] = session
     return session
 
@@ -119,6 +140,18 @@ def attach_gr_stage_metadata(
         num_prompt_tokens=int(native_request.num_prompt_tokens),
         produces_output=not prefill_chunk,
     )
+    manager = getattr(scheduler, "kv_cache_manager", None)
+    if manager is not None:
+        # Scheduler owns the native block refcounts. Python references in a
+        # Worker cannot prevent block reuse after abort or preemption.
+        groups = tuple(tuple(group) for group in manager.get_blocks(req_id).blocks)
+        blocks = tuple(block for group in groups for block in group)
+        manager.block_pool.touch(blocks)
+        # The last reference determines eviction order. Match native free():
+        # preserve group order and release each group's prompt tail first.
+        session._kv_dispatch_leases[dispatch_id] = tuple(
+            block for group in groups for block in reversed(group)
+        )
     session._next_dispatch_id += 1
     session._in_flight_dispatches.add(dispatch_id)
     if not prefill_chunk:
@@ -199,12 +232,23 @@ def _read_worker_payload(
         if terminal_result.batch_id != session.session_id:
             raise _GRWorkerProtocolError("Worker returned a terminal result for another session")
 
-    produced = worker_result.produced_token_count if worker_result is not None else 1
+    produced = (
+        worker_result.produced_token_count
+        if worker_result is not None
+        else int(metadata.produces_output)
+    )
     worker_finished = bool(worker_result.finished) if worker_result is not None else False
     if not isinstance(produced, int) or isinstance(produced, bool) or produced not in (0, 1):
         raise _GRWorkerProtocolError("Worker returned an invalid produced_token_count")
-    if produced == 0 and not worker_finished and terminal_result is None:
+    if (
+        metadata.produces_output
+        and produced == 0
+        and not worker_finished
+        and terminal_result is None
+    ):
         raise _GRWorkerProtocolError("Worker returned no token for a non-terminal logical stage")
+    if not metadata.produces_output and produced != 0:
+        raise _GRWorkerProtocolError("Worker produced a token for a non-output Prefill chunk")
     if (
         worker_result is not None
         and produced == 1
@@ -239,6 +283,9 @@ def update_gr_from_output(
     if metadata.dispatch_id not in session._in_flight_dispatches:
         return _stage_completion(session, metadata.stage_index, model_output)
     session._in_flight_dispatches.remove(metadata.dispatch_id)
+    blocks = session._kv_dispatch_leases.pop(metadata.dispatch_id, None)
+    if blocks is not None:
+        scheduler.kv_cache_manager.block_pool.free_blocks(blocks)
 
     # Once termination starts, successors that were already queued are only
     # drained. They must not advance logical tokens or replace the result that
@@ -255,15 +302,21 @@ def update_gr_from_output(
             _sessions(scheduler).pop(session.session_id, None)
         return _stage_completion(session, metadata.stage_index, model_output)
 
-    if not metadata.produces_output:
-        return _stage_completion(session, metadata.stage_index, model_output)
-
     try:
         worker_result, terminal_result, produced, worker_finished = _read_worker_payload(
             session, metadata, model_output
         )
     except _GRWorkerProtocolError as error:
         return _fail_gr_dispatch(scheduler, session, metadata, model_output, str(error))
+
+    if not metadata.produces_output:
+        if worker_finished or terminal_result is not None:
+            session.status = GRSessionStatus.FINISHING
+            session.terminal_result_pending = True
+            session._pending_terminal_result = terminal_result
+        return _stage_completion(
+            session, metadata.stage_index, model_output, finished=worker_finished
+        )
 
     session.completed_stages += 1
     session.confirmed_token_count += produced

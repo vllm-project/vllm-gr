@@ -72,6 +72,11 @@ class CUDAConstraintBackend:
     def info(self) -> ConstraintBackendInfo:
         return self._info
 
+    @property
+    def is_ready(self) -> bool:
+        """Whether admission can use this backend without initialization work."""
+        return self._state is _BackendState.READY
+
     def _tables(self) -> tuple[torch.Tensor, ...]:
         tables = (
             self._first_token_ids,
@@ -94,6 +99,7 @@ class CUDAConstraintBackend:
         out_wire_logprobs: torch.Tensor | None = None,
         out_prefill_status: torch.Tensor | None = None,
         out_prefill_payload: torch.Tensor | None = None,
+        device_step: torch.Tensor | None = None,
         validate: bool = True,
         build_output: bool = True,
     ) -> ConstraintOutput | None:
@@ -161,6 +167,7 @@ class CUDAConstraintBackend:
                 "out_wire_logprobs": out_wire_logprobs,
             }
             if not validate:
+                launch_kwargs["device_step"] = device_step
                 launch_kwargs["out_prefill_status"] = out_prefill_status
                 launch_kwargs["out_prefill_payload"] = out_prefill_payload
             launch_out(
@@ -243,6 +250,7 @@ class CUDAConstraintBackend:
         out_wire_logprobs: torch.Tensor | None = None,
         out_prefill_status: torch.Tensor | None = None,
         out_prefill_payload: torch.Tensor | None = None,
+        device_step: torch.Tensor | None = None,
     ) -> None:
         """Write to a prevalidated persistent Worker workspace.
 
@@ -266,6 +274,7 @@ class CUDAConstraintBackend:
             out_wire_logprobs=out_wire_logprobs,
             out_prefill_status=out_prefill_status,
             out_prefill_payload=out_prefill_payload,
+            device_step=device_step,
             validate=False,
             build_output=False,
         )

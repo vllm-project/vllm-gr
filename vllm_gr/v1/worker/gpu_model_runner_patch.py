@@ -256,6 +256,9 @@ def make_patched_sample_tokens_gpu(_orig_sample_tokens):
 
     @wraps(_orig_sample_tokens)
     def patched_sample_tokens(self, grammar_output, *args, **kwargs):
+        stage_runner = getattr(self, "_gr_gpu_stage_runner", None)
+        if stage_runner is not None and stage_runner.pending is not None:
+            return stage_runner.sample(grammar_output)
         from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
 
         out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)

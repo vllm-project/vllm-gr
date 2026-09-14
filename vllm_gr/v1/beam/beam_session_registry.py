@@ -62,6 +62,10 @@ class BeamSessionRegistry:
         self._free_slots: List[int] = list(range(max_batch))  # free-list
         self._slots: Dict[int, SessionSlotState] = {}  # slot → state
 
+    @property
+    def num_active_sessions(self) -> int:
+        return len(self._slot_map)
+
     def allocate(self, session_id: str, beam_width: int, prefix_len: int) -> int:
         """Allocate a slot for a new session.
 

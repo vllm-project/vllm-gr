@@ -334,6 +334,7 @@ class BeamAttentionImpl(AttentionImpl):
                     beam_value,
                     beam_session.slot,
                     decode_step_buf,
+                    active_mask=getattr(attn_metadata, "beam_active_mask", None),
                 )
             else:
                 # Non-CUDA (NPU xllm/cascade, CPU unit tests) dispatches through

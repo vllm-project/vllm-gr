@@ -122,6 +122,7 @@ class BeamAttentionMetadata:
     # When is_beam_decode is True and beam_session is available,
     # the attention forward uses the incremental decode path.
     is_beam_decode: bool = False
+    beam_active_mask: torch.Tensor | None = None
     beam_session: Any = None  # BeamSearchSession reference
     # DEPRECATED: beam_layer_idx is no longer the primary pool resolution
     # mechanism.  Prefer passing ``beam_pool`` directly as an explicit

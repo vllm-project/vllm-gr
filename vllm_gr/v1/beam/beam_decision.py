@@ -138,6 +138,7 @@ class BeamPostprocessWorkspace:
     # Optional persistent-runner scratch, allocated once when the runner binds.
     # Ordinary postprocess callers retain their existing allocations and ABI.
     state_scratch: BeamStateScratch | None = None
+    execution_owner: Any = None
 
     @classmethod
     def allocate(

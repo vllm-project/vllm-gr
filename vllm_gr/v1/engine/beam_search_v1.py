@@ -81,6 +81,7 @@ class GRSessionState:
     _in_flight_dispatches: set[int] = field(default_factory=set, init=False, repr=False)
     _pending_terminal_result: BeamBatchResult | None = field(default=None, init=False, repr=False)
     _terminal_emitted: bool = field(default=False, init=False, repr=False)
+    _kv_dispatch_leases: dict[int, Any] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.session_id:

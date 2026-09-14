@@ -285,6 +285,43 @@ def test_single_token_and_initialization_errors():
     assert runner.state.error_code.cpu().item() == ERROR_NOT_INITIALIZED
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("invalid", [False, True])
+def test_finished_uninitialized_row_ignores_prefill(dtype, graph, invalid):
+    runner = _runtime(steps=3, dtype=dtype, batch=2, state_index=1)
+    state = runner.state
+    valid = _gpu([[10, 11, 12, 13]], [[0, -1, -2, -3]])
+    candidates = _gpu([[10, 11, 12, 13]], [[float("nan")] * 4]) if invalid else valid
+    runner.initialize_from_prefill(*candidates)
+    runner.reset()
+
+    def initialize():
+        runner.initialize_from_prefill(*candidates)
+
+    replay = initialize
+    if graph:
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            initialize()
+        runner.reset()
+        replay = captured.replay
+    state.is_finished[1] = True
+    snapshot = {
+        name: value.clone()
+        for name, value in vars(state).items()
+        if isinstance(value, torch.Tensor)
+    }
+    replay()
+    for name, expected in snapshot.items():
+        torch.testing.assert_close(getattr(state, name), expected, rtol=0, atol=0)
+    runner.reset()
+    runner.initialize_from_prefill(*valid)
+    assert state.num_generated_tokens[1].cpu().item() == 1
+    assert state.error_code[1].cpu().item() == 0
+    assert state.is_initialized[1].cpu().item()
+
+
 def test_invalid_values_do_not_partially_commit():
     runner = _runtime(stops=(99,))
     runner.initialize_from_prefill(*_gpu([[1, 2, 3, 4]], [[0] * 4]))

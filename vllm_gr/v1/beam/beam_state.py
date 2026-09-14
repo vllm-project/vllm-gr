@@ -72,6 +72,8 @@ class BeamSearchState:
         self.max_batch_size = batch
         self.beam_width = beam_width
         self.max_new_tokens = max_new_tokens
+        self.stop_token_ids_config = stop_token_ids
+        self.ignore_stop_tokens_config = ignore_stop_tokens
         self.completed_capacity = capacity
         self.device = sequence.device
         self.sequence = sequence[:, :beam_width]

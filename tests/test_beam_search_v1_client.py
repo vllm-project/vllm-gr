@@ -423,3 +423,12 @@ def test_submission_rollback_fences_delayed_acceptance() -> None:
         assert backend.cleanup_calls == [("abort", "session-1")]
 
     asyncio.run(run())
+
+
+def test_public_output_flow_fails_before_a5_submission() -> None:
+    from vllm_gr.entrypoints.beam_search_v1.output_processor import (
+        BeamSearchOutputProcessor,
+    )
+
+    with pytest.raises(NotImplementedError, match="A5 final-result consumer"):
+        BeamSearchOutputProcessor.ensure_available()

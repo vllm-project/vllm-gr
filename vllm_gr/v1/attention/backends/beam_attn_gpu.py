@@ -274,6 +274,7 @@ def cascade_attention(
                     slot,
                     decode_step_buf,
                     beam_width=W,
+                    active_mask=getattr(attn_metadata, "beam_active_mask", None),
                 )
             else:
                 # Eager fallback: host-int slice copy (packed layout)
