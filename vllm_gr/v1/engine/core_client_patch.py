@@ -51,6 +51,14 @@ def sync_mp_beam_request_step_update(self, update):
     self._send_input(EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, update)
 
 
+def sync_mp_beam_request_step_update_batch(self, updates):
+    from vllm.v1.engine import EngineCoreRequestType
+
+    if not updates:
+        return
+    self._send_input(EngineCoreRequestType.BEAM_STEP_BATCH, updates)
+
+
 def sync_mp_beam_session_template(self, template):
     from vllm.v1.engine import EngineCoreRequestType
 
@@ -94,6 +102,19 @@ def inproc_add_requests(self, requests, force_batch=False):
 
 def inproc_beam_request_step_update(self, update):
     self.engine_core._handle_beam_request_step_update(update)
+
+
+def inproc_beam_request_step_update_batch(self, updates):
+    if not updates:
+        return
+
+    from vllm.v1.engine import EngineCoreRequestType
+
+    from vllm_gr.v1.engine.core import dispatch_gr_engine_core_input
+
+    dispatch_gr_engine_core_input(
+        self.engine_core, EngineCoreRequestType.BEAM_STEP_BATCH, updates
+    )
 
 
 def inproc_beam_session_template(self, template):
@@ -172,11 +193,17 @@ def apply_engine_client_patches() -> None:
     SyncMPClient.add_requests = sync_mp_add_requests
     SyncMPClient.beam_request_step_update = sync_mp_beam_request_step_update
     SyncMPClient.beam_session_template = sync_mp_beam_session_template
+    SyncMPClient.beam_request_step_update_batch = (
+        sync_mp_beam_request_step_update_batch
+    )
     SyncMPClient.submit_session = sync_mp_submit_session
     SyncMPClient.submit_gr_session = sync_mp_submit_gr_session
     InprocClient.add_requests = inproc_add_requests
     InprocClient.beam_request_step_update = inproc_beam_request_step_update
     InprocClient.beam_session_template = inproc_beam_session_template
+    InprocClient.beam_request_step_update_batch = (
+        inproc_beam_request_step_update_batch
+    )
     InprocClient.submit_session = inproc_submit_session
     InprocClient.submit_gr_session = inproc_submit_gr_session
     InprocClient.get_output = make_patched_inproc_get_output(InprocClient.get_output)

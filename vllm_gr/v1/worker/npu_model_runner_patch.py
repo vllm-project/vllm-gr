@@ -288,9 +288,31 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
             self, orig_input_batch, request_row_configs, beam_data, sampler_output
         )
 
+        materialize_sync_output = bool(
+            not getattr(self, "use_async_scheduling", False)
+            and sampler_output is not None
+            and getattr(sampler_output, "sampled_token_ids", None) is not None
+            and getattr(sampler_output, "logprobs_tensors", None) is not None
+        )
+        if materialize_sync_output:
+            # vLLM 0.22's scheduler requires LogprobsLists because it calls
+            # slice_request on the flattened candidate payload.
+            collapsed_logprobs = (
+                sampler_output.logprobs_tensors.tolists()
+                if logprobs_lists is not None
+                else None
+            )
+            collapsed_sampled = sampler_output.sampled_token_ids[:n].tolist()
+        else:
+            # Async conversion, or a compatibility payload without tensors.
+            collapsed_logprobs = (
+                [[] for _ in range(n)] if logprobs_lists is not None else None
+            )
+            collapsed_sampled = [[] for _ in range(n)]
+
         return (
-            [[] for _ in range(n)] if logprobs_lists is not None else None,
-            [[] for _ in range(n)],
+            collapsed_logprobs,
+            collapsed_sampled,
             prompt_logprobs_dict,
             collapsed_req_ids,
             collapsed_idx,
@@ -461,6 +483,7 @@ def _capture_create_dummy_context_npu(
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor
 
     from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+    from vllm_gr.v1.beam.execution_batch import BeamExecutionBatch
 
     configured_max_batch = int(getattr(gr_cfg, "beam_max_batch_size", 1))
     context = getattr(runner, "_beam_context", None)
@@ -474,28 +497,36 @@ def _capture_create_dummy_context_npu(
         raise RuntimeError(
             "captured Beam context capacity differs from beam_max_batch_size"
         )
-    slot = context.registry.allocate(_BEAM_DUMMY_REQ_ID, beam_width=width, prefix_len=prefix_len)
-    session = BeamSearchSession(session_id=_BEAM_DUMMY_REQ_ID, slot=slot, context=context)
-    session.begin_session(width, prefix_len)
-
-    runner._beam_context = context
-    runner._beam_sessions = {_BEAM_DUMMY_REQ_ID: session}
-
-    beam_data = {
-        _BEAM_DUMMY_REQ_ID: {
+    request_width = int(gr_cfg.beam_max_width)
+    sessions = []
+    beam_data = {}
+    for row in range(configured_max_batch):
+        request_id = (
+            _BEAM_DUMMY_REQ_ID
+            if configured_max_batch == 1
+            else f"{_BEAM_DUMMY_REQ_ID}-{row}"
+        )
+        slot = context.registry.allocate(request_id, request_width, prefix_len)
+        item = BeamSearchSession(session_id=request_id, slot=slot, context=context)
+        item.begin_session(request_width, prefix_len)
+        sessions.append(item)
+        beam_data[request_id] = {
             "prefix_len": prefix_len,
             "cache_len": prefix_len,
             "max_decode_steps": steps_upper,
             "is_beam_decode": True,
-            "beam_width": width,
+            "beam_width": request_width,
             "beam_decode_steps": 1,
-            "parent_beam_ids": [0] * width,
+            "parent_beam_ids": [0] * request_width,
             "decode_step": 0,
         }
-    }
+
+    session = BeamExecutionBatch(sessions) if configured_max_batch > 1 else sessions[0]
+    runner._beam_context = context
+    runner._beam_sessions = {item.session_id: item for item in sessions}
     beam_info = {
         "beam_data": beam_data,
-        "req_ids": [_BEAM_DUMMY_REQ_ID],
+        "req_ids": list(beam_data),
         "beam_session": session,
     }
 
@@ -535,36 +566,38 @@ def _dummy_beam_forward_npu(
 
     from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 
+    count = len(beam_info["req_ids"])
+    request_width = width // count
     # 1. Refresh the per-step device buffers (same as the runtime path).
     context.decode_step_buf.fill_(0)
     if hasattr(context, "decode_step_1based_buf"):
         context.decode_step_1based_buf.fill_(1)
     if hasattr(context, "xllm_block_table_buf"):
         context.xllm_block_table_buf.fill_(0)
-        context.xllm_block_table_buf[0] = 0  # dummy session slot
+        context.xllm_block_table_buf[:count].copy_(
+            torch.arange(count, dtype=torch.int32, device=runner.device)
+        )
 
     # 2. Dummy inputs in the runner's persistent buffers (fixed addresses).
     input_ids = runner.input_ids.gpu[:width]
     input_ids.fill_(1)
     positions = runner.positions[:width]
-    positions.copy_(
-        torch.arange(prefix_len, prefix_len + width, dtype=positions.dtype, device=runner.device)
-    )
+    positions.fill_(prefix_len)
 
-    # 3. Dummy batch state: 1 req with `width` scheduled tokens;
-    #    seq_len = prefix_len + width.  CPU write precedes the H2D copy.
-    runner.optimistic_seq_lens_cpu[:1] = prefix_len + width
-    runner.optimistic_seq_lens_cpu[1:] = 0
+    # 3. Dummy batch state: B requests with W scheduled tokens each;
+    #    seq_len = prefix_len + W.  CPU write precedes the H2D copy.
+    runner.optimistic_seq_lens_cpu[:count] = prefix_len + request_width
+    runner.optimistic_seq_lens_cpu[count:] = 0
     runner.seq_lens.copy_(runner.optimistic_seq_lens_cpu, non_blocking=True)
 
     # 4. query_start_loc: CPU write precedes copy_to_gpu.
-    runner.query_start_loc.np[0] = 0
-    runner.query_start_loc.np[1] = width
-    runner.query_start_loc.np[2:] = 0
+    for row in range(count + 1):
+        runner.query_start_loc.np[row] = row * request_width
+    runner.query_start_loc.np[count + 1 :] = 0
     runner.query_start_loc.copy_to_gpu()
 
-    # 5. Commit block table for 1 request.
-    runner.input_batch.block_table.commit_block_table(1)
+    # 5. Commit the block table for every active request.
+    runner.input_batch.block_table.commit_block_table(count)
 
     # 6. Dummy runs have no real slot assignments — fill with -1 so
     #    reshape_and_cache kernels skip the KV write.  (The NPU
@@ -573,7 +606,7 @@ def _dummy_beam_forward_npu(
     #    pre-fill of stale slot ids is overwritten.)
     slot_mappings_by_group, _ = runner._get_slot_mappings(
         num_tokens_padded=width,
-        num_reqs_padded=1,
+        num_reqs_padded=count,
         num_tokens_unpadded=width,
     )
     if slot_mappings_by_group is not None:
@@ -587,10 +620,10 @@ def _dummy_beam_forward_npu(
     try:
         metadata, _ = runner._build_attention_metadata(
             num_tokens=width,
-            num_reqs=1,
-            max_query_len=width,
+            num_reqs=count,
+            max_query_len=request_width,
             num_tokens_padded=width,
-            num_reqs_padded=1,
+            num_reqs_padded=count,
             for_cudagraph_capture=capture,
         )
         with set_ascend_forward_context(
@@ -690,7 +723,8 @@ def capture_beam_decode_graph(runner) -> bool:
 
     # Re-entry guard: an existing graph references the current context's
     # buffer addresses; rebuilding the context would silently detach it.
-    width = int(gr_cfg.beam_max_width)
+    count = int(getattr(gr_cfg, "beam_max_batch_size", 1))
+    width = int(gr_cfg.beam_max_width) * count
     if _beam_full_graph_ready(runner, width):
         return True
 
@@ -742,7 +776,7 @@ def capture_beam_decode_graph(runner) -> bool:
         # Drop the dummy session even if capture threw.  The context and
         # pools stay — a captured graph (if any) references their addresses.
         session.end_session()
-        runner._beam_sessions.pop(_BEAM_DUMMY_REQ_ID, None)
+        runner._beam_sessions.clear()
         runner._current_beam_info = None
 
     if captured:

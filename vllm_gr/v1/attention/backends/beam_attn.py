@@ -27,6 +27,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
     _get_fp8_dtype_for_flashattn,
 )
+from vllm_gr.v1.beam.execution_batch import select_execution_pool
 
 __all__ = [
     "BeamAttentionBackend",
@@ -285,16 +286,18 @@ class BeamAttentionImpl(AttentionImpl):
         is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
 
         if is_beam_decode and beam_session is not None and beam_session.is_active:
-            # Resolve this layer's KV pool with module-level caching.
-            # First touch: extract the layer index from layer_name via
-            # extract_layer_index (loud AssertionError on ambiguous names
-            # instead of silently defaulting to layer 0).  Subsequent
-            # forwards reuse the cached pool, zero per-step lookup cost.
-            pool = getattr(layer, "_beam_pool", None)
-            if pool is None:
+            # Cache the layer index permanently, but keep the pool cache
+            # shape-aware: single sessions use [capacity, W], while a
+            # BeamExecutionBatch exposes [1, capacity * W] at the same address.
+            layer_idx = getattr(layer, "_beam_pool_layer_idx", None)
+            if layer_idx is None:
                 layer_name = getattr(layer, "layer_name", "")
                 layer_idx = extract_layer_index(layer_name)
-                pool = beam_session.pools[layer_idx]
+                layer._beam_pool_layer_idx = layer_idx
+            current_pool = beam_session.pools[layer_idx]
+            cached_pool = getattr(layer, "_beam_pool", None)
+            pool = select_execution_pool(cached_pool, current_pool)
+            if pool is not cached_pool:
                 layer._beam_pool = pool
 
             # Extract the beam tokens' KV from the key/value tensors (they

@@ -264,6 +264,7 @@ def _prepare_beam_step_requests(
 ) -> list["EngineCoreRequest"]:
     """Prepare EngineCoreRequest items for active instances at this step."""
     engine_core_requests = []
+    beam_step_updates = []
     for j, instance in enumerate(instances_batch):
         if len(instance.beams) == 0:
             # This instance has no active beams (finished)
@@ -367,7 +368,7 @@ def _prepare_beam_step_requests(
                 # re-registration must not run again for this step.
                 instance_self_advance_chained.discard(j)
             else:
-                llm_engine.engine_core.beam_request_step_update(update)
+                beam_step_updates.append(update)
 
             # Update tracking variables
             instance_prev_beam_internal_ids[j] = child_beam_ids
@@ -391,6 +392,13 @@ def _prepare_beam_step_requests(
             llm_engine.output_processor.add_request(ec_req, None, None, 0)
             engine_core_requests.append(ec_req)
 
+    if len(beam_step_updates) == 1:
+        llm_engine.engine_core.beam_request_step_update(beam_step_updates[0])
+    elif beam_step_updates:
+        cohort_id = (int(prompt_start) << 32) | int(token)
+        for update in beam_step_updates:
+            update.cohort_id = cohort_id
+        llm_engine.engine_core.beam_request_step_update_batch(beam_step_updates)
     return engine_core_requests
 
 

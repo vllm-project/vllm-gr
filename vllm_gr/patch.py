@@ -147,6 +147,10 @@ def _validate_request_types_patch() -> str | None:
         getattr(getattr(EngineCoreRequestType, "ADD_BATCH", None), "value", None) == b"\x06"
         and getattr(getattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE", None), "value", None)
         == b"\x07"
+        and getattr(getattr(EngineCoreRequestType, "SUBMIT_GR_SESSION", None), "value", None)
+        == b"\x0a"
+        and getattr(getattr(EngineCoreRequestType, "BEAM_STEP_BATCH", None), "value", None)
+        == b"\x0b"
     )
     return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
 
@@ -161,7 +165,9 @@ def _validate_engine_clients_patch() -> str | None:
     from vllm_gr.v1.engine.core_client_patch import (
         inproc_add_requests,
         inproc_beam_request_step_update,
+        inproc_beam_request_step_update_batch,
         sync_mp_add_requests,
+        sync_mp_beam_request_step_update_batch,
         sync_mp_beam_request_step_update,
     )
 
@@ -170,6 +176,10 @@ def _validate_engine_clients_patch() -> str | None:
         and AsyncMPClient.beam_request_step_update_async is beam_request_step_update_async
         and SyncMPClient.add_requests is sync_mp_add_requests
         and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
+        and SyncMPClient.beam_request_step_update_batch
+        is sync_mp_beam_request_step_update_batch
+        and InprocClient.beam_request_step_update_batch
+        is inproc_beam_request_step_update_batch
         and InprocClient.add_requests is inproc_add_requests
         and InprocClient.beam_request_step_update is inproc_beam_request_step_update
         and getattr(InprocClient.get_output, "_vllm_gr_inproc_self_advance", False)

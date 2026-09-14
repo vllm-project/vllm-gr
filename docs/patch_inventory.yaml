@@ -118,6 +118,7 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_request_types_patch
       - tests/contract/test_engine_core_protocol_contracts.py
+      - tests/test_engine_core_codec.py
     process_roles: [api_server, engine_core]
     target: vllm.v1.engine.EngineCoreRequestType
     risk: critical
@@ -132,6 +133,7 @@ patches:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
       - tests/test_beam_request_unit.py
+      - tests/test_cohort_bucketing.py
     process_roles: [engine_core]
     target: vllm.v1.engine.core.EngineCoreProc
     risk: critical
@@ -159,6 +161,8 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_gpu_model_runner_patch.py
+      - tests/test_input_batch_proxy.py
+      - tests/test_beam_execution_batch.py
       - tests/test_model_runner_common.py
       - tests/test_model_runner_patch.py
     process_roles: [gpu_worker]
@@ -177,6 +181,8 @@ patches:
       - tests/test_npu_model_runner_patch.py
       - tests/test_model_runner_patch.py
       - tests/test_model_runner_common.py
+      - tests/test_input_batch_proxy.py
+      - tests/test_beam_execution_batch.py
     process_roles: [npu_worker]
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner.load_model and execution hooks
     risk: critical
@@ -189,6 +195,7 @@ patches:
     activation: the facade module is imported and CUSTOM is selected for GR Beam Attention
     validator_or_test:
       - tests/test_beam_attention_platform_execution.py
+      - tests/test_beam_execution_batch.py
       - tests/test_beam_attention_metadata.py
       - tests/test_attention_backend_custom.py
     process_roles: [engine_core, worker]

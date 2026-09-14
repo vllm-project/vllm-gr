@@ -265,22 +265,26 @@ def test_sampling_metadata_remap_is_cached_and_warmed_at_remap() -> None:
 
     common._beam_remap_inputs(runner, scheduler_output, [4])
     proxy = runner.input_batch
+    remapped = proxy.sampling_metadata
 
     # Eager warm: the metadata was remapped during _beam_remap_inputs
     # (prepare phase), not deferred to the first _sample access.  One beam
     # request with beam_width=2 → the 1-row temperature expands to 2 rows.
-    assert sampling_metadata.temperature.tolist() == [20, 20]
+    assert sampling_metadata.temperature.tolist() == [20]
+    assert remapped is not sampling_metadata
+    assert remapped.temperature.tolist() == [20, 20]
     cache = object.__getattribute__(proxy, "_sampling_metadata_cache")
-    assert cache is sampling_metadata
+    assert cache[0] is sampling_metadata
+    assert cache[1] is remapped
     idx_cache = object.__getattribute__(proxy, "_logits_idx_tensor_cache")
     assert idx_cache is not None and idx_cache[1].tolist() == [0, 0]
 
-    # Cache hit: a fresh request-length tensor planted after the first read
-    # must NOT be re-expanded (the remap loop is skipped entirely on the
-    # second access).
+    # Cache hit: changing the source after warm must not replace or mutate the
+    # already-remapped copy (the remap loop is skipped on the second access).
+    # Per-request sampling metadata is immutable in production.
     sampling_metadata.temperature = torch.tensor([30])
-    assert proxy.sampling_metadata is sampling_metadata
-    assert proxy.sampling_metadata.temperature.tolist() == [30]
+    assert proxy.sampling_metadata is remapped
+    assert proxy.sampling_metadata.temperature.tolist() == [20, 20]
 
 
 def test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment() -> None:
@@ -298,8 +302,10 @@ def test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment() -> None
     proxy = common.InputBatchProxy(input_batch, ["beam", "beam"], [0, 0], [0, 0])
     input_batch.sampling_metadata = sampling_metadata
 
-    assert proxy.sampling_metadata is sampling_metadata
-    assert sampling_metadata.temperature.tolist() == [10, 10]
+    first_remapped = proxy.sampling_metadata
+    assert first_remapped is not sampling_metadata
+    assert sampling_metadata.temperature.tolist() == [10]
+    assert first_remapped.temperature.tolist() == [10, 10]
 
     # Mid-step rebuild (refresh_metadata): a new metadata object with fresh
     # per-request tensors is picked up and remapped despite the cache.
@@ -313,8 +319,11 @@ def test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment() -> None
         repetition_penalties=None,
     )
     input_batch.sampling_metadata = rebuilt
-    assert proxy.sampling_metadata is rebuilt
-    assert rebuilt.temperature.tolist() == [7, 7]
+    rebuilt_remapped = proxy.sampling_metadata
+    assert rebuilt_remapped is not rebuilt
+    assert rebuilt_remapped is not first_remapped
+    assert rebuilt.temperature.tolist() == [7]
+    assert rebuilt_remapped.temperature.tolist() == [7, 7]
 
     # Assignment through the proxy forwards to the underlying batch AND
     # invalidates the cache, so the next read remaps the new object.
@@ -329,8 +338,10 @@ def test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment() -> None
     )
     proxy.sampling_metadata = replaced
     assert input_batch.sampling_metadata is replaced
-    assert proxy.sampling_metadata is replaced
-    assert replaced.temperature.tolist() == [5, 5]
+    replaced_remapped = proxy.sampling_metadata
+    assert replaced_remapped is not replaced
+    assert replaced.temperature.tolist() == [5]
+    assert replaced_remapped.temperature.tolist() == [5, 5]
 
 
 def test_sampling_metadata_batched_gather_matches_per_attr_index() -> None:
@@ -352,7 +363,10 @@ def test_sampling_metadata_batched_gather_matches_per_attr_index() -> None:
     proxy = common.InputBatchProxy(input_batch, ["a", "b"], [0, 0, 1], [0, 0, 1])
 
     meta = proxy.sampling_metadata
-    assert meta is sampling_metadata
+    assert meta is not sampling_metadata
+    assert sampling_metadata.temperature.tolist() == [0.5, 1.5]
+    assert sampling_metadata.top_p.tolist() == pytest.approx([0.9, 0.8])
+    assert sampling_metadata.top_k.tolist() == [32, 16]
     assert meta.temperature.tolist() == [0.5, 0.5, 1.5]
     assert meta.top_p.dtype is torch.float32
     assert torch.equal(meta.top_p, torch.tensor([0.9, 0.9, 0.8], dtype=torch.float32))
@@ -900,11 +914,43 @@ def test_beam_session_rejects_concurrent_incremental_requests() -> None:
         },
     }
 
-    with pytest.raises(RuntimeError, match="concurrent incremental beam decode"):
+    with pytest.raises(RuntimeError, match="exceeds configured capacity"):
         common._get_or_create_beam_session(
             runner,
             beam_data,
             SimpleNamespace(beam_finished_session_ids=[]),
+        )
+
+
+def test_beam_session_rejects_asymmetric_cohort_shrink() -> None:
+    runner = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(
+            beam_max_batch_size=2,
+            beam_max_width=2,
+            beam_max_decode_steps=3,
+        ),
+        _beam_sessions={"beam-a": object(), "beam-b": object()},
+        _beam_active_cohort_ids=("beam-a", "beam-b"),
+    )
+    beam_data = {
+        "beam-a": {
+            "is_beam_decode": True,
+            "decode_step": 1,
+            "beam_decode_steps": 2,
+            "beam_width": 2,
+            "prefix_len": 4,
+            "max_decode_steps": 3,
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="EOS asymmetrically"):
+        common._get_or_create_beam_session(
+            runner,
+            beam_data,
+            SimpleNamespace(
+                beam_finished_session_ids=[],
+                num_scheduled_tokens={"beam-a": 2},
+            ),
         )
 
 
@@ -929,7 +975,7 @@ def _batch_context_runner(**overrides: Any) -> SimpleNamespace:
                 max_num_batched_tokens=8,
             )
         ),
-        device=torch.device("cpu"),
+        device=SimpleNamespace(type="npu"),
     )
     for name, value in overrides.items():
         setattr(runner, name, value)
@@ -939,6 +985,8 @@ def _batch_context_runner(**overrides: Any) -> SimpleNamespace:
 def test_batch_context_load_wrapper_reserves_and_accounts_fixed_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from vllm_gr.v1.beam import beam_decision
+
     created: list[int] = []
 
     def create_context(runner: Any, config: Any, max_batch: int) -> SimpleNamespace:
@@ -961,6 +1009,7 @@ def test_batch_context_load_wrapper_reserves_and_accounts_fixed_capacity(
         return "loaded"
 
     monkeypatch.setattr(common, "_create_beam_context", create_context)
+    monkeypatch.setattr(beam_decision, "_xllm_decode_mode_active", lambda: True)
     wrapped = common.make_load_model_with_batch_context(original)
     runner = _batch_context_runner()
 
