@@ -151,12 +151,16 @@ class GRConfig:
     # the step's outputs.  Only valid with beam_worker_decision=True (the
     # chain consumes worker beam decisions).
     beam_engine_driven: bool | None = None
+    # Added after pre-existing fields to preserve positional construction.
+    # One logical session occupies beam_max_width physical rows.
+    beam_max_batch_size: int = 1
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
             validate_beam_engine_driven,
             validate_beam_graph_enabled,
+            validate_beam_max_batch_size,
             validate_beam_max_decode_steps,
             validate_beam_max_width,
             validate_beam_worker_decision,
@@ -193,6 +197,11 @@ class GRConfig:
             self,
             "beam_max_decode_steps",
             validate_beam_max_decode_steps(self.beam_max_decode_steps),
+        )
+        object.__setattr__(
+            self,
+            "beam_max_batch_size",
+            validate_beam_max_batch_size(self.beam_max_batch_size),
         )
         object.__setattr__(
             self,

@@ -28,6 +28,7 @@ _WORKER_SAMPLE_TOKENS_PATCH_MARKER = "_vllm_gr_beam_sample_tokens_patch"
 _WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
 _WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
 _WORKER_MODEL_FORWARD_PATCH_MARKER = "_vllm_gr_prefill_model_forward_patch"
+_WORKER_BATCH_CONTEXT_LOAD_PATCH_MARKER = "_vllm_gr_beam_batch_context_load_patch"
 
 
 def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -1532,6 +1533,106 @@ def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     )
 
 
+def _beam_context_device_memory_bytes(context: Any) -> int:
+    """Return unique device-tensor bytes owned by a beam context."""
+
+    tensors = [value for value in vars(context).values() if torch.is_tensor(value)]
+    tensors.extend(
+        value for value in vars(context.decision).values() if torch.is_tensor(value)
+    )
+    tensors.extend(
+        tensor
+        for pool in context.pools
+        for tensor in (pool.unshared_key, pool.unshared_value)
+    )
+    unique_tensors: dict[tuple[str, int], torch.Tensor] = {}
+    for tensor in tensors:
+        unique_tensors[(str(tensor.device), tensor.data_ptr())] = tensor
+    return sum(tensor.numel() * tensor.element_size() for tensor in unique_tensors.values())
+
+
+def make_load_model_with_batch_context(original):
+    """Reserve multi-session Beam storage before native KV-cache profiling."""
+
+    if getattr(original, _WORKER_BATCH_CONTEXT_LOAD_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def load_model_with_batch_context(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        config = _get_gr_config(self)
+        count = int(getattr(config, "beam_max_batch_size", 1))
+        if count <= 1:
+            return result
+
+        width = getattr(config, "beam_max_width", None)
+        if width is None:
+            raise ValueError("beam_max_batch_size > 1 requires beam_max_width")
+        if not bool(getattr(config, "beam_worker_decision", False)):
+            raise ValueError("beam_max_batch_size > 1 requires worker-side beam decision")
+        if bool(getattr(self, "use_async_scheduling", False)):
+            raise ValueError(
+                "beam_max_batch_size > 1 currently requires synchronous scheduling"
+            )
+
+        parallel = self.parallel_config
+        parallel_sizes = (
+            int(getattr(parallel, "tensor_parallel_size", 1)),
+            int(getattr(parallel, "pipeline_parallel_size", 1)),
+            int(getattr(parallel, "data_parallel_size", 1)),
+        )
+        if parallel_sizes != (1, 1, 1):
+            raise ValueError(
+                "beam_max_batch_size > 1 currently requires TP=1, PP=1, and DP=1"
+            )
+
+        scheduler = self.vllm_config.scheduler_config
+        max_num_seqs = int(getattr(scheduler, "max_num_seqs", 0))
+        max_num_batched_tokens = int(getattr(scheduler, "max_num_batched_tokens", 0))
+        required_tokens = count * int(width)
+        if max_num_seqs < count or max_num_batched_tokens < required_tokens:
+            raise ValueError(
+                "beam_max_batch_size requires scheduler capacity for B sessions "
+                f"and B*W tokens (B={count}, W={width}, "
+                f"max_num_seqs={max_num_seqs}, "
+                f"max_num_batched_tokens={max_num_batched_tokens})"
+            )
+
+        if str(self.device.type).lower() == "npu":
+            from vllm_gr.v1.beam.beam_decision import _xllm_decode_mode_active
+
+            if not _xllm_decode_mode_active():
+                raise ValueError("NPU beam_max_batch_size > 1 requires xllm decode execution")
+
+        context = getattr(self, "_beam_context", None)
+        if context is None:
+            context = _create_beam_context(self, config, max_batch=count)
+            self._beam_context = context
+        elif int(context.max_batch) != count:
+            raise RuntimeError(
+                "existing Beam context capacity does not match beam_max_batch_size "
+                f"({context.max_batch} != {count})"
+            )
+
+        context_bytes = _beam_context_device_memory_bytes(context)
+        self.model_memory_usage = int(getattr(self, "model_memory_usage", 0)) + context_bytes
+        logger.info(
+            "vllm-gr: reserved Beam multi-session context "
+            "(batch=%d, width=%d, device_bytes=%d)",
+            count,
+            width,
+            context_bytes,
+        )
+        return result
+
+    setattr(
+        load_model_with_batch_context,
+        _WORKER_BATCH_CONTEXT_LOAD_PATCH_MARKER,
+        True,
+    )
+    return load_model_with_batch_context
+
+
 def _seed_beam_decision_from_metadata(session: Any, mdata: dict[str, Any]) -> None:
     """Synchronize decision state with the authoritative selected parents."""
     parent_scores = mdata.get("parent_cumulative_logprobs")
@@ -1619,10 +1720,10 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     if len(incremental_ids) > 1:
         raise RuntimeError(
             "vllm-gr concurrent incremental beam decode requests are not "
-            "supported: the beam KV pool holds a single active session "
-            f"(max_batch=1), but this batch carries {len(incremental_ids)} "
-            f"({incremental_ids}). Serialize beam search requests or wait "
-            "for the active one to finish."
+            "enabled yet: fixed-capacity storage is configured, but the "
+            "multi-request layout/result path has not been installed. "
+            f"This batch carries {len(incremental_ids)} requests "
+            f"({incremental_ids})."
         )
 
     gr_cfg = _get_gr_config(runner)
@@ -1646,7 +1747,11 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     #    as the dummy-capture paths — a single source of truth prevents
     #    silent size mismatches that would invalidate captured graphs.
     if not hasattr(runner, "_beam_context"):
-        runner._beam_context = _create_beam_context(runner, gr_cfg, max_batch=1)
+        runner._beam_context = _create_beam_context(
+            runner,
+            gr_cfg,
+            max_batch=int(getattr(gr_cfg, "beam_max_batch_size", 1)),
+        )
 
     # 4. Per-request session management
     active_session = None
@@ -1970,9 +2075,14 @@ def is_worker_runner_patched(runner_class) -> bool:
     wrapper that preserves the original result — but the marker must still
     be present for the gate-check to pass.
     """
+    load_model = getattr(runner_class, "load_model", None)
     has_determine = hasattr(runner_class, "_determine_batch_execution_and_padding")
     return bool(
         getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)
+        and (
+            not callable(load_model)
+            or getattr(load_model, _WORKER_BATCH_CONTEXT_LOAD_PATCH_MARKER, False)
+        )
         and getattr(runner_class._prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False)
         and getattr(
             runner_class._bookkeeping_sync,

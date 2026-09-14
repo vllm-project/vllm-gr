@@ -76,6 +76,8 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_engine_args_patch
       - tests/test_attention_backend_custom.py
+      - tests/test_gr_config.py
+      - tests/test_gr_config_v1.py
     process_roles: [main, api_server]
     target: vllm.engine.arg_utils.EngineArgs
     risk: high
@@ -157,9 +159,10 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_gpu_model_runner_patch.py
+      - tests/test_model_runner_common.py
       - tests/test_model_runner_patch.py
     process_roles: [gpu_worker]
-    target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
+    target: vllm.v1.worker.gpu_model_runner.GPUModelRunner.load_model and execution hooks
     risk: critical
     contract: gpu-model-runner-signatures
     removal_condition: stable upstream grouped input and output hooks replace private runner mutation
@@ -173,8 +176,9 @@ patches:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_npu_model_runner_patch.py
       - tests/test_model_runner_patch.py
+      - tests/test_model_runner_common.py
     process_roles: [npu_worker]
-    target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
+    target: vllm_ascend.worker.model_runner_v1.NPUModelRunner.load_model and execution hooks
     risk: critical
     contract: null
     removal_condition: vLLM-Ascend exposes stable grouped input and output hooks

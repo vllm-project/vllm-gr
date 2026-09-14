@@ -86,6 +86,7 @@ def test_attention_selector_contracts() -> None:
 def test_gpu_model_runner_private_method_contracts() -> None:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+    assert _parameter_names(GPUModelRunner.load_model) == ["self"]
     assert _parameter_names(GPUModelRunner._prepare_inputs) == [
         "self",
         "scheduler_output",

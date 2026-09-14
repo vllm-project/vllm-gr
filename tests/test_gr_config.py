@@ -17,6 +17,7 @@ from vllm_gr.config import (
 )
 from vllm_gr.config.parser import (
     ATTENTION_BACKEND_KEY,
+    BEAM_MAX_BATCH_SIZE_KEY,
     BEAM_MAX_DECODE_STEPS_KEY,
     BEAM_MAX_WIDTH_KEY,
     CATALOG_PATH_KEY,
@@ -499,6 +500,30 @@ def test_beam_max_decode_steps_defaults_to_onerec_sid_length() -> None:
     overridden.write_to_vllm_config(vllm_config)
     assert vllm_config.additional_config[BEAM_MAX_DECODE_STEPS_KEY] == 8
     assert GRConfig.from_vllm_config(vllm_config).beam_max_decode_steps == 8
+
+
+def test_beam_max_batch_size_defaults_to_one_and_round_trips() -> None:
+    config = GRConfig.from_vllm_config(_vllm_config())
+    assert config.beam_max_batch_size == 1
+
+    vllm_config = _vllm_config()
+    config.write_to_vllm_config(vllm_config)
+    assert BEAM_MAX_BATCH_SIZE_KEY not in vllm_config.additional_config
+
+    overridden = GRConfig(beam_max_batch_size=4)
+    overridden.write_to_vllm_config(vllm_config)
+    assert vllm_config.additional_config[BEAM_MAX_BATCH_SIZE_KEY] == 4
+    assert GRConfig.from_vllm_config(vllm_config).beam_max_batch_size == 4
+
+
+@pytest.mark.parametrize("value", [None, True, 0, -1, 129, 1.5, "2"])
+def test_beam_max_batch_size_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match="beam_max_batch_size"):
+        GRConfig(beam_max_batch_size=value)  # type: ignore[arg-type]
+
+
+def test_beam_max_batch_size_accepts_upper_bound() -> None:
+    assert GRConfig(beam_max_batch_size=128).beam_max_batch_size == 128
 
 
 def _npic_engine_args(beam_max_width: int, catalog_path: str | None = None) -> SimpleNamespace:

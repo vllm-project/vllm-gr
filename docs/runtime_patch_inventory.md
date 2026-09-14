@@ -137,6 +137,8 @@ aligned with it.
 - Behavior:
     - registers active GR CLI options;
     - writes GR values into `VllmConfig.additional_config`;
+    - validates and propagates the fixed per-worker Beam session capacity
+      configured by `beam_max_batch_size`;
     - applies active NPU compatibility defaults.
 - Descriptor assumptions:
     - `add_cli_args` is a `staticmethod`;
@@ -229,12 +231,19 @@ aligned with it.
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
+    - `GPUModelRunner.load_model`
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
     - `GPUModelRunner._bookkeeping_sync`
 - Platform: GPU
 - Risk: Critical
+- Behavior:
+    - reserves fixed-address Beam session storage before KV-cache profiling;
+    - accounts the reserved device tensors in `model_memory_usage`;
+    - keeps multi-request execution fail-closed until layout and result fan-out
+      are installed together.
 - Dependencies:
+    - `load_model()` completes before native KV-cache capacity profiling;
     - private method signatures;
     - the 2-item `_prepare_inputs` result;
     - the 7-item `_bookkeeping_sync` result;
@@ -247,12 +256,18 @@ aligned with it.
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
+    - `NPUModelRunner.load_model`
     - `NPUModelRunner.execute_model`
     - `NPUModelRunner._prepare_inputs`
     - `NPUModelRunner._bookkeeping_sync`
 - Platform: NPU
 - Risk: Critical
+- Behavior:
+    - applies the same fixed-capacity allocation and memory accounting as GPU;
+    - requires synchronous, single-device xllm execution when capacity is
+      greater than one.
 - Dependencies:
+    - `load_model()` completes before native KV-cache capacity profiling;
     - NPU-specific private method signatures;
     - the 4-item `_prepare_inputs` result;
     - the 6-item `_bookkeeping_sync` result;

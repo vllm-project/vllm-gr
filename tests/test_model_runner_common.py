@@ -908,6 +908,92 @@ def test_beam_session_rejects_concurrent_incremental_requests() -> None:
         )
 
 
+def _batch_context_runner(**overrides: Any) -> SimpleNamespace:
+    config = SimpleNamespace(
+        beam_max_batch_size=2,
+        beam_max_width=4,
+        beam_max_decode_steps=3,
+        beam_worker_decision=True,
+    )
+    runner = SimpleNamespace(
+        _vllm_gr_config=config,
+        use_async_scheduling=False,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+        ),
+        vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=2,
+                max_num_batched_tokens=8,
+            )
+        ),
+        device=torch.device("cpu"),
+    )
+    for name, value in overrides.items():
+        setattr(runner, name, value)
+    return runner
+
+
+def test_batch_context_load_wrapper_reserves_and_accounts_fixed_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[int] = []
+
+    def create_context(runner: Any, config: Any, max_batch: int) -> SimpleNamespace:
+        del runner, config
+        created.append(max_batch)
+        return SimpleNamespace(
+            max_batch=max_batch,
+            suffix=torch.zeros(3, dtype=torch.float32),
+            decision=SimpleNamespace(scores=torch.zeros(2, dtype=torch.int64)),
+            pools=[
+                SimpleNamespace(
+                    unshared_key=torch.zeros(1, dtype=torch.float16),
+                    unshared_value=torch.zeros(1, dtype=torch.float16),
+                )
+            ],
+        )
+
+    def original(runner: Any) -> str:
+        runner.model_memory_usage = 100
+        return "loaded"
+
+    monkeypatch.setattr(common, "_create_beam_context", create_context)
+    wrapped = common.make_load_model_with_batch_context(original)
+    runner = _batch_context_runner()
+
+    assert wrapped(runner) == "loaded"
+    assert runner._beam_context.max_batch == 2
+    assert runner.model_memory_usage == 132
+    assert created == [2]
+    assert common.make_load_model_with_batch_context(wrapped) is wrapped
+
+    # A reload reuses fixed-address storage but accounts it against the
+    # freshly reset native model-memory total.
+    assert wrapped(runner) == "loaded"
+    assert runner.model_memory_usage == 132
+    assert created == [2]
+
+
+def test_batch_context_load_wrapper_rejects_async_scheduling() -> None:
+    runner = _batch_context_runner(use_async_scheduling=True)
+    wrapped = common.make_load_model_with_batch_context(lambda runner: "loaded")
+
+    with pytest.raises(ValueError, match="synchronous scheduling"):
+        wrapped(runner)
+
+
+def test_batch_context_load_wrapper_validates_scheduler_capacity() -> None:
+    runner = _batch_context_runner()
+    runner.vllm_config.scheduler_config.max_num_batched_tokens = 7
+    wrapped = common.make_load_model_with_batch_context(lambda runner: "loaded")
+
+    with pytest.raises(ValueError, match=r"B\*W tokens"):
+        wrapped(runner)
+
+
 # ---------------------------------------------------------------------------
 # M2: inlined sample_tokens (merge the second collective_rpc into
 # execute_model; upstream core.py None short-circuit does the skipping)

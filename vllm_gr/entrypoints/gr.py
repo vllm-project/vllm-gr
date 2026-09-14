@@ -46,7 +46,11 @@ from vllm_gr.beam_search_decision_utils import (
     select_top_indices,
 )
 from vllm_gr.config import ConstraintBackend, GRConfig
-from vllm_gr.config.validation import validate_beam_max_width, validate_beam_width
+from vllm_gr.config.validation import (
+    validate_beam_max_batch_size,
+    validate_beam_max_width,
+    validate_beam_width,
+)
 from vllm_gr.constraints import (
     BeamConstraintCoordinator,
     ParentCandidateBuilder,
@@ -837,9 +841,12 @@ class GRLLM(LLM):
         beam_graph_enabled: bool | None = None,
         beam_max_width: int | None = None,
         beam_max_decode_steps: int | None = None,
+        beam_max_batch_size: int | None = None,
         **kwargs,
     ):
         beam_max_width = validate_beam_max_width(beam_max_width)
+        if beam_max_batch_size is not None:
+            beam_max_batch_size = validate_beam_max_batch_size(beam_max_batch_size)
         # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
         # vllm-gr default before LLM.__init__ constructs VllmConfig so the V1
         # beam-search worker patches remain active.
@@ -929,6 +936,8 @@ class GRLLM(LLM):
             beam_updates["vllm_gr_beam_max_width"] = beam_max_width
         if beam_max_decode_steps is not None:
             beam_updates["vllm_gr_beam_max_decode_steps"] = beam_max_decode_steps
+        if beam_max_batch_size is not None:
+            beam_updates["vllm_gr_beam_max_batch_size"] = beam_max_batch_size
         if beam_updates:
             additional_config = dict(kwargs.pop("additional_config", None) or {})
             additional_config.update(beam_updates)

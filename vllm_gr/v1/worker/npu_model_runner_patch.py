@@ -462,7 +462,18 @@ def _capture_create_dummy_context_npu(
 
     from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 
-    context = _create_beam_context(runner, gr_cfg, max_batch=1)
+    configured_max_batch = int(getattr(gr_cfg, "beam_max_batch_size", 1))
+    context = getattr(runner, "_beam_context", None)
+    if context is None:
+        context = _create_beam_context(
+            runner,
+            gr_cfg,
+            max_batch=configured_max_batch,
+        )
+    elif int(context.max_batch) != configured_max_batch:
+        raise RuntimeError(
+            "captured Beam context capacity differs from beam_max_batch_size"
+        )
     slot = context.registry.allocate(_BEAM_DUMMY_REQ_ID, beam_width=width, prefix_len=prefix_len)
     session = BeamSearchSession(session_id=_BEAM_DUMMY_REQ_ID, slot=slot, context=context)
     session.begin_session(width, prefix_len)

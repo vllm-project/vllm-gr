@@ -64,6 +64,18 @@ def test_canonical_mapping_round_trip_is_exact(tmp_path: Path) -> None:
     assert gr_config_to_mapping(config) == raw
 
 
+def test_canonical_beam_max_batch_size_round_trips(tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    beam = raw["beam"]
+    assert isinstance(beam, dict)
+    beam["max_batch_size"] = 4
+
+    config = gr_config_from_mapping(raw)
+
+    assert config.beam_max_batch_size == 4
+    assert gr_config_to_mapping(config) == raw
+
+
 @pytest.mark.parametrize("worker_decision", [True, False])  # type: ignore[misc]
 def test_canonical_beam_runtime_options_round_trip(
     worker_decision: bool,
