@@ -6,6 +6,7 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 from __future__ import annotations
 
 import math
+import copy
 import threading
 import time
 from typing import Any
@@ -135,6 +136,34 @@ def _cache_beam_request(self, request) -> None:
         }
         if preserved_template is not None:
             self.beam_cache[request.request_id]["step_template"] = preserved_template
+
+    # Unconstrained beam-session prefill (Stage 1 resident form): the
+    # session template arrived first (gr.py sends template-before-ADD), so a
+    # cached template with the resident marker identifies this ADD as the
+    # beam session's prefill.  Stamp the request so
+    # build_beam_request_metadata publishes is_beam_prefill and the NPU
+    # worker's unconstrained prefill-decision gate can fire — without this
+    # marker an unconstrained prefill carries no beam_data at all and the
+    # engine-driven chain never seeds step 0 (the async_beam_search drain
+    # loop would wait forever).  Constraint Table prefills keep their own
+    # is_constraint_prefill branch below and never set is_beam_prefill.
+    if (
+        preserved_template is not None
+        and bool(getattr(preserved_template, "resident", False))
+        and not _engine_constraint_table_active(self)
+    ):
+        request.is_beam_prefill = True
+        request.beam_width = preserved_template.beam_width
+        # Single-Request form: the prefill ADD IS the whole session's Request,
+        # so stamp the decode-time metadata the worker needs on it directly —
+        # build_beam_request_metadata branches prefill-vs-decode by token count
+        # on this one Request, and the worker seeds its decision buffers at
+        # prefill sample time from these same fields.
+        if bool(getattr(preserved_template, "single_request", False)):
+            request.is_beam_single_request = True
+            request.is_beam_resident = True
+            request.prefix_len = preserved_template.prefix_len
+            request.max_decode_steps = preserved_template.max_decode_steps
 
     if _engine_constraint_table_active(self):
         # Constraint Tables generate the step-0 candidates in the Worker from
@@ -381,6 +410,28 @@ def _apply_beam_step(self, update) -> bool:
     assert all(len(t) == decode_steps for t in update.beam_tokens)
     beam_decode_step = decode_steps - 1 if decode_steps > 0 else 0
 
+    # Stage 1 resident form: the first decode step's Request must survive the
+    # whole session so the upstream AsyncScheduler keeps scheduling it as an
+    # ordinary cached-reqs decode (1 token/step).  The per-step form instead
+    # finishes same-step (max_tokens=1) and is re-ADDed every step.
+    resident = bool(getattr(update, "resident", False))
+    if resident:
+        decode_sampling_params = copy.copy(update.sampling_params)
+        # EOS cannot be honoured by the resident form: the worker decision's
+        # step count is authoritative (settled design §7 ①) and the scheduler
+        # must never finish the request early on a sampled EOS token — the
+        # beam rows' tokens are overwritten by the decision anyway.
+        decode_sampling_params.ignore_eos = True
+        # The frontend loop of ``loop_len = max_decode_steps`` iterations is
+        # prefill + ``loop_len - 1`` decode steps (per-step form: iteration 0
+        # ADDs the prefill, iterations 1.. run decodes).  Upstream books one
+        # output token per decode step on the resident Request, so
+        # ``max_tokens = loop_len - 1`` finishes the request exactly ON the
+        # terminal decode step (``decode_step = loop_len - 2``) — the 0.22.1
+        # async schedule guard then blocks any over-step before the frontend
+        # cleanup arrives.
+        decode_sampling_params.max_tokens = max(1, int(update.max_decode_steps) - 1)
+
     # For incremental decode, only send the new token per beam
     # (prefix KV is in paged cache, previous decode KV is in pool)
     # But we need to include the prefix tokens in prompt_token_ids so the
@@ -399,7 +450,11 @@ def _apply_beam_step(self, update) -> bool:
     req = Request(
         request_id=session_id,  # Single request ID representing all beams
         prompt_token_ids=beam_token_ids,
-        sampling_params=update.sampling_params,
+        # Resident form: the long-lived Request carries the resident-adjusted
+        # params (ignore_eos=True, max_tokens=max_decode_steps); the per-step
+        # form keeps the update's original one-token params (finishes
+        # same-step, re-ADDed every step).
+        sampling_params=decode_sampling_params if resident else update.sampling_params,
         pooling_params=None,
         client_index=update.client_index,
         arrival_time=arrival,
@@ -446,6 +501,11 @@ def _apply_beam_step(self, update) -> bool:
     # scores without suffixes.  Constraint Table decode additionally uses
     # them to rebuild the operator's sequence_group.
     req.beam_suffix = [list(t) for t in update.beam_tokens]
+    # Stage 1 resident form: the Request lives for the whole session; the
+    # worker derives every subsequent step's inputs from the device beam
+    # decision instead of a per-step re-ADD.  build_beam_request_metadata
+    # reads this to stamp the resident marker into SchedulerOutput.beam_data.
+    req.is_beam_resident = resident
 
     if _engine_constraint_table_active(self):
         # Constraint Table decode: the Worker runs the constrained top-k
@@ -488,6 +548,10 @@ def _apply_beam_step(self, update) -> bool:
                 "trace_headers": update.trace_headers,
                 "max_decode_steps": update.max_decode_steps,
                 "is_constrained": bool(getattr(req, "is_constrained", False)),
+                # Stage 1 resident form: the Request stays in the scheduler's
+                # running set; the engine-driven chain must NOT re-ADD it and
+                # the frontend must NOT send further step updates.
+                "resident": resident,
             }
     return True
 
@@ -611,6 +675,30 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
         # update (beam_width=0) which pops the beam_cache entry.
         return
 
+    # Stage 1 resident form: the session's Request lives in the scheduler's
+    # running set for the whole session (max_tokens = max_decode_steps), so
+    # the upstream AsyncScheduler keeps producing 1-token/step cached-reqs
+    # schedules on its own.  Chaining a successor (or letting the frontend
+    # send a step update) would re-ADD the still-running session id and trip
+    # scheduler.add_request's duplicate-id assert.  Mark the decision chained
+    # so the frontend's per-step send is suppressed as well.
+    with self.beam_cache_lock:
+        session_cached = self.beam_cache.get(session_id)
+        running_suffix = (session_cached or {}).get("running_suffix", {})
+        resident = bool(running_suffix.get("resident", False))
+        # Single-Request form never builds a running_suffix (no step-0 ADD),
+        # so detect it from the cached template instead — decode decisions of
+        # such a session must not chain (the Request is already running).
+        template_cached = (session_cached or {}).get("step_template")
+        single_request = bool(
+            getattr(template_cached, "single_request", False)
+            if template_cached is not None
+            else False
+        )
+    if resident or single_request:
+        decision["beam_self_advance_chained"] = True
+        return
+
     # Ownership guard (mixed batches): a decision produced for another
     # session (e.g. session B's constrained prefill batched with session A's
     # decode) must never chain onto this session's step update.
@@ -690,6 +778,18 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
                 session_id,
             )
             return
+        # Single-Request form: the prefill ADD already carries the whole
+        # session lifecycle (max_tokens=max_decode_steps, ignore_eos=True),
+        # so the Request stays in the scheduler's running set and the
+        # upstream AsyncScheduler schedules every decode step on its own.
+        # Chaining a step-0 ADD (or letting the frontend send one) would
+        # re-ADD the still-running session id and trip scheduler.add_request's
+        # duplicate-id assert.  The worker seeds its device beam-decision
+        # buffers at prefill sample time, so no engine-driven handoff is
+        # needed.  Mark chained so the frontend's per-step send is suppressed.
+        if bool(getattr(template, "single_request", False)):
+            decision["beam_self_advance_chained"] = True
+            return
         beam_width = template.beam_width
         if beam_width < 1 or len(new_tokens) != beam_width:
             logger.warning(
@@ -712,6 +812,11 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
         routing = template
         prev_suffixes: list[list[int]] = [[] for _ in range(beam_width)]
         step = 1
+        # Stage 1: propagate the resident marker so _apply_beam_step builds
+        # the long-lived Request (max_tokens=max_decode_steps) instead of the
+        # per-step form.  The frontend's template opts a session into the
+        # resident form; non-resident templates keep Stage 0 semantics.
+        resident = bool(getattr(template, "resident", False))
     else:
         # ----- decode step -> next decode step -----
         if running is None:
@@ -730,6 +835,7 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
         beam_width = routing.beam_width
         prev_suffixes = routing.beam_tokens
         step = None  # derived from the extended suffixes below
+        resident = False
 
     # A worker decision that contains EOS needs frontend lifecycle handling:
     # the frontend records the completed candidates, removes them from the
@@ -784,6 +890,10 @@ def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
         constraint_step=(
             routing.constraint_step if is_prefill else (step if routing.is_constrained else 0)
         ),
+        # Stage 1: resident propagates from the prefill template (decode
+        # chaining in a resident session never reaches this construction —
+        # the resident early-return above already marked the decision chained).
+        resident=resident if is_prefill else False,
     )
     if _apply_beam_step(self, update):
         if is_prefill:

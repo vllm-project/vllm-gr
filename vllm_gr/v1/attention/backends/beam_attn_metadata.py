@@ -384,6 +384,40 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 self._h2d_host = torch.zeros(4 * max_segs, dtype=torch.int32, pin_memory=True)
                 self._h2d_dev = torch.zeros(4 * max_segs, dtype=torch.int32, device=self.device)
 
+                # Event + pending flag guarding the pinned staging above (see
+                # _pack_int32_to_dev).  The staging write of the NEXT pack would
+                # race a still-queued H2D of the PREVIOUS one; the recorded
+                # event narrows the required wait from "the entire stream has
+                # drained" to exactly "the previous H2D has executed".  Falls
+                # back to a full device synchronize when events are unavailable
+                # (older CANN).
+                self._h2d_event = None
+                self._h2d_pending = False
+                try:
+                    ev_cls = torch.cuda.Event if self._is_cuda else torch.npu.Event
+                    self._h2d_event = ev_cls(enable_timing=False)
+                except Exception:
+                    self._h2d_event = None
+
+                # Dedicated pinned staging for block-table ROW indices so the
+                # per-step row gather never falls back to PyTorch's implicit
+                # pageable H2D (see _device_block_table_rows).  Deliberately
+                # separate from _h2d_host: _pack_int32_to_dev rewrites its
+                # staging later in the same build(), which would race the
+                # source of a still-queued index transfer.
+                self._bt_idx_host = torch.zeros(max_reqs, dtype=torch.int64, pin_memory=True)
+                self._bt_idx_dev = torch.zeros(max_reqs, dtype=torch.int64, device=self.device)
+
+                # Event + pending flag guarding the block-table index staging
+                # (same staging-rewrite race as _h2d_host, see _pack_int32_to_dev).
+                self._bt_idx_event = None
+                self._bt_idx_pending = False
+                try:
+                    ev_cls = torch.cuda.Event if self._is_cuda else torch.npu.Event
+                    self._bt_idx_event = ev_cls(enable_timing=False)
+                except Exception:
+                    self._bt_idx_event = None
+
     def _update_aot_schedule(self, fast_build: bool):
         self.aot_schedule = self.aot_schedule and not fast_build
         if self.aot_sliding_window is None:
@@ -581,13 +615,15 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             return False
         cache = self._geometry_cache()
         if not cache.get(geom_key, False):
-            self._pack_int32_to_dev(
-                [
-                    (prefix_seqlens_kv_view, list(prefix_seqlens_kv_cpu)),
-                    (prefix_cu_seqlens_q_view, [0] + list(prefix_cu_seqlens_q_cpu)),
-                    (suffix_cu_seqlens_q_view, [0] + list(suffix_cu_seqlens_q_cpu)),
-                ]
-            )
+            from torch.autograd.profiler import record_function
+            with record_function("beam_metadata_initial_upload"):
+                self._pack_int32_to_dev(
+                    [
+                        (prefix_seqlens_kv_view, list(prefix_seqlens_kv_cpu)),
+                        (prefix_cu_seqlens_q_view, [0] + list(prefix_cu_seqlens_q_cpu)),
+                        (suffix_cu_seqlens_q_view, [0] + list(suffix_cu_seqlens_q_cpu)),
+                    ]
+                )
             cache[geom_key] = True
 
         # Device-side step update (no H2D):
@@ -975,6 +1011,15 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         Needs ``self._fixed_buffers`` and the ``_h2d_host`` / ``_h2d_dev``
         staging pair allocated by ``__init__``.
+
+        The pinned ``_h2d_host`` staging is a single shared resource across
+        packs: rewriting it while a previous pack's H2D is still queued would
+        corrupt that transfer.  Before touching the staging we therefore wait —
+        but only on the RECORDED EVENT of the previous H2D, not on a stream /
+        device synchronize.  The event-grained wait is precisely scoped: the
+        small pinned copy typically completes long before the previous step's
+        compute kernels, so the host usually passes without blocking and the
+        async-scheduling overlap is preserved.
         """
         total = sum(len(host_list) for _dst, host_list in entries)
         if total == 0:
@@ -982,6 +1027,17 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         assert total <= self._h2d_host.numel(), (
             f"beam metadata host staging overflow: {total} > {self._h2d_host.numel()}"
         )
+
+        event = getattr(self, "_h2d_event", None)
+        pending = getattr(self, "_h2d_pending", False)
+        if pending:
+            if event is not None:
+                event.synchronize()
+            elif self._is_cuda:
+                torch.cuda.synchronize()
+            elif self._is_npu:
+                torch.npu.synchronize()
+            self._h2d_pending = False
 
         # Build the host payload with one numpy concatenate instead of a
         # per-entry ``torch.as_tensor(list)`` + ``copy_`` pair.  The Python
@@ -992,8 +1048,17 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         segments = [np.asarray(hl, dtype=np_dtype) for _dst, hl in entries]
         packed = np.concatenate(segments) if len(segments) > 1 else segments[0]
         self._h2d_host[:total].copy_(torch.from_numpy(packed))
-        # Single host -> device transfer for the whole payload.
-        self._h2d_dev[:total].copy_(self._h2d_host[:total])
+        # Single host -> device transfer for the whole payload (pinned ->
+        # truly async; recorded so the next pack can wait on exactly this
+        # transfer instead of the whole stream).
+        self._h2d_dev[:total].copy_(self._h2d_host[:total], non_blocking=True)
+        if event is not None:
+            event.record()
+            self._h2d_pending = True
+        elif self._is_cuda:
+            torch.cuda.synchronize()
+        elif self._is_npu:
+            torch.npu.synchronize()
 
         off = 0
         for dst, host_list in entries:
@@ -1001,6 +1066,82 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             if n:
                 dst.copy_(self._h2d_dev[off : off + n])
                 off += n
+
+    def _device_block_table_rows(
+        self,
+        block_table_tensor: torch.Tensor,
+        req_idxs: list[int],
+        num_blocks: int,
+    ) -> torch.Tensor:
+        """Row-gather a block table WITHOUT a host-blocking implicit H2D.
+
+        ``block_table_tensor[req_idxs, :num_blocks]`` with a Python-list index
+        makes PyTorch build a CPU index tensor and upload it from PAGEABLE
+        memory.  Pageable H2D copies have synchronous semantics (and must wait
+        their stream turn, i.e. for every kernel enqueued by the previous
+        step), so the host blocks until the prior step's device pipeline
+        drains — exactly the stall that defeats async-scheduling overlap.
+
+        This helper keeps the entire chain async:
+
+        * contiguous row range (the common pure-beam layout, e.g. ``[0]`` or
+          ``[0..R-1]``) — a plain slice view, zero copies, zero H2D;
+        * otherwise — the row indices go through the dedicated PINNED staging
+          pair as a truly async H2D and the gather runs as an on-device
+          ``index_select`` (the staging is deliberately separate from
+          ``_h2d_host``, which ``_pack_int32_to_dev`` rewrites later in the
+          same build()).
+
+        Falls back to the legacy fancy index when the staging pair is absent
+        (test harnesses build the builder via ``object.__new__``) or lives on
+        a different device than the block table.
+        """
+        n = len(req_idxs)
+        if n == 0:
+            return block_table_tensor[:0, :num_blocks]
+        start = req_idxs[0]
+        if all(req_idxs[i] == start + i for i in range(n)):
+            # Contiguous rows: pure slice view, no gather, no H2D.
+            return block_table_tensor[start : start + n, :num_blocks]
+        host = getattr(self, "_bt_idx_host", None)
+        dev = getattr(self, "_bt_idx_dev", None)
+        if (
+            host is None
+            or dev is None
+            or dev.device != block_table_tensor.device
+            or n > host.numel()
+        ):
+            # No usable staging: legacy (possibly blocking) fancy index.
+            return block_table_tensor[req_idxs, :num_blocks]
+        event = getattr(self, "_bt_idx_event", None)
+        if getattr(self, "_bt_idx_pending", False):
+            # A previous gather's pinned H2D may still be queued: wait on its
+            # recorded event (not the whole stream) before rewriting staging.
+            if event is not None:
+                event.synchronize()
+                self._bt_idx_pending = False
+            elif not host.is_pinned():
+                # Non-pinned (CPU-only test) staging: the copy was synchronous,
+                # nothing can be in flight.
+                pass
+            else:
+                if self._is_cuda:
+                    torch.cuda.synchronize()
+                elif self._is_npu:
+                    torch.npu.synchronize()
+                self._bt_idx_pending = False
+        host[:n].copy_(torch.as_tensor(req_idxs, dtype=host.dtype))
+        dev[:n].copy_(host[:n], non_blocking=True)  # pinned -> truly async
+        if event is not None:
+            event.record()
+            self._bt_idx_pending = True
+        elif host.is_pinned() and (self._is_cuda or self._is_npu):
+            # No event support: keep correctness with a full (coarse) sync.
+            if self._is_cuda:
+                torch.cuda.synchronize()
+            else:
+                torch.npu.synchronize()
+        return block_table_tensor.index_select(0, dev[:n])[:, :num_blocks]
 
     def _create_std_tensors(
         self,
@@ -1025,7 +1166,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             std_indices_tensor.copy_(torch.as_tensor(std_indices, dtype=torch.long, device="cpu"))
             std_block_table = self._std_block_table_buf[: len(std_req_idxs), :num_std_blocks]
             std_block_table.copy_(
-                common_attn_metadata.block_table_tensor[std_req_idxs, :num_std_blocks]
+                self._device_block_table_rows(
+                    common_attn_metadata.block_table_tensor,
+                    std_req_idxs,
+                    num_std_blocks,
+                )
             )
             num_cu = len(std_cu_seqlens_q_cpu) + 1  # +1 for leading 0
             std_cu_seqlens_q_device = self._std_cu_seqlens_q_buf[:num_cu]
@@ -1038,9 +1183,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             )
         else:
             std_indices_tensor = torch.tensor(std_indices, dtype=torch.long, device=device)
-            std_block_table = common_attn_metadata.block_table_tensor[
-                std_req_idxs, :num_std_blocks
-            ].contiguous()
+            std_block_table = self._device_block_table_rows(
+                common_attn_metadata.block_table_tensor,
+                std_req_idxs,
+                num_std_blocks,
+            ).contiguous()
             if self._is_cuda:
                 # Tests / kernel harnesses that skip __init__ buffer alloc.
                 std_cu_seqlens_q_device = torch.tensor(
@@ -1129,6 +1276,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         if suffix_max_seq_len is None:
             suffix_max_seq_len = max(suffix_seqlens_kv_cpu) if suffix_seqlens_kv_cpu else 0
 
+        from torch.autograd.profiler import record_function
+
         if self._fixed_buffers:
             prefix_indices_tensor = self._prefix_indices_buf[:num_prefix]
             # Incremental decode produces a contiguous prefix index range
@@ -1172,19 +1321,25 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # already in the address-stable buffer and can be skipped.
             copied = self._geometry_cache().setdefault("block_table_copied", set())
             if geom_key is None or geom_key not in copied:
-                prefix_block_table[:, :max_prefix_blocks_count].copy_(
-                    common_attn_metadata.block_table_tensor[
-                        prefix_req_idxs_cpu, :max_prefix_blocks_count
-                    ]
-                )
+                with record_function("## copy_ 2 non_blocking"):
+                    prefix_block_table[:, :max_prefix_blocks_count].copy_(
+                        self._device_block_table_rows(
+                            common_attn_metadata.block_table_tensor,
+                            prefix_req_idxs_cpu,
+                            max_prefix_blocks_count,
+                        ),
+                        non_blocking=True,
+                    )
                 if geom_key is not None:
                     copied.add(geom_key)
         else:
             prefix_indices_tensor = torch.tensor(prefix_indices, dtype=torch.long, device=device)
             prefix_max_seq_len = max(prefix_seqlens_kv_cpu) if prefix_seqlens_kv_cpu else 0
-            prefix_block_table = common_attn_metadata.block_table_tensor[
-                prefix_req_idxs_cpu, :max_prefix_blocks_count
-            ].contiguous()
+            prefix_block_table = self._device_block_table_rows(
+                common_attn_metadata.block_table_tensor,
+                prefix_req_idxs_cpu,
+                max_prefix_blocks_count,
+            ).contiguous()
 
         if suffix_slot_mapping_out_list:
             suffix_total_tokens = len(suffix_slot_mapping_out_list)
@@ -1704,10 +1859,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     metadata.std_block_table.shape[1] if metadata.std_block_table is not None else 0
                 )
                 std_block_table = self._std_block_table_buf[:num_std, :num_std_blocks]
-                std_block_table.copy_(blk_table[metadata.std_req_idxs_cpu, :num_std_blocks])
+                std_block_table.copy_(
+                    self._device_block_table_rows(
+                        blk_table, metadata.std_req_idxs_cpu, num_std_blocks
+                    )
+                )
                 new_metadata.std_block_table = std_block_table
             else:
-                new_metadata.std_block_table = blk_table[metadata.std_req_idxs_cpu].contiguous()
+                new_metadata.std_block_table = self._device_block_table_rows(
+                    blk_table, metadata.std_req_idxs_cpu, blk_table.shape[1]
+                ).contiguous()
         if metadata.prefix_req_idxs_cpu:
             if self._fixed_buffers:
                 num_prefix = len(metadata.prefix_req_idxs_cpu)
@@ -1715,12 +1876,18 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 # so the replayed graph reads the same tensor geometry).
                 prefix_block_table = self._prefix_block_table_buf[:num_prefix]
                 prefix_block_table[:, : metadata.max_prefix_blocks_count].copy_(
-                    blk_table[metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count]
+                    self._device_block_table_rows(
+                        blk_table,
+                        metadata.prefix_req_idxs_cpu,
+                        metadata.max_prefix_blocks_count,
+                    )
                 )
                 new_metadata.prefix_block_table = prefix_block_table
             else:
-                new_metadata.prefix_block_table = blk_table[
-                    metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count
-                ].contiguous()
+                new_metadata.prefix_block_table = self._device_block_table_rows(
+                    blk_table,
+                    metadata.prefix_req_idxs_cpu,
+                    metadata.max_prefix_blocks_count,
+                ).contiguous()
 
         return new_metadata

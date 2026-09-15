@@ -56,3 +56,23 @@ class BeamRequestStepUpdate(
     # Atomic synchronous multi-request cohort. None preserves the legacy
     # single-session wire representation.
     cohort_id: int | None = None
+    # Stage 1 resident form (async scheduling): when True, the first decode
+    # step builds ONE Request that lives for the whole session
+    # (max_tokens=max_decode_steps, ignore_eos=True); subsequent decode steps
+    # are driven by the upstream scheduler as ordinary cached-reqs decode —
+    # the worker overwrites input_ids/positions from the device beam decision
+    # (9.diff "scheduler keeps bookkeeping, worker owns the inputs" model).
+    # Default False keeps the Stage 0 per-step Request lifecycle
+    # byte-identical on the wire.
+    resident: bool = False
+    # Stage 1 single-Request form: the initial prefill ADD carries the WHOLE
+    # session lifecycle (max_tokens = max_decode_steps, ignore_eos=True) and
+    # terminates naturally via check_stop (FINISHED_LENGTH_CAPPED).  There is
+    # no engine-driven prefill→step0 ADD chain, no input_queue hop, and no
+    # frontend re-registration: the prefill and every decode step run as
+    # successive schedules of the SAME Request, and the worker seeds the device
+    # beam-decision buffers (sequence[:,:,0] = prefill winners) at prefill
+    # sample time so step 0's input overwrite reads the real winners.  Superset
+    # of ``resident`` (the Request is still long-lived); the extra flag only
+    # selects the no-re-ADD control flow.
+    single_request: bool = False

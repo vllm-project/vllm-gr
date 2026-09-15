@@ -163,6 +163,9 @@ class GRConfig:
     # Added after pre-existing fields to preserve positional construction.
     # One logical session occupies beam_max_width physical rows.
     beam_max_batch_size: int = 1
+    # Stage 1 resident-Request form for the legacy async Beam entry point.
+    # The unified V1 execution mode remains a separate deployment contract.
+    beam_async: bool = False
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -235,6 +238,12 @@ class GRConfig:
                 "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "
                 "(the engine-driven session consumes worker beam decisions)"
             )
+        if self.beam_async and self.beam_max_width is None:
+            raise ValueError(
+                'vllm-gr beam_async=True requires beam_max_width '
+                '(the resident form sources every decode step from the worker '
+                'beam decision buffers)'
+            )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None
@@ -259,6 +268,7 @@ class GRConfig:
             or self.beam_worker_decision is not None
             or self.beam_engine_driven is not None
             or self.beam_execution_mode is not BeamExecutionMode.LEGACY
+            or self.beam_async
         )
 
     @classmethod

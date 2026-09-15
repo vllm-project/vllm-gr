@@ -266,8 +266,12 @@ def _prepare_beam_step_requests(
     engine_core_requests = []
     beam_step_updates = []
     for j, instance in enumerate(instances_batch):
-        if len(instance.beams) == 0:
-            # This instance has no active beams (finished)
+        if len(instance.beams) == 0 or j in instance_completed_sessions:
+            # This instance has no active beams (finished) — the terminal
+            # short-circuit also lands here: it keeps the rebuilt final
+            # beams on instance.beams but marks the session completed, so
+            # the loop must stop stepping this instance while its results
+            # stay intact for the caller's final assembly.
             if j not in instance_completed_sessions and j in instance_prefill_id:
                 _beam_request_cleanup(
                     llm_engine,
@@ -589,6 +593,29 @@ def _custom_beam_search_batch(
     max_decode_steps: int = 0,
 ) -> None:
     """Run beam search in batch mode for custom attention backend."""
+    # Stage 0 form guard: with async scheduling the engine runs the
+    # two-phase step_with_batch_queue pipeline, but this loop's per-step
+    # Request lifecycle (max_tokens=1, finishes same-step, engine-driven
+    # chaining) keeps exactly one batch in flight — the pipeline cannot
+    # overlap and the M2 inline-sample fast path is disabled on top
+    # (_should_inline_sample_tokens requires use_async_scheduling=False).
+    # Net effect is a regression, and the combination is unvalidated;
+    # fail fast instead.  The Stage 1 resident-Request form (see
+    # ``GRLLM.async_beam_search``) is the async-scheduling
+    # entry point.
+    scheduler_config = getattr(
+        getattr(llm_engine, "vllm_config", None),
+        "scheduler_config",
+        None,
+    )
+    if getattr(scheduler_config, "async_scheduling", False):
+        raise ValueError(
+            "vllm-gr beam_search (CUSTOM attention) does not support "
+            "--async-scheduling in the Stage 0 per-step form; it regresses "
+            "both the batch pipeline and the inline-sample fast path. "
+            "Disable async scheduling, or use the Stage 1 resident-Request "
+            "async_beam_search form."
+        )
     instance_prefill_id: dict[int, str] = {}
     instance_prev_beam_internal_ids: dict[int, list[str]] = {}
     instance_fork_info: dict[int, ForkInfo] = {}
@@ -614,10 +641,12 @@ def _custom_beam_search_batch(
     )
 
     for token in token_iter:
-        # Check if all instances are done
+        # Check if all instances are done.  A terminal-short-circuit
+        # instance keeps its rebuilt final beams but is in
+        # instance_completed_sessions — count it as done.
         all_done = True
-        for instance in instances_batch:
-            if len(instance.beams) > 0:
+        for j, instance in enumerate(instances_batch):
+            if len(instance.beams) > 0 and j not in instance_completed_sessions:
                 all_done = False
                 break
         if all_done:
@@ -669,6 +698,11 @@ def _custom_beam_search_batch(
             result = outputs_map.get(search_id)
 
             if result is None:
+                # Engine-driven chaining can run the whole session ahead of
+                # the frontend (chained steps produce outputs under the
+                # session id only).  With no result for this instance this
+                # iteration there is nothing to consume; a later iteration
+                # (or the terminal short-circuit there) picks it up.
                 continue
 
             # Worker-side beam decision: when the accelerator
@@ -678,13 +712,67 @@ def _custom_beam_search_batch(
             from vllm_gr.entrypoints.openai.serving_engine import (
                 _worker_decision_flatten,
                 _worker_decision_from_result,
+                _worker_final_sequences,
             )
 
             worker_decision = _worker_decision_from_result(result)
+
+            # Terminal short-circuit (worker-sinking Stage 0): a terminal
+            # decision carries the full cumulative state (out_sequence
+            # [1, W, steps] + out_log_probs [1, W]) accumulated on the
+            # device across every decode step.  Rebuild the instance's
+            # beams from it in one shot and retire the session — the
+            # per-step materialize / EOS-ledger / parent-pointer chain and
+            # all further step iterations for this instance are skipped.
+            # EOS is constrained to ignore_eos (the worker decision's step
+            # count is authoritative).
+            final_state = _worker_final_sequences(worker_decision or {})
+            if final_state is not None:
+                sequences, scores = final_state
+                seed = instance.beams[0]
+                new_beams = []
+                for beam_tokens, beam_score in zip(sequences, scores):
+                    beam = BeamSearchSequence(
+                        orig_prompt=seed.orig_prompt,
+                        tokens=list(seed.tokens[: instance.prompt_len]) + list(beam_tokens),
+                        # Per the settled design: per-step logprobs are not
+                        # reconstructible without parent pointers; the
+                        # terminal path degrades to cum_logprob only.
+                        logprobs=None,
+                        cum_logprob=beam_score,
+                        lora_request=seed.lora_request,
+                    )
+                    new_beams.append(beam)
+                instance.beams = new_beams
+                _beam_request_cleanup(
+                    llm_engine,
+                    session_id,
+                    instance_prev_beam_internal_ids[j],
+                )
+                instance_completed_sessions.add(j)
+                # A chained flag on a terminal decision is meaningless (no
+                # successor exists); make sure no stale chained marker
+                # survives into any later iteration.
+                instance_self_advance_chained.discard(j)
+                continue
+
             worker_candidates = None
             if worker_decision is not None:
                 worker_candidates = _worker_decision_flatten(
                     worker_decision, beam_width, instance.beams
+                )
+            if (
+                worker_candidates is None
+                and worker_decision is not None
+                and bool(worker_decision.get("is_last_step", False))
+            ):
+                # Terminal decision WITHOUT a usable out_sequence (CUDA
+                # compact-buffer transport, malformed payload): fall back
+                # to the per-step path for this step so the frontend
+                # finishes the session from the per-candidate logprobs.
+                logger.warning(
+                    "vllm-gr: terminal worker decision lacks out_sequence; "
+                    "falling back to the per-step materialize path"
                 )
             # EngineCore chained this step's successor from the worker's
             # decision (engine-driven): the next iteration skips its
@@ -832,6 +920,187 @@ def _install_renderer_eos_token_id_cache() -> None:
     BaseRenderer.get_eos_token_id = get_eos_token_id_cached
 
 
+def _custom_async_beam_search_batch(
+    llm_engine,
+    instances_batch: list["BeamSearchInstance"],
+    prompt_start: int,
+    tokenizer,
+    beam_width: int,
+    beam_search_params: "SamplingParams",
+    sid_end_token_id: int | None,
+    max_decode_steps: int,
+    is_constrained: bool = False,
+) -> None:
+    """Stage 1 single-Request form: submit once, consume only the terminal.
+
+    Per instance:
+    1. ADD_BATCH the prefill and cache a ``single_request=True`` session
+       template (BEAM_SESSION_TEMPLATE).  The prefill ADD carries the WHOLE
+       session lifecycle (``max_tokens = max_decode_steps``,
+       ``ignore_eos=True``), so it terminates naturally via ``check_stop``
+       (FINISHED_LENGTH_CAPPED) after ``loop_len`` output tokens.  EngineCore
+       suppresses the engine-driven prefill→step0 ADD chain — the upstream
+       AsyncScheduler schedules every decode step as an ordinary cached-reqs
+       step (1 token/step) on that SAME Request, while the worker overwrites
+       input_ids/positions from the device beam decision (the 9.diff
+       worker-overwrite model) and seeds its decision buffers at prefill
+       sample time.
+    2. Drain ``llm_engine.step()`` outputs.  Intermediate steps carry only
+       the per-step decision — nothing to consume.  The terminal decision
+       (``is_last_step=True`` + ``out_sequence``) rebuilds the instance's
+       beams in one shot (Stage 0 terminal short-circuit, reused verbatim).
+    3. Cleanup via the standard ``beam_width=0`` update.
+
+    The Request never finishes early, so its OutputProcessor state is never
+    popped mid-session — no frontend re-registration is needed (the prefill
+    and the decode steps all run under the same id).  This loop never sends a
+    per-step step update; the session's decisions are marked
+    ``beam_self_advance_chained`` by EngineCore, so the frontend per-step
+    protocol is bypassed entirely.
+    """
+    from vllm_gr.entrypoints.openai.serving_engine import (
+        _worker_decision_from_result,
+        _worker_final_sequences,
+    )
+
+    instance_prefill_id: dict[int, str] = {}
+    # Frontend RequestOutputs arrive under the EXTERNAL request id; map them
+    # back to the batch index (the internal session id never leaves the
+    # EngineCore for the sync offline path).
+    instance_external_id: dict[str, int] = {}
+    instance_completed: set[int] = set()
+    # Internal session id -> batch index: decode-step outputs and the terminal
+    # decision ride the same Request, but a RequestOutput may surface under
+    # either the external or the internal id depending on the async-scheduling
+    # iteration; match both.
+    instance_session_id: dict[str, int] = {}
+
+    # ---- Step 1: one submission per instance ----
+    engine_core_requests = []
+    templates: dict[str, "BeamRequestStepUpdate"] = {}
+    for j, instance in enumerate(instances_batch):
+        if len(instance.beams) == 0:
+            instance_completed.add(j)
+            continue
+        request_id_item = f"offline-beam-{prompt_start + j}-0"
+        tokens_prompt = _create_tokens_prompt_from_beam(instance.beams[0])
+        ec_req = llm_engine.input_processor.process_inputs(
+            request_id=request_id_item,
+            prompt=tokens_prompt,
+            params=beam_search_params,
+            supported_tasks=llm_engine.get_supported_tasks(),
+            arrival_time=time.time(),
+            lora_request=instance.beams[0].lora_request,
+        )
+        llm_engine.input_processor.assign_request_id(ec_req)
+        llm_engine.output_processor.add_request(ec_req, None, None, 0)
+        engine_core_requests.append(ec_req)
+        # instance.beams[0].tokens is the full prefill prompt (incl. optional
+        # sid_begin); prefix_len must mirror the per-step form's step-0 value.
+        prefix_len = len(instance.beams[0].tokens)
+        # assign_request_id swapped in the internal id (external-uuid suffix);
+        # the EngineCore session (beam_cache key, Request.request_id) runs
+        # under that internal id, so the template / cleanup / output matching
+        # must all use it.  The frontend RequestOutput arrives under the
+        # EXTERNAL id, tracked separately below.
+        session_id = ec_req.request_id
+        instance_prefill_id[j] = session_id
+        instance_session_id[session_id] = j
+        instance_external_id[ec_req.external_req_id] = j
+        # Resident template: the fields EngineCore cannot derive itself when
+        # chaining step-0 from the worker's prefill decision, plus the
+        # Stage-1 ``resident`` marker that makes the chained step-0 Request
+        # long-lived (core.py _apply_beam_step resident branch).
+        decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params)
+        eos_token_id = (
+            sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
+        )
+        templates[session_id] = BeamRequestStepUpdate(
+            session_id=session_id,
+            parent_beam_ids=[],
+            child_beam_ids=[],
+            beam_tokens=[],
+            pruned_ids=[],
+            prefix_len=prefix_len,
+            beam_width=beam_width,
+            sampling_params=decode_sampling_params,
+            eos_token_id=eos_token_id,
+            lora_request=instance.beams[0].lora_request,
+            max_decode_steps=max_decode_steps,
+            # Constraint Tables: 1 = constrained decode step 0 (the value the
+            # per-step frontend puts on the step-0 update).
+            constraint_step=1 if is_constrained else 0,
+            resident=True,
+            # Single-Request form: the prefill ADD carries the whole session
+            # (max_tokens=max_decode_steps); EngineCore suppresses the
+            # prefill→step0 ADD chain and the frontend never re-registers.
+            single_request=True,
+        )
+
+    if not engine_core_requests:
+        return
+
+    # Send the session template BEFORE the ADD_BATCH: an unconstrained NPU
+    # prefill must be recognisable as a beam-session prefill at
+    # _cache_beam_request time so the worker prefill-decision gate
+    # (is_beam_prefill metadata) can fire.  The EngineCore's out-of-order
+    # template handling (stub entry preserved by _cache_beam_request) makes
+    # either order correct; template-first keeps the cache hit path.
+    for session_id, template in templates.items():
+        llm_engine.engine_core.beam_session_template(template)
+    llm_engine.engine_core.add_requests(engine_core_requests, force_batch=True)
+
+    # ---- Step 2: drain outputs until every session reports its terminal ----
+    while len(instance_completed) < len(instances_batch):
+        step_outputs = llm_engine.step()
+        if not step_outputs:
+            # An async-scheduling step can legitimately produce no frontend
+            # output (schedule-only iteration of step_with_batch_queue);
+            # keep draining until the terminal decision surfaces.
+            continue
+        for out in step_outputs:
+            j = instance_external_id.get(out.request_id)
+            if j is None:
+                # Not the external prefill id: decode-step outputs and the
+                # terminal decision arrive under the internal session id.
+                j = instance_session_id.get(out.request_id)
+            if j is None or j in instance_completed:
+                # Not one of this batch's sessions (or an already-retired
+                # session's late duplicate output) — drop it.
+                continue
+            worker_decision = _worker_decision_from_result(out)
+            final_state = _worker_final_sequences(worker_decision or {})
+            if final_state is None:
+                # Non-terminal per-step output: the single-Request form has
+                # nothing to consume (no materialize / EOS ledger on this path).
+                continue
+            sequences, scores = final_state
+            seed = instances_batch[j].beams[0]
+            new_beams = []
+            for beam_tokens, beam_score in zip(sequences, scores):
+                new_beams.append(
+                    BeamSearchSequence(
+                        orig_prompt=seed.orig_prompt,
+                        tokens=list(seed.tokens) + list(beam_tokens),
+                        # Settled design §7 ②: the terminal path degrades to
+                        # cum_logprob-only; per-step logprobs are not
+                        # reconstructible without the parent-pointer chain.
+                        logprobs=None,
+                        cum_logprob=beam_score,
+                        lora_request=seed.lora_request,
+                    )
+                )
+            instances_batch[j].beams = new_beams
+            _beam_request_cleanup(llm_engine, instance_prefill_id[j], [instance_prefill_id[j]])
+            instance_completed.add(j)
+
+    # ---- Step 3: safety-net cleanup (error / fallback paths) ----
+    for j, session_id in instance_prefill_id.items():
+        if j not in instance_completed:
+            _beam_request_cleanup(llm_engine, session_id, [session_id])
+            instance_completed.add(j)
+
+
 class GRLLM(LLM):
     """LLM subclass with catalog-aware beam search.
 
@@ -850,11 +1119,15 @@ class GRLLM(LLM):
         beam_max_width: int | None = None,
         beam_max_decode_steps: int | None = None,
         beam_max_batch_size: int | None = None,
+        beam_async: bool = False,
         **kwargs,
     ):
         beam_max_width = validate_beam_max_width(beam_max_width)
         if beam_max_batch_size is not None:
             beam_max_batch_size = validate_beam_max_batch_size(beam_max_batch_size)
+        from vllm_gr.config.validation import validate_beam_async
+
+        beam_async = validate_beam_async(beam_async)
         # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
         # vllm-gr default before LLM.__init__ constructs VllmConfig so the V1
         # beam-search worker patches remain active.
@@ -946,6 +1219,8 @@ class GRLLM(LLM):
             beam_updates["vllm_gr_beam_max_decode_steps"] = beam_max_decode_steps
         if beam_max_batch_size is not None:
             beam_updates["vllm_gr_beam_max_batch_size"] = beam_max_batch_size
+        if beam_async:
+            beam_updates["vllm_gr_beam_async"] = True
         if beam_updates:
             additional_config = dict(kwargs.pop("additional_config", None) or {})
             additional_config.update(beam_updates)
@@ -1534,6 +1809,248 @@ class GRLLM(LLM):
 
         schedule_frontend_gc_freeze()
         return compact_outputs if output_mode == "compact" else outputs
+
+    def async_beam_search(
+        self,
+        prompts: list[Union["TokensPrompt", "TextPrompt"]],
+        params: "BeamSearchParams",
+        lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
+        concurrency_limit: int | None = None,
+    ) -> list["BeamSearchOutput"]:
+        """Stage 1 resident-Request beam search (async scheduling entry point).
+
+        One submission per prompt (prefill ADD + resident session template);
+        EngineCore chains step-0 from the worker's prefill decision and builds
+        ONE long-lived Request per session (``max_tokens = decode steps``,
+        ``ignore_eos=True``), the upstream AsyncScheduler drives every further
+        decode step as a cached-reqs step, and the worker overwrites
+        input_ids/positions from the device beam decision.  The frontend only
+        consumes the terminal decision (``out_sequence`` + cumulative scores)
+        — no per-step materialize, EOS ledger, or step-update RPC.
+
+        Requires the ``beam_async`` deployment (``GRLLM(..., beam_async=True)``),
+        which keeps async scheduling ON and is refused by the Stage 0
+        ``beam_search`` per-step form.  Per the settled design (§7): EOS is
+        constrained to ``ignore_eos`` (the worker decision's step count is
+        authoritative) and ``logprobs`` degrade to ``cum_logprob`` only.
+
+        Args:
+            prompts: A list of prompts (text or token IDs).
+            params: The beam search parameters.
+            lora_request: LoRA request to use for generation, if any.
+            concurrency_limit: Max concurrent resident sessions. If None,
+                uses min(number of prompts, beam_max_batch_size).
+        """
+        logger.debug("Called async_beam_search")
+        beam_width = validate_beam_width(params.beam_width)
+        max_tokens = params.max_tokens
+        temperature = params.temperature
+        begin_token = params.begin_token if hasattr(params, "begin_token") else None
+        end_token = params.end_token if hasattr(params, "end_token") else None
+
+        # ---- Deployment guards ----
+        vllm_config = getattr(self.llm_engine, "vllm_config", None)
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        gr_cfg = GRConfig.from_vllm_config(vllm_config)
+        if not gr_cfg.beam_async:
+            raise ValueError(
+                "vllm-gr async_beam_search requires the Stage 1 deployment: "
+                "construct GRLLM(..., beam_async=True) so async scheduling "
+                "stays enabled for beam sessions."
+            )
+        if not getattr(scheduler_config, "async_scheduling", False):
+            raise ValueError(
+                "vllm-gr async_beam_search requires async scheduling "
+                "(scheduler_config.async_scheduling); the beam_async "
+                "deployment normally keeps it on — check startup warnings."
+            )
+        attention_backend = None
+        if vllm_config is not None and hasattr(vllm_config, "attention_config"):
+            attention_backend = getattr(vllm_config.attention_config, "backend", None)
+        use_custom_attn = attention_backend is not None and (
+            "CUSTOM" in str(attention_backend).upper()
+            or getattr(attention_backend, "name", "").upper() == "CUSTOM"
+        )
+        if not use_custom_attn:
+            raise ValueError(
+                "vllm-gr async_beam_search requires the CUSTOM attention "
+                "backend: attention_config={'backend': 'CUSTOM'}."
+            )
+        if self.constraint_coordinator is not None and isinstance(
+            self.constraint_coordinator.strategy, TrieConstraintStrategy
+        ):
+            raise ValueError(
+                "vllm-gr async_beam_search does not support Trie catalog "
+                "constraints (frontend-driven candidate path); use "
+                "constraint_table or the per-step beam_search."
+            )
+        is_constrained = isinstance(self.constraint_strategy, ConstraintTableStrategy)
+        if is_constrained:
+            validate_constraint_generation_limits(
+                beam_width=beam_width,
+                max_generate_steps=max_tokens,
+            )
+        if not params.ignore_eos:
+            # Settled design §7 ①: EOS cannot be honoured by the resident form
+            # (the worker decision's step count is authoritative); rather than
+            # silently changing semantics, fail fast.
+            raise ValueError(
+                "vllm-gr async_beam_search requires ignore_eos=True in "
+                "BeamSearchParams (the resident Request runs to the planned "
+                "decode-step count; early-EOS semantics stay on beam_search)."
+            )
+
+        tokenizer = self.get_tokenizer()
+        sid_begin_token_id: int | None = None
+        if begin_token is not None:
+            sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
+            if sid_begin_token_id is None or sid_begin_token_id == -1:
+                logger.warning(
+                    "begin_token must be a valid token in the tokenizer "
+                    "vocabulary, got token %s",
+                    begin_token,
+                )
+                sid_begin_token_id = None
+        sid_end_token_id: int | None = None
+        if end_token is not None:
+            sid_end_token_id = tokenizer.convert_tokens_to_ids(end_token)
+            if sid_end_token_id is None or sid_end_token_id == -1:
+                logger.warning(
+                    "end_token must be a valid token in the tokenizer "
+                    "vocabulary, got token %s",
+                    end_token,
+                )
+                sid_end_token_id = None
+
+        resident_capacity = int(gr_cfg.beam_max_batch_size)
+        if concurrency_limit is None:
+            concurrency_limit = min(len(prompts), resident_capacity)
+        elif concurrency_limit < 1 or concurrency_limit > resident_capacity:
+            raise ValueError(
+                "async_beam_search concurrency_limit must be in [1, "
+                f"{resident_capacity}] for the configured beam_max_batch_size"
+            )
+
+        instances: list[BeamSearchInstance] = []
+        engine_inputs = self._preprocess_cmpl(prompts)
+        lora_requests = self._lora_request_to_seq(lora_request, len(engine_inputs))
+
+        for lora_req, prompt in zip(lora_requests, engine_inputs):
+            if prompt["type"] == "embeds":
+                raise NotImplementedError("Embedding prompt not supported for beam search")
+
+            # Match the synchronous entry point: only keys are rebound below,
+            # and prompt_token_ids is copied before appending the begin token.
+            # Avoid deep-copying the full prompt on the prefill critical path.
+            engine_prompt = dict(prompt)
+            if engine_prompt.get("type") == "enc_dec":
+                engine_prompt["decoder_prompt"] = dict(
+                    engine_prompt["decoder_prompt"]
+                )
+            decoder_prompt = (
+                engine_prompt
+                if engine_prompt["type"] != "enc_dec"
+                else engine_prompt["decoder_prompt"]
+            )
+            prompt_tokens = decoder_prompt["prompt_token_ids"]
+
+            if sid_begin_token_id is not None or sid_end_token_id is not None:
+                prompt_tokens = list(prompt_tokens)
+                if sid_begin_token_id is not None:
+                    prompt_tokens.append(sid_begin_token_id)
+                decoder_prompt["prompt_token_ids"] = prompt_tokens
+
+            instance = BeamSearchInstance(engine_prompt, lora_request=lora_req, logprobs=None)
+            instance.beams[0].logprobs = FlatLogprobs()
+            instance.prompt_len = (
+                len(prompt_tokens) - 1 if sid_begin_token_id is not None else len(prompt_tokens)
+            )
+            instances.append(instance)
+
+        pre_calc = 0 if sid_begin_token_id is None else 1
+        if sid_end_token_id is not None:
+            pre_calc += 1
+        if max_tokens - pre_calc < 0:
+            logger.warning(
+                "max_tokens is less than the number of tokens to be pre-calculated. "
+                "Setting max_tokens to the number of pre-calculated tokens."
+            )
+            max_tokens = pre_calc
+        # decode-loop length (== number of generated tokens): iteration 0 is the
+        # prefill, the remaining ``loop_len - 1`` are decode steps.
+        max_decode_steps = max_tokens - pre_calc
+
+        # Single-Request form: ONE Request carries the whole session lifecycle.
+        # ``max_tokens = max_decode_steps`` lets the Request terminate naturally
+        # via check_stop (FINISHED_LENGTH_CAPPED) after exactly ``loop_len``
+        # output tokens (prefill + ``loop_len - 1`` decodes), so the prefill
+        # never returns to the frontend for a re-ADD — the upstream
+        # AsyncScheduler keeps scheduling the same Request.  ``logprobs`` stays
+        # at ``beam_width`` / ``flat_logprobs=True`` so the worker's
+        # unconstrained prefill-decision gate reads the step-0 candidates from
+        # the prefill's flat top-K.
+        beam_search_params = SamplingParams(
+            logprobs=beam_width,
+            max_tokens=max_decode_steps,
+            temperature=temperature,
+            skip_clone=True,
+            detokenize=False,
+            flat_logprobs=True,
+            # The single Request runs the whole session; EOS must NOT cap it
+            # early (settled design §7 ①: the worker decision's step count is
+            # authoritative — the beam rows' tokens are overwritten anyway).
+            ignore_eos=True,
+        )
+
+        # Cache decoded prompt text and token length for the final assembly.
+        cached_prompts = []
+        for instance in instances:
+            prompt_tokens = instance.beams[0].tokens
+            prompt_text = tokenizer.decode(prompt_tokens)
+            cached_prompts.append({"text": prompt_text, "len": len(prompt_tokens)})
+
+        for prompt_start in range(0, len(prompts), concurrency_limit):
+            instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
+            _custom_async_beam_search_batch(
+                llm_engine=self.llm_engine,
+                instances_batch=instances_batch,
+                prompt_start=prompt_start,
+                tokenizer=tokenizer,
+                beam_width=beam_width,
+                beam_search_params=beam_search_params,
+                sid_end_token_id=sid_end_token_id,
+                max_decode_steps=max_decode_steps,
+                is_constrained=is_constrained,
+            )
+
+        # ---- Final assembly (mirrors beam_search, cum_logprob-only) ----
+        outputs = []
+        for idx, instance in enumerate(instances):
+            # The worker's terminal sequence covers exactly the decode steps;
+            # append the optional sid_end token to every surviving beam.
+            if sid_end_token_id is not None:
+                for beam in instance.beams:
+                    beam.tokens.append(sid_end_token_id)
+            sorted_completed = sorted(
+                instance.completed + instance.beams,
+                key=lambda x: x.cum_logprob,
+                reverse=True,
+            )
+            best_beams = sorted_completed[:beam_width]
+
+            prompt_cache = cached_prompts[idx]
+            prompt_text = prompt_cache["text"]
+            prompt_len = prompt_cache["len"]
+            beam_token_lists = [beam.tokens[prompt_len:] for beam in best_beams]
+            if hasattr(tokenizer, "batch_decode"):
+                decoded_gen_texts = tokenizer.batch_decode(beam_token_lists)
+            else:
+                decoded_gen_texts = [tokenizer.decode(tokens) for tokens in beam_token_lists]
+            for beam, gen_text in zip(best_beams, decoded_gen_texts):
+                beam.text = prompt_text + gen_text
+            outputs.append(BeamSearchOutput(sequences=best_beams))
+
+        return outputs
 
     def shutdown(self) -> None:
         if self._shutdown_complete:

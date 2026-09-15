@@ -182,6 +182,71 @@ def _worker_decision_from_result(beam_result) -> Mapping[str, object] | None:
     return decision
 
 
+def _worker_final_sequences(
+    decision: Mapping[str, object],
+) -> tuple[list[list[int]], list[float]] | None:
+    """Unpack a *terminal* worker beam decision into per-beam sequences.
+
+    The NPU terminal decision carries the cumulative decode state the
+    device-resident ``BeamDecisionBuffers`` accumulated across all steps:
+    ``out_sequence`` ``[1, W_eff, steps]`` (token chosen at every step per
+    surviving beam) and ``out_log_probs`` ``[1, W_eff]`` (cumulative beam
+    scores).  Together they replace the frontend's whole per-step
+    materialize / EOS-ledger / parent-pointer chain: the beam search is
+    already finished when this payload arrives.
+
+    Returns ``(sequences, scores)`` — exactly ``W_eff`` sequences of equal
+    length ``steps`` plus their cumulative logprobs — or ``None`` when the
+    payload is not a usable terminal state (CUDA compact-buffer path, a
+    non-terminal step decision, or a malformed shape); callers fall back to
+    the per-step path in that case.
+    """
+    if not bool(decision.get("is_last_step", False)):
+        return None
+    seq_value = decision.get("out_sequence")
+    score_value = decision.get("out_log_probs")
+    if seq_value is None or score_value is None:
+        return None
+
+    def _to_list(value):
+        if value is None:
+            return None
+        if hasattr(value, "tolist"):
+            try:
+                value = value.tolist()
+            except Exception:
+                return None
+        if not isinstance(value, list) or not value:
+            return None
+        return value
+
+    seq_rows = _to_list(seq_value)
+    score_rows = _to_list(score_value)
+    if seq_rows is None or score_rows is None:
+        return None
+    # Drop the leading batch dim ([1, W, steps] -> [W, steps]).
+    if len(seq_rows) == 1 and isinstance(seq_rows[0], list):
+        seq_rows = seq_rows[0]
+    if len(score_rows) == 1 and isinstance(score_rows[0], list):
+        score_rows = score_rows[0]
+    if not seq_rows or len(seq_rows) != len(score_rows):
+        return None
+    sequences: list[list[int]] = []
+    for row in seq_rows:
+        if not isinstance(row, list) or not row:
+            return None
+        try:
+            sequences.append([int(t) for t in row])
+        except (TypeError, ValueError):
+            return None
+    scores: list[float] = []
+    for row in score_rows:
+        if not isinstance(row, (int, float)):
+            return None
+        scores.append(float(row))
+    return sequences, scores
+
+
 _dp_rank_counter = 0
 _dp_rank_lock = asyncio.Lock()
 
@@ -846,6 +911,40 @@ async def beam_search(
             # logprobs extraction + NumPy top-k entirely and feed the worker's
             # winners into the existing EOS / materialisation pipeline.
             worker_decision = _worker_decision_from_result(beam_result)
+
+            # Terminal short-circuit (worker-sinking Stage 0): the worker's
+            # terminal decision carries the full cumulative state
+            # (out_sequence [1, W, steps] + out_log_probs [1, W]) — replace
+            # every active beam in one shot, retire the session, and exit
+            # the step loop.  Per the settled design the terminal path
+            # degrades to cum_logprob-only (logprobs=None) and EOS is
+            # constrained to ignore_eos (the worker's step count is
+            # authoritative).
+            final_state = _worker_final_sequences(worker_decision or {})
+            if final_state is not None:
+                sequences, final_scores = final_state
+                seed = all_beams[0]
+                rebuilt = []
+                for seq_tokens, seq_score in zip(sequences, final_scores):
+                    # seed.tokens is initial_tokens (prompt + optional
+                    # sid_begin); out_sequence covers ONLY the decode steps,
+                    # so the full beam is the shared prefix + worker sequence.
+                    rebuilt.append(
+                        BeamSearchSequence(
+                            orig_prompt=seed.orig_prompt,
+                            tokens=list(seed.tokens) + list(seq_tokens),
+                            logprobs=None,
+                            cum_logprob=seq_score,
+                            lora_request=seed.lora_request,
+                        )
+                    )
+                all_beams = rebuilt
+                await _beam_request_cleanup(
+                    self.engine_client, prefill_id, prev_beam_internal_ids, rank
+                )
+                prev_beam_internal_ids = []
+                break
+
             worker_candidates = None
             if worker_decision is not None:
                 worker_candidates = _worker_decision_flatten(worker_decision, beam_width, all_beams)

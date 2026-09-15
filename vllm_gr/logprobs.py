@@ -176,7 +176,15 @@ def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):
     ``sid_end_token_id`` is given and the beam did not finish with EOS,
     an extra entry is appended for the session-end token.
 
+    Terminal worker-decision beams (worker-sinking Stage 0) carry no
+    parent pointers and are built with ``logprobs=None`` by design (the
+    settled degradation: cum_logprob only).  They are left untouched so
+    the degradation stays visible instead of being silently replaced by
+    a prompt-only FlatLogprobs that would misrepresent the beam's steps.
+
     Thin wrapper around :func:`reconstruct_beam_logprobs_batch` kept for
     backward compatibility with existing call sites and tests.
     """
+    if getattr(beam, "_lp_step_data", None) is None and beam.logprobs is None:
+        return
     reconstruct_beam_logprobs_batch([beam], initial_logprobs, sid_end_token_id)

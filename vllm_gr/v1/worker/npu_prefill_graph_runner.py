@@ -92,9 +92,11 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
       - each layer's FIA-v2 call is wrapped in graph_task_group_begin/end
         with host seq-lens lists pre-built outside the capture region;
       - replay: populate static buffers, rewrite every task group's params
-        (fresh lists + current block table) on a dedicated update stream,
-        order the serving stream after the update stream
-        (``wait_stream``), then ``graph.replay()``.
+        (fresh lists + current block table) on a dedicated update stream with
+        a per-layer event recorded after each task update, then
+        ``graph.replay()`` — each in-graph layer's FIA blocks on its baked
+        event.wait until the update signals it, so the replay pipelines with
+        the update at layer granularity.
     """
 
     def __init__(
@@ -146,6 +148,25 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         if self._update_stream is None:
             self._update_stream = torch.npu.Stream(device=self.device)
         return self._update_stream
+
+    def _release_all_events(self, entry: Any) -> None:
+        """Fire every per-layer event for ``entry`` on the update stream.
+
+        Recovery for replay-first (Plan A') aborts: a replay already enqueued
+        on the serving stream stalls at each layer's in-graph ``event.wait``.
+        If the matching update is aborted (exception), the un-recorded layers
+        would hang the replay forever. Recording all events lets the stalled
+        replay drain; its output is discarded by the caller's eager fallback.
+        """
+        update_stream = self._get_update_stream()
+        layers = getattr(entry, "layers", None)
+        if not layers:
+            return
+        with torch.npu.stream(update_stream):
+            for task in layers:
+                event = getattr(task, "event", None)
+                if event is not None:
+                    event.record(update_stream)
 
     def _bind_entry_workspace(self, entry: Any) -> None:
         """Reuse the cross-bucket shared workspace when it is already sized.
@@ -513,9 +534,16 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
 
         from vllm_gr.v1.attention.backends.beam_attn_npu import update_graph_params
 
+        graph = buf.captured_graphs[1]
+        graph.replay()
+
         try:
             update_ok = update_graph_params(
-                self._get_update_stream(), entry, qlen_list, kvlen_list, bt_staged
+                self._get_update_stream(),
+                entry,
+                qlen_list,
+                kvlen_list,
+                bt_staged,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(
@@ -536,13 +564,12 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         #       the update's device work is ordered after the previous
         #       replay's completion (the serving-stream tail includes it), so
         #       the update never rewrites tasks that are still executing;
-        #   (2) this serving_stream.wait_stream(update_stream) — replay after
-        #       the update's device work;
+        #   (2) NO whole-graph serving_stream.wait_stream(update_stream): each
+        #       layer's FIA in the replayed graph blocks on its baked in-graph
+        #       event.wait until the update stream records that layer's event
+        #       right after its task update, so the replay's layer i overlaps
+        #       the update's layer i+1 instead of waiting for the whole update;
         #   (3) host program order (params rewritten before replay enqueued).
         # The host never blocks, so it can pipeline the next batch while the
         # device still executes this replay.
-        torch.npu.current_stream().wait_stream(self._get_update_stream())
-
-        graph = buf.captured_graphs[1]
-        graph.replay()
         return buf.output_bufs[1]

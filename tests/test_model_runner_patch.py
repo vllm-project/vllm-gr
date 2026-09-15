@@ -231,3 +231,37 @@ def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     model_runner_patch.apply_worker_patches()
 
     assert getattr(Runner.sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, False)
+
+
+def test_npu_resident_input_overwrite_uses_each_session_slot() -> None:
+    import torch
+
+    from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
+
+    sequence = torch.tensor(
+        [
+            [[1, 11], [2, 12]],
+            [[3, 21], [4, 22]],
+        ],
+        dtype=torch.int32,
+    )
+    decision = SimpleNamespace(sequence=sequence)
+    context = SimpleNamespace(decision=decision)
+    runner = SimpleNamespace(
+        _beam_sessions={
+            "a": SimpleNamespace(slot=0, context=context),
+            "b": SimpleNamespace(slot=1, context=context),
+        },
+        input_ids=SimpleNamespace(gpu=torch.full((6,), -1, dtype=torch.int32)),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={
+            "a": {"resident": True, "is_beam_decode": True, "beam_width": 2, "decode_step": 1},
+            "b": {"resident": True, "is_beam_decode": True, "beam_width": 2, "decode_step": 1},
+        },
+        _gr_request_row_configs=[("a", 0, 2, []), ("b", 2, 2, [])],
+    )
+
+    npu_patch._resident_beam_overwrite_input_ids_npu(runner, scheduler_output, [])
+
+    assert runner.input_ids.gpu.tolist() == [11, 12, 21, 22, -1, -1]

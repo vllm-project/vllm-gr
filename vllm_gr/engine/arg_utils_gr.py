@@ -628,6 +628,7 @@ def create_engine_config(self, usage_context=None, headless=False):
             beam_worker_decision=effective_beam_worker_decision,
             beam_engine_driven=effective_beam_engine_driven,
             beam_execution_mode=existing_gr_config.beam_execution_mode,
+            beam_async=existing_gr_config.beam_async,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
         )
@@ -671,6 +672,20 @@ def create_engine_config(self, usage_context=None, headless=False):
             write_canonical_gr_config(config, effective_gr_config)
         else:
             effective_gr_config.write_to_vllm_config(config)
+
+    scheduler_config = getattr(config, 'scheduler_config', None)
+    if (
+        effective_gr_config.beam_engine_driven
+        and effective_gr_config.beam_execution_mode is BeamExecutionMode.LEGACY
+        and not effective_gr_config.beam_async
+        and getattr(scheduler_config, 'async_scheduling', False)
+    ):
+        logger.warning(
+            'vllm-gr: disabling async scheduling because the legacy per-step '
+            'beam-decode lifecycle cannot use the batch-queue pipeline; use '
+            'beam_async=True for the resident-Request async path'
+        )
+        scheduler_config.async_scheduling = False
 
     if effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM:
         attention_config = getattr(config, "attention_config", None)

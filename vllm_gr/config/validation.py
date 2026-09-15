@@ -274,6 +274,20 @@ def validate_beam_engine_driven(value: object) -> bool | None:
     raise ValueError("vllm-gr beam_engine_driven must be a boolean or null")
 
 
+def validate_beam_async(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    raise ValueError("vllm-gr beam_async must be a boolean")
+
+
 def validate_beam_max_decode_steps(value: object) -> int:
     return _validate_positive_int(
         value if value is not None else _BEAM_MAX_DECODE_STEPS_DEFAULT,
