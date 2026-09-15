@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GPU V1 adapter for A3 dispatches and PR1 persistent Beam state.
+"""GPU V1 adapter for asynchronous scheduling dispatches and persistent Beam state.
 
 Bindings are views of the existing Worker session registry. The only supported
 execution is one item on TP=1. Resource rows and physical model rows are explicit
@@ -12,16 +12,14 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from threading import Lock
+from threading import Condition, Lock
 from typing import Any, cast
 
 import torch
-import triton
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
-from vllm_gr.ops.cuda import beam_stage as ops
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
@@ -33,15 +31,25 @@ from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
+    GRExecutionCapacity,
+    GRRetireMetadata,
+    GRRetireResult,
     GRStageKind,
     GRStageMetadata,
     GRWorkerResult,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import (
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_RETIRE_RESULT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
 from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
+from vllm_gr.v1.worker.gr_inputs import (
+    GRInputBuffers,
+    PreparedGRInputs,
+    bind_device_inputs,
+)
 
 METADATA_ABI = 1
 CONTROL_CAPACITY = 2
@@ -96,7 +104,7 @@ def validate_dispatch(
     for key, m in mapping.items():
         if not isinstance(m, GRStageMetadata) or key != m.session_id:
             raise ValueError("invalid GR metadata identity")
-        for number in (m.dispatch_id, m.stage_index, m.num_prompt_tokens):
+        for number in (m.dispatch_id, m.stage_index, m.num_prompt_tokens, m.owner_generation):
             if isinstance(number, bool) or not isinstance(number, int) or number < 0:
                 raise ValueError(
                     "GR dispatch indices and prompt length must be nonnegative integers"
@@ -138,6 +146,8 @@ def validate_dispatch(
         ):
             raise ValueError("GR dispatch flags, step and scheduled count have invalid types")
         params = m.beam_params
+        if m.execution_capacity is not None:
+            m.execution_capacity.validate(params)
         if (
             type(params.beam_width) is not int
             or not 1 <= params.beam_width <= 256
@@ -190,6 +200,7 @@ def validate_dispatch(
         elif (
             m.dispatch_id != previous.dispatch_id + 1
             or m.stage_index != previous.stage_index + int(previous.produces_output)
+            or m.owner_generation != previous.owner_generation
             or params != previous.beam_params
             or m.output_options != previous.output_options
             or m.num_prompt_tokens != previous.num_prompt_tokens
@@ -212,46 +223,78 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         with self._lock:
             if self._output is not None:
                 return self._output
-            self.owner.copy_done[self.slot].synchronize()
-            controls = self.owner.host_control[self.slot].tolist()
-            req_ids, sampled, results = [], [], {}
-            for entry, (produced, finished, error) in zip(self.execution.entries, controls):
-                m = entry.metadata
-                terminal = None
-                if error:
-                    terminal = BeamBatchResult(
-                        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
-                        batch_id=m.session_id,
-                        output=None,
-                        failure=BeamBatchFailure(
-                            "beam_device_error",
-                            f"Beam device error {error}",
-                            entry.binding.item_index,
-                        ),
-                    )
-                req_ids.append(entry.binding.native_request_id)
-                # These are scheduler placeholders. They must never be used as
-                # model inputs or published as generated Beam sequences.
-                sampled.append([0] if produced else [])
-                results[m.session_id] = GRWorkerResult(
-                    m.session_id,
-                    m.dispatch_id,
-                    m.stage_index,
-                    produced,
-                    m.output_device_state,
-                    bool(finished),
-                    terminal,
-                )
-            out = ModelRunnerOutput(
-                req_ids=req_ids,
-                req_id_to_index={r: i for i, r in enumerate(req_ids)},
-                sampled_token_ids=sampled,
+            # CUDA/D2H failures are fatal and must reach the native Executor
+            # failure channel. Never publish a successful release after one.
+            try:
+                self.owner.copy_done[self.slot].synchronize()
+                controls = self.owner.host_control[self.slot].tolist()
+                self._output = self._convert(controls)
+            except (ValueError, TypeError, IndexError) as error:
+                self._output = self._conversion_failure(error)
+            finally:
+                with self.owner.control_drained:
+                    self.owner.control_busy[self.slot] = False
+                    self.owner.control_drained.notify_all()
+            return self._output
+
+    def _conversion_failure(self, error: Exception) -> ModelRunnerOutput:
+        out = ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
+        results = {}
+        for entry in self.execution.entries:
+            m = entry.metadata
+            out.req_id_to_index[m.session_id] = len(out.req_ids)
+            out.req_ids.append(m.session_id)
+            out.sampled_token_ids.append([])
+            terminal = BeamBatchResult(
+                BEAM_BATCH_PROTOCOL_VERSION,
+                m.session_id,
+                None,
+                BeamBatchFailure("worker_output_error", str(error), entry.binding.item_index),
             )
-            setattr(out, GR_WORKER_RESULT_ATTR, results)
-            self._output = out
-            with self.owner.control_lock:
-                self.owner.control_busy[self.slot] = False
-            return out
+            results[m.session_id] = GRWorkerResult(
+                m.session_id, m.dispatch_id, m.stage_index, 0, m.output_device_state, True, terminal
+            )
+        setattr(out, GR_WORKER_RESULT_ATTR, results)
+        return out
+
+    def _convert(self, controls) -> ModelRunnerOutput:
+        if len(controls) != len(self.execution.entries):
+            raise ValueError("Asynchronous scheduling control snapshot has the wrong row count")
+        req_ids, sampled, results = [], [], {}
+        for entry, (produced, finished, error) in zip(self.execution.entries, controls):
+            m = entry.metadata
+            terminal = None
+            if error:
+                terminal = BeamBatchResult(
+                    protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                    batch_id=m.session_id,
+                    output=None,
+                    failure=BeamBatchFailure(
+                        "beam_device_error",
+                        f"Beam device error {error}",
+                        entry.binding.item_index,
+                    ),
+                )
+            req_ids.append(entry.binding.native_request_id)
+            # These are scheduler placeholders. They must never be used as
+            # model inputs or published as generated Beam sequences.
+            sampled.append([0] if produced else [])
+            results[m.session_id] = GRWorkerResult(
+                m.session_id,
+                m.dispatch_id,
+                m.stage_index,
+                produced,
+                m.output_device_state,
+                bool(finished),
+                terminal,
+            )
+        out = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={r: i for i, r in enumerate(req_ids)},
+            sampled_token_ids=sampled,
+        )
+        setattr(out, GR_WORKER_RESULT_ATTR, results)
+        return out
 
 
 class GPUBeamStageRunner:
@@ -282,6 +325,7 @@ class GPUBeamStageRunner:
         self.previous: GRStageMetadata | None = None
         self.pending: tuple[BeamDispatchExecution, int] | None = None
         self.control_lock = Lock()
+        self.control_drained = Condition(self.control_lock)
         self.control_busy = [False] * CONTROL_CAPACITY
         self.device_control = torch.empty(
             (CONTROL_CAPACITY, 1, 3), device=beam.state.device, dtype=torch.int32
@@ -295,20 +339,18 @@ class GPUBeamStageRunner:
         self.last_work = torch.Event()
         self.closed = False
         self.cancelled = False
-        self.host_static: torch.Tensor
-        self.device_static: torch.Tensor
+        self.execution_error: Exception | None = None
+        self.inputs: GRInputBuffers | None = None
+        self.prepared: PreparedGRInputs | None = None
         self.metadata: Any = None
         self.graph: Any = None
         self.graph_logits: torch.Tensor | None = None
-        self.attention_needs_refresh = True
-        self.graph_captures = 0
-        self.graph_replays = 0
-        self.graph_key: tuple[Any, ...] | None = None
         self.logits: torch.Tensor | None = None
         self.input_ids = torch.empty(
             beam.state.beam_width, device=beam.state.device, dtype=torch.int32
         )
         self.positions = torch.empty_like(self.input_ids, dtype=torch.int64)
+        self.slots = torch.full_like(self.positions, -1)
         self.execution_mask = torch.empty_like(self.input_ids, dtype=torch.bool)
         self.constraint_steps = beam.state.num_generated_tokens[
             binding.state_row : binding.state_row + 1
@@ -361,143 +403,88 @@ class GPUBeamStageRunner:
         execution = BeamDispatchExecution(tuple(entries), offset)
         self.pending = execution, slot
         self.previous = stages[0]  # B=1 admission bridge, not a model/state row.
-        if self.previous is not None:
-            torch.cuda.current_stream(self.beam.state.device).wait_event(self.last_work)
-        ops.latch_entry[(1,)](
-            self.beam.state.num_generated_tokens,
-            self.device_control[slot],
-            STATE_ROW=self.binding.state_row,
+        torch.cuda.current_stream(self.beam.state.device).wait_event(self.last_work)
+        self.device_control[slot, 0, :1].copy_(
+            self.beam.state.num_generated_tokens[
+                self.binding.state_row : self.binding.state_row + 1
+            ]
         )
         return execution
 
+    def prepare_cpu(self, m: GRStageMetadata, slot: int) -> PreparedGRInputs:
+        worker = self.worker
+        groups = worker.kv_cache_config.kv_cache_groups
+        if len(groups) != 1:
+            raise RuntimeError("Asynchronous scheduling requires one uniform KV cache group")
+        if self.inputs is None:
+            self.inputs = GRInputBuffers(
+                self.beam.state.beam_width,
+                worker.model_config.max_model_len,
+                groups[0].kv_cache_spec.block_size,
+                self.beam.state.device,
+            )
+        native = worker.requests[self.binding.native_request_id]
+        return self.inputs.prepare_cpu(m, self.binding, block_ids=native.block_ids, slot=slot)
+
     def _bind_attention(self, m: GRStageMetadata) -> None:
         from vllm_gr.v1.attention.backends.beam_attn_metadata import (
-            BeamAttentionMetadata,
+            BeamAttentionMetadataBuilder,
         )
 
-        worker, state = self.worker, self.beam.state
-        width, device = state.beam_width, state.device
-        groups = worker.kv_cache_config.kv_cache_groups
-        names = tuple(name for group in groups for name in group.layer_names)
-        native = worker.requests[self.binding.native_request_id]
-        block_size = groups[0].kv_cache_spec.block_size
-        prefix_blocks = (m.num_prompt_tokens + block_size - 1) // block_size
-        blocks = tuple(tuple(group[:prefix_blocks]) for group in native.block_ids)
-        key = (
-            METADATA_ABI,
-            state.max_batch_size,
-            state.max_new_tokens,
-            tuple(
-                (p.unshared_key.data_ptr(), p.unshared_value.data_ptr(), p.unshared_key.stride())
-                for p in self.beam.session.pools
-            ),
-            width,
-            (self.binding.state_row, self.binding.kv_slot, self.binding.workspace_row),
-            state.sequence.stride(),
-            self.beam.workspace.max_batch,
-            m.num_prompt_tokens,
-            tuple(len(group) for group in blocks),
-            names,
-            self.input_ids.data_ptr(),
-            self.positions.data_ptr(),
-            state.sequence.data_ptr(),
-            self.prefixes.data_ptr(),
-        )
-        if self.metadata is not None and self.graph_key != key:
-            if not self.attention_needs_refresh:
-                raise RuntimeError(
-                    "GR graph/resource binding changed; drain and release before recapture"
-                )
-            # Refresh is only set for a new, fully drained session binding.
-            # A larger registry can rotate KV slots even during serial reuse.
-            self.graph, self.graph_logits, self.metadata, self.graph_key = None, None, None, None
-        if self.metadata is not None:
-            if self.attention_needs_refresh:
-                self.host_static[3:].copy_(torch.tensor(blocks[0], dtype=torch.int32))
-                self.device_static.copy_(self.host_static, non_blocking=True)
-                self.metadata.beam_session = self.beam.session
-                self.attention_needs_refresh = False
-            return
-        if len(blocks) != 1 or len(groups) != 1:
-            raise RuntimeError("persistent GPU Beam requires one uniform KV cache group")
-        # Pin static request metadata as well: torch.tensor(..., device="cuda")
-        # would wait for the preceding Prefill forward before the first Decode.
-        self.host_static = torch.tensor(
-            [0, width, m.num_prompt_tokens, *blocks[0]], dtype=torch.int32, pin_memory=True
-        )
-        self.device_static = torch.empty(self.host_static.shape, dtype=torch.int32, device=device)
-        self.device_static.copy_(self.host_static, non_blocking=True)
-        block_table = self.device_static[3:].view(1, -1)
-        arange = torch.arange(width, dtype=torch.int32, device=device)
-        query_offsets = torch.arange(width + 1, dtype=torch.int32, device=device)
-        prefix_offsets = self.device_static[:2]
-        prompt = self.device_static[2:3]
-        suffix_lengths = torch.empty(width, dtype=torch.int32, device=device)
-        suffix_offsets = torch.empty(width + 1, dtype=torch.int32, device=device)
-        slots = torch.full((width,), -1, dtype=torch.int64, device=device)
-        metadata = BeamAttentionMetadata(
-            num_actual_tokens=width,
-            max_query_len=1,
-            query_start_loc=query_offsets,
-            max_seq_len=m.num_prompt_tokens + state.max_new_tokens,
-            seq_lens=suffix_lengths,
-            block_table=block_table,
-            slot_mapping=slots,
-            is_beam_decode=True,
-            beam_session=self.beam.session,
-            beam_active_mask=self.execution_mask,
-            prefix_indices=arange,
-            num_prefix_indices=width,
-            prefix_cu_seqlens_q_device=prefix_offsets,
-            prefix_seqlens_kv_device=prompt,
-            prefix_max_q_len=width,
-            prefix_max_seq_len=m.num_prompt_tokens,
-            prefix_block_table=block_table,
-            suffix_cu_seqlens_q_device=query_offsets,
-            suffix_cu_seqlens_k_device=suffix_offsets,
-            suffix_seqlens_kv_device=suffix_lengths,
-            suffix_max_q_len=1,
-            suffix_max_seq_len=self.beam.session.context.max_decode_steps,
+        if self.prepared is None or self.prepared.metadata != m or self.inputs is None:
+            raise RuntimeError(
+                "Asynchronous scheduling attention requires this dispatch's CPU preparation"
+            )
+        worker = self.worker
+        views = self.inputs.upload(self.prepared)
+        self.device_positions = views["positions"]
+        self.metadata = BeamAttentionMetadataBuilder.build_async(
+            layout=self.prepared.layout,
+            views=views,
+            session=self.beam.session,
+            mask=self.execution_mask,
+            slots=self.slots,
+            block_size=self.inputs.block_size,
+            max_model_len=self.inputs.max_model_len,
             num_heads=worker.model_config.get_num_attention_heads(worker.parallel_config),
             num_kv_heads=worker.model_config.get_num_kv_heads(worker.parallel_config),
         )
-        self.metadata = metadata
-        self.attention = dict.fromkeys(names, metadata)
-        self.slot_mappings = dict.fromkeys(names, slots)
-        self.graph_key = key
-        self.attention_needs_refresh = False
+        names = tuple(
+            name for group in worker.kv_cache_config.kv_cache_groups for name in group.layer_names
+        )
+        self.attention = dict.fromkeys(names, self.metadata)
+        self.slot_mappings = dict.fromkeys(names, self.slots)
 
     def prepare_decode(self, entry: BeamDispatchEntry) -> None:
-        s, w, b = self.beam.state, self.beam.workspace, self.binding
-        ops.prepare_decode[(1,)](
-            s.input_ids,
-            s.sequence,
-            s.active_mask,
-            s.num_generated_tokens,
-            s.num_decode_steps,
-            s.is_initialized,
-            s.is_finished,
-            s.error_code,
-            self.input_ids,
-            self.positions,
-            self.execution_mask,
-            self.beam.session.context.decode_step_buf,
-            w.prefix_token_ids,
-            self.metadata.suffix_seqlens_kv_device,
-            self.metadata.suffix_cu_seqlens_k_device,
-            STATE_ROW=b.state_row,
-            WORKSPACE_ROW=b.workspace_row,
-            ROW_OFFSET=entry.row_offset,
-            WIDTH=s.beam_width,
-            PROMPT=entry.metadata.num_prompt_tokens,
-            TOKEN_BATCH_STRIDE=s.input_ids.stride(0),
-            SEQ_BATCH_STRIDE=s.sequence.stride(0),
-            SEQ_BEAM_STRIDE=s.sequence.stride(1),
-            PREFIX_BATCH_STRIDE=w.prefix_token_ids.stride(0),
-            PREFIX_BEAM_STRIDE=w.prefix_token_ids.stride(1),
-            MAX_STEPS=s.max_new_tokens - 1,
-            BLOCK=triton.next_power_of_2(s.beam_width + 1),
-        )
+        # Device binding has no dependency on Host output consumption.
+        prepared = self.prepared
+        if (
+            prepared is None
+            or prepared.metadata != entry.metadata
+            or prepared.binding != entry.binding
+        ):
+            raise RuntimeError(
+                "Asynchronous scheduling device binding does not match the prepared dispatch"
+            )
+        bind_device_inputs(prepared, self)
+
+    def capture_forward(self) -> None:
+        """Startup-only capture over the asynchronous scheduling execution view, including LM head."""
+        stream = torch.cuda.current_stream(self.beam.state.device)
+        side = torch.cuda.Stream(device=self.beam.state.device)
+        side.wait_stream(stream)
+        with torch.cuda.stream(side):
+            self._forward()
+            self._forward()
+        stream.wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(self.graph, stream=side):
+                self.graph_logits = self._forward()
+        except Exception:
+            self.graph = None
+            raise
+        stream.wait_stream(side)
 
     def _forward(self) -> torch.Tensor:
         from vllm.config import CUDAGraphMode
@@ -544,6 +531,8 @@ class GPUBeamStageRunner:
                     )
                 self.logits = worker.execute_model_state.logits
             else:
+                # Pure CPU work can run before the native Prefill staging fence.
+                self.prepared = self.prepare_cpu(m, self.pending[1])
                 if previous_kind is GRStageKind.PREFILL:
                     # Native Prefill asynchronously reads pinned InputBatch
                     # buffers that _update_states mutates on the CPU. A stream
@@ -564,34 +553,24 @@ class GPUBeamStageRunner:
                 )
                 if graph_enabled:
                     if self.graph is None:
-                        stream = torch.cuda.current_stream(self.beam.state.device)
-                        capture_stream = torch.cuda.Stream(device=self.beam.state.device)
-                        capture_stream.wait_stream(stream)
-                        with torch.cuda.stream(capture_stream):
-                            self._forward()
-                            self._forward()
-                        stream.wait_stream(capture_stream)
-                        self.graph = torch.cuda.CUDAGraph()
-                        try:
-                            with torch.cuda.graph(self.graph, stream=capture_stream):
-                                self.graph_logits = self._forward()
-                        except Exception as error:
-                            self.graph = None
-                            raise RuntimeError(
-                                "persistent Beam FULL graph capture failed"
-                            ) from error
-                        stream.wait_stream(capture_stream)
-                        self.graph_captures += 1
+                        raise RuntimeError(
+                            "Asynchronous scheduling graph mode requires successful startup capture"
+                        )
                     self.graph.replay()
-                    self.graph_replays += 1
                     self.logits = self.graph_logits
                 else:
                     self.logits = self._forward()
         return None
 
     def sample(self, grammar_output: Any = None) -> AsyncGPUBeamOutput:
+        if self.execution_error is not None:
+            raise RuntimeError(
+                "Asynchronous scheduling execute_model failed"
+            ) from self.execution_error
         if grammar_output is not None or self.pending is None:
             raise RuntimeError("GR sample requires a pending dispatch and no grammar output")
+        if self.backend is None:
+            raise RuntimeError("GR sampling requires a bound constraint backend")
         execution, slot = self.pending
         for entry in execution.entries:
             m = entry.metadata
@@ -615,13 +594,13 @@ class GPUBeamStageRunner:
                     self.beam.initialize_from_prefill(*candidates)
                 else:
                     self.beam.advance(*candidates)
-            ops.latch_result[(1,)](
-                self.beam.state.num_generated_tokens,
-                self.beam.state.is_finished,
-                self.beam.state.error_code,
-                self.device_control[slot],
-                STATE_ROW=entry.binding.state_row,
+            row = slice(entry.binding.state_row, entry.binding.state_row + 1)
+            control = self.device_control[slot, 0]
+            control[:1].copy_(self.beam.state.num_generated_tokens[row] - control[:1])
+            control[1:2].copy_(
+                self.beam.state.is_finished[row] | (self.beam.state.error_code[row] != 0)
             )
+            control[2:3].copy_(self.beam.state.error_code[row])
         stream = torch.cuda.current_stream(self.beam.state.device)
         self.produced_ready[slot].record(stream)
         self.last_work.record(stream)
@@ -645,6 +624,19 @@ class GPUBeamStageRunner:
             for name, value in vars(self.beam.state).items()
             if isinstance(value, torch.Tensor)
         }
+
+    def request_release(self, metadata: GRRetireMetadata) -> AsyncGRRetireOutput:
+        if (
+            self.previous is None
+            or metadata.session_id != self.binding.session_id
+            or metadata.owner_generation != self.previous.owner_generation
+            or self.pending is not None
+        ):
+            raise RuntimeError(
+                "Asynchronous scheduling retirement identity does not match the drained execution"
+            )
+        self.cancel(self.binding)
+        return AsyncGRRetireOutput(self, metadata)
 
     def cancel(self, binding: BeamRequestBinding) -> None:
         if binding != self.binding:
@@ -678,6 +670,63 @@ class GPUBeamStageRunner:
         self.worker._beam_sessions.pop(binding.session_id, None)
 
 
+class AsyncGRRetireOutput(AsyncModelRunnerOutput):
+    """Release proof is constructed only after GPU work and output consumers drain."""
+
+    def __init__(self, owner, metadata):
+        self.owner, self.metadata = owner, metadata
+        self._lock = Lock()
+        self._output = None
+
+    def get_output(self):
+        with self._lock:
+            if self._output is not None:
+                return self._output
+            owner = self.owner
+            with owner.control_drained:
+                owner.control_drained.wait_for(lambda: not any(owner.control_busy))
+            done = torch.Event()
+            done.record(torch.cuda.current_stream(owner.beam.state.device))
+            owner.release(owner.binding, consumer_done=done)
+            if not owner.closed or owner.beam.workspace.execution_owner is owner:
+                raise RuntimeError("Asynchronous scheduling Worker release did not complete")
+            m = self.metadata
+            out = ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
+            setattr(
+                out,
+                GR_RETIRE_RESULT_ATTR,
+                GRRetireResult(m.session_id, m.owner_generation, m.retire_id, True),
+            )
+            self._output = out
+            return out
+
+
+def execute_gr_retirement(worker, scheduler_output):
+    metadata = getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR)
+    if (
+        not isinstance(metadata, GRRetireMetadata)
+        or scheduler_output.total_num_scheduled_tokens
+        or scheduler_output.num_scheduled_tokens
+        or getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
+        or metadata.session_id not in scheduler_output.finished_req_ids
+    ):
+        raise ValueError("invalid Asynchronous scheduling retirement control frame")
+    previous = getattr(worker, "_gr_retirement_output", None)
+    if previous is not None and previous.metadata == metadata:
+        return previous
+    owner = getattr(worker, "_gr_gpu_stage_runner", None)
+    if owner is None or owner.closed:
+        raise RuntimeError("Asynchronous scheduling retirement has no matching live Worker owner")
+    result = owner.request_release(metadata)
+    # Preserve the native finished_req_ids cleanup entry, without Forward or sampling.
+    event = worker.prepare_inputs_event
+    if event is not None:
+        event.synchronize()
+    worker._update_states(scheduler_output)
+    worker._gr_retirement_output = result
+    return result
+
+
 def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
     """Admit first, then derive the adapter from existing Worker resources."""
     existing = getattr(worker, "_gr_gpu_stage_runner", None)
@@ -694,6 +743,10 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
     )
 
     cfg = _get_gr_config(worker)
+    capacity = GRExecutionCapacity(cfg.beam_max_width)
+    capacity.validate(m.beam_params)
+    if m.execution_capacity is not None and m.execution_capacity != capacity:
+        raise ValueError("Scheduler and Worker Asynchronous scheduling execution capacities differ")
     parallel = worker.parallel_config
     if (
         torch.device(worker.device).type != "cuda"
@@ -714,6 +767,15 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
     backend = getattr(worker, "constraint_backend", None)
     if not isinstance(backend, CUDAConstraintBackend):
         raise ValueError("persistent GR requires a loaded canonical CUDA Constraint Table")
+    if (
+        existing is not None
+        and existing.graph is not None
+        and existing.backend is not None
+        and existing.backend is not backend
+    ):
+        raise ValueError(
+            "Asynchronous scheduling captured constraint/model binding cannot change after startup"
+        )
     if (
         not backend.is_ready
         or backend.info.table_metadata.vocab_size != worker.model_config.get_vocab_size()
@@ -793,14 +855,11 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
     reuse = (
         existing is not None
         and existing.closed
-        and existing.previous is not None
-        and existing.previous.beam_params == m.beam_params
-        and existing.previous.num_prompt_tokens == m.num_prompt_tokens
+        and existing.beam.state.beam_width == m.beam_params.beam_width
         and existing.beam.session.context is context
         and existing.beam.workspace is workspace
     )
-    if reuse:
-        assert existing is not None
+    if reuse and existing.previous is not None and existing.previous.beam_params == m.beam_params:
         state = existing.beam.state
         state.reset(existing.binding.state_row)
     else:
@@ -822,7 +881,11 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         adapter.beam, adapter.binding, adapter.backend = beam, binding, backend
         adapter.previous, adapter.pending = None, None
         adapter.closed, adapter.cancelled = False, False
-        adapter.attention_needs_refresh = True
+        adapter.execution_error = None
+        adapter.prepared = None
+        adapter.constraint_steps = state.num_generated_tokens[
+            binding.state_row : binding.state_row + 1
+        ]
         context._gr_execution_owner = adapter
         workspace.execution_owner = adapter
     else:

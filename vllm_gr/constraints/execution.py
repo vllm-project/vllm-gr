@@ -70,7 +70,9 @@ class ConstrainedTopKTensorResult:
         if self.top_tokens.dim() != 2:
             raise ValueError(f"expected a 2-D result, got {self.top_tokens.dim()} dims")
         if self.top_tokens.dtype != torch.int32:
-            raise ValueError(f"top_tokens must be int32 (ACS/NPU ABI), got {self.top_tokens.dtype}")
+            raise ValueError(
+                f"top_tokens must be int32 (constraint operator ABI), got {self.top_tokens.dtype}"
+            )
         if self.top_logprobs.dtype != torch.float32:
             raise ValueError(f"top_logprobs must be float32, got {self.top_logprobs.dtype}")
         if self.valid_mask.dtype != torch.bool:
@@ -259,7 +261,7 @@ class _ConstrainedTopKExecutionBase:
             current_step=current_step,
             vocab_size=self._vocab_size,
         )
-        # Normalize to the ACS/NPU ABI: top-k token ids are int32 (the Torch
+        # Normalize to the constraint operator ABI: top-k token ids are int32 (the Torch
         # operator returns int64); downstream consumers require int32.
         return ConstrainedTopKTensorResult(
             top_tokens=top_tokens.to(torch.int32),

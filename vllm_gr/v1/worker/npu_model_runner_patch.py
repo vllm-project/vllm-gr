@@ -99,10 +99,10 @@ def make_patched_sample_npu(_orig_sample):
     / ``beam_search_rec_final_select``) when ``GRConfig.beam_worker_decision``
     is enabled — the result is stashed on the runner as
     ``_beam_decision_result`` and attached to ``ModelRunnerOutput.beam_search_result``
-    by ``make_patched_execute_model`` (ACS-aligned save flow).  When disabled
+    by ``make_patched_execute_model`` (asynchronous result flow).  When disabled
     or inapplicable the decision stays in the frontend and nothing changes.
 
-    Sampler short-circuit (ACS ``model_runner_v1`` constrained decode path):
+    Sampler short-circuit (Asynchronous scheduling ``model_runner_v1`` constrained decode path):
     when the worker beam decision is active and every sampling row of the
     step is constrained, the original sampler run is dead work — its
     log_softmax + topk + gather_logprobs output is entirely overwritten by

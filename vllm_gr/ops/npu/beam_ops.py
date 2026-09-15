@@ -3,7 +3,7 @@
 
 """NPU dispatch wrappers for the xLLM beam-search decode operators.
 
-Covers all six operators used by the ACS decode pipeline.  ``cache_unshared_kv``,
+Covers all six operators used by the asynchronous Decode pipeline. ``cache_unshared_kv``,
 ``x_attention`` and ``select_unshared_kv`` form the execution path ported by the
 NPU decode migration plan; ``beam_search_group`` and ``beam_search_rec_final_select``
 are the worker-side beam-decision operators kept as building blocks for a future
@@ -14,12 +14,11 @@ own module and is intentionally not re-exported here.
 ABI notes (verified on device, 2026-08-22; recorded in the workspace
 operator survey ``xllm_ops-decode*.md`` and locked by ``tests/kernels/``):
 - ``decode_step`` is heterogeneous across the library: ``cache_unshared_kv``
-  and ``x_attention`` require an int32 ``[1]`` device tensor (the ACS
-  docstrings claiming ``int`` are wrong), while ``select_unshared_kv``,
+  and ``x_attention`` require an int32 ``[1]`` device tensor, while ``select_unshared_kv``,
   ``beam_search_group`` and ``beam_search_rec_final_select`` take a host int.
   This wrapper takes a host int everywhere and converts as needed.
 - ``x_attention`` ignores an explicit ``unshared_block_tables`` argument: the
-  ACS Python wrapper unconditionally passes ``None`` (``xllm_ops.py:65``),
+  Python wrapper passes ``None``,
   which selects the contiguous-unshared layout with implicit row mapping
   ``batch = shared_block_table.shape[0]``, ``beam = num_tokens / batch``.
 - ``beam_search_rec_final_select`` tiling constraints: ``result_width`` must
@@ -207,7 +206,7 @@ def beam_search_group(
         top_probs: fp32 ``[request_num * beam_width, beam_width]``.
         sequence: int32 ``[request_num, beam_width, current_step + 1]``.
         current_step: 0-based step (0 is a legacy kernel-initialization path
-            that only writes the flat sequence head; ACS bypasses it through
+            that only writes the flat sequence head; asynchronous scheduling uses
             ``init_from_prefill``).
         top_k: number of beams to keep.
 

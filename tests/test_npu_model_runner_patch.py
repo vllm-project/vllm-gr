@@ -496,7 +496,7 @@ def test_npu_worker_decision_derives_kv_reorder_from_host_copy(
 def test_npu_worker_decision_skips_kv_reorder_on_last_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The final step applies no reorder (ACS skips select_unshared_kv)."""
+    """The final step applies no reorder (Asynchronous scheduling skips select_unshared_kv)."""
     beam_width = 4
     decision = {
         "out_token_ids": torch.zeros(1, beam_width, dtype=torch.int32),

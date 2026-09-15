@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Compile the constraint triples document into ACS-compatible lookup tables.
+"""Compile the constraint triples document into operator-compatible lookup tables.
 
 The ``ConstraintTableCompiler`` consumes the task-5 triples document (see
 :mod:`vllm_gr.constraints.json_compiler`) and, together with the model
-tokenizer and ``model_config.vocab_size``, produces the eight ACS-operator
+tokenizer and ``model_config.vocab_size``, produces the eight constraint-operator
 tables consumed by ``rec_constrained_topk``:
 
 - ``first_token_ids``: valid ``s_a`` token IDs for step 0.
@@ -16,7 +16,7 @@ tables consumed by ``rec_constrained_topk``:
 - ``prefix2_values``: valid ``s_c`` token IDs for step 2, grouped by ``(s_a, s_b)``.
 - ``max_prefix1_degree`` / ``max_prefix2_degree``: per-level max candidate count.
 
-Layout and dtype follow the ACS ``rec_constrained_topk`` operator contract:
+Layout and dtype follow the ``rec_constrained_topk`` operator contract:
 ``pair_key`` is ``int64``; offsets and values are ``int32``.
 
 The compiler performs the strict validation listed in the task document:
@@ -401,7 +401,7 @@ def validate_resource_tables(resource: ConstraintTableResource) -> None:
 
 
 class ConstraintTableCompiler:
-    """Compile a triples document into ACS-compatible constraint tables."""
+    """Compile a triples document into operator-compatible constraint tables."""
 
     def __init__(self, tokenizer: Any, vocab_size: int) -> None:
         self.tokenizer = tokenizer
@@ -453,7 +453,7 @@ class ConstraintTableCompiler:
             self._validate_token_id(token_id)
 
         # Step 1: prefix1_offsets / prefix1_values / prefix1_pair_keys.
-        # CSR offsets are built as cumulative counts, matching the ACS
+        # CSR offsets are built as cumulative counts, matching the
         # operator layout: counts[token_id] = number of s_b continuations,
         # then prefix1_offsets = [0] + cumsum(counts).
         counts = np.zeros(self.vocab_size, dtype=np.int32)

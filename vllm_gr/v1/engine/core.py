@@ -251,7 +251,10 @@ def _handle_submit_gr_session(self, batch_request) -> None:
             raise RuntimeError("beam_search_v1 requires a non-blocking EngineCore batch queue")
         preprocessed = self.preprocess_add_request(engine_request)
     except Exception:
-        self._handle_request_preproc_error(engine_request)
+        handler = getattr(self, "_handle_request_preproc_error", None)
+        if handler is None:
+            raise  # InprocClient has no output-socket error handler.
+        handler(engine_request)
         return
     native_request = preprocessed[0]
     # GR owns stop-token/EOS handling. The native token is only a placeholder
@@ -260,7 +263,13 @@ def _handle_submit_gr_session(self, batch_request) -> None:
     native_request.sampling_params.ignore_eos = True
     native_request.sampling_params.stop_token_ids = []
     native_request.gr_batch_request = batch_request
-    _add_preprocessed_request(self, preprocessed)
+    try:
+        _add_preprocessed_request(self, preprocessed)
+    except (ValueError, RuntimeError):
+        handler = getattr(self, "_handle_request_preproc_error", None)
+        if handler is None:
+            raise  # InprocClient has no output-socket error handler.
+        handler(engine_request)
 
 
 def _apply_beam_step(self, update) -> bool:

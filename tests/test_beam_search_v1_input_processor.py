@@ -17,7 +17,6 @@ from vllm.v1.engine.output_processor import OutputProcessor
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search_v1.input_processor import BeamSearchInputProcessor
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
-    AsyncBeamSearchFrontend,
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
@@ -29,7 +28,7 @@ def _make_engine(parallel_config: Any = None) -> Any:
     config = SimpleNamespace(
         additional_config={"vllm_gr_beam_max_width": 2},
         model_config=SimpleNamespace(max_model_len=32),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32, async_scheduling=True),
         parallel_config=parallel_config
         or SimpleNamespace(
             data_parallel_size=1, data_parallel_size_local=1, local_engines_only=False
@@ -219,60 +218,15 @@ def test_embedding_inputs_are_rejected_before_prompt_mutation(
     assert request.prompt_embeds is embeddings
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
-    "local_only,local_size,expected_ranks",
-    [(True, 2, [0, 1, 0, 1]), (True, 1, [0, 0, 0, 0]), (False, 2, [0, 1, 2, 3])],
-)
-def test_online_entrypoint_uses_only_visible_dp_ranks(
-    monkeypatch: pytest.MonkeyPatch, local_only: bool, local_size: int, expected_ranks: list[int]
-) -> None:
-    import vllm_gr.entrypoints.beam_search_v1 as entrypoint
-    from vllm_gr.entrypoints.openai import serving_engine
+@pytest.mark.parametrize("local_only,local_size", [(True, 2), (True, 1), (False, 2)])  # type: ignore[misc]
+def test_online_entrypoint_rejects_dp_before_submission(local_only: bool, local_size: int) -> None:
+    from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
 
     engine = _make_engine(
         SimpleNamespace(
             data_parallel_size=4, data_parallel_size_local=local_size, local_engines_only=local_only
         )
     )
-    serving = SimpleNamespace(
-        engine_client=engine,
-        input_processor=SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2)),
-    )
-    ranks = []
-
-    async def prepare_and_submit(
-        frontend: AsyncBeamSearchFrontend, call: OnlineBeamSearchRequest
-    ) -> list[Any]:
-        request = await frontend.prepare_request(call)
-        session = await frontend.submit_once(request)
-        rank = request.items[0].request.data_parallel_rank
-        assert session.data_parallel_rank == call.data_parallel_rank == rank
-        ranks.append(rank)
-        await frontend.close(session)
-        assert session.data_parallel_rank == rank
-        return []
-
-    from vllm_gr.entrypoints.beam_search_v1.output_processor import (
-        BeamSearchOutputProcessor,
-    )
-
-    # This routing-only fixture supplies an explicit test final consumer.
-    monkeypatch.setattr(BeamSearchOutputProcessor, "ensure_available", lambda: None)
-    monkeypatch.setattr(entrypoint, "run_beam_search_v1_async", prepare_and_submit)
-    monkeypatch.setattr(serving_engine, "_dp_rank_counter", 0)
-
-    async def run() -> None:
-        for index in range(4):
-            outputs = [
-                output
-                async for output in serving_engine.beam_search_v1(
-                    serving,
-                    [1, 2],
-                    f"request-{index}",
-                    BeamSearchParams(beam_width=2, max_tokens=3),
-                )
-            ]
-            assert outputs == []
-
-    asyncio.run(run())
-    assert ranks == expected_ranks
+    with pytest.raises(BeamSearchRequestError, match="TP/PP/DP/DCP/PCP=1"):
+        _prepare_request(engine, [1, 2], BeamSearchParams(beam_width=2, max_tokens=3), online=True)
+    engine.submit_gr_session.assert_not_called()

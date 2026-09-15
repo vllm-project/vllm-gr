@@ -314,7 +314,7 @@ class TestPrepareConstraintTable:
             )
 
     def test_auto_builds_from_tokenizer_groups(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """catalog_path=None builds the tables from s_a/s_b/s_c groups (ACS default)."""
+        """catalog_path=None builds the tables from s_a/s_b/s_c groups (OneRec default)."""
         _fake_activate_provider(monkeypatch, device_type="npu", adapter=_available_adapter())
 
         resource = prepare_constraint_table(

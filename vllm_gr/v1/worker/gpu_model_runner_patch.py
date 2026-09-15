@@ -926,6 +926,12 @@ def make_patched_model_forward_gpu(_orig_model_forward):
     @wraps(_orig_model_forward)
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
         scheduler_output = getattr(self, "_current_scheduler_output", None)
+        if getattr(scheduler_output, "gr_stage_metadata", None):
+            # Stage dispatch keeps Prefill on native Forward until its graph
+            # selection is enabled; Decode has an independent startup graph.
+            return _orig_model_forward(
+                self, input_ids=input_ids, positions=positions, *args, **kwargs
+            )
         if scheduler_output is not None:
             if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
                 p_runner = get_prefill_graph_runner(self)
@@ -960,9 +966,6 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                                     slot_mapping = blk_table.slot_mapping.gpu
                             except Exception as e:
                                 logger.warning("Could not get slot_mapping: %r", e)
-                        if slot_mapping is None:
-                            logger.debug("Could not get slot_mapping: extraction unavailable.")
-
                         output_buf = p_runner.execute_model_prefill(
                             bucket=bucket,
                             input_ids=input_ids,
@@ -972,12 +975,6 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                         )
 
                         if output_buf is not None:
-                            logger.debug(
-                                "Prefill Graph Replay: Executed captured CUDA Graph for bucket %d (reqs=%d, %d actual tokens).",
-                                bucket,
-                                num_reqs,
-                                total_tokens,
-                            )
                             return output_buf
         return _orig_model_forward(self, input_ids=input_ids, positions=positions, *args, **kwargs)
 

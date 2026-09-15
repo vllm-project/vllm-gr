@@ -441,3 +441,9 @@ def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
             "additional_config key(s): " + ", ".join(repr(key) for key in legacy_keys)
         )
     additional_config[GR_CONFIG_KEY] = gr_config_to_mapping(gr_config)
+    # EngineArgs reads the defaults before applying the canonical mapping.
+    # UniProc keeps that same config object; it must not retain the old parse.
+    try:
+        object.__setattr__(vllm_config, "_vllm_gr_parsed_config", None)
+    except (AttributeError, TypeError):
+        pass

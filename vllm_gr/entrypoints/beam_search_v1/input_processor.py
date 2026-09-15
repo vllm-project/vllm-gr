@@ -88,6 +88,12 @@ def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> N
 
 
 def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
+
+    try:
+        validate_gr_execution_config(vllm_config)
+    except ValueError as error:
+        raise BeamSearchRequestError(str(error)) from error
     validate_beam_batch_request(request)
     if len(request.items) != 1:
         raise BeamSearchRequestError("beam_search_v1 currently requires exactly one prompt")
@@ -98,9 +104,13 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
         raise BeamSearchRequestError(
             "beam_search_v1 requires vllm-gr beam_max_width to be configured"
         )
-    if request.beam_params.beam_width > max_width:
+    if request.beam_params.beam_width != max_width:
         raise BeamSearchRequestError(
-            f"beam_width {request.beam_params.beam_width} exceeds runtime limit {max_width}"
+            f"Asynchronous scheduling beam_width must equal the fixed runtime width {max_width}"
+        )
+    if request.beam_params.max_tokens not in (1, 2, 3):
+        raise BeamSearchRequestError(
+            "Asynchronous scheduling supports effective generation budget N=1/2/3"
         )
     if request.beam_params.max_tokens > gr_config.beam_max_decode_steps:
         raise BeamSearchRequestError(
@@ -120,7 +130,9 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
             f"{model_config.max_model_len}"
         )
     scheduler_config = vllm_config.scheduler_config
-    if len(prompt_tokens) > scheduler_config.max_num_batched_tokens:
+    if len(prompt_tokens) > scheduler_config.max_num_batched_tokens and not getattr(
+        scheduler_config, "enable_chunked_prefill", False
+    ):
         raise BeamSearchRequestError(
             f"Prefill length {len(prompt_tokens)} exceeds max_num_batched_tokens "
             f"{scheduler_config.max_num_batched_tokens}"

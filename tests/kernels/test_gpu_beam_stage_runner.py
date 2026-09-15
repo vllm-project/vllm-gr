@@ -15,7 +15,6 @@ import torch
 from tests.constraints.test_table import make_table
 from tests.test_gr_async_scheduler import _batch_request
 from vllm_gr.constraints.loader import _upload_cuda_backend
-from vllm_gr.ops.cuda import beam_stage as ops
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
     cache_unshared_kv_graph,
@@ -41,6 +40,7 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     get_stage_runner,
     validate_dispatch,
 )
+from vllm_gr.v1.worker.gr_inputs import GRInputBuffers, bind_device_inputs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
@@ -70,9 +70,11 @@ def dispatch(m):
     return result
 
 
-def runtime(dtype=torch.float16, n=3):
+def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
     context = BeamAttentionContext(3, 6, 1, 5, 8, 2, torch.device("cuda"), dtype)
-    state = BeamSearchState(context.decision, beam_width=4, max_new_tokens=n)
+    state = BeamSearchState(
+        context.decision, beam_width=4, max_new_tokens=n, stop_token_ids=stop_token_ids
+    )
     # State row 2, workspace row 1 and KV slot 0 are intentionally distinct.
     slot = context.registry.allocate("session-0", 4, 7)
     session = BeamSearchSession("session-0", slot, context)
@@ -90,12 +92,25 @@ def runtime(dtype=torch.float16, n=3):
         worker, beam, BeamRequestBinding("session-0", 0, "session-0", 2, 0, 1), backend
     )
     owner.metadata = SimpleNamespace(
+        suffix_cu_seqlens_q_device=torch.arange(5, device="cuda", dtype=torch.int32),
         suffix_seqlens_kv_device=torch.empty(4, device="cuda", dtype=torch.int32),
         suffix_cu_seqlens_k_device=torch.empty(5, device="cuda", dtype=torch.int32),
     )
     owner.temperatures.fill_(1)
     owner.prefixes.fill_(-1)
     return owner
+
+
+def prepare_binding(owner, entry):
+    """Prime the CPU/upload contract for tests that isolate device binding."""
+    if owner.inputs is None:
+        owner.inputs = GRInputBuffers(owner.beam.state.beam_width, 64, 16, owner.beam.state.device)
+    slot = owner.pending[1] if owner.pending is not None else 0
+    owner.prepared = owner.inputs.prepare_cpu(
+        entry.metadata, entry.binding, block_ids=[[1]], slot=slot
+    )
+    owner.device_positions = owner.inputs.upload(owner.prepared)["positions"]
+    owner.prepare_decode(entry)
 
 
 def admission_worker(sliding_windows=(None, None), dtype=torch.float16):
@@ -227,7 +242,7 @@ def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
     for stage in range(n):
         execution = owner.admit(dispatch(metadata(stage, n=n)))
         if stage:
-            owner.prepare_decode(execution.entries[0])
+            prepare_binding(owner, execution.entries[0])
             current = torch.ones((4, 1, 8), device="cuda", dtype=dtype)
             for pool in owner.beam.session.pools:
                 cache_unshared_kv_graph(
@@ -283,6 +298,7 @@ def test_terminal_successor_preserves_all_layer_kv(graph):
     owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
     owner.sample().get_output()
     entry = replace(entry, metadata=metadata(1), row_count=4)
+    prepare_binding(owner, entry)
     for pool in owner.beam.session.pools:
         pool.unshared_key.fill_(123)
         pool.unshared_value.fill_(456)
@@ -393,7 +409,7 @@ def test_session_init_binding_rejected_before_writes(fault):
     torch.testing.assert_close(owner.beam.state.sequence, before)
 
 
-def test_device_prepare_nonzero_model_offset_and_strided_prefix():
+def test_device_binding_preserves_surrounding_storage_and_strided_prefix():
     owner = runtime()
     s = owner.beam.state
     s.is_initialized[2] = True
@@ -405,37 +421,14 @@ def test_device_prepare_nonzero_model_offset_and_strided_prefix():
     prefix = torch.full((3, 4, 7), 99, device="cuda", dtype=torch.int32)[:, :, :3]
     tokens = torch.full((9,), 77, device="cuda", dtype=torch.int32)
     positions = tokens.clone()
-    lengths = owner.metadata.suffix_seqlens_kv_device
     offsets = owner.metadata.suffix_cu_seqlens_k_device
-    ops.prepare_decode[(1,)](
-        s.input_ids,
-        s.sequence,
-        s.active_mask,
-        s.num_generated_tokens,
-        s.num_decode_steps,
-        s.is_initialized,
-        s.is_finished,
-        s.error_code,
-        tokens,
-        positions,
-        owner.execution_mask,
-        owner.beam.session.context.decode_step_buf,
-        prefix,
-        lengths,
-        offsets,
-        STATE_ROW=2,
-        WORKSPACE_ROW=1,
-        ROW_OFFSET=3,
-        WIDTH=4,
-        PROMPT=7,
-        TOKEN_BATCH_STRIDE=s.input_ids.stride(0),
-        SEQ_BATCH_STRIDE=s.sequence.stride(0),
-        SEQ_BEAM_STRIDE=s.sequence.stride(1),
-        PREFIX_BATCH_STRIDE=prefix.stride(0),
-        PREFIX_BEAM_STRIDE=prefix.stride(1),
-        MAX_STEPS=2,
-        BLOCK=8,
-    )
+    buffers = GRInputBuffers(4, 64, 16, "cuda")
+    prepared = buffers.prepare_cpu(metadata(2), owner.binding, block_ids=[[1]], slot=0)
+    owner.input_ids = tokens[3:7]
+    owner.positions = positions[3:7]
+    owner.prefixes = prefix[1]
+    owner.device_positions = torch.tensor(prepared.layout["positions"], device="cuda")
+    bind_device_inputs(prepared, owner)
     assert tokens.tolist() == [77, 77, 77, 3, 0, 5, 0, 77, 77]
     assert positions.tolist() == [77, 77, 77, 8, 0, 8, 0, 77, 77]
     assert prefix[1].tolist() == [[1, 2, -1], [-1, -1, -1], [1, 2, -1], [-1, -1, -1]]
@@ -462,7 +455,7 @@ def test_all_eos_successor_and_error_preserve_committed_state():
     owner.logits = torch.full((4, 6), float("inf"), device="cuda", dtype=torch.float16)
     # Populate valid prefixes for the candidate error to be an invalid score,
     # not merely an empty-table lookup.
-    owner.prepare_decode(owner.pending[0].entries[0])
+    prepare_binding(owner, owner.pending[0].entries[0])
     protected = {
         name: value.clone()
         for name, value in vars(state).items()
@@ -475,7 +468,7 @@ def test_all_eos_successor_and_error_preserve_committed_state():
     for name, value in protected.items():
         torch.testing.assert_close(getattr(state, name), value)
     execution = owner.admit(dispatch(metadata(2)))
-    owner.prepare_decode(execution.entries[0])
+    prepare_binding(owner, execution.entries[0])
     owner.logits = torch.zeros((4, 6), device="cuda", dtype=torch.float16)
     successor = owner.sample().get_output()
     assert getattr(successor, GR_WORKER_RESULT_ATTR)["session-0"].produced_token_count == 0
@@ -524,7 +517,7 @@ def test_workspace_bounds_and_exclusive_shared_scratch():
         second.initialize_from_prefill(*values)
 
 
-def test_graph_geometry_change_requires_drained_binding_refresh():
+def test_fresh_metadata_updates_contents_without_changing_graph_addresses():
     owner = runtime()
     owner.metadata = None
     owner.worker.requests = {"session-0": SimpleNamespace(block_ids=([1],))}
@@ -535,17 +528,24 @@ def test_graph_geometry_change_requires_drained_binding_refresh():
     )
     owner.worker.parallel_config = SimpleNamespace()
     owner.worker.model_config = SimpleNamespace(
-        get_num_attention_heads=lambda _: 1, get_num_kv_heads=lambda _: 1
+        max_model_len=64, get_num_attention_heads=lambda _: 1, get_num_kv_heads=lambda _: 1
     )
-    owner._bind_attention(metadata())
+    first = metadata(1)
+    owner.prepared = owner.prepare_cpu(first, 0)
+    owner._bind_attention(first)
     old = owner.metadata
-    owner.graph = object()
-    changed = replace(metadata(), num_prompt_tokens=8)
-    with pytest.raises(RuntimeError, match="drain and release"):
-        owner._bind_attention(changed)
-    assert owner.metadata is old
-    # This flag is published only after release and re-admission in production.
-    owner.attention_needs_refresh = True
+    graph = owner.graph = object()
+    owner.worker.requests["session-0"].block_ids = ([2],)
+    changed = replace(metadata(2), num_prompt_tokens=8)
+    owner.prepared = owner.prepare_cpu(changed, 1)
     owner._bind_attention(changed)
-    assert owner.graph is None and owner.metadata is not old
+    assert owner.metadata is not old
+    assert owner.graph is graph
+    assert owner.metadata.prefix_block_table.data_ptr() == old.prefix_block_table.data_ptr()
     assert owner.metadata.prefix_seqlens_kv_device.tolist() == [8]
+    assert owner.metadata.prefix_block_table.tolist() == [[2, 0, 0, 0]]
+    assert owner.metadata.suffix_seqlens_kv_cpu == [2] * 4
+    assert old.suffix_seqlens_kv_cpu == [1] * 4
+    assert owner.metadata.num_reqs == 1
+    assert owner.metadata.query_start_loc_cpu == [0, 4]
+    assert owner.metadata.prefix_max_seq_len == 64

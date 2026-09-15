@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Worker-side beam decision for incremental beam decode (ACS-aligned).
+"""Worker-side beam decision for incremental beam decode (asynchronous scheduling).
 
 After the accelerator model forward produces top-k candidates (from the sampler's
 logprob tensors, or the Constraint Table ``rec_constrained_topk`` override),
@@ -15,8 +15,8 @@ the full ``W * K`` logprob tensor to the frontend for a NumPy ``argpartition``:
 Cumulative scores and sequence history live in the device-resident
 :class:`~vllm_gr.v1.beam.beam_attention_context.BeamDecisionBuffers`
 (``context.decision``), which the worker treats as the single source of truth,
-mirroring the ACS ``BeamSearchContext.decode_select`` + ``init_from_prefill``
-save flow.  The result dict (``out_token_ids`` / ``out_token_index`` /
+through Prefill initialization and subsequent asynchronous Decode updates.
+The result dict (``out_token_ids`` / ``out_token_index`` /
 ``out_log_probs`` / ``out_sequence``) is attached to
 ``ModelRunnerOutput.beam_search_result`` and consumed by the serving frontend.
 
@@ -1010,7 +1010,7 @@ def init_beam_decision_state(
 ) -> None:
     """Seed the persistent decision buffers from the first candidate round.
 
-    Mirrors ACS ``BeamSearchContext.init_from_prefill``: at the first
+    At the first
     decision step each beam (one row of ``[B*W, W]`` candidates) contributes
     its top candidate token and score to ``sequence[..., 0]`` and
     ``beam_scores``, so the subsequent ``beam_search_group`` steps read
@@ -1104,7 +1104,7 @@ def _select_candidates(
     sampled token in column 0; the constrained override already replaced the
     constrained rows with the fixed-width ``W`` operator output.  For
     unconstrained rows we drop the sampled-token column to get exactly ``W``
-    candidates per beam, matching ACS ``model_runner_v1``.
+    candidates per beam.
 
     dtype: the ``.to(...)`` casts are skipped when the source tensor already
     carries the target dtype (``torch.Tensor.to`` short-circuits, but the
@@ -1207,10 +1207,10 @@ def _reorder_kv_same_step(
     beam_index: torch.Tensor,
     group_token_num: torch.Tensor,
 ) -> None:
-    """Apply the beam decision's KV reorder inside the SAME step (ACS timing).
+    """Apply the beam decision's KV reorder inside the SAME step.
 
-    ACS ``decode_select`` runs ``select_unshared_kv`` immediately after
-    ``beam_search_group`` (context.py:471-480) — the next step's attention
+    Asynchronous scheduling runs ``select_unshared_kv`` immediately after
+    ``beam_search_group`` — the next step's attention
     then reads an already-reordered pool with no frontend round-trip in the
     critical path.  ``beam_search_group`` output is grouped by source beam
     ascending (the torch reference's stable ``argsort(parent)`` locks the
@@ -1275,14 +1275,14 @@ def _finalize_decision(
     beam_width: int,
     result_width: int,
 ) -> dict[str, torch.Tensor]:
-    """Persist cumulative state + run the ACS decode_select post-processing.
+    """Persist cumulative state and apply the asynchronous Beam decision.
 
     Non-final steps (``prefix`` is not None): convert the operator's GLOBAL
     ``request * beam_width`` offsets to request-local form for both the
-    parent mapping and the prefix sums (ACS context.py:458-468), persist
+    parent mapping and the prefix sums, persist
     ``group_token_num`` for the fused ``select_unshared_kv`` kernel, and
     reorder the KV pool in the SAME step.  Final steps (``prefix is None``):
-    no reorder (ACS skips select_unshared_kv on the last step).
+    no reorder (select_unshared_kv is skipped on the last step).
     """
     # Persist cumulative state back into the fixed-address buffers.
     write_w = min(out_seq.shape[1], bufs.sequence.shape[1])
@@ -1329,7 +1329,7 @@ def _run_npu_decision(
     is_last_step: bool,
     result_width: int,
 ) -> dict[str, torch.Tensor] | None:
-    """Run the fused xllm decision operators (ACS decode_select equivalent)."""
+    """Run the fused xllm decision operators."""
     from vllm_gr.ops.npu import beam_ops
 
     bufs = session.context.decision

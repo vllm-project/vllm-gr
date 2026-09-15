@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""A1 contracts for EngineCore-owned asynchronous Beam Search V1 execution.
-
-This module defines state and extension points only. A2-A5 provide the
-request, scheduler, executor, Worker-state, and terminal-result implementations.
-"""
+"""Contracts for EngineCore-owned Asynchronous scheduling Beam Search V1 execution and retirement."""
 
 from __future__ import annotations
 
@@ -39,6 +35,99 @@ class GRSessionStatus(str, Enum):
     FAILED = "failed"
 
 
+class GRResourceStatus(str, Enum):
+    WAITING = "waiting"
+    RUNNING = "running"
+    DRAINING = "draining"
+    RETIRING = "retiring"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True, slots=True)
+class GRExecutionCapacity:
+    """Shared Asynchronous scheduling admission contract; storage capacity does not enable concurrency."""
+
+    beam_width: int
+    active_sessions: int = 1
+    dispatches_per_session: int = 2
+
+    def __post_init__(self) -> None:
+        if type(self.beam_width) is not int or not 1 <= self.beam_width <= 256:
+            raise ValueError(
+                "Asynchronous scheduling requires a fixed physical beam width in [1, 256]"
+            )
+        if (
+            type(self.active_sessions) is not int
+            or self.active_sessions != 1
+            or type(self.dispatches_per_session) is not int
+            or self.dispatches_per_session != 2
+        ):
+            raise ValueError(
+                "Asynchronous scheduling requires one execution owner and two dispatch slots"
+            )
+
+    def validate(self, params: BeamBatchParams) -> None:
+        if (
+            type(params.beam_width) is not int
+            or params.beam_width != self.beam_width
+            or type(params.max_tokens) is not int
+            or params.max_tokens not in (1, 2, 3)
+        ):
+            raise ValueError(
+                "Asynchronous scheduling requires the startup beam width and effective N=1/2/3"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class GRRetireMetadata:
+    session_id: str
+    owner_generation: int
+    retire_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class GRRetireResult:
+    session_id: str
+    owner_generation: int
+    retire_id: int
+    released: bool
+
+
+def validate_gr_execution_config(config: Any) -> None:
+    """Reject unsupported Asynchronous scheduling runtimes before native/Worker request allocation."""
+    if not config.scheduler_config.async_scheduling:
+        raise ValueError("Asynchronous scheduling requires async_scheduling=True")
+    parallel = getattr(config, "parallel_config", None)
+    for name in (
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "decode_context_parallel_size",
+        "prefill_context_parallel_size",
+    ):
+        if getattr(parallel, name, 1) != 1:
+            raise ValueError("Asynchronous scheduling requires TP/PP/DP/DCP/PCP=1")
+    if getattr(parallel, "use_ubatching", False):
+        raise ValueError("Asynchronous scheduling does not support microbatching")
+    for name in ("speculative_config", "lora_config", "kv_transfer_config", "ec_transfer_config"):
+        if getattr(config, name, None) is not None:
+            raise ValueError(f"Asynchronous scheduling does not support {name}")
+    model = getattr(config, "model_config", None)
+    if any(
+        getattr(model, name, False)
+        for name in ("is_encoder_decoder", "is_hybrid", "is_multimodal_model")
+    ):
+        raise ValueError("Asynchronous scheduling requires a uniform text decoder model")
+    dtype = getattr(model, "dtype", None)
+    if dtype is not None and str(dtype) not in ("torch.float16", "torch.bfloat16"):
+        raise ValueError("Asynchronous scheduling requires FP16 or BF16")
+    if getattr(model, "quantization", None) is not None:
+        raise ValueError("Asynchronous scheduling does not support quantization")
+    device = getattr(getattr(config, "device_config", None), "device", None)
+    if device is not None and str(device).split(":")[0] != "cuda":
+        raise ValueError("Asynchronous scheduling requires GPU ModelRunner V1")
+
+
 @dataclass(frozen=True, slots=True)
 class GRDeviceStateRef:
     """Reference to Beam state that remains owned by the Worker device."""
@@ -52,8 +141,8 @@ class GRSessionState:
     """EngineCore scheduling state for one B=1 GR session.
 
     ``issued_stages`` and ``completed_stages`` count only output-producing
-    logical stages. Physical dispatches, including no-output Prefill
-    recomputation, are tracked separately by private EngineCore state.
+    logical stages. Physical dispatches, including no-output initial Prefill
+    chunks, are tracked separately by private EngineCore state.
     ``output_placeholders`` reserves results that have been scheduled but are
     not yet confirmed on the host.
 
@@ -75,6 +164,10 @@ class GRSessionState:
     pending_device_token_count: int = 0
     latest_device_state: GRDeviceStateRef | None = None
     terminal_result_pending: bool = False
+    resource_status: GRResourceStatus = GRResourceStatus.WAITING
+    owner_generation: int = 0
+    retirement: GRRetireMetadata | None = None
+    worker_resources_allocated: bool = False
     # EngineCore-private lifecycle state. These fields are excluded from the
     # constructor and never cross the Scheduler/Worker boundary.
     _next_dispatch_id: int = field(default=0, init=False, repr=False)
@@ -127,13 +220,13 @@ class GRSessionState:
 class GRStageMetadata:
     """GR metadata attached to one native vLLM ``SchedulerOutput``.
 
-    Stage 0 is Prefill. Stages 1..N are Decode steps 0..N-1. ``dispatch_id``
-    identifies every physical invocation, including no-output recomputation;
-    ``stage_index`` advances only for output-producing logical stages. A4 must
-    echo both IDs in GRWorkerResult so A3 can reject stale or mismatched work.
+    Stage 0 is Prefill. For effective budget N, stages 1..N-1 are Decode
+    steps 0..N-2. ``dispatch_id`` identifies every physical invocation,
+    including no-output initial Prefill chunks; ``stage_index`` advances only
+    for output-producing stages. Worker echoes both IDs in GRWorkerResult.
 
-    A3 attaches SchedulerOutput.gr_v1_stages: dict[str, GRStageMetadata], keyed
-    by session_id; one native output may contain stages from several sessions.
+    SchedulerOutput.gr_stage_metadata is keyed by session_id. Asynchronous scheduling admits one
+    execution owner; owner_generation distinguishes reuse of a session ID.
     session_init carries the existing B=1 request (Beam parameters, output
     options and beam_params.constraint_resource_id) once, with Prefill only.
     Native SchedulerOutput supplies prompt/KV data. Stage k > 0 references
@@ -154,6 +247,8 @@ class GRStageMetadata:
     num_prompt_tokens: int
     produces_output: bool = True
     session_init: BeamBatchRequest | None = None
+    owner_generation: int = 0
+    execution_capacity: GRExecutionCapacity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,12 +386,17 @@ class GREngineCoreInterface(Protocol):
 __all__ = [
     "GRAsyncSchedulerInterface",
     "GRDeviceStateRef",
+    "GRExecutionCapacity",
     "GREngineCoreInterface",
     "GRModelExecutorInterface",
+    "GRResourceStatus",
+    "GRRetireMetadata",
+    "GRRetireResult",
     "GRSessionState",
     "GRSessionStatus",
     "GRStageCompletion",
     "GRStageKind",
     "GRStageMetadata",
     "GRWorkerResult",
+    "validate_gr_execution_config",
 ]

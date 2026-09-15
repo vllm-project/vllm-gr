@@ -216,7 +216,7 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         default=None,
         help="Move the beam decision (beam_search_group / rec_final_select + "
         "select_unshared_kv) into the accelerator worker and return results via "
-        "ModelRunnerOutput.beam_search_result (ACS-aligned save flow). CUDA "
+        "ModelRunnerOutput.beam_search_result (asynchronous result flow). CUDA "
         "beam deployments enable this by default; NPU requires xllm decode "
         "execution and its operator library. Without it the frontend NumPy "
         "decision path is kept.",

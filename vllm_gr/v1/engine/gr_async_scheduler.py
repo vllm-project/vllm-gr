@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from vllm_gr.v1.beam.batch_contracts import (
@@ -15,18 +16,25 @@ from vllm_gr.v1.beam.batch_contracts import (
 )
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
+    GRExecutionCapacity,
+    GRResourceStatus,
+    GRRetireMetadata,
+    GRRetireResult,
     GRSessionState,
     GRSessionStatus,
     GRStageCompletion,
     GRStageKind,
     GRStageMetadata,
     GRWorkerResult,
+    validate_gr_execution_config,
 )
 
 GR_STAGE_OUTPUT_ATTR = "gr_stage_metadata"
 GR_WORKER_RESULT_ATTR = "gr_worker_results"
 GR_BATCH_RESULT_ATTR = "gr_batch_results"
 GR_LOOKAHEAD_DEPTH = 2
+GR_RETIRE_OUTPUT_ATTR = "gr_retire_metadata"
+GR_RETIRE_RESULT_ATTR = "gr_retire_result"
 _DRAINING_STATUSES = frozenset(
     {
         GRSessionStatus.FINISHING,
@@ -46,6 +54,153 @@ def _sessions(scheduler: Any) -> dict[str, GRSessionState]:
         sessions = {}
         scheduler._gr_v1_sessions = sessions
     return sessions
+
+
+def _progress(scheduler: Any) -> None:
+    scheduler._gr_progress = getattr(scheduler, "_gr_progress", 0) + 1
+
+
+def _admit_owner(scheduler: Any) -> GRSessionState | None:
+    sessions = _sessions(scheduler)
+    owner_id = getattr(scheduler, "_gr_owner", None)
+    if owner_id is not None:
+        return sessions[owner_id]
+    # Dict insertion order is the session FIFO, independent of native priority.
+    for session in sessions.values():
+        if session.resource_status is GRResourceStatus.WAITING:
+            generation = getattr(scheduler, "_gr_owner_generation", 0) + 1
+            scheduler._gr_owner_generation = generation
+            scheduler._gr_owner = session.session_id
+            session.owner_generation = generation
+            session.resource_status = GRResourceStatus.RUNNING
+            _progress(scheduler)
+            return session
+    return None
+
+
+class _AdmissionQueue:
+    """Filtered native queue: hidden requests retain their objects and FIFO positions."""
+
+    def __init__(self, queue: Any, owner_id: str):
+        self.queue, self.owner_id = queue, owner_id
+
+    def __iter__(self):
+        return (r for r in self.queue if r.request_id == self.owner_id)
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+    def __bool__(self):
+        return any(True for _ in self)
+
+    def peek_request(self):
+        return next(iter(self))
+
+    def pop_request(self):
+        request = self.peek_request()
+        self.queue.remove_request(request)
+        return request
+
+    def __getattr__(self, name):
+        return getattr(self.queue, name)
+
+
+@contextmanager
+def gr_admission(scheduler: Any):
+    """Gate native selection and reserve the full logical KV extent on first allocation."""
+    owner = _admit_owner(scheduler)
+    if owner is None:
+        yield
+        return
+    waiting, skipped = scheduler.waiting, scheduler.skipped_waiting
+    budget = scheduler.max_num_scheduled_tokens
+    manager = scheduler.kv_cache_manager
+    allocate = manager.allocate_slots
+
+    def reserve(request, num_new_tokens, *args, **kwargs):
+        if request.request_id != owner.session_id:
+            raise RuntimeError("Asynchronous scheduling allocation escaped the execution owner")
+        computed = request.num_computed_tokens + kwargs.get("num_new_computed_tokens", 0)
+        extent = request.num_prompt_tokens + owner.max_decode_steps
+        kwargs["num_lookahead_tokens"] = max(0, extent - computed - num_new_tokens)
+        result = allocate(request, num_new_tokens, *args, **kwargs)
+        if result is None and owner.issued_stages:
+            raise RuntimeError(
+                "Asynchronous scheduling lost reserved KV capacity after Beam generation"
+            )
+        return result
+
+    scheduler.waiting = _AdmissionQueue(waiting, owner.session_id)
+    scheduler.skipped_waiting = _AdmissionQueue(skipped, owner.session_id)
+    manager.allocate_slots = reserve
+    if not can_issue_gr_stage(scheduler, owner):
+        scheduler.max_num_scheduled_tokens = 0
+    try:
+        yield
+    finally:
+        scheduler.waiting, scheduler.skipped_waiting = waiting, skipped
+        scheduler.max_num_scheduled_tokens = budget
+        manager.allocate_slots = allocate
+
+
+def _drain_resources(scheduler: Any, session: GRSessionState) -> None:
+    session.resource_status = GRResourceStatus.DRAINING
+    if not session.worker_resources_allocated:
+        _release_owner(scheduler, session)
+
+
+def _release_owner(scheduler: Any, session: GRSessionState) -> None:
+    session.resource_status = GRResourceStatus.CLOSED
+    _sessions(scheduler).pop(session.session_id, None)
+    if getattr(scheduler, "_gr_owner", None) == session.session_id:
+        scheduler._gr_owner = None
+    _progress(scheduler)
+
+
+def attach_gr_retirement(scheduler: Any, output: Any) -> None:
+    owner = _sessions(scheduler).get(getattr(scheduler, "_gr_owner", None))
+    if (
+        owner is None
+        or owner.resource_status is not GRResourceStatus.DRAINING
+        or owner._in_flight_dispatches
+        or owner.terminal_result_pending
+    ):
+        return
+    if output.total_num_scheduled_tokens:
+        raise RuntimeError("Asynchronous scheduling retirement must be a zero-token control frame")
+    retire_id = getattr(scheduler, "_gr_retire_id", 0) + 1
+    scheduler._gr_retire_id = retire_id
+    owner.retirement = GRRetireMetadata(owner.session_id, owner.owner_generation, retire_id)
+    owner.resource_status = GRResourceStatus.RETIRING
+    setattr(output, GR_RETIRE_OUTPUT_ATTR, owner.retirement)
+    output.finished_req_ids.add(owner.session_id)
+    _progress(scheduler)
+
+
+def consume_gr_retirement(scheduler: Any, output: Any, model_output: Any) -> None:
+    metadata = getattr(output, GR_RETIRE_OUTPUT_ATTR, None)
+    if metadata is None:
+        return
+    session = _sessions(scheduler).get(metadata.session_id)
+    if session is None or session.retirement != metadata:
+        return  # A duplicate/stale receipt cannot release the current owner.
+    result = getattr(model_output, GR_RETIRE_RESULT_ATTR, None)
+    expected = GRRetireResult(
+        metadata.session_id, metadata.owner_generation, metadata.retire_id, True
+    )
+    if (
+        not isinstance(result, GRRetireResult)
+        or type(result.owner_generation) is not int
+        or type(result.retire_id) is not int
+        or result.released is not True
+        or result != expected
+    ):
+        # A missing/mismatched release proof is a Worker protocol failure.
+        # Never continue service by guessing that the shared buffers are free.
+        raise RuntimeError(
+            "Asynchronous scheduling Worker did not prove release of the matching execution owner"
+        )
+    _release_owner(scheduler, session)
 
 
 def _install_gr_prompt_cache_guard(scheduler: Any) -> None:
@@ -81,6 +236,31 @@ def add_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionState:
     sessions = _sessions(scheduler)
     if session_id in sessions:
         raise ValueError(f"GR session already exists: {session_id}")
+    config = getattr(scheduler, "vllm_config", None)
+    if config is not None:
+        validate_gr_execution_config(config)
+    capacity = getattr(scheduler, "_gr_execution_capacity", None)
+    if capacity is None:
+        from vllm_gr.config import GRConfig
+
+        width = GRConfig.from_vllm_config(config).beam_max_width if config is not None else None
+        if config is not None and width is None:
+            raise ValueError(
+                "Asynchronous scheduling requires beam_max_width to be fixed at startup"
+            )
+        capacity = GRExecutionCapacity(width or request.beam_params.beam_width)
+        scheduler._gr_execution_capacity = capacity
+    capacity.validate(request.beam_params)
+    manager = getattr(scheduler, "kv_cache_manager", None)
+    if manager is not None:
+        pool = manager.block_pool
+        block_size = scheduler.cache_config.block_size
+        extent = len(engine_request.prompt_token_ids) + request.beam_params.max_tokens - 1
+        if (
+            extent >= manager.max_model_len
+            or (extent + block_size - 1) // block_size > pool.num_gpu_blocks - 1
+        ):
+            raise ValueError("Asynchronous scheduling request exceeds the total native KV capacity")
     session = GRSessionState(
         session_id=session_id,
         request=request,
@@ -90,12 +270,15 @@ def add_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionState:
     )
     _install_gr_prompt_cache_guard(scheduler)
     sessions[session_id] = session
+    _admit_owner(scheduler)
     return session
 
 
 def can_issue_gr_stage(scheduler: Any, session: GRSessionState) -> bool:
     return (
-        session.status in (GRSessionStatus.WAITING, GRSessionStatus.RUNNING)
+        getattr(scheduler, "_gr_owner", None) == session.session_id
+        and session.resource_status is GRResourceStatus.RUNNING
+        and session.status in (GRSessionStatus.WAITING, GRSessionStatus.RUNNING)
         and session.next_stage_kind is not None
         and len(session._in_flight_dispatches) < GR_LOOKAHEAD_DEPTH
     )
@@ -117,11 +300,17 @@ def attach_gr_stage_metadata(
     native_request = scheduler.requests.get(req_id)
     if native_request is None:
         return None
+    if not can_issue_gr_stage(scheduler, session):
+        raise RuntimeError("native Scheduler selected a blocked Asynchronous scheduling dispatch")
 
     # Initial chunked Prefill and post-preemption recomputation do not produce
     # a token. Physical dispatch accounting still tracks them, but logical
     # stage, placeholder, and device-state ownership must not advance.
     prefill_chunk = bool(native_request.is_prefill_chunk)
+    if prefill_chunk and session.issued_stages:
+        raise RuntimeError(
+            "Asynchronous scheduling cannot recompute Prefill after Beam initialization"
+        )
     dispatch_id = session._next_dispatch_id
     stage_index = session.issued_stages
     kind = GRStageKind.PREFILL if prefill_chunk or stage_index == 0 else GRStageKind.DECODE
@@ -139,6 +328,8 @@ def attach_gr_stage_metadata(
         output_options=session.request.output_options,
         num_prompt_tokens=int(native_request.num_prompt_tokens),
         produces_output=not prefill_chunk,
+        owner_generation=session.owner_generation,
+        execution_capacity=scheduler._gr_execution_capacity,
     )
     manager = getattr(scheduler, "kv_cache_manager", None)
     if manager is not None:
@@ -154,6 +345,8 @@ def attach_gr_stage_metadata(
         )
     session._next_dispatch_id += 1
     session._in_flight_dispatches.add(dispatch_id)
+    session.worker_resources_allocated = True
+    _progress(scheduler)
     if not prefill_chunk:
         session.issued_stages += 1
         session.status = GRSessionStatus.RUNNING
@@ -195,27 +388,22 @@ def _read_worker_payload(
     session: GRSessionState,
     metadata: GRStageMetadata,
     model_output: Any,
-) -> tuple[GRWorkerResult | None, BeamBatchResult | None, int, bool]:
-    """Read and validate one output-producing dispatch response.
-
-    A missing ``gr_worker_results`` attribute is retained as the A3-only
-    compatibility path. Once A4 attaches the mapping, an entry for every GR
-    dispatch is mandatory and must echo its identity.
-    """
+) -> tuple[GRWorkerResult, BeamBatchResult | None, int, bool]:
+    """Require a Worker receipt with matching identity for every active dispatch."""
     worker_results = _result_mapping(model_output, GR_WORKER_RESULT_ATTR)
     worker_result = worker_results.get(session.session_id) if worker_results is not None else None
-    if worker_results is not None and worker_result is None:
+    if worker_result is None:
         raise _GRWorkerProtocolError("Worker omitted GRWorkerResult for a dispatched GR stage")
-    if worker_result is not None and not isinstance(worker_result, GRWorkerResult):
+    if not isinstance(worker_result, GRWorkerResult):
         raise _GRWorkerProtocolError("Worker returned an invalid GRWorkerResult")
-    if worker_result is not None and (
+    if (
         worker_result.session_id != session.session_id
         or worker_result.dispatch_id != metadata.dispatch_id
         or worker_result.stage_index != metadata.stage_index
     ):
         raise _GRWorkerProtocolError("Worker returned a GR result for a different dispatch")
 
-    terminal_result = worker_result.terminal_result if worker_result is not None else None
+    terminal_result = worker_result.terminal_result
     if terminal_result is None:
         terminal_results = _result_mapping(model_output, GR_BATCH_RESULT_ATTR)
         if terminal_results is not None:
@@ -232,12 +420,8 @@ def _read_worker_payload(
         if terminal_result.batch_id != session.session_id:
             raise _GRWorkerProtocolError("Worker returned a terminal result for another session")
 
-    produced = (
-        worker_result.produced_token_count
-        if worker_result is not None
-        else int(metadata.produces_output)
-    )
-    worker_finished = bool(worker_result.finished) if worker_result is not None else False
+    produced = worker_result.produced_token_count
+    worker_finished = bool(worker_result.finished)
     if not isinstance(produced, int) or isinstance(produced, bool) or produced not in (0, 1):
         raise _GRWorkerProtocolError("Worker returned an invalid produced_token_count")
     if (
@@ -249,11 +433,7 @@ def _read_worker_payload(
         raise _GRWorkerProtocolError("Worker returned no token for a non-terminal logical stage")
     if not metadata.produces_output and produced != 0:
         raise _GRWorkerProtocolError("Worker produced a token for a non-output Prefill chunk")
-    if (
-        worker_result is not None
-        and produced == 1
-        and worker_result.device_state != metadata.output_device_state
-    ):
+    if produced == 1 and worker_result.device_state != metadata.output_device_state:
         raise _GRWorkerProtocolError("Worker returned a device state for a different logical stage")
     return worker_result, terminal_result, produced, worker_finished
 
@@ -278,11 +458,15 @@ def update_gr_from_output(
         return _stage_completion(session, session.completed_stages, model_output)
 
     # Completion is keyed by the physical dispatch rather than logical stage.
-    # Recompute chunks can reuse a logical stage, while each dispatched
+    # Initial Prefill chunks can share a logical stage, while each dispatched
     # SchedulerOutput must still be consumed exactly once.
-    if metadata.dispatch_id not in session._in_flight_dispatches:
+    if (
+        metadata.owner_generation != session.owner_generation
+        or metadata.dispatch_id not in session._in_flight_dispatches
+    ):
         return _stage_completion(session, metadata.stage_index, model_output)
     session._in_flight_dispatches.remove(metadata.dispatch_id)
+    _progress(scheduler)
     blocks = session._kv_dispatch_leases.pop(metadata.dispatch_id, None)
     if blocks is not None:
         scheduler.kv_cache_manager.block_pool.free_blocks(blocks)
@@ -299,7 +483,7 @@ def update_gr_from_output(
             session.status in (GRSessionStatus.ABORTED, GRSessionStatus.FAILED)
             or not session.terminal_result_pending
         ):
-            _sessions(scheduler).pop(session.session_id, None)
+            _drain_resources(scheduler, session)
         return _stage_completion(session, metadata.stage_index, model_output)
 
     try:
@@ -314,6 +498,7 @@ def update_gr_from_output(
             session.status = GRSessionStatus.FINISHING
             session.terminal_result_pending = True
             session._pending_terminal_result = terminal_result
+            session.resource_status = GRResourceStatus.DRAINING
         return _stage_completion(
             session, metadata.stage_index, model_output, finished=worker_finished
         )
@@ -327,16 +512,13 @@ def update_gr_from_output(
         session.status = GRSessionStatus.FINISHING
         session.terminal_result_pending = True
         session._pending_terminal_result = terminal_result
+        session.resource_status = GRResourceStatus.DRAINING
     return _stage_completion(
         session,
         metadata.stage_index,
         model_output,
         finished=finished,
-        device_state=(
-            worker_result.device_state
-            if worker_result is not None
-            else metadata.output_device_state
-        ),
+        device_state=worker_result.device_state,
     )
 
 
@@ -360,6 +542,7 @@ def _fail_gr_dispatch(
     if metadata.produces_output:
         session.completed_stages += 1
     session.status = GRSessionStatus.FINISHING
+    session.resource_status = GRResourceStatus.DRAINING
     session.terminal_result_pending = True
     if session._pending_terminal_result is None:
         session._pending_terminal_result = _make_failure_result(
@@ -403,13 +586,14 @@ def _close_gr_session(scheduler: Any, session: GRSessionState) -> None:
     session.output_placeholders = 0
     session.pending_device_token_count = 0
     session.status = GRSessionStatus.FINISHED
-    _sessions(scheduler).pop(session.session_id, None)
+    _drain_resources(scheduler, session)
 
 
 def finish_gr_session(
     scheduler: Any, session: GRSessionState, status: GRSessionStatus
 ) -> BeamBatchResult | None:
     session.status = status
+    _drain_resources(scheduler, session)
     session.terminal_result_pending = False
     if status == GRSessionStatus.FAILED:
         return _make_failure_result(session, "engine_failure", "GR session failed in EngineCore")
@@ -425,7 +609,7 @@ def abort_gr_session(scheduler: Any, session_id: str) -> None:
         session.terminal_result_pending = False
     scheduler.finish_requests(session_id, RequestStatus.FINISHED_ABORTED)
     if session is not None and not session._in_flight_dispatches:
-        _sessions(scheduler).pop(session_id, None)
+        _drain_resources(scheduler, session)
 
 
 def release_gr_session(scheduler: Any, session_id: str) -> None:
@@ -434,7 +618,11 @@ def release_gr_session(scheduler: Any, session_id: str) -> None:
         return
     if session._in_flight_dispatches:
         raise RuntimeError("cannot release a GR session with in-flight stages")
-    del _sessions(scheduler)[session_id]
+    if session.worker_resources_allocated:
+        raise RuntimeError(
+            "Asynchronous scheduling release requires a matching Worker retirement proof"
+        )
+    _release_owner(scheduler, session)
 
 
 def install_gr_scheduler_methods(scheduler_cls: type[Any]) -> None:

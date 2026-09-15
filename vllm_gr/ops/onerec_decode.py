@@ -346,7 +346,7 @@ def _beam_search_group_torch(
         # Matches the NPU kernel's legacy initialization contract (verified on
         # device): only the flat sequence rows [0, batch_size) receive their
         # own row's first candidate token; every other output stays zero.
-        # The ACS integration bypasses this path through init_from_prefill.
+        # The Asynchronous scheduling integration bypasses this path through init_from_prefill.
         flat_out_sequence = out_sequence.reshape(-1, total_rounds)
         flat_out_sequence[:batch_size, 0] = top_tokens[:batch_size, 0].to(torch.int32)
         return (

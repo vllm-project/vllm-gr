@@ -38,7 +38,7 @@ _BEAM_MAX_DECODE_STEPS_DEFAULT: int = 3  # OneRec SID: max_tokens=5 minus begin/
 
 # Sentinel catalog_path for the NPU default Constraint Table backend: the
 # tables are auto-built from the tokenizer's s_a/s_b/s_c token groups instead
-# of a catalog triples document (ACS-aligned OneRec default).
+# of a catalog triples document (OneRec default).
 AUTO_CONSTRAINT_TABLE_PATH: str = "__vllm_gr_auto_constraint_table__"
 
 
@@ -137,7 +137,7 @@ class GRConfig:
     # None = unset (the Driver applies platform defaults).  True moves the beam
     # decision (beam_search_group / beam_search_rec_final_select +
     # select_unshared_kv) into the accelerator worker and returns the result via
-    # ModelRunnerOutput.beam_search_result, aligning with the ACS save flow.
+    # ModelRunnerOutput.beam_search_result, aligning with the asynchronous scheduling save flow.
     # CUDA beam deployments default to True; NPU requires xllm execution.
     # False explicitly keeps the frontend NumPy path.
     beam_worker_decision: bool | None = None
