@@ -8,8 +8,100 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
 from vllm_gr.v1.worker import model_runner_common as common
+
+
+def test_async_scheduling_decode_bypasses_prefill_graph_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = SimpleNamespace(
+        gr_stage_metadata={"request": SimpleNamespace(kind=GRStageKind.DECODE)}
+    )
+    runner = SimpleNamespace(_current_scheduler_output=output)
+    tokens, positions, hidden = object(), object(), object()
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Asynchronous scheduling entered the legacy bucket Prefill graph")
+
+    def original(self: Any, input_ids: Any, positions: Any) -> Any:
+        assert self is runner and input_ids is tokens
+        return hidden
+
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", forbidden)
+    assert gpu_patch.make_patched_model_forward(original)(runner, tokens, positions) is hidden
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "bucket, captured, replay", [(4, True, True), (8, True, False), (4, False, False)]
+)
+def test_async_scheduling_prefill_reuses_existing_runner_without_padding_or_runtime_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    bucket: int,
+    captured: bool,
+    replay: bool,
+) -> None:
+    tokens, positions = torch.zeros(4, dtype=torch.int32), torch.arange(4)
+    hidden, eager = object(), object()
+    calls: list[str] = []
+    output = SimpleNamespace(
+        gr_stage_metadata={"request": SimpleNamespace(kind=GRStageKind.PREFILL)},
+        num_scheduled_tokens={"request": 4},
+        total_num_scheduled_tokens=4,
+    )
+
+    def execute_model_prefill(**kwargs: Any) -> Any:
+        assert kwargs["input_ids"] is tokens
+        assert kwargs["positions"] is positions
+        assert kwargs["bucket"] == 4
+        calls.append("replay")
+        return hidden
+
+    prefill = SimpleNamespace(
+        match_bucket=lambda _: bucket,
+        has_captured_graph=lambda *args: captured,
+        execute_model_prefill=execute_model_prefill,
+    )
+    runner = SimpleNamespace(
+        _current_scheduler_output=output,
+        _prefill_graph_runner=prefill,
+        model_config=SimpleNamespace(enforce_eager=False),
+        input_batch=SimpleNamespace(
+            block_table=[SimpleNamespace(slot_mapping=SimpleNamespace(gpu=positions))]
+        ),
+    )
+
+    def original(self: Any, input_ids: Any, positions: Any) -> Any:
+        assert input_ids is tokens
+        calls.append("eager")
+        return eager
+
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
+    result = gpu_patch.make_patched_model_forward(original)(runner, tokens, positions)
+    assert result is (hidden if replay else eager)
+    assert calls == (["replay"] if replay else ["eager"])
+
+
+@pytest.mark.parametrize("enforce_eager", [True, False])  # type: ignore[misc]
+def test_async_scheduling_prefill_never_initializes_a_graph_runner_during_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    enforce_eager: bool,
+) -> None:
+    runner = SimpleNamespace(
+        _current_scheduler_output=SimpleNamespace(
+            gr_stage_metadata={"r": SimpleNamespace(kind=GRStageKind.PREFILL)}
+        ),
+        model_config=SimpleNamespace(enforce_eager=enforce_eager),
+    )
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("request allocated a graph runner")
+
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", forbidden)
+    assert gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(runner) == "eager"
 
 
 def test_gpu_prepare_preserves_order_and_two_item_contract(

@@ -10,6 +10,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.beam_decision import maybe_run_worker_beam_decision
+from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker.constraint_hook import (
     apply_constrained_sample_override,
     consume_prelaunched_cuda_prefill,
@@ -926,12 +927,25 @@ def make_patched_model_forward_gpu(_orig_model_forward):
     @wraps(_orig_model_forward)
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
         scheduler_output = getattr(self, "_current_scheduler_output", None)
-        if getattr(scheduler_output, "gr_stage_metadata", None):
-            # Stage dispatch keeps Prefill on native Forward until its graph
-            # selection is enabled; Decode has an independent startup graph.
-            return _orig_model_forward(
-                self, input_ids=input_ids, positions=positions, *args, **kwargs
-            )
+        gr_stages = getattr(scheduler_output, "gr_stage_metadata", None)
+        if gr_stages:
+            # Decode uses its independent startup graph. Only pure asynchronous Prefill
+            # may enter the existing Prefill graph dispatch below.
+            if (
+                len(gr_stages) != 1
+                or next(iter(gr_stages.values())).kind is not GRStageKind.PREFILL
+            ):
+                return _orig_model_forward(
+                    self, input_ids=input_ids, positions=positions, *args, **kwargs
+                )
+            if getattr(self.model_config, "enforce_eager", False):
+                return _orig_model_forward(
+                    self, input_ids=input_ids, positions=positions, *args, **kwargs
+                )
+            if is_prefill_graph_enabled() and not hasattr(self, "_prefill_graph_runner"):
+                return _orig_model_forward(
+                    self, input_ids=input_ids, positions=positions, *args, **kwargs
+                )
         if scheduler_output is not None:
             if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
                 p_runner = get_prefill_graph_runner(self)
@@ -951,6 +965,21 @@ def make_patched_model_forward_gpu(_orig_model_forward):
 
                 if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
                     bucket = p_runner.match_bucket(total_tokens)
+                    if gr_stages:
+                        # Padding changes BF16 GEMM geometry and may reorder
+                        # Beam candidates. Reuse existing exact buckets; retain
+                        # eager for shapes needing extra padding or adapters.
+                        if (
+                            bucket is not None
+                            and bucket != total_tokens
+                            or input_ids is None
+                            or tuple(input_ids.shape) != (total_tokens,)
+                            or positions is None
+                            or tuple(positions.shape) != (total_tokens,)
+                            or kwargs.get("inputs_embeds") is not None
+                            or kwargs.get("intermediate_tensors") is not None
+                        ):
+                            bucket = None
                     if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
                         # Extract slot mapping from active block table
                         slot_mapping = None
