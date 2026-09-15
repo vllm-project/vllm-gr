@@ -292,6 +292,11 @@ class NPUGraphLayerTask:
     num_kv_heads: int
     scale: float
     sparse_mode: int
+    # Per-layer cross-stream fence (torch.npu.ExternalEvent) recorded in-graph
+    # at capture time: the replayed graph blocks at each layer's event.wait
+    # until the update stream records the event after rewriting that layer's
+    # task params, so the replay's layer i overlaps the update's layer i+1.
+    event: Any = None
 
 
 @dataclass
@@ -431,10 +436,13 @@ def _prefill_attention_graph(
     reshape_and_cache) stay plain-captured; only the FIA call is task-grouped
     so ``update_graph_params`` can rewrite the host lists per replay.
 
-    No per-layer events: the runner orders the WHOLE update after the
-    previous replay's completion and the WHOLE replay after the update's
-    completion with stream-level waits (``wait_stream`` pairs), which makes
-    per-layer event granularity redundant.
+    A per-layer ``torch.npu.ExternalEvent`` is created and waited here (inside
+    the capture region, so the ``event.wait`` is baked into the graph): at
+    replay each layer's FIA blocks on this event until the update stream
+    records it right after rewriting that layer's task params. This replaces
+    the whole-graph ``serving_stream.wait_stream(update_stream)`` fence and
+    lets the update's layer i+1 run concurrently with the replay's layer i
+    (vllm-ascend full-graph convention, attention_v1.py L957-960).
     """
     entry = _GRAPH_CAPTURE_STATE["entry"]
     assert entry is not None, "NPU prefill graph capture requires an active entry"
@@ -477,6 +485,15 @@ def _prefill_attention_graph(
     workspace = entry.workspace
     lse = torch.empty(1, dtype=output.dtype, device=output.device)
     stream = torch.npu.current_stream()
+    # Bake a per-layer cross-stream fence into the graph (vllm-ascend
+    # attention_v1.py L957-960): wait() inside the capture region records an
+    # in-graph event-wait, reset() leaves the event unrecorded so the first
+    # replay's wait pairs cleanly with the first update's record. Without this
+    # fence the runner would need a whole-graph wait_stream, serializing the
+    # update and the replay.
+    event = torch.npu.ExternalEvent()
+    event.wait(stream)
+    event.reset(stream)
     torch.npu.graph_task_group_begin(stream)
     torch_npu.npu_fused_infer_attention_score_v2.out(**kw, workspace=workspace, out=[output, lse])
     handle = torch.npu.graph_task_group_end(stream)
@@ -499,6 +516,7 @@ def _prefill_attention_graph(
             num_kv_heads=attn_metadata.num_kv_heads,
             scale=scale,
             sparse_mode=3 if attn_metadata.causal else 0,
+            event=event,
         )
     )
 
@@ -533,15 +551,16 @@ def update_graph_params(
     # CANN's RIC task update requires the update stream to be the CURRENT
     # stream (vllm-ascend wraps update_attn_params the same way); issuing the
     # update on a non-current stream fails with 507000.
-    serving_stream = torch.npu.current_stream()
+    tasks = entry.layers
     with torch.npu.stream(update_stream):
         # Order this update's device work AFTER the previous replay: without
         # this dependency the update's FIA executions would run on the update
         # stream concurrently with the previous replay on the serving stream,
         # and both write the same layer output buffers (out=[output, lse]) —
-        # corrupting the replay's results.
-        update_stream.wait_stream(serving_stream)
-        for task in entry.layers:
+        # corrupting the replay's results. This cross-step fence must stay
+        # even with per-layer events: it serializes whole steps, while the
+        # events only pipeline layers WITHIN one step.
+        for idx, task in enumerate(tasks):
             output = task.output
             query = task.query
             key = task.key
@@ -552,6 +571,7 @@ def update_graph_params(
                     "NPU prefill graph update: layer tensors are missing; "
                     "aborting the update (the replay would execute with stale params)."
                 )
+                _release_remaining_events(update_stream, tasks, idx)
                 return False
             mask = task.mask
             torch.npu.graph_task_update_begin(update_stream, task.handle)
@@ -573,4 +593,27 @@ def update_graph_params(
                 out=[output, lse],
             )
             torch.npu.graph_task_update_end(update_stream)
+            # Signal the in-graph per-layer fence: the replayed graph's FIA
+            # for THIS layer is blocked at its baked event.wait until this
+            # record lands, so each layer starts as soon as its own params are
+            # rewritten while the update stream moves on to the next layer.
+            if task.event is not None:
+                task.event.record(update_stream)
     return True
+
+def _release_remaining_events(
+    update_stream: Any,
+    tasks: list,
+    start_idx: int,
+) -> None:
+    """Fire every not-yet-recorded per-layer event from ``start_idx`` onward.
+
+    Used on a mid-update abort (replay-first mode) so a replay already
+    enqueued on the serving stream does not stall forever at the
+    ``event.wait`` of layers whose rebind was skipped. The replay then
+    completes with stale params on those layers; the caller discards its
+    output and falls back to eager.
+    """
+    for task in tasks[start_idx:]:
+        if task.event is not None:
+            task.event.record(update_stream)

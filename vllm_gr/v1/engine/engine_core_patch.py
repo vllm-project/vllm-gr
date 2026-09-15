@@ -14,6 +14,8 @@ from vllm.logger import init_logger
 from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
+from torch.autograd.profiler import record_function
+
 logger = init_logger(__name__)
 
 _BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
@@ -80,28 +82,204 @@ def make_patched_process_engine_step(original_step):
 
     @wraps(original_step)
     def patched_process_engine_step(self):
-        from vllm_gr.v1.engine.core import _beam_self_advance
+        with record_function("## process_step ##"):
+            from vllm_gr.v1.engine.core import _beam_self_advance
 
-        outputs, model_executed = self.step_fn()
-        if outputs:
-            try:
-                _beam_self_advance(self, outputs)
-            except Exception:
-                logger.exception(
-                    "vllm-gr: beam self-advance failed; falling back to the "
-                    "frontend step-update loop for this step"
-                )
-        for output in outputs.items() if outputs else ():
-            self.output_queue.put_nowait(output)
-        self.post_step(model_executed)
+            outputs, model_executed = self.step_fn()
+            if outputs:
+                try:
+                    _beam_self_advance(self, outputs)
+                except Exception:
+                    logger.exception(
+                        "vllm-gr: beam self-advance failed; falling back to the "
+                        "frontend step-update loop for this step"
+                    )
+            for output in outputs.items() if outputs else ():
+                self.output_queue.put_nowait(output)
+            self.post_step(model_executed)
 
-        if not model_executed and self.scheduler.has_requests():
-            time.sleep(0.001)
+            # Upstream sleeps whenever the scheduler "has requests" without
+            # executing the model, to let KV-transfer / connector threads
+            # progress.  Those stalled requests live in running/waiting, i.e.
+            # ``has_unfinished_requests()``; the extra disjunct upstream adds —
+            # finished-but-unflushed ids (``finished_req_ids``) — describes the
+            # beam session tail exactly: the terminal decode is freed in this
+            # step's ``update_from_output`` and nothing needs the GIL yielded.
+            # Sleeping there (as upstream does) burns ~1ms per session for
+            # zero benefit, so gate on unfinished requests only.
+            if not model_executed and self.scheduler.has_unfinished_requests():
+                time.sleep(0.001)
 
-        return model_executed
+            return model_executed
 
     setattr(patched_process_engine_step, _ENGINE_STEP_PATCH_MARKER, True)
     return patched_process_engine_step
+
+
+_STEP_QUEUE_PATCH_MARKER = "_vllm_gr_step_batch_queue_drain"
+
+
+def _running_all_unschedulable(scheduler) -> bool:
+    """True iff ``schedule()`` would emit an empty SchedulerOutput.
+
+    Reproduces the AsyncScheduler RUNNING-loop skip conditions so the
+    step wrapper can drain in-flight futures without first running (and
+    paying for) an empty ``schedule`` + ``execute_model``.  Returns True
+    only when there are RUNNING requests but every one of them is already
+    at the async completion guard or has zero new tokens to schedule, AND
+    nothing is waiting / skipped-waiting (those always need a real
+    schedule).  No-requests is handled by the caller's ``has_requests``
+    check.
+
+    The KV / EC connector paths perform per-iteration bookkeeping inside
+    ``schedule`` (delayed block frees, connector meta build); skipping it
+    while a connector is active could defer cleanup, so bail out (return
+    False) whenever either connector is present — the optimization is
+    only taken for the connector-free beam-search shape where it is safe.
+    """
+    if getattr(scheduler, "connector", None) is not None:
+        return False
+    if getattr(scheduler, "ec_connector", None) is not None:
+        return False
+    running = getattr(scheduler, "running", None)
+    if not running:
+        return False
+    num_waiting = (
+        len(scheduler.waiting)
+        + len(getattr(scheduler, "skipped_waiting", ()))
+        - getattr(scheduler, "num_waiting_for_streaming_input", 0)
+    )
+    if num_waiting > 0:
+        return False
+    max_model_len = scheduler.max_model_len
+    for request in running:
+        # Async completion guard (scheduler.py:369): a request already at
+        # its max_tokens (with an in-flight placeholder) is skipped.
+        if (
+            request.num_output_placeholders > 0
+            and request.num_computed_tokens + 2 - request.num_output_placeholders
+            >= request.num_prompt_tokens + request.max_tokens
+        ):
+            continue
+        # num_new_tokens (scheduler.py:385) clamped to max_model_len
+        # (scheduler.py:396); == 0 means nothing to schedule for it.
+        num_new_tokens = (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+        num_new_tokens = min(num_new_tokens, max_model_len - 1 - request.num_computed_tokens)
+        if num_new_tokens > 0:
+            return False
+    return True
+
+
+def make_patched_step_with_batch_queue(original_step):
+    """Skip the empty-batch schedule/execute when only draining remains.
+
+    With async scheduling (``batch_queue_size == 2``) and a Stage 1 single
+    resident beam request, the terminal decode step is already in flight when
+    the request reaches ``max_tokens``: the AsyncScheduler's RUNNING guard
+    (``num_computed_tokens + 2 - num_output_placeholders >= num_prompt_tokens
+    + max_tokens``) then makes the NEXT ``schedule()`` produce an EMPTY
+    SchedulerOutput for that request.  Upstream still feeds that empty output
+    through ``execute_model`` (the worker early-returns on
+    ``total_num_scheduled_tokens == 0``) and appends its future to the queue,
+    so the batch takes TWO extra ``step_with_batch_queue`` iterations to drain
+    — one to schedule the empty batch AND pop the terminal future, another to
+    pop the just-appended empty future.  Both iterations pay a multi-ms host
+    cost (``schedule`` + worker ``execute_model`` entry + ``update_from_output``)
+    for zero model work (profiling bw128_t3: ~5ms + ~3.4ms).
+
+    When the scheduler has no schedulable work but the batch queue still holds
+    in-flight futures, jump straight to draining the oldest future instead of
+    scheduling (and executing) an empty batch.  This collapses the two
+    trailing drain iterations into one and removes the empty-batch
+    ``execute_model`` host overhead entirely.  The drain reproduces upstream's
+    pop → ``future.result()`` → ``update_from_output`` tail verbatim (no
+    spec-decode / deferred-structured-output on the beam path), so the terminal
+    decision still reaches ``_beam_self_advance`` / the frontend drain loop
+    exactly once.  When the drained step freed the session's last request, the
+    finished-id flush iteration upstream would otherwise run as its own
+    busy-loop pass; it is instead run inline (see the terminal-drain flush
+    comment in the wrapper), collapsing the trailing iterations into a single
+    busy-loop pass.
+
+    Guarded to the async beam-search shape: only short-circuits when the batch
+    queue is non-empty AND scheduling would produce nothing.  Every other case
+    (real pending work, prefix-cache/connector frees, a genuinely empty queue)
+    falls through to the original method untouched.
+    """
+    if getattr(original_step, _STEP_QUEUE_PATCH_MARKER, False):
+        return original_step
+
+    @wraps(original_step)
+    def patched_step_with_batch_queue(self):
+        batch_queue = getattr(self, "batch_queue", None)
+        if batch_queue:
+            # Short-circuit when scheduling would produce nothing but the
+            # queue still holds in-flight futures to drain.  ``has_requests``
+            # stays True while a RUNNING request sits at the AsyncScheduler
+            # completion guard (its ``update_from_output`` has not run yet),
+            # so it cannot distinguish "will schedule" from "will emit an
+            # empty SchedulerOutput".  Reproduce the two conditions that make
+            # the RUNNING loop skip a request — the async completion guard
+            # (scheduler.py:369) and ``num_new_tokens == 0`` (scheduler.py:
+            # 423) — and only short-circuit when EVERY running request would
+            # be skipped AND nothing is waiting.  Waiting requests (new
+            # prefills, resumed streams) always need the real ``schedule``.
+            scheduler = self.scheduler
+            if not scheduler.has_requests() or _running_all_unschedulable(scheduler):
+                future, scheduler_output, exec_model_fut = batch_queue.pop()
+                with (
+                    self.log_error_detail(scheduler_output),
+                    self.log_iteration_details(scheduler_output),
+                ):
+                    model_output = future.result()
+                    if model_output is None:
+                        exec_model_fut.result()
+                        raise RuntimeError("unexpected error")
+                self._process_aborts_queue()
+                engine_core_outputs = scheduler.update_from_output(
+                    scheduler_output, model_output
+                )
+                # Terminal-drain flush: freeing the last request above put its
+                # id into ``scheduler.finished_req_ids``, and upstream only
+                # emits+clears that set inside the NEXT ``schedule()`` —
+                # forcing one more busy-loop iteration whose empty schedule
+                # empty execute_model exist solely to deliver the ids to the
+                # worker's persistent batch.  When nothing else is runnable
+                # and the batch queue is now empty, run that flush iteration
+                # inline via the original (unpatched) step instead and merge
+                # its (normally empty) outputs into the drain's — the busy
+                # loop then wakes with ``has_work()`` already False and never
+                # pays the extra iteration's wrapper / output-queue /
+                # has_work overhead.  The flush performs the identical empty
+                # schedule + execute + drain upstream would have run next
+                # pass, so execute_model call counts and the DP all-reduce
+                # consensus sequence are unchanged; only host latency moves
+                # inside this pass.
+                if (
+                    not batch_queue
+                    and scheduler.finished_req_ids
+                    and not scheduler.has_unfinished_requests()
+                ):
+                    flush_outputs, _flush_executed = original_step(self)
+                    for client_index, flush_eco in flush_outputs.items():
+                        eco = engine_core_outputs.get(client_index)
+                        if eco is None:
+                            engine_core_outputs[client_index] = flush_eco
+                            continue
+                        eco.outputs.extend(flush_eco.outputs)
+                        if flush_eco.finished_requests:
+                            merged = set(eco.finished_requests or ())
+                            merged |= flush_eco.finished_requests
+                            eco.finished_requests = merged
+                return engine_core_outputs, False
+        return original_step(self)
+
+    setattr(patched_step_with_batch_queue, _STEP_QUEUE_PATCH_MARKER, True)
+    return patched_step_with_batch_queue
 
 
 def make_patched_handle_client_request(original):
@@ -227,6 +405,16 @@ def apply_engine_core_request_patches() -> None:
     # next beam-decode ADD in the same busy-loop iteration.
     EngineCoreProc._process_engine_step = make_patched_process_engine_step(
         EngineCoreProc._process_engine_step
+    )
+
+    # Wrap the async-scheduling step so a resident beam session's terminal
+    # decode does not leave two empty-batch drain iterations behind (see
+    # make_patched_step_with_batch_queue).  EngineCore defines
+    # step_with_batch_queue; EngineCoreProc inherits it, and ``__init__``
+    # binds ``self.step_fn`` to it, so patching the base class makes every
+    # instance's ``step_fn`` resolve to the wrapped version.
+    EngineCore.step_with_batch_queue = make_patched_step_with_batch_queue(
+        EngineCore.step_with_batch_queue
     )
 
     EngineCore._patched_for_beam_requests = True
@@ -558,6 +746,7 @@ def apply_scheduler_patch():
                 request.max_tokens = 0
             output = _original_schedule(self)
 
+
             # Propagate beam request attributes from Request objects to SchedulerOutput
             beam_data = {}
             if hasattr(output, "num_scheduled_tokens"):
@@ -825,7 +1014,9 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         beam_ids = {
             req_id
             for req_id, mdata in beam_data.items()
-            if mdata.get("is_beam_decode", False) or mdata.get("is_constraint_prefill", False)
+            if mdata.get("is_beam_decode", False)
+            or mdata.get("is_constraint_prefill", False)
+            or mdata.get("is_beam_prefill", False)
         }
         decision_owner = (
             beam_search_result.get("session_id") if isinstance(beam_search_result, dict) else None

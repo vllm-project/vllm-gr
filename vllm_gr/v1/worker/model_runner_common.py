@@ -691,6 +691,26 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
                 new_logits_indices.append(token_offset + seq_len - 1)
                 beams_count_with_logits = 1
                 logits_to_batch_idx.extend([batch_idx] * beams_count_with_logits)
+            elif mdata is not None and seq_len > 0 and num_computed_tokens >= num_prompt_tokens:
+                # A scheduled request whose prefill is already complete
+                # (num_computed >= num_prompt) but is NOT a beam decode
+                # books tokens no branch claims: the remap emits no logits
+                # row for them, the forward's logits end up 0-row, and the
+                # sampler dies inside a dynamo guard far from the cause
+                # (observed with a beam-prefill Request whose max_tokens was
+                # misconfigured > 1: the prefill finished, the scheduler
+                # kept decoding it, and every beam branch ignored it).  Fail
+                # at the source instead.  Still-streaming prefill chunks are
+                # exempt — they legitimately claim no logits row until their
+                # last chunk.
+                raise RuntimeError(
+                    f"vllm-gr beam remap: request {req_id!r} scheduled "
+                    f"{seq_len} token(s) that no branch claims "
+                    f"(num_computed={num_computed_tokens}, "
+                    f"num_prompt={num_prompt_tokens}, "
+                    f"beam_data={mdata}). The batch would produce 0-row "
+                    f"logits and crash in the sampler."
+                )
             row_to_req_id.extend([req_id] * beams_count)
             row_to_batch_idx.extend([batch_idx] * beams_count)
 
@@ -1575,9 +1595,11 @@ def make_load_model_with_batch_context(original):
             raise ValueError("beam_max_batch_size > 1 requires beam_max_width")
         if not bool(getattr(config, "beam_worker_decision", False)):
             raise ValueError("beam_max_batch_size > 1 requires worker-side beam decision")
-        if bool(getattr(self, "use_async_scheduling", False)):
+        if bool(getattr(self, "use_async_scheduling", False)) and not bool(
+            getattr(config, "beam_async", False)
+        ):
             raise ValueError(
-                "beam_max_batch_size > 1 currently requires synchronous scheduling"
+                "beam_max_batch_size > 1 with async scheduling requires beam_async"
             )
 
         parallel = self.parallel_config
@@ -1751,8 +1773,14 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     if len(incremental_ids) > 1:
         if str(getattr(getattr(runner, "device", None), "type", "")).lower() != "npu":
             raise RuntimeError("multi-request beam decode is currently supported only on NPU")
-        if bool(getattr(runner, "use_async_scheduling", False)):
-            raise RuntimeError("multi-request beam decode requires synchronous scheduling")
+        async_scheduling = bool(getattr(runner, "use_async_scheduling", False))
+        async_resident = async_scheduling and all(
+            beam_data[req_id].get("resident", False)
+            and beam_data[req_id].get("single_request", False)
+            for req_id in incremental_ids
+        )
+        if async_scheduling and not async_resident:
+            raise RuntimeError("multi-request async decode requires resident single requests")
 
         widths = {int(beam_data[req_id]["beam_width"]) for req_id in incremental_ids}
         steps = {int(beam_data[req_id]["decode_step"]) for req_id in incremental_ids}
@@ -1762,14 +1790,15 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 "and one synchronized decode step"
             )
         scheduled = getattr(scheduler_output, "num_scheduled_tokens", {})
+        expected_tokens = 1 if async_resident else next(iter(widths))
         if any(
-            int(scheduled.get(req_id, -1)) != int(beam_data[req_id]["beam_width"])
+            int(scheduled.get(req_id, -1)) != expected_tokens
             for req_id in incremental_ids
         ):
             raise RuntimeError(
-                "multi-request beam decode must schedule all W tokens for every request"
+                "multi-request beam decode received an unexpected per-request token count"
             )
-        if any(
+        if not async_resident and any(
             beam_data[req_id].get("parent_cumulative_logprobs") is None
             or not beam_data[req_id].get("beam_suffix")
             for req_id in incremental_ids
@@ -1850,6 +1879,18 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         session = runner._beam_sessions.get(req_id)
         mdata_step = mdata.get("decode_step", 0)
 
+        # Stage 1 resident form: the scheduler re-uses ONE Request for every
+        # decode step, so the Request-derived ``decode_step`` stays 0 after
+        # the first step.  The session's own ``worker_decode_steps`` (advanced
+        # by the device beam decision each step) is the authoritative step
+        # counter — derive from it, mirroring 9.diff's
+        # ``_beam_search_context.current_step``.
+        if mdata.get("resident", False) and session is not None:
+            decision_state = getattr(session.context, "decision", None)
+            resident_steps = (
+                int(decision_state.worker_decode_steps) if decision_state is not None else 0
+            )
+            mdata_step = max(mdata_step, resident_steps)
         # Terminal-step detection.  ``max_decode_steps`` on the
         # metadata is the frontend LOOP length (``max_tokens -
         # pre_calc``): iteration 0 is the prefill, so the request
@@ -1874,7 +1915,19 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         # not only on subsequent steps.
         loop_len = mdata.get("max_decode_steps", 0)
         planned_decode_steps = loop_len - 1 if loop_len > 0 else gr_cfg.beam_max_decode_steps
-        is_last_step = mdata_step >= planned_decode_steps - 1
+        if mdata.get("single_request", False):
+            # Single-Request form: the prefill seeds ``worker_decode_steps = 1``
+            # (column 0 = prefill winners) BEFORE the first decode runs, so the
+            # count is 1-based across the whole session (prefill + decodes).
+            # The terminal decode is the one that produces the loop_len-th
+            # token: it begins with ``worker_decode_steps == loop_len - 1``
+            # (loop_len - 2 columns from prior decisions + 1 from the prefill
+            # seed), so the terminal threshold is ``loop_len - 1`` — one higher
+            # than the two-Request form's ``planned_decode_steps - 1`` because
+            # the prefill seed occupies column 0.
+            is_last_step = mdata_step >= max(1, loop_len - 1)
+        else:
+            is_last_step = mdata_step >= planned_decode_steps - 1
 
         if session is not None:
             # Existing session: step_complete or reset
@@ -1887,6 +1940,37 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 session.begin_session(mdata["beam_width"], mdata["prefix_len"])
                 _seed_beam_decision_from_metadata(session, mdata)
                 session._state.is_last_step = is_last_step
+            elif mdata.get("single_request", False):
+                # Single-Request form: the session was created + seeded at
+                # prefill sample time (column 0 = prefill winners,
+                # worker_decode_steps = 1, decode_step = 0).  The prefill's
+                # parent mapping is the identity (all parents 0), so there is
+                # no KV reorder to apply, and the first decode must write KV
+                # to pool slice 0 (decode_step stays 0 — do NOT advance here).
+                # Subsequent decodes fall through to the ``else`` below once a
+                # real decode decision has advanced ``worker_decode_steps``
+                # past the prefill seed and recorded a ``kv_reorder``.
+                state = session._state
+                state.is_last_step = is_last_step
+                decision_state = getattr(session.context, "decision", None)
+                seeded = (
+                    int(decision_state.worker_decode_steps) if decision_state is not None else 0
+                )
+                if seeded > 1:
+                    # A decode decision already ran (worker_decode_steps >= 2):
+                    # consume its same-step KV-reorder record the same way the
+                    # two-Request ``else`` branch does, then advance decode_step
+                    # so this step writes the next pool slice.  parent_beam_ids
+                    # is None for resident rows; the record's non-None-ness
+                    # (set by the resident stub branch) is the only gate.
+                    recorded = state.kv_reorder
+                    if recorded is not None:
+                        state.kv_reorder = None
+                    else:
+                        # A worker fallback did not apply same-step reorder.
+                        state.decode_step += 1
+                # else: still on the first decode (only the prefill seed is in
+                # the buffers) — leave decode_step at 0 to write pool slice 0.
             else:
                 # Subsequent decode steps: apply the previous step's beam decision.
                 # step_complete (select_unshared_kv + advance_step) must run BEFORE
@@ -2000,6 +2084,172 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     return active_session
 
 
+def _create_single_request_beam_session(
+    runner: Any,
+    req_id: str,
+    beam_width: int,
+    prefix_len: int,
+    max_decode_steps: int,
+) -> Any | None:
+    """Create + seed the beam session for a Single-Request prefill (Stage 1).
+
+    The Single-Request form runs the prefill and every decode step on the SAME
+    Request, so the worker must own the beam session from prefill sample time:
+    a later decode step's ``_get_or_create_beam_session`` then finds the
+    already-seeded session instead of creating a fresh one whose
+    ``begin_session`` reset would zero the just-seeded ``sequence`` buffer.
+
+    Seeding mirrors ``init_beam_decision_state``: column 0 of the device
+    ``sequence`` buffer holds the W prefill winners and ``beam_scores`` their
+    logprobs, ``worker_decode_steps = 1`` (one committed token — the prefill
+    choice).  The prefill winners themselves are written by the caller (the
+    prefill decision) into the buffers right after this returns; this helper
+    only establishes the session + context so the device-resident buffers exist
+    at a fixed address.  KV reorder is NOT applied at prefill: every beam
+    shares the prefill KV with parent 0 (identity), so there is nothing to
+    reorder until the first decode decision.
+
+    Returns the session, or ``None`` when the shared context cannot be created
+    (e.g. ``beam_max_width`` unconfigured) — the caller then falls back to the
+    engine-driven two-Request path.
+    """
+    runner._beam_sessions = getattr(runner, "_beam_sessions", {})
+    # A session already exists for this id (e.g. a re-delivered prefill output
+    # in an async iteration): reuse it and re-seed rather than allocating
+    # another slot in the capacity-sized resident registry.
+    existing = runner._beam_sessions.get(req_id)
+    if existing is not None:
+        existing.begin_session(beam_width, prefix_len)
+        return existing
+
+    gr_cfg = _get_gr_config(runner)
+    if gr_cfg.beam_max_width is None:
+        return None
+    if not hasattr(runner, "_beam_context"):
+        runner._beam_context = _create_beam_context(
+            runner,
+            gr_cfg,
+            max_batch=int(getattr(gr_cfg, "beam_max_batch_size", 1)),
+        )
+    context = runner._beam_context
+    if beam_width > context.max_beams or max_decode_steps > context.max_decode_steps:
+        logger.warning(
+            "vllm-gr single-request beam session %s exceeds pool capacity "
+            "(max_beams=%d, max_decode_steps=%d; request beam_width=%d, "
+            "max_decode_steps=%d); falling back to engine-driven chaining.",
+            req_id,
+            context.max_beams,
+            context.max_decode_steps,
+            beam_width,
+            max_decode_steps,
+        )
+        return None
+
+    from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
+
+    try:
+        slot = context.registry.allocate(req_id, beam_width, prefix_len)
+    except RuntimeError:
+        # Release any stale session (unexpected abort path) and retry once.
+        for sid in list(runner._beam_sessions.keys()):
+            if sid != req_id:
+                runner._beam_sessions.pop(sid).end_session()
+        slot = context.registry.allocate(req_id, beam_width, prefix_len)
+    session = BeamSearchSession(session_id=req_id, slot=slot, context=context)
+    session.begin_session(beam_width, prefix_len)
+    # decode_step stays 0: the prefill writes KV to pool slice 0; the first
+    # decode forward writes slice 1 (decode_step advanced by the session's
+    # step progression in _get_or_create_beam_session, NOT here).
+    session._state.decode_step = 0
+    runner._beam_sessions[req_id] = session
+    return session
+
+
+def _widen_resident_beam_accounting(runner: Any, beam_session: Any, scheduler_output: Any):
+    """Widen a pure resident beam-decode step's accounting from 1 to W tokens.
+
+    Stage 1 resident form: the EngineCore scheduler books one token per step
+    on the session's single logical Request, so ``SchedulerOutput`` arrives
+    with ``num_scheduled_tokens = {rid: 1}``.  The worker beam stack needs
+    the physical W-row batch that step 0 gets naturally (its W step-0 tokens
+    are engine-scheduled): the remap expands per-beam rows from the
+    scheduled-token window, the width-keyed beam FULL graph is granted by the
+    scheduled token count, and the sampler produces W rows.  This returns a
+    shallow ``dataclasses.replace()`` copy with the widened counts, leaving
+    the EngineCore-side scheduler's own object untouched (uniproc shares
+    objects between the engine and the worker — mutating in place would
+    corrupt the engine's bookkeeping of the resident Request).
+
+    Only a PURE resident cohort qualifies: every scheduled request is resident
+    + is_beam_decode, and every engine-side count is either 1 (widen to that
+    request's W physical rows) or already W.  A pre-widened resident step is
+    returned unchanged, as is every non-resident / mixed batch (Stage 0
+    per-step form keeps its engine-provided accounting).
+    """
+    beam_data = getattr(scheduler_output, "beam_data", None) or {}
+    resident_rows = {
+        rid: mdata
+        for rid, mdata in beam_data.items()
+        if mdata.get("resident", False) and mdata.get("is_beam_decode", False)
+    }
+    if not resident_rows:
+        return scheduler_output
+
+    # Only a pure resident cohort is widened. Mixed ordinary/beam traffic keeps
+    # the engine accounting and is rejected by the fixed-cohort session gate.
+    scheduled = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+    if set(scheduled) != set(resident_rows):
+        return scheduler_output
+
+    widened_counts: dict[str, int] = {}
+    changed = False
+    for rid, mdata in resident_rows.items():
+        engine_tokens = int(scheduled[rid])
+        width = int(mdata.get("beam_width", 0))
+        if width <= 0:
+            raise RuntimeError(f"resident beam session {rid!r} has invalid width {width}")
+        if engine_tokens == width:
+            widened_counts[rid] = width
+            continue
+        if engine_tokens != 1:
+            raise RuntimeError(
+                f"vllm-gr resident beam decode expected 1 engine-scheduled token "
+                f"for session {rid!r}, got {engine_tokens} (beam_width={width})."
+            )
+        widened_counts[rid] = width
+        changed = True
+
+    if not changed:
+        return scheduler_output
+
+    # Shallow replace: the token counts move to a fresh dict on a fresh
+    # SchedulerOutput so the EngineCore scheduler's own bookkeeping of the
+    # resident Request is untouched.  BUT ``replace()`` only rebuilds the
+    # DECLARED dataclass fields — ``beam_data`` and
+    # ``beam_finished_session_ids`` are dynamic attributes attached by
+    # patched_schedule, so the copy drops them unless they are carried over
+    # explicitly.  Without beam_data the downstream NPU prepare-inputs hook
+    # early-returns (no remap, no row expansion, no input_ids overwrite) and
+    # the step silently degrades to a 1-row eager forward with no worker
+    # beam decision — the frontend drain loop then waits forever for a
+    # terminal decision that never comes (observed 2026-09-11: step 1
+    # sampled [1, V], no aclgraph replay, engine idle afterwards).  Copy
+    # every non-declared instance attribute so the widened copy is a
+    # faithful superset of the original.
+    from dataclasses import fields, replace
+
+    widened = replace(
+        scheduler_output,
+        num_scheduled_tokens=widened_counts,
+        total_num_scheduled_tokens=sum(widened_counts.values()),
+    )
+    declared = {f.name for f in fields(scheduler_output)}
+    for attr, value in vars(scheduler_output).items():
+        if attr not in declared:
+            setattr(widened, attr, value)
+    return widened
+
+
 def make_patched_execute_model(_orig_execute_model):
     """Wrap execute_model to publish beam-request context for the run.
 
@@ -2036,6 +2286,18 @@ def make_patched_execute_model(_orig_execute_model):
         # Manage BeamSearchSession for incremental decode
         beam_session = _get_or_create_beam_session(self, self._current_beam_data, scheduler_output)
         if beam_session is not None:
+            # Stage 1 resident form: publish the session-derived decode step
+            # back into beam_data so the later _beam_remap_inputs /
+            # _process_beam_decode_request (inside _prepare_inputs) see the
+            # real per-step value instead of the frozen Request-derived 0.
+            # Non-resident sessions already carry the correct per-ADD value;
+            # overwriting is still correct there (same number), so no flag
+            # check is needed — but only touch resident rows to keep the
+            # per-step path byte-identical.
+            for rid, mdata in self._current_beam_data.items():
+                if mdata.get("resident", False) and mdata.get("is_beam_decode", False):
+                    mdata["decode_step"] = beam_session._state.decode_step
+                    mdata["beam_decode_steps"] = beam_session._state.decode_step + 1
             beam_info["beam_session"] = beam_session
 
             # Refresh device-side buffers before model forward / Graph replay.
@@ -2066,6 +2328,34 @@ def make_patched_execute_model(_orig_execute_model):
                     sessions = getattr(beam_session, "sessions", (beam_session,))
                     for row, session in enumerate(sessions):
                         context.xllm_block_table_buf[row] = session.slot
+
+            # Stage 1 resident form: the scheduler books ONE token/step on
+            # the single logical Request, but the worker-side beam machinery
+            # (remap row expansion, beam attention metadata, the width-keyed
+            # FULL graph, the sampler's per-beam rows) all need the PHYSICAL
+            # batch to carry W rows — exactly the batch shape step 0 has
+            # naturally (its W step-0 tokens are scheduled by the engine).
+            # From step 1 on, widen the worker-visible accounting to W via a
+            # shallow ``replace()`` copy: the EngineCore-side scheduler keeps
+            # its own 1-token bookkeeping (uniproc shares the object, so the
+            # copy must not alias it), and every downstream consumer
+            # (_update_states token gather, _prepare_inputs positions,
+            # _determine exact-width gate, ACL/CUDA graph replay) then sees
+            # the same W-row batch step 0 already validated end to end.
+            # The placeholder input_ids upstream gathers for the W rows get
+            # overwritten with the decision winners by
+            # _resident_beam_overwrite_input_ids_* before the forward, and
+            # the beam-decode attention branch never writes paged KV
+            # (cache_unshared_kv targets the unshared pool), so the widened
+            # rows cannot pollute the prefix cache.
+            scheduler_output = _widen_resident_beam_accounting(
+                self, beam_session, scheduler_output
+            )
+            # The widened copy is the step's authoritative scheduler output:
+            # _beam_remap_inputs stashes _gr_request_row_configs on it and
+            # the constraint hook / bookkeeping patches read them back from
+            # _current_scheduler_output.
+            self._current_scheduler_output = scheduler_output
 
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info

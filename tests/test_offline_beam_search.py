@@ -66,6 +66,11 @@ def _run_offline_beam_search(
         # the platform default resolution (xllm on NPU with xllm-ops
         # installed, cascade otherwise).
         engine_kwargs["additional_config"] = {"vllm_gr_npu_decode_execution": npu_decode_execution}
+    # Shared dev pools can carry co-tenant load (e.g. burn-in processes);
+    # cap the allocation below the default 0.92 so startup never fails on
+    # "free memory < utilization" in a multi-tenant environment.
+    if os.getenv("VLLM_GR_TEST_MEM_UTIL"):
+        engine_kwargs["gpu_memory_utilization"] = float(os.environ["VLLM_GR_TEST_MEM_UTIL"])
 
     with GRLLM(
         model=model_name,

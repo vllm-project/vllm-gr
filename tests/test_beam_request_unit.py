@@ -891,6 +891,35 @@ class TestBeamCache:
         metadata = build_beam_request_metadata(mock_req, num_scheduled_tokens=3)
         assert "is_constrained" not in metadata
 
+    def test_scheduler_ignores_truthy_dynamic_protocol_markers(self) -> None:
+        req = MagicMock()
+        req.request_id = "s0"
+        req.is_beam_decode = True
+        req.beam_width = 2
+        req.beam_decode_steps = 1
+        req.beam_decode_step = 0
+        req.prefix_len = 3
+        req.num_computed_tokens = 5
+        req.parent_beam_indices = [0, 0]
+        req.max_decode_steps = 4
+        req.result_width = None
+        req.parent_cumulative_logprobs = None
+        req.beam_suffix = [[50], [60]]
+        # Leave async/resident/constrained markers unset. MagicMock creates
+        # truthy child mocks for them; those must not enable protocol branches.
+
+        metadata = build_beam_request_metadata(req, num_scheduled_tokens=2)
+
+        assert metadata is not None
+        assert metadata["is_beam_decode"] is True
+        assert metadata["resident"] is False
+        assert metadata["cache_len"] == 3
+        assert metadata["parent_beam_ids"] == [0, 0]
+        assert metadata["beam_suffix"] == [[50], [60]]
+        assert "is_beam_prefill" not in metadata
+        assert "is_constraint_prefill" not in metadata
+        assert "is_constrained" not in metadata
+
     def test_scheduler_rejects_missing_beam_width(self) -> None:
         req = SimpleNamespace(request_id="s0", is_beam_decode=True, num_computed_tokens=1)
 

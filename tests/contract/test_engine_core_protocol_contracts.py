@@ -88,6 +88,10 @@ BEAM_STEP_UPDATE_FIELDS = (
     "constraint_step",
     "parent_cumulative_logprobs",
     "cohort_id",
+    # Stage 1 resident-Request form (async scheduling): default False keeps
+    # legacy streams byte-identical (omit_defaults drops it).
+    "resident",
+    "single_request",
 )
 
 
@@ -182,7 +186,12 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
     assert raw_payload[8:13] == [2, 3, 4, 5, 6]
     assert raw_payload[13] is None
     assert raw_payload[14:16] == ["cache-salt", {"traceparent": "trace-0"}]
-    assert raw_payload[16:] == [[0, 0], 4, 2, [-1.0, -2.0], 7]
+    assert raw_payload[16:] == [[0, 0], 4, 2, [-1.0, -2.0], 7, False, False]
+    resident_update = _minimal_beam_step_update(
+        constraint_step=2, resident=True, single_request=True
+    )
+    resident_payload = msgspec.msgpack.decode(msgspec.msgpack.encode(resident_update))
+    assert resident_payload[16:] == [[0, 0], 4, 2, None, None, True, True]
 
 
 def test_scheduler_beam_metadata_shape() -> None:
@@ -209,6 +218,9 @@ def test_scheduler_beam_metadata_shape() -> None:
         "decode_step": 1,
         "parent_beam_ids": [0, 0],
         "max_decode_steps": 4,
+        # Stage 1 resident marker: the per-step form always books False (a
+        # non-resident Request); only a resident Request stamps True.
+        "resident": False,
         # Final-step output width for the worker beam decision; falls back
         # to beam_width on the worker when the request does not carry one.
         "result_width": None,

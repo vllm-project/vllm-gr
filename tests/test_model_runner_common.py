@@ -143,6 +143,32 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
     assert input_batch.logprob_token_ids == {}
 
 
+def test_beam_prefill_decode_tokens_still_fail_unclaimed_guard() -> None:
+    input_batch = SimpleNamespace(
+        req_ids=["beam-prefill"],
+        logprob_token_ids={},
+        num_computed_tokens_cpu=[4],
+        num_prompt_tokens=[4],
+    )
+    runner = SimpleNamespace(input_batch=input_batch)
+    scheduler_output = SimpleNamespace(
+        beam_data={
+            "beam-prefill": {
+                "is_beam_decode": False,
+                "is_beam_prefill": True,
+                "beam_width": 2,
+            }
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="no branch claims"):
+        common._beam_remap_inputs(
+            runner,
+            scheduler_output,
+            [1],
+        )
+
+
 def test_incremental_layout_cache_short_circuits_remap() -> None:
     """A pure incremental-beam batch replays its cached row layout.
 
@@ -960,6 +986,7 @@ def _batch_context_runner(**overrides: Any) -> SimpleNamespace:
         beam_max_width=4,
         beam_max_decode_steps=3,
         beam_worker_decision=True,
+        beam_async=False,
     )
     runner = SimpleNamespace(
         _vllm_gr_config=config,
@@ -1026,12 +1053,34 @@ def test_batch_context_load_wrapper_reserves_and_accounts_fixed_capacity(
     assert created == [2]
 
 
-def test_batch_context_load_wrapper_rejects_async_scheduling() -> None:
+def test_batch_context_load_wrapper_requires_async_beam_mode() -> None:
     runner = _batch_context_runner(use_async_scheduling=True)
     wrapped = common.make_load_model_with_batch_context(lambda runner: "loaded")
 
-    with pytest.raises(ValueError, match="synchronous scheduling"):
+    with pytest.raises(ValueError, match="requires beam_async"):
         wrapped(runner)
+
+
+def test_batch_context_load_wrapper_allows_async_beam_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.beam import beam_decision
+
+    context = SimpleNamespace(
+        max_batch=2,
+        suffix=torch.empty(0),
+        decision=SimpleNamespace(),
+        pools=[],
+    )
+    runner = _batch_context_runner(use_async_scheduling=True)
+    runner._vllm_gr_config.beam_async = True
+    runner._beam_context = context
+    monkeypatch.setattr(beam_decision, "_xllm_decode_mode_active", lambda: True)
+    wrapped = common.make_load_model_with_batch_context(lambda runner: "loaded")
+
+    assert wrapped(runner) == "loaded"
+    assert runner._beam_context is context
+    assert runner.model_memory_usage == 0
 
 
 def test_batch_context_load_wrapper_validates_scheduler_capacity() -> None:
@@ -1466,3 +1515,86 @@ def test_execute_wrapper_releases_depth_on_exception() -> None:
     with pytest.raises(ExpectedError):
         wrapped(runner, scheduler_output)
     assert common._WORKER_EXECUTE_DEPTH == 0
+
+
+def test_widen_resident_beam_accounting_supports_synchronized_cohort() -> None:
+    from dataclasses import dataclass
+
+    @dataclass
+    class SchedulerOutput:
+        num_scheduled_tokens: dict[str, int]
+        total_num_scheduled_tokens: int
+
+    original = SchedulerOutput({"a": 1, "b": 1}, 2)
+    original.beam_data = {
+        "a": {"resident": True, "single_request": True, "is_beam_decode": True, "beam_width": 2},
+        "b": {"resident": True, "single_request": True, "is_beam_decode": True, "beam_width": 2},
+    }
+    original.beam_finished_session_ids = ["done"]
+
+    widened = common._widen_resident_beam_accounting(None, None, original)
+
+    assert widened is not original
+    assert widened.num_scheduled_tokens == {"a": 2, "b": 2}
+    assert widened.total_num_scheduled_tokens == 4
+    assert widened.beam_data is original.beam_data
+    assert widened.beam_finished_session_ids == ["done"]
+    assert original.num_scheduled_tokens == {"a": 1, "b": 1}
+    assert original.total_num_scheduled_tokens == 2
+
+
+def test_resident_decode_does_not_advance_twice_after_same_step_reorder() -> None:
+    decision = SimpleNamespace(worker_decode_steps=2)
+    context = SimpleNamespace(
+        decision=decision,
+        max_beams=2,
+        max_decode_steps=4,
+    )
+    state = SimpleNamespace(
+        decode_step=1,
+        is_last_step=False,
+        kv_reorder=[],
+        beam_width=2,
+    )
+    session = SimpleNamespace(
+        session_id="a",
+        slot=0,
+        context=context,
+        _state=state,
+        beam_width=2,
+    )
+    runner = SimpleNamespace(
+        device=SimpleNamespace(type="npu"),
+        use_async_scheduling=True,
+        _beam_context=context,
+        _beam_sessions={"a": session},
+        _vllm_gr_config=SimpleNamespace(
+            beam_max_batch_size=1,
+            beam_max_width=2,
+            beam_max_decode_steps=4,
+        ),
+    )
+    beam_data = {
+        "a": {
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_decode_steps": 0,
+            "beam_width": 2,
+            "prefix_len": 8,
+            "max_decode_steps": 4,
+            "resident": True,
+            "single_request": True,
+        }
+    }
+
+    returned = common._get_or_create_beam_session(
+        runner,
+        beam_data,
+        SimpleNamespace(
+            beam_finished_session_ids=[], num_scheduled_tokens={"a": 1}
+        ),
+    )
+
+    assert returned is session
+    assert state.kv_reorder is None
+    assert state.decode_step == 1

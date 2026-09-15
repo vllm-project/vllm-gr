@@ -18,6 +18,7 @@ from vllm_gr.config.models import (
 from vllm_gr.config.validation import (
     validate_artifact_digest,
     validate_attention_backend,
+    validate_beam_async,
     validate_beam_engine_driven,
     validate_beam_graph_enabled,
     validate_beam_max_batch_size,
@@ -52,6 +53,7 @@ BEAM_MAX_BATCH_SIZE_KEY: Final = "vllm_gr_beam_max_batch_size"
 NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
 BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
 BEAM_ENGINE_DRIVEN_KEY: Final = "vllm_gr_beam_engine_driven"
+BEAM_ASYNC_KEY: Final = "vllm_gr_beam_async"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -67,6 +69,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         NPU_DECODE_EXECUTION_KEY,
         BEAM_WORKER_DECISION_KEY,
         BEAM_ENGINE_DRIVEN_KEY,
+        BEAM_ASYNC_KEY,
     }
 )
 _TOP_LEVEL_KEYS: Final = frozenset(
@@ -80,6 +83,7 @@ _BEAM_KEYS: Final = frozenset(
         "max_batch_size",
         "worker_decision",
         "engine_driven",
+        "async_resident",
     }
 )
 _CONSTRAINT_TABLE_KEYS: Final = frozenset(
@@ -187,6 +191,7 @@ def gr_config_from_mapping(
         beam_max_batch_size=validate_beam_max_batch_size(beam_raw.get("max_batch_size", 1)),
         beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
         beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
+        beam_async=validate_beam_async(beam_raw.get("async_resident")),
         schema_version=validate_schema_version(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
@@ -237,6 +242,11 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         beam["worker_decision"] = config.beam_worker_decision
     if config.beam_engine_driven is not None:
         beam["engine_driven"] = config.beam_engine_driven
+    # beam_async (Stage 1 resident form) round-trips only when enabled; the
+    # disabled default stays omitted so existing schema-v1 artifacts are
+    # unaffected.
+    if config.beam_async:
+        beam["async_resident"] = True
 
     return {
         "schema_version": config.schema_version,
@@ -344,6 +354,7 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_engine_driven=validate_beam_engine_driven(
             additional_config.get(BEAM_ENGINE_DRIVEN_KEY)
         ),
+        beam_async=validate_beam_async(additional_config.get(BEAM_ASYNC_KEY)),
     )
 
 
@@ -440,6 +451,12 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     else:
         # Both explicit values round-trip (an opt-out must survive a write).
         additional_config[BEAM_ENGINE_DRIVEN_KEY] = beam_engine_driven
+
+    beam_async = validate_beam_async(gr_config.beam_async)
+    if beam_async:
+        additional_config[BEAM_ASYNC_KEY] = True
+    else:
+        additional_config.pop(BEAM_ASYNC_KEY, None)
 
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:

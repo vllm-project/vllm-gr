@@ -616,6 +616,7 @@ def create_engine_config(self, usage_context=None, headless=False):
             ),
             beam_worker_decision=effective_beam_worker_decision,
             beam_engine_driven=effective_beam_engine_driven,
+            beam_async=existing_gr_config.beam_async,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
         )
@@ -651,6 +652,31 @@ def create_engine_config(self, usage_context=None, headless=False):
             write_canonical_gr_config(config, effective_gr_config)
         else:
             effective_gr_config.write_to_vllm_config(config)
+
+    # Stage 0 form guard: the per-step beam-decode Request lifecycle
+    # (max_tokens=1, finishes same-step, engine-driven chaining) cannot use
+    # the two-phase batch-queue pipeline — exactly one batch is ever in
+    # flight, the pipeline never overlaps, and the M2 inline-sample fast
+    # path is disabled on top (_should_inline_sample_tokens requires
+    # use_async_scheduling=False).  vLLM 0.22 auto-enables async scheduling
+    # when nothing opted out, so an accelerator beam deployment (beam
+    # engine-driven) must opt out here — EXCEPT beam_async deployments,
+    # whose Stage 1 resident-Request form is the async-scheduling entry
+    # point (docs/beam_search_worker_sinking_plan.md §4.1).
+    scheduler_config = getattr(config, "scheduler_config", None)
+    if (
+        effective_gr_config.beam_engine_driven
+        and not effective_gr_config.beam_async
+        and getattr(scheduler_config, "async_scheduling", False)
+    ):
+        logger.warning(
+            "vllm-gr: disabling async scheduling — the Stage 0 per-step "
+            "beam-decode form (beam_engine_driven) cannot overlap the "
+            "batch-queue pipeline and would also disable the inline-sample "
+            "fast path. (The Stage 1 resident-Request form is the "
+            "async-scheduling entry point.)"
+        )
+        scheduler_config.async_scheduling = False
 
     if effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM:
         attention_config = getattr(config, "attention_config", None)

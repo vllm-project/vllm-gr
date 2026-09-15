@@ -787,12 +787,16 @@ def _step_engine(
     outputs: dict[int, EngineCoreOutputs],
     model_executed: bool = True,
     has_requests: bool = False,
+    has_unfinished_requests: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         step_fn=lambda: (outputs, model_executed),
         output_queue=queue.SimpleQueue(),
         post_step=MagicMock(),
-        scheduler=SimpleNamespace(has_requests=lambda: has_requests),
+        scheduler=SimpleNamespace(
+            has_requests=lambda: has_requests,
+            has_unfinished_requests=lambda: has_unfinished_requests,
+        ),
     )
 
 
@@ -1120,3 +1124,76 @@ class TestApplyBeamStepParentScoreGuard:
         assert result.finished
         assert result.outputs[0].finish_reason == "error"
         assert "s0" not in processor.request_states
+
+
+def test_unconstrained_resident_prefill_seeds_every_batch_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    width = 2
+    sequence = torch.zeros((2, width, 4), dtype=torch.int32)
+    beam_scores = torch.zeros((2, width), dtype=torch.float32)
+    decision = SimpleNamespace(
+        sequence=sequence, beam_scores=beam_scores, worker_decode_steps=0
+    )
+    context = SimpleNamespace(decision=decision)
+    sessions = {
+        "a": SimpleNamespace(slot=0, context=context),
+        "b": SimpleNamespace(slot=1, context=context),
+    }
+    monkeypatch.setattr(
+        model_runner_common,
+        "_get_gr_config",
+        lambda _runner: SimpleNamespace(
+            beam_worker_decision=True, constraint_backend=None
+        ),
+    )
+    monkeypatch.setattr(
+        model_runner_common,
+        "_create_single_request_beam_session",
+        lambda _runner, req_id, **_kwargs: sessions[req_id],
+    )
+    beam_data = {
+        req_id: {
+            "is_beam_prefill": True,
+            "is_beam_single_request": True,
+            "beam_width": width,
+            "prefix_len": 8,
+            "max_decode_steps": 3,
+        }
+        for req_id in ("a", "b")
+    }
+    runner = SimpleNamespace(
+        device=SimpleNamespace(type="npu"),
+        _current_beam_info={"beam_data": beam_data, "req_ids": ["a", "b"]},
+    )
+    sampler_output = SimpleNamespace(
+        logprobs_tensors=SimpleNamespace(
+            logprob_token_ids=torch.tensor([[99, 11, 12], [98, 21, 22]]),
+            logprobs=torch.tensor([[0.0, -1.0, -2.0], [0.0, -3.0, -4.0]]),
+        )
+    )
+
+    result = beam_decision._run_unconstrained_prefill_decision(
+        runner, sampler_output
+    )
+
+    assert result == {"stage": "prefill", "session_id": "a"}
+    assert sequence[:, :, 0].tolist() == [[11, 12], [21, 22]]
+    assert beam_scores.tolist() == [[-1.0, -2.0], [-3.0, -4.0]]
+    assert decision.worker_decode_steps == 1
+
+
+def test_lazy_beam_payload_keeps_materialized_dict_semantics() -> None:
+    calls = 0
+
+    def materialize() -> dict:
+        nonlocal calls
+        calls += 1
+        return {"by_request": {"a": {"is_last_step": True}}}
+
+    payload = beam_decision._LazyBeamPayload({"session_id": None}, materialize)
+    expected = {"a": {"is_last_step": True}}
+    assert payload.get("by_request") == expected
+    assert payload.get("by_request") == expected
+    assert payload["by_request"] == expected
+    assert calls == 1

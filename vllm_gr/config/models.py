@@ -154,6 +154,16 @@ class GRConfig:
     # Added after pre-existing fields to preserve positional construction.
     # One logical session occupies beam_max_width physical rows.
     beam_max_batch_size: int = 1
+    # Stage 1 resident-Request form (async scheduling entry point).  True
+    # keeps async scheduling ON for beam deployments (vLLM 0.22 auto-enables
+    # it; the Stage 0 auto-off guard in arg_utils_gr skips this deployment)
+    # and enables ``GRLLM.async_beam_search``: one resident Request per
+    # session (max_tokens = decode steps), the upstream scheduler drives
+    # every decode step as a cached-reqs step, and the worker overwrites
+    # input_ids/positions from the device beam decision (9.diff model).  The
+    # Stage 0 per-step ``beam_search`` refuses to run in this deployment
+    # (its Request lifecycle is incompatible with the batch-queue pipeline).
+    beam_async: bool = False
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -228,6 +238,12 @@ class GRConfig:
                 "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "
                 "(the engine-driven session consumes worker beam decisions)"
             )
+        if self.beam_async and self.beam_max_width is None:
+            raise ValueError(
+                "vllm-gr beam_async=True requires beam_max_width "
+                "(the resident form sources every decode step from the worker "
+                "beam decision buffers)"
+            )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None
@@ -251,6 +267,7 @@ class GRConfig:
             or (self.constraint_table is not None and self.constraint_table.enabled)
             or self.beam_worker_decision is not None
             or self.beam_engine_driven is not None
+            or self.beam_async
         )
 
     @classmethod

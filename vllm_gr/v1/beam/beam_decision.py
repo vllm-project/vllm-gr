@@ -362,6 +362,104 @@ class BeamPostprocessWorkspacePool:
         return sum(workspace.device_memory_bytes for workspace in self._buckets.values())
 
 
+@dataclass(slots=True)
+class BeamNpuTransportWorkspace:
+    """Minimal pinned-host transport for one NPU beam-decision geometry.
+
+    The CUDA :class:`BeamPostprocessWorkspace` carries ~25 CUDA-kernel scratch
+    buffers that the NPU path never uses; rather than grow that class with an
+    NPU branch, this object holds *only* what the compact result encoding
+    needs: a pinned int32 host staging buffer, its cached NumPy view, and one
+    NPU copy event.
+
+    Layout of the staging buffer (int32 words, packed back-to-back):
+    ``[ids | parents | score_bits | sequence?]`` — the first three segments are
+    the equal-width compact wire arrays (``beam_result_i32_f32_v1``); the
+    optional trailing segment carries the terminal step's ``out_sequence``
+    (``[B, W, steps]`` int32) so the FINAL step also moves its whole payload in
+    one D2H.  The nested ``out_sequence`` / ``out_log_probs`` lists the serving
+    terminal short-circuit (``_worker_final_sequences``) consumes verbatim are
+    then derived from the host view — pure host-memory reads, no second sync.
+
+    The encoding reuses the CUDA ``beam_result_i32_f32_v1`` wire format for the
+    compact arrays, so the frontend decodes it through the device-agnostic
+    ``unpack_beam_result_buffer`` path with no consumer-side change.
+    """
+
+    key: BeamPostprocessWorkspaceKey
+    max_batch: int
+    max_decode_steps: int
+    device: torch.device
+    host_result: torch.Tensor
+    host_result_numpy: Any
+    copy_event: Any | None
+    # In-flight guard for the deferred terminal D2H (see ``_LazyBeamPayload``):
+    # the pinned ``host_result`` is a single shared staging buffer across every
+    # session, so the next terminal encode must not rewrite it while the async
+    # output thread is still materializing the previous terminal's copy.  Set
+    # on the busy-loop thread right after ``copy_event.record()``; cleared when
+    # the lazy payload materializes (event-grained sync) or, defensively, at
+    # the top of the next terminal fast path before any staging write.  Mirrors
+    # the ``_h2d_pending`` flag in ``beam_attn_metadata._pack_int32_to_dev``.
+    copy_pending: bool = False
+
+    @property
+    def capacity(self) -> int:
+        """Staging words: 3 compact arrays + the terminal sequence segment."""
+
+        return (3 + self.max_decode_steps) * self.max_batch * self.key.beam_width
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        max_batch: int,
+        beam_width: int,
+        max_decode_steps: int,
+        device: torch.device | str,
+        logits_dtype: torch.dtype,
+    ) -> "BeamNpuTransportWorkspace":
+        """Allocate the pinned host staging pair once; callers retain it."""
+
+        if isinstance(max_batch, bool) or not isinstance(max_batch, int) or max_batch < 1:
+            raise ValueError("max_batch must be a positive integer")
+        if isinstance(beam_width, bool) or not isinstance(beam_width, int) or beam_width < 1:
+            raise ValueError("beam_width must be a positive integer")
+        if (
+            isinstance(max_decode_steps, bool)
+            or not isinstance(max_decode_steps, int)
+            or max_decode_steps < 1
+        ):
+            raise ValueError("max_decode_steps must be a positive integer")
+        resolved_device = torch.device(device)
+        if resolved_device.type != "npu":
+            raise ValueError("BeamNpuTransportWorkspace is only supported for NPU workspaces")
+
+        capacity = (3 + max_decode_steps) * max_batch * beam_width
+        host_result = torch.empty(capacity, dtype=torch.int32, pin_memory=True)
+        copy_event = None
+        try:
+            copy_event = torch.npu.Event(enable_timing=False)
+        except Exception:
+            # torch.npu.Event unavailable (older CANN / import-time): degrade to
+            # a global ``torch.npu.synchronize()`` in the encoder.  Still one
+            # synchronization per step rather than one per tensor.
+            copy_event = None
+        return cls(
+            key=BeamPostprocessWorkspaceKey(beam_width, beam_width, logits_dtype),
+            max_batch=max_batch,
+            max_decode_steps=max_decode_steps,
+            device=resolved_device,
+            host_result=host_result,
+            host_result_numpy=host_result.numpy(),
+            copy_event=copy_event,
+        )
+
+    @property
+    def pinned_memory_bytes(self) -> int:
+        return self.host_result.numel() * self.host_result.element_size()
+
+
 def get_beam_postprocess_workspace(
     runner: Any,
     beam_width: int,
@@ -382,6 +480,23 @@ def get_beam_postprocess_workspace(
         return pool.require(key)
     except KeyError:
         return None
+
+
+def get_beam_npu_transport_workspace(
+    runner: Any,
+    beam_width: int,
+) -> BeamNpuTransportWorkspace | None:
+    """Return the prewarmed NPU transport workspace, never allocating on a miss."""
+
+    device = getattr(runner, "device", None)
+    if str(getattr(device, "type", "")) != "npu":
+        return None
+    workspace = getattr(runner, "_beam_npu_transport_workspace", None)
+    if not isinstance(workspace, BeamNpuTransportWorkspace):
+        return None
+    if workspace.key.beam_width != beam_width:
+        return None
+    return workspace
 
 
 def _encode_cuda_beam_result(
@@ -457,6 +572,289 @@ def _encode_cuda_beam_result(
         "buffer": host_numpy.tobytes(),
         "is_last_step": bool(is_last_step),
     }
+    return payload, [int(parent) for parent in host_numpy[count : 2 * count].tolist()]
+
+
+class _LazyBeamPayload(dict):
+    """A terminal beam-decision payload that defers its D2H sync + materialization.
+
+    The terminal step's ``copy_event.synchronize()`` + ``tobytes()``/``tolist()``
+    is the heaviest host-side work in a beam session (the W*steps ``tolist`` of
+    ``out_sequence`` alone).  Running it synchronously inside ``sample_tokens``
+    blocks the worker busy-loop thread, which under async scheduling serializes
+    the *next* session's ``execute_model``/``sample_tokens`` issuance even though
+    the terminal step has nothing left to schedule for its own session.
+
+    This dict subclass carries the cheap scalar fields (``buffer_format``,
+    ``shape``, ``is_last_step``, and the caller-added ``stage``/``session_id``)
+    immediately so EngineCore's ``patched_update_from_output`` can route it
+    without touching the device, while the three heavy fields (``buffer``,
+    ``out_log_probs``, ``out_sequence``) are materialized lazily at the first
+    pickle.  The worker→EngineCore IPC goes through ``MessageQueue.enqueue`` →
+    ``pickle.dumps`` (shm_broadcast.py), so ``__reduce__`` fires exactly there —
+    on the async output thread when async scheduling is on, i.e. off the
+    busy-loop critical path; on the busy-loop thread otherwise (identical to
+    the previous inline behavior, no regression).
+
+    The pinned ``host_result`` staging is a single shared buffer across
+    sessions; the lazy payload keeps the ``copy_event`` reference and the
+    ``copy_pending`` guard on the workspace ensures the next terminal encode
+    waits on this event before rewriting staging (cross-thread staging-rewrite
+    race, same class as ``_pack_int32_to_dev``).
+    """
+
+    __slots__ = ("_materialize_fn", "_materialized", "_materialized_dict")
+
+    def __init__(self, scalars: dict, materialize_fn):
+        super().__init__(scalars)
+        self._materialize_fn = materialize_fn
+        self._materialized = False
+        self._materialized_dict: dict | None = None
+
+    def get(self, key, default=None):
+        # In uniprocess deployments there is no pickle boundary to trigger
+        # __reduce__. Materialize only when a consumer asks for a heavy field.
+        if not self._materialized and key not in self:
+            return self._materialize().get(key, default)
+        return super().get(key, default)
+
+    def __reduce__(self):
+        return (dict, (self._materialize(),))
+
+    def _materialize(self) -> dict:
+        if self._materialized:
+            assert self._materialized_dict is not None
+            return self._materialized_dict
+        heavy = self._materialize_fn()
+        # Keep normal dict semantics after the first lazy read: later ``get``
+        # and ``__getitem__`` calls must see the same materialized fields.
+        super().update(heavy)
+        result = dict(self)
+        self._materialized = True
+        self._materialized_dict = result
+        # Drop the closure reference once materialized so the pinned buffer /
+        # workspace are not retained past the pickle boundary.
+        self._materialize_fn = None  # type: ignore[assignment]
+        return result
+
+
+def _encode_npu_beam_result(
+    decision: dict[str, Any],
+    *,
+    is_last_step: bool,
+    workspace: BeamNpuTransportWorkspace | None = None,
+) -> tuple[dict[str, Any], list[int]] | None:
+    """Encode NPU winners with one device-to-host synchronization.
+
+    Mirrors ``_encode_cuda_beam_result``'s fast path: pack the three
+    equal-width arrays (int32 token ids, int32 parents, fp32 scores
+    bit-reinterpreted as int32) into the pinned host staging buffer, issue a
+    single ``non_blocking`` D2H copy, and synchronize once.  This replaces the
+    legacy per-key ``.to("cpu").tolist()`` loop, which cost ~30ms per tensor
+    on NPU (profiling bw128_1k_t3) — 3 tensors per step stalled ~90ms.
+
+    The wire format is identical to the CUDA compact buffer
+    (``beam_result_i32_f32_v1``), so the frontend decodes it through the same
+    device-agnostic ``unpack_beam_result_buffer`` path.
+
+    Terminal step (``is_last_step``): the decision additionally carries
+    ``out_sequence`` ``[B, W_eff, steps]`` (cumulative decode state).  It is
+    appended to the SAME pinned transfer (staging layout
+    ``[ids | parents | score_bits | sequence]``).  When a ``copy_event`` is
+    available the terminal step is **deferred**: the D2H + ``record()`` is
+    issued here, but the ``synchronize()`` + ``tobytes``/``tolist``
+    materialization is postponed to the first pickle of the returned
+    ``_LazyBeamPayload``.  Under async scheduling that pickle happens on the
+    output thread (off the worker busy-loop), so the worker can immediately
+    issue the next session's compute while the terminal tail (final select
+    D2H + W*steps tolist + pickle) overlaps — the terminal step has nothing
+    left to schedule for its own session.  Without an event, or for
+    non-terminal steps, the sync stays inline (one sync per session).
+
+    Returns ``(payload, parent_host)`` — ``parent_host`` is the request-0 parent
+    mapping derived from the same D2H copy, so the KV-reorder record needs no
+    second device→host sync (cf. the ``_finalize_decision`` comment).  For the
+    deferred terminal path ``parent_host`` is an empty list (the terminal step
+    has no successor, so the KV-reorder record is never consumed).  Returns
+    ``None`` when the payload shape/dtype does not satisfy the fast path; the
+    caller keeps the legacy per-key list fallback for correctness.
+    """
+    token_ids = decision.get("out_token_ids")
+    parents = decision.get("out_token_index")
+    scores = decision.get("out_log_probs")
+    sequence = decision.get("out_sequence")
+    if not all(torch.is_tensor(value) for value in (token_ids, parents, scores)):
+        return None
+    if token_ids.ndim != 2 or parents.shape != token_ids.shape or scores.shape != token_ids.shape:
+        return None
+    # Terminal step requires the sequence tensor for the same-transfer packing;
+    # a missing/odd-shaped sequence on the terminal step falls back to the
+    # legacy path (correctness first).
+    if is_last_step and (
+        not torch.is_tensor(sequence)
+        or sequence.ndim != 3
+        or sequence.shape[0] != token_ids.shape[0]
+        or sequence.shape[1] != token_ids.shape[1]
+    ):
+        return None
+
+    count = token_ids.numel()
+    seq_words = sequence.numel() if (is_last_step and torch.is_tensor(sequence)) else 0
+    fast_path = (
+        workspace is not None
+        and token_ids.device == workspace.device
+        and parents.device == workspace.device
+        and scores.device == workspace.device
+        and token_ids.dtype is torch.int32
+        and parents.dtype is torch.int32
+        and scores.dtype is torch.float32
+        and token_ids.is_contiguous()
+        and parents.is_contiguous()
+        and scores.is_contiguous()
+        and count <= workspace.max_batch * workspace.key.beam_width
+        and workspace.host_result.is_pinned()
+    )
+    if is_last_step and fast_path:
+        # The sequence segment must fit the prewarmed staging tail; its extent
+        # is bounded by beam_max_decode_steps at allocation time.
+        fast_path = (
+            torch.is_tensor(sequence)
+            and sequence.device == workspace.device
+            and sequence.dtype is torch.int32
+            and sequence.is_contiguous()
+            and seq_words
+            <= workspace.max_batch
+            * workspace.key.beam_width
+            * workspace.max_decode_steps
+        )
+    if fast_path:
+        # Staging-rewrite guard: the pinned ``host_result`` is a single shared
+        # buffer across sessions.  A previous terminal step may have issued a
+        # DEFERRED D2H (``copy_event.record()`` without an inline sync) whose
+        # materialization is still pending on the async output thread.  Wait on
+        # that recorded event — event-grained, not a stream sync — before
+        # rewriting staging so the two transfers never overlap.  No-op for the
+        # common case where the previous step materialized inline (non-terminal
+        # or fallback path clears the flag on sync).
+        if workspace.copy_pending:
+            if workspace.copy_event is not None:
+                workspace.copy_event.synchronize()
+            else:
+                torch.npu.synchronize()
+            workspace.copy_pending = False
+        # One device-side concat → one D2H copy → one event sync.  The concat
+        # keeps the copy a single contiguous transfer; the int32 bit-view of
+        # the fp32 scores avoids any float↔int conversion on the host side.
+        # Terminal step: the int32 sequence rides in the same transfer.
+        pieces = (
+            token_ids.view(-1),
+            parents.view(-1),
+            scores.view(-1).view(torch.int32),
+        )
+        if is_last_step:
+            pieces = pieces + (sequence.view(-1),)
+        packed = torch.cat(pieces)
+        total_words = 3 * count + seq_words
+        host = workspace.host_result[:total_words]
+        host.copy_(packed, non_blocking=True)
+
+        # Deferred terminal path: when an event is available, issue the D2H
+        # ``record()`` and return WITHOUT syncing or materializing.  The sync
+        # ``tobytes``/``tolist`` happens lazily at the first pickle (see
+        # ``_LazyBeamPayload``), which under async scheduling lands on the
+        # output thread — off the busy-loop critical path — so the worker can
+        # immediately dequeue/issue the next session's execute_model.  The
+        # terminal step has no subsequent scheduling of its own, so deferring
+        # its wait only ever overlaps it with useful next-batch work.
+        if is_last_step and workspace.copy_event is not None:
+            workspace.copy_event.record()
+            workspace.copy_pending = True
+            batch, width = int(token_ids.shape[0]), int(token_ids.shape[1])
+            steps = seq_words // (batch * width)
+            # ``parent_host`` is consumed only for non-terminal steps (caller
+            # builds ``state.kv_reorder`` from it); the terminal step has no
+            # successor, so an empty list is the correct deferred return.
+            scalars = {
+                "buffer_format": _BEAM_RESULT_BUFFER_FORMAT,
+                "shape": [batch, width],
+                "is_last_step": True,
+            }
+            ws_host = workspace.host_result
+            ws_numpy = workspace.host_result_numpy
+            copy_event = workspace.copy_event
+
+            def _materialize(
+                _copy_event=copy_event,
+                _ws=workspace,
+                _host=ws_host,
+                _numpy=ws_numpy,
+                _count=count,
+                _seq_words=seq_words,
+                _batch=batch,
+                _width=width,
+                _steps=steps,
+            ) -> dict[str, Any]:
+                _copy_event.synchronize()
+                _ws.copy_pending = False
+                return {
+                    "buffer": _numpy[: 3 * _count].tobytes(),
+                    "out_log_probs": _host[2 * _count : 3 * _count]
+                    .view(torch.float32)
+                    .reshape(_batch, _width)
+                    .tolist(),
+                    "out_sequence": _host[3 * _count : 3 * _count + _seq_words]
+                    .reshape(_batch, _width, _steps)
+                    .tolist(),
+                }
+
+            return _LazyBeamPayload(scalars, _materialize), []
+
+        # Inline path: non-terminal steps, or terminal without a usable event
+        # (fallback to the previous behavior — one sync per terminal session).
+        if workspace.copy_event is not None:
+            workspace.copy_event.record()
+            workspace.copy_event.synchronize()
+        else:
+            # Event API unavailable: a global device sync is coarser (all NPU
+            # work, not just this copy) but still collapses the per-tensor
+            # syncs into one.
+            torch.npu.synchronize()
+        host_numpy = workspace.host_result_numpy[:total_words]
+    else:
+        token_ids_i32 = token_ids if token_ids.dtype is torch.int32 else token_ids.to(torch.int32)
+        parents_i32 = parents if parents.dtype is torch.int32 else parents.to(torch.int32)
+        scores_f32 = scores if scores.dtype is torch.float32 else scores.to(torch.float32)
+        pieces = (
+            token_ids_i32.contiguous().reshape(-1),
+            parents_i32.contiguous().reshape(-1),
+            scores_f32.contiguous().reshape(-1).view(torch.int32),
+        )
+        if is_last_step and torch.is_tensor(sequence):
+            seq_i32 = sequence if sequence.dtype is torch.int32 else sequence.to(torch.int32)
+            pieces = pieces + (seq_i32.contiguous().reshape(-1),)
+        host = torch.cat(pieces).to(device="cpu")
+        host_numpy = host.numpy()
+    payload = {
+        "buffer_format": _BEAM_RESULT_BUFFER_FORMAT,
+        "shape": [int(token_ids.shape[0]), int(token_ids.shape[1])],
+        "buffer": host_numpy[: 3 * count].tobytes(),
+        "is_last_step": bool(is_last_step),
+    }
+    if is_last_step:
+        # Derive the plain nested lists the serving terminal short-circuit
+        # reads (``_worker_final_sequences``) from the already-synced host
+        # tensor — host-memory reads only, no further D2H.  The fp32 score
+        # re-interpretation uses a torch dtype bit-view (int32 and float32
+        # share the 4-byte itemsize); both branches keep ``host`` as a
+        # contiguous CPU int32 tensor.
+        batch, width = int(token_ids.shape[0]), int(token_ids.shape[1])
+        steps = seq_words // (batch * width)
+        payload["out_log_probs"] = (
+            host[2 * count : 3 * count].view(torch.float32).reshape(batch, width).tolist()
+        )
+        payload["out_sequence"] = (
+            host[3 * count : 3 * count + seq_words].reshape(batch, width, steps).tolist()
+        )
     return payload, [int(parent) for parent in host_numpy[count : 2 * count].tolist()]
 
 
@@ -750,6 +1148,22 @@ def worker_decision_enabled(runner: Any) -> bool:
     return True
 
 
+def _resident_beam_decode_step(beam_info: Any) -> bool:
+    """True when the current step is a Stage 1 resident beam-decode step.
+
+    The ``resident`` metadata flag is set by ``build_beam_request_metadata``
+    from ``Request.is_beam_resident`` and only ever originates from the
+    ``beam_async`` entry point's session template, so it is exactly the
+    Stage 1 async-scheduling form — no extra config lookup is needed.
+    """
+    if not beam_info:
+        return False
+    for mdata in (beam_info.get("beam_data") or {}).values():
+        if mdata.get("is_beam_decode", False) and mdata.get("resident", False):
+            return True
+    return False
+
+
 def enqueue_cuda_prefill_workspace_result(
     token_ids: torch.Tensor,
     scores: torch.Tensor,
@@ -997,6 +1411,233 @@ def _run_cuda_prefill_decision(runner: Any, sampler_output: Any) -> dict[str, to
         # branch keys on stage="prefill" and validates session_id against the
         # output it was attached to, so a mixed batch (A decode + B prefill)
         # can never chain B's decision onto A's session.
+        "stage": "prefill",
+        "session_id": prefill_req_id,
+    }
+
+
+def _run_unconstrained_prefill_decision(
+    runner: Any,
+    sampler_output: Any,
+) -> dict[str, torch.Tensor] | None:
+    """Publish the top-W prefill winners for an UNCONSTRAINED beam session.
+
+    The Stage 1 resident form (``GRLLM.async_beam_search``) chains step 0
+    from a prefill worker decision on every accelerator.  Constraint Table
+    prefills publish theirs through ``_run_cuda_prefill_decision`` (the
+    constrained top-k operator's fixed-width row); an unconstrained session
+    has no such operator, but the ordinary sampler already computed the
+    flat top-K of the prefill logits (``logprobs == beam_width`` on the
+    prefill's sampling params), so the first W candidates ARE the step-0
+    beam survivors — all with parent 0, mirroring the CUDA contract
+    (``_run_cuda_prefill_decision``'s ownership markers included).
+
+    The decode session seeds its own persistent buffers later from the
+    step-0 candidate matrix (``init_beam_decision_state``); prefill scores
+    never touch them (same isolation rule as the CUDA path).
+    """
+    from vllm_gr.config import ConstraintBackend
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    device = getattr(runner, "device", None)
+    if str(getattr(device, "type", "")) not in ("npu", "cuda"):
+        return None
+    gr_cfg = _get_gr_config(runner)
+    if not bool(gr_cfg.beam_worker_decision):
+        return None
+    if gr_cfg.constraint_backend == ConstraintBackend.CONSTRAINT_TABLE:
+        # Constraint Table prefills publish through the dedicated CUDA path
+        # (constrained top-k operator + fixed-width rows).
+        return None
+
+    beam_info = getattr(runner, "_current_beam_info", None)
+    beam_data = (beam_info.get("beam_data") or {}) if beam_info else {}
+    prefills = [
+        (req_id, mdata)
+        for req_id, mdata in beam_data.items()
+        if mdata.get("is_beam_prefill", False)
+    ]
+    if len(prefills) > 1:
+        # Async resident B>1: seed every request row directly into its
+        # registry slot. The prefill decision never leaves the worker.
+        if not all(
+            mdata.get("is_beam_single_request", False)
+            or mdata.get("single_request", False)
+            for _, mdata in prefills
+        ):
+            return None
+        widths = {mdata.get("beam_width") for _, mdata in prefills}
+        if len(widths) != 1:
+            return None
+        width = next(iter(widths))
+        if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+            return None
+
+        lp_tensors = getattr(sampler_output, "logprobs_tensors", None)
+        token_ids = getattr(lp_tensors, "logprob_token_ids", None)
+        scores = getattr(lp_tensors, "logprobs", None)
+        if (
+            not torch.is_tensor(token_ids)
+            or not torch.is_tensor(scores)
+            or token_ids.ndim != 2
+            or scores.shape != token_ids.shape
+            or token_ids.shape[0] != len(prefills)
+        ):
+            return None
+        n_cols = min(token_ids.shape[1], scores.shape[1])
+        if n_cols > width:
+            out_ids = token_ids[:, 1 : width + 1].to(dtype=torch.int32).contiguous()
+            out_scores = scores[:, 1 : width + 1].to(dtype=torch.float32).contiguous()
+        elif n_cols == width:
+            out_ids = token_ids[:, :width].to(dtype=torch.int32).contiguous()
+            out_scores = scores[:, :width].to(dtype=torch.float32).contiguous()
+        else:
+            return None
+
+        prefill_map = dict(prefills)
+        scheduled_order = [
+            req_id
+            for req_id in (beam_info.get("req_ids") or ())
+            if req_id in prefill_map
+        ]
+        if len(scheduled_order) != len(prefills):
+            scheduled_order = [req_id for req_id, _ in prefills]
+
+        from vllm_gr.v1.worker.model_runner_common import (
+            _create_single_request_beam_session,
+        )
+
+        sessions = []
+        for row, req_id in enumerate(scheduled_order):
+            mdata = prefill_map[req_id]
+            session = _create_single_request_beam_session(
+                runner,
+                req_id=req_id,
+                beam_width=width,
+                prefix_len=int(mdata.get("prefix_len", 0)),
+                max_decode_steps=int(mdata.get("max_decode_steps", 0)),
+            )
+            if session is None:
+                raise RuntimeError(
+                    f"unable to allocate resident beam session for {req_id!r}"
+                )
+            bufs = getattr(session.context, "decision", None)
+            if bufs is None:
+                raise RuntimeError("resident beam context has no decision buffers")
+            slot = int(session.slot)
+            winners = out_ids[row, :width]
+            if winners.dtype is not bufs.sequence.dtype:
+                winners = winners.to(bufs.sequence.dtype)
+            win_scores = out_scores[row, :width]
+            if win_scores.dtype is not bufs.beam_scores.dtype:
+                win_scores = win_scores.to(bufs.beam_scores.dtype)
+            bufs.sequence[slot, :width, 0].copy_(winners)
+            bufs.beam_scores[slot, :width].copy_(win_scores)
+            bufs.worker_decode_steps = 1
+            sessions.append(session)
+
+        if beam_info is not None:
+            beam_info["beam_session"] = sessions[0]
+        return {"stage": "prefill", "session_id": scheduled_order[0]}
+
+    # The result ABI is one logical request (mirrors the CUDA gate).
+    if len(prefills) != 1:
+        return None
+    prefill_req_id, mdata = prefills[0]
+    width = mdata.get("beam_width")
+    if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+        return None
+
+    lp_tensors = getattr(sampler_output, "logprobs_tensors", None)
+    token_ids = getattr(lp_tensors, "logprob_token_ids", None)
+    scores = getattr(lp_tensors, "logprobs", None)
+    if (
+        not torch.is_tensor(token_ids)
+        or not torch.is_tensor(scores)
+        or token_ids.ndim != 2
+        or scores.shape != token_ids.shape
+        or token_ids.shape[0] != 1
+    ):
+        return None
+    # Flat layout is [sampled, top1, ..., topK]: drop the sampled-token
+    # column (dedup semantics, cf. extract_and_dedup_flat_logprobs) before
+    # taking the W beam candidates.  A row already exactly W wide is the
+    # constrained-override shape and never reaches this unconstrained gate,
+    # but keep the min() guard from _select_candidates so slicing cannot
+    # overflow.
+    n_cols = min(token_ids.shape[1], scores.shape[1])
+    if n_cols > width:
+        cand_ids = token_ids[:, 1 : width + 1]
+        cand_scores = scores[:, 1 : width + 1]
+    elif n_cols == width:
+        cand_ids = token_ids[:, :width]
+        cand_scores = scores[:, :width]
+    else:
+        return None
+
+    out_ids = cand_ids.to(dtype=torch.int32).contiguous()
+    out_scores = cand_scores.to(dtype=torch.float32).contiguous()
+    out_parents = torch.zeros_like(out_ids, dtype=torch.int32)
+
+    # Single-Request form: the prefill IS the session's first step, so seed
+    # the device-resident decision buffers NOW (column 0 = prefill winners,
+    # ``worker_decode_steps = 1``) — before any decode step runs.  This makes
+    # the first decode's input overwrite read the real winners instead of the
+    # reset-zeros a freshly-``begin_session``'d buffer would hold, and lets the
+    # subsequent ``_get_or_create_beam_session`` find an already-seeded session
+    # (no second ``begin_session`` reset).  The engine-driven two-Request path
+    # keeps the old contract (buffers seeded later by ``init_beam_decision_state``
+    # during the step-0 decode decision).
+    if mdata.get("is_beam_single_request", False) or mdata.get("single_request", False):
+        from vllm_gr.v1.worker.model_runner_common import (
+            _create_single_request_beam_session,
+        )
+
+        session = _create_single_request_beam_session(
+            runner,
+            req_id=prefill_req_id,
+            beam_width=width,
+            prefix_len=int(mdata.get("prefix_len", 0)),
+            max_decode_steps=int(mdata.get("max_decode_steps", 0)),
+        )
+        if session is not None:
+            bufs = getattr(session.context, "decision", None)
+            if bufs is not None:
+                n = min(width, bufs.sequence.shape[1])
+                winners = out_ids[0, :n]
+                if winners.dtype is not bufs.sequence.dtype:
+                    winners = winners.to(bufs.sequence.dtype)
+                win_scores = out_scores[0, :n]
+                if win_scores.dtype is not bufs.beam_scores.dtype:
+                    win_scores = win_scores.to(bufs.beam_scores.dtype)
+                # Device-side seed (same stream as the prefill forward / the
+                # next decode's overwrite — ordered before both).
+                bufs.sequence[session.slot, :n, 0].copy_(winners)
+                bufs.beam_scores[session.slot, :n].copy_(win_scores)
+                bufs.worker_decode_steps = 1
+            # Publish the session so the prefill iteration's worker-decision
+            # bookkeeping and the next decode's execute_model see it.
+            if beam_info is not None:
+                beam_info["beam_session"] = session
+        # The prefill decision has no host-side consumer in the Single-Request
+        # form (no engine-driven prefill→step0 chain, the frontend drain loop
+        # drops non-terminal outputs), so return a tensor-free stub instead of
+        # the full candidate payload.  ``maybe_run_worker_beam_decision``'s
+        # compact-encode path sees no tensors and publishes nothing — avoiding
+        # the per-prefill pinned D2H + ``copy_event.synchronize()`` that the
+        # two-Request form pays to ship the candidates to the frontend.  The
+        # ownership markers are kept so any downstream ``_beam_advance_from_*``
+        # hook still recognises the (suppressed) prefill stage.
+        return {
+            "stage": "prefill",
+            "session_id": prefill_req_id,
+        }
+
+    return {
+        "out_token_ids": out_ids,
+        "out_token_index": out_parents,
+        "out_log_probs": out_scores,
+        # Ownership markers: same contract as _run_cuda_prefill_decision.
         "stage": "prefill",
         "session_id": prefill_req_id,
     }
@@ -1342,6 +1983,7 @@ def _run_npu_decision(
     """Run the fused xllm decision operators (ACS decode_select equivalent)."""
     from vllm_gr.ops.npu import beam_ops
 
+
     bufs = session.context.decision
     width = bufs.worker_decode_steps
     beam_width = session.beam_width
@@ -1678,7 +2320,7 @@ def run_beam_decision(
 
 
 def _run_batch_worker_decision(runner: Any, batch: Any, sampler_output: Any) -> None:
-    """Run one device decision and publish request-local synchronous results."""
+    """Run one device decision and publish request-local cohort results."""
     first = batch.sessions[0]
     first._batch_sessions = batch.sessions
     beam_data = runner._current_beam_info["beam_data"]
@@ -1703,15 +2345,92 @@ def _run_batch_worker_decision(runner: Any, batch: Any, sampler_output: Any) -> 
     if decision is None:
         raise RuntimeError("batched worker decision unavailable; refusing partial output")
 
+    request_ids = [session.session_id for session in batch.sessions]
+    resident_batch = all(
+        beam_data[request_id].get("resident", False)
+        and beam_data[request_id].get("single_request", False)
+        for request_id in request_ids
+    )
+    runner._beam_decision_tensors = {
+        key: value
+        for key, value in decision.items()
+        if key in ("out_token_ids", "out_log_probs", "out_token_index")
+        and torch.is_tensor(value)
+    }
+
+    if resident_batch and not first._state.is_last_step:
+        # The next inputs and KV mapping are already device resident. Publish
+        # only per-request routing stubs and perform no D2H on intermediate steps.
+        results = {}
+        for session in batch.sessions:
+            session._state.kv_reorder = []
+            results[session.session_id] = {
+                "stage": "decode",
+                "session_id": session.session_id,
+                "is_last_step": False,
+            }
+        runner._beam_decision_result = {"by_request": results}
+        return
+
+    from vllm_gr.v1.beam.execution_batch import split_batch_decision
+
+    device_type = str(getattr(getattr(runner, "device", None), "type", ""))
+    if resident_batch and first._state.is_last_step and device_type == "npu":
+        compact = _encode_npu_beam_result(
+            decision,
+            is_last_step=True,
+            workspace=get_beam_npu_transport_workspace(runner, first.beam_width),
+        )
+        if compact is not None:
+            global_payload, _ = compact
+
+            def _materialize_batch(
+                _payload=global_payload,
+                _request_ids=tuple(request_ids),
+                _width=first.beam_width,
+            ) -> dict[str, Any]:
+                full = (
+                    _payload._materialize()
+                    if isinstance(_payload, _LazyBeamPayload)
+                    else dict(_payload)
+                )
+                unpacked = unpack_beam_result_buffer(full)
+                if unpacked is None:
+                    raise RuntimeError("invalid compact batched beam result")
+                token_ids, scores, parents = unpacked
+                rows = len(_request_ids)
+                host = {
+                    "out_token_ids": [
+                        token_ids[row * _width : (row + 1) * _width]
+                        for row in range(rows)
+                    ],
+                    "out_token_index": [
+                        parents[row * _width : (row + 1) * _width]
+                        for row in range(rows)
+                    ],
+                    "out_log_probs": [
+                        scores[row * _width : (row + 1) * _width]
+                        for row in range(rows)
+                    ],
+                    "out_sequence": full["out_sequence"],
+                }
+                return {
+                    "by_request": split_batch_decision(
+                        _request_ids, _width, host, True
+                    )
+                }
+
+            runner._beam_decision_result = _LazyBeamPayload(
+                {"session_id": None}, _materialize_batch
+            )
+            return
+
     keys = ("out_token_ids", "out_token_index", "out_log_probs", "out_sequence")
     host = {
         key: decision[key].detach().to("cpu").tolist()
         for key in keys
         if torch.is_tensor(decision.get(key))
     }
-    from vllm_gr.v1.beam.execution_batch import split_batch_decision
-
-    request_ids = [session.session_id for session in batch.sessions]
     results = split_batch_decision(
         request_ids,
         first.beam_width,
@@ -1721,12 +2440,6 @@ def _run_batch_worker_decision(runner: Any, batch: Any, sampler_output: Any) -> 
     for session in batch.sessions:
         if not session._state.is_last_step:
             session._state.kv_reorder = results[session.session_id]["out_token_index"][0]
-    runner._beam_decision_tensors = {
-        key: value
-        for key, value in decision.items()
-        if key in ("out_token_ids", "out_log_probs", "out_token_index")
-        and torch.is_tensor(value)
-    }
     runner._beam_decision_result = {"by_request": results}
 
 
@@ -1741,13 +2454,34 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
         return
 
     prefill_decision = _run_cuda_prefill_decision(runner, sampler_output)
+    if prefill_decision is None:
+        # Unconstrained Stage 1 beam prefill (NPU or CUDA): the ordinary
+        # sampler's flat top-K carries the step-0 beam candidates.
+        prefill_decision = _run_unconstrained_prefill_decision(runner, sampler_output)
     if prefill_decision is not None:
+        # Single-Request prefill stub: the device buffers were seeded inside
+        # ``_run_unconstrained_prefill_decision`` and the tensor-free payload
+        # has no host-side consumer (no engine-driven chain, frontend drops
+        # non-terminal outputs).  Skip the compact-encode + D2H sync entirely
+        # — publish nothing so ``_attach_beam_search_result`` attaches None.
+        if not torch.is_tensor(prefill_decision.get("out_token_ids")):
+            runner._beam_decision_tensors = None
+            runner._beam_decision_result = None
+            return
         runner._beam_decision_tensors = prefill_decision
         width = int(prefill_decision["out_token_ids"].shape[1])
+        device_type = str(getattr(getattr(runner, "device", None), "type", ""))
+        # Compact transport: one D2H sync instead of three per-tensor
+        # .tolist() calls.  The CUDA workspace fast path only exists on
+        # CUDA; on NPU (or without a prewarmed workspace) the allocating
+        # branch of _encode_cuda_beam_result packs the same
+        # ``beam_result_i32_f32_v1`` wire format on any device.
         compact = _encode_cuda_beam_result(
             prefill_decision,
             is_last_step=False,
-            workspace=get_beam_postprocess_workspace(runner, width),
+            workspace=get_beam_postprocess_workspace(runner, width)
+            if device_type == "cuda"
+            else None,
         )
         runner._beam_decision_result = compact[0] if compact is not None else None
         if runner._beam_decision_result is not None:
@@ -1788,9 +2522,57 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
         # Keep the device winners alive until bookkeeping has replaced the
         # redundant W-by-W sampler payload with its O(W) compatibility row.
         device_type = str(getattr(getattr(runner, "device", None), "type", ""))
+        if (
+            not state.is_last_step
+            and _resident_beam_decode_step(beam_info)
+            and not bool(decision.get("_gr_deferred_cuda_status", False))
+        ):
+            # Stage 1 resident intermediate step: NOTHING consumes the
+            # decision payload on the host.  The EngineCore resident early
+            # return only reads ``is_last_step`` (False) to set the chained
+            # marker, the frontend drain loop drops non-terminal outputs,
+            # the next step's inputs come from the device-resident sequence
+            # buffer, and the KV reorder was already applied on-device by
+            # ``_finalize_decision`` (``parent_beam_ids`` is None for
+            # resident rows, so the reorder record's VALUE is never
+            # compared — only its non-None-ness gates the next step's
+            # ``decode_step`` advance in ``_get_or_create_beam_session``).
+            # Publishing a host-only stub therefore preserves every
+            # consumer contract while removing the per-step pinned D2H
+            # ``copy_event.synchronize()`` that stalls the async-scheduling
+            # pipeline every decode step.  The terminal step keeps the
+            # full compact encode (one sync per session, not per step).
+            # CUDA deferred-status results already staged a host payload
+            # without a worker-side sync; they fall through to the normal
+            # encode, which only packs the already-staged host buffer.
+            runner._beam_decision_tensors = decision
+            # Non-empty sentinel (never compared, only truth-tested as a
+            # ``is not None`` record) so the next prepare consumes it and
+            # skips the duplicate decode_step advance.
+            state.kv_reorder = []
+            runner._beam_decision_result = {
+                "stage": "decode",
+                "is_last_step": False,
+            }
+            decode_req_id_stub = next(
+                (
+                    req_id
+                    for req_id, mdata in (beam_info.get("beam_data") or {}).items()
+                    if mdata.get("is_beam_decode", False)
+                ),
+                None,
+            )
+            if decode_req_id_stub is not None:
+                runner._beam_decision_result["session_id"] = decode_req_id_stub
+            return
         workspace = (
             get_beam_postprocess_workspace(runner, session.beam_width)
             if device_type == "cuda"
+            else None
+        )
+        npu_transport = (
+            get_beam_npu_transport_workspace(runner, session.beam_width)
+            if device_type == "npu"
             else None
         )
         deferred = (
@@ -1812,6 +2594,13 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
             return
 
         runner._beam_decision_tensors = decision
+        # NPU: collapse the per-tensor D2H syncs into one pinned copy + event
+        # sync via the compact buffer (the CUDA transport optimization, now
+        # extended to NPU).  Both step kinds take it: non-terminal steps pack
+        # ids/parents/scores; the terminal step additionally packs
+        # ``out_sequence`` into the same transfer and derives the nested
+        # ``out_sequence`` / ``out_log_probs`` lists the serving terminal
+        # short-circuit reads from the synced host view.
         compact = (
             _encode_cuda_beam_result(
                 decision,
@@ -1819,17 +2608,30 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
                 workspace=workspace,
             )
             if device_type == "cuda"
-            else None
+            else (
+                _encode_npu_beam_result(
+                    decision,
+                    is_last_step=state.is_last_step,
+                    workspace=npu_transport,
+                )
+                if device_type == "npu"
+                else None
+            )
         )
         if compact is not None:
             payload, parent_host = compact
             if not state.is_last_step:
                 state.kv_reorder = parent_host[: session.beam_width]
+            # Terminal NPU compact path returns a ``_LazyBeamPayload`` with
+            # ``parent_host == []``: the terminal step has no successor, so the
+            # KV-reorder record is unused, and deferring its materialization
+            # keeps the sync off the busy-loop thread (see _LazyBeamPayload).
             decision = payload
         else:
-            # NPU keeps its established plain-container ABI.  Its host-copy
-            # and xllm lifecycle have separate performance contracts; do not
-            # change them as part of the CUDA transport optimization.
+            # Legacy plain-container ABI: NPU without a prewarmed transport
+            # workspace, or a payload whose shape/dtype bypassed the compact
+            # fast path.  One per-key ``.to("cpu").tolist()`` sync remains —
+            # correct, but ~30ms per tensor on NPU.
             keys = (
                 ("out_token_ids", "out_token_index", "out_log_probs")
                 if not state.is_last_step
@@ -1840,9 +2642,11 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
                 value = decision.get(key)
                 if value is None:
                     continue
-                payload[key] = (
-                    value.detach().to("cpu").tolist() if torch.is_tensor(value) else value
-                )
+                from torch.autograd.profiler import record_function
+                with record_function("## to cpu ##"):
+                    payload[key] = (
+                        value.detach().to("cpu").tolist() if torch.is_tensor(value) else value
+                    )
             payload["is_last_step"] = bool(state.is_last_step)
             if not state.is_last_step:
                 out_idx_host = payload.get("out_token_index")
@@ -1867,12 +2671,14 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
 
 
 __all__ = [
+    "BeamNpuTransportWorkspace",
     "BeamPostprocessWorkspace",
     "BeamPostprocessWorkspaceKey",
     "BeamPostprocessWorkspacePool",
     "enqueue_cuda_prefill_postprocess",
     "enqueue_cuda_prefill_workspace_result",
     "flatten_decision_value",
+    "get_beam_npu_transport_workspace",
     "get_beam_postprocess_workspace",
     "init_beam_decision_from_parents",
     "init_beam_decision_state",

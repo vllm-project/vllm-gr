@@ -39,6 +39,77 @@ from vllm_gr.v1.worker.prefill_graph_runner import (
 logger = init_logger(__name__)
 
 
+def _resident_beam_overwrite_input_ids_npu(runner, scheduler_output, logits_indices) -> None:
+    """Overwrite device input_ids for resident beam-decode steps (Stage 1).
+
+    A resident session books one token/step on its single logical Request,
+    so upstream ``_prepare_inputs`` fills input_ids from the scheduler's
+    sampled tokens — wrong for beam rows whose parents the device decision
+    may have re-mapped.  The authoritative inputs live in the beam context's
+    fixed-address sequence buffer: request slot r, beam row b, decode step s
+    reads ``sequence[r, b, s]``.  In the Single-Request form column 0 holds
+    the prefill winners seeded at prefill
+    sample time (``_run_unconstrained_prefill_decision``), and each decode
+    step s reads column s — the previous decision's chosen token — so step 0
+    reads the real prefill winners instead of reset-zeros.
+
+    Copy NPU→NPU on the current stream — ordered before the model forward on
+    the same stream, no host round trip (the 9.diff
+    ``_last_out_token_ids`` technique).
+    """
+    beam_data = getattr(scheduler_output, "beam_data", {})
+    resident_ids = [
+        req_id
+        for req_id, mdata in beam_data.items()
+        if mdata.get("resident", False) and mdata.get("is_beam_decode", False)
+    ]
+    if not resident_ids:
+        return
+
+    # _beam_remap_inputs records the physical row order used by input_ids.
+    # A pure resident cohort contributes W contiguous rows per request.
+    row_configs = getattr(scheduler_output, "_gr_request_row_configs", ())
+    ordered_ids = [cfg[0] for cfg in row_configs if cfg[0] in resident_ids]
+    if len(ordered_ids) != len(resident_ids) or set(ordered_ids) != set(resident_ids):
+        raise RuntimeError("resident beam row layout does not match the scheduled cohort")
+
+    input_ids_gpu = runner.input_ids.gpu
+    token_offset = 0
+    sessions = getattr(runner, "_beam_sessions", {})
+    for req_id in ordered_ids:
+        mdata = beam_data[req_id]
+        session = sessions.get(req_id)
+        bufs = getattr(getattr(session, "context", None), "decision", None)
+        if bufs is None:
+            raise RuntimeError(
+                "vllm-gr resident beam decode requires decision buffers for "
+                f"session {req_id!r}"
+            )
+        beam_width = int(mdata["beam_width"])
+        step = int(mdata.get("decode_step", 0))
+        slot = int(session.slot)
+        if (
+            step >= bufs.sequence.shape[2]
+            or beam_width > bufs.sequence.shape[1]
+            or slot >= bufs.sequence.shape[0]
+        ):
+            raise RuntimeError(
+                f"vllm-gr resident beam decode step {step} (width {beam_width}, "
+                f"slot {slot}) exceeds decision buffer {tuple(bufs.sequence.shape)}"
+            )
+        winners = bufs.sequence[slot, :beam_width, step]
+        if winners.dtype is not input_ids_gpu.dtype:
+            winners = winners.to(input_ids_gpu.dtype)
+        input_ids_gpu[token_offset : token_offset + beam_width].copy_(
+            winners, non_blocking=True
+        )
+        token_offset += beam_width
+    # Each request contributes W expanded rows × 1 token per row, laid out
+    # contiguously from 0 by _beam_remap_inputs. ``input_ids`` is a CpuGpuBuffer;
+    # the device tensor is ``.gpu`` (same int32 dtype as the
+    # sequence buffer, so the copy is dtype-exact).
+
+
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
     """Wrap the NPU four-item ``_prepare_inputs`` contract."""
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
@@ -73,6 +144,18 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = _materialize_logits_indices(self, new_logits_indices)
+
+        # Stage 1 resident form: overwrite the device input_ids with the
+        # beam-decision winners straight from the device-resident sequence
+        # buffer (NPU→NPU copy, no D2H sync — the 9.diff
+        # ``_last_out_token_ids`` equivalent).  For a resident session the
+        # scheduler only books 1 token/step on the (single) logical Request,
+        # so the upstream-prepared input_ids hold the scheduler's sampled
+        # tokens, which are wrong for beam rows (the beam decision may have
+        # re-parented every row).  Row layout: the remap above expanded the
+        # synchronized resident cohort into contiguous per-request W-row
+        # segments, each row inputting exactly one token.
+        _resident_beam_overwrite_input_ids_npu(self, scheduler_output, new_logits_indices)
 
         return (
             logits_indices,
@@ -215,6 +298,99 @@ def make_patched_sample_tokens_npu(_orig_sample_tokens):
 
     setattr(patched_sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, True)
     return patched_sample_tokens
+
+
+_BEAM_NPU_TRANSPORT_LOAD_PATCH_MARKER = "_vllm_gr_beam_npu_transport_load_patched"
+
+
+def initialize_beam_npu_transport_workspaces(runner, *, max_batch: int | None = None):
+    """Prewarm the NPU Beam decision transport workspace on ``runner``.
+
+    Mirrors the CUDA ``initialize_beam_postprocess_workspaces`` contract but
+    allocates only the minimal pinned-host staging pair the compact result
+    encoding needs (no CUDA-kernel scratch).  The workspace collapses the
+    NPU decision's 3 per-tensor ``.to("cpu").tolist()`` syncs into one pinned
+    D2H + event sync per non-terminal step (~90ms → ~30ms; profiling
+    bw128_1k_t3).
+    """
+    device = torch.device(getattr(runner, "device", "cpu"))
+    if device.type != "npu":
+        return None
+
+    from vllm_gr.v1.beam.beam_decision import BeamNpuTransportWorkspace
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    gr_cfg = _get_gr_config(runner)
+    width = gr_cfg.beam_max_width
+    if not bool(gr_cfg.beam_worker_decision) or width is None:
+        return None
+    # The compact transport only benefits the fused xllm decision path; the
+    # cascade path keeps its frontend NumPy decision and never reaches the
+    # worker decision encoder.
+    if not _npu_xllm_decode_mode_active():
+        return None
+
+    context = getattr(runner, "_beam_context", None)
+    resolved_max_batch = (
+        int(max_batch) if max_batch is not None else int(getattr(context, "max_batch", 1))
+    )
+    dtype = getattr(getattr(runner, "model_config", None), "dtype", None)
+    if not isinstance(dtype, torch.dtype):
+        raise RuntimeError(
+            f"NPU Beam transport workspace requires model_config.dtype, got {dtype!r}"
+        )
+
+    existing = getattr(runner, "_beam_npu_transport_workspace", None)
+    if isinstance(existing, BeamNpuTransportWorkspace):
+        if (
+            existing.key.beam_width != int(width)
+            or existing.max_batch != resolved_max_batch
+            or existing.max_decode_steps != int(gr_cfg.beam_max_decode_steps)
+        ):
+            raise RuntimeError(
+                "prewarmed NPU Beam transport workspace geometry changed after "
+                "initialization; rebuilding the pinned buffer is forbidden"
+            )
+        return existing
+
+    workspace = BeamNpuTransportWorkspace.allocate(
+        max_batch=resolved_max_batch,
+        beam_width=int(width),
+        max_decode_steps=int(gr_cfg.beam_max_decode_steps),
+        device=device,
+        logits_dtype=dtype,
+    )
+    runner._beam_npu_transport_workspace = workspace
+    logger.info(
+        "vllm-gr: prewarmed NPU Beam decision transport workspace "
+        "(batch=%d, width=%d, steps=%d, dtype=%s, pinned_bytes=%d)",
+        resolved_max_batch,
+        width,
+        int(gr_cfg.beam_max_decode_steps),
+        dtype,
+        workspace.pinned_memory_bytes,
+    )
+    return workspace
+
+
+def make_load_model_with_beam_npu_transport_workspace(original):
+    """Initialize the NPU Beam decision transport storage after weights load."""
+
+    if getattr(original, _BEAM_NPU_TRANSPORT_LOAD_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def load_model_with_beam_npu_transport_workspace(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        initialize_beam_npu_transport_workspaces(self)
+        return result
+
+    setattr(
+        load_model_with_beam_npu_transport_workspace,
+        _BEAM_NPU_TRANSPORT_LOAD_PATCH_MARKER,
+        True,
+    )
+    return load_model_with_beam_npu_transport_workspace
 
 
 def _maybe_run_worker_beam_decision(runner, sampler_output) -> None:
@@ -823,6 +999,13 @@ make_patched_sample = make_patched_sample_npu
 make_patched_sample_tokens = make_patched_sample_tokens_npu
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_npu
+)
+# The dispatcher (model_runner_patch.py) looks up this exact name to install a
+# post-load_model hook; aliasing it wires the NPU transport workspace prewarm
+# into the runner's load_model lifecycle (it is a no-op on the CUDA module,
+# which defines its own workspace prewarm under the same name).
+make_load_model_with_beam_postprocess_workspace = (
+    make_load_model_with_beam_npu_transport_workspace
 )
 
 
