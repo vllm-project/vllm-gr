@@ -44,6 +44,7 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
+from vllm_gr.v1.worker.beam_final_output import GPUBeamFinalOutput
 from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
 from vllm_gr.v1.worker.gr_inputs import (
     GRInputBuffers,
@@ -212,10 +213,17 @@ def validate_dispatch(
 class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
     """Only the executor's output consumer waits and constructs the IPC value."""
 
-    def __init__(self, owner: GPUBeamStageRunner, execution: BeamDispatchExecution, slot: int):
+    def __init__(
+        self,
+        owner: GPUBeamStageRunner,
+        execution: BeamDispatchExecution,
+        slot: int,
+        terminal_payload: bool,
+    ):
         self.owner = owner
         self.execution = execution
         self.slot = slot
+        self.terminal_payload = terminal_payload
         self._output: ModelRunnerOutput | None = None
         self._lock = Lock()
 
@@ -226,9 +234,12 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
             # CUDA/D2H failures are fatal and must reach the native Executor
             # failure channel. Never publish a successful release after one.
             try:
-                self.owner.copy_done[self.slot].synchronize()
-                controls = self.owner.host_control[self.slot].tolist()
-                self._output = self._convert(controls)
+                if self.terminal_payload:
+                    controls = [self.owner.final_output.wait_embedded_control()]
+                else:
+                    self.owner.copy_done[self.slot].synchronize()
+                    controls = self.owner.host_control[self.slot].tolist()
+                self._output = self._convert(controls, final_ready=self.terminal_payload)
             except (ValueError, TypeError, IndexError) as error:
                 self._output = self._conversion_failure(error)
             finally:
@@ -245,27 +256,29 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
             out.req_id_to_index[m.session_id] = len(out.req_ids)
             out.req_ids.append(m.session_id)
             out.sampled_token_ids.append([])
-            terminal = BeamBatchResult(
+            failure = BeamBatchResult(
                 BEAM_BATCH_PROTOCOL_VERSION,
                 m.session_id,
                 None,
                 BeamBatchFailure("worker_output_error", str(error), entry.binding.item_index),
             )
+            terminal = self.owner.final_output.failure(self.owner, failure)
             results[m.session_id] = GRWorkerResult(
                 m.session_id, m.dispatch_id, m.stage_index, 0, m.output_device_state, True, terminal
             )
         setattr(out, GR_WORKER_RESULT_ATTR, results)
         return out
 
-    def _convert(self, controls) -> ModelRunnerOutput:
+    def _convert(self, controls, *, final_ready: bool) -> ModelRunnerOutput:
         if len(controls) != len(self.execution.entries):
             raise ValueError("Asynchronous scheduling control snapshot has the wrong row count")
         req_ids, sampled, results = [], [], {}
         for entry, (produced, finished, error) in zip(self.execution.entries, controls):
             m = entry.metadata
             terminal = None
+            final_output = self.owner.final_output
             if error:
-                terminal = BeamBatchResult(
+                failure = BeamBatchResult(
                     protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
                     batch_id=m.session_id,
                     output=None,
@@ -275,6 +288,22 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                         entry.binding.item_index,
                     ),
                 )
+                terminal = final_output.failure(self.owner, failure)
+            elif finished and not self.owner.cancelled:
+                try:
+                    terminal = final_output.consume(self.owner, ready=final_ready)
+                except Exception as exc:
+                    failure = BeamBatchResult(
+                        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                        batch_id=m.session_id,
+                        output=None,
+                        failure=BeamBatchFailure(
+                            "beam_final_output_error",
+                            f"Failed to materialize final Beam output: {exc}",
+                            entry.binding.item_index,
+                        ),
+                    )
+                    terminal = final_output.failure(self.owner, failure)
             req_ids.append(entry.binding.native_request_id)
             # These are scheduler placeholders. They must never be used as
             # model inputs or published as generated Beam sequences.
@@ -324,6 +353,7 @@ class GPUBeamStageRunner:
         self.worker, self.beam, self.binding, self.backend = worker, beam, binding, backend
         self.previous: GRStageMetadata | None = None
         self.pending: tuple[BeamDispatchExecution, int] | None = None
+        self._validated_dispatch: tuple[Any, tuple[GRStageMetadata, ...]] | None = None
         self.control_lock = Lock()
         self.control_drained = Condition(self.control_lock)
         self.control_busy = [False] * CONTROL_CAPACITY
@@ -342,6 +372,7 @@ class GPUBeamStageRunner:
         self.execution_error: Exception | None = None
         self.inputs: GRInputBuffers | None = None
         self.prepared: PreparedGRInputs | None = None
+        self.final_output: GPUBeamFinalOutput
         self.metadata: Any = None
         self.graph: Any = None
         self.logits: torch.Tensor | None = None
@@ -375,7 +406,16 @@ class GPUBeamStageRunner:
             raise RuntimeError("GR backend or shared execution ownership changed")
         if self.pending is not None:
             raise RuntimeError("sample_tokens must consume the previous GR execute state")
-        stages = validate_dispatch(scheduler_output, previous=self.previous, binding=self.binding)
+        validated = self._validated_dispatch
+        self._validated_dispatch = None
+        if validated is not None and validated[0] is scheduler_output:
+            stages = validated[1]
+        else:
+            stages = validate_dispatch(
+                scheduler_output,
+                previous=self.previous,
+                binding=self.binding,
+            )
         for m in stages:
             state, params = self.beam.state, m.beam_params
             if (
@@ -385,6 +425,19 @@ class GPUBeamStageRunner:
                 or state.ignore_stop_tokens_config != params.ignore_stop_tokens
             ):
                 raise ValueError("GR metadata configuration does not match persistent Beam state")
+        if not hasattr(self, "final_output"):
+            first = stages[0]
+            self.final_output = GPUBeamFinalOutput(
+                self, self.binding, first.beam_params, first.output_options
+            )
+        elif self.previous is None or self.final_output.binding != self.binding:
+            first = stages[0]
+            if self.final_output.is_compatible(self):
+                self.final_output.reset(self, self.binding, first.beam_params, first.output_options)
+            else:
+                self.final_output = GPUBeamFinalOutput(
+                    self, self.binding, first.beam_params, first.output_options
+                )
         entries, offset = [], 0
         for m in stages:
             count = (
@@ -562,6 +615,7 @@ class GPUBeamStageRunner:
         if self.backend is None:
             raise RuntimeError("GR sampling requires a bound constraint backend")
         execution, slot = self.pending
+        terminal_payload = False
         for entry in execution.entries:
             m = entry.metadata
             if m.produces_output and not self.cancelled:
@@ -591,17 +645,22 @@ class GPUBeamStageRunner:
                 self.beam.state.is_finished[row] | (self.beam.state.error_code[row] != 0)
             )
             control[2:3].copy_(self.beam.state.error_code[row])
+            # The fixed-length terminal stage returns one packed payload whose
+            # header replaces the separate per-stage control D2H.
+            if m.is_last_stage:
+                terminal_payload = self.final_output.enqueue(self, control)
         stream = torch.cuda.current_stream(self.beam.state.device)
         self.produced_ready[slot].record(stream)
         self.last_work.record(stream)
-        with torch.cuda.stream(self.copy_stream):
-            self.copy_stream.wait_event(self.produced_ready[slot])
-            self.host_control[slot].copy_(self.device_control[slot], non_blocking=True)
-            self.copy_done[slot].record(self.copy_stream)
+        if not terminal_payload:
+            with torch.cuda.stream(self.copy_stream):
+                self.copy_stream.wait_event(self.produced_ready[slot])
+                self.host_control[slot].copy_(self.device_control[slot], non_blocking=True)
+                self.copy_done[slot].record(self.copy_stream)
         self.worker.execute_model_state = None
         self.worker.kv_connector_output = None
         self.pending = None
-        return AsyncGPUBeamOutput(self, execution, slot)
+        return AsyncGPUBeamOutput(self, execution, slot, terminal_payload)
 
     def completion_view(self, binding: BeamRequestBinding) -> dict[str, torch.Tensor]:
         if self.closed or binding != self.binding:
@@ -625,9 +684,11 @@ class GPUBeamStageRunner:
             raise RuntimeError(
                 "Asynchronous scheduling retirement identity does not match the drained execution"
             )
+        self.final_output.abort(self)
         self.cancel(self.binding)
         return AsyncGRRetireOutput(self, metadata)
 
+    @torch.inference_mode()
     def cancel(self, binding: BeamRequestBinding) -> None:
         if binding != self.binding:
             raise ValueError("cancel binding mismatch")
@@ -675,9 +736,10 @@ class AsyncGRRetireOutput(AsyncModelRunnerOutput):
             owner = self.owner
             with owner.control_drained:
                 owner.control_drained.wait_for(lambda: not any(owner.control_busy))
-            done = torch.Event()
-            done.record(torch.cuda.current_stream(owner.beam.state.device))
-            owner.release(owner.binding, consumer_done=done)
+            owner.release(
+                owner.binding,
+                consumer_done=owner.final_output.consumer_done(owner),
+            )
             if not owner.closed or owner.beam.workspace.execution_owner is owner:
                 raise RuntimeError("Asynchronous scheduling Worker release did not complete")
             m = self.metadata
@@ -725,7 +787,6 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
     require_beam_execution_mode(worker.vllm_config, BeamExecutionMode.V1)
     existing = getattr(worker, "_gr_gpu_stage_runner", None)
     if existing is not None and not existing.closed:
-        validate_dispatch(scheduler_output, previous=existing.previous, binding=existing.binding)
         if getattr(worker, "constraint_backend", None) is not existing.backend:
             raise ValueError("GR constraint backend binding changed before session release")
         return cast(GPUBeamStageRunner, existing)
@@ -888,4 +949,5 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
     sessions[m.session_id] = session
     worker._beam_sessions = sessions
     worker._gr_gpu_stage_runner = adapter
+    adapter._validated_dispatch = (scheduler_output, stages)
     return cast(GPUBeamStageRunner, adapter)

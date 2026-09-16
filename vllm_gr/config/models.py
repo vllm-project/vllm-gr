@@ -8,6 +8,7 @@ from enum import Enum
 
 GR_CONFIG_SCHEMA_VERSION = 1
 CONSTRAINT_TABLE_FORMAT = "constraint_table_v1"
+CONSTRAINT_TABLE_MAX_DECODE_STEPS = 3
 # Temporary global Beam width ceiling. Keep every configuration, request,
 # runtime contract, and fused kernel on this single limit until wider kernels
 # are implemented and qualified end to end.

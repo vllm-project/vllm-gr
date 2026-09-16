@@ -145,8 +145,17 @@ class BeamSearchClient:
             session.failed = True
             return _create_failure_result(session.batch_id, "execution_failed", exc)
 
-    def build_output(self, call: OfflineBeamSearchRequest, result: BeamBatchResult) -> list[Any]:
-        return BeamSearchOutputProcessor().process_outputs(call, result)
+    def build_output(
+        self,
+        call: OfflineBeamSearchRequest,
+        request: BeamBatchRequest,
+        result: BeamBatchResult,
+    ) -> list[Any]:
+        if result.failure is not None:
+            raise BeamSearchEngineError(result.failure)
+        return BeamSearchOutputProcessor(self.llm.get_tokenizer()).process_outputs(
+            call, request, result
+        )
 
     def abort(self, session: BeamSearchSession) -> None:
         if session.terminal or session.closed:
@@ -241,8 +250,18 @@ class AsyncBeamSearchClient:
             session.failed = True
             return _create_failure_result(session.batch_id, "execution_failed", exc)
 
-    def build_output(self, call: OnlineBeamSearchRequest, result: BeamBatchResult) -> list[Any]:
-        return BeamSearchOutputProcessor().process_online_outputs(call, result)
+    def build_output(
+        self,
+        call: OnlineBeamSearchRequest,
+        request: BeamBatchRequest,
+        result: BeamBatchResult,
+    ) -> list[Any]:
+        if result.failure is not None:
+            raise BeamSearchEngineError(result.failure)
+        tokenizer = self.serving.input_processor.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("beam_search_v1 tokenizer became unavailable")
+        return BeamSearchOutputProcessor(tokenizer).process_online_outputs(call, request, result)
 
     async def abort(self, session: BeamSearchSession) -> None:
         if session.terminal or session.closed:

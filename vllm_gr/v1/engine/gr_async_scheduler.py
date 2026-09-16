@@ -12,7 +12,6 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchRequest,
     BeamBatchResult,
-    validate_beam_batch_result,
 )
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
@@ -447,12 +446,6 @@ def _read_worker_payload(
     if terminal_result is not None:
         if not isinstance(terminal_result, BeamBatchResult):
             raise _GRWorkerProtocolError("Worker returned an invalid BeamBatchResult")
-        try:
-            validate_beam_batch_result(terminal_result)
-        except (TypeError, ValueError) as error:
-            raise _GRWorkerProtocolError(
-                f"Worker returned an invalid BeamBatchResult: {error}"
-            ) from error
         if terminal_result.batch_id != session.session_id:
             raise _GRWorkerProtocolError("Worker returned a terminal result for another session")
 

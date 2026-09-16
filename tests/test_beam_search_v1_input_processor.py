@@ -24,9 +24,35 @@ from vllm_gr.sampling_params import BeamSearchParams
 from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
 
 
-def _make_engine(parallel_config: Any = None) -> Any:
+def _canonical_gr_config(*, enabled: bool = True, backend: str = "cuda") -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "beam": {
+            "execution_mode": "v1",
+            "graph_enabled": True,
+            "max_width": 2,
+            "max_decode_steps": 3,
+        },
+        "constraint_table": {
+            "enabled": enabled,
+            "backend": backend,
+            "path": "/tmp/test-constraint-table.safetensors",
+            "format": "constraint_table_v1",
+            "artifact_digest": "sha256:" + "a" * 64,
+            "tokenizer_digest": "sha256:" + "b" * 64,
+            "max_top_k": 4,
+        },
+        "attention_backend": None,
+    }
+
+
+def _make_engine(
+    parallel_config: Any = None, *, additional_config: dict[str, Any] | None = None
+) -> Any:
     config = SimpleNamespace(
-        additional_config={"vllm_gr_beam_execution_mode": "v1", "vllm_gr_beam_max_width": 2},
+        additional_config=(
+            {"vllm_gr": _canonical_gr_config()} if additional_config is None else additional_config
+        ),
         model_config=SimpleNamespace(max_model_len=32),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32, async_scheduling=True),
         parallel_config=parallel_config
@@ -144,6 +170,31 @@ def _prepare_request(
         _lora_request_to_seq=lambda lora, size: [lora],
     )
     return processor.process_offline_inputs(llm, OfflineBeamSearchRequest([prompt], params))
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "additional_config",
+    [
+        {"vllm_gr_beam_execution_mode": "v1", "vllm_gr_beam_max_width": 2},
+        {"vllm_gr": _canonical_gr_config(enabled=False)},
+        {"vllm_gr": _canonical_gr_config(backend="cpu")},
+    ],
+    ids=["missing", "disabled", "non-cuda"],
+)
+def test_request_requires_enabled_canonical_cuda_constraint_table(
+    additional_config: dict[str, Any],
+) -> None:
+    engine = _make_engine(additional_config=additional_config)
+    with pytest.raises(
+        BeamSearchRequestError,
+        match="requires an enabled canonical CUDA constraint table",
+    ):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=3),
+            online=True,
+        )
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]

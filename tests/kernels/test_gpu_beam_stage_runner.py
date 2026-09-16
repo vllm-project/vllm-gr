@@ -293,13 +293,16 @@ def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
         assert result.produced_token_count == 1
         assert result.stage_index == stage
         assert result.finished == (stage == n - 1)
-        assert result.terminal_result is None
+        assert (result.terminal_result is not None) == (stage == n - 1)
+        if result.terminal_result is not None:
+            assert result.terminal_result.output is not None
     assert state.num_generated_tokens.tolist() == [0, 0, n]
     assert state.num_decode_steps.tolist() == [0, 0, n - 1]
     for name, value in protected.items():
         torch.testing.assert_close(getattr(state, name)[:2], value)
     assert ws.selected_token_ids[0].tolist() == [987] * 4
     assert state.num_completed[2] > 0
+    assert owner.final_output.final_d2h_count == 1
     done = torch.Event()
     done.record()
     owner.release(owner.binding, consumer_done=done)
@@ -519,6 +522,41 @@ def test_release_requires_control_and_completion_consumer_drain():
     owner.release(owner.binding, consumer_done=done)
     with pytest.raises(RuntimeError, match="live matching"):
         owner.completion_view(owner.binding)
+
+
+@pytest.mark.parametrize("penalty,expected_first", [(0.0, 11), (2.0, 33), (-1.0, 11)])
+def test_final_ranking_applies_length_penalty_without_changing_logprobs(penalty, expected_first):
+    from vllm_gr.ops.cuda.beam_state import FINISH_LENGTH, FINISH_STOP
+
+    owner = runtime()
+    m = metadata()
+    m = replace(
+        m,
+        beam_params=msgspec.structs.replace(m.beam_params, length_penalty=penalty),
+        output_options=msgspec.structs.replace(m.output_options, num_return_sequences=2),
+    )
+    owner.admit(dispatch(m))
+    state, row = owner.beam.state, owner.binding.state_row
+    state.num_completed[row] = 2
+    state.completed_token_ids[row, :2] = torch.tensor([11, 33], device="cuda")
+    state.completed_scores[row, :2] = torch.tensor([-0.1, -0.15], device="cuda")
+    state.completed_lengths[row, :2] = torch.tensor([1, 3], device="cuda")
+    state.completed_finish_reasons[row, :2] = torch.tensor(
+        [FINISH_STOP, FINISH_LENGTH], device="cuda"
+    )
+    state.completed_parent_ids[row, :2] = 0
+    state.history_token_ids[row, :2, 0] = torch.tensor([22, 23], device="cuda")
+    state.history_parent_ids[row, :2, 0] = 0
+    owner.last_work.record()
+
+    result = owner.final_output.consume(owner)
+
+    assert result.failure is None
+    sequences = result.output.items[0].sequences
+    assert (sequences[0].stop_token_id or sequences[0].token_ids[-1]) == expected_first
+    assert sorted(sequence.cumulative_logprob for sequence in sequences) == pytest.approx(
+        [-0.15, -0.1]
+    )
 
 
 def test_workspace_bounds_and_exclusive_shared_scratch():

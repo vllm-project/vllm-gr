@@ -117,12 +117,14 @@ def test_canonical_writer_uses_primitive_mapping(tmp_path: Path) -> None:
         _canonical_mapping(str(tmp_path / "table.safetensors"), enabled=False)
     )
     vllm_config = SimpleNamespace(additional_config={"unrelated": 1})
+    stale = GRConfig.from_vllm_config(vllm_config)
+    assert stale.beam_max_width is None
 
     write_canonical_gr_config(vllm_config, config)
 
     payload = vllm_config.additional_config[GR_CONFIG_KEY]
     assert json.loads(json.dumps(payload)) == payload
-    assert parse_gr_config(vllm_config) == config
+    assert GRConfig.from_vllm_config(vllm_config) == config
     assert vllm_config.additional_config["unrelated"] == 1
 
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, NoReturn, cast
 
 import torch
+from vllm import envs
 from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version as _get_flash_attn_version,
 )
@@ -38,6 +39,11 @@ else:
     reshape_and_cache_flash = _flash_attn_varlen_unavailable
     merge_attn_states = _flash_attn_varlen_unavailable
     flash_attn_supports_sinks = _flash_attn_varlen_unavailable
+
+
+def _num_splits(default: int) -> int:
+    """Use deterministic FlashAttention reductions when vLLM requests them."""
+    return 1 if envs.VLLM_BATCH_INVARIANT else default
 
 
 def is_available() -> bool:
@@ -157,6 +163,7 @@ def prefill_attention(
         block_table=block_table,
         softcap=logits_soft_cap,
         fa_version=vllm_flash_attn_version,
+        num_splits=_num_splits(0),
         s_aux=s_aux,
     )
 
@@ -197,6 +204,7 @@ def cascade_attention(
             block_table=attn_metadata.std_block_table,
             softcap=logits_soft_cap,
             fa_version=vllm_flash_attn_version,
+            num_splits=_num_splits(0),
         )
         if attn_metadata.prefix_indices is None:
             output[: attn_metadata.num_std_indices] = std_out
@@ -226,7 +234,7 @@ def cascade_attention(
             return_softmax_lse=True,
             fa_version=vllm_flash_attn_version,
             scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
-            num_splits=attn_metadata.max_num_splits,
+            num_splits=_num_splits(attn_metadata.max_num_splits),
             s_aux=s_aux,
         )
 
@@ -312,6 +320,7 @@ def cascade_attention(
                 softcap=logits_soft_cap,
                 return_softmax_lse=True,
                 fa_version=vllm_flash_attn_version,
+                num_splits=_num_splits(0),
             )
         else:
             # Standard beam decode path: extract_suffix_kv from paged cache
@@ -340,6 +349,7 @@ def cascade_attention(
                 softcap=logits_soft_cap,
                 return_softmax_lse=True,
                 fa_version=vllm_flash_attn_version,
+                num_splits=_num_splits(0),
             )
 
         # FA2 GQA de-swizzle: with grouped-query attention (group_size > 1) and a

@@ -19,6 +19,10 @@ from vllm_gr.ops.cuda.beam_kv_reorder import (
     _select_kv_gather_kernel,
     _select_kv_scatter_kernel,
 )
+from vllm_gr.ops.cuda.beam_selection import (
+    _hierarchical_topk_out,
+    allocate_beam_selection_scratch,
+)
 from vllm_gr.ops.cuda.beam_state import (
     ERROR_ALREADY_INITIALIZED,
     ERROR_CAPACITY,
@@ -27,6 +31,7 @@ from vllm_gr.ops.cuda.beam_state import (
     ERROR_NOT_INITIALIZED,
     FINISH_LENGTH,
     FINISH_STOP,
+    _pack_final_beams_kernel,
     _validate_step_kernel,
 )
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
@@ -38,6 +43,7 @@ from vllm_gr.v1.beam.cpu_reference import (
     select_initial_beams,
     select_next_beams,
 )
+from vllm_gr.v1.worker.beam_final_output import _PayloadLayout
 from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -734,6 +740,59 @@ def test_width_boundaries_and_final_candidate_history(width):
         assert score == 0
         assert reason == FINISH_LENGTH
         assert tie == index
+
+
+def test_final_compaction_preserves_rank_and_parent_lineage():
+    runner = _runtime(width=4, steps=3)
+    runner.initialize_from_prefill(*_gpu([[100, 101, 102, 103]], [[0, -1, -2, -3]]))
+    tokens = np.arange(16, dtype=np.int32).reshape(4, 4) + 1000
+    runner.advance(*_gpu(tokens, np.zeros((4, 4), dtype=np.float32)))
+    runner.advance(*_gpu(tokens, np.zeros((4, 4), dtype=np.float32)))
+    state = runner.state
+    scratch = allocate_beam_selection_scratch(
+        1, 1, state.completed_capacity, state.beam_width, state.device
+    )
+    _, indices, _ = _hierarchical_topk_out(
+        torch.zeros((1, 1), device="cuda"),
+        state.completed_scores,
+        None,
+        1,
+        1,
+        state.completed_capacity,
+        state.beam_width,
+        scratch,
+    )
+    layout = _PayloadLayout.create(state.beam_width, state.max_new_tokens)
+    payload = torch.zeros(layout.size, dtype=torch.int32, device="cuda")
+    _pack_final_beams_kernel[(state.beam_width,)](
+        indices,
+        state.num_completed,
+        state.completed_token_ids[0],
+        state.completed_scores[0],
+        state.completed_parent_ids[0],
+        state.completed_lengths[0],
+        state.completed_finish_reasons[0],
+        state.history_token_ids[0],
+        state.history_parent_ids[0],
+        payload[3:],
+        WIDTH=state.beam_width,
+        STEPS=state.max_new_tokens,
+        RESULT_WIDTH=state.beam_width,
+        ROW_STRIDE=layout.row_stride,
+        ROW_BLOCK=triton.next_power_of_2(2 * state.max_new_tokens),
+    )
+    compact = payload.cpu()
+    assert compact[3].item() == 4
+    rows = compact[4:].view(4, layout.row_stride)
+    assert rows[:, :3].tolist() == [
+        [100, 1000, 1000],
+        [100, 1000, 1001],
+        [100, 1000, 1002],
+        [100, 1000, 1003],
+    ]
+    assert rows[:, 3:6].tolist() == [[0, 0, 0]] * 4
+    assert rows[:, 7].tolist() == [3] * 4
+    assert rows[:, 8].tolist() == [FINISH_LENGTH] * 4
 
 
 def test_no_candidates_and_masked_kv_rows():

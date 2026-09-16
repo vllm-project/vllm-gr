@@ -27,10 +27,12 @@ class _Frontend:
     def __init__(self, *, fail_wait: bool = False) -> None:
         self.events: list[str] = []
         self.fail_wait = fail_wait
+        self.request: BeamBatchRequest | None = None
 
     def prepare_request(self, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
         self.events.append("prepare")
-        return cast(BeamBatchRequest, {"call": call})
+        self.request = cast(BeamBatchRequest, {"call": call})
+        return self.request
 
     def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
         self.events.append("submit")
@@ -49,10 +51,11 @@ class _Frontend:
     def build_output(
         self,
         call: OfflineBeamSearchRequest,
+        request: BeamBatchRequest,
         result: BeamBatchResult,
     ) -> list[Any]:
         self.events.append("build_output")
-        return [call, result]
+        return [call, request, result]
 
     def close(self, session: BeamSearchSession) -> None:
         self.events.append("close")
@@ -65,6 +68,7 @@ def test_v1_flow_submits_once_waits_once_and_closes() -> None:
     result = run_beam_search_v1(frontend, call)
 
     assert result[0] is call
+    assert result[1] is frontend.request
     assert frontend.events == ["prepare", "submit", "wait", "build_output", "close"]
 
 
@@ -122,6 +126,7 @@ def test_v1_async_flow_awaits_preparation_before_submitting_and_closes() -> None
     frontend.prepare_request.assert_awaited_once_with(call)
     frontend.submit_once.assert_awaited_once_with(request)
     frontend.wait_final.assert_awaited_once_with(session)
+    frontend.build_output.assert_called_once_with(call, request, result)
     frontend.close.assert_awaited_once_with(session)
 
 

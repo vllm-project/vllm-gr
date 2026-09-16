@@ -207,9 +207,15 @@ def test_partial_eos_keeps_active_beams_with_delayed_receipts(dtype):
         if step == 0:
             assert owner.beam.state.active_mask[2].sum().item() == 1
             assert owner.beam.state.num_completed[2].item() == 1
-    for receipt in receipts:
+    for step, receipt in enumerate(receipts):
         result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
-        assert result.produced_token_count == 1 and result.terminal_result is None
+        assert result.produced_token_count == 1
+        if step < len(receipts) - 1:
+            assert not result.finished and result.terminal_result is None
+        else:
+            assert result.finished
+            assert result.terminal_result is not None
+            assert result.terminal_result.failure is None
     count = owner.beam.state.num_completed[2].item()
     lengths = owner.beam.state.completed_lengths[2, :count].tolist()
     assert 1 in lengths and 3 in lengths
@@ -255,7 +261,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         )
 
     monkeypatch.setattr(GPUBeamStageRunner, "_forward", unexpected_forward)
-    for prompt, budget in [(7, 3), (21, 2)]:
+    for prompt, budget in [(7, 1), (21, 3), (11, 1)]:
         first = replace(metadata(n=budget), num_prompt_tokens=prompt)
         assert get_stage_runner(worker, dispatch(first)) is owner
         worker.requests["session-0"] = SimpleNamespace(block_ids=[[1, 2]])
@@ -271,8 +277,25 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
                 receipts[0].get_output()
             m = replace(metadata(step, n=budget), num_prompt_tokens=prompt)
             owner.execute(dispatch(m), prefill)
+            if step == 0:
+                final = owner.final_output
+                assert final.layout.width == owner.beam.state.beam_width
+                assert final.layout.steps == budget
+                assert final.device.numel() == final.layout.size
+                assert final.host.numel() == final.layout.size
+                assert final._ranking_scores.shape == (
+                    1,
+                    owner.beam.state.completed_capacity,
+                )
+                assert final.prompt_length == prompt
             receipts.append(owner.sample())
+        terminal = None
         for receipt in receipts:
-            receipt.get_output()
+            result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+            terminal = result.terminal_result or terminal
+        assert terminal is not None and terminal.output is not None
+        for sequence in terminal.output.items[0].sequences:
+            assert len(sequence.token_ids) == budget
+            assert sequence.cumulative_logprob is not None
         owner.request_release(GRRetireMetadata("session-0", 0, budget)).get_output()
         assert owner.graph is graph
