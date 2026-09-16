@@ -66,9 +66,8 @@ class BeamSearchSession:
         state.is_last_step = False
         state.is_active = True
         state.kv_reorder = None
-        # Reset the device-resident beam-decision state the same way (ACS
-        # ``BeamSearchBufferPool.reset_buffers`` semantics): without this a
-        # second session reusing the slot inherits the previous session's
+        # Reset the device-resident Beam decision state. Otherwise a second
+        # session reusing the slot inherits the previous session's
         # ``sequence`` / ``beam_scores`` / ``worker_decode_steps``, and
         # ``init_beam_decision_state`` is silently skipped because
         # ``worker_decode_steps != 0`` — every subsequent decision then reads

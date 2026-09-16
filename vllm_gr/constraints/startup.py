@@ -169,8 +169,7 @@ def compile_constraint_table_resource_from_tokenizer(
 ) -> ConstraintTableResource:
     """Build Constraint Tables directly from the tokenizer's s_a/s_b/s_c groups.
 
-    Port of the ACS ``build_constraint_tables_from_tokenizer`` flow: when the
-    tokenizer carries ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>`` special tokens
+    When the tokenizer carries ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>`` special tokens
     (OneRec-style), the six CSR tables are constructed without a catalog JSON
     document, so ``constraint_backend=constraint_table`` can run by default on
     models that declare the three token groups.
@@ -217,8 +216,8 @@ def prepare_constraint_table(
     :func:`~vllm_gr.entrypoints.openai.serving_models.OpenAIServingModels._ensure_constraint_tables_injected`).
 
     ``catalog_path`` may be ``None`` — the tables are then built directly from
-    the tokenizer's ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>`` groups (ACS-aligned
-    default for OneRec-style models).  The sentinel
+    the tokenizer's ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>`` groups (the default
+    for OneRec-style models). The sentinel
     :data:`~vllm_gr.config.models.AUTO_CONSTRAINT_TABLE_PATH` selects the same
     tokenizer path explicitly (used by the NPU platform default).
 

@@ -12,6 +12,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_gr.config import (
+    BeamExecutionMode,
     ConstraintBackend,
     GRAttentionBackend,
     GRConfig,
@@ -100,6 +101,7 @@ def _init_engine_args(
     catalog_path: str | None = None,
     constraint_backend: ConstraintBackend | str | None = None,
     vllm_gr_config: GRConfigInput | None = None,
+    beam_execution_mode: str | None = None,
     **kwargs: object,
 ) -> None:
     """Apply vllm-gr defaults and accept GR-only Python API arguments.
@@ -121,6 +123,7 @@ def _init_engine_args(
     self.catalog_path = catalog_path
     self.constraint_backend = constraint_backend
     self._vllm_gr_config_input = vllm_gr_config
+    setattr(self, "beam_execution_mode", beam_execution_mode)
 
 
 def _nested_attention_backend_is_explicit(value: object) -> bool:
@@ -185,6 +188,13 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help="Path to a schema-versioned vLLM-GR YAML config.",
     )
     model_group.add_argument(
+        "--beam-execution-mode",
+        choices=[mode.value for mode in BeamExecutionMode],
+        default=None,
+        help="Beam interface used for this engine's lifetime: legacy (default) or v1. "
+        "The v1 interface requires async scheduling; legacy also supports native async scheduling.",
+    )
+    model_group.add_argument(
         "--beam-max-width",
         type=int,
         default=None,
@@ -216,7 +226,7 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         default=None,
         help="Move the beam decision (beam_search_group / rec_final_select + "
         "select_unshared_kv) into the accelerator worker and return results via "
-        "ModelRunnerOutput.beam_search_result (ACS-aligned save flow). CUDA "
+        "ModelRunnerOutput.beam_search_result (asynchronous result flow). CUDA "
         "beam deployments enable this by default; NPU requires xllm decode "
         "execution and its operator library. Without it the frontend NumPy "
         "decision path is kept.",
@@ -271,6 +281,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
     engine_args.beam_worker_decision = getattr(args, "beam_worker_decision", None)
     engine_args.beam_engine_driven = getattr(args, "beam_engine_driven", None)
+    engine_args.beam_execution_mode = getattr(args, "beam_execution_mode", None)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -600,6 +611,7 @@ def create_engine_config(self, usage_context=None, headless=False):
             ),
             beam_worker_decision=effective_beam_worker_decision,
             beam_engine_driven=effective_beam_engine_driven,
+            beam_execution_mode=existing_gr_config.beam_execution_mode,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
         )
@@ -627,6 +639,14 @@ def create_engine_config(self, usage_context=None, headless=False):
     ):
         effective_gr_config = replace(effective_gr_config, beam_engine_driven=True)
 
+    execution_mode = getattr(self, "beam_execution_mode", None)
+    if execution_mode is not None:
+        from vllm_gr.config.validation import validate_beam_execution_mode
+
+        effective_gr_config = replace(
+            effective_gr_config, beam_execution_mode=validate_beam_execution_mode(execution_mode)
+        )
+
     if effective_gr_config != existing_gr_config or canonical_input is not None:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
         # forbidden. Keep GR-only values in VllmConfig.additional_config so
@@ -642,6 +662,10 @@ def create_engine_config(self, usage_context=None, headless=False):
             from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
             attention_config.backend = AttentionBackendEnum.CUSTOM
+    if effective_gr_config.beam_execution_mode is BeamExecutionMode.V1:
+        from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
+
+        validate_gr_execution_config(config)
     return config
 
 

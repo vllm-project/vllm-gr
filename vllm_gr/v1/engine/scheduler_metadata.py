@@ -92,7 +92,7 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
         "parent_beam_ids": getattr(req, "parent_beam_indices", None),
         "max_decode_steps": getattr(req, "max_decode_steps", 0),
         # Final-step output width for the worker beam decision (number of
-        # returned sequences; ACS ``BeamSearchParams.result_width`` semantics:
+        # returned sequences; Asynchronous scheduling ``BeamSearchParams.result_width`` semantics:
         # independent of the decode step count, defaults to beam_width when
         # the request does not carry one).
         "result_width": getattr(req, "result_width", None),

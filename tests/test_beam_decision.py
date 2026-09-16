@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the worker-side beam decision (ACS decode_select port).
+"""Unit tests for the worker-side beam decision (Asynchronous scheduling decode_select port).
 
 Covers the five correctness gaps fixed in the NPU post-processing port:
 
@@ -529,7 +529,7 @@ def test_kv_reorder_record_matches_global_index_minus_offset() -> None:
     out_idx = torch.tensor([[0, 1, 0, 1], [4, 5, 4, 5]], dtype=torch.int32)
     out_lp = torch.zeros(2, beam_width, dtype=torch.float32)
     out_seq = torch.zeros(2, beam_width, 2, dtype=torch.int32)
-    # Global prefix sums (ACS kernel contract): request-offset included.
+    # Global prefix sums (Asynchronous scheduling kernel contract): request-offset included.
     prefix = torch.tensor([[1, 2, 2, 2], [5, 6, 6, 6]], dtype=torch.int32)
 
     beam_decision._finalize_decision(
@@ -557,7 +557,7 @@ def test_kv_reorder_record_matches_global_index_minus_offset() -> None:
 
 
 def test_same_step_reorder_applied_and_decode_step_advanced() -> None:
-    """The decision step reorders the KV pool itself (ACS timing)."""
+    """The decision step reorders the KV pool itself."""
     context = _make_context(max_beams=4, max_decode_steps=4)
     session = _make_session(context)
     session.begin_session(beam_width=4, prefix_len=8)

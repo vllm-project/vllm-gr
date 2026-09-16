@@ -30,7 +30,7 @@ class SessionSlotState:
     prefix_len: int = 0
     is_last_step: bool = False
     is_active: bool = False
-    # Worker-side same-step KV reorder record (ACS decode_select timing).
+    # Worker-side same-step KV reorder record.
     # ``kv_reorder`` holds the request-local parent mapping the worker's beam
     # decision already applied to the KV pool inside the *same* execute_model
     # step (``beam_decision.run_beam_decision`` → ``select_unshared_kv``).

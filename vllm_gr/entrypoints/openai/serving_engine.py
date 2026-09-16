@@ -68,6 +68,12 @@ async def beam_search_v1(
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
     """Submit one online V1 request and yield terminal outputs only."""
+    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.config.execution import require_beam_execution_mode
+
+    require_beam_execution_mode(
+        getattr(self.engine_client, "vllm_config", None), BeamExecutionMode.V1
+    )
     from vllm_gr.entrypoints.beam_search_v1 import run_beam_search_v1_async
     from vllm_gr.entrypoints.beam_search_v1.protocol import OnlineBeamSearchRequest
 
@@ -438,6 +444,12 @@ async def beam_search(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
+    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.config.execution import require_beam_execution_mode
+
+    require_beam_execution_mode(
+        getattr(self.engine_client, "vllm_config", None), BeamExecutionMode.LEGACY
+    )
     generation_time: float = 0.0
     num_generation_tokens: int = 0
     beam_width = params.beam_width

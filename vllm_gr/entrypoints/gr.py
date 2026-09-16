@@ -995,6 +995,12 @@ class GRLLM(LLM):
         concurrency_limit: int | None = None,
     ) -> list["BeamSearchOutput"]:
         """Run Beam Search through the new EngineCore-owned V1 pipeline."""
+        from vllm_gr.config import BeamExecutionMode
+        from vllm_gr.config.execution import require_beam_execution_mode
+
+        require_beam_execution_mode(
+            getattr(self.llm_engine, "vllm_config", None), BeamExecutionMode.V1
+        )
         from vllm_gr.entrypoints.beam_search_v1 import run_beam_search_v1
         from vllm_gr.entrypoints.beam_search_v1.protocol import OfflineBeamSearchRequest
 
@@ -1079,8 +1085,15 @@ class GRLLM(LLM):
         # Lazy imports for beam search dependencies
         import itertools
 
+        from vllm_gr.config import BeamExecutionMode
+        from vllm_gr.config.execution import require_beam_execution_mode
+
         if output_mode not in ("full", "compact"):
             raise ValueError(f"output_mode must be 'full' or 'compact', got {output_mode!r}")
+
+        require_beam_execution_mode(
+            getattr(self.llm_engine, "vllm_config", None), BeamExecutionMode.LEGACY
+        )
 
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?

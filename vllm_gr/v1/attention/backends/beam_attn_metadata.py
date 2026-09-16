@@ -137,6 +137,112 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
 
+    @staticmethod
+    def build_async_layout(
+        *,
+        width: int,
+        prompt_len: int,
+        decode_step: int,
+        block_ids: list[int],
+        max_blocks: int,
+        query_start_loc_cpu: list[int] | tuple[int, ...],
+        seq_lens_cpu: list[int] | tuple[int, ...],
+    ) -> dict[str, list[int]]:
+        """Complete CPU layout for B=1 incremental Decode, with no cache lookup.
+
+        CPU mirrors are mandatory. This entry never falls back to device reads,
+        geometry caches, cached views, cached schedules or the legacy uploader.
+        Common attention has one packed request; suffix attention has W beams.
+        """
+        if any(
+            not isinstance(values, (list, tuple)) or any(type(value) is not int for value in values)
+            for values in (query_start_loc_cpu, seq_lens_cpu)
+        ):
+            raise ValueError(
+                "Asynchronous scheduling attention requires explicit CPU query/sequence mirrors"
+            )
+        if list(query_start_loc_cpu) != [0, width] or list(seq_lens_cpu) != [
+            prompt_len + decode_step + 1
+        ]:
+            raise ValueError(
+                "Asynchronous scheduling common CPU mirrors disagree with the planned Decode"
+            )
+        if len(block_ids) > max_blocks:
+            raise ValueError("Asynchronous scheduling prefix block table exceeds model capacity")
+        return {
+            "positions": [prompt_len + decode_step] * width,
+            "query": [0, width],
+            "sequence": list(seq_lens_cpu),
+            "prefix_lengths": [prompt_len],
+            "blocks": list(block_ids) + [0] * (max_blocks - len(block_ids)),
+            "logits": list(range(width)),
+            "suffix_query": list(range(width + 1)),
+            "suffix_lengths": [decode_step + 1] * width,
+            "suffix_offsets": [i * (decode_step + 1) for i in range(width + 1)],
+        }
+
+    @staticmethod
+    def build_async(
+        *,
+        layout: dict[str, list[int]],
+        views: dict[str, torch.Tensor],
+        session: Any,
+        mask: torch.Tensor,
+        slots: torch.Tensor,
+        block_size: int,
+        max_model_len: int,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> BeamAttentionMetadata:
+        """Build a fresh metadata description over stable device storage each step.
+
+        The GPU V1 adapter uses the existing FA2 incremental path (no AOT
+        schedule). Both eager and graph use block-aligned model/pool bounds.
+        """
+        width = len(layout["positions"])
+        prefix = layout["prefix_lengths"][0]
+        blocks = views["blocks"].view(1, -1)
+        return BeamAttentionMetadata(
+            num_actual_tokens=width,
+            num_reqs=1,
+            max_query_len=width,
+            query_start_loc=views["query"],
+            query_start_loc_cpu=list(layout["query"]),
+            max_seq_len=max_model_len,
+            seq_lens=views["sequence"],
+            seq_lens_cpu=list(layout["sequence"]),
+            block_table=blocks,
+            slot_mapping=slots,
+            is_beam_decode=True,
+            beam_session=session,
+            beam_active_mask=mask,
+            prefix_indices=views["logits"],
+            num_prefix_indices=width,
+            prefix_cu_seqlens_q_device=views["query"],
+            prefix_seqlens_kv_device=views["prefix_lengths"],
+            prefix_max_q_len=width,
+            prefix_max_seq_len=((max_model_len + block_size - 1) // block_size) * block_size,
+            prefix_block_table=blocks,
+            prefix_seqlens_q_cpu=[width],
+            prefix_cu_seqlens_q_cpu=list(layout["query"]),
+            prefix_seqlens_kv_cpu=[prefix],
+            prefix_cu_seqlens_kv_cpu=[0, prefix],
+            suffix_cu_seqlens_q_device=views["suffix_query"],
+            suffix_cu_seqlens_k_device=views["suffix_offsets"],
+            suffix_seqlens_kv_device=views["suffix_lengths"],
+            suffix_max_q_len=1,
+            suffix_max_seq_len=session.context.max_decode_steps,
+            suffix_seqlens_q_cpu=[1] * width,
+            suffix_cu_seqlens_q_cpu=list(layout["suffix_query"]),
+            suffix_seqlens_kv_cpu=list(layout["suffix_lengths"]),
+            suffix_cu_seqlens_kv_cpu=list(layout["suffix_offsets"]),
+            suffix_total_tokens=layout["suffix_offsets"][-1],
+            incremental_suffix_kv_len=layout["suffix_lengths"][0],
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+        )
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -1278,8 +1384,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         # lists below), the query-start offsets (rebuilt from q_starts), and
         # the device-side refresh in _create_beam_tensors.  A hit skips
         # _segment_requests / _build_std_mappings / _build_beam_mappings
-        # entirely (the ACS pattern: decode steps replay a cached layout and
-        # only touch step-dependent scalars).
+        # entirely: this legacy Decode path reuses the layout and only updates
+        # step-dependent scalars. The asynchronous build_async entrypoint does
+        # not use these caches.
         geom_layout_cache = self._geometry_cache().setdefault("layout", {})
         cached_layout = geom_layout_cache.get(geom_key) if geom_key is not None else None
         if cached_layout is not None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -82,6 +83,9 @@ def test_grllm_v1_entry_uses_new_frontend(monkeypatch: pytest.MonkeyPatch) -> No
 
     frontend = _Frontend()
     fake_llm = object.__new__(GRLLM)
+    fake_llm.llm_engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"})
+    )
     monkeypatch.setattr(
         GRLLM,
         "_create_beam_search_v1_client",

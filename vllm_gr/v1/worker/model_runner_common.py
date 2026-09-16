@@ -66,8 +66,8 @@ def _write_position_segments(
     expand per-segment offsets; on Ascend that aten op is a pure host-side
     stall (profiling bw128_1k_t3: 45.5ms + 90.6ms per decode step with zero
     device activity), because the ACL backend materializes the repeat on
-    device.  ACS builds positions with plain numpy writes
-    (model_runner_v1.py ``positions_np[start:end] = ...``); we match that.
+    device. Asynchronous scheduling instead builds positions with plain NumPy
+    writes before uploading the completed layout.
     """
     if not seg_lens:
         return
@@ -1066,7 +1066,7 @@ def _attach_beam_search_result(runner: Any, model_output: Any) -> None:
     Under async scheduling the runner returns an ``AsyncModelRunnerOutput``
     wrapper; the scheduler eventually sees ``get_output()`` which returns the
     inner ``ModelRunnerOutput``, so the attribute must land on that inner
-    object.  This matches the ACS ``ModelRunnerOutput.beam_search_result``
+    object.  This matches the asynchronous scheduling ``ModelRunnerOutput.beam_search_result``
     save-flow used by the scheduler ``kv_transfer_params`` attachment.
 
     Async ``execute_model`` returns ``None`` / an ``ExecuteModelState`` (the
@@ -1203,16 +1203,11 @@ def _get_gr_config(runner) -> Any:
     return cfg
 
 
-def _beam_full_graph_ready(runner, num_tokens: int) -> bool:
-    """True iff a FULL-mode graph for this beam width is captured.
-
-    The beam graph is captured once at engine startup (dummy data, output
-    never consumed).  ``capture_beam_decode_graph`` records the captured
-    width in ``runner._beam_graph_keys``; this function checks that set
-    directly — O(1), no traversal of wrapper instances, and no risk of
-    matching a native (beam-kernel-free) graph whose descriptor happens to
-    collide.  Device-neutral: shared by the GPU and NPU patches.
-    """
+def _beam_full_graph_ready(runner: Any, num_tokens: int) -> bool:
+    """Query the GPU Beam component; retain the device-neutral NPU key contract."""
+    graph = getattr(runner, "_beam_decode_graph", None)
+    if graph is not None:
+        return bool(graph.ready and num_tokens == graph.width)
     beam_keys = getattr(runner, "_beam_graph_keys", None)
     return beam_keys is not None and num_tokens in beam_keys
 
@@ -1687,9 +1682,8 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         # terminal step, engine-driven chaining produced a 3rd decode, and
         # its constraint_step=3 was rejected by
         # build_beam_request_metadata (decode steps are 1/2 only).
-        # This matches the ACS reference (``current_step`` there is
-        # 1-based across the prefill: ``current_step >= loop_len - 1``
-        # is ``decode_step >= loop_len - 2`` here).
+        # With Prefill counted as the first generation step, the final Decode
+        # is ``decode_step >= loop_len - 2``.
         # When the host omitted the loop length, fall back to the
         # pool bound (``gr_cfg.beam_max_decode_steps``), which counts
         # DECODE-ONLY steps — never to beam_decode_steps, which is
@@ -1725,7 +1719,7 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
 
                 # Worker-side same-step reorder record: the worker beam
                 # decision already applied ``select_unshared_kv`` inside the
-                # previous execute_model (ACS decode_select timing) and
+                # previous execute_model and
                 # advanced decode_step there.  Consume the record —
                 # re-applying the same parent mapping is NOT idempotent
                 # (p . p != p), so an exact match with the frontend's
@@ -1829,16 +1823,35 @@ def make_patched_execute_model(_orig_execute_model):
 
     @wraps(_orig_execute_model)
     def _patched_execute_model_step(self, scheduler_output, *args, **kwargs):
-        from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+        from vllm_gr.config import BeamExecutionMode
+        from vllm_gr.config.execution import require_beam_execution_mode
+        from vllm_gr.v1.engine.gr_async_scheduler import (
+            GR_RETIRE_OUTPUT_ATTR,
+            GR_STAGE_OUTPUT_ATTR,
+        )
+
+        if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is not None:
+            from vllm_gr.v1.worker.gpu_beam_stage_runner import execute_gr_retirement
+
+            require_beam_execution_mode(self.vllm_config, BeamExecutionMode.V1)
+            return execute_gr_retirement(self, scheduler_output)
 
         if getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
             if str(self.device).split(":")[0] != "cuda":
                 raise ValueError("persistent GR stage execution requires GPU V1")
             from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
 
-            return get_stage_runner(self, scheduler_output).execute(
-                scheduler_output, _orig_execute_model, *args, **kwargs
-            )
+            stage_runner = get_stage_runner(self, scheduler_output)
+            try:
+                return stage_runner.execute(scheduler_output, _orig_execute_model, *args, **kwargs)
+            except Exception as error:
+                # Native BatchQueue associates the execute and sample Futures.
+                # Sampling must also fail, otherwise valid-looking stale logits
+                # could hide a failed execute Future from that native path.
+                stage_runner.execution_error = error
+                raise
+        if getattr(scheduler_output, "beam_data", {}):
+            require_beam_execution_mode(self.vllm_config, BeamExecutionMode.LEGACY)
         gr_stage = getattr(self, "_gr_gpu_stage_runner", None)
         if gr_stage is not None and not gr_stage.closed:
             if getattr(scheduler_output, "beam_data", {}):

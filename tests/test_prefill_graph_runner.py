@@ -548,6 +548,7 @@ def test_gpu_replay_falls_back_without_slot_mapping() -> None:
         )
         is None
     )
+    assert gpu_runner.last_replay_reason == "missing_slot_mapping"
 
 
 def test_get_max_context_len() -> None:
@@ -632,6 +633,8 @@ def test_gpu_replay_falls_back_when_kvlen_exceeds_bound() -> None:
     )
 
     # Within the bound, the replay proceeds (no-op fake graph).
+    assert gpu_runner.last_replay_reason == "kv_length_exceeds_bound"
+
     class FakeGraph:
         def replay(self) -> None:
             pass
@@ -648,6 +651,108 @@ def test_gpu_replay_falls_back_when_kvlen_exceeds_bound() -> None:
         )
         is buf.output_bufs[1]
     )
+    assert gpu_runner.last_replay_reason == "replay"
+
+
+@pytest.mark.parametrize("async_stage", [False, True])  # type: ignore[misc]
+def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
+    monkeypatch: pytest.MonkeyPatch, async_stage: bool
+) -> None:
+    """Both dispatch paths replay padded buffers with the real Attention extent."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
+    from vllm_gr.v1.worker import gpu_model_runner_patch as patch
+    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+
+    live_slots = torch.arange(1152, dtype=torch.int64)
+    live_table = torch.zeros((1, 72), dtype=torch.int32)
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        model_config=SimpleNamespace(enforce_eager=False),
+        input_batch=SimpleNamespace(
+            req_id_to_index={"r": 0},
+            num_computed_tokens_cpu=np.array([0]),
+            num_prompt_tokens=np.array([2048]),
+            block_table=[
+                SimpleNamespace(
+                    slot_mapping=SimpleNamespace(gpu=live_slots),
+                    block_table=SimpleNamespace(gpu=live_table),
+                )
+            ],
+        ),
+        query_start_loc=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+        seq_lens=torch.zeros(1, dtype=torch.int32),
+    )
+    graph_runner = GPUPrefillGraphRunner(runner, buckets=[1024, 1152])
+    runner._prefill_graph_runner = graph_runner
+    monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(patch, "get_prefill_graph_runner", lambda _: graph_runner)
+    replays: list[int] = []
+
+    class Graph:
+        def __init__(self, bucket: int) -> None:
+            self.bucket = bucket
+
+        def replay(self) -> None:
+            replays.append(self.bucket)
+
+    for bucket, buf in graph_runner.buffers.items():
+        buf.captured_graphs[1] = Graph(bucket)
+        buf.output_bufs[1] = torch.zeros(bucket, 8)
+        buf.max_seq_len_bounds[1] = 2 * bucket
+        buf.block_table_buf = torch.zeros_like(live_table)
+
+    def pointers() -> list[int]:
+        return [
+            getattr(buf, name).data_ptr()
+            for buf in graph_runner.buffers.values()
+            for name in (
+                "input_ids_buf",
+                "positions_buf",
+                "slot_mapping_buf",
+                "query_start_loc_buf",
+                "seq_lens_buf",
+                "block_table_buf",
+            )
+        ]
+
+    addresses = pointers()
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Supported padded Prefill fell back to eager")
+
+    wrapped = patch.make_patched_model_forward(forbidden)
+    for index, length in enumerate((900, 1024, 1025, 900)):
+        scheduled = SimpleNamespace(
+            num_scheduled_tokens={"r": length},
+            total_num_scheduled_tokens=length,
+        )
+        if async_stage:
+            scheduled.gr_stage_metadata = {"r": SimpleNamespace(kind=GRStageKind.PREFILL)}
+        runner._current_scheduler_output = scheduled
+        runner.query_start_loc.gpu[1] = length
+        runner.seq_lens[0] = length
+        live_table.fill_(index + 1)
+        ids = torch.full((length,), index + 7, dtype=torch.int32)
+        positions = torch.arange(length)
+        bucket = 1024 if length <= 1024 else 1152
+        buf = graph_runner.buffers[bucket]
+        assert wrapped(runner, ids, positions) is buf.output_bufs[1]
+        assert graph_runner.last_replay_reason == "replay"
+        assert torch.equal(buf.input_ids_buf[:length], ids)
+        assert torch.all(buf.input_ids_buf[length:] == buf.pad_token_id)
+        assert torch.equal(buf.positions_buf[:length], positions)
+        assert torch.all(buf.positions_buf[length:] == 0)
+        assert torch.equal(buf.slot_mapping_buf[:length], live_slots[:length])
+        assert torch.all(buf.slot_mapping_buf[length:] == -1)
+        assert buf.query_start_loc_buf[:2].tolist() == [0, length]
+        assert buf.seq_lens_buf[0].item() == length
+        assert torch.equal(buf.block_table_buf, live_table)
+        assert pointers() == addresses
+    assert replays == [1024, 1024, 1152, 1024]
 
 
 def test_prefill_runner_init_survives_allocation_failure(

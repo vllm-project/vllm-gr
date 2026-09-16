@@ -64,6 +64,14 @@ def test_canonical_mapping_round_trip_is_exact(tmp_path: Path) -> None:
     assert gr_config_to_mapping(config) == raw
 
 
+def test_canonical_write_invalidates_cached_defaults_for_uniproc(tmp_path: Path) -> None:
+    host = SimpleNamespace(additional_config={})
+    assert GRConfig.from_vllm_config(host).beam_max_width is None
+    config = gr_config_from_mapping(_canonical_mapping(str(tmp_path / "table.safetensors")))
+    write_canonical_gr_config(host, config)
+    assert GRConfig.from_vllm_config(host) == config
+
+
 @pytest.mark.parametrize("worker_decision", [True, False])  # type: ignore[misc]
 def test_canonical_beam_runtime_options_round_trip(
     worker_decision: bool,

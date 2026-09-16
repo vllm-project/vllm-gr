@@ -731,7 +731,7 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
         pass
 
     scheduler_output = SimpleNamespace(beam_data={"beam": {"is_beam_decode": True}})
-    runner = SimpleNamespace()
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(additional_config={}))
     should_raise = False
 
     def execute_model(self: Any, output: Any) -> str:
@@ -934,6 +934,7 @@ def _m2_runner(
         return sample_tokens_return
 
     runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(additional_config={}),
         _vllm_gr_config=SimpleNamespace(
             beam_engine_driven=beam_engine_driven,
             beam_worker_decision=beam_worker_decision,

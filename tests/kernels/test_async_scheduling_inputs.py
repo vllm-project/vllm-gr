@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="no-untyped-def,no-untyped-call,misc"
+"""CUDA asynchronous scheduling preparation, output drain and fixed-address graph contracts."""
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from threading import Event
+from types import SimpleNamespace
+from typing import Any
+
+import msgspec
+import pytest
+import torch
+
+from tests.kernels.test_gpu_beam_stage_runner import (
+    dispatch,
+    metadata,
+    prepare_binding,
+    runtime,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata import (
+    BeamAttentionMetadataBuilder,
+)
+from vllm_gr.v1.engine.beam_search_v1 import GRRetireMetadata
+from vllm_gr.v1.engine.gr_async_scheduler import (
+    GR_RETIRE_RESULT_ATTR,
+    GR_WORKER_RESULT_ATTR,
+)
+from vllm_gr.v1.worker.gr_inputs import ERROR_DISPATCH_STATE, GRInputBuffers
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+
+
+@pytest.mark.parametrize("width", [1, 4, 128, 256])
+@pytest.mark.parametrize("n", [2, 3])
+def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, n):
+    buffers = GRInputBuffers(width, 96, 16, "cuda")
+    binding = SimpleNamespace(session_id="session-0")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "Asynchronous scheduling used a cache or read generated device state on the CPU"
+        )
+
+    first = None
+    for step in range(n - 1):
+        m = replace(
+            metadata(step + 1, n=n),
+            num_prompt_tokens=17 + step,
+            beam_params=msgspec.structs.replace(metadata(n=n).beam_params, beam_width=width),
+        )
+        with monkeypatch.context() as patch:
+            for name in (
+                "_geometry_cache",
+                "_geom_cache_key",
+                "_pack_int32_to_dev",
+                "_get_schedule",
+            ):
+                patch.setattr(BeamAttentionMetadataBuilder, name, forbidden)
+            for name in ("item", "cpu", "tolist"):
+                patch.setattr(torch.Tensor, name, forbidden)
+            prepared = buffers.prepare_cpu(m, binding, block_ids=[[2 + step, 4]], slot=step)
+            views = buffers.upload(prepared)
+            built = BeamAttentionMetadataBuilder.build_async(
+                layout=prepared.layout,
+                views=views,
+                session=SimpleNamespace(context=SimpleNamespace(max_decode_steps=3)),
+                mask=torch.ones(width, device="cuda", dtype=torch.bool),
+                slots=torch.full((width,), -1, device="cuda", dtype=torch.int64),
+                block_size=16,
+                max_model_len=96,
+                num_heads=1,
+                num_kv_heads=1,
+            )
+        assert built.num_reqs == 1
+        assert built.query_start_loc.tolist() == [0, width]
+        assert built.seq_lens.tolist() == [17 + 2 * step + 1]
+        assert built.suffix_seqlens_kv_device.tolist() == [step + 1] * width
+        assert built.suffix_cu_seqlens_k_device.tolist() == [
+            i * (step + 1) for i in range(width + 1)
+        ]
+        assert prepared.layout["positions"] == [17 + 2 * step] * width
+        if first is not None:
+            assert built is not first
+            assert built.prefix_block_table.data_ptr() == first.prefix_block_table.data_ptr()
+            assert first.prefix_seqlens_kv_cpu == [17]
+        first = built
+
+
+@pytest.mark.parametrize("mirror", [None, "device"])
+def test_missing_cpu_mirrors_fail_without_device_fallback(mirror, monkeypatch):
+    query = None if mirror is None else torch.tensor([0, 4], device="cuda")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("device mirror was read on the Host")
+
+    monkeypatch.setattr(torch.Tensor, "item", forbidden)
+    monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
+    monkeypatch.setattr(torch.Tensor, "__bool__", forbidden)
+    with pytest.raises(ValueError, match="CPU query/sequence mirrors"):
+        BeamAttentionMetadataBuilder.build_async_layout(
+            width=4,
+            prompt_len=7,
+            decode_step=0,
+            block_ids=[1],
+            max_blocks=4,
+            query_start_loc_cpu=query,
+            seq_lens_cpu=None,
+        )
+
+
+def test_staging_slot_waits_for_its_own_h2d_before_host_write():
+    buffers = GRInputBuffers(4, 64, 16, "cuda")
+    binding = SimpleNamespace(session_id="session-0")
+    first = buffers.prepare_cpu(metadata(1), binding, block_ids=[[1]], slot=0)
+    buffers.upload(first)
+    torch.accelerator.synchronize()
+    saved = buffers.host[0].clone()
+    waiting, allow = Event(), Event()
+
+    class DelayedCopy:
+        def query(self):
+            return False
+
+        def synchronize(self):
+            waiting.set()
+            assert allow.wait(10)
+
+    buffers.h2d_done[0] = DelayedCopy()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(buffers.prepare_cpu, metadata(2), binding, block_ids=[[2]], slot=0)
+        assert waiting.wait(10)
+        assert torch.equal(buffers.host[0], saved)
+        # The other dispatch has an independent pinned source.
+        buffers.prepare_cpu(metadata(2), binding, block_ids=[[3]], slot=1)
+        assert torch.equal(buffers.host[0], saved)
+        allow.set()
+        future.result(timeout=10)
+    assert not torch.equal(buffers.host[0], saved)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_planned_state_mismatch_is_a_device_error_with_no_generated_successor(dtype):
+    owner = runtime(dtype)
+    owner.admit(dispatch(metadata()))
+    owner.logits = torch.zeros((1, 6), device="cuda", dtype=dtype)
+    first = owner.sample()
+    owner.beam.state.num_decode_steps[2:3].fill_(1)  # Planned Decode is zero.
+    execution = owner.admit(dispatch(metadata(1)))
+    prepare_binding(owner, execution.entries[0])
+    assert owner.beam.state.error_code[2].item() == ERROR_DISPATCH_STATE
+    assert owner.input_ids.tolist() == [0] * 4
+    assert owner.positions.tolist() == [0] * 4
+    assert not owner.execution_mask.any().item()
+    assert owner.beam.session.context.decode_step_buf.item() == -1
+    assert owner.metadata.suffix_seqlens_kv_device.tolist() == [1] * 4
+    owner.logits = torch.zeros((4, 6), device="cuda", dtype=dtype)
+    second = owner.sample()
+    assert not first._output  # Successor was submitted before predecessor consumption.
+    first.get_output()
+    result = getattr(second.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+    assert result.produced_token_count == 0
+    assert result.finished and result.terminal_result.failure.code == "beam_device_error"
+
+
+def test_retirement_waits_for_output_consumer_and_returns_release_proof():
+    owner = runtime()
+    owner.admit(dispatch(metadata()))
+    owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
+    receipt = owner.sample()
+    retirement = owner.request_release(GRRetireMetadata("session-0", 0, 1))
+    assert owner.cancelled and not owner.closed
+    started = Event()
+
+    def consume():
+        started.set()
+        return retirement.get_output()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(consume)
+        assert started.wait(10)
+        assert not future.done()
+        assert not owner.closed
+        receipt.get_output()
+        output = future.result(timeout=10)
+    assert getattr(output, GR_RETIRE_RESULT_ATTR).released
+    assert owner.closed
+    assert owner.beam.session.context.registry.num_active_sessions == 0
+    assert retirement.get_output() is output
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_partial_eos_keeps_active_beams_with_delayed_receipts(dtype):
+    owner = runtime(dtype, stop_token_ids=(1,))
+    receipts: list[Any] = []
+    for step in range(3):
+        if step == 2:
+            receipts[0].get_output()
+        m = metadata(step)
+        m = replace(m, beam_params=msgspec.structs.replace(m.beam_params, stop_token_ids=(1,)))
+        execution = owner.admit(dispatch(m))
+        if step:
+            prepare_binding(owner, execution.entries[0])
+        owner.logits = torch.zeros((1 if step == 0 else 4, 6), device="cuda", dtype=dtype)
+        receipts.append(owner.sample())
+        if step == 0:
+            assert owner.beam.state.active_mask[2].sum().item() == 1
+            assert owner.beam.state.num_completed[2].item() == 1
+    for receipt in receipts:
+        result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+        assert result.produced_token_count == 1 and result.terminal_result is None
+    count = owner.beam.state.num_completed[2].item()
+    lengths = owner.beam.state.completed_lengths[2, :count].tolist()
+    assert 1 in lengths and 3 in lengths
+    owner.request_release(GRRetireMetadata("session-0", 0, 1)).get_output()
+    assert owner.closed
+
+
+@torch.inference_mode()
+def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch):
+    from tests.kernels.test_gpu_beam_stage_runner import (
+        admission_worker,
+        install_decode_model,
+    )
+    from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+        GPUBeamStageRunner,
+        get_stage_runner,
+    )
+    from vllm_gr.v1.worker.gr_startup import capture_async_forward
+
+    worker = admission_worker()
+    worker.requests = {}
+    worker.prepare_inputs_event = None
+    worker.model_config.enforce_eager = False
+    worker.model_config.max_model_len = 64
+    worker._vllm_gr_config.beam_graph_enabled = True
+    worker._vllm_gr_config.beam_worker_decision = True
+    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True)
+    worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec = SimpleNamespace(block_size=16)
+    worker._update_states = lambda _: None
+    install_decode_model(
+        worker,
+        lambda ids, positions: ids[:, None].to(torch.float16).expand(-1, 6) + positions[:, None],
+    )
+    assert capture_async_forward(worker)
+    owner = worker._gr_gpu_stage_runner
+    graph = owner.graph
+    assert owner.closed and graph is not None
+
+    def unexpected_forward(self):
+        raise AssertionError(
+            "requests must replay the startup graph without capturing or eager Forward"
+        )
+
+    monkeypatch.setattr(GPUBeamStageRunner, "_forward", unexpected_forward)
+    for prompt, budget in [(7, 3), (21, 2)]:
+        first = replace(metadata(n=budget), num_prompt_tokens=prompt)
+        assert get_stage_runner(worker, dispatch(first)) is owner
+        worker.requests["session-0"] = SimpleNamespace(block_ids=[[1, 2]])
+
+        def prefill(worker, output):
+            worker.execute_model_state = SimpleNamespace(
+                logits=torch.zeros((1, 6), device="cuda", dtype=torch.float16)
+            )
+
+        receipts: list[Any] = []
+        for step in range(budget):
+            if step == 2:
+                receipts[0].get_output()
+            m = replace(metadata(step, n=budget), num_prompt_tokens=prompt)
+            owner.execute(dispatch(m), prefill)
+            receipts.append(owner.sample())
+        for receipt in receipts:
+            receipt.get_output()
+        owner.request_release(GRRetireMetadata("session-0", 0, budget)).get_output()
+        assert owner.graph is graph

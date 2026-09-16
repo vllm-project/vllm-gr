@@ -32,6 +32,9 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             model_runner=model_runner,
             buckets=buckets,
         )
+        # CPU-only diagnostic for the most recent replay attempt; never reads
+        # device state or changes the stream ordering.
+        self.last_replay_reason: str | None = None
         logger.info(
             "GPUPrefillGraphRunner initialized on device %s with buckets %s",
             self.device,
@@ -310,6 +313,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         )
         num_reqs = len(token_counts)
         total_actual = sum(token_counts)
+        self.last_replay_reason = "graph_not_captured"
         buf = self.buffers.get(bucket)
         if buf is None or not buf.has_captured_graph(num_reqs):
             return None
@@ -317,6 +321,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         # Never replay with a missing slot mapping: the captured
         # reshape-and-cache would skip or misdirect the current KV writes.
         if slot_mapping is None:
+            self.last_replay_reason = "missing_slot_mapping"
             logger.warning(
                 "GPU prefill graph replay: no current slot mapping; falling back to eager prefill."
             )
@@ -328,6 +333,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         bound = buf.max_seq_len_bounds.get(num_reqs)
         max_kvlen = self._max_scheduled_kvlen(num_scheduled_tokens)
         if bound is not None and max_kvlen is not None and max_kvlen > bound:
+            self.last_replay_reason = "kv_length_exceeds_bound"
             logger.debug(
                 "GPU prefill graph replay: batch max KV length %d exceeds the "
                 "captured bound %d; falling back to eager prefill.",
@@ -337,6 +343,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             return None
 
         if input_ids is None or positions is None:
+            self.last_replay_reason = "missing_inputs"
             logger.warning(
                 "GPU prefill graph replay: missing live inputs; falling back to eager prefill."
             )
@@ -366,6 +373,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         # _prepare_inputs just computed, in the InputBatch row order.
         qsl_gpu = getattr(self.model_runner, "query_start_loc", None)
         if qsl_gpu is None or not hasattr(qsl_gpu, "gpu"):
+            self.last_replay_reason = "missing_query_start_loc"
             logger.warning(
                 "GPU prefill graph replay: live query_start_loc unavailable; "
                 "falling back to eager prefill."
@@ -376,6 +384,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         )
         seq_gpu = getattr(self.model_runner, "seq_lens", None)
         if seq_gpu is None:
+            self.last_replay_reason = "missing_seq_lens"
             logger.warning(
                 "GPU prefill graph replay: live seq_lens unavailable; "
                 "falling back to eager prefill."
@@ -395,12 +404,14 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                 if live_bt is None:
                     raise AttributeError("live block table is None")
             except (AttributeError, IndexError, TypeError):
+                self.last_replay_reason = "missing_block_table"
                 logger.warning(
                     "GPU prefill graph replay: live block table unavailable; "
                     "falling back to eager prefill."
                 )
                 return None
             if live_bt.shape[0] < num_reqs or live_bt.shape[1] > buf.block_table_buf.shape[1]:
+                self.last_replay_reason = "block_table_shape"
                 logger.warning(
                     "GPU prefill graph replay: block table shape %s exceeds the "
                     "staged buffer; falling back to eager prefill.",
@@ -415,5 +426,6 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         # Replay the captured graph for num_reqs.
         graph = buf.captured_graphs[num_reqs]
         graph.replay()
+        self.last_replay_reason = "replay"
 
         return buf.output_bufs[num_reqs]

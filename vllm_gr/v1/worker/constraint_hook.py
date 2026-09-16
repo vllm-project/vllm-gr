@@ -1561,7 +1561,7 @@ def build_constrained_sampler_output(
 ) -> Any:
     """Run the constrained operator and build a SamplerOutput directly.
 
-    ACS-aligned sampler short-circuit (``model_runner_v1`` decode path):
+    Asynchronous scheduling sampler short-circuit (``model_runner_v1`` decode path):
     when every sampling row is constrained, the sampler's log_softmax +
     topk + gather_logprobs is dead work — the operator already produces the
     fixed-width ``W`` candidates the beam decision consumes.  This builds

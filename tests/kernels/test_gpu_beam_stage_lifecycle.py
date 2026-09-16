@@ -10,7 +10,13 @@ import pytest
 import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from tests.kernels.test_gpu_beam_stage_runner import dispatch, metadata, runtime
+from tests.kernels.test_gpu_beam_stage_runner import (
+    dispatch,
+    install_decode_model,
+    metadata,
+    prepare_binding,
+    runtime,
+)
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
@@ -52,7 +58,7 @@ def warm_stage_kernels(dtype):
             receipts[0].get_output()
         execution = owner.admit(dispatch(metadata(stage)))
         if stage:
-            owner.prepare_decode(execution.entries[0])
+            prepare_binding(owner, execution.entries[0])
         owner.logits = torch.zeros((1 if stage == 0 else 4, 6), device="cuda", dtype=dtype)
         receipts.append(owner.sample())
     for receipt in receipts:
@@ -94,7 +100,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunke
     )
     worker.requests = {
         "session-0": SimpleNamespace(
-            prev_num_draft_len=0, num_computed_tokens=0, output_token_ids=[], block_ids=[[]]
+            prev_num_draft_len=0, num_computed_tokens=0, output_token_ids=[], block_ids=[[0]]
         )
     }
     worker.late_interaction_runner = SimpleNamespace(on_requests_finished=noop)
@@ -104,9 +110,29 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunke
     worker.use_async_spec_decode = False
     worker.use_async_scheduling = True
     worker._may_reorder_batch = noop
-    worker.model_config = SimpleNamespace(enforce_eager=not graph)
-    owner._bind_attention = noop
+    worker.model_config = SimpleNamespace(
+        enforce_eager=not graph,
+        max_model_len=16,
+        get_num_attention_heads=lambda _: 1,
+        get_num_kv_heads=lambda _: 1,
+    )
+    worker.parallel_config = SimpleNamespace()
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=["layer"], kv_cache_spec=SimpleNamespace(block_size=16))
+        ]
+    )
     owner._forward = lambda: decode_logits + owner.input_ids[:, None].to(dtype)
+    if graph:
+        worker.device = owner.beam.state.device
+        worker._beam_context = owner.beam.session.context
+        worker.vllm_config = SimpleNamespace()
+        worker._vllm_gr_config = SimpleNamespace(beam_max_width=4)
+        install_decode_model(worker, lambda ids, pos: decode_logits + ids[:, None].to(dtype))
+        owner.prepared = owner.prepare_cpu(metadata(1), 0)
+        owner._bind_attention(metadata(1))
+        owner.input_ids.zero_()
+        owner.capture_forward()
     monkeypatch.setattr(
         "vllm.v1.worker.gpu_model_runner.get_pp_group",
         lambda: SimpleNamespace(is_last_rank=True),

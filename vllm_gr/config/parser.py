@@ -11,6 +11,7 @@ from vllm_gr.config.models import (
     _BEAM_MAX_DECODE_STEPS_DEFAULT,
     CONSTRAINT_TABLE_FORMAT,
     GR_CONFIG_SCHEMA_VERSION,
+    BeamExecutionMode,
     ConstraintBackend,
     ConstraintTableConfig,
     GRConfig,
@@ -19,6 +20,7 @@ from vllm_gr.config.validation import (
     validate_artifact_digest,
     validate_attention_backend,
     validate_beam_engine_driven,
+    validate_beam_execution_mode,
     validate_beam_graph_enabled,
     validate_beam_max_decode_steps,
     validate_beam_max_width,
@@ -50,6 +52,7 @@ BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
 NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
 BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
 BEAM_ENGINE_DRIVEN_KEY: Final = "vllm_gr_beam_engine_driven"
+BEAM_EXECUTION_MODE_KEY: Final = "vllm_gr_beam_execution_mode"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -64,6 +67,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         NPU_DECODE_EXECUTION_KEY,
         BEAM_WORKER_DECISION_KEY,
         BEAM_ENGINE_DRIVEN_KEY,
+        BEAM_EXECUTION_MODE_KEY,
     }
 )
 _TOP_LEVEL_KEYS: Final = frozenset(
@@ -76,6 +80,7 @@ _BEAM_KEYS: Final = frozenset(
         "max_decode_steps",
         "worker_decision",
         "engine_driven",
+        "execution_mode",
     }
 )
 _CONSTRAINT_TABLE_KEYS: Final = frozenset(
@@ -182,6 +187,7 @@ def gr_config_from_mapping(
         ),
         beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
         beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
+        beam_execution_mode=validate_beam_execution_mode(beam_raw.get("execution_mode", "legacy")),
         schema_version=validate_schema_version(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
@@ -230,6 +236,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         beam["worker_decision"] = config.beam_worker_decision
     if config.beam_engine_driven is not None:
         beam["engine_driven"] = config.beam_engine_driven
+    if config.beam_execution_mode is not BeamExecutionMode.LEGACY:
+        beam["execution_mode"] = config.beam_execution_mode.value
 
     return {
         "schema_version": config.schema_version,
@@ -334,6 +342,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_engine_driven=validate_beam_engine_driven(
             additional_config.get(BEAM_ENGINE_DRIVEN_KEY)
         ),
+        beam_execution_mode=validate_beam_execution_mode(
+            additional_config.get(BEAM_EXECUTION_MODE_KEY, "legacy")
+        ),
     )
 
 
@@ -426,6 +437,11 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         # Both explicit values round-trip (an opt-out must survive a write).
         additional_config[BEAM_ENGINE_DRIVEN_KEY] = beam_engine_driven
 
+    if gr_config.beam_execution_mode is BeamExecutionMode.LEGACY:
+        additional_config.pop(BEAM_EXECUTION_MODE_KEY, None)
+    else:
+        additional_config[BEAM_EXECUTION_MODE_KEY] = gr_config.beam_execution_mode.value
+
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     """Write a complete canonical primitive mapping into ``VllmConfig``."""
@@ -441,3 +457,9 @@ def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
             "additional_config key(s): " + ", ".join(repr(key) for key in legacy_keys)
         )
     additional_config[GR_CONFIG_KEY] = gr_config_to_mapping(gr_config)
+    # EngineArgs reads the defaults before applying the canonical mapping.
+    # UniProc keeps that same config object; it must not retain the old parse.
+    try:
+        object.__setattr__(vllm_config, "_vllm_gr_parsed_config", None)
+    except (AttributeError, TypeError):
+        pass

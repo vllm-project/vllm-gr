@@ -82,6 +82,7 @@ def make_patched_process_engine_step(original_step):
     def patched_process_engine_step(self):
         from vllm_gr.v1.engine.core import _beam_self_advance
 
+        progress_before = getattr(self.scheduler, "_gr_progress", 0)
         outputs, model_executed = self.step_fn()
         if outputs:
             try:
@@ -95,7 +96,12 @@ def make_patched_process_engine_step(original_step):
             self.output_queue.put_nowait(output)
         self.post_step(model_executed)
 
-        if not model_executed and self.scheduler.has_requests():
+        if (
+            not model_executed
+            and self.scheduler.has_requests()
+            and getattr(self.scheduler, "_gr_progress", 0) == progress_before
+            and not getattr(self, "batch_queue", None)
+        ):
             time.sleep(0.001)
 
         return model_executed
@@ -105,21 +111,42 @@ def make_patched_process_engine_step(original_step):
 
 
 def make_patched_handle_client_request(original):
-    """Dispatch GR wire types that reach the EngineCore busy loop.
+    """Dispatch GR wire types and isolate expected ADD admission rejections.
 
     Upstream logs unrecognized types.  The socket adapter normally consumes
-    GR messages on the input thread; this wrap is the in-process / fallback
-    path and a compile-time-shaped extension point for those types.
+    GR messages on the input thread; this wrap also handles their fallback
+    dispatch. Native ADD is consumed here on the core thread, where Scheduler
+    admission failures can be returned to the requesting client.
     """
     if getattr(original, _CLIENT_REQUEST_PATCH_MARKER, False):
         return original
 
     @wraps(original)
     def patched_handle_client_request(self, request_type, request, *args, **kwargs):
+        from vllm.v1.engine import EngineCoreRequestType
+
         from vllm_gr.v1.engine.core import dispatch_gr_engine_core_input
+        from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
 
         if dispatch_gr_engine_core_input(self, request_type, request):
             return None
+        if request_type == EngineCoreRequestType.ADD:
+            # Admission runs here, after the socket thread has queued ADD.
+            # Preserve upstream shutdown/DP handling and catch only explicit
+            # GR rejections. Internal failures still reach the fatal handler.
+            try:
+                return original(self, request_type, request, *args, **kwargs)
+            except GRAdmissionError as error:
+                native_request, _request_wave = request
+                logger.warning(
+                    "Rejecting request %s during GR admission: %s",
+                    native_request.request_id,
+                    error,
+                )
+                self._send_error_outputs_to_client(
+                    [native_request.request_id], native_request.client_index
+                )
+                return None
         return original(self, request_type, request, *args, **kwargs)
 
     setattr(patched_handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, True)
@@ -376,10 +403,9 @@ def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished
             session.status = GRSessionStatus.FINISHING
         session.terminal_result_pending = False
 
-        # External finish/abort paths need no GR terminal result. Keep state
-        # only while already-dispatched device work still has to drain.
-        if not session._in_flight_dispatches:
-            sessions.pop(req_id, None)
+        from vllm_gr.v1.engine.gr_async_scheduler import _drain_resources
+
+        _drain_resources(scheduler, session)
 
 
 def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
@@ -408,10 +434,24 @@ def apply_scheduler_patch():
 
     from vllm_gr.v1.engine.gr_async_scheduler import (
         GR_STAGE_OUTPUT_ATTR,
+        GRAdmissionError,
+        _prepare_gr_session,
+        _register_gr_session,
+        has_gr_cleanup_work,
         install_gr_scheduler_methods,
     )
 
     install_gr_scheduler_methods(Scheduler)
+
+    if not getattr(Scheduler.has_requests, "_gr_retirement_work", False):
+        original_has_requests = Scheduler.has_requests
+
+        @wraps(original_has_requests)
+        def has_requests(self):
+            return original_has_requests(self) or has_gr_cleanup_work(self)
+
+        has_requests._gr_retirement_work = True
+        Scheduler.has_requests = has_requests
 
     if not getattr(Scheduler.add_request, "_vllm_gr_v1_add_request", False):
         original_add_request = Scheduler.add_request
@@ -419,8 +459,28 @@ def apply_scheduler_patch():
         @wraps(original_add_request)
         def patched_add_request(self, request):
             batch_request = getattr(request, "gr_batch_request", None)
+            sessions = getattr(self, "_gr_v1_sessions", {})
+            if (batch_request is None and sessions) or (
+                batch_request is not None
+                and any(
+                    getattr(r, "gr_batch_request", None) is None for r in self.requests.values()
+                )
+            ):
+                raise GRAdmissionError(
+                    "Asynchronous scheduling requests cannot mix with ordinary or legacy Beam requests"
+                )
             if batch_request is not None:
-                self.add_gr_session(batch_request)
+                if request.request_id != batch_request.batch_id:
+                    raise GRAdmissionError("native request_id and GR batch_id must be identical")
+                if request.request_id in self.requests:
+                    raise GRAdmissionError(f"GR request already exists: {request.request_id}")
+                # All expected rejections precede native queue insertion. GR
+                # registration follows native ADD so a failed insertion cannot
+                # leave a ghost session/owner or consume a generation number.
+                session = _prepare_gr_session(self, batch_request)
+                result = original_add_request(self, request)
+                _register_gr_session(self, session)
+                return result
             return original_add_request(self, request)
 
         setattr(patched_add_request, "_vllm_gr_v1_add_request", True)
@@ -518,18 +578,14 @@ def apply_scheduler_patch():
         ) = cached_patches
         self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
         self.kv_cache_manager.coordinator.cache_blocks = patch_cache_blocks
-        blocked_gr_max_tokens = {}
+        from vllm_gr.v1.engine.gr_async_scheduler import (
+            attach_gr_retirement,
+            gr_admission,
+        )
+
         try:
-            # Keep at most two consecutive stages of one session outstanding.
-            # Temporarily making a saturated request length-capped lets native
-            # schedule() skip it while still scheduling other ready requests.
-            for req_id, session in getattr(self, "_gr_v1_sessions", {}).items():
-                request = self.requests.get(req_id)
-                if request is None or self.can_issue_gr_stage(session):
-                    continue
-                blocked_gr_max_tokens[req_id] = request.max_tokens
-                request.max_tokens = 0
-            output = _original_schedule(self)
+            with gr_admission(self):
+                output = _original_schedule(self)
 
             # Propagate beam request attributes from Request objects to SchedulerOutput
             beam_data = {}
@@ -566,12 +622,9 @@ def apply_scheduler_patch():
                 if metadata is not None:
                     gr_stages[req_id] = metadata
             setattr(output, GR_STAGE_OUTPUT_ATTR, gr_stages)
+            attach_gr_retirement(self, output)
             return output
         finally:
-            for req_id, max_tokens in blocked_gr_max_tokens.items():
-                request = self.requests.get(req_id)
-                if request is not None:
-                    request.max_tokens = max_tokens
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
             self.kv_cache_manager.coordinator.cache_blocks = _original_cache_blocks
 
@@ -582,7 +635,7 @@ def apply_scheduler_patch():
 
     # Also wrap update_from_output so the worker's beam decision
     # (ModelRunnerOutput.beam_search_result) reaches the frontend via
-    # EngineCoreOutput.kv_transfer_params (ACS-aligned save flow).
+    # EngineCoreOutput.kv_transfer_params (asynchronous result flow).
     _patch_scheduler_update_from_output(Scheduler)
 
 
@@ -753,8 +806,12 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
 
     @wraps(_original_update)
     def patched_update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
-        from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+        from vllm_gr.v1.engine.gr_async_scheduler import (
+            GR_STAGE_OUTPUT_ATTR,
+            consume_gr_retirement,
+        )
 
+        consume_gr_retirement(self, scheduler_output, model_runner_output)
         gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {})
         sessions = getattr(self, "_gr_v1_sessions", {})
         dispatched_sessions = {

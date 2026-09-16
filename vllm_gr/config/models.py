@@ -38,7 +38,7 @@ _BEAM_MAX_DECODE_STEPS_DEFAULT: int = 3  # OneRec SID: max_tokens=5 minus begin/
 
 # Sentinel catalog_path for the NPU default Constraint Table backend: the
 # tables are auto-built from the tokenizer's s_a/s_b/s_c token groups instead
-# of a catalog triples document (ACS-aligned OneRec default).
+# of a catalog triples document (OneRec default).
 AUTO_CONSTRAINT_TABLE_PATH: str = "__vllm_gr_auto_constraint_table__"
 
 
@@ -107,6 +107,13 @@ class NPUDecodeExecution(str, Enum):
     XLLM = "xllm"
 
 
+class BeamExecutionMode(str, Enum):
+    """Engine-lifetime Beam interface, independent of native async scheduling."""
+
+    LEGACY = "legacy"
+    V1 = "v1"
+
+
 @dataclass(frozen=True)
 class GRConfig:
     """Validated vLLM-GR configuration reconstructed in each process."""
@@ -137,7 +144,7 @@ class GRConfig:
     # None = unset (the Driver applies platform defaults).  True moves the beam
     # decision (beam_search_group / beam_search_rec_final_select +
     # select_unshared_kv) into the accelerator worker and returns the result via
-    # ModelRunnerOutput.beam_search_result, aligning with the ACS save flow.
+    # ModelRunnerOutput.beam_search_result, aligning with the asynchronous scheduling save flow.
     # CUDA beam deployments default to True; NPU requires xllm execution.
     # False explicitly keeps the frontend NumPy path.
     beam_worker_decision: bool | None = None
@@ -151,11 +158,13 @@ class GRConfig:
     # the step's outputs.  Only valid with beam_worker_decision=True (the
     # chain consumes worker beam decisions).
     beam_engine_driven: bool | None = None
+    beam_execution_mode: BeamExecutionMode = BeamExecutionMode.LEGACY
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
             validate_beam_engine_driven,
+            validate_beam_execution_mode,
             validate_beam_graph_enabled,
             validate_beam_max_decode_steps,
             validate_beam_max_width,
@@ -214,6 +223,9 @@ class GRConfig:
             "beam_engine_driven",
             validate_beam_engine_driven(self.beam_engine_driven),
         )
+        object.__setattr__(
+            self, "beam_execution_mode", validate_beam_execution_mode(self.beam_execution_mode)
+        )
         if self.beam_engine_driven and not self.beam_worker_decision:
             raise ValueError(
                 "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "
@@ -242,6 +254,7 @@ class GRConfig:
             or (self.constraint_table is not None and self.constraint_table.enabled)
             or self.beam_worker_decision is not None
             or self.beam_engine_driven is not None
+            or self.beam_execution_mode is not BeamExecutionMode.LEGACY
         )
 
     @classmethod

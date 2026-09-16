@@ -29,6 +29,7 @@ from vllm_gr.v1.beam.batch_contracts import (
 )
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
+    GRResourceStatus,
     GRSessionStatus,
     GRStageKind,
     GRWorkerResult,
@@ -104,6 +105,7 @@ def _scheduler() -> SimpleNamespace:
         num_prompt_tokens=3,
     )
     return SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16),
         scheduler_config=SimpleNamespace(async_scheduling=True),
         requests={"session-0": native_request},
     )
@@ -255,14 +257,15 @@ def test_early_finish_stops_issue_and_drains_already_queued_stage() -> None:
     assert finished
     assert native_request.num_output_placeholders == 0
     assert session.status == GRSessionStatus.FINISHED
-    assert session.session_id not in scheduler._gr_v1_sessions
+    assert session.resource_status is GRResourceStatus.DRAINING
+    assert scheduler._gr_v1_sessions[session.session_id] is session
     output = result[0].outputs[0]
     assert output.finished
     assert output.kv_transfer_params is not None
     assert output.kv_transfer_params["gr_batch_result"] == terminal_result
 
 
-def test_native_eos_enters_gr_drain_in_a3_compatibility_path() -> None:
+def test_native_eos_enters_gr_drain_after_worker_receipt() -> None:
     class NativeScheduler:
         def __init__(self) -> None:
             native_request = _scheduler().requests["session-0"]
@@ -320,7 +323,19 @@ def test_native_eos_enters_gr_drain_in_a3_compatibility_path() -> None:
         setattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
         outputs.append(scheduler_output)
 
-    premature_result = scheduler.update_from_output(outputs[0], SimpleNamespace())
+    prefill = getattr(outputs[0], GR_STAGE_OUTPUT_ATTR)[session.session_id]
+    worker_result = GRWorkerResult(
+        session.session_id,
+        prefill.dispatch_id,
+        prefill.stage_index,
+        1,
+        prefill.output_device_state,
+        False,
+    )
+    premature_result = scheduler.update_from_output(
+        outputs[0],
+        SimpleNamespace(**{GR_WORKER_RESULT_ATTR: {session.session_id: worker_result}}),
+    )
 
     assert session.status == GRSessionStatus.FINISHING
     assert session.terminal_result_pending
@@ -332,7 +347,8 @@ def test_native_eos_enters_gr_drain_in_a3_compatibility_path() -> None:
 
     terminal_result = scheduler.update_from_output(outputs[1], SimpleNamespace())
 
-    assert session.session_id not in scheduler._gr_v1_sessions
+    assert session.resource_status is GRResourceStatus.DRAINING
+    assert scheduler._gr_v1_sessions[session.session_id] is session
     final_output = terminal_result[0].outputs[0]
     assert final_output.finished
     failure = final_output.kv_transfer_params["gr_batch_result"].failure
@@ -355,7 +371,7 @@ def test_chunked_prefill_does_not_consume_a_logical_stage() -> None:
     assert session.output_placeholders == 0
 
 
-def test_preemption_recompute_does_not_consume_a_decode_stage() -> None:
+def test_recompute_is_rejected_after_beam_initialization() -> None:
     scheduler = _scheduler()
     session = add_gr_session(scheduler, _batch_request())
     native_request = scheduler.requests[session.session_id]
@@ -389,19 +405,10 @@ def test_preemption_recompute_does_not_consume_a_decode_stage() -> None:
     latest_device_state = session.latest_device_state
     native_request.is_prefill_chunk = True
     recompute_output = _scheduler_output()
-    recompute = attach_gr_stage_metadata(scheduler, recompute_output, session)
-    assert recompute is not None
-    setattr(recompute_output, GR_STAGE_OUTPUT_ATTR, {session.session_id: recompute})
-
-    assert recompute.kind == GRStageKind.PREFILL
-    assert not recompute.produces_output
-    assert recompute.stage_index == 1
-    assert recompute.dispatch_id != prefill.dispatch_id
+    with pytest.raises(RuntimeError, match="cannot recompute"):
+        attach_gr_stage_metadata(scheduler, recompute_output, session)
     assert session.issued_stages == 1
     assert session.latest_device_state == latest_device_state
-
-    update_gr_from_output(scheduler, session, recompute_output, SimpleNamespace())
-
     assert session.completed_stages == 1
     assert not session._in_flight_dispatches
 
@@ -410,7 +417,10 @@ def test_backend_configuration_error_uses_request_error_channel() -> None:
     request = _batch_request()
     errors: list[object] = []
     engine = SimpleNamespace(
-        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=False)),
+        vllm_config=SimpleNamespace(
+            additional_config={"vllm_gr_beam_execution_mode": "v1"},
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+        ),
         batch_queue=object(),
         batch_queue_size=2,
         _handle_request_preproc_error=lambda native_request: errors.append(native_request),
@@ -428,7 +438,10 @@ def test_gr_submission_disables_native_stop_ownership() -> None:
     )
     added: list[Any] = []
     engine = SimpleNamespace(
-        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=True)),
+        vllm_config=SimpleNamespace(
+            additional_config={"vllm_gr_beam_execution_mode": "v1"},
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+        ),
         batch_queue=object(),
         batch_queue_size=2,
         preprocess_add_request=lambda engine_request: (native_request,),
@@ -472,6 +485,7 @@ def test_native_abort_all_result_cleans_unscheduled_gr_session() -> None:
     )
 
     assert session.status == GRSessionStatus.ABORTED
+    assert session.resource_status is GRResourceStatus.CLOSED
     assert session.session_id not in scheduler._gr_v1_sessions
 
 
@@ -490,6 +504,7 @@ def test_native_abort_overrides_a_pending_gr_terminal_result() -> None:
 
     assert session.status == GRSessionStatus.ABORTED
     assert not session.terminal_result_pending
+    assert session.resource_status is GRResourceStatus.CLOSED
     assert session.session_id not in scheduler._gr_v1_sessions
 
 
@@ -643,6 +658,27 @@ def test_nonoutput_prefill_validates_worker_receipt_identity() -> None:
     assert session.confirmed_token_count == session.completed_stages == 0
 
 
+@pytest.mark.parametrize("has_mapping", [False, True])
+def test_missing_worker_receipt_fails_without_confirming_tokens(has_mapping: bool) -> None:
+    scheduler = _scheduler()
+    session = add_gr_session(scheduler, _batch_request())
+    scheduled = _scheduler_output()
+    metadata = attach_gr_stage_metadata(scheduler, scheduled, session)
+    assert metadata is not None
+    setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
+    output = SimpleNamespace(**({GR_WORKER_RESULT_ATTR: {}} if has_mapping else {}))
+
+    completion = update_gr_from_output(scheduler, session, scheduled, output)
+
+    assert completion.finished and "omitted GRWorkerResult" in (completion.error or "")
+    assert session.confirmed_token_count == 0
+    assert not session._in_flight_dispatches
+    assert session.resource_status is GRResourceStatus.DRAINING
+    assert session._pending_terminal_result is not None
+    assert session._pending_terminal_result.failure is not None
+    assert session._pending_terminal_result.failure.code == "worker_protocol_error"
+
+
 def test_nonoutput_prefill_accepts_zero_without_finishing() -> None:
     scheduler = _scheduler()
     session = add_gr_session(scheduler, _batch_request())
@@ -686,7 +722,8 @@ def test_native_kv_dispatch_lease_survives_abort_until_receipt() -> None:
 
     scheduler.kv_cache_manager = SimpleNamespace(
         get_blocks=lambda req_id: SimpleNamespace(blocks=((block,),)),
-        block_pool=SimpleNamespace(touch=touch, free_blocks=free),
+        block_pool=SimpleNamespace(touch=touch, free_blocks=free, num_gpu_blocks=8),
+        max_model_len=4096,
     )
     session = add_gr_session(scheduler, _batch_request())
     scheduled = _scheduler_output()
@@ -742,7 +779,7 @@ def test_dispatch_lease_preserves_native_eviction_order(
     pool, groups, managers = resources()
     scheduler = _scheduler()
     scheduler.kv_cache_manager = SimpleNamespace(
-        get_blocks=lambda _: SimpleNamespace(blocks=groups), block_pool=pool
+        get_blocks=lambda _: SimpleNamespace(blocks=groups), block_pool=pool, max_model_len=4096
     )
     session = add_gr_session(scheduler, _batch_request())
     scheduled = []

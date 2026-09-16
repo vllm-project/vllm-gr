@@ -3,8 +3,7 @@
 
 """Build Constraint Tables directly from a tokenizer's s_a / s_b / s_c tokens.
 
-Port of the ACS ``onerec_vllm_inference.build_constraint_tables_from_tokenizer``
-logic: scan ``tokenizer.get_added_vocab()`` for the three contiguous special
+Scan ``tokenizer.get_added_vocab()`` for the three contiguous special
 token groups ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>``, then build the six CSR
 tables consumed by ``rec_constrained_topk`` without requiring a catalog JSON
 document.  The result is a :class:`~vllm_gr.constraints.compiler.ConstraintTableResource`
@@ -12,7 +11,7 @@ document.  The result is a :class:`~vllm_gr.constraints.compiler.ConstraintTable
 injection pipeline unchanged (``prepare_constraint_table`` /
 ``install_constraint_table`` / ``inject_constraint_resources``).
 
-Two candidate modes (matching ACS):
+Two candidate modes (matching the constraint operators):
 
 - **Fully-connected** (default): every valid ``s_a`` maps to every valid
   ``s_b`` maps to every valid ``s_c``.  Table size grows O(N^3); the item
@@ -131,8 +130,8 @@ def _build_fully_connected(
     np.cumsum(counts, out=prefix1_offsets[1:])
 
     # tile (not element-wise repeat): each s_a gets the full sorted s_b list,
-    # matching the a-major ordering of ``pair_keys`` below (torch .repeat() in
-    # the ACS port is tile semantics; np.repeat would misalign the CSR bucket).
+    # matching the a-major ordering of ``pair_keys`` below. Using np.repeat
+    # instead would misalign the CSR bucket.
     prefix1_values = np.tile(valid_b_token_ids, na)
 
     a_token_ids = np.asarray([sa_start + n for n in valid_a_ids], dtype=np.int64)

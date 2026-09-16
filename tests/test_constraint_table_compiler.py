@@ -68,7 +68,7 @@ def test_compiles_basic_catalog(tokenizer: MagicMock) -> None:
     assert resource.vocab_size == 10
 
 
-def test_dtypes_follow_acs_contract(tokenizer: MagicMock) -> None:
+def test_dtypes_follow_operator_contract(tokenizer: MagicMock) -> None:
     resource = _compile([["1", "2", "3"]], vocab_size=10, tokenizer=tokenizer)
 
     assert resource.prefix1_pair_keys.dtype == np.int64

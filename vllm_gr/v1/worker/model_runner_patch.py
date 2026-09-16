@@ -193,6 +193,9 @@ def _install_active_worker_resource_hook() -> None:
 
 def apply_worker_patches() -> None:
     """Install grouped-Beam hooks on active-platform ModelRunner targets."""
+    from vllm_gr.v1.worker.gr_async_output import install_async_output_guard
+
+    install_async_output_guard()
     logger.info("vllm-gr: apply_worker_patches called")
     # collective_rpc targets the Worker, not its ModelRunner.  Install this
     # even when all runner hooks were already present (idempotent) so canonical
@@ -269,7 +272,13 @@ def apply_worker_patches() -> None:
                 @wraps(_orig)
                 def patched_capture_model(self, *args, **kwargs):
                     res = _orig(self, *args, **kwargs)
-                    if _beam_capture is not None:
+                    from vllm_gr.config import BeamExecutionMode
+                    from vllm_gr.v1.worker.gr_startup import capture_async_forward
+                    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+                    if _get_gr_config(self).beam_execution_mode is BeamExecutionMode.V1:
+                        capture_async_forward(self)
+                    elif _beam_capture is not None:
                         try:
                             _beam_capture(self)
                         except Exception:

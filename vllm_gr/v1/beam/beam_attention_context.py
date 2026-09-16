@@ -20,12 +20,12 @@ from vllm_gr.v1.beam.beam_session_registry import BeamSessionRegistry
 
 
 class BeamDecisionBuffers:
-    """Device-resident beam-decision state (ACS ``BeamSearchBufferPool`` analog).
+    """Device-resident beam-decision state.
 
     Holds ``sequence`` / ``beam_scores`` / ``group_token_num`` so that the
     beam decision (``beam_search_group`` / ``beam_search_rec_final_select`` +
     ``select_unshared_kv``) can run on the NPU worker with stable addresses,
-    matching the ACS ``BeamSearchContext.decode_select`` save-flow.  The
+    matching the device Beam update order. The
     buffers are sized to (max_batch, max_beams, max_decode_steps) and are
     never reallocated after construction — this keeps every address stable
     for ACL graph capture/replay and for the fused xllm decision operators.
@@ -201,7 +201,7 @@ class BeamAttentionContext:
             device=device,
         )
 
-        # Device-resident beam-decision state (ACS BeamSearchBufferPool analog).
+        # Device-resident beam-decision state .
         self.decision = BeamDecisionBuffers(max_batch, max_beams, max_decode_steps, device, dtype)
 
     def get_suffix_buf(self, slot: int, beam_width: int) -> tuple[torch.Tensor, torch.Tensor]:

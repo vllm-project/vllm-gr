@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any, cast
+
+import regex as re
 
 from vllm_gr.config.models import (
     _BEAM_MAX_DECODE_STEPS_DEFAULT,
     CONSTRAINT_TABLE_FORMAT,
     GR_CONFIG_SCHEMA_VERSION,
     MAX_BEAM_WIDTH,
+    BeamExecutionMode,
     ConstraintBackend,
     ConstraintTableBackendEnum,
     GRAttentionBackend,
@@ -19,6 +21,15 @@ from vllm_gr.config.models import (
 )
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def validate_beam_execution_mode(value: object) -> BeamExecutionMode:
+    if isinstance(value, str):
+        try:
+            return BeamExecutionMode(value)
+        except ValueError:
+            pass
+    raise ValueError("vllm-gr beam.execution_mode must be 'legacy' or 'v1'")
 
 
 def validate_schema_version(value: object) -> int:

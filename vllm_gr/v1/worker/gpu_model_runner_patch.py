@@ -10,6 +10,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.beam_decision import maybe_run_worker_beam_decision
+from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker.constraint_hook import (
     apply_constrained_sample_override,
     consume_prelaunched_cuda_prefill,
@@ -721,36 +722,6 @@ def _dummy_beam_forward(
         BEAM_DATA_VAR.reset(token)
 
 
-def _verify_and_record_captured_graph(runner, width: int) -> bool:
-    """Walk CUDAGraphWrapper instances once to confirm a beam graph was captured.
-
-    After capture, verify that vllm's CUDAGraphWrapper registered a graph for
-    the beam ``BatchDescriptor(num_tokens=width, uniform=True)``.  If found,
-    record ``width`` in ``runner._beam_graph_keys`` for O(1) runtime lookups.
-
-    Returns:
-        ``True`` if a matching graph was found and recorded.
-    """
-    from vllm.compilation.cuda_graph import CUDAGraphWrapper
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
-
-    desc = BatchDescriptor(num_tokens=width, uniform=True)
-    for wrapper in CUDAGraphWrapper._all_instances:
-        if wrapper.runtime_mode != CUDAGraphMode.FULL:
-            continue
-        entry = wrapper.concrete_cudagraph_entries.get(desc)
-        if entry is not None and entry.cudagraph is not None:
-            # Record the captured width so _beam_full_graph_ready can look it
-            # up directly (O(1)) without traversing vllm-internal state.
-            beam_keys = getattr(runner, "_beam_graph_keys", None)
-            if beam_keys is None:
-                beam_keys = set()
-                runner._beam_graph_keys = beam_keys
-            beam_keys.add(width)
-            return True
-    return False
-
-
 def capture_beam_decode_graph(runner) -> bool:
     """Startup dummy capture of the beam-decode FULL CUDA graph.
 
@@ -773,12 +744,11 @@ def capture_beam_decode_graph(runner) -> bool:
 
     Returns True if a graph was captured.
     """
-    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
-
+    from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
     gr_cfg = _get_gr_config(runner)
-    if not gr_cfg.beam_graph_active:
+    if not gr_cfg.beam_graph_active or runner.model_config.enforce_eager:
         return False
 
     # ── TP / DP ubatching guard ─────────────────────────────────
@@ -821,11 +791,8 @@ def capture_beam_decode_graph(runner) -> bool:
     #   Prefix FA Host-side parameter global-upper-bound design, the captured
     #   graph's shape does not depend on the prefix length (FA2 reads the true
     #   extent from device-side seqused_k), so 1024 is arbitrary.
-    # - num_warmups: two eager forwards prime the Triton JIT of
-    #   cache_unshared_kv / copy_suffix_kv and FA2 shape selection before
-    #   the FULL-mode capture forward.
+    # The shared component runs two eager warmups before FULL capture.
     prefix_len = 1024
-    num_warmups = 2
 
     # 1. Create the worker-level beam context + one dummy session.
     context, session, beam_info, batch_descriptor = _capture_create_dummy_context(
@@ -835,43 +802,14 @@ def capture_beam_decode_graph(runner) -> bool:
     # 2. Warmup + capture.
     captured = False
     try:
-        set_cudagraph_capturing_enabled(True)
-        # The graph pool's tensors are inference tensors (the native
-        # ``_dummy_run`` creates them under ``@torch.inference_mode()``), so
-        # ``capture_begin``'s in-place updates are only legal inside
-        # inference mode.  Mirror the native decorator here.
-        with torch.inference_mode():
-            # CUDA graph capture requires a non-default stream (native
-            # graph_capture() provides one during capture_model; emulate here).
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.accelerator.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(num_warmups):
-                    _dummy_beam_forward(
-                        runner,
-                        context,
-                        beam_info,
-                        batch_descriptor,
-                        width,
-                        prefix_len,
-                        capture=False,
-                    )
-                _dummy_beam_forward(
-                    runner,
-                    context,
-                    beam_info,
-                    batch_descriptor,
-                    width,
-                    prefix_len,
-                    capture=True,
-                )
-            torch.accelerator.current_stream().wait_stream(side)
-            torch.accelerator.synchronize()
-
-            # 3. Verify capture succeeded and record the width.
-            captured = _verify_and_record_captured_graph(runner, width)
+        graph = get_beam_decode_graph(runner)
+        graph.capture(
+            lambda capture: _dummy_beam_forward(
+                runner, context, beam_info, batch_descriptor, width, prefix_len, capture
+            )
+        )
+        captured = graph.ready
     finally:
-        set_cudagraph_capturing_enabled(False)
         # Drop the dummy session even if capture threw. The context and
         # pools stay — a captured graph (if any) references their addresses.
         session.end_session()
@@ -926,6 +864,27 @@ def make_patched_model_forward_gpu(_orig_model_forward):
     @wraps(_orig_model_forward)
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
         scheduler_output = getattr(self, "_current_scheduler_output", None)
+        gr_stages = getattr(scheduler_output, "gr_stage_metadata", None)
+        if gr_stages:
+            # Decode uses its independent startup graph. Only pure asynchronous Prefill
+            # may enter the existing Prefill graph dispatch below.
+            if (
+                len(gr_stages) != 1
+                or next(iter(gr_stages.values())).kind is not GRStageKind.PREFILL
+            ):
+                return _orig_model_forward(
+                    self, input_ids=input_ids, positions=positions, *args, **kwargs
+                )
+            if getattr(self.model_config, "enforce_eager", False):
+                logger.debug("Prefill CUDA graph fallback: enforce_eager")
+                return _orig_model_forward(
+                    self, input_ids=input_ids, positions=positions, *args, **kwargs
+                )
+            if is_prefill_graph_enabled() and not hasattr(self, "_prefill_graph_runner"):
+                logger.debug("Prefill CUDA graph fallback: runner_not_initialized")
+                return _orig_model_forward(
+                    self, input_ids=input_ids, positions=positions, *args, **kwargs
+                )
         if scheduler_output is not None:
             if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
                 p_runner = get_prefill_graph_runner(self)
@@ -945,6 +904,23 @@ def make_patched_model_forward_gpu(_orig_model_forward):
 
                 if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
                     bucket = p_runner.match_bucket(total_tokens)
+                    reason = "no_matching_bucket" if bucket is None else "graph_not_captured"
+                    if gr_stages:
+                        # Reuse the same padded geometry and static buffers as
+                        # legacy Prefill. The runner keeps the real Attention
+                        # lengths and masks padded KV slots. Async scheduling
+                        # adds no exact-bucket requirement; adapters and invalid
+                        # live input shapes still fall back to the original path.
+                        if (
+                            input_ids is None
+                            or tuple(input_ids.shape) != (total_tokens,)
+                            or positions is None
+                            or tuple(positions.shape) != (total_tokens,)
+                            or kwargs.get("inputs_embeds") is not None
+                            or kwargs.get("intermediate_tensors") is not None
+                        ):
+                            reason = "unsupported_inputs"
+                            bucket = None
                     if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
                         # Extract slot mapping from active block table
                         slot_mapping = None
@@ -960,9 +936,6 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                                     slot_mapping = blk_table.slot_mapping.gpu
                             except Exception as e:
                                 logger.warning("Could not get slot_mapping: %r", e)
-                        if slot_mapping is None:
-                            logger.debug("Could not get slot_mapping: extraction unavailable.")
-
                         output_buf = p_runner.execute_model_prefill(
                             bucket=bucket,
                             input_ids=input_ids,
@@ -973,12 +946,22 @@ def make_patched_model_forward_gpu(_orig_model_forward):
 
                         if output_buf is not None:
                             logger.debug(
-                                "Prefill Graph Replay: Executed captured CUDA Graph for bucket %d (reqs=%d, %d actual tokens).",
-                                bucket,
-                                num_reqs,
+                                "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
+                                "bucket=%s outcome=replay",
                                 total_tokens,
+                                num_reqs,
+                                bucket,
                             )
                             return output_buf
+                        reason = getattr(p_runner, "last_replay_reason", "runner_rejected")
+                    logger.debug(
+                        "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
+                        "bucket=%s outcome=%s",
+                        total_tokens,
+                        num_reqs,
+                        bucket,
+                        reason,
+                    )
         return _orig_model_forward(self, input_ids=input_ids, positions=positions, *args, **kwargs)
 
     setattr(patched_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, True)

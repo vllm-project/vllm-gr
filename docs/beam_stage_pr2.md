@@ -2,6 +2,20 @@
 
 ## Scope and ownership
 
+Select the Beam interface before creating the engine. In a canonical GR
+configuration, set `beam.execution_mode: v1` for `beam_search_v1`. The default
+is `legacy` for `beam_search`. Alternatively, `beam_execution_mode="v1"` in
+`GRLLM` / `EngineArgs`, or `--beam-execution-mode v1` on the CLI, overrides the
+configured mode. This mode override also works with canonical configuration;
+the existing restrictions on mixing other GR configuration sources remain.
+
+The selection is fixed for the engine's lifetime and is serialized to every
+Worker. Native `async_scheduling=True`, worker decisions and engine-driven
+chaining do not select the V1 interface: legacy Beam also uses these features.
+V1 requires native async scheduling. A request sent through the wrong Beam
+interface is rejected before submission; EngineCore and Worker validate the
+mode as well.
+
 The GPU V1 Worker recognizes the imported A3 `GR_STAGE_OUTPUT_ATTR` before
 legacy session updates. A native logical Request owns Prefill and its paged
 prompt KV. Subsequent invocations execute W physical model rows using the
@@ -40,6 +54,31 @@ release require the complete binding.
 
 ## Execution and dependency changes
 
+Expected GR admission failures (unsupported mixing, duplicate identity,
+request Beam geometry or permanent KV capacity excess) raise
+`GRAdmissionError`. In the multiprocess path, the EngineCore ADD consumer
+catches only this type and sends one native `FinishReason.ERROR` response to
+the rejected request's client. Admission stays on the EngineCore thread;
+the socket thread only preprocesses and queues ADD. In-process callers
+receive the admission exception directly. Other internal exceptions retain
+the native engine-failure behavior, and shutdown retains native abort
+handling.
+
+Admission validates before native queue insertion, and publishes the GR
+session/owner only after native ADD succeeds. Rejections leave existing
+requests, in-flight work and resource ownership unchanged. Temporary KV
+shortage still applies backpressure; exceeding total capacity is a permanent
+request rejection.
+
+Pause and resume retain the native scheduler policy. `keep` drains already
+submitted batches and preserves active and waiting GR sessions with their
+state and KV; `wait` finishes native running requests while waiting requests
+remain queued. GR resource ownership can precede native execution, so owning
+the shared buffers does not make a queued request runnable during `wait`.
+Pending terminal delivery, draining resources and outstanding Worker release
+proofs still count as cleanup work under either pause mode. Retained sessions
+alone do not prevent pause completion. Resume continues the preserved queues.
+
 1. Admission checks the complete metadata mapping, native identity/Prefill
    extent, output budget, stage dependencies, configuration and deployment
    limits before dispatch controls or session state are modified.
@@ -74,11 +113,42 @@ native buffers and add no Host input-preparation wait.
 
 ## Graphs and terminal safety
 
-The Decode adapter captures a complete forward/LM-head CUDA graph with the
-real W-row layout. It uses its own graph to avoid collision with native or
-legacy graphs keyed only by token count. The existing compiled model and
-Attention implementation are reused; Beam postprocessing remains explicit
-CUDA launches. Capture failure is an error when this mode is requested.
+Both interfaces use the same `BeamDecodeGraph` capture/replay implementation.
+Each engine initializes the input adapter for its selected mode and captures
+one fixed-width Forward graph over that adapter's buffers. The graph returns
+hidden states; LM head and Beam postprocessing are subsequent CUDA launches
+on the ordered compute stream. There is no per-step Host wait for logits.
+
+The component has a Beam-only `CUDAGraphWrapper` registry, separate from native
+ordinary-attention graphs with the same token-count descriptor. It retains
+the fixed input/metadata views and Beam context. Legacy graph dispatch and V1
+replay use this same component; the model wrapper delegates non-Beam forwards
+to the original native model. Beam graph capture also works with native
+compilation/cudagraphs disabled. Capture failure is an error in V1 graph mode;
+legacy retains its eager fallback.
+
+Prefill uses the existing `GPUPrefillGraphRunner` in both modes, including
+padding into the smallest configured bucket that holds the current scheduled
+token count. For example, 900 scheduled tokens replay the 1024-token graph;
+the real Attention lengths remain 900 and padded KV slots are masked with
+`-1`. Prefix-cache hits and chunking change the scheduled extent, so bucket
+selection uses that extent rather than the original prompt length. V1 retains
+its live input shape and adapter checks, startup-only capture, and the
+runner's slot mapping, static-buffer and captured KV-length-bound checks.
+Unsupported inputs or unavailable graphs fall back to native execution.
+
+Debug logs report the scheduled token count, request count, selected bucket
+and replay/fallback outcome. The GPU Prefill runner also exposes
+`last_replay_reason` for its latest replay attempt, including missing input
+metadata and KV lengths exceeding the captured bound. These diagnostics only
+use CPU metadata and add no device synchronization. A replay is reported only
+after the graph has actually been submitted.
+
+Numerical comparisons must separate legacy-versus-V1 execution at identical
+padded geometry from padded-graph-versus-eager execution. BF16 rounding may
+change Beam order when the matrix shape changes. Allowing padded replay
+preserves the existing graph behavior; it does not assert bitwise equality
+with unpadded eager execution or full graph coverage for every workload.
 
 Binding validation covers metadata ABI, batch capacity, W, generation
 capacity, state strides, state/workspace rows, KV slot, all-layer pool
