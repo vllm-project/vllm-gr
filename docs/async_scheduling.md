@@ -4,6 +4,9 @@ Asynchronous scheduling runs Beam Search V1 on the native vLLM 0.22.1 `execute_m
 interface. The next dispatch can prepare inputs and submit GPU work after the
 preceding sampling submission, before EngineCore consumes its receipt.
 
+For a runnable OneRec-1.7B setup before reading this execution contract, see
+[the OneRec-1.7B V1 asynchronous scheduling quickstart](onerec_v1_async_quickstart.md).
+
 ## Supported execution contract
 
 - GPU ModelRunner V1, FP16/BF16, uniform text decoder with Beam Attention and a

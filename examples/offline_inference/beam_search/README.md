@@ -12,6 +12,10 @@ It compiles a temporary CUDA Constraint Table artifact, builds the canonical V1
 configuration, calls `GRLLM.beam_search_v1`, and prints the leading Beam results.
 Run `python offline_beam_search_v1.py --help` for its arguments.
 
+New to V1 scheduling? Follow the end-to-end
+[OneRec-1.7B asynchronous scheduling quickstart](../../../docs/onerec_v1_async_quickstart.md)
+first; this document is the detailed configuration reference.
+
 ## Installation
 
 Follow the instructions in  

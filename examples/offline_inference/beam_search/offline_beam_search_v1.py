@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Run one offline Beam Search V1 request with a CUDA Constraint Table."""
 
 from __future__ import annotations

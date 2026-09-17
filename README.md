@@ -47,9 +47,10 @@ refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark related test 
 ## Executing
 
 - For the EngineCore-owned asynchronous Beam Search V1 path, start with the
-  [offline Beam Search examples](examples/offline_inference/beam_search/README.md#beam-search-v1).
-  The guide explains the differences from the legacy path, runtime/request
-  parameters, and provides a runnable V1 script.
+  [OneRec V1 asynchronous scheduling quickstart](docs/onerec_v1_async_quickstart.md).
+  It gives a beginner-friendly, end-to-end reproduction path; consult the
+  [offline Beam Search examples](examples/offline_inference/beam_search/README.md#beam-search-v1)
+  for the full configuration reference.
 - Please refer to [offline inference](examples/offline_inference/beam_search/README.md) for offline beam search example.
 - Please refer to [online inference](examples/online_serving/beam_search/README.md) for online inference example.
 
