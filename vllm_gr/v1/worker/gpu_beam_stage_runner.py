@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Condition, Lock
 from typing import Any, cast
 
 import torch
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gr.constraints.backend import ConstraintMetadata
@@ -246,6 +247,18 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                 with self.owner.control_drained:
                     self.owner.control_busy[self.slot] = False
                     self.owner.control_drained.notify_all()
+            results = getattr(self._output, GR_WORKER_RESULT_ATTR)
+            # The Scheduler looks ahead, so a terminal receipt from an earlier
+            # stage can still be followed by an already-issued successor. Only
+            # the declared last stage proves that nothing is still in transit;
+            # early termination keeps the explicit retirement round trip.
+            last_stage = self.execution.entries[-1].metadata.is_last_stage
+            if last_stage and any(result.finished for result in results.values()):
+                self.owner.request_terminal_release()
+            if self.owner.release_terminal_if_drained():
+                session_id = self.owner.binding.session_id
+                result = results[session_id]
+                results[session_id] = replace(result, resources_released=True)
             return self._output
 
     def _conversion_failure(self, error: Exception) -> ModelRunnerOutput:
@@ -369,6 +382,8 @@ class GPUBeamStageRunner:
         self.last_work = torch.Event()
         self.closed = False
         self.cancelled = False
+        self.terminal_release_requested = False
+        self.terminal_release_claimed = False
         self.execution_error: Exception | None = None
         self.inputs: GRInputBuffers | None = None
         self.prepared: PreparedGRInputs | None = None
@@ -688,6 +703,45 @@ class GPUBeamStageRunner:
         self.cancel(self.binding)
         return AsyncGRRetireOutput(self, metadata)
 
+    def request_terminal_release(self) -> None:
+        """Stop further work after a terminal receipt; release after all consumers drain."""
+        with self.control_lock:
+            if self.terminal_release_requested:
+                return
+            # A terminal control snapshot already proves that device execution
+            # stopped. Avoid enqueueing the fallback cancel writes on the hot
+            # path; any look-ahead receipt is covered by the latest last_work.
+            self.final_output.abort(self)
+            self.cancelled = True
+            self.terminal_release_requested = True
+
+    def release_terminal_if_drained(self) -> bool:
+        """Release on the last terminal output consumer, without a control dispatch."""
+        with self.control_lock:
+            ready = (
+                self.terminal_release_requested
+                and not self.terminal_release_claimed
+                and not self.closed
+                and self.pending is None
+                and not any(self.control_busy)
+            )
+            if ready:
+                self.terminal_release_claimed = True
+        if not ready:
+            return False
+        self.release(
+            self.binding,
+            consumer_done=self.final_output.consumer_done(self),
+        )
+        # Native Scheduler cleanup normally arrives in the next
+        # SchedulerOutput.finished_req_ids. The fused terminal path has no
+        # follow-up control dispatch, so retire the Worker's cached request
+        # locally after all GPU and output consumers have drained.
+        cleanup = SchedulerOutput.make_empty()
+        cleanup.finished_req_ids.add(self.binding.native_request_id)
+        self.worker._update_states(cleanup)
+        return True
+
     @torch.inference_mode()
     def cancel(self, binding: BeamRequestBinding) -> None:
         if binding != self.binding:
@@ -936,6 +990,8 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         adapter.beam, adapter.binding, adapter.backend = beam, binding, backend
         adapter.previous, adapter.pending = None, None
         adapter.closed, adapter.cancelled = False, False
+        adapter.terminal_release_requested = False
+        adapter.terminal_release_claimed = False
         adapter.execution_error = None
         adapter.prepared = None
         adapter.constraint_steps = state.num_generated_tokens[

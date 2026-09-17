@@ -215,7 +215,7 @@ def test_wait_finishes_running_request_and_retirement_but_preserves_waiting(core
     assert_finished(core, ["A", "B"])
 
 
-def test_keep_delivers_in_flight_terminal_result_and_retires_before_pause_completes(core):
+def test_keep_delivers_terminal_result_and_releases_without_cleanup_frame(core):
     active = submit(core, "A", n=1)
     waiting = submit(core, "B")
     step(core)
@@ -223,12 +223,12 @@ def test_keep_delivers_in_flight_terminal_result_and_retires_before_pause_comple
     assert isinstance(paused, Future) and not paused.done()
     step(core)  # Consume the already-issued terminal Prefill result.
     assert active._terminal_emitted
-    assert active.resource_status is GRResourceStatus.DRAINING
-    assert core.scheduler.has_requests()  # Worker release still needs a frame.
-    assert not paused.done()
-    drain(core)
-    assert paused.done() and paused.result() is None
     assert active.resource_status is GRResourceStatus.CLOSED
+    # The fused release drains the last GR cleanup work inside the consuming
+    # frame, so the native input-loop idle check completes the pause without
+    # another engine step.
+    core._process_input_queue()
+    assert paused.done() and paused.result() is None
     assert core.scheduler._gr_v1_sessions == {"B": waiting}
     assert model_dispatches(core) == [("A", 0)]
     core.resume_scheduler()

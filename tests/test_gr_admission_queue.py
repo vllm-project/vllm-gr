@@ -86,7 +86,7 @@ def assert_one_error(core, name, client=3):
 
 
 def worker_receipt(scheduler, scheduled):
-    """Build deterministic CPU stage, final-output and retirement receipts."""
+    """Build deterministic CPU stage, final-output and fallback retirement receipts."""
     if getattr(scheduled, GR_RETIRE_OUTPUT_ATTR, None) is not None:
         worker_output = release_receipt(scheduled)
     elif getattr(scheduled, GR_STAGE_OUTPUT_ATTR, None):
@@ -97,7 +97,7 @@ def worker_receipt(scheduler, scheduled):
                 continue
             request = scheduler._gr_v1_sessions[session_id].request
             # CPU fixture for the terminal consumer contract. This tests
-            # delivery/retirement, not model generation or the A5 adapter.
+            # delivery/release, not model generation or the A5 adapter.
             sequences = tuple(
                 BeamOutputSequence(
                     token_ids=(3,) * request.beam_params.max_tokens,
@@ -126,7 +126,7 @@ def worker_receipt(scheduler, scheduled):
 
 
 def complete(core, name):
-    """Drive the real Scheduler with deterministic Worker and retirement receipts."""
+    """Drive the real Scheduler with deterministic Worker terminal receipts."""
     outputs: list[EngineCoreOutput] = []
     for _ in range(20):
         if not core.scheduler.has_requests():

@@ -266,6 +266,8 @@ class GRWorkerResult:
     terminal_result is supplied once for the terminating stage, with batch_id
     matching session_init.batch_id. A3 retains it until successors are drained,
     then delivers it through the frontend's wait_final channel.
+    resources_released is supplied once by the last terminal output consumer;
+    it replaces the normal-path zero-token retirement round trip.
     """
 
     session_id: str
@@ -275,6 +277,7 @@ class GRWorkerResult:
     device_state: GRDeviceStateRef
     finished: bool
     terminal_result: BeamBatchResult | None = None
+    resources_released: bool = False
 
 
 @dataclass(frozen=True, slots=True)

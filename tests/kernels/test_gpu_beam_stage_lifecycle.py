@@ -94,6 +94,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunke
         req_id_to_index={"session-0": 0},
         num_computed_tokens_cpu_tensor=pinned,
         num_computed_tokens_cpu=pinned.numpy(),
+        remove_request=noop,
         update_req_spec_token_ids=noop,
         condense=noop,
         refresh_metadata=noop,
@@ -143,8 +144,9 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunke
     )
 
     def update(scheduled):
-        m = getattr(scheduled, GR_STAGE_OUTPUT_ATTR)["session-0"]
-        if m.stage_index == 1:
+        metadata = getattr(scheduled, GR_STAGE_OUTPUT_ATTR, {})
+        m = metadata.get("session-0")
+        if m is not None and m.stage_index == 1:
             assert dma_done.query(), "Decode overwrites a live native Prefill DMA source"
         return GPUModelRunner._update_states(worker, scheduled)
 

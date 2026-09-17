@@ -704,16 +704,27 @@ def _finish_native_gr_request(scheduler, request, request_id, request_status) ->
             delattr(scheduler, _GR_FINALIZING_IDS_ATTR)
 
 
-def _discard_pending_native_finish(scheduler, client_index, request_id) -> None:
+def _discard_pending_native_finish(
+    scheduler, client_index, request_id, *, worker_released: bool = False
+) -> None:
     finished_by_client = getattr(scheduler, "finished_req_ids_dict", None)
-    if finished_by_client is None:
+    if finished_by_client is not None:
+        pending_finished = finished_by_client.get(client_index)
+        if pending_finished is not None:
+            pending_finished.discard(request_id)
+            if not pending_finished:
+                finished_by_client.pop(client_index, None)
+    if not worker_released:
         return
-    pending_finished = finished_by_client.get(client_index)
-    if pending_finished is None:
-        return
-    pending_finished.discard(request_id)
-    if not pending_finished:
-        finished_by_client.pop(client_index, None)
+    # A fused release retires the Worker's cached request in the consuming
+    # frame, so no retirement control frame will carry this ID to the Worker.
+    # Leaving it pending would keep has_requests() true forever: while
+    # PAUSED_ALL, schedule() early-returns before it can consume the set, so
+    # the engine would never look idle and the pause Future would never
+    # complete.
+    pending_finished_ids = getattr(scheduler, "finished_req_ids", None)
+    if pending_finished_ids is not None:
+        pending_finished_ids.discard(request_id)
 
 
 def _finalize_ready_gr_session(scheduler, result, session) -> None:
@@ -781,8 +792,15 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
     target_outputs.finished_requests = finished_requests
 
     # finish_requests() ran after upstream assembled this step's outputs. Avoid
-    # publishing the same finished ID again on the next update.
-    _discard_pending_native_finish(scheduler, client_index, request_id)
+    # publishing the same finished ID again on the next update. A Worker that
+    # already proved the release has no cached request left, so the pending
+    # native finish must not survive either.
+    _discard_pending_native_finish(
+        scheduler,
+        client_index,
+        request_id,
+        worker_released=not session.worker_resources_allocated,
+    )
 
     _close_gr_session(scheduler, session)
 

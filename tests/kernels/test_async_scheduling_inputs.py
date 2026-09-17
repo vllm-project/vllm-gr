@@ -216,10 +216,10 @@ def test_partial_eos_keeps_active_beams_with_delayed_receipts(dtype):
             assert result.finished
             assert result.terminal_result is not None
             assert result.terminal_result.failure is None
+            assert result.resources_released
     count = owner.beam.state.num_completed[2].item()
     lengths = owner.beam.state.completed_lengths[2, :count].tolist()
     assert 1 in lengths and 3 in lengths
-    owner.request_release(GRRetireMetadata("session-0", 0, 1)).get_output()
     assert owner.closed
 
 
@@ -297,5 +297,5 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         for sequence in terminal.output.items[0].sequences:
             assert len(sequence.token_ids) == budget
             assert sequence.cumulative_logprob is not None
-        owner.request_release(GRRetireMetadata("session-0", 0, budget)).get_output()
+        assert owner.closed
         assert owner.graph is graph

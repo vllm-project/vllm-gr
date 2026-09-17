@@ -88,7 +88,11 @@ def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
         make_table(), device=torch.device("cuda"), max_top_k=4, max_rows=4
     )
     backend._mark_ready()
-    worker = SimpleNamespace(_beam_sessions={"session-0": session}, execute_model_state=None)
+    worker = SimpleNamespace(
+        _beam_sessions={"session-0": session},
+        execute_model_state=None,
+        _update_states=Mock(),
+    )
     owner = GPUBeamStageRunner(
         worker, beam, BeamRequestBinding("session-0", 0, "session-0", 2, 0, 1), backend
     )
@@ -168,6 +172,7 @@ def admission_worker(sliding_windows=(None, None), dtype=torch.float16):
         ),
         compilation_config=SimpleNamespace(static_forward_context=layers),
         _beam_postprocess_workspaces=SimpleNamespace(require=Mock(return_value=workspace)),
+        _update_states=Mock(),
     )
 
 
@@ -294,6 +299,7 @@ def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
         assert result.stage_index == stage
         assert result.finished == (stage == n - 1)
         assert (result.terminal_result is not None) == (stage == n - 1)
+        assert result.resources_released == (stage == n - 1)
         if result.terminal_result is not None:
             assert result.terminal_result.output is not None
     assert state.num_generated_tokens.tolist() == [0, 0, n]
@@ -303,11 +309,11 @@ def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
     assert ws.selected_token_ids[0].tolist() == [987] * 4
     assert state.num_completed[2] > 0
     assert owner.final_output.final_d2h_count == 1
-    done = torch.Event()
-    done.record()
-    owner.release(owner.binding, consumer_done=done)
-    owner.release(owner.binding, consumer_done=done)
+    assert owner.closed
     assert not owner.beam.session.context.registry.has_session("session-0")
+    cleanup = owner.worker._update_states.call_args.args[0]
+    assert cleanup.total_num_scheduled_tokens == 0
+    assert cleanup.finished_req_ids == {"session-0"}
     state.reset(2)
     for name, value in protected.items():
         torch.testing.assert_close(getattr(state, name)[:2], value)
@@ -490,17 +496,64 @@ def test_all_eos_successor_and_error_preserve_committed_state():
         for name, value in vars(state).items()
         if isinstance(value, torch.Tensor) and name != "error_code"
     }
-    result = owner.sample().get_output()
-    receipt = getattr(result, GR_WORKER_RESULT_ATTR)["session-0"]
-    assert receipt.finished and receipt.produced_token_count == 0
-    assert receipt.terminal_result.failure.code == "beam_device_error"
-    for name, value in protected.items():
-        torch.testing.assert_close(getattr(state, name), value)
+    result = owner.sample()
     execution = owner.admit(dispatch(metadata(2)))
     prepare_binding(owner, execution.entries[0])
     owner.logits = torch.zeros((4, 6), device="cuda", dtype=torch.float16)
-    successor = owner.sample().get_output()
-    assert getattr(successor, GR_WORKER_RESULT_ATTR)["session-0"].produced_token_count == 0
+    successor = owner.sample()
+
+    result = result.get_output()
+    receipt = getattr(result, GR_WORKER_RESULT_ATTR)["session-0"]
+    assert receipt.finished and receipt.produced_token_count == 0
+    assert receipt.terminal_result.failure.code == "beam_device_error"
+    assert not receipt.resources_released
+    for name, value in protected.items():
+        torch.testing.assert_close(getattr(state, name), value)
+    successor_result = getattr(successor.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+    assert successor_result.produced_token_count == 0
+    assert successor_result.resources_released
+    assert owner.closed
+    assert owner.execution_mask.count_nonzero() == 0
+
+
+def test_early_terminal_receipt_defers_release_until_the_last_stage():
+    """A queued look-ahead dispatch must still be admissible after the receipt.
+
+    The Scheduler may already have issued the successor of a stage that turned
+    terminal. Locally drained work therefore cannot release the owner: only a
+    receipt from the declared last stage proves that nothing is still in
+    transit.
+    """
+    owner = runtime()
+    state = owner.beam.state
+    owner.admit(dispatch(metadata()))
+    owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
+    owner.sample().get_output()
+    owner.admit(dispatch(metadata(1)))
+    owner.logits = torch.full((4, 6), float("inf"), device="cuda", dtype=torch.float16)
+    prepare_binding(owner, owner.pending[0].entries[0])
+    protected = {
+        name: value.clone()
+        for name, value in vars(state).items()
+        if isinstance(value, torch.Tensor) and name != "error_code"
+    }
+
+    # The successor is admitted only after the terminal receipt was consumed.
+    receipt = getattr(owner.sample().get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+    assert receipt.finished and receipt.produced_token_count == 0
+    assert receipt.terminal_result.failure.code == "beam_device_error"
+    assert not receipt.resources_released
+    assert not owner.closed
+    for name, value in protected.items():
+        torch.testing.assert_close(getattr(state, name), value)
+
+    execution = owner.admit(dispatch(metadata(2)))
+    prepare_binding(owner, execution.entries[0])
+    owner.logits = torch.zeros((4, 6), device="cuda", dtype=torch.float16)
+    successor = getattr(owner.sample().get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+    assert successor.produced_token_count == 0
+    assert successor.resources_released
+    assert owner.closed
     assert owner.execution_mask.count_nonzero() == 0
 
 

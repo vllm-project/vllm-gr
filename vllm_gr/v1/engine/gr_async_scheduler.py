@@ -437,6 +437,8 @@ def _read_worker_payload(
         or worker_result.stage_index != metadata.stage_index
     ):
         raise _GRWorkerProtocolError("Worker returned a GR result for a different dispatch")
+    if type(worker_result.resources_released) is not bool:
+        raise _GRWorkerProtocolError("Worker returned an invalid resource-release proof")
 
     terminal_result = worker_result.terminal_result
     if terminal_result is None:
@@ -504,6 +506,30 @@ def update_gr_from_output(
     # drained. They must not advance logical tokens or replace the result that
     # selected the terminal path.
     if session.status in _DRAINING_STATUSES:
+        try:
+            worker_results = _result_mapping(model_output, GR_WORKER_RESULT_ATTR)
+            worker_result = (
+                worker_results.get(session.session_id) if worker_results is not None else None
+            )
+            if worker_result is not None:
+                if not isinstance(worker_result, GRWorkerResult):
+                    raise _GRWorkerProtocolError("Worker returned an invalid GRWorkerResult")
+                if (
+                    worker_result.session_id != session.session_id
+                    or worker_result.dispatch_id != metadata.dispatch_id
+                    or worker_result.stage_index != metadata.stage_index
+                ):
+                    raise _GRWorkerProtocolError(
+                        "Worker returned a GR result for a different dispatch"
+                    )
+                if type(worker_result.resources_released) is not bool:
+                    raise _GRWorkerProtocolError(
+                        "Worker returned an invalid resource-release proof"
+                    )
+                if worker_result.resources_released:
+                    session.worker_resources_allocated = False
+        except _GRWorkerProtocolError as error:
+            return _fail_gr_dispatch(scheduler, session, metadata, model_output, str(error))
         if metadata.produces_output:
             # The logical stage was issued before termination and is now
             # retired, but its speculative output must not be confirmed.
@@ -521,6 +547,17 @@ def update_gr_from_output(
         )
     except _GRWorkerProtocolError as error:
         return _fail_gr_dispatch(scheduler, session, metadata, model_output, str(error))
+
+    if worker_result.resources_released:
+        if not worker_finished:
+            return _fail_gr_dispatch(
+                scheduler,
+                session,
+                metadata,
+                model_output,
+                "Worker released GR resources before a terminal receipt",
+            )
+        session.worker_resources_allocated = False
 
     if not metadata.produces_output:
         if worker_finished or terminal_result is not None:

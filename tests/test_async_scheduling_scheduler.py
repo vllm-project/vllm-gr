@@ -124,19 +124,24 @@ def add(scheduler, name, prompt=7, n=3):
     return scheduler._gr_v1_sessions[name]
 
 
-def receipt(scheduled, *, finished=None):
+def receipt(scheduled, *, finished=None, released=None):
     mapping = getattr(scheduled, GR_STAGE_OUTPUT_ATTR, {})
     ids, sampled, results = [], [], {}
     for name, m in mapping.items():
         ids.append(name)
         sampled.append([0] if m.produces_output else [])
+        worker_finished = m.is_last_stage if finished is None else finished
+        resources_released = (
+            bool(worker_finished and m.is_last_stage) if released is None else released
+        )
         results[name] = GRWorkerResult(
             name,
             m.dispatch_id,
             m.stage_index,
             int(m.produces_output),
             m.output_device_state,
-            m.is_last_stage if finished is None else finished,
+            worker_finished,
+            resources_released=resources_released,
         )
     out = ModelRunnerOutput(
         req_ids=ids, req_id_to_index={r: i for i, r in enumerate(ids)}, sampled_token_ids=sampled
@@ -156,7 +161,7 @@ def release_receipt(scheduled):
     return out
 
 
-def test_fifo_owner_retains_second_slot_and_waits_for_retirement(scheduler):
+def test_fifo_owner_handoffs_on_terminal_receipt_without_retirement(scheduler):
     a = add(scheduler, "A")
     b = add(scheduler, "B")
     c = add(scheduler, "C")
@@ -173,15 +178,26 @@ def test_fifo_owner_retains_second_slot_and_waits_for_retirement(scheduler):
     assert list(third.num_scheduled_tokens) == ["A"]
     scheduler.update_from_output(second, receipt(second))
     scheduler.update_from_output(third, receipt(third))
-    assert a.resource_status is GRResourceStatus.DRAINING
-    assert a._terminal_emitted
-    retirement = scheduler.schedule()
-    assert retirement.total_num_scheduled_tokens == 0
-    assert a.resource_status is GRResourceStatus.RETIRING
-    assert scheduler.schedule().total_num_scheduled_tokens == 0
-    scheduler.update_from_output(retirement, release_receipt(retirement))
     assert a.resource_status is GRResourceStatus.CLOSED
+    assert a._terminal_emitted
     assert list(scheduler.schedule().num_scheduled_tokens) == ["C"]
+
+
+def test_early_terminal_releases_on_last_lookahead_receipt(scheduler):
+    session = add(scheduler, "A")
+    add(scheduler, "B")
+    first, successor = scheduler.schedule(), scheduler.schedule()
+
+    scheduler.update_from_output(first, receipt(first, finished=True, released=False))
+    assert session.resource_status is GRResourceStatus.DRAINING
+    assert session._in_flight_dispatches
+
+    scheduler.update_from_output(successor, receipt(successor, finished=True, released=True))
+    assert session.resource_status is GRResourceStatus.CLOSED
+    assert session._terminal_emitted
+    next_output = scheduler.schedule()
+    assert getattr(next_output, GR_RETIRE_OUTPUT_ATTR, None) is None
+    assert list(next_output.num_scheduled_tokens) == ["B"]
 
 
 def test_chunked_prefill_saturates_without_output_placeholders(scheduler):
@@ -217,7 +233,7 @@ def test_wrong_and_duplicate_retirement_cannot_release_another_owner(scheduler):
     a = add(scheduler, "A", n=1)
     add(scheduler, "B")
     first = scheduler.schedule()
-    scheduler.update_from_output(first, receipt(first))
+    scheduler.update_from_output(first, receipt(first, released=False))
     retire = scheduler.schedule()
     out = release_receipt(retire)
     correct = getattr(out, GR_RETIRE_RESULT_ATTR)
@@ -346,10 +362,8 @@ def test_prefix_cache_hit_reuses_only_full_prompt_blocks(scheduler):
     while True:
         output = scheduler.schedule()
         scheduler.update_from_output(output, receipt(output))
-        if scheduler._gr_v1_sessions["A"]._terminal_emitted:
+        if "A" not in scheduler._gr_v1_sessions:
             break
-    retirement = scheduler.schedule()
-    scheduler.update_from_output(retirement, release_receipt(retirement))
     add(scheduler, "B", prompt=33, n=3)
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"B": 1}
