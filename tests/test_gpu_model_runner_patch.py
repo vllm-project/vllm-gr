@@ -410,6 +410,9 @@ def test_gpu_bookkeeping_reuses_host_ready_prefill_views(
 ) -> None:
     from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 
+    # This installed V1 hook must not be rerouted by an inherited V2 opt-in.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
     width = 4
     original_batch = SimpleNamespace()
     host_ids = torch.tensor([[31, 32, 33, 34]], dtype=torch.int32)
@@ -995,12 +998,14 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda _: contextlib.nullcontext())
     context = object()
+    native_model = object()
     runner = SimpleNamespace(
         device="cuda",
         model_config=SimpleNamespace(enforce_eager=False),
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False),
         _beam_sessions={},
         _beam_context=context,
+        model=native_model,
     )
     session = SimpleNamespace(end_session=lambda: None)
     monkeypatch.setattr(
@@ -1012,6 +1017,11 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     graph.worker, graph.width = runner, 4
     graph.descriptor = BatchDescriptor(num_tokens=4, uniform=True)
     graph.wrapper = SimpleNamespace(concrete_cudagraph_entries={})
+    # R1 install/uninstall state (normally set in __init__, bypassed by
+    # object.__new__): V1's capture() installs the wrapper persistently, so
+    # the ownership pair must be present and consistent.
+    graph.original_model = native_model
+    graph.installed = False
     monkeypatch.setattr(shared, "get_beam_decode_graph", lambda _: graph)
     modes = []
 
@@ -1027,6 +1037,10 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     assert gpu_patch.capture_beam_decode_graph(runner)
     assert modes == [False, False, True]
     assert runner._beam_graph_keys == {4}
+    # V1 persistent install (R1): after capture the wrapper owns worker.model
+    # (the native FULL replay path routes through it for the engine lifetime).
+    assert runner.model is graph.wrapper
+    assert graph.installed is True
 
 
 def test_create_beam_context_uses_grconfig_params() -> None:

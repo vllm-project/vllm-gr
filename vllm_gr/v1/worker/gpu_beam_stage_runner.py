@@ -216,6 +216,102 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         return out
 
 
+class _StageExecutionHooks:
+    """Per-runner execution surface bridging the persistent GR stage core.
+
+    The stage-runner core (session/state/workspace/constraint/inputs) is
+    ModelRunner-agnostic; only the native execution surface differs between
+    the V1 and V2 runners.  Each hook maps one such surface.  The default
+    implementation below is the V1 surface (``_model_forward`` /
+    ``execute_model_state.logits`` / ``prepare_inputs_event`` /
+    ``_update_states`` / ``requests[..].block_ids``); the V2 runner installs
+    its own via :mod:`vllm_gr.v1.worker.gpu_beam_stage_runner_v2`.
+    """
+
+    persistent_graph_install = True
+
+    def __init__(self, worker: Any):
+        self.worker = worker
+
+    def forward_hidden(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        attention: Any,
+        slot_mappings: Any,
+        capture: bool,
+    ) -> torch.Tensor:
+        """Run one beam-decode forward, returning hidden states."""
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import set_forward_context
+        from vllm.v1.cudagraph_dispatcher import BatchDescriptor
+
+        worker = self.worker
+        with set_forward_context(
+            attention,
+            worker.vllm_config,
+            num_tokens=input_ids.numel(),
+            cudagraph_runtime_mode=CUDAGraphMode.FULL if capture else CUDAGraphMode.NONE,
+            batch_descriptor=BatchDescriptor(num_tokens=input_ids.numel(), uniform=True),
+            slot_mapping=slot_mappings,
+        ):
+            return worker._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=None,
+            )
+
+    def prefill_logits(
+        self, original: Callable[..., Any], scheduler_output: Any, *args: Any, **kwargs: Any
+    ) -> torch.Tensor:
+        """Run the native prefill execution and extract its logits."""
+        worker = self.worker
+        out = original(worker, scheduler_output, *args, **kwargs)
+        if out is not None or worker.execute_model_state is None:
+            raise RuntimeError("native GR Prefill must return logits through execute_model_state")
+        return worker.execute_model_state.logits
+
+    def prefill_stage_fence(self) -> None:
+        """Wait for any native prefill reads of reused CPU input buffers.
+
+        V1: the pinned InputBatch buffers the Prefill forward reads
+        asynchronously are mutated on the CPU by ``_update_states``; a stream
+        wait on the decode stream cannot protect those Host writes.  V2
+        builds a fresh InputBatch per step and needs no fence.
+        """
+        event = getattr(self.worker, "prepare_inputs_event", None)
+        if event is not None:
+            event.synchronize()
+
+    def consume_native_state(self, scheduler_output: Any) -> None:
+        """Apply the runner's native request-state bookkeeping."""
+        self.worker._update_states(scheduler_output)
+
+    def decode_block_ids(self, session_id: str) -> list[list[int]]:
+        """Host KV block ids for the session's prompt, grouped per KV group."""
+        native = self.worker.requests[session_id]
+        return native.block_ids
+
+
+def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
+    """Resolve decode graph replay, preserving unexpected-missing invariants."""
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    requested = not worker.model_config.enforce_eager and _get_gr_config(worker).beam_graph_enabled
+    if not requested:
+        return False
+    if getattr(worker, "_gr_async_decode_graph_capture_failed", False):
+        if graph is not None:
+            raise RuntimeError("Decode capture failed but a graph is still published")
+        return False
+    if graph is not None:
+        if not graph.ready:
+            raise RuntimeError("Published Decode graph is not ready")
+        return True
+    raise RuntimeError("Asynchronous scheduling graph mode requires successful startup capture")
+
+
 class GPUBeamStageRunner:
     """One exclusive execution owner, using the existing session/state/workspace."""
 
@@ -225,6 +321,7 @@ class GPUBeamStageRunner:
         beam: BeamSearchRunner,
         binding: BeamRequestBinding,
         backend: CUDAConstraintBackend,
+        hooks: _StageExecutionHooks | None = None,
     ):
         if (
             binding.session_id != beam.session.session_id
@@ -241,6 +338,7 @@ class GPUBeamStageRunner:
         ):
             raise RuntimeError("Beam context already has an execution owner")
         self.worker, self.beam, self.binding, self.backend = worker, beam, binding, backend
+        self.hooks = hooks if hooks is not None else _StageExecutionHooks(worker)
         self.previous: GRStageMetadata | None = None
         self.pending: tuple[BeamDispatchExecution, int] | None = None
         self._validated_dispatch: tuple[Any, tuple[GRStageMetadata, ...]] | None = None
@@ -367,8 +465,12 @@ class GPUBeamStageRunner:
                 groups[0].kv_cache_spec.block_size,
                 self.beam.state.device,
             )
-        native = worker.requests[self.binding.native_request_id]
-        return self.inputs.prepare_cpu(m, self.binding, block_ids=native.block_ids, slot=slot)
+        block_ids = (
+            [list(group) for group in m.kv_blocks]
+            if getattr(m, "kv_blocks", None) is not None
+            else self.hooks.decode_block_ids(self.binding.native_request_id)
+        )
+        return self.inputs.prepare_cpu(m, self.binding, block_ids=block_ids, slot=slot)
 
     def _bind_attention(self, m: GRStageMetadata) -> None:
         from vllm_gr.v1.attention.backends.beam_attn_metadata import (
@@ -412,37 +514,21 @@ class GPUBeamStageRunner:
             )
         bind_device_inputs(prepared, self)
 
-    def capture_forward(self) -> None:
-        """Capture the shared Beam Forward over this interface's fixed inputs."""
+    def capture_forward(self) -> Any:
+        """Return a captured candidate; startup publishes it after cleanup."""
         from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
 
         graph = get_beam_decode_graph(self.worker)
-        graph.capture(self._forward_hidden)
-        self.graph = graph
+        graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
+        return graph
 
     def _forward(self) -> torch.Tensor:
         return self.worker.model.compute_logits(self._forward_hidden(False))
 
     def _forward_hidden(self, capture: bool) -> torch.Tensor:
-        from vllm.config import CUDAGraphMode
-        from vllm.forward_context import set_forward_context
-        from vllm.v1.cudagraph_dispatcher import BatchDescriptor
-
-        worker = self.worker
-        with set_forward_context(
-            self.attention,
-            worker.vllm_config,
-            num_tokens=self.input_ids.numel(),
-            cudagraph_runtime_mode=CUDAGraphMode.FULL if capture else CUDAGraphMode.NONE,
-            batch_descriptor=BatchDescriptor(num_tokens=self.input_ids.numel(), uniform=True),
-            slot_mapping=self.slot_mappings,
-        ):
-            return worker._model_forward(
-                input_ids=self.input_ids,
-                positions=self.positions,
-                intermediate_tensors=None,
-                inputs_embeds=None,
-            )
+        return self.hooks.forward_hidden(
+            self.input_ids, self.positions, self.attention, self.slot_mappings, capture
+        )
 
     def execute(
         self, scheduler_output: Any, original: Callable[..., Any], *args: Any, **kwargs: Any
@@ -460,38 +546,21 @@ class GPUBeamStageRunner:
             if m.kind is GRStageKind.PREFILL:
                 self.temperatures.fill_(m.beam_params.temperature)
                 self.prefixes.fill_(-1)
-                out = original(worker, scheduler_output, *args, **kwargs)
-                if out is not None or worker.execute_model_state is None:
-                    raise RuntimeError(
-                        "native GR Prefill must return logits through execute_model_state"
-                    )
-                self.logits = worker.execute_model_state.logits
+                self.logits = self.hooks.prefill_logits(original, scheduler_output, *args, **kwargs)
             else:
                 # Pure CPU work can run before the native Prefill staging fence.
                 self.prepared = self.prepare_cpu(m, self.pending[1])
                 if previous_kind is GRStageKind.PREFILL:
-                    # Native Prefill asynchronously reads pinned InputBatch
-                    # buffers that _update_states mutates on the CPU. A stream
-                    # wait on last_work cannot protect those Host writes.
-                    event = worker.prepare_inputs_event
-                    if event is not None:
-                        event.synchronize()
+                    # Native Prefill may asynchronously read reused CPU input
+                    # buffers that the native state update mutates.  The
+                    # runner-specific fence orders those Host writes.
+                    self.hooks.prefill_stage_fence()
                 # Decode does not upload these native input buffers again, so
                 # subsequent Decode dispatches need no Host input-prep wait.
-                worker._update_states(scheduler_output)
+                self.hooks.consume_native_state(scheduler_output)
                 self._bind_attention(m)
                 self.prepare_decode(entry)
-                from vllm_gr.v1.worker.model_runner_common import _get_gr_config
-
-                graph_enabled = (
-                    not worker.model_config.enforce_eager
-                    and _get_gr_config(worker).beam_graph_enabled
-                )
-                if graph_enabled:
-                    if self.graph is None:
-                        raise RuntimeError(
-                            "Asynchronous scheduling graph mode requires successful startup capture"
-                        )
+                if should_replay_decode_graph(worker, self.graph):
                     self.logits = worker.model.compute_logits(self.graph.replay())
                 else:
                     self.logits = self._forward()
@@ -616,7 +685,7 @@ class GPUBeamStageRunner:
         # locally after all GPU and output consumers have drained.
         cleanup = SchedulerOutput.make_empty()
         cleanup.finished_req_ids.add(self.binding.native_request_id)
-        self.worker._update_states(cleanup)
+        self.hooks.consume_native_state(cleanup)
         return True
 
     @torch.inference_mode()
@@ -681,6 +750,16 @@ class AsyncGRRetireOutput(AsyncModelRunnerOutput):
                 GRRetireResult(m.session_id, m.owner_generation, m.retire_id, True),
             )
             self._output = out
+            # Startup graph capture releases its dummy owner directly and
+            # never reaches this real-retirement path. Schedule only after a
+            # serving session has fully drained and released its resources,
+            # so the one-shot freeze covers lazily-created persistent state
+            # without being consumed by the startup dummy session.
+            from vllm_gr.v1.worker.model_runner_common import (
+                schedule_warmup_gc_freeze,
+            )
+
+            schedule_warmup_gc_freeze()
             return out
 
 
@@ -702,21 +781,22 @@ def execute_gr_retirement(worker, scheduler_output):
         raise RuntimeError("Asynchronous scheduling retirement has no matching live Worker owner")
     result = owner.request_release(metadata)
     # Preserve the native finished_req_ids cleanup entry, without Forward or sampling.
-    event = worker.prepare_inputs_event
-    if event is not None:
-        event.synchronize()
-    worker._update_states(scheduler_output)
+    owner.hooks.prefill_stage_fence()
+    owner.hooks.consume_native_state(scheduler_output)
     worker._gr_retirement_output = result
     return result
 
 
-def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
+def get_stage_runner(
+    worker: Any,
+    scheduler_output: Any,
+    *,
+    hooks_type: type[_StageExecutionHooks] = _StageExecutionHooks,
+) -> GPUBeamStageRunner:
     """Admit first, then derive the adapter from existing Worker resources."""
-    from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.config.execution import require_beam_execution_mode
-
-    require_beam_execution_mode(worker.vllm_config, BeamExecutionMode.V1)
     existing = getattr(worker, "_gr_gpu_stage_runner", None)
+    if existing is not None and type(existing.hooks) is not hooks_type:
+        raise ValueError("GR execution hooks cannot change during the runner lifetime")
     if existing is not None and not existing.closed:
         if getattr(worker, "constraint_backend", None) is not existing.backend:
             raise ValueError("GR constraint backend binding changed before session release")
@@ -910,7 +990,7 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         context._gr_execution_owner = adapter
         workspace.execution_owner = adapter
     else:
-        adapter = GPUBeamStageRunner(worker, beam, binding, backend)
+        adapter = GPUBeamStageRunner(worker, beam, binding, backend, hooks=hooks_type(worker))
     sessions = getattr(worker, "_beam_sessions", {})
     sessions[m.session_id] = session
     worker._beam_sessions = sessions

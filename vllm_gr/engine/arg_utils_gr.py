@@ -647,6 +647,26 @@ def create_engine_config(self, usage_context=None, headless=False):
             effective_gr_config, beam_execution_mode=validate_beam_execution_mode(execution_mode)
         )
 
+    # Ascend may retain the V2 opt-in while constructing a V1 runner. Only
+    # CUDA V2 Beam engines require the persistent protocol; ordinary V2
+    # engines and existing V1/NPU defaults remain unchanged.
+    if (
+        _is_cuda_platform()
+        and getattr(config, "use_v2_model_runner", False)
+        and (
+            effective_gr_config.beam_max_width is not None
+            or (
+                effective_gr_config.constraint_table is not None
+                and effective_gr_config.constraint_table.enabled
+            )
+        )
+        and effective_gr_config.beam_execution_mode is not BeamExecutionMode.V1
+    ):
+        raise ValueError(
+            "ModelRunner V2 Beam requires beam.execution_mode='v1'; "
+            "select it explicitly before engine initialization, or use ModelRunner V1"
+        )
+
     if effective_gr_config != existing_gr_config or canonical_input is not None:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
         # forbidden. Keep GR-only values in VllmConfig.additional_config so

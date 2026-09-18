@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -122,7 +123,9 @@ def prepare_binding(owner, entry):
     owner.prepare_decode(entry)
 
 
-def admission_worker(sliding_windows=(None, None), dtype=torch.float16):
+def admission_worker(
+    sliding_windows: tuple[int | None, ...] = (None, None), dtype: torch.dtype = torch.float16
+) -> SimpleNamespace:
     device = torch.device("cuda", torch.accelerator.current_device_index())
     backend, _ = _upload_cuda_backend(make_table(), device=device, max_top_k=4, max_rows=4)
     backend._mark_ready()
@@ -180,7 +183,9 @@ def admission_worker(sliding_windows=(None, None), dtype=torch.float16):
     )
 
 
-def install_decode_model(worker, forward):
+def install_decode_model(
+    worker: SimpleNamespace, forward: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+) -> None:
     """Use a tiny real model with the production graph wrapper and context."""
     from vllm.config import CompilationConfig, ParallelConfig
 

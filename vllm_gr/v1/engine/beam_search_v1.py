@@ -117,6 +117,11 @@ def validate_gr_execution_config(config: Any) -> None:
     from vllm_gr.config.execution import require_beam_execution_mode
 
     require_beam_execution_mode(config, BeamExecutionMode.V1)
+    validate_gr_execution_runtime(config)
+
+
+def validate_gr_execution_runtime(config: Any) -> None:
+    """Validate runtime capabilities after the persistent protocol is admitted."""
     if not config.scheduler_config.async_scheduling:
         raise ValueError("Asynchronous scheduling requires async_scheduling=True")
     if getattr(config.scheduler_config, "enable_chunked_prefill", False):
@@ -155,7 +160,7 @@ def validate_gr_device_config(config: Any) -> None:
     """Reject unavailable adapters without importing a device runtime."""
     device = getattr(getattr(config, "device_config", None), "device", None)
     if device is not None and str(device).split(":")[0] != "cuda":
-        raise ValueError("Asynchronous scheduling requires GPU ModelRunner V1")
+        raise ValueError("Asynchronous scheduling requires a CUDA ModelRunner")
 
 
 def validate_gr_request(request: BeamBatchRequest) -> None:
@@ -280,6 +285,11 @@ class GRStageMetadata:
     session_init: BeamBatchRequest | None = None
     owner_generation: int = 0
     execution_capacity: GRExecutionCapacity | None = None
+    # Per-KV-group prompt block ids, published by the scheduler with every
+    # dispatch.  Runners without host-side request state (V2) build their beam
+    # attention block table from this instead of reaching into scheduler
+    # structures; V1 may still fall back to its own request state when None.
+    kv_blocks: tuple[tuple[int, ...], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,8 +553,8 @@ def validate_dispatch(
 __all__ = [
     "GRAsyncSchedulerInterface",
     "GRDeviceStateRef",
-    "GRExecutionCapacity",
     "GREngineCoreInterface",
+    "GRExecutionCapacity",
     "GRModelExecutorInterface",
     "GRResourceStatus",
     "GRRetireMetadata",
@@ -555,8 +565,9 @@ __all__ = [
     "GRStageKind",
     "GRStageMetadata",
     "GRWorkerResult",
-    "validate_gr_execution_config",
-    "validate_gr_device_config",
-    "validate_gr_request",
     "validate_dispatch",
+    "validate_gr_device_config",
+    "validate_gr_execution_config",
+    "validate_gr_execution_runtime",
+    "validate_gr_request",
 ]

@@ -10,6 +10,7 @@ import msgspec
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.engine import (
     EngineCoreOutput,
@@ -784,12 +785,14 @@ def test_native_kv_dispatch_lease_survives_abort_until_receipt() -> None:
 @pytest.mark.parametrize("native_first", [False, True])
 @pytest.mark.parametrize("shared_prefix", [False, True])
 @pytest.mark.parametrize("status", [GRSessionStatus.ABORTED, GRSessionStatus.FINISHING])
+@pytest.mark.parametrize("native_block_ids", [False, True])
 def test_dispatch_lease_preserves_native_eviction_order(
     num_groups: int,
     num_leases: int,
     native_first: bool,
     shared_prefix: bool,
     status: GRSessionStatus,
+    native_block_ids: bool,
 ) -> None:
     def resources() -> tuple[BlockPool, list[Any], list[Any]]:
         pool = BlockPool(num_gpu_blocks=3 * num_groups + 2, enable_caching=True, hash_block_size=16)
@@ -818,14 +821,21 @@ def test_dispatch_lease_preserves_native_eviction_order(
     expected = [block.block_id for block in reference.free_block_queue.get_all_free_blocks()]
     pool, groups, managers = resources()
     scheduler = _scheduler()
+    kv = KVCacheBlocks(tuple(groups)) if native_block_ids else SimpleNamespace(blocks=groups)
     scheduler.kv_cache_manager = SimpleNamespace(
-        get_blocks=lambda _: SimpleNamespace(blocks=groups), block_pool=pool, max_model_len=4096
+        get_blocks=lambda _: kv, block_pool=pool, max_model_len=4096
     )
     session = add_gr_session(scheduler, _batch_request())
     scheduled = []
     for _ in range(num_leases):
         output = _scheduler_output()
+        refs_before = [block.ref_cnt for group in groups for block in group]
         m = attach_gr_stage_metadata(scheduler, output, session)
+        assert m is not None
+        assert m.kv_blocks == tuple(tuple(block.block_id for block in group) for group in groups)
+        assert [block.ref_cnt for group in groups for block in group] == [
+            count + 1 for count in refs_before
+        ]
         setattr(output, GR_STAGE_OUTPUT_ATTR, {session.session_id: m})
         scheduled.append(output)
         scheduler.requests[session.session_id].num_computed_tokens += 1

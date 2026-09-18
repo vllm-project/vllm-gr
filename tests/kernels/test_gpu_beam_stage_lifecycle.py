@@ -133,7 +133,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
         owner.prepared = owner.prepare_cpu(metadata(1), 0)
         owner._bind_attention(metadata(1))
         owner.input_ids.zero_()
-        owner.capture_forward()
+        owner.graph = owner.capture_forward()
     monkeypatch.setattr(
         "vllm.v1.worker.gpu_model_runner.get_pp_group",
         lambda: SimpleNamespace(is_last_rank=True),

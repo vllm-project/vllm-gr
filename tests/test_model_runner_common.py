@@ -1158,6 +1158,7 @@ def _reset_warmup_gc_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_DONE", False)
     monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", False)
     monkeypatch.setattr(common, "_WORKER_EXECUTE_DEPTH", 0)
+    monkeypatch.setattr(common, "_GC_FREEZE_IN_PROGRESS", False)
     # Keep the quiescent fallback wait short in tests.
     monkeypatch.setattr(common, "_QUIESCENT_WAIT_TIMEOUT_S", 2.0)
 
@@ -1275,6 +1276,43 @@ def test_warmup_daemon_waits_for_quiescent_boundary(
     assert common._GC_WARMUP_FREEZE_COMPLETE is True
 
 
+def test_warmup_daemon_blocks_execute_reentry_until_freeze_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The zero-depth observation and freeze form one admission boundary."""
+    _reset_warmup_gc_state(monkeypatch)
+    freeze_started = threading.Event()
+    release_freeze = threading.Event()
+    execute_entered = threading.Event()
+
+    def fake_freeze(*, raise_thresholds: bool) -> list[int]:
+        freeze_started.set()
+        assert release_freeze.wait(5.0)
+        return [700, 100_000, 100_000]
+
+    def enter_execute() -> None:
+        common._enter_worker_execute()
+        try:
+            execute_entered.set()
+        finally:
+            common._exit_worker_execute()
+
+    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+    assert common.schedule_warmup_gc_freeze() is True
+    assert freeze_started.wait(5.0)
+
+    thread = threading.Thread(target=enter_execute)
+    thread.start()
+    assert not execute_entered.wait(0.2), "execute entered during the claimed GC boundary"
+
+    release_freeze.set()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert execute_entered.is_set()
+    assert _wait_freeze_daemon_done()
+    assert common._GC_FREEZE_IN_PROGRESS is False
+
+
 def test_warmup_daemon_skips_when_rpc_already_froze(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1332,3 +1370,52 @@ def test_execute_wrapper_releases_depth_on_exception() -> None:
     with pytest.raises(ExpectedError):
         wrapped(runner, scheduler_output)
     assert common._WORKER_EXECUTE_DEPTH == 0
+
+
+# ---------------------------------------------------------------------------
+# V2 ordinary frames remain native; no global dispatch context is needed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raises", [False, True])  # type: ignore[misc]
+def test_v2_plain_frame_native_execution_and_gc_cleanup(raises: bool) -> None:
+    runner = SimpleNamespace()
+    output = SimpleNamespace(beam_data={})
+
+    def native(self: Any, scheduled: Any) -> str:
+        assert self is runner and scheduled is output
+        assert common._WORKER_EXECUTE_DEPTH == 1
+        if raises:
+            raise RuntimeError("native failed")
+        return "result"
+
+    wrapped = common.make_patched_execute_model_v2(native)
+    if raises:
+        with pytest.raises(RuntimeError, match="native failed"):
+            wrapped(runner, output)
+    else:
+        assert wrapped(runner, output) == "result"
+    assert common._WORKER_EXECUTE_DEPTH == 0
+
+
+def test_slim_v2_wrapper_fail_fast_on_legacy_beam_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refactor §4.3: the slim V2 execute_model wrapper must raise loudly on a
+    legacy beam_data frame instead of silently running the (deleted) LEGACY
+    stack under a runner whose patch layer no longer supports it."""
+    scheduler_output = SimpleNamespace(beam_data={"beam": {"is_beam_decode": True}})
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(additional_config={}))
+
+    def execute_model(self: Any, output: Any) -> str:
+        raise AssertionError("native execute_model must not run for a beam_data frame")
+
+    wrapped = common.make_patched_execute_model_v2(execute_model)
+    with pytest.raises(ValueError, match="legacy beam_data frames are not supported"):
+        wrapped(runner, scheduler_output)
+
+
+def test_slim_v2_wrapper_is_idempotent() -> None:
+    def execute_model(self: Any, output: Any) -> str:
+        return "result"
+
+    wrapped = common.make_patched_execute_model_v2(execute_model)
+    assert common.make_patched_execute_model_v2(wrapped) is wrapped

@@ -121,7 +121,7 @@ def test_set_gr_constraint_resources_fails_when_runner_lacks_sample_hook(
         model_runner = object()  # a runner class without _sample
 
     manager = ConstraintResourceManager()
-    with pytest.raises(RuntimeError, match="raw-logits hook"):
+    with pytest.raises(RuntimeError, match="Constraint Tables cannot start"):
         set_gr_constraint_resources(FakeWorker(), wire, manager)
 
     class PatchedRunner:
@@ -138,6 +138,40 @@ def test_set_gr_constraint_resources_fails_when_runner_lacks_sample_hook(
 
     manager = ConstraintResourceManager()
     status = set_gr_constraint_resources(PatchedWorker(), wire, manager)
+    assert status["cached"] is True
+
+
+def test_set_gr_constraint_resources_accepts_v2_stage_hooks(
+    tokenizer: MagicMock,
+) -> None:
+    """The V2 stage execute/sample_tokens pair satisfies the resource gate."""
+    from vllm_gr.v1.worker.model_runner_common import (
+        _WORKER_EXECUTE_PATCH_MARKER,
+        _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
+    )
+
+    resource = _build_resource(tokenizer)
+    wire = to_wire(resource)
+
+    class PatchedV2Runner:
+        pass
+
+    def patched_execute(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return object()
+
+    def patched_sample_tokens(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return object()
+
+    setattr(patched_execute, _WORKER_EXECUTE_PATCH_MARKER, True)
+    setattr(patched_sample_tokens, _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, True)
+    setattr(PatchedV2Runner, "execute_model", patched_execute)
+    setattr(PatchedV2Runner, "sample_tokens", patched_sample_tokens)
+
+    class PatchedV2Worker:
+        model_runner = PatchedV2Runner()
+
+    manager = ConstraintResourceManager()
+    status = set_gr_constraint_resources(PatchedV2Worker(), wire, manager)
     assert status["cached"] is True
 
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Runtime installer for sliced-vocabulary logits projection."""
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_gr.ops.sliced_logits import (
@@ -91,6 +92,51 @@ def apply_sliced_logits_patch() -> bool:
             Sampler.gather_logprobs = patched_gather_logprobs
         except Exception as exc:
             logger.debug("vllm_gr: Could not patch Sampler.gather_logprobs: %s", exc)
+
+        # V2 ModelRunner: sampling lives in the new worker-local module, whose
+        # ``compute_topk_logprobs`` does the same torch.topk the V1
+        # ``gather_logprobs`` clamp above protects. With a narrow catalog
+        # vocabulary slice the logits have far fewer columns than the request's
+        # num_logprobs (e.g. an impossible 3-token catalog slices to a single
+        # column), and the unclamped topk raises "selected index k out of
+        # range". The callers bind the function into their own module
+        # namespace (``from ... import compute_topk_logprobs``), so the clamp
+        # must be installed on every importer's binding, not just the defining
+        # module.
+        def _make_clamped_v2_topk(original_v2_topk):
+            def patched_compute_topk_logprobs(logits, num_logprobs, *args, **kwargs):
+                if logits is not None and torch.is_tensor(logits) and logits.numel() > 0:
+                    num_logprobs = min(num_logprobs, logits.size(-1))
+                return original_v2_topk(logits, num_logprobs, *args, **kwargs)
+
+            return patched_compute_topk_logprobs
+
+        try:
+            from vllm.v1.worker.gpu.sample import logprob as v2_logprob
+
+            v2_logprob.compute_topk_logprobs = _make_clamped_v2_topk(
+                v2_logprob.compute_topk_logprobs
+            )
+        except Exception as exc:
+            logger.debug("vllm_gr: Could not patch V2 compute_topk_logprobs: %s", exc)
+
+        for _v2_module_name in (
+            "vllm.v1.worker.gpu.sample.sampler",
+            "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+        ):
+            try:
+                import importlib
+
+                _v2_module = importlib.import_module(_v2_module_name)
+                _bound = getattr(_v2_module, "compute_topk_logprobs", None)
+                if callable(_bound):
+                    _v2_module.compute_topk_logprobs = _make_clamped_v2_topk(_bound)
+            except Exception as exc:
+                logger.debug(
+                    "vllm_gr: Could not patch %s.compute_topk_logprobs: %s",
+                    _v2_module_name,
+                    exc,
+                )
 
         _SLICED_LOGITS_PATCHED = True
         logger.info("vllm_gr: Patched LogitsProcessor._get_logits for sliced vocabulary projection")

@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Wire instance-local native Prefill capture followed by GR Beam capture."""
+
+from __future__ import annotations
+
+from functools import wraps
+
+from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+_WORKER_V2_GRAPH_PATCH_MARKER = "_vllm_gr_beam_capture_v2_patch"
+
+
+def make_patched_capture_model_v2(_orig_capture_model):
+    """Install the Prefill plan, run native capture, then capture Beam Decode."""
+    if getattr(_orig_capture_model, _WORKER_V2_GRAPH_PATCH_MARKER, False):
+        return _orig_capture_model
+
+    @wraps(_orig_capture_model)
+    def patched_capture_model(self, *args, **kwargs):
+        # The Engine admits only beam_search_v1 for V2 Beam engines. The
+        # execution layer checks whether Beam is enabled, not its protocol.
+        if _get_gr_config(self).beam_max_width is not None:
+            from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+            from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import (
+                install_prefill_graph_manager_v2,
+            )
+
+            install_prefill_graph_manager_v2(self)
+            res = _orig_capture_model(self, *args, **kwargs)
+            from vllm_gr.v1.worker.gr_startup import capture_async_forward
+
+            self._gr_async_decode_graph_capture_failed = False
+            self._gr_async_decode_graph_capture_error = None
+            capture_async_forward(self, hooks_type=V2StageExecutionHooks, allow_eager_fallback=True)
+        else:
+            # No Beam resources configured: preserve ordinary native V2.
+            res = _orig_capture_model(self, *args, **kwargs)
+
+        # All applicable CUDA graphs are now captured and the serving-time
+        # heap is fully built. Freeze it so long-lived post-startup objects
+        # are not rescanned by gen-1/gen-2 GC during serving (V1 parity;
+        # measured 29-36ms collected=0 pauses when missing).
+        from vllm_gr.v1.worker.model_runner_common import (
+            freeze_gc_after_graph_capture,
+        )
+
+        freeze_gc_after_graph_capture(self)
+        return res
+
+    setattr(patched_capture_model, _WORKER_V2_GRAPH_PATCH_MARKER, True)
+    return patched_capture_model
+
+
+__all__ = ["make_patched_capture_model_v2"]

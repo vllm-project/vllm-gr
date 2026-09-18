@@ -32,19 +32,41 @@ _OPENCV_PKGS = [
 def configure_model_runner_default() -> None:
     """Default vllm-gr processes to the V1 model runner.
 
-    The GR beam-search worker patches currently target the V1 GPU/NPU model
-    runner lifecycle.  vLLM 0.22 enables ModelRunner V2 automatically for
+    The GR beam-search worker patches target the V1 GPU/NPU model runner
+    lifecycle by default.  vLLM 0.22 enables ModelRunner V2 automatically for
     supported models such as Qwen3, which bypasses those patches and can
     silently produce incorrect beam-search results.  Set the environment
-    default before vLLM constructs its configuration, while preserving an
-    explicit user override for V2 development and validation.
+    default before vLLM constructs its configuration.
+
+    An explicit ``VLLM_USE_V2_MODEL_RUNNER=1`` (or any truthy spelling) is
+    preserved as an opt-in experimental path: the V2 runner is
+    beam_search_v1-only (``execution_mode=v1`` persistent GR stage path).  The
+    LEGACY ``beam_data`` frame stack is not supported under V2 and fails fast.
     """
-    if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
+    value = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
+    if value is None:
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
         logger.info(
             "VLLM_USE_V2_MODEL_RUNNER was not set; defaulting to ModelRunner V1 "
             "for vllm-gr compatibility."
         )
+        return
+
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        # Normalize truthy spellings to "1": vLLM's env parser converts the
+        # value with int(), which rejects "true"/"yes"/"on" (ValueError).
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+        logger.warning(
+            "VLLM_USE_V2_MODEL_RUNNER=%s is an experimental vllm-gr path; "
+            "the V2 runner is beam_search_v1-only (legacy beam_data frames "
+            "fail fast).",
+            value,
+        )
+    elif normalized in ("0", "false", "no", "off", ""):
+        # Likewise normalize falsy spellings (and empty string) to "0".
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    # Any other value is left untouched so vLLM surfaces its own parse error.
 
 
 def _distribution_version(distribution: str) -> str:

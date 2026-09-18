@@ -164,7 +164,15 @@ def test_planned_state_mismatch_is_a_device_error_with_no_generated_successor(dt
     assert result.finished and result.terminal_result.failure.code == "beam_device_error"
 
 
-def test_retirement_waits_for_output_consumer_and_returns_release_proof():
+def test_retirement_waits_for_output_consumer_and_returns_release_proof(monkeypatch):
+    from vllm_gr.v1.worker import model_runner_common
+
+    freezes: list[str] = []
+    monkeypatch.setattr(
+        model_runner_common,
+        "schedule_warmup_gc_freeze",
+        lambda: freezes.append("scheduled"),
+    )
     owner = runtime()
     owner.admit(dispatch(metadata()))
     owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
@@ -188,6 +196,7 @@ def test_retirement_waits_for_output_consumer_and_returns_release_proof():
     assert owner.closed
     assert owner.beam.session.context.registry.num_active_sessions == 0
     assert retirement.get_output() is output
+    assert freezes == ["scheduled"]
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -230,6 +239,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         admission_worker,
         install_decode_model,
     )
+    from vllm_gr.v1.worker import model_runner_common
     from vllm_gr.v1.worker.gpu_beam_stage_runner import (
         GPUBeamStageRunner,
         get_stage_runner,
@@ -237,6 +247,12 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
     from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
     worker = admission_worker()
+    freezes: list[str] = []
+    monkeypatch.setattr(
+        model_runner_common,
+        "schedule_warmup_gc_freeze",
+        lambda: freezes.append("scheduled"),
+    )
     worker.requests = {}
     worker.prepare_inputs_event = None
     worker.model_config.enforce_eager = False
@@ -252,6 +268,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         lambda ids, positions: ids[:, None].to(torch.float16).expand(-1, 6) + positions[:, None],
     )
     assert capture_async_forward(worker)
+    assert freezes == []
     owner = worker._gr_gpu_stage_runner
     graph = owner.graph
     assert owner.closed and graph is not None

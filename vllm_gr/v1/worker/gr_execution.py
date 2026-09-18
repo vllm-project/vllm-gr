@@ -85,13 +85,21 @@ def _require_device(worker: Any) -> None:
 
 
 def execute_gr_stage(
-    worker: Any, scheduled: Any, original: Callable[..., Any], *args: Any, **kwargs: Any
+    worker: Any,
+    scheduled: Any,
+    original: Callable[..., Any],
+    *args: Any,
+    hooks_type: type[Any] | None = None,
+    **kwargs: Any,
 ) -> Any:
     _require_device(worker)
-    from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
+    from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+        _StageExecutionHooks,
+        get_stage_runner,
+    )
 
     local = worker_input(scheduled)
-    stage_runner = get_stage_runner(worker, local)
+    stage_runner = get_stage_runner(worker, local, hooks_type=hooks_type or _StageExecutionHooks)
     try:
         return stage_runner.execute(local, original, *args, **kwargs)
     except Exception as error:

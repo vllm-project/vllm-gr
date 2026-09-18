@@ -811,7 +811,8 @@ def capture_beam_decode_graph(runner) -> bool:
         graph.capture(
             lambda capture: _dummy_beam_forward(
                 runner, context, beam_info, batch_descriptor, width, prefix_len, capture
-            )
+            ),
+            persistent_install=True,
         )
         captured = graph.ready
     finally:

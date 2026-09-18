@@ -1344,9 +1344,18 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         req_ids = beam_info["req_ids"] if beam_info else []
 
         q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
-        # Prefer the runner's CPU mirror (populated by _prepare_inputs) to avoid
-        # a device->host .cpu() round-trip on every build().
+        # Preserve V1's exact CPU mirror. Native V2 supplies an upper bound
+        # instead, which is exact without speculative decoding (including
+        # cached/chunked Prefill). Legacy Beam rows retain their own lengths.
         seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        if seq_lens_cpu is None or seq_lens_cpu.numel() < num_reqs:
+            upper_bound = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
+            if (
+                upper_bound is not None
+                and self.vllm_config.speculative_config is None
+                and not any(m and m.get("is_beam_decode", False) for m in beam_data.values())
+            ):
+                seq_lens_cpu = upper_bound
         if seq_lens_cpu is not None and seq_lens_cpu.numel() >= num_reqs:
             seq_lens_cpu_list = seq_lens_cpu[:num_reqs].tolist()
         else:

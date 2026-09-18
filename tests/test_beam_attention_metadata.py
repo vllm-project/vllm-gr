@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 import torch
+from vllm.v1.attention.backend import CommonAttentionMetadata
 
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
@@ -19,6 +20,7 @@ from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 
 def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
     builder = object.__new__(BeamAttentionMetadataBuilder)
+    builder.vllm_config = SimpleNamespace(speculative_config=None)
     builder.device = torch.device("cpu")
     builder.block_size = block_size
     builder.aot_schedule = False
@@ -69,6 +71,78 @@ def _build_metadata(
         BEAM_DATA_VAR.reset(token)
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "query_starts,seq_lens,num_reqs",
+    [
+        pytest.param([0, 8], [8], 1, id="prefill"),
+        pytest.param([0, 1], [8], 1, id="prefix-cache-hit"),
+        pytest.param([0, 3], [3], 1, id="first-chunk"),
+        pytest.param([0, 3], [6], 1, id="continuation-chunk"),
+        pytest.param([0, 3, 3], [6, 0], 1, id="padded-request"),
+        pytest.param([0, 3, 3], [6, 0], 2, id="full-graph-padded-request"),
+        pytest.param([0, 3, 4], [6, 8], 2, id="multiple-requests"),
+    ],
+)
+def test_native_cpu_lengths_avoid_device_read(
+    monkeypatch: pytest.MonkeyPatch,
+    query_starts: list[int],
+    seq_lens: list[int],
+    num_reqs: int,
+) -> None:
+    common = CommonAttentionMetadata(
+        **vars(_common_metadata(query_starts, seq_lens, [[0, 1, 2, 3]] * len(seq_lens)))
+    )
+    common.num_reqs = num_reqs
+    common.seq_lens_cpu_upper_bound = common.seq_lens.clone()
+
+    def forbid_cpu(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("native CPU lengths must avoid a device-to-host read")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", forbid_cpu)
+    metadata = _make_builder().build(0, common)
+
+    assert metadata.seq_lens_cpu == seq_lens[:num_reqs]
+    assert metadata.query_start_loc_cpu == query_starts
+    assert metadata.seq_lens is common.seq_lens
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "source", ["missing", "short", "speculative", "v1-mirror", "short-v1-mirror"]
+)
+def test_native_cpu_length_fallback_preserves_exact_lengths(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    common = CommonAttentionMetadata(**vars(_common_metadata([0, 1], [8], [[0, 1, 2, 3]])))
+    builder = _make_builder()
+    if source == "short":
+        common.seq_lens_cpu_upper_bound = torch.empty(0, dtype=torch.int32)
+    elif source in ("speculative", "v1-mirror"):
+        # Async speculation may overestimate the actual context length.
+        common.seq_lens_cpu_upper_bound = torch.tensor([11], dtype=torch.int32)
+        builder.vllm_config.speculative_config = SimpleNamespace()
+        if source == "v1-mirror":
+            common._seq_lens_cpu = torch.tensor([8], dtype=torch.int32)
+    elif source == "short-v1-mirror":
+        common._seq_lens_cpu = torch.empty(0, dtype=torch.int32)
+        common.seq_lens_cpu_upper_bound = torch.tensor([8], dtype=torch.int32)
+
+    reads = []
+    original_cpu = torch.Tensor.cpu
+
+    def record_cpu(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        reads.append(tensor)
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", record_cpu)
+    metadata = builder.build(0, common)
+
+    assert metadata.seq_lens_cpu == [8]
+    assert len(reads) == (0 if source in ("v1-mirror", "short-v1-mirror") else 1)
+    if reads:
+        assert reads[0] is common.seq_lens
+
+
+@pytest.mark.parametrize("native_upper_bound", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     (
         "query_starts",
@@ -140,6 +214,7 @@ def _build_metadata(
     ],
 )
 def test_build_routes_standard_and_beam_metadata(
+    native_upper_bound: bool,
     query_starts: list[int],
     seq_lens: list[int],
     block_table: list[list[int]],
@@ -147,8 +222,13 @@ def test_build_routes_standard_and_beam_metadata(
     beam_data: dict[str, dict[str, Any]],
     expected: dict[str, Any],
 ) -> None:
+    common = _common_metadata(query_starts, seq_lens, block_table)
+    if native_upper_bound:
+        # Legacy Beam batches must keep using their exact custom lengths,
+        # including ordinary rows mixed into the same batch.
+        common.seq_lens_cpu_upper_bound = torch.tensor([99] * len(seq_lens), dtype=torch.int32)
     metadata = _build_metadata(
-        _common_metadata(query_starts, seq_lens, block_table),
+        common,
         req_ids,
         beam_data,
     )

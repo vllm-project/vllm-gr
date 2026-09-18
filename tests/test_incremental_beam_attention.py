@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
@@ -14,26 +13,6 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
 from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
 from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
-
-
-@pytest.mark.skip(  # type: ignore[misc]
-    reason="_copy_pool_suffix_to_fixed_buffer is a decode_graph-only function; our 8ffc23d implementation does pool-to-suffix copy inline in cascade_attention"
-)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
-def test_copy_pool_suffix_to_fixed_buffer_is_beam_major(dtype: torch.dtype) -> None:
-    """This test is skipped because _copy_pool_suffix_to_fixed_buffer does not
-    exist in our 8ffc23d implementation. The pool-to-suffix copy is performed
-    inline in cascade_attention (beam_attn_gpu.py) instead."""
-    pass
-
-
-@pytest.mark.skip(  # type: ignore[misc]
-    reason="_copy_pool_suffix_to_fixed_buffer is a decode_graph-only function; our 8ffc23d implementation does pool-to-suffix copy inline in cascade_attention"
-)
-def test_copy_pool_suffix_validates_capacity_before_writing() -> None:
-    """This test is skipped because _copy_pool_suffix_to_fixed_buffer does not
-    exist in our 8ffc23d implementation."""
-    pass
 
 
 def _make_session(
@@ -247,13 +226,3 @@ def test_incremental_metadata_builder_uses_active_session_contract() -> None:
     # suffix_slot_mapping_out is an empty tensor (not None) in incremental path
     assert metadata.suffix_slot_mapping_out is not None
     assert metadata.suffix_slot_mapping_out.numel() == 0
-
-
-@pytest.mark.skip(  # type: ignore[misc]
-    reason="cascade_attention_incremental is a decode_graph-only function; our 8ffc23d implementation uses cascade_attention with beam_pool parameter"
-)
-def test_incremental_cascade_uses_pool_buffer_and_caller_output() -> None:
-    """This test is skipped because cascade_attention_incremental does not
-    exist in our 8ffc23d implementation. The incremental path is handled by
-    cascade_attention with beam_pool parameter."""
-    pass

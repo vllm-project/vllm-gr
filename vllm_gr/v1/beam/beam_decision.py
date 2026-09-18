@@ -1097,6 +1097,7 @@ def init_beam_decision_from_parents(
 def _select_candidates(
     sampler_output: Any,
     width: int,
+    v2_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Extract ``[B*W, W]`` (token_ids int32, probs fp32) from sampler output.
 
@@ -1105,6 +1106,12 @@ def _select_candidates(
     constrained rows with the fixed-width ``W`` operator output.  For
     unconstrained rows we drop the sampled-token column to get exactly ``W``
     candidates per beam.
+
+    ``v2_layout`` selects an explicit layout contract instead of inferring it
+    from ``shape[1]``: ``False`` is the V1 (and vLLM 0.22.1 V2) layout with the
+    sampled token in column 0; ``True`` declares a pure top-K layout with no
+    sampled column.  The flag is threaded from the V2 sample wrapper so the
+    layout is never guessed from the tensor width alone.
 
     dtype: the ``.to(...)`` casts are skipped when the source tensor already
     carries the target dtype (``torch.Tensor.to`` short-circuits, but the
@@ -1129,7 +1136,13 @@ def _select_candidates(
     # Constrained rows already have width == W; unconstrained rows have
     # width == max_logprobs + 1.  Use min() so slicing can't overflow.
     n_cols = min(token_ids.shape[1], logprobs.shape[1])
-    if n_cols > width:
+    if v2_layout:
+        # Pure top-K: every column is a candidate (no sampled column to drop).
+        if n_cols < width:
+            return None
+        top_tokens = token_ids[:, :width]
+        top_probs = logprobs[:, :width]
+    elif n_cols > width:
         top_tokens = token_ids[:, 1 : width + 1]
         top_probs = logprobs[:, 1 : width + 1]
     elif n_cols == width:
@@ -1152,6 +1165,7 @@ def _select_candidates_into(
     sampler_output: Any,
     width: int,
     workspace: BeamPostprocessWorkspace,
+    v2_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
     """Normalize sampler candidates into fixed CUDA workspace buffers."""
 
@@ -1170,7 +1184,14 @@ def _select_candidates_into(
     if token_ids.ndim != 2 or logprobs.ndim != 2 or token_ids.shape[0] != logprobs.shape[0]:
         return None
     n_cols = min(token_ids.shape[1], logprobs.shape[1])
-    if n_cols > width:
+    if v2_layout:
+        # Pure top-K: every column is a candidate (no sampled column to drop).
+        if n_cols < width:
+            return None
+        source_tokens = token_ids[:, :width]
+        source_scores = logprobs[:, :width]
+        source_mask = valid_mask if torch.is_tensor(valid_mask) else None
+    elif n_cols > width:
         source_tokens = token_ids[:, 1 : width + 1]
         source_scores = logprobs[:, 1 : width + 1]
         source_mask = None
@@ -1576,6 +1597,8 @@ def run_beam_decision(
     sampler_output: Any,
     is_last_step: bool,
     result_width: int | None = None,
+    *,
+    v2_layout: bool = False,
 ) -> dict[str, torch.Tensor] | None:
     """Run the worker-side beam decision for one decode step.
 
@@ -1586,6 +1609,7 @@ def run_beam_decision(
             per-beam top-k candidates (post constraint override).
         is_last_step: whether this is the final decode step.
         result_width: output width for the final step; defaults to beam width.
+        v2_layout: explicit sampler layout contract (see ``_select_candidates``).
 
     Returns a dict with ``out_token_ids`` / ``out_token_index`` /
     ``out_log_probs`` / ``out_sequence`` (device tensors, ``[B, W_eff]`` /
@@ -1600,9 +1624,9 @@ def run_beam_decision(
         return None
     workspace = get_beam_postprocess_workspace(runner, width) if device_type == "cuda" else None
     candidates = (
-        _select_candidates_into(sampler_output, width, workspace)
+        _select_candidates_into(sampler_output, width, workspace, v2_layout=v2_layout)
         if workspace is not None
-        else _select_candidates(sampler_output, width)
+        else _select_candidates(sampler_output, width, v2_layout=v2_layout)
     )
     if candidates is None:
         return None
@@ -1667,8 +1691,18 @@ def run_beam_decision(
     return decision
 
 
-def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
-    """Run and publish the active accelerator's worker-side beam decision."""
+def maybe_run_worker_beam_decision(
+    runner: Any,
+    sampler_output: Any,
+    *,
+    v2_layout: bool = False,
+) -> None:
+    """Run and publish the active accelerator's worker-side beam decision.
+
+    ``v2_layout`` is threaded to :func:`run_beam_decision` so the V2 sample
+    wrapper can declare its sampler layout explicitly (see
+    :func:`_select_candidates`).
+    """
     fast_prefill = _run_cuda_prefill_postprocess(runner, sampler_output)
     if fast_prefill is not None:
         payload, compatibility_views = fast_prefill
@@ -1716,6 +1750,7 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
         sampler_output,
         is_last_step=state.is_last_step,
         result_width=result_width,
+        v2_layout=v2_layout,
     )
     if decision is not None:
         # Keep the device winners alive until bookkeeping has replaced the

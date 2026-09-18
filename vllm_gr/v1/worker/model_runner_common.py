@@ -29,6 +29,23 @@ _WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
 _WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
 _WORKER_MODEL_FORWARD_PATCH_MARKER = "_vllm_gr_prefill_model_forward_patch"
 
+# ModelRunner V2 patch markers.  The V2 runner has a different method surface
+# (``prepare_inputs``/``sample``/``sample_tokens`` instead of
+# ``_prepare_inputs``/``_bookkeeping_sync``/``_sample``), so the V2 wrappers
+# stamp their own markers while sharing the execute_model wrapper (and its
+# marker) with V1.
+_WORKER_V2_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_v2_patch"
+_WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER = "_vllm_gr_beam_sample_tokens_v2_patch"
+# P0 beam steady-state state-machine bypass (V2 only): finish/add wrappers.
+_WORKER_V2_FINISH_REQUESTS_PATCH_MARKER = "_vllm_gr_beam_finish_requests_v2_patch"
+_WORKER_V2_ADD_REQUESTS_PATCH_MARKER = "_vllm_gr_beam_add_requests_v2_patch"
+
+# Canonical Constraint Backend load/shutdown markers.  Defined here (the shared
+# home) so both the V1 dispatcher and the V2-aware validation gate can read the
+# same constants without a circular import.
+_CONSTRAINT_LOAD_PATCH_MARKER = "_vllm_gr_constraint_load_patched"
+_CONSTRAINT_SHUTDOWN_PATCH_MARKER = "_vllm_gr_constraint_shutdown_patched"
+
 
 def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Safely extracts underlying hardware and host indexing position tensors."""
@@ -999,6 +1016,11 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
     host_ids = decision.get("_host_token_ids")
     host_scores = decision.get("_host_log_probs")
     host_ranks = decision.get("_host_selected_token_ranks")
+    # The host-staged reduction is a V1 async-output optimization: V1's
+    # bookkeeping already copied the sampler payload to host, so publishing the
+    # O(W) compatibility row from the host copy avoids a second D2H.  (This
+    # helper is V1-only: the V2 sample path was removed with the LEGACY frame
+    # stack.)
     host_ready = bool(
         getattr(runner, "_beam_result_host_ready", False)
         and torch.is_tensor(host_ids)
@@ -1230,13 +1252,27 @@ def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
     if runner is None:
         raise RuntimeError("worker has no model_runner for Beam graph diagnostics")
     config = _get_gr_config(runner)
-    return {
+    stats: dict[str, Any] = {
         "runner": type(runner).__name__,
         "beam_graph_enabled": bool(config.beam_graph_enabled),
         "beam_max_width": config.beam_max_width,
         "captured_widths": sorted(int(width) for width in getattr(runner, "_beam_graph_keys", ())),
         "full_dispatches": int(getattr(runner, "_beam_graph_full_dispatch_count", 0)),
     }
+    manager = getattr(runner, "cudagraph_manager", None)
+    counts = getattr(manager, "dispatch_counts", None)
+    if counts is not None:
+        stats["prefill_graph_captured_buckets"] = sorted(
+            desc.num_tokens for desc in manager._successful if desc.cg_mode.name == "FULL"
+        )
+        stats["prefill_graph_piecewise_buckets"] = sorted(
+            desc.num_tokens for desc in manager._successful if desc.cg_mode.name == "PIECEWISE"
+        )
+        stats["prefill_graph_full_capture_failures"] = dict(manager.full_capture_failures)
+        stats["prefill_graph_full_dispatches"] = counts["FULL"]
+        stats["prefill_graph_piecewise_dispatches"] = counts["PIECEWISE"]
+        stats["prefill_graph_none_dispatches"] = counts["NONE"]
+    return stats
 
 
 _GC_FROZEN_AFTER_CAPTURE_MARKER = "_vllm_gr_gc_frozen_after_capture"
@@ -1271,6 +1307,7 @@ _QUIESCENT_WAIT_TIMEOUT_S = 30.0
 # quiescent boundary instead.  A step admitted while the collection is
 # already running can still see the tail of that one-shot pause.
 _WORKER_EXECUTE_DEPTH = 0
+_GC_FREEZE_IN_PROGRESS = False
 _WORKER_EXECUTE_COND = threading.Condition()
 
 # GC threshold applied to ALL generations (0/1/2) while serving, after the
@@ -1288,6 +1325,8 @@ _SERVING_GC_THRESHOLD = 50_000
 def _enter_worker_execute() -> None:
     global _WORKER_EXECUTE_DEPTH
     with _WORKER_EXECUTE_COND:
+        while _GC_FREEZE_IN_PROGRESS:
+            _WORKER_EXECUTE_COND.wait()
         _WORKER_EXECUTE_DEPTH += 1
 
 
@@ -1362,7 +1401,9 @@ def schedule_warmup_gc_freeze() -> bool:
         _GC_WARMUP_FREEZE_DONE = True
 
     def _run() -> None:
+        global _GC_FREEZE_IN_PROGRESS
         global _GC_WARMUP_FREEZE_DONE, _GC_WARMUP_FREEZE_COMPLETE
+        claimed_freeze_boundary = False
         try:
             with _WORKER_EXECUTE_COND:
                 deadline = time.monotonic() + _QUIESCENT_WAIT_TIMEOUT_S
@@ -1377,10 +1418,15 @@ def schedule_warmup_gc_freeze() -> bool:
                         )
                         break
                     _WORKER_EXECUTE_COND.wait(remaining)
-            with _GC_WARMUP_FREEZE_LOCK:
-                if _GC_WARMUP_FREEZE_COMPLETE:
-                    # The explicit warmup RPC already froze this heap.
-                    return
+                with _GC_WARMUP_FREEZE_LOCK:
+                    if _GC_WARMUP_FREEZE_COMPLETE:
+                        # The explicit warmup RPC already froze this heap.
+                        return
+                # Claim the admission boundary while still holding the same
+                # condition lock used by _enter_worker_execute. No new model
+                # step can enter between the zero-depth observation and GC.
+                _GC_FREEZE_IN_PROGRESS = True
+                claimed_freeze_boundary = True
             thresholds = _freeze_serving_gc(raise_thresholds=True)
             with _GC_WARMUP_FREEZE_LOCK:
                 _GC_WARMUP_FREEZE_COMPLETE = True
@@ -1397,6 +1443,11 @@ def schedule_warmup_gc_freeze() -> bool:
             logger.exception(
                 "vllm-gr: automatic warmup GC freeze failed; continuing with default GC"
             )
+        finally:
+            if claimed_freeze_boundary:
+                with _WORKER_EXECUTE_COND:
+                    _GC_FREEZE_IN_PROGRESS = False
+                    _WORKER_EXECUTE_COND.notify_all()
 
     threading.Thread(
         target=_run,
@@ -1409,16 +1460,15 @@ def schedule_warmup_gc_freeze() -> bool:
 def freeze_gc_after_graph_capture(runner: Any) -> None:
     """Freeze the serving-time heap once CUDA-graph capture has finished.
 
-    vLLM's startup ``freeze_gc_heap()`` runs at the end of ``EngineCore.__init__``
-    — *before* KV-cache allocation and CUDA-graph capture.  The long-lived
-    objects created afterwards (KV caches, captured native/beam/prefill graph
-    state, beam-session infrastructure) therefore stay in the tracked young/
-    middle generations.  During serving, gen-1 collections scan them all every
-    few requests for cycles that never exist (measured 29-36 ms pauses with
+    GC state is process-local. vLLM freezes the EngineCore startup heap, but
+    that does not reliably cover graph objects created in a separate Worker
+    process, nor vllm-gr's native/beam/prefill capture objects. During serving,
+    gen-1 collections otherwise scan this long-lived graph heap every few
+    requests for cycles that never exist (measured 29-36 ms pauses with
     ``collected=0``, landing on a fixed 4-request cadence and spiking that
-    request's latency).  Running a full collection and ``gc.freeze()`` here
-    moves this post-startup heap into the permanent generation so gen-0/gen-1
-    collections during serving no longer scan it.
+    request's latency). Running a full collection and ``gc.freeze()`` here
+    moves the completed capture heap into the permanent generation so later
+    collections scan only serving-time allocations.
 
     Idempotent: only the first invocation after capture runs the collection.
     Runs in the EngineCore/worker process (``capture_model`` executes there).
@@ -1834,6 +1884,110 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     return active_session
 
 
+def _dispatch_retirement_frame(self, scheduler_output):
+    """Handle a GR retirement control frame; returns the retire output.
+
+    Returns None when ``scheduler_output`` is not a retirement frame (the
+    caller continues with the normal dispatch).
+    """
+    from vllm_gr.v1.engine.gr_async_scheduler import GR_RETIRE_OUTPUT_ATTR
+
+    if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is None:
+        return None
+    from vllm_gr.v1.worker.gr_execution import execute_gr_retirement
+
+    return execute_gr_retirement(self, scheduler_output)
+
+
+def _dispatch_stage_frame(
+    self, scheduler_output, orig_execute_model, *args, hooks_type=None, **kwargs
+):
+    """Handle a persistent GR stage frame (beam_search_v1 execution).
+
+    Returns ``_NOT_A_STAGE_FRAME`` when ``scheduler_output`` is not a stage
+    frame; otherwise the stage runner's execute() result.  On an execution
+    failure the error is recorded on the stage runner before re-raising —
+    the native BatchQueue associates the execute and sample Futures, so
+    sampling must also fail or valid-looking stale logits could hide a
+    failed execute Future from that native path.
+    """
+    from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+
+    if not getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
+        return _NOT_A_STAGE_FRAME
+    if str(self.device).split(":")[0] != "cuda":
+        raise ValueError("persistent GR stage execution requires a CUDA runner")
+    from vllm_gr.v1.worker.gr_execution import execute_gr_stage
+
+    return execute_gr_stage(
+        self, scheduler_output, orig_execute_model, *args, hooks_type=hooks_type, **kwargs
+    )
+
+
+# Sentinel distinguishing "not a stage frame" from a legitimate None result.
+_NOT_A_STAGE_FRAME = object()
+
+
+def make_patched_execute_model_v2(_orig_execute_model):
+    """Slim execute_model wrapper for the V2 ModelRunner (beam_search_v1 only).
+
+    Refactor design §4.2: under V2 the beam surface is the persistent GR
+    stage path; the LEGACY ``beam_data`` frame stack (M1 remap / M2 inline
+    sample / session refresh / constraint prelaunch) is not supported.  The
+    wrapper therefore:
+
+    - dispatches retirement and stage control frames (shared helpers);
+    - FAILS FAST on a ``beam_data`` frame — the historical alternative was a
+      silent wrong-beam-results mode when the V1/V2 flag resolved differently
+      than the patch layer assumed (ISSUES §1.1); a loud error names both
+      remediations (execution_mode=v1, or unset the V2 flag);
+
+    Everything else is the untouched native ``execute_model``.
+    """
+    if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
+        return _orig_execute_model
+
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
+
+    @wraps(_orig_execute_model)
+    def _patched_execute_model_step_v2(self, scheduler_output, *args, **kwargs):
+        retirement = _dispatch_retirement_frame(self, scheduler_output)
+        if retirement is not None:
+            return retirement
+
+        stage = _dispatch_stage_frame(
+            self,
+            scheduler_output,
+            _orig_execute_model,
+            *args,
+            hooks_type=V2StageExecutionHooks,
+            **kwargs,
+        )
+        if stage is not _NOT_A_STAGE_FRAME:
+            return stage
+
+        if getattr(scheduler_output, "beam_data", {}):
+            raise ValueError(
+                "legacy beam_data frames are not supported under ModelRunnerV2; "
+                "use beam.execution_mode='v1' or unset VLLM_USE_V2_MODEL_RUNNER"
+            )
+
+        return _orig_execute_model(self, scheduler_output, *args, **kwargs)
+
+    @wraps(_orig_execute_model)
+    def patched_execute_model_v2(self, scheduler_output, *args, **kwargs):
+        # Same quiescent-boundary tracking as the V1 wrapper: the GC-freeze
+        # daemon waits for in-flight executions to drain before collecting.
+        _enter_worker_execute()
+        try:
+            return _patched_execute_model_step_v2(self, scheduler_output, *args, **kwargs)
+        finally:
+            _exit_worker_execute()
+
+    setattr(patched_execute_model_v2, _WORKER_EXECUTE_PATCH_MARKER, True)
+    return patched_execute_model_v2
+
+
 def make_patched_execute_model(_orig_execute_model):
     """Wrap execute_model to publish beam-request context for the run.
 
@@ -1851,16 +2005,20 @@ def make_patched_execute_model(_orig_execute_model):
             GR_STAGE_OUTPUT_ATTR,
         )
 
-        if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is not None:
-            from vllm_gr.v1.worker.gr_execution import execute_gr_retirement
-
+        # Only the V1 entry supports both Beam protocols. Shared stage and
+        # retirement code receives an already admitted persistent frame.
+        if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is not None or getattr(
+            scheduler_output, GR_STAGE_OUTPUT_ATTR, None
+        ):
             require_beam_execution_mode(self.vllm_config, BeamExecutionMode.V1)
-            return execute_gr_retirement(self, scheduler_output)
 
-        if getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
-            from vllm_gr.v1.worker.gr_execution import execute_gr_stage
+        retirement = _dispatch_retirement_frame(self, scheduler_output)
+        if retirement is not None:
+            return retirement
 
-            return execute_gr_stage(self, scheduler_output, _orig_execute_model, *args, **kwargs)
+        stage = _dispatch_stage_frame(self, scheduler_output, _orig_execute_model, *args, **kwargs)
+        if stage is not _NOT_A_STAGE_FRAME:
+            return stage
         if getattr(scheduler_output, "beam_data", {}):
             require_beam_execution_mode(self.vllm_config, BeamExecutionMode.LEGACY)
         gr_stage = getattr(self, "_gr_gpu_stage_runner", None)
@@ -2003,15 +2161,41 @@ def make_patched_execute_model(_orig_execute_model):
     return patched_execute_model
 
 
+def is_worker_runner_v2_patched(runner_class) -> bool:
+    """Return whether all grouped-beam hooks are present on a V2 runner class.
+
+    The V2 runner (``vllm.v1.worker.gpu.model_runner.GPUModelRunner``) exposes
+    ``sample_tokens`` instead of the V1 ``_bookkeeping_sync`` surface. The
+    required V2 method set is the slim ``execute_model`` and ``sample_tokens``
+    stage bypass plus the canonical Constraint Backend load/shutdown markers.
+    Native ``sample`` remains untouched: V2 supports only beam_search_v1,
+    whose stage runner owns constrained sampling. ``prepare_inputs`` /
+    ``finish_requests`` / ``add_requests`` are NOT patched under V2 — the
+    stage path drives the native state machine directly (``consume_native_state``).
+    """
+    return bool(
+        getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)
+        and getattr(runner_class.sample_tokens, _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False)
+        and getattr(runner_class.load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False)
+        and getattr(runner_class.shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
+    )
+
+
 def is_worker_runner_patched(runner_class) -> bool:
     """Return whether all grouped-beam hooks are present on a runner class.
 
+    Dispatches between the V1 and V2 method surfaces: the V2 runner has a
+    ``prepare_inputs`` method and no ``_prepare_inputs``.
+
     The ``_determine_batch_execution_and_padding`` hook stamps the beam
-    determine marker on all platforms.  On GPU it overrides the dispatch
+    determine marker on all V1 platforms.  On GPU it overrides the dispatch
     result to force FULL CUDA Graph for beam decode; on NPU it is a no-op
     wrapper that preserves the original result — but the marker must still
     be present for the gate-check to pass.
     """
+    if hasattr(runner_class, "prepare_inputs") and not hasattr(runner_class, "_prepare_inputs"):
+        return is_worker_runner_v2_patched(runner_class)
+
     has_determine = hasattr(runner_class, "_determine_batch_execution_and_padding")
     return bool(
         getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)

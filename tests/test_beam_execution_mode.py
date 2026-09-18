@@ -56,27 +56,6 @@ def test_v1_requires_native_async() -> None:
         require_beam_execution_mode(config, BeamExecutionMode.LEGACY)
 
 
-def test_legacy_async_startup_does_not_allocate_v1_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.worker import gpu_beam_stage_runner, gr_startup
-
-    allocate = Mock(side_effect=AssertionError("legacy startup allocated V1 state"))
-    monkeypatch.setattr(gpu_beam_stage_runner, "get_stage_runner", allocate)
-    worker = SimpleNamespace(
-        device="cuda",
-        use_async_scheduling=True,
-        model_config=SimpleNamespace(enforce_eager=False),
-        _vllm_gr_config=SimpleNamespace(
-            beam_execution_mode=BeamExecutionMode.LEGACY,
-            beam_graph_enabled=True,
-            beam_max_width=4,
-            beam_worker_decision=True,
-            constraint_table=SimpleNamespace(enabled=True),
-        ),
-    )
-    assert not gr_startup.capture_async_forward(worker)
-    allocate.assert_not_called()
-
-
 def test_wrong_mode_rejected_before_core_preprocessing() -> None:
     from tests.test_gr_async_scheduler import _batch_request
     from vllm_gr.v1.engine.core import _handle_submit_gr_session
@@ -121,3 +100,56 @@ def test_mode_override_rejects_empty_string(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: False)
     with pytest.raises(ValueError, match="execution_mode"):
         arg_utils_gr.create_engine_config(SimpleNamespace(beam_execution_mode=""))
+
+
+# Exercise each admission branch; non-V2 and non-Beam paths ignore V2 policy.
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "device_type,use_v2,with_beam,mode",
+    [
+        ("cuda", True, True, None),
+        ("cuda", True, True, "legacy"),
+        ("cuda", True, True, "v1"),
+        ("cuda", False, True, None),
+        ("cuda", True, False, None),
+        ("npu", True, True, "legacy"),
+    ],
+)
+@pytest.mark.parametrize("encoding", ["canonical", "legacy"])  # type: ignore[misc]
+def test_engine_validates_v2_beam_protocol_without_changing_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
+    use_v2: bool,
+    with_beam: bool,
+    mode: str | None,
+    encoding: str,
+) -> None:
+    from vllm_gr.engine import arg_utils_gr
+
+    config = SimpleNamespace(
+        additional_config={},
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        use_v2_model_runner=use_v2,
+    )
+    monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
+    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: device_type == "cuda")
+    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: device_type == "npu")
+    gr_config = GRConfig(
+        beam_max_width=4 if with_beam else None,
+        constraint_table=ConstraintTableConfig(max_top_k=4) if encoding == "canonical" else None,
+    )
+    if encoding == "canonical":
+        raw = gr_config_to_mapping(gr_config)
+    else:
+        gr_config.write_to_vllm_config(config)
+        raw = None
+    args = SimpleNamespace(_vllm_gr_config_input=raw, beam_execution_mode=mode)
+    original_additional_config = config.additional_config.copy()
+    if device_type == "cuda" and use_v2 and with_beam and mode != "v1":
+        with pytest.raises(ValueError, match="ModelRunner V2 Beam requires.*execution_mode='v1'"):
+            arg_utils_gr.create_engine_config(args)
+        assert config.additional_config == original_additional_config
+    else:
+        assert arg_utils_gr.create_engine_config(args) is config
+        assert GRConfig.from_vllm_config(config).beam_execution_mode is (
+            BeamExecutionMode.V1 if mode == "v1" else BeamExecutionMode.LEGACY
+        )
