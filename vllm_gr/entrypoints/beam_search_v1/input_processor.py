@@ -18,6 +18,9 @@ from vllm_gr.config.models import (
     ConstraintTableBackendEnum,
 )
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
+from vllm_gr.entrypoints.beam_search_v1.output_processor import (
+    BeamSearchOutputProcessor,
+)
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
@@ -30,7 +33,6 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchParams,
     BeamBatchRequest,
     BeamOutputOptions,
-    validate_beam_batch_request,
 )
 
 
@@ -52,14 +54,16 @@ def _get_token_id(tokenizer: Any, token: str | None, name: str) -> int | None:
 def _create_request_params(
     params: Any,
     tokenizer: Any,
-) -> tuple[SamplingParams, int | None]:
+) -> tuple[SamplingParams, int | None, int | None]:
+    if not params.ignore_eos:
+        raise BeamSearchRequestError("beam_search_v1 requires ignore_eos=True")
     begin_token_id = _get_token_id(tokenizer, getattr(params, "begin_token", None), "begin_token")
     end_token_id = _get_token_id(tokenizer, getattr(params, "end_token", None), "end_token")
     reserved_tokens = int(begin_token_id is not None) + int(end_token_id is not None)
     decode_steps = params.max_tokens - reserved_tokens
     if decode_steps <= 0:
         raise BeamSearchRequestError(
-            "max_tokens must leave at least one Decode step after begin/end tokens"
+            "max_tokens must leave at least one generated token after begin/end tokens"
         )
 
     stop_token_id = end_token_id
@@ -78,7 +82,7 @@ def _create_request_params(
         flat_logprobs=True,
         skip_clone=True,
     )
-    return sampling_params, begin_token_id
+    return sampling_params, begin_token_id, end_token_id
 
 
 def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> None:
@@ -90,46 +94,21 @@ def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> N
         request.prompt_token_ids = [*request.prompt_token_ids, begin_token_id]
 
 
-def _validate_parallel_config(parallel: Any) -> None:
-    if any(
-        getattr(parallel, name, 1) != 1
-        for name in (
-            "tensor_parallel_size",
-            "pipeline_parallel_size",
-            "data_parallel_size",
-            "decode_context_parallel_size",
-            "prefill_context_parallel_size",
-        )
-    ):
-        raise BeamSearchRequestError(
-            "beam_search_v1 currently requires TP/PP/DP/context parallel sizes of 1"
-        )
-
-
 def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
-    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
+    from vllm_gr.v1.engine.beam_search_v1 import (
+        validate_gr_device_config,
+        validate_gr_execution_config,
+        validate_gr_request,
+    )
 
     try:
         validate_gr_execution_config(vllm_config)
+        validate_gr_device_config(vllm_config)
+        validate_gr_request(request)
     except ValueError as error:
         raise BeamSearchRequestError(str(error)) from error
-    validate_beam_batch_request(request)
-    if len(request.items) != 1:
-        raise BeamSearchRequestError("beam_search_v1 currently requires exactly one prompt")
 
     gr_config = GRConfig.from_vllm_config(vllm_config)
-    _validate_parallel_config(vllm_config.parallel_config)
-    if not getattr(vllm_config.scheduler_config, "async_scheduling", True):
-        raise BeamSearchRequestError("beam_search_v1 requires async_scheduling")
-    if getattr(vllm_config, "speculative_config", None) is not None:
-        raise BeamSearchRequestError("beam_search_v1 does not support speculative decoding")
-    model = vllm_config.model_config
-    if getattr(model, "is_encoder_decoder", False) or getattr(model, "is_hybrid", False):
-        raise BeamSearchRequestError("beam_search_v1 requires a decoder with uniform attention KV")
-    if getattr(model, "quantization", None) is not None:
-        raise BeamSearchRequestError("beam_search_v1 does not support quantized models")
-    if request.items[0].request.lora_request is not None:
-        raise BeamSearchRequestError("beam_search_v1 does not support LoRA")
     table = gr_config.constraint_table
     if table is None or not table.enabled or table.backend is not ConstraintTableBackendEnum.CUDA:
         raise BeamSearchRequestError(
@@ -240,7 +219,9 @@ class BeamSearchInputProcessor:
         if call.concurrency_limit is not None and call.concurrency_limit <= 0:
             raise BeamSearchRequestError("concurrency_limit must be positive or None")
         tokenizer = llm.get_tokenizer()
-        sampling_params, begin_token_id = _create_request_params(call.params, tokenizer)
+        sampling_params, begin_token_id, end_token_id = _create_request_params(
+            call.params, tokenizer
+        )
         engine_inputs = llm._preprocess_cmpl(call.prompts)
         lora_requests = llm._lora_request_to_seq(call.lora_request, 1)
         request_id = _generate_request_id()
@@ -255,12 +236,27 @@ class BeamSearchInputProcessor:
         _prepare_prompt(engine_request, begin_token_id)
         self.engine.input_processor.assign_request_id(engine_request)
         session_id = engine_request.request_id
-        return _create_batch_request(
+        batch = _create_batch_request(
             session_id=session_id,
             engine_request=engine_request,
             params=call.params,
             vllm_config=self.engine.vllm_config,
         )
+        prompt = call.prompts[0]
+        self.output_processor = BeamSearchOutputProcessor(
+            batch,
+            tokenizer,
+            begin_token_id,
+            end_token_id,
+            (
+                prompt.get("prompt")
+                if isinstance(prompt, dict)
+                else prompt
+                if isinstance(prompt, str)
+                else None
+            ),
+        )
+        return batch
 
     async def process_online_inputs(
         self, serving: Any, call: OnlineBeamSearchRequest
@@ -268,7 +264,9 @@ class BeamSearchInputProcessor:
         tokenizer = serving.input_processor.tokenizer
         if tokenizer is None:
             raise BeamSearchRequestError("beam_search_v1 requires tokenizer initialization")
-        sampling_params, begin_token_id = _create_request_params(call.params, tokenizer)
+        sampling_params, begin_token_id, end_token_id = _create_request_params(
+            call.params, tokenizer
+        )
         request_id = _generate_request_id(call.request_id)
         engine_request = self.engine.input_processor.process_inputs(
             request_id,
@@ -287,9 +285,24 @@ class BeamSearchInputProcessor:
         # Preserve the caller's original identity for output and abort routing.
         engine_request.external_req_id = call.request_id
         session_id = engine_request.request_id
-        return _create_batch_request(
+        batch = _create_batch_request(
             session_id=session_id,
             engine_request=engine_request,
             params=call.params,
             vllm_config=self.engine.vllm_config,
         )
+        prompt = call.prompt
+        self.output_processor = BeamSearchOutputProcessor(
+            batch,
+            tokenizer,
+            begin_token_id,
+            end_token_id,
+            (
+                prompt.get("prompt")
+                if isinstance(prompt, dict)
+                else prompt
+                if isinstance(prompt, str)
+                else None
+            ),
+        )
+        return batch

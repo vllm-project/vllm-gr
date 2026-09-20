@@ -113,6 +113,7 @@ def get_loader(
     tokenizer: Optional[Any] = None,
     enable_thinking: Optional[bool] = None,
     custom_input_len: Optional[int] = None,
+    truncate_side: str = "head",
 ):
     """
     Get loader instance for a task
@@ -125,6 +126,8 @@ def get_loader(
         tokenizer: Tokenizer instance (optional, required for message-based formats)
         enable_thinking: Enable thinking mode (optional, overrides task config if set)
         custom_input_len: Set the input length to a predefined length
+        truncate_side: Which end of an over-long prompt to keep when trimming to
+            custom_input_len: "head" (default, historic behavior) or "tail"
 
     Returns:
         Loader instance
@@ -145,6 +148,7 @@ def get_loader(
         tokenizer=tokenizer,
         enable_thinking=enable_thinking,
         custom_input_len=custom_input_len,
+        truncate_side=truncate_side,
     )
 
 
@@ -157,6 +161,7 @@ class DataLoaderWrapper:
         data_dir: str,
         enable_thinking: Optional[bool] = None,
         custom_input_len: Optional[int] = None,
+        truncate_side: str = "head",
     ):
         if tokenizer is None:
             raise ValueError(
@@ -169,10 +174,14 @@ class DataLoaderWrapper:
             if custom_input_len <= 0:
                 raise ValueError("custom_input_len must be a positive integer")
 
+        if truncate_side not in ("head", "tail"):
+            raise ValueError(f"truncate_side must be 'head' or 'tail', got {truncate_side!r}")
+
         self.tokenizer = tokenizer
         self.data_dir = data_dir
         self.enable_thinking = enable_thinking
         self.custom_input_len = custom_input_len
+        self.truncate_side = truncate_side
         self._loader_cache = {}
 
     def load_data(
@@ -189,6 +198,7 @@ class DataLoaderWrapper:
                 tokenizer=self.tokenizer,
                 enable_thinking=self.enable_thinking,
                 custom_input_len=self.custom_input_len,
+                truncate_side=self.truncate_side,
             )
 
         loader = self._loader_cache[task_name]
@@ -205,6 +215,7 @@ class BaseLoader(ABC):
         tokenizer: Optional[Any] = None,
         enable_thinking: Optional[bool] = None,
         custom_input_len: Optional[int] = None,
+        truncate_side: str = "head",
     ):
         """Initialize base loader"""
         if custom_input_len is not None:
@@ -212,11 +223,15 @@ class BaseLoader(ABC):
             if custom_input_len <= 0:
                 raise ValueError("custom_input_len must be a positive integer")
 
+        if truncate_side not in ("head", "tail"):
+            raise ValueError(f"truncate_side must be 'head' or 'tail', got {truncate_side!r}")
+
         self.task_config = task_config
         self.data_dir = data_dir
         self.tokenizer = tokenizer
         self.enable_thinking = enable_thinking
         self.custom_input_len = custom_input_len
+        self.truncate_side = truncate_side
         self.task_name = task_config.get("name", "unknown")
 
         # Validate tokenizer is provided for messages-based format
@@ -574,6 +589,12 @@ class BaseLoader(ABC):
             repeat_count = (target_len + current_len - 1) // current_len
             adjusted_token_ids = (prompt_token_ids * repeat_count)[:target_len]
             action = "extended"
+        elif self.truncate_side == "tail":
+            # Keep the last target_len tokens: task prompts whose instruction
+            # and most recent history sit at the end (e.g. interactive) stay
+            # meaningful, while "head" would cut the actual question off.
+            adjusted_token_ids = prompt_token_ids[-target_len:]
+            action = "tail-trimmed"
         else:
             adjusted_token_ids = prompt_token_ids[:target_len]
             action = "trimmed"

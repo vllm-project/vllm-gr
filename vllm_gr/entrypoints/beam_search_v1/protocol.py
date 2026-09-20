@@ -14,7 +14,7 @@ from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest, BeamBatchResult
 
 @dataclass(frozen=True, slots=True)
 class OfflineBeamSearchRequest:
-    """Offline arguments; A2 must reject multiple prompts for now.
+    """Offline arguments for one prompt per submission.
 
     Submit-once means once per B=1 session. Future multi-prompt support needs
     an outer adapter enforcing concurrency_limit and restoring input order.
@@ -68,7 +68,7 @@ class BeamSearchFrontend(Protocol):
     def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
         """Submit once and transfer cleanup ownership with the returned handle.
 
-        A2 must own cleanup by request.batch_id before sending. If submission
+        The frontend owns cleanup by request.batch_id before sending. If submission
         fails after acceptance, roll it back or hand it to reliable cleanup;
         the caller has no session handle until this method returns.
         """
@@ -78,19 +78,14 @@ class BeamSearchFrontend(Protocol):
         """Wait for the terminal EngineCore result."""
         ...
 
-    def build_output(
-        self,
-        call: OfflineBeamSearchRequest,
-        request: BeamBatchRequest,
-        result: BeamBatchResult,
-    ) -> list[Any]:
-        """Convert the result using the exact request accepted by EngineCore."""
+    def build_output(self, call: OfflineBeamSearchRequest, result: BeamBatchResult) -> list[Any]:
+        """Convert the terminal result to frontend BeamSearchOutput objects."""
         ...
 
     def close(self, session: BeamSearchSession) -> None:
         """Idempotently release a terminal session or abort an unfinished one.
 
-        A2 must request EngineCore abort on abnormal exit, not just discard
+        The frontend must request EngineCore abort on abnormal exit, not just discard
         the frontend handle. Device resources stay alive until work is drained.
         Synchronous cleanup retries on the calling thread until acknowledged.
         """
@@ -105,7 +100,7 @@ class AsyncBeamSearchFrontend(Protocol):
     async def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
         """Same ownership contract as sync submit, including cancellation.
 
-        A2 must roll back or retain reliable cleanup ownership if cancelled
+        The frontend must roll back or retain reliable cleanup ownership if cancelled
         after acceptance but before returning, using the preexisting batch ID.
         Cleanup must survive repeated cancellation and fence delayed acceptance.
         Failed rollback remains owned and is retried until abort is acknowledged.
@@ -114,12 +109,7 @@ class AsyncBeamSearchFrontend(Protocol):
 
     async def wait_final(self, session: BeamSearchSession) -> BeamBatchResult: ...
 
-    def build_output(
-        self,
-        call: OnlineBeamSearchRequest,
-        request: BeamBatchRequest,
-        result: BeamBatchResult,
-    ) -> list[Any]: ...
+    def build_output(self, call: OnlineBeamSearchRequest, result: BeamBatchResult) -> list[Any]: ...
 
     async def close(self, session: BeamSearchSession) -> None:
         """Retain abort/release retries through errors and caller cancellation.
@@ -131,7 +121,7 @@ class AsyncBeamSearchFrontend(Protocol):
 
 
 class GRSessionClient(Protocol):
-    """A3 methods installed on the synchronous vLLM ``LLMEngine``."""
+    """Session transport methods installed on the synchronous vLLM ``LLMEngine``."""
 
     def submit_gr_session(self, request: BeamBatchRequest) -> object: ...
 
@@ -147,7 +137,7 @@ class GRSessionClient(Protocol):
 
 
 class AsyncGRSessionClient(Protocol):
-    """A3 methods installed on vLLM ``AsyncLLM`` for online serving."""
+    """Session transport methods installed on vLLM ``AsyncLLM`` for online serving."""
 
     def submit_gr_session(self, request: BeamBatchRequest) -> Awaitable[object]: ...
 

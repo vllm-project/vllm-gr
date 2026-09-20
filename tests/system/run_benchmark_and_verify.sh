@@ -156,7 +156,14 @@ echo "Running OneRec offline benchmark"
 # (a missing override silently disabled the pool and corrupted beam decode).
 beam_width=128
 beam_graph_args=(--beam-max-width "$beam_width")
-output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
+# V1 currently has a CUDA execution adapter only. Gate beam_search_v1 on
+# GPU and keep NPU on llm.beam_search(), with Constraint Tables on both.
+# Set the mode explicitly so an inherited V1 override cannot break NPU runs.
+offline_beam_v1=0
+if [[ "$device" == "gpu" || "$device" == "cuda" ]]; then
+  offline_beam_v1=1
+fi
+output=$(VLLM_GR_BENCHMARK_V1="$offline_beam_v1" python -m benchmarks.open_one_rec.one_rec_acc_test \
   --gr \
   --model "$MODEL_PATH" \
   --dataset-path "$DATASET_PATH" \

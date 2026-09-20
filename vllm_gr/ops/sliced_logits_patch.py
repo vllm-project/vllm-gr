@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Runtime installer for sliced-vocabulary logits projection."""
 
+from typing import Any
+
 from vllm.logger import init_logger
 
 from vllm_gr.ops.sliced_logits import (
@@ -29,16 +31,26 @@ def _restore_vocab_slice_config() -> None:
         set_vocab_slice_config(offset, slice_size)
 
 
+def _is_our_hook(fn: Any) -> bool:
+    """Whether ``fn`` is a hook installed by this module (survives rebinding)."""
+    return getattr(fn, "__qualname__", "").startswith("apply_sliced_logits_patch")
+
+
 def apply_sliced_logits_patch() -> bool:
     """Install sliced-logits hooks and report whether this call applied them."""
     global _SLICED_LOGITS_PATCHED
 
-    if _SLICED_LOGITS_PATCHED:
-        return False
-
     try:
         from vllm.model_executor.layers.logits_processor import LogitsProcessor
         from vllm.v1.sample.sampler import Sampler
+
+        # Trust only the live class, not the module-level flag: platform
+        # plugins (e.g. vllm-ascend op registration) can swap
+        # LogitsProcessor after we patched it, which would silently
+        # disable slicing while the stale flag blocks re-application.
+        if _is_our_hook(LogitsProcessor._get_logits) and _is_our_hook(LogitsProcessor.__init__):
+            _SLICED_LOGITS_PATCHED = True
+            return False
 
         _restore_vocab_slice_config()
 
@@ -80,15 +92,16 @@ def apply_sliced_logits_patch() -> bool:
         LogitsProcessor._get_logits = patched_get_logits
 
         try:
-            original_gather = Sampler.gather_logprobs
+            if not _is_our_hook(Sampler.gather_logprobs):
+                original_gather = Sampler.gather_logprobs
 
-            @staticmethod
-            def patched_gather_logprobs(logprobs, num_logprobs, token_ids, *args, **kwargs):
-                if logprobs is not None and logprobs.numel() > 0:
-                    num_logprobs = min(num_logprobs, logprobs.size(-1))
-                return original_gather(logprobs, num_logprobs, token_ids, *args, **kwargs)
+                @staticmethod
+                def patched_gather_logprobs(logprobs, num_logprobs, token_ids, *args, **kwargs):
+                    if logprobs is not None and logprobs.numel() > 0:
+                        num_logprobs = min(num_logprobs, logprobs.size(-1))
+                    return original_gather(logprobs, num_logprobs, token_ids, *args, **kwargs)
 
-            Sampler.gather_logprobs = patched_gather_logprobs
+                Sampler.gather_logprobs = patched_gather_logprobs
         except Exception as exc:
             logger.debug("vllm_gr: Could not patch Sampler.gather_logprobs: %s", exc)
 

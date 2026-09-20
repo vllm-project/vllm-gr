@@ -236,6 +236,16 @@ def _publish_beam_session_error(self, update) -> None:
     )
 
 
+def is_gr_session_retired(self, session_id: str) -> bool:
+    """Nonblocking lifecycle query, ordered after submission/abort on the IPC socket.
+
+    The socket reader enqueues the native ADD before a later utility request.
+    Only the core thread reads Scheduler state; waiting here would deadlock its
+    native BatchQueue and prevent the retirement frame from being consumed.
+    """
+    return session_id not in getattr(self.scheduler, "_gr_v1_sessions", {})
+
+
 def _handle_submit_gr_session(self, batch_request) -> None:
     """Preprocess once, then let Scheduler register and run the persistent session."""
     if not batch_request.items:
@@ -243,15 +253,21 @@ def _handle_submit_gr_session(self, batch_request) -> None:
         return
     engine_request = batch_request.items[0].request
     try:
-        from vllm_gr.config import BeamExecutionMode
-        from vllm_gr.config.execution import require_beam_execution_mode
+        from vllm_gr.v1.engine.beam_search_v1 import (
+            GRRequestAdmission,
+            validate_gr_device_config,
+            validate_gr_execution_config,
+            validate_gr_request,
+        )
 
-        require_beam_execution_mode(self.vllm_config, BeamExecutionMode.V1)
-        if len(batch_request.items) != 1:
-            raise ValueError("Beam Search V1 currently requires batch size B=1")
-        if not self.vllm_config.scheduler_config.async_scheduling:
-            raise RuntimeError("beam_search_v1 requires vLLM async_scheduling")
-        if self.batch_queue is None or self.batch_queue_size < 2:
+        runtime = getattr(self, "_gr_admission_runtime", None)
+        if runtime is None:
+            # Direct adapters without EngineCore initialization retain the
+            # full boundary check; initialized V1 engines use the startup contract.
+            validate_gr_execution_config(self.vllm_config)
+            validate_gr_device_config(self.vllm_config)
+        validate_gr_request(batch_request)
+        if runtime is None and (self.batch_queue is None or self.batch_queue_size < 2):
             raise RuntimeError("beam_search_v1 requires a non-blocking EngineCore batch queue")
         preprocessed = self.preprocess_add_request(engine_request)
     except Exception:
@@ -264,9 +280,25 @@ def _handle_submit_gr_session(self, batch_request) -> None:
     # GR owns stop-token/EOS handling. The native token is only a placeholder
     # for an asynchronously maintained beam state and must not terminate the
     # Request before GR has produced its authoritative terminal result.
-    native_request.sampling_params.ignore_eos = True
+    from copy import copy
+
+    native_request.sampling_params = copy(native_request.sampling_params)
     native_request.sampling_params.stop_token_ids = []
     native_request.gr_batch_request = batch_request
+    if (
+        runtime is not None
+        and type(batch_request.items) is tuple
+        and type(batch_request.beam_params.stop_token_ids) is tuple
+    ):
+        # Direct Python construction can put mutable containers in a frozen
+        # msgspec Struct. Such submissions keep full Scheduler validation.
+        native_request._gr_request_admission = GRRequestAdmission(
+            runtime,
+            batch_request,
+            engine_request.sampling_params,
+            engine_request.prompt_token_ids,
+            len(engine_request.prompt_token_ids),
+        )
     # Multiprocess admission is handled when the core thread consumes ADD.
     # In-process callers receive the original admission exception directly.
     _add_preprocessed_request(self, preprocessed)

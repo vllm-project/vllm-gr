@@ -48,6 +48,12 @@ def make_patched_engine_core_init(original_init):
 
         _ensure_beam_state(self)
         original_init(self, *args, **kwargs)
+        # The base constructor has created Scheduler and the batch queue;
+        # EngineCoreProc has not started its input thread yet.
+        if hasattr(self, "vllm_config"):
+            from vllm_gr.v1.engine.beam_search_v1 import initialize_gr_admission
+
+            initialize_gr_admission(self)
 
     setattr(patched_init, _BEAM_STATE_INIT_MARKER, True)
 
@@ -170,6 +176,7 @@ def apply_engine_core_request_patches() -> None:
         _handle_beam_session_template,
         _handle_submit_gr_session,
         _handle_submit_session,
+        is_gr_session_retired,
         process_input_sockets,
     )
 
@@ -187,6 +194,7 @@ def apply_engine_core_request_patches() -> None:
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCore._handle_beam_session_template = _handle_beam_session_template
     EngineCore._handle_submit_session = _handle_submit_session
+    EngineCore.is_gr_session_retired = is_gr_session_retired
     EngineCore._handle_submit_gr_session = _handle_submit_gr_session
     EngineCore._apply_beam_step = _apply_beam_step
     EngineCore._beam_self_advance = _beam_self_advance
@@ -228,6 +236,35 @@ def apply_engine_core_request_patches() -> None:
     logger.debug("Engine-core request patches applied.")
 
 
+def apply_attention_backend_registration() -> None:
+    """Register the Beam attention backend so Backend.CUSTOM resolves.
+
+    A freshly spawned EngineCore child builds the model (and resolves the
+    attention backend) through the standard vLLM registry path before any
+    ModelRunner hook import chain runs. Importing this module executes its
+    ``@register_backend(AttentionBackendEnum.CUSTOM)`` decorator, which is
+    otherwise only applied in the frontend process plan. Without it, spawn
+    mode fails with "Backend CUSTOM must be registered before use".
+
+    The registration is also written explicitly instead of relying on that
+    import side effect: importing vllm-ascend's worker chain rebinds
+    Backend.CUSTOM to vllm-ascend's own backend, and a cached module import
+    does not re-execute the decorator, so re-calling this function must be
+    able to restore the Beam registration.
+    """
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
+
+    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+
+    register_backend(
+        AttentionBackendEnum.CUSTOM,
+        f"{BeamAttentionBackend.__module__}.{BeamAttentionBackend.__qualname__}",
+    )
+
+
 def apply_engine_core_child_patches() -> None:
     """Compatibility helper that installs all EngineCore-side capabilities.
 
@@ -237,10 +274,15 @@ def apply_engine_core_child_patches() -> None:
     """
     from vllm_gr.v1.worker.model_runner_patch import apply_worker_patches
 
+    apply_attention_backend_registration()
     apply_engine_core_request_patches()
     apply_kv_hash_memo_patch()
     apply_scheduler_patch()
     apply_worker_patches()
+    # apply_worker_patches imports vllm-ascend, which rebinds
+    # Backend.CUSTOM to its own backend; restore the Beam registration as
+    # the final state of this installer.
+    apply_attention_backend_registration()
 
 
 # Re-entry guard to detect recursive calls
@@ -477,7 +519,8 @@ def apply_scheduler_patch():
                 # All expected rejections precede native queue insertion. GR
                 # registration follows native ADD so a failed insertion cannot
                 # leave a ghost session/owner or consume a generation number.
-                session = _prepare_gr_session(self, batch_request)
+                admission = request.__dict__.pop("_gr_request_admission", None)
+                session = _prepare_gr_session(self, batch_request, admission=admission)
                 result = original_add_request(self, request)
                 _register_gr_session(self, session)
                 return result
@@ -658,7 +701,7 @@ def _native_request_terminated(scheduler, result, request_id) -> bool:
 
 
 def _reconcile_native_gr_termination(scheduler, result, session) -> None:
-    from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
+    from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, GRSessionStatus
     from vllm_gr.v1.engine.gr_async_scheduler import _make_failure_result
 
     if session.status not in (GRSessionStatus.WAITING, GRSessionStatus.RUNNING):
@@ -666,6 +709,7 @@ def _reconcile_native_gr_termination(scheduler, result, session) -> None:
     if not _native_request_terminated(scheduler, result, session.session_id):
         return
 
+    session.resource_status = GRResourceStatus.DRAINING
     session.status = GRSessionStatus.FINISHING
     session.terminal_result_pending = True
     if session._pending_terminal_result is None:
@@ -761,9 +805,11 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
     request_status = (
         RequestStatus.FINISHED_ERROR
         if terminal_result.failure is not None
-        else RequestStatus.FINISHED_STOPPED
+        else RequestStatus.FINISHED_LENGTH_CAPPED
     )
-    finish_reason = FinishReason.ERROR if terminal_result.failure is not None else FinishReason.STOP
+    finish_reason = (
+        FinishReason.ERROR if terminal_result.failure is not None else FinishReason.LENGTH
+    )
 
     _finish_native_gr_request(scheduler, native_request, request_id, request_status)
 
@@ -829,12 +875,21 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
             consume_gr_retirement,
         )
 
-        consume_gr_retirement(self, scheduler_output, model_runner_output)
+        retired_session = consume_gr_retirement(self, scheduler_output, model_runner_output)
         gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {})
         sessions = getattr(self, "_gr_v1_sessions", {})
         dispatched_sessions = {
             session_id: sessions[session_id] for session_id in gr_stages if session_id in sessions
         }
+        # Filter retired owners/dispatches before native token accounting too.
+        # B=1 forbids mixing ordinary requests with a GR dispatch.
+        if gr_stages and not any(
+            m.owner_generation == sessions[sid].owner_generation
+            and m.dispatch_id in sessions[sid]._in_flight_dispatches
+            for sid, m in gr_stages.items()
+            if sid in sessions
+        ):
+            return {}
         native_update_ids = getattr(self, _GR_NATIVE_UPDATE_IDS_ATTR, None)
         if native_update_ids is None:
             native_update_ids = set()
@@ -853,6 +908,15 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
             self.update_gr_from_output(session, scheduler_output, model_runner_output)
             _reconcile_native_gr_termination(self, result, session)
             updated_sessions.append(session)
+
+        if retired_session is not None and retired_session.terminal_result_pending:
+            updated_sessions.append(retired_session)
+        # Native tokens are accounting placeholders, including on terminal
+        # frames. Only the BeamBatchResult may expose generated tokens.
+        for outputs in result.values():
+            for output in outputs.outputs:
+                if output.request_id in dispatched_sessions:
+                    output.new_token_ids = []
 
         # A terminal result may arrive before a look-ahead successor. Buffer it
         # in GRSessionState and publish only after every physical dispatch has

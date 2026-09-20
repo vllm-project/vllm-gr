@@ -1,8 +1,9 @@
 # Asynchronous scheduling
 
-Asynchronous scheduling runs Beam Search V1 on the native vLLM 0.22.1 `execute_model → sample_tokens`
-interface. The next dispatch can prepare inputs and submit GPU work after the
-preceding sampling submission, before EngineCore consumes its receipt.
+Beam Search V1 uses vLLM 0.22.1's native `execute_model -> sample_tokens`,
+BatchQueue and Future consumption. Both `GRLLM.beam_search_v1()` and the
+online `OpenAIServing.beam_search_v1()` return final Beam results after Worker
+retirement. Legacy `beam_search()` remains available in legacy execution mode.
 
 For a runnable OneRec-1.7B setup before reading this execution contract, see
 [the OneRec-1.7B V1 asynchronous scheduling quickstart](onerec_v1_async_quickstart.md).
@@ -10,116 +11,166 @@ For a runnable OneRec-1.7B setup before reading this execution contract, see
 ## Supported execution contract
 
 - GPU ModelRunner V1, FP16/BF16, uniform text decoder with Beam Attention and a
-  canonical CUDA constraint table; the existing model, KV and head-size checks apply.
-- B=1, one execution owner, two physical dispatch slots including initial Prefill chunks.
-- W is fixed at startup, 1–256. Effective N is 1, 2 or 3 and includes the first
-  token sampled from Prefill. TP/PP/DP/DCP/PCP are all 1.
-- Native async scheduling and an Executor batch queue of at least two entries.
-  No ordinary/legacy Beam request mixing while an asynchronous scheduling session owns resources.
-- No speculative decoding, LoRA, KV/EC transfer, quantization, sliding-window
-  attention, multimodal inputs, hybrid models or microbatching.
+  canonical CUDA Constraint Table. Existing model, KV and head-size limits apply.
+- B=1, fixed membership, synchronous Beam progression, TP/PP/DP/DCP/PCP=1.
+- Fixed startup width W=1..256. Effective generation budget N=1/2/3 includes the
+  first token from Prefill. Optional begin/end tokens reserve their budget once
+  in the frontend; begin is appended to the prompt, end to the final output.
+- `ignore_eos=True` is mandatory. Legal EOS is an ordinary generated token.
+  Successful completion has finish reason `length`; output conversion never
+  trims generated EOS or changes cumulative logprobs.
+- V1 execution mode, native `async_scheduling=True`, and at least two Executor
+  batch queue entries. There is one execution owner and at most two physical
+  dispatches awaiting receipts.
+- `enable_chunked_prefill=False`. Prompt-only prefix-cache hits and misses are
+  supported. Full logical KV capacity is reserved before execution.
+- No ordinary/legacy request mixing, speculative decoding, LoRA, KV/EC transfer,
+  quantization, sliding-window attention, multimodal models, hybrid models or
+  microbatching. NPU execution requires the adapter tracked by #399.
 
-Public output-consumer readiness checks remain in place. This contract covers
-native Scheduler and Worker execution; public output delivery is separate.
+Invalid request semantics are rejected before session allocation. Device
+capability and startup capture checks stay in the GPU implementation. No
+additional asynchronous scheduler or public async Beam switch is introduced.
 
-## Existing baseline and new behavior
+EngineCore validates static execution constraints during initialization and
+shares that startup contract with Scheduler. Each submission is validated by
+Core once; Scheduler consumes a request-bound admission result and rechecks the
+mutable native fields before ADD. Direct submissions with mutable contract
+containers retain full Scheduler validation. Duplicate-request, request-mixing
+and KV-capacity checks always remain at admission.
 
-The base is upstream `6bca38c` (the same tree as `632f7d2`): native
-BatchQueue/Executor/Futures, two-dispatch lookahead,
-device Beam state, individual dispatch KV leases, Beam update/KV reorder kernels
-and an independent control D2H stream already existed.
+## State ownership
 
-Asynchronous scheduling adds:
+One native Request is submitted with one ADD and remains through Prefill and
+Decode. Its computed-token count, output placeholders and generation budget
+control scheduling. GR freezes stage metadata after native schedule bookkeeping;
+for an emitted stage, `stage_index = num_computed_tokens - num_prompt_tokens`.
+Prefill is stage 0 and Decode stages have `decode_step = stage_index - 1`.
+Metadata does not require the previous receipt or a generated token on the CPU.
 
-1. **Admission before native selection.** A view of native waiting queues exposes
-   only the FIFO execution owner, retaining the original Request objects and queue
-   ordering. A zero native token budget blocks both Decode and Prefill chunks when
-   either physical slot is unavailable. Admission reserves P+N-1 native KV positions
-   through `allocate_slots(num_lookahead_tokens=...)`. Temporary shortage applies
-   backpressure; impossible capacity is rejected. Recompute after generation is rejected.
-2. **Complete per-step CPU preparation.** `GRInputBuffers.prepare_cpu` rebuilds
-   positions, offsets, suffix lengths, prefix blocks and logits rows from Host
-   metadata and bindings. No generated device state is read on the CPU. The
-   metadata builder's asynchronous entrypoints bypass its geometry, layout,
-   view, copy and schedule caches. Missing CPU mirrors are errors.
-3. **Ordered device binding.** Ordinary PyTorch operations select actual device
-   tokens and constraint prefixes, validate generated count and planned step, and
-   mask terminated successors. Active step mismatches produce device error 6.
-   Two pinned staging slots each have an H2D completion event. H2D, state binding
-   and Forward run on the compute stream; control snapshots use separate slots
-   and D2H events. The first Decode retains the native input-preparation Host fence.
-4. **Startup graph capture.** A dedicated fixed-W Forward graph is captured
-   at startup; LM head and Beam postprocessing run outside it. Device input, mask,
-   metadata and KV addresses stay fixed while their contents change each step and
-   request. Metadata descriptions are fresh each step.
-   Prefix bounds are block-aligned model capacity; suffix bounds are pool capacity.
-   A requested but unavailable graph is an error; requests never capture graphs.
-   Asynchronous Prefill reuses the existing project Prefill runner, including padded
-   graph replay: 900 scheduled tokens can use a captured 1024-token bucket. Bucket
-   selection uses the scheduled token count after prefix-cache hits and chunking.
-   Replay refreshes static buffers, preserves real Attention lengths and masks padded
-   KV writes. Missing startup graphs, unsupported live inputs, missing metadata or
-   slot mapping, and exceeded captured KV-length or buffer bounds still fall back
-   to the native Forward path; requests never create or capture a new runner.
-   Padding alone does not trigger eager fallback. It can change BF16 results and
-   Beam candidate ordering; the historical exact-bucket results do not establish
-   precision for the padded path, whose matching validation remains outstanding.
-5. **Independent retirement proof.** Result completion and resource completion
-   are separate. Resources transition `WAITING → RUNNING → DRAINING → RETIRING →
-   CLOSED`. A zero-token SchedulerOutput carries session, owner generation and
-   retirement ID. Worker drains control consumers and GPU work, clears actual
-   session/workspace ownership, then returns a normal ModelRunnerOutput proof.
-   Only the matching proof allows the next owner. Cancelled waiting requests that
-   never allocated Worker resources close immediately.
-6. **Native queue progress and errors.** Retirement counts as pending work even
-   for the last request. Submissions, receipt consumption, retirement and admission
-   increment Host progress and avoid the fixed idle sleep. Each active dispatch
-   requires a matching Worker receipt; absent receipts cannot confirm tokens.
-   Async conversion failures
-   become request errors; fatal Worker/CUDA failures reach native Executor failure
-   handling, including exceptions raised in Multiproc's output consumer thread.
+GR keeps session status, owner generation, dispatch identities, in-flight records
+and individual dispatch KV leases. These protect resource ownership rather than
+maintaining a second token budget. Diagnostic issued/completed counts derive
+from those records. Duplicate, stale and mismatched-generation receipts cannot
+advance native progress or release a lease twice.
+
+Admission exposes the FIFO owner through the native waiting queues. Native KV
+reservation covers P+N-1 computed positions. Prefix caching only publishes valid
+prompt KV; speculative logical positions do not become reusable prefix entries.
+Resource shortage applies backpressure. Impossible capacity and recomputation
+after generation are rejected.
+
+## Execution and terminal delivery
+
+`GRStageMetadata`, `GRWorkerResult`, `BeamBatchResult` and
+`GRRetireMetadata`/`GRRetireResult` describe dispatch, receipt, terminal output
+and retirement. They contain no CUDA stream or event types. Worker copies the
+mutable native execution view before updating it, including when EngineCore and
+Worker share a process. The Scheduler sees one logical Decode token; the device
+adapter executes W rows.
+
+CPU preparation builds complete layout and metadata from host geometry. The
+first Decode performs that work before the native Prefill host-staging fence.
+Two pinned staging slots have individual reuse fences. Upload, generated-token
+binding and Forward remain ordered on the compute stream. Fixed graph addresses
+and full suffix-KV reorder semantics are retained.
+
+The Decode graph contains Forward only; the LM head and Beam decisions remain
+outside it. Prefill reuses the existing startup runner and padded replay, with
+the existing eager fallbacks. Bucket selection uses scheduled tokens after a
+prefix-cache hit. Padding preserves real attention lengths and masks padded KV
+writes; it can change BF16 rounding and Beam ordering. Requests never capture
+graphs. See the validation document for measured replay/fallback and precision.
+
+The last effective stage produces completed records, including N=1 directly
+from Prefill. The GPU uses `GPUBeamFinalOutput` to rank completed records,
+walk parent history and pack the returned paths into independent, reusable
+storage. The terminal receipt header and sequences/scores share one pinned-host
+transfer. At W=128/N=3 this payload is 5,136 bytes. The output consumer waits
+for its event; the model submission thread performs no device-wide wait.
+
+V1 returns final token sequences, cumulative scores and parent chains through
+the upstream compact transport contract. Per-step candidate logprobs are not
+part of that contract: offline `logprobs` is empty and online `logprobs` is
+`None`. Offline token/text materialization reuses the upstream lazy converter,
+including its tokenizer-boundary checks. Fixed-length survivors need no
+length-penalty ranking kernel because their denominators are identical.
+
+Typed terminal conversion also checks sequence values for effective budgets
+N=1/2/3. Public conversion reuses those checks only for the same immutable
+output and budget; replaced values and direct construction retain full checks.
+The validation metadata is local to the frontend and never adds a wire field.
+Protocol/request identity, success/failure status and candidate counts are
+checked before any output is returned. Offline construction shares a request
+template while allocating separate mutable fields for each Beam.
+
+Terminal output and resource completion are separate facts. Public delivery
+waits for both:
 
 ```mermaid
 sequenceDiagram
     participant E as EngineCore
     participant W as Worker CPU
     participant G as GPU compute
-    participant C as Receipt consumer
-    E->>W: execute_model(k)
-    W->>G: Input / Forward(k)
-    E->>W: sample_tokens(k)
-    W->>G: Beam update / control snapshot(k)
-    E->>W: execute_model(k+1)
-    W->>W: CPU layout and metadata build
-    W->>G: Ordered upload / bind / Forward(k+1)
-    G-->>C: Independent control copy(k)
-    C-->>E: Retire dispatch(k)
-    E->>W: Zero-token retirement frame after drain
-    W-->>E: Release proof after actual cleanup
-    E->>W: Admit next session
+    participant C as Output consumer
+    E->>W: Prefill execute/sample
+    W->>G: Prefill Forward and Beam selection
+    E->>W: D0 execute/sample before Prefill receipt
+    W->>W: Prepare CPU inputs, then host-staging fence
+    W->>G: Ordered binding and Decode Forward
+    G-->>C: Receipt copies and final independent snapshot
+    alt Final consumer proves device and consumer drain
+        C->>W: Release terminal execution resources
+        C-->>E: Matched terminal receipt and release proof
+    else Explicit retirement needed
+        C-->>E: Matched receipts and pending terminal result
+        E->>W: Zero-token retirement frame after dispatch drain
+        W-->>E: Matching release proof after device and consumer drain
+    end
+    E-->>E: Deliver once and release owner
 ```
 
-### First Decode after Prefill
+The final output consumer can prove release in its terminal receipt, avoiding
+an additional retirement round trip. Otherwise, resources drain through
+`DRAINING -> RETIRING -> CLOSED`; retirement remains pending work even after
+the native Request has been removed. The zero-token frame follows the native
+queue and output-consumption mechanism. Both paths require matching owner and
+generation identities before resource reuse and final frontend delivery.
+Native placeholder tokens never enter public results.
 
-The final Prefill chunk advances the issued-stage count when it is scheduled;
-its real output need not have reached the CPU. Once Worker has submitted both
-Prefill execution and sampling, EngineCore can submit D1 into the second slot.
-Worker begins D1's CPU layout preparation inside `execute_model(D1)`. It then
-checks the native pinned-input fence, updates native request state, uploads the
-layout, builds attention metadata, and submits device binding and Forward.
-The fence protects Host buffer reuse; it does not wait for Prefill Forward.
-Actual token/Beam-state reads remain ordered after Prefill sampling on the GPU.
+Cancellation before Worker admission allocates no Worker resources. Running
+cancellation stops new scheduling and drains submitted work. The frontend sends
+internal IDs even if a prior abort removed routing, and uses ordered nonblocking
+native utility queries to await retirement. Submission rollback fences delayed
+acceptance; retained cleanup tasks survive caller cancellation and retry
+recoverable transport failures. Fatal EngineCore errors propagate through the
+native error path rather than retrying forever.
 
-Prefill Graph reduces the time spent submitting model operations on the Host.
-That leaves a larger GPU execution window for D1 preparation in the same Worker
-thread. Graph replay and asynchronous queue progress are both needed to explain
-the observed benefit; graph replay alone does not move CPU preparation earlier
-when the benchmark deliberately waits for each receipt. Short eager fallbacks
-can still finish before the next dispatch's CPU preparation starts.
+## Device adapter for #399
 
-## Validation
+The implemented routing boundary is `v1/worker/gr_execution.py`; GPU ownership,
+staging, streams, snapshots and graph details stay in `gpu_beam_stage_runner.py` and `beam_final_output.py`.
+An NPU adapter must provide the same concrete operations used by the GPU path:
 
-See [the validation summary](async_scheduling_validation.md) for supported
-inputs, precision results and regression commands. Experimental benchmarks,
-trace analysis and diagnostic instrumentation are maintained outside the
-production change.
+1. Validate device capability and capacity at startup; admit frozen dispatch
+   metadata with `validate_gr_dispatch` before allocating an owner.
+2. Execute the detached native input view using public Prefill/Decode metadata;
+   keep logical token counts distinct from the W-row device view.
+3. Submit sampling and return an asynchronous native output wrapper whose
+   consumer yields matched `GRWorkerResult` receipts and a final
+   `BeamBatchResult` containing final sequences, cumulative scores and parent chains.
+4. Handle cancellation and consume `GRRetireMetadata`; prove actual device and
+   output-consumer drain with `GRRetireResult` before slot/workspace reuse.
+
+NPU supplies its own ordering primitives and graph implementation. It reuses the
+Scheduler, native Request, queues, terminal conversion and lifecycle contracts;
+no unused abstract runtime framework is required.
+
+## Examples
+
+See [reproducible public calls](beam_search_v1_examples.md) and the
+[current validation and ABBA record](benchmarks/beam_search_v1_398_validation.md).
+The current performance timer covers only the `beam_search_v1()` call and return.
+Reading lazy offline tokens/text happens outside that timer. Historical Worker
+retirement timings and measurements including lazy materialization use different
+boundaries and must be compared separately.

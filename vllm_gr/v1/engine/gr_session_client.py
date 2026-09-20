@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +16,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchRequest,
     BeamBatchResult,
 )
+from vllm_gr.v1.engine.gr_result_validation import decode_terminal_result
 
 
 @dataclass(slots=True)
@@ -32,9 +35,18 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
     result = params.get("gr_batch_result")
     # kv_transfer_params is an untyped IPC field, so array-like msgspec
     # structs arrive as plain lists after a multiprocess round trip.
-    if isinstance(result, (list, tuple)):
-        result = msgspec.convert(result, type=BeamBatchResult)
     if isinstance(result, BeamBatchResult):
+        # Struct construction does not validate fields, and convert() trusts
+        # existing structs. Rebuild the four wire fields to discard local
+        # validation metadata, then use the same typed boundary as IPC values.
+        result = msgspec.to_builtins(
+            BeamBatchResult(result.protocol_version, result.batch_id, result.output, result.failure)
+        )
+    if isinstance(result, (list, tuple)):
+        result = decode_terminal_result(result, request.beam_params.max_tokens)
+    if isinstance(result, BeamBatchResult):
+        # Fence transport identity here. Public conversion checks the request's
+        # result envelope and reuses any sequence checks done during decoding.
         if result.batch_id != request.batch_id:
             raise ValueError("terminal Beam result belongs to a different session")
         return result
@@ -44,7 +56,7 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
         output=None,
         failure=BeamBatchFailure(
             code="worker_result_unavailable",
-            message="A4/A5 did not attach gr_batch_result to the terminal output",
+            message="EngineCore did not attach gr_batch_result to the terminal output",
             item_index=None,
         ),
     )
@@ -71,11 +83,21 @@ def wait_gr_session_sync(
 
 
 def abort_gr_session_sync(engine: Any, session_id: str) -> None:
-    engine.abort_request([session_id], internal=True)
+    # Always send the internal ID: a previous abort may already have removed
+    # frontend routing while its transport acknowledgement was lost.
+    engine.output_processor.abort_requests([session_id], internal=True)
+    engine.engine_core.abort_requests([session_id])
+    core = engine.engine_core
+    if hasattr(core, "engine_core"):
+        while not core.engine_core.is_gr_session_retired(session_id):
+            engine.step()
+    else:
+        while not core.call_utility("is_gr_session_retired", session_id):
+            time.sleep(0.001)
 
 
 def release_gr_session_sync(engine: Any, session_id: str) -> None:
-    # EngineCore releases the scheduler state after all queued stages drain.
+    # Terminal delivery is fenced by retirement in EngineCore.
     return None
 
 
@@ -102,11 +124,14 @@ async def wait_gr_session_async(
 
 
 async def abort_gr_session_async(engine: Any, session_id: str) -> None:
-    await engine.abort(session_id, internal=True)
+    engine.output_processor.abort_requests([session_id], internal=True)
+    await engine.engine_core.abort_requests_async([session_id])
+    while not await engine.engine_core.call_utility_async("is_gr_session_retired", session_id):
+        await asyncio.sleep(0.001)
 
 
 async def release_gr_session_async(engine: Any, session_id: str) -> None:
-    # EngineCore releases the scheduler state after all queued stages drain.
+    # Terminal delivery is fenced by retirement in EngineCore.
     return None
 
 

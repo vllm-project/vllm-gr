@@ -202,7 +202,9 @@ class GPUBeamFinalOutput:
         if control is not None:
             self.device[:_CONTROL_WORDS].copy_(control)
             self._control_embedded = True
-        if self.length_penalty != 0:
+        # Ignored EOS completes every survivor at the same effective budget;
+        # the common length penalty cannot change their ranking.
+        if self.length_penalty != 0 and not state.ignore_stop_tokens_config:
             beam_state_ops._rank_final_beams_kernel[(triton.cdiv(state.completed_capacity, 256),)](
                 ranking_scores,
                 state.completed_lengths[row],

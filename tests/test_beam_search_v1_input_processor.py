@@ -104,7 +104,7 @@ def test_online_request_preserves_native_external_id_routing(
                 OnlineBeamSearchRequest(
                     prompt=[1, 2],
                     request_id=request_id,
-                    params=BeamSearchParams(beam_width=2, max_tokens=3),
+                    params=BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
                 ),
             )
             for request_id in (external_id, external_id, "unrelated-request")
@@ -135,7 +135,7 @@ def test_beam_metadata_uses_native_normalized_temperature(temperature: float) ->
     serving = SimpleNamespace(
         input_processor=SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
     )
-    params = BeamSearchParams(beam_width=2, max_tokens=3, temperature=temperature)
+    params = BeamSearchParams(beam_width=2, max_tokens=3, temperature=temperature, ignore_eos=True)
     request = asyncio.run(
         BeamSearchInputProcessor(engine).process_online_inputs(
             serving, OnlineBeamSearchRequest([1, 2], "request-1", params)
@@ -192,45 +192,30 @@ def test_request_requires_enabled_canonical_cuda_constraint_table(
         _prepare_request(
             engine,
             [1, 2],
-            BeamSearchParams(beam_width=2, max_tokens=3),
+            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
             online=True,
         )
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
-@pytest.mark.parametrize(  # type: ignore[misc]
-    "model_eos,end_token,ignore_eos,expected_stops",
-    [
-        ([2, 99], None, False, {2, 99}),
-        ([2, 99], "<end>", False, {2, 8, 99}),
-        ([2, 99], None, True, set()),
-        ([2, 99], "<end>", True, set()),
-        (99, "<end>", False, {2, 8, 99}),
-    ],
-)
+@pytest.mark.parametrize("end_token", [None, "<end>"])  # type: ignore[misc]
 def test_beam_metadata_uses_native_effective_stop_tokens(
     online: bool,
-    model_eos: int | list[int],
     end_token: str | None,
-    ignore_eos: bool,
-    expected_stops: set[int],
 ) -> None:
     engine = _make_engine()
-    engine.input_processor.generation_config_fields = {"eos_token_id": model_eos}
+    engine.input_processor.generation_config_fields = {"eos_token_id": [2, 99]}
     request = _prepare_request(
         engine,
         [10, 11],
-        BeamSearchParams(beam_width=2, max_tokens=3, end_token=end_token, ignore_eos=ignore_eos),
+        BeamSearchParams(beam_width=2, max_tokens=3, end_token=end_token, ignore_eos=True),
         online=online,
     )
     native_params = request.items[0].request.sampling_params
     assert native_params is not None
-    effective_stops = set(native_params.stop_token_ids or ())
-    if native_params.eos_token_id is not None:
-        effective_stops.add(native_params.eos_token_id)
-    assert effective_stops == expected_stops
-    assert set(request.beam_params.stop_token_ids) == expected_stops
-    assert request.beam_params.ignore_stop_tokens == native_params.ignore_eos == ignore_eos
+    assert not native_params.stop_token_ids and native_params.eos_token_id is None
+    assert not request.beam_params.stop_token_ids
+    assert request.beam_params.ignore_stop_tokens and native_params.ignore_eos
 
 
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
@@ -259,7 +244,7 @@ def test_embedding_inputs_are_rejected_before_prompt_mutation(
         _prepare_request(
             engine,
             prompt,
-            BeamSearchParams(beam_width=2, max_tokens=3, begin_token=begin_token),
+            BeamSearchParams(beam_width=2, max_tokens=3, begin_token=begin_token, ignore_eos=True),
             online=online,
         )
     assert len(processed_requests) == 1
@@ -279,5 +264,32 @@ def test_online_entrypoint_rejects_dp_before_submission(local_only: bool, local_
         )
     )
     with pytest.raises(BeamSearchRequestError, match="TP/PP/DP/DCP/PCP=1"):
-        _prepare_request(engine, [1, 2], BeamSearchParams(beam_width=2, max_tokens=3), online=True)
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+            online=True,
+        )
+    engine.submit_gr_session.assert_not_called()
+
+
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("invalid", ["chunked_prefill", "device", "eos"])  # type: ignore[misc]
+def test_rejected_runtime_never_submits(online: bool, invalid: str) -> None:
+    engine = _make_engine()
+    if invalid == "chunked_prefill":
+        engine.vllm_config.scheduler_config.enable_chunked_prefill = True
+        message = "enable_chunked_prefill=False"
+    elif invalid == "device":
+        engine.vllm_config.device_config = SimpleNamespace(device="npu")
+        message = "no execution adapter"
+    else:
+        message = "ignore_eos=True"
+    with pytest.raises(BeamSearchRequestError, match=message):
+        _prepare_request(
+            engine,
+            [10, 11],
+            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=invalid != "eos"),
+            online=online,
+        )
     engine.submit_gr_session.assert_not_called()

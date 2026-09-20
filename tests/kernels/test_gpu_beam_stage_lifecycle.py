@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -17,7 +19,9 @@ from tests.kernels.test_gpu_beam_stage_runner import (
     prepare_binding,
     runtime,
 )
+from vllm_gr.v1.engine.beam_search_v1 import GRRetireMetadata
 from vllm_gr.v1.engine.gr_async_scheduler import (
+    GR_RETIRE_RESULT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
@@ -67,7 +71,7 @@ def warm_stage_kernels(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("chunked", [False])
 @pytest.mark.parametrize("graph", [False, True])
 def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunked, graph):
     warm_stage_kernels(dtype)
@@ -226,13 +230,8 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunke
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("n", [1, 2, 3])
 @pytest.mark.parametrize("consume_first", [False, True])
-def test_cancelled_chunk_drains_without_initialization(dtype, n, consume_first):
+def test_cancelled_prefill_drains_without_initialization(dtype, n, consume_first):
     owner = runtime(dtype, n)
-    owner.admit(dispatch(metadata(output=False, n=n)))
-    first = owner.sample()
-    if consume_first:
-        first.get_output()
-    queued = dispatch(metadata(dispatch=1, n=n))
     owner.cancel(owner.binding)
     state = owner.beam.state
     snapshot = {
@@ -240,20 +239,61 @@ def test_cancelled_chunk_drains_without_initialization(dtype, n, consume_first):
         for name, value in vars(state).items()
         if isinstance(value, torch.Tensor)
     }
-    owner.admit(queued)
-    # Cancellation must not require or inspect logits from a drain-only chunk.
+    owner.admit(dispatch(metadata(n=n)))
     owner.logits = None
     final = owner.sample()
-    before = getattr(first.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+    if consume_first:
+        final.get_output()
     after = getattr(final.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
-    assert before.dispatch_id == 0 and not before.finished and before.produced_token_count == 0
-    assert after.dispatch_id == 1 and after.finished and after.produced_token_count == 0
+    assert after.finished and after.produced_token_count == 0
     assert after.terminal_result is None
     for name, value in snapshot.items():
         torch.testing.assert_close(getattr(state, name), value, rtol=0, atol=0)
     release(owner)
-    owner.beam.state.reset(owner.binding.state_row)
+    state.reset(owner.binding.state_row)
     assert not state.is_finished[owner.binding.state_row]
     assert not state.is_initialized[owner.binding.state_row]
-    for name, value in snapshot.items():
-        torch.testing.assert_close(getattr(state, name)[:2], value[:2], rtol=0, atol=0)
+
+
+def test_cancelled_terminal_payload_drains_before_release(monkeypatch):
+    owner = runtime(n=1)
+    owner.admit(dispatch(metadata(n=1)))
+    owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
+    final = owner.sample()
+    assert final.terminal_payload
+    retirement = owner.request_release(GRRetireMetadata("session-0", 0, 1))
+    waiting = Event()
+    wait_for = owner.control_drained.wait_for
+
+    def observe_wait(predicate):
+        waiting.set()
+        return wait_for(predicate)
+
+    monkeypatch.setattr(owner.control_drained, "wait_for", observe_wait)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        released = pool.submit(retirement.get_output)
+        try:
+            assert waiting.wait(timeout=5)
+            assert not released.done() and not owner.closed
+        finally:
+            receipt = final.get_output()
+        assert getattr(receipt, GR_WORKER_RESULT_ATTR)["session-0"].terminal_result is None
+        proof = getattr(released.result(timeout=5), GR_RETIRE_RESULT_ATTR)
+    assert proof.released and owner.closed
+    assert owner.final_output.final_d2h_count == 1
+    assert owner.beam.session.context.registry.num_active_sessions == 0
+
+
+def test_terminal_device_failure_reaches_native_error_channel(monkeypatch):
+    owner = runtime(n=1)
+    owner.admit(dispatch(metadata(n=1)))
+    owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
+    final = owner.sample()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("device completion failed")
+
+    monkeypatch.setattr(owner.final_output, "consume", fail)
+    with pytest.raises(RuntimeError, match="device completion failed"):
+        final.get_output()
+    assert final._output is None

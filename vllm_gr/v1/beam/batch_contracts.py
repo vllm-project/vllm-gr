@@ -528,8 +528,11 @@ def validate_beam_batch_plan_limits(
 def _validate_output_sequence(sequence: BeamOutputSequence, *, name: str) -> None:
     if not isinstance(sequence, BeamOutputSequence):
         _fail(f"{name} must be BeamOutputSequence")
+    # Decoded IDs are plain ints. Build field paths and call the generic
+    # validator only for invalid values or integer subclasses.
     for index, token_id in enumerate(sequence.token_ids):
-        _non_negative_int(f"{name}.token_ids[{index}]", token_id)
+        if type(token_id) is not int or token_id < 0:
+            _non_negative_int(f"{name}.token_ids[{index}]", token_id)
     if sequence.cumulative_logprob is not None and (
         isinstance(sequence.cumulative_logprob, bool)
         or not isinstance(sequence.cumulative_logprob, (int, float))
@@ -537,10 +540,11 @@ def _validate_output_sequence(sequence: BeamOutputSequence, *, name: str) -> Non
     ):
         _fail(f"{name}.cumulative_logprob must be finite or None")
     for index, parent_beam_index in enumerate(sequence.parent_beam_indices):
-        _non_negative_int(
-            f"{name}.parent_beam_indices[{index}]",
-            parent_beam_index,
-        )
+        if type(parent_beam_index) is not int or parent_beam_index < 0:
+            _non_negative_int(
+                f"{name}.parent_beam_indices[{index}]",
+                parent_beam_index,
+            )
     if sequence.finish_reason not in ("stop", "length"):
         _fail(f"{name}.finish_reason must be 'stop' or 'length'")
     if sequence.finish_reason == "stop":

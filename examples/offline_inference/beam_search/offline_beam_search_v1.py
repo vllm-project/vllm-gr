@@ -124,7 +124,7 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         # Public max_tokens includes the begin and end boundary positions.
         max_tokens=args.generated_steps + 2,
         temperature=0.0,
-        ignore_eos=False,
+        ignore_eos=True,
         include_stop_str_in_output=True,
         begin_token=BEGIN_TOKEN,
         end_token=END_TOKEN,

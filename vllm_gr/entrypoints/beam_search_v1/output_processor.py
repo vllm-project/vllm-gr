@@ -1,84 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Validated public-output conversion for persistent Beam Search V1."""
+"""Convert the shared terminal result without reprocessing the request budget."""
 
-from __future__ import annotations
+import math
+import os
+from collections.abc import Sequence
+from typing import Any, cast
 
-from collections.abc import Mapping, Sequence
-from typing import Any, NoReturn
-
+from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
 from vllm.inputs import tokens_input
+from vllm.outputs import CompletionOutput, RequestOutput
 
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchEngineError
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
-from vllm_gr.entrypoints.beam_search_v1.token_utils import boundary_token_id
 from vllm_gr.tokenizer_fast import fast_batch_decode, fast_decode
 from vllm_gr.v1.beam.batch_contracts import (
+    BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
-    BeamBatchOutput,
     BeamBatchRequest,
     BeamBatchResult,
     BeamOutputSequence,
+    validate_beam_batch_result,
 )
-
-
-def _raise_engine_error(code: str, message: str, item_index: int | None = None) -> NoReturn:
-    raise BeamSearchEngineError(BeamBatchFailure(code, message, item_index))
-
-
-def _result_output(result: BeamBatchResult) -> BeamBatchOutput:
-    if result.failure is not None:
-        raise BeamSearchEngineError(result.failure)
-    return result.output  # type: ignore[return-value]
-
-
-def _token_id(tokenizer: Any, token: str | None, name: str) -> int | None:
-    return boundary_token_id(tokenizer, token, name)
-
-
-def _prompt_text(prompt: Any) -> str | None:
-    if isinstance(prompt, str):
-        return prompt
-    if isinstance(prompt, Mapping):
-        text = prompt.get("prompt")
-        if isinstance(text, str):
-            return text
-    return None
-
-
-def _prompt_boundaries(
-    tokenizer: Any,
-    request: BeamBatchRequest,
-    params: Any,
-) -> tuple[list[Sequence[int]], list[Sequence[int]], int | None, int | None]:
-    begin_token_id = _token_id(tokenizer, getattr(params, "begin_token", None), "begin_token")
-    end_token_id = _token_id(tokenizer, getattr(params, "end_token", None), "end_token")
-    prepared_prompts: list[Sequence[int]] = []
-    original_prompts: list[Sequence[int]] = []
-    for item in request.items:
-        prompt_token_ids = item.request.prompt_token_ids
-        prepared = prompt_token_ids
-        if begin_token_id is not None:
-            original = prepared[:-1]
-        else:
-            original = prepared
-        prepared_prompts.append(prepared)
-        original_prompts.append(original)
-    return prepared_prompts, original_prompts, begin_token_id, end_token_id
-
-
-def _output_suffix(sequence: BeamOutputSequence, end_token_id: int | None) -> list[int]:
-    suffix = list(sequence.token_ids)
-    # end_token reserves one public-output position but is not sampled when a
-    # fixed-length Beam survives. Stop completions already own their boundary
-    # and must respect include_stop_token without an artificial end marker.
-    if sequence.finish_reason == "length" and end_token_id is not None:
-        suffix.append(end_token_id)
-    return suffix
+from vllm_gr.v1.engine.gr_result_validation import has_validated_sequences
 
 
 def _can_share_prompt_decode(tokenizer: Any, prepared_prompt: Sequence[int]) -> bool:
@@ -100,7 +48,7 @@ def _can_share_prompt_decode(tokenizer: Any, prepared_prompt: Sequence[int]) -> 
 
 
 class _V1BeamTailMaterializer:
-    """Populate one V1 Beam on first public access using PR380's lazy class."""
+    """Populate one V1 Beam on first access to its lazy public fields."""
 
     __slots__ = ("_tokenizer", "_prepared", "_shared_prompt", "_prompt_text")
 
@@ -132,127 +80,178 @@ class _V1BeamTailMaterializer:
 
 
 class BeamSearchOutputProcessor:
-    """Convert one trusted terminal result without retaining session state."""
+    """Keep normalized prompt identity and the already resolved boundary tokens."""
 
-    def __init__(self, tokenizer: Any) -> None:
-        if tokenizer is None:
-            raise ValueError("beam_search_v1 output conversion requires a tokenizer")
+    def __init__(
+        self,
+        request: BeamBatchRequest,
+        tokenizer: Any,
+        begin_token_id: int | None,
+        end_token_id: int | None,
+        prompt_text: str | None,
+    ) -> None:
+        self.request = request
         self.tokenizer = tokenizer
+        self.begin = [] if begin_token_id is None else [begin_token_id]
+        self.end = [] if end_token_id is None else [end_token_id]
+        self.native_prompt = list(request.items[0].request.prompt_token_ids or ())
+        self.prompt_tokens = self.native_prompt[:-1] if self.begin else self.native_prompt[:]
+        self.prompt_text = prompt_text
+        self.strict_result_validation = (
+            os.environ.get("VLLM_GR_BEAM_STRICT_RESULT_VALIDATION") == "1"
+        )
 
-    @classmethod
-    def ensure_available(cls) -> None:
-        """A5 output conversion is installed and safe to admit work."""
+    def _convert_sequences(
+        self, result: BeamBatchResult, call: OfflineBeamSearchRequest | None
+    ) -> list[Any]:
+        """Validate and construct each output once, before exposing any result."""
+        try:
+            if result.protocol_version != BEAM_BATCH_PROTOCOL_VERSION:
+                raise ValueError("terminal result has an unsupported protocol_version")
+            if result.batch_id != self.request.batch_id:
+                raise ValueError("terminal result belongs to a different session")
+            if (result.output is None) == (result.failure is None):
+                raise ValueError("exactly one of output and failure must be present")
+            if result.failure is not None:
+                failure = result.failure
+                if not failure.code.strip() or not failure.message.strip():
+                    raise ValueError("terminal failure code and message must be non-empty")
+                if failure.item_index is not None and not 0 <= failure.item_index < len(
+                    self.request.items
+                ):
+                    raise ValueError("terminal failure item_index is outside the submitted batch")
+                raise BeamSearchEngineError(failure)
+            assert result.output is not None
+            if len(result.output.items) != 1:
+                raise ValueError("terminal result must contain one request")
+            item = result.output.items[0]
+            if item.item_index != 0 or item.request_id != self.request.items[0].request.request_id:
+                raise ValueError("terminal result request identity differs from submission")
+            sequences: tuple[BeamOutputSequence, ...] = item.sequences
+            if not 0 < len(sequences) <= self.request.output_options.num_return_sequences:
+                raise ValueError("terminal result has an invalid sequence count")
+            self._validate_sequences(result, sequences)
+            if self.strict_result_validation:
+                self._validate_diagnostics(result, sequences)
+            if call is not None:
+                from vllm_gr.entrypoints.gr import _LazyMaterializedBeamSequence
+
+                materializer = _V1BeamTailMaterializer(self.tokenizer, self.native_prompt)
+                prompt = tokens_input(
+                    self.prompt_tokens[:],
+                    prompt=self.prompt_text,
+                    cache_salt=self.request.items[0].request.cache_salt,
+                )
+                end_suffix = tuple(self.end)
+                # Copy the request-shared fields in C, then fill only the
+                # per-beam fields. Mutable lists remain private to each beam.
+                copy_state = {
+                    "orig_prompt": prompt,
+                    "tokens": None,
+                    "logprobs": None,
+                    "cum_logprob": None,
+                    "text": None,
+                    "finish_reason": "length",
+                    "stop_reason": None,
+                    "lora_request": call.lora_request,
+                    "_v1_suffix": None,
+                    "_lazy_materializer": materializer,
+                }.copy
+            outputs: list[Any] = []
+            append = outputs.append
+            new = object.__new__
+            for seq in sequences:
+                tokens = seq.token_ids
+                score = seq.cumulative_logprob
+                if call is not None:
+                    beam = new(_LazyMaterializedBeamSequence)
+                    state = copy_state()
+                    state["tokens"] = []
+                    state["logprobs"] = []
+                    state["cum_logprob"] = score
+                    state["_v1_suffix"] = tokens + end_suffix
+                    beam.__dict__ = state
+                    append(beam)
+                else:
+                    append(
+                        CompletionOutput(
+                            index=len(outputs),
+                            text="",
+                            token_ids=self.begin + list(tokens) + self.end,
+                            cumulative_logprob=score,
+                            logprobs=None,
+                            finish_reason="length",
+                            stop_reason=None,
+                        )
+                    )
+            return outputs
+        except ValueError as exc:
+            raise BeamSearchEngineError(BeamBatchFailure("invalid_result", str(exc), None)) from exc
+
+    def _validate_sequences(
+        self, result: BeamBatchResult, sequences: tuple[BeamOutputSequence, ...]
+    ) -> None:
+        expected_length = self.request.beam_params.max_tokens
+        if has_validated_sequences(result, expected_length):
+            return
+        isfinite = math.isfinite
+        for seq in sequences:
+            tokens = seq.token_ids
+            score = seq.cumulative_logprob
+            if len(tokens) != expected_length or not tokens or seq.finish_reason != "length":
+                raise ValueError("terminal result does not match the generation budget")
+            if seq.stop_token_id is not None:
+                raise ValueError("terminal result must preserve ignored EOS")
+            if (
+                tokens[0] < 0
+                or (expected_length > 1 and tokens[1] < 0)
+                or (expected_length > 2 and tokens[2] < 0)
+                or (expected_length > 3 and min(tokens[3:]) < 0)
+            ):
+                raise ValueError("terminal token_ids must be non-negative")
+            if score is None or not isfinite(score):
+                raise ValueError("terminal scores must be present and finite")
+
+    def _validate_diagnostics(
+        self, result: BeamBatchResult, sequences: tuple[BeamOutputSequence, ...]
+    ) -> None:
+        """Audit internal lineage and ranking when explicitly requested."""
+        validate_beam_batch_result(result)
+        params = self.request.beam_params
+        previous_score = float("inf")
+        for seq in sequences:
+            if len(seq.parent_beam_indices) != params.max_tokens or any(
+                parent >= params.beam_width for parent in seq.parent_beam_indices
+            ):
+                raise ValueError("terminal result has an invalid parent chain")
+            score = cast(float, seq.cumulative_logprob)
+            if score > previous_score:
+                raise ValueError("terminal scores must be sorted")
+            previous_score = score
 
     def process_outputs(
-        self,
-        call: OfflineBeamSearchRequest,
-        request: BeamBatchRequest,
-        result: BeamBatchResult,
-    ) -> list[Any]:
-        output = _result_output(result)
-        try:
-            prepared, original, _, end_token_id = _prompt_boundaries(
-                self.tokenizer, request, call.params
-            )
-
-            from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
-
-            from vllm_gr.entrypoints.gr import _LazyMaterializedBeamSequence
-
-            end_suffix = () if end_token_id is None else (end_token_id,)
-            converted = []
-            for item in output.items:
-                source_prompt = call.prompts[item.item_index]
-                prompt = tokens_input(
-                    original[item.item_index],
-                    prompt=_prompt_text(source_prompt),
-                    cache_salt=request.items[item.item_index].request.cache_salt,
-                )
-                materializer = _V1BeamTailMaterializer(self.tokenizer, prepared[item.item_index])
-                lora_request = request.items[item.item_index].request.lora_request
-                sequences = []
-                for sequence in item.sequences:
-                    # Initialize the final lazy type in one pass. Its generated
-                    # __init__ would invoke three Python descriptor setters per
-                    # beam; constructing the base first also needs a class swap.
-                    # Keep every public BeamSearchSequence field initialized.
-                    beam = object.__new__(_LazyMaterializedBeamSequence)
-                    beam.__dict__ = {
-                        "orig_prompt": prompt,
-                        "tokens": [],
-                        "logprobs": [],
-                        "lora_request": lora_request,
-                        "cum_logprob": float(sequence.cumulative_logprob),
-                        "text": None,
-                        "finish_reason": sequence.finish_reason,
-                        "stop_reason": sequence.stop_token_id,
-                        # Stop completions already carry their requested boundary.
-                        "_v1_suffix": sequence.token_ids + end_suffix
-                        if sequence.finish_reason == "length"
-                        else sequence.token_ids,
-                        "_lazy_materializer": materializer,
-                    }
-                    sequences.append(beam)
-                converted.append(BeamSearchOutput(sequences=sequences))
-            return converted
-        except BeamSearchEngineError:
-            raise
-        except Exception as exc:
-            _raise_engine_error("output_conversion_failed", str(exc))
+        self, call: OfflineBeamSearchRequest, result: BeamBatchResult
+    ) -> list[BeamSearchOutput]:
+        return [BeamSearchOutput(sequences=self._convert_sequences(result, call))]
 
     def process_online_outputs(
-        self,
-        call: OnlineBeamSearchRequest,
-        request: BeamBatchRequest,
-        result: BeamBatchResult,
-    ) -> list[Any]:
-        output = _result_output(result)
-        try:
-            _, original, begin_token_id, end_token_id = _prompt_boundaries(
-                self.tokenizer, request, call.params
+        self, call: OnlineBeamSearchRequest, result: BeamBatchResult
+    ) -> list[RequestOutput]:
+        outputs = self._convert_sequences(result, None)
+        texts = fast_batch_decode(self.tokenizer, [output.token_ids for output in outputs])
+        for output, text in zip(outputs, texts, strict=True):
+            output.text = text
+        return [
+            RequestOutput(
+                request_id=call.request_id,
+                prompt=(
+                    self.prompt_text
+                    if self.prompt_text is not None
+                    else fast_decode(self.tokenizer, self.prompt_tokens)
+                ),
+                prompt_token_ids=self.prompt_tokens[:],
+                prompt_logprobs=None,
+                outputs=outputs,
+                finished=True,
             )
-
-            from vllm.outputs import CompletionOutput, RequestOutput
-
-            item = output.items[0]
-            completion_token_ids = [
-                ([] if begin_token_id is None else [begin_token_id])
-                + _output_suffix(sequence, end_token_id)
-                for sequence in item.sequences
-            ]
-            texts = fast_batch_decode(self.tokenizer, completion_token_ids)
-            lora_request = request.items[0].request.lora_request
-            completions = [
-                CompletionOutput(
-                    index=index,
-                    text=text,
-                    token_ids=token_ids,
-                    cumulative_logprob=sequence.cumulative_logprob,
-                    logprobs=None,
-                    finish_reason=sequence.finish_reason,
-                    stop_reason=sequence.stop_token_id,
-                    lora_request=lora_request,
-                )
-                for index, (sequence, token_ids, text) in enumerate(
-                    zip(item.sequences, completion_token_ids, texts, strict=True)
-                )
-            ]
-            prompt_token_ids = original[0]
-            prompt_text = _prompt_text(call.prompt)
-            if prompt_text is None:
-                prompt_text = fast_decode(self.tokenizer, prompt_token_ids)
-            return [
-                RequestOutput(
-                    request_id=call.request_id,
-                    prompt=prompt_text,
-                    prompt_token_ids=prompt_token_ids,
-                    prompt_logprobs=None,
-                    outputs=completions,
-                    finished=True,
-                    lora_request=lora_request,
-                )
-            ]
-        except BeamSearchEngineError:
-            raise
-        except Exception as exc:
-            _raise_engine_error("output_conversion_failed", str(exc))
+        ]

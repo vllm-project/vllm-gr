@@ -65,12 +65,16 @@ from vllm_gr.v1.engine.gr_session_client import (
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
 
+def _worker_result(*args: Any, **kwargs: Any) -> GRWorkerResult:
+    return GRWorkerResult(*args, owner_generation=1, **kwargs)
+
+
 def _batch_request(max_tokens: int = 3) -> BeamBatchRequest:
     request = EngineCoreRequest(
         request_id="session-0",
         prompt_token_ids=[1, 2, 3],
         mm_features=None,
-        sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0.0),
+        sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0.0, ignore_eos=True),
         pooling_params=None,
         arrival_time=1.0,
         lora_request=None,
@@ -86,7 +90,7 @@ def _batch_request(max_tokens: int = 3) -> BeamBatchRequest:
             max_tokens=max_tokens,
             temperature=0.0,
             stop_token_ids=(2,),
-            ignore_stop_tokens=False,
+            ignore_stop_tokens=True,
         ),
         output_options=BeamOutputOptions(
             num_return_sequences=4,
@@ -103,6 +107,7 @@ def _scheduler() -> SimpleNamespace:
         is_prefill_chunk=False,
         num_output_placeholders=0,
         num_prompt_tokens=3,
+        num_computed_tokens=2,
     )
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
@@ -111,7 +116,8 @@ def _scheduler() -> SimpleNamespace:
     )
 
 
-def _scheduler_output() -> SimpleNamespace:
+def _scheduler_output(scheduler: Any) -> SimpleNamespace:
+    scheduler.requests["session-0"].num_computed_tokens += 1
     return SimpleNamespace(num_scheduled_tokens={"session-0": 1})
 
 
@@ -130,7 +136,7 @@ def test_prefill_decode_lookahead_uses_device_dependency_without_cpu_update() ->
     native_request = scheduler.requests[session.session_id]
 
     native_request.num_output_placeholders = 1
-    prefill_output = _scheduler_output()
+    prefill_output = _scheduler_output(scheduler)
     prefill = attach_gr_stage_metadata(scheduler, prefill_output, session)
     setattr(prefill_output, GR_STAGE_OUTPUT_ATTR, {session.session_id: prefill})
 
@@ -141,7 +147,7 @@ def test_prefill_decode_lookahead_uses_device_dependency_without_cpu_update() ->
 
     # Decode1 is issued before Prefill's Future is consumed by the CPU.
     native_request.num_output_placeholders = 2
-    decode_output = _scheduler_output()
+    decode_output = _scheduler_output(scheduler)
     decode = attach_gr_stage_metadata(scheduler, decode_output, session)
     setattr(decode_output, GR_STAGE_OUTPUT_ATTR, {session.session_id: decode})
 
@@ -153,7 +159,7 @@ def test_prefill_decode_lookahead_uses_device_dependency_without_cpu_update() ->
 
     # Reaping old Prefill output opens one queue slot while Decode1 remains live.
     native_request.num_output_placeholders = 1
-    worker_result = GRWorkerResult(
+    worker_result = _worker_result(
         session_id=session.session_id,
         dispatch_id=prefill.dispatch_id,
         stage_index=0,
@@ -176,14 +182,14 @@ def test_early_finish_stops_issue_and_drains_already_queued_stage() -> None:
     outputs = []
     for placeholders in (1, 2):
         native_request.num_output_placeholders = placeholders
-        output = _scheduler_output()
+        output = _scheduler_output(scheduler)
         metadata = attach_gr_stage_metadata(scheduler, output, session)
         assert metadata is not None
         setattr(output, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
         outputs.append((output, metadata))
 
     terminal_result = _failure_result()
-    first_result = GRWorkerResult(
+    first_result = _worker_result(
         session_id=session.session_id,
         dispatch_id=outputs[0][1].dispatch_id,
         stage_index=0,
@@ -220,7 +226,7 @@ def test_early_finish_stops_issue_and_drains_already_queued_stage() -> None:
     assert premature_result[0].finished_requests is not None
     assert session.session_id not in premature_result[0].finished_requests
 
-    queued_result = GRWorkerResult(
+    queued_result = _worker_result(
         session_id=session.session_id,
         dispatch_id=outputs[1][1].dispatch_id,
         stage_index=1,
@@ -238,6 +244,16 @@ def test_early_finish_stops_issue_and_drains_already_queued_stage() -> None:
     assert session.status == GRSessionStatus.FINISHING
     assert session.completed_stages == 2
     assert session._pending_terminal_result == terminal_result
+    assert not _gr_session_ready_to_finalize(session)
+    from tests.test_async_scheduling_scheduler import release_receipt
+    from vllm_gr.v1.engine.gr_async_scheduler import (
+        attach_gr_retirement,
+        consume_gr_retirement,
+    )
+
+    retirement = SimpleNamespace(total_num_scheduled_tokens=0, finished_req_ids=set())
+    attach_gr_retirement(scheduler, retirement)
+    consume_gr_retirement(scheduler, retirement, release_receipt(retirement))
     assert _gr_session_ready_to_finalize(session)
     assert session.session_id in scheduler._gr_v1_sessions
 
@@ -257,8 +273,8 @@ def test_early_finish_stops_issue_and_drains_already_queued_stage() -> None:
     assert finished
     assert native_request.num_output_placeholders == 0
     assert session.status == GRSessionStatus.FINISHED
-    assert session.resource_status is GRResourceStatus.DRAINING
-    assert scheduler._gr_v1_sessions[session.session_id] is session
+    assert session.resource_status is GRResourceStatus.CLOSED
+    assert session.session_id not in scheduler._gr_v1_sessions
     output = result[0].outputs[0]
     assert output.finished
     assert output.kv_transfer_params is not None
@@ -286,7 +302,9 @@ def test_native_eos_enters_gr_drain_after_worker_receipt() -> None:
             *args: Any,
             **kwargs: Any,
         ) -> dict[int, EngineCoreOutputs]:
-            metadata = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR)["session-0"]
+            metadata = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {}).get("session-0")
+            if metadata is None:
+                return {0: EngineCoreOutputs(outputs=[])}
             if metadata.stage_index != 0:
                 return {0: EngineCoreOutputs(outputs=[])}
 
@@ -317,14 +335,14 @@ def test_native_eos_enters_gr_drain_after_worker_receipt() -> None:
     outputs = []
     for placeholders in (1, 2):
         scheduler.requests[session.session_id].num_output_placeholders = placeholders
-        scheduler_output = _scheduler_output()
+        scheduler_output = _scheduler_output(scheduler)
         metadata = attach_gr_stage_metadata(scheduler, scheduler_output, session)
         assert metadata is not None
         setattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
         outputs.append(scheduler_output)
 
     prefill = getattr(outputs[0], GR_STAGE_OUTPUT_ATTR)[session.session_id]
-    worker_result = GRWorkerResult(
+    worker_result = _worker_result(
         session.session_id,
         prefill.dispatch_id,
         prefill.stage_index,
@@ -349,6 +367,15 @@ def test_native_eos_enters_gr_drain_after_worker_receipt() -> None:
 
     assert session.resource_status is GRResourceStatus.DRAINING
     assert scheduler._gr_v1_sessions[session.session_id] is session
+    assert not terminal_result[0].outputs
+    from tests.test_async_scheduling_scheduler import release_receipt
+    from vllm_gr.v1.engine.gr_async_scheduler import attach_gr_retirement
+
+    retirement = SimpleNamespace(total_num_scheduled_tokens=0, finished_req_ids=set())
+    attach_gr_retirement(scheduler, retirement)
+    terminal_result = scheduler.update_from_output(retirement, release_receipt(retirement))
+    assert session.resource_status is GRResourceStatus.CLOSED
+    assert session.session_id not in scheduler._gr_v1_sessions
     final_output = terminal_result[0].outputs[0]
     assert final_output.finished
     failure = final_output.kv_transfer_params["gr_batch_result"].failure
@@ -356,19 +383,16 @@ def test_native_eos_enters_gr_drain_after_worker_receipt() -> None:
     assert failure.code == "native_termination_without_gr_result"
 
 
-def test_chunked_prefill_does_not_consume_a_logical_stage() -> None:
+def test_partial_prefill_rejected_without_dispatch_or_lease() -> None:
     scheduler = _scheduler()
     session = add_gr_session(scheduler, _batch_request())
     scheduler.requests[session.session_id].is_prefill_chunk = True
-    output = _scheduler_output()
-
-    metadata = attach_gr_stage_metadata(scheduler, output, session)
-
-    assert metadata is not None
-    assert metadata.kind == GRStageKind.PREFILL
-    assert not metadata.produces_output
-    assert session.issued_stages == 0
-    assert session.output_placeholders == 0
+    with pytest.raises(RuntimeError, match="partial Prefill"):
+        attach_gr_stage_metadata(scheduler, _scheduler_output(scheduler), session)
+    assert not session._dispatch_records
+    assert not session._in_flight_dispatches
+    assert not session._kv_dispatch_leases
+    assert not session.worker_resources_allocated
 
 
 def test_recompute_is_rejected_after_beam_initialization() -> None:
@@ -377,7 +401,7 @@ def test_recompute_is_rejected_after_beam_initialization() -> None:
     native_request = scheduler.requests[session.session_id]
 
     native_request.num_output_placeholders = 1
-    prefill_output = _scheduler_output()
+    prefill_output = _scheduler_output(scheduler)
     prefill = attach_gr_stage_metadata(scheduler, prefill_output, session)
     assert prefill is not None
     setattr(prefill_output, GR_STAGE_OUTPUT_ATTR, {session.session_id: prefill})
@@ -389,7 +413,7 @@ def test_recompute_is_rejected_after_beam_initialization() -> None:
         SimpleNamespace(
             **{
                 GR_WORKER_RESULT_ATTR: {
-                    session.session_id: GRWorkerResult(
+                    session.session_id: _worker_result(
                         session_id=session.session_id,
                         dispatch_id=prefill.dispatch_id,
                         stage_index=prefill.stage_index,
@@ -404,7 +428,7 @@ def test_recompute_is_rejected_after_beam_initialization() -> None:
 
     latest_device_state = session.latest_device_state
     native_request.is_prefill_chunk = True
-    recompute_output = _scheduler_output()
+    recompute_output = _scheduler_output(scheduler)
     with pytest.raises(RuntimeError, match="cannot recompute"):
         attach_gr_stage_metadata(scheduler, recompute_output, session)
     assert session.issued_stages == 1
@@ -434,7 +458,7 @@ def test_backend_configuration_error_uses_request_error_channel() -> None:
 def test_gr_submission_disables_native_stop_ownership() -> None:
     request = _batch_request()
     native_request = SimpleNamespace(
-        sampling_params=SimpleNamespace(ignore_eos=False, stop_token_ids=[2])
+        sampling_params=SimpleNamespace(ignore_eos=True, stop_token_ids=[2])
     )
     added: list[Any] = []
     engine = SimpleNamespace(
@@ -527,23 +551,32 @@ def test_internal_gr_finalization_preserves_the_pending_terminal_result() -> Non
     assert session.session_id in scheduler._gr_v1_sessions
 
 
-def test_abort_adapters_treat_randomized_session_id_as_internal() -> None:
+@pytest.mark.parametrize("online", [False, True])
+def test_abort_adapters_wait_for_retirement_with_internal_id(online: bool) -> None:
+    from unittest.mock import AsyncMock, Mock
+
     internal_id = "internal-randomized-id"
-    sync_calls: list[tuple[list[str], bool]] = []
-    async_calls: list[tuple[str, bool]] = []
-
-    sync_engine = SimpleNamespace(
-        abort_request=lambda request_ids, *, internal: sync_calls.append((request_ids, internal))
-    )
-
-    async def abort(request_id: str, *, internal: bool) -> None:
-        async_calls.append((request_id, internal))
-
-    abort_gr_session_sync(sync_engine, internal_id)
-    asyncio.run(abort_gr_session_async(SimpleNamespace(abort=abort), internal_id))
-
-    assert sync_calls == [([internal_id], True)]
-    assert async_calls == [(internal_id, True)]
+    output_processor = SimpleNamespace(abort_requests=Mock(return_value=[]))
+    if online:
+        core = SimpleNamespace(
+            abort_requests_async=AsyncMock(),
+            call_utility_async=AsyncMock(side_effect=[False, False, True]),
+        )
+        engine = SimpleNamespace(output_processor=output_processor, engine_core=core)
+        asyncio.run(abort_gr_session_async(engine, internal_id))
+        core.abort_requests_async.assert_awaited_once_with([internal_id])
+        assert core.call_utility_async.await_count == 3
+        core.call_utility_async.assert_awaited_with("is_gr_session_retired", internal_id)
+    else:
+        core = SimpleNamespace(
+            abort_requests=Mock(), call_utility=Mock(side_effect=[False, False, True])
+        )
+        engine = SimpleNamespace(output_processor=output_processor, engine_core=core)
+        abort_gr_session_sync(engine, internal_id)
+        core.abort_requests.assert_called_once_with([internal_id])
+        assert core.call_utility.call_count == 3
+        core.call_utility.assert_called_with("is_gr_session_retired", internal_id)
+    output_processor.abort_requests.assert_called_once_with([internal_id], internal=True)
 
 
 def test_terminal_result_restores_untyped_multiprocess_payload() -> None:
@@ -634,15 +667,14 @@ def test_async_dp_submit_starts_stats_task_before_first_request() -> None:
     assert request.items[0].request.current_wave == 7
 
 
-def test_nonoutput_prefill_validates_worker_receipt_identity() -> None:
+def test_prefill_validates_worker_receipt_identity() -> None:
     scheduler = _scheduler()
     session = add_gr_session(scheduler, _batch_request())
-    scheduler.requests[session.session_id].is_prefill_chunk = True
-    scheduled = _scheduler_output()
+    scheduled = _scheduler_output(scheduler)
     metadata = attach_gr_stage_metadata(scheduler, scheduled, session)
     assert metadata is not None
     setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
-    result = GRWorkerResult(
+    result = _worker_result(
         session.session_id,
         metadata.dispatch_id + 1,
         metadata.stage_index,
@@ -655,14 +687,14 @@ def test_nonoutput_prefill_validates_worker_receipt_identity() -> None:
     completion = update_gr_from_output(scheduler, session, scheduled, output)
     assert completion.finished
     assert "different dispatch" in completion.error
-    assert session.confirmed_token_count == session.completed_stages == 0
+    assert session.completed_stages == 1
 
 
 @pytest.mark.parametrize("has_mapping", [False, True])
 def test_missing_worker_receipt_fails_without_confirming_tokens(has_mapping: bool) -> None:
     scheduler = _scheduler()
     session = add_gr_session(scheduler, _batch_request())
-    scheduled = _scheduler_output()
+    scheduled = _scheduler_output(scheduler)
     metadata = attach_gr_stage_metadata(scheduler, scheduled, session)
     assert metadata is not None
     setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
@@ -671,7 +703,6 @@ def test_missing_worker_receipt_fails_without_confirming_tokens(has_mapping: boo
     completion = update_gr_from_output(scheduler, session, scheduled, output)
 
     assert completion.finished and "omitted GRWorkerResult" in (completion.error or "")
-    assert session.confirmed_token_count == 0
     assert not session._in_flight_dispatches
     assert session.resource_status is GRResourceStatus.DRAINING
     assert session._pending_terminal_result is not None
@@ -679,11 +710,10 @@ def test_missing_worker_receipt_fails_without_confirming_tokens(has_mapping: boo
     assert session._pending_terminal_result.failure.code == "worker_protocol_error"
 
 
-def test_nonoutput_prefill_accepts_zero_without_finishing() -> None:
+def test_prefill_rejects_zero_without_finishing() -> None:
     scheduler = _scheduler()
     session = add_gr_session(scheduler, _batch_request())
-    scheduler.requests[session.session_id].is_prefill_chunk = True
-    scheduled = _scheduler_output()
+    scheduled = _scheduler_output(scheduler)
     metadata = attach_gr_stage_metadata(scheduler, scheduled, session)
     assert metadata is not None
     setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {session.session_id: metadata})
@@ -692,7 +722,7 @@ def test_nonoutput_prefill_accepts_zero_without_finishing() -> None:
         output,
         GR_WORKER_RESULT_ATTR,
         {
-            session.session_id: GRWorkerResult(
+            session.session_id: _worker_result(
                 session.session_id,
                 metadata.dispatch_id,
                 metadata.stage_index,
@@ -703,8 +733,8 @@ def test_nonoutput_prefill_accepts_zero_without_finishing() -> None:
         },
     )
     completion = update_gr_from_output(scheduler, session, scheduled, output)
-    assert not completion.finished and completion.error is None
-    assert session.confirmed_token_count == session.completed_stages == 0
+    assert completion.finished and "no token" in completion.error
+    assert session.completed_stages == 1
     assert not session._in_flight_dispatches
 
 
@@ -726,7 +756,7 @@ def test_native_kv_dispatch_lease_survives_abort_until_receipt() -> None:
         max_model_len=4096,
     )
     session = add_gr_session(scheduler, _batch_request())
-    scheduled = _scheduler_output()
+    scheduled = _scheduler_output(scheduler)
     metadata = attach_gr_stage_metadata(scheduler, scheduled, session)
     assert block.ref_cnt == 2
     free((block,))  # Native abort/preemption drops its request reference.
@@ -784,7 +814,7 @@ def test_dispatch_lease_preserves_native_eviction_order(
     session = add_gr_session(scheduler, _batch_request())
     scheduled = []
     for _ in range(num_leases):
-        output = _scheduler_output()
+        output = _scheduler_output(scheduler)
         m = attach_gr_stage_metadata(scheduler, output, session)
         setattr(output, GR_STAGE_OUTPUT_ATTR, {session.session_id: m})
         scheduled.append(output)

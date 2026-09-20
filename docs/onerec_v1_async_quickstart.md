@@ -153,5 +153,4 @@ python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py
 
 - [Asynchronous scheduling execution contract](async_scheduling.md): scheduling, Prefill/Decode overlap, and retirement.
 - [Offline Beam Search V1 reference](../examples/offline_inference/beam_search/README.md#beam-search-v1): full configuration fields and script arguments.
-- [Asynchronous scheduling validation](async_scheduling_validation.md): system tests and precision or graph-replay boundaries.
 - [OneRec benchmark](benchmarks/README.md): dataset, online benchmarks, and accuracy evaluation.

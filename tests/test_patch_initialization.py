@@ -32,12 +32,25 @@ def test_patch_plans_preserve_process_responsibilities() -> None:
         "batch_and_fork",
     ]
     assert engine_core_patches == [
+        "attention_backend",
         "engine_core_requests",
         "kv_hash_memo",
         "scheduler",
         "model_runner",
     ]
     assert set(frontend_patches).isdisjoint(engine_core_patches)
+
+
+def test_engine_core_plan_registers_custom_attention_backend() -> None:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    from vllm_gr.patch import initialize_engine_core_beam_patches
+
+    report = initialize_engine_core_beam_patches()
+
+    assert AttentionBackendEnum.CUSTOM.is_overridden()
+    assert AttentionBackendEnum.CUSTOM.get_class().__name__ == "BeamAttentionBackend"
+    assert all(result.status.value != "failed" for result in report.results)
 
 
 def test_runtime_patch_order_preserves_ascend_initialization(

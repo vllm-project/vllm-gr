@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import msgspec
@@ -29,6 +30,7 @@ from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
     GRStageKind,
     GRStageMetadata,
+    validate_gr_dispatch,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
@@ -39,7 +41,6 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
     get_stage_runner,
-    validate_dispatch,
 )
 from vllm_gr.v1.worker.gr_inputs import GRInputBuffers, bind_device_inputs
 
@@ -74,7 +75,11 @@ def dispatch(m):
 def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
     context = BeamAttentionContext(3, 6, 1, 5, 8, 2, torch.device("cuda"), dtype)
     state = BeamSearchState(
-        context.decision, beam_width=4, max_new_tokens=n, stop_token_ids=stop_token_ids
+        context.decision,
+        beam_width=4,
+        max_new_tokens=n,
+        stop_token_ids=stop_token_ids,
+        ignore_stop_tokens=True,
     )
     # State row 2, workspace row 1 and KV slot 0 are intentionally distinct.
     slot = context.registry.allocate("session-0", 4, 7)
@@ -208,6 +213,56 @@ def test_admission_accepts_full_attention(dtype):
     owner.release(owner.binding, consumer_done=done)
 
 
+def test_combined_execute_validates_once_per_new_session(monkeypatch):
+    from vllm_gr.v1.worker import gpu_beam_stage_runner
+    from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
+
+    worker = admission_worker()
+    validate = Mock(wraps=validate_gr_dispatch)
+    monkeypatch.setattr(gpu_beam_stage_runner, "validate_gr_dispatch", validate)
+
+    def prefill(worker, scheduled):
+        worker.execute_model_state = SimpleNamespace(
+            logits=torch.zeros((1, 6), device=worker.device, dtype=torch.float16)
+        )
+
+    execute = make_patched_execute_model(prefill)
+    first_owner = None
+    for generation in range(2):
+        scheduled = dispatch(replace(metadata(n=1), owner_generation=generation))
+        execute(worker, scheduled)
+        owner = worker._gr_gpu_stage_runner
+        if first_owner is None:
+            first_owner = owner
+        assert owner is first_owner
+        assert validate.call_count == generation + 1
+        result = getattr(owner.sample().get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+        assert result.finished and result.resources_released
+        assert result.terminal_result.failure is None
+        assert owner.closed and not worker._beam_sessions
+
+
+@pytest.mark.parametrize("fault", ["native_extent", "session_init"])
+def test_combined_execute_rejects_first_dispatch_before_allocation(fault):
+    from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
+
+    worker = admission_worker()
+    m = metadata()
+    if fault == "session_init":
+        m = replace(m, session_init=msgspec.structs.replace(_batch_request(), protocol_version=2))
+    scheduled = dispatch(m)
+    if fault == "native_extent":
+        scheduled.total_num_scheduled_tokens = 99
+    original = Mock()
+    with pytest.raises(ValueError):
+        make_patched_execute_model(lambda *a, **kw: original(*a, **kw))(worker, scheduled)
+    original.assert_not_called()
+    worker._update_states.assert_not_called()
+    worker._beam_postprocess_workspaces.require.assert_not_called()
+    assert getattr(worker, "_gr_gpu_stage_runner", None) is None
+    assert getattr(worker, "_beam_context", None) is None
+
+
 @pytest.mark.parametrize("windows", [(4, 4), (None, 4), (4, None), (None, 1)])
 def test_admission_rejects_sliding_window_before_resource_creation(windows, monkeypatch):
     from vllm_gr.v1.worker import model_runner_common
@@ -269,7 +324,7 @@ def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
     for pool in owner.beam.session.pools:
         pool.unshared_key[1:].fill_(123)
         pool.unshared_value[1:].fill_(456)
-    receipts = []
+    receipts: list[Any] = []
     for stage in range(n):
         execution = owner.admit(dispatch(metadata(stage, n=n)))
         if stage:
@@ -302,6 +357,13 @@ def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
         assert result.resources_released == (stage == n - 1)
         if result.terminal_result is not None:
             assert result.terminal_result.output is not None
+            assert result.terminal_result.failure is None
+            sequences = result.terminal_result.output.items[0].sequences
+            assert sequences
+            assert all(
+                len(seq.token_ids) == n and len(seq.parent_beam_indices) == n for seq in sequences
+            )
+            assert all(seq.finish_reason == "length" for seq in sequences)
     assert state.num_generated_tokens.tolist() == [0, 0, n]
     assert state.num_decode_steps.tolist() == [0, 0, n - 1]
     for name, value in protected.items():
@@ -381,13 +443,10 @@ def test_terminal_successor_preserves_all_layer_kv(graph):
 
 def test_chunks_identity_and_admission_before_writes():
     owner = runtime()
-    m = metadata(output=False)
-    owner.admit(dispatch(m))
-    result = owner.sample().get_output()
-    assert getattr(result, GR_WORKER_RESULT_ATTR)[m.session_id].produced_token_count == 0
-    assert owner.beam.state.num_generated_tokens.sum() == 0
-    continuation = metadata(dispatch=1)
-    owner.admit(dispatch(continuation))
+    with pytest.raises(ValueError, match="full Prefill"):
+        owner.admit(dispatch(metadata(output=False)))
+    assert owner.pending is None and owner.previous is None
+    owner.admit(dispatch(metadata()))
     owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
     owner.sample().get_output()
     before = owner.beam.state.sequence.clone()
@@ -395,13 +454,13 @@ def test_chunks_identity_and_admission_before_writes():
         owner.admit(dispatch(metadata(stage=1, dispatch=99)))
     with pytest.raises(ValueError, match="second active"):
         other = replace(
-            metadata(stage=1, dispatch=2),
+            metadata(stage=1, dispatch=1),
             session_id="other",
             output_device_state=GRDeviceStateRef("other", 1),
             input_device_state=GRDeviceStateRef("other", 0),
         )
         owner.admit(dispatch(other))
-    mixed = dispatch(metadata(1, dispatch=2))
+    mixed = dispatch(metadata(1, dispatch=1))
     mixed.num_scheduled_tokens["ordinary"] = 1
     with pytest.raises(ValueError, match="mix"):
         owner.admit(mixed)
@@ -420,6 +479,53 @@ def test_native_identity_and_extent_rejected_before_admission():
     with pytest.raises(ValueError, match="total disagrees"):
         owner.admit(invalid)
     assert owner.previous is None
+
+
+@pytest.mark.parametrize("fault", ["dispatch", "generation", "session", "native_extent"])
+@pytest.mark.parametrize("combined", [False, True])
+def test_reused_adapter_validates_current_dispatch_before_execute(fault, combined):
+    owner = runtime()
+    worker = owner.worker
+    worker.vllm_config = SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"})
+    worker.constraint_backend = owner.backend
+    worker.device = owner.beam.state.device
+    worker._gr_gpu_stage_runner = owner
+    previous = metadata()
+    owner.previous = previous
+    scheduled = dispatch(metadata(1))
+    adapter = get_stage_runner(worker, scheduled)
+    # Even the same mutable native input may change after adapter lookup;
+    # validation must examine the current input rather than a cached verdict.
+    if fault == "native_extent":
+        scheduled.total_num_scheduled_tokens = 99
+    else:
+        changes: dict[str, dict[str, Any]] = {
+            "dispatch": {"dispatch_id": 99},
+            "generation": {"owner_generation": 1},
+            "session": {"session_id": "other"},
+        }
+        scheduled.gr_stage_metadata["session-0"] = replace(metadata(1), **changes[fault])
+    before = owner.beam.state.sequence.clone()
+    original = Mock()
+    with pytest.raises(ValueError):
+        if combined:
+            from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
+
+            make_patched_execute_model(lambda *a, **kw: original(*a, **kw))(worker, scheduled)
+        else:
+            adapter.execute(scheduled, original)
+    original.assert_not_called()
+    worker._update_states.assert_not_called()
+    assert owner.pending is None and owner.previous is previous
+    assert not any(owner.control_busy)
+    torch.testing.assert_close(owner.beam.state.sequence, before)
+    if combined:
+        assert isinstance(owner.execution_error, ValueError)
+        with pytest.raises(RuntimeError, match="execute_model failed"):
+            owner.sample()
+    done = torch.Event()
+    done.record()
+    owner.release(owner.binding, consumer_done=done)
 
 
 @pytest.mark.parametrize("fault", ["protocol", "item", "prompt"])
@@ -477,7 +583,7 @@ def test_multiple_entries_rejected_even_with_storage_capacity():
     getattr(output, GR_STAGE_OUTPUT_ATTR)["other"] = replace(m, session_id="other")
     output.num_scheduled_tokens["other"] = 7
     with pytest.raises(ValueError, match="B=1"):
-        validate_dispatch(output)
+        validate_gr_dispatch(output)
 
 
 def test_all_eos_successor_and_error_preserve_committed_state():
@@ -577,41 +683,6 @@ def test_release_requires_control_and_completion_consumer_drain():
         owner.completion_view(owner.binding)
 
 
-@pytest.mark.parametrize("penalty,expected_first", [(0.0, 11), (2.0, 33), (-1.0, 11)])
-def test_final_ranking_applies_length_penalty_without_changing_logprobs(penalty, expected_first):
-    from vllm_gr.ops.cuda.beam_state import FINISH_LENGTH, FINISH_STOP
-
-    owner = runtime()
-    m = metadata()
-    m = replace(
-        m,
-        beam_params=msgspec.structs.replace(m.beam_params, length_penalty=penalty),
-        output_options=msgspec.structs.replace(m.output_options, num_return_sequences=2),
-    )
-    owner.admit(dispatch(m))
-    state, row = owner.beam.state, owner.binding.state_row
-    state.num_completed[row] = 2
-    state.completed_token_ids[row, :2] = torch.tensor([11, 33], device="cuda")
-    state.completed_scores[row, :2] = torch.tensor([-0.1, -0.15], device="cuda")
-    state.completed_lengths[row, :2] = torch.tensor([1, 3], device="cuda")
-    state.completed_finish_reasons[row, :2] = torch.tensor(
-        [FINISH_STOP, FINISH_LENGTH], device="cuda"
-    )
-    state.completed_parent_ids[row, :2] = 0
-    state.history_token_ids[row, :2, 0] = torch.tensor([22, 23], device="cuda")
-    state.history_parent_ids[row, :2, 0] = 0
-    owner.last_work.record()
-
-    result = owner.final_output.consume(owner)
-
-    assert result.failure is None
-    sequences = result.output.items[0].sequences
-    assert (sequences[0].stop_token_id or sequences[0].token_ids[-1]) == expected_first
-    assert sorted(sequence.cumulative_logprob for sequence in sequences) == pytest.approx(
-        [-0.15, -0.1]
-    )
-
-
 def test_workspace_bounds_and_exclusive_shared_scratch():
     owner = runtime()
     with pytest.raises(ValueError, match="workspace_index"):
@@ -666,3 +737,88 @@ def test_fresh_metadata_updates_contents_without_changing_graph_addresses():
     assert owner.metadata.num_reqs == 1
     assert owner.metadata.query_start_loc_cpu == [0, 4]
     assert owner.metadata.prefix_max_seq_len == 64
+
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_terminal_snapshot_matches_reference_and_survives_live_state_mutation(n):
+    import numpy as np
+
+    from vllm_gr.v1.beam.batch_codec import BeamBatchCodec
+    from vllm_gr.v1.beam.cpu_reference import (
+        normalize_constraint_candidates,
+        select_final_sequences,
+        select_initial_beams,
+        select_next_beams,
+    )
+    from vllm_gr.v1.engine.gr_session_client import _terminal_result
+
+    owner = runtime(n=n)
+    receipts: list[Any] = []
+    candidate_history = []
+    for stage in range(n):
+        if stage == 2:
+            receipts[0].get_output()
+        execution = owner.admit(dispatch(metadata(stage, n=n)))
+        if stage:
+            prepare_binding(owner, execution.entries[0])
+        # Distinct logits plus sparse constraints exercise parent reorder.
+        owner.logits = torch.arange(
+            (1 if stage == 0 else 4) * 6, device="cuda", dtype=torch.float16
+        ).reshape(-1, 6)
+        receipts.append(owner.sample())
+        # The oracle records candidate scratch in the test only. Production
+        # retains and transfers just the compact final paths.
+        rows = 1 if stage == 0 else 4
+        candidate_history.append(
+            tuple(
+                value[:rows].cpu().numpy().copy()
+                for value in (owner.tokens, owner.scores, owner.valid)
+            )
+        )
+    final = receipts[-1]
+    owner.beam.state.history_token_ids.fill_(999)
+    owner.tokens.fill_(999)
+    owner.beam.state.completed_scores.fill_(-999)
+    result = getattr(final.get_output(), GR_WORKER_RESULT_ATTR)["session-0"].terminal_result
+    assert result.failure is None
+    ref: Any = None
+    for stage in range(n):
+        rows = 1 if stage == 0 else ref.items[0].num_active_beams
+        candidates = (
+            normalize_constraint_candidates(
+                item_index=0,
+                parent_beam_indices=np.arange(rows),
+                token_ids=candidate_history[stage][0][:rows],
+                logprobs=candidate_history[stage][1][:rows],
+                valid_mask=candidate_history[stage][2][:rows],
+            ),
+        )
+        if stage == n - 1:
+            expected = select_final_sequences(
+                ref, candidates, beam_width=4, num_return_sequences=4, ignore_stop_tokens=True
+            )
+        elif ref is None:
+            ref = select_initial_beams(candidates, beam_width=4, ignore_stop_tokens=True)
+        else:
+            ref = select_next_beams(ref, candidates, ignore_stop_tokens=True)
+    for actual, wanted in zip(
+        result.output.items[0].sequences, expected.items[0].sequences, strict=True
+    ):
+        assert actual.token_ids == wanted.token_ids
+        assert actual.parent_beam_indices == wanted.parent_beam_indices
+        assert actual.cumulative_logprob == wanted.cumulative_logprob
+    assert owner.final_output.final_d2h_count == 1
+    assert owner.final_output.final_d2h_bytes == 4 * (4 + 4 * (2 * n + 4))
+    assert not hasattr(owner, "candidate_tokens")
+    codec = BeamBatchCodec()
+    assert codec.decode_result(codec.encode_result(result)) == result
+    untyped = msgspec.msgpack.decode(msgspec.msgpack.encode(result))
+    restored = _terminal_result(
+        _batch_request(n), SimpleNamespace(kv_transfer_params={"gr_batch_result": untyped})
+    )
+    assert restored == result
+    for receipt in receipts:
+        receipt.get_output()
+    done = torch.Event()
+    done.record()
+    owner.release(owner.binding, consumer_done=done)

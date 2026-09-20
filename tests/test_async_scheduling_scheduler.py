@@ -79,10 +79,10 @@ def scheduler(tmp_path, request):
         scheduler_config=SchedulerConfig(
             max_model_len=64,
             is_encoder_decoder=False,
-            max_num_batched_tokens=16,
+            max_num_batched_tokens=64,
             max_num_seqs=4,
             async_scheduling=True,
-            enable_chunked_prefill=True,
+            enable_chunked_prefill=False,
         ),
         additional_config={"vllm_gr_beam_execution_mode": "v1", "vllm_gr_beam_max_width": 4},
     )
@@ -142,6 +142,7 @@ def receipt(scheduled, *, finished=None, released=None):
             m.output_device_state,
             worker_finished,
             resources_released=resources_released,
+            owner_generation=m.owner_generation,
         )
     out = ModelRunnerOutput(
         req_ids=ids, req_id_to_index={r: i for i, r in enumerate(ids)}, sampled_token_ids=sampled
@@ -150,7 +151,7 @@ def receipt(scheduled, *, finished=None, released=None):
     return out
 
 
-def release_receipt(scheduled):
+def release_receipt(scheduled: Any) -> ModelRunnerOutput:
     m = getattr(scheduled, GR_RETIRE_OUTPUT_ATTR)
     out = ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
     setattr(
@@ -200,18 +201,37 @@ def test_early_terminal_releases_on_last_lookahead_receipt(scheduler):
     assert list(next_output.num_scheduled_tokens) == ["B"]
 
 
-def test_chunked_prefill_saturates_without_output_placeholders(scheduler):
-    a = add(scheduler, "A", prompt=49)
+def test_chunked_prefill_rejected_before_registration(scheduler):
+    scheduler.scheduler_config.enable_chunked_prefill = True
+    with pytest.raises(ValueError, match="enable_chunked_prefill=False"):
+        add(scheduler, "A", prompt=49)
+    assert not getattr(scheduler, "_gr_v1_sessions", {})
+    assert not getattr(scheduler, "_gr_owner", None)
+
+
+def test_stale_owner_release_proof_cannot_finalize_draining_session(scheduler):
+    session = add(scheduler, "A")
     add(scheduler, "B")
-    first, second = scheduler.schedule(), scheduler.schedule()
-    assert first.num_scheduled_tokens == second.num_scheduled_tokens == {"A": 16}
-    assert scheduler.requests["A"].num_output_placeholders == 0
-    assert a.issued_stages == 0
-    assert len(scheduler.kv_cache_manager.get_blocks("A").blocks[0]) == 4
-    assert scheduler.schedule().total_num_scheduled_tokens == 0
-    assert scheduler.requests["A"].num_computed_tokens == 32
-    scheduler.update_from_output(first, receipt(first))
-    assert scheduler.schedule().num_scheduled_tokens == {"A": 16}
+    first, successor = scheduler.schedule(), scheduler.schedule()
+    scheduler.update_from_output(first, receipt(first, finished=True, released=False))
+
+    stale = receipt(successor, finished=True, released=True)
+    results = getattr(stale, GR_WORKER_RESULT_ATTR)
+    results["A"] = replace(results["A"], owner_generation=session.owner_generation + 1)
+    scheduler.update_from_output(successor, stale)
+
+    assert session.worker_resources_allocated
+    assert session.resource_status is GRResourceStatus.DRAINING
+    assert not session._terminal_emitted
+    assert scheduler._gr_owner == "A"
+    assert session._pending_terminal_result.failure.code == "worker_protocol_error"
+
+    retirement = scheduler.schedule()
+    assert getattr(retirement, GR_RETIRE_OUTPUT_ATTR).session_id == "A"
+    scheduler.update_from_output(retirement, release_receipt(retirement))
+    assert session.resource_status is GRResourceStatus.CLOSED
+    assert session._terminal_emitted
+    assert list(scheduler.schedule().num_scheduled_tokens) == ["B"]
 
 
 def test_last_cancelled_request_keeps_work_until_release(scheduler):
@@ -265,7 +285,7 @@ def test_temporary_kv_shortage_applies_backpressure(scheduler):
     assert scheduler.schedule().total_num_scheduled_tokens == 0
     assert not session.worker_resources_allocated
     pool.free_blocks(held)
-    assert scheduler.schedule().num_scheduled_tokens == {"A": 16}
+    assert scheduler.schedule().num_scheduled_tokens == {"A": 33}
     assert len(scheduler.kv_cache_manager.get_blocks("A").blocks[0]) == 3
 
 
@@ -371,3 +391,49 @@ def test_prefix_cache_hit_reuses_only_full_prompt_blocks(scheduler):
     m = getattr(output, GR_STAGE_OUTPUT_ATTR)["B"]
     assert m.produces_output and m.stage_index == 0
     assert len(scheduler.kv_cache_manager.get_blocks("B").blocks[0]) == 3
+
+
+def test_duplicate_receipt_never_reenters_native_accounting(scheduler):
+    session = add(scheduler, "A")
+    first = scheduler.schedule()
+    second = scheduler.schedule()
+    native = scheduler.requests["A"]
+    assert session.issued_stages == 2
+    scheduler.update_from_output(first, receipt(first))
+    before = (
+        native.num_output_tokens,
+        native.num_output_placeholders,
+        tuple(block.ref_cnt for block in scheduler.kv_cache_manager.get_blocks("A").blocks[0]),
+    )
+    assert scheduler.update_from_output(first, receipt(first)) == {}
+    after = (
+        native.num_output_tokens,
+        native.num_output_placeholders,
+        tuple(block.ref_cnt for block in scheduler.kv_cache_manager.get_blocks("A").blocks[0]),
+    )
+    assert before == after
+    assert session._in_flight_dispatches == {1}
+    assert scheduler.requests["A"] is native
+    scheduler.update_from_output(second, receipt(second))
+
+
+def test_worker_input_detaches_retained_native_blocks(scheduler):
+    from vllm_gr.v1.worker.gr_execution import worker_input
+
+    add(scheduler, "A")
+    scheduled = scheduler.schedule()
+    view = worker_input(scheduled)
+    original = scheduled.scheduled_new_reqs[0]
+    local = view.scheduled_new_reqs[0]
+    original_blocks = tuple(tuple(group) for group in original.block_ids)
+    local.block_ids[0].append(999)
+    local.prompt_token_ids.append(999)
+    local.sampling_params.stop_token_ids = [999]
+    view.num_scheduled_tokens["A"] = 256
+    view.total_num_scheduled_tokens = 256
+    assert tuple(tuple(group) for group in original.block_ids) == original_blocks
+    assert original.prompt_token_ids == [1] * 7
+    assert original.sampling_params.stop_token_ids == []
+    assert scheduled.num_scheduled_tokens == {"A": 7}
+    assert scheduled.total_num_scheduled_tokens == 7
+    assert view.gr_stage_metadata is scheduled.gr_stage_metadata

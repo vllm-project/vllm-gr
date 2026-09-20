@@ -5,6 +5,8 @@
 
 from collections import deque
 from queue import Queue
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import msgspec
 import pytest
@@ -24,7 +26,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputSequence,
     BeamRequestOutput,
 )
-from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus
+from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, initialize_gr_admission
 from vllm_gr.v1.engine.core import _handle_submit_gr_session
 from vllm_gr.v1.engine.engine_core_patch import apply_engine_core_request_patches
 from vllm_gr.v1.engine.gr_async_scheduler import (
@@ -57,6 +59,7 @@ def bare_core(scheduler, cls):
     if not hasattr(kv_cache_utils, "NONE_HASH"):
         kv_cache_utils.init_none_hash(sha256)
     core.request_block_hasher = get_request_block_hasher(16, sha256)
+    initialize_gr_admission(core)
     return core
 
 
@@ -97,7 +100,7 @@ def worker_receipt(scheduler, scheduled):
                 continue
             request = scheduler._gr_v1_sessions[session_id].request
             # CPU fixture for the terminal consumer contract. This tests
-            # delivery/release, not model generation or the A5 adapter.
+            # delivery/release, not model generation or the device adapter.
             sequences = tuple(
                 BeamOutputSequence(
                     token_ids=(3,) * request.beam_params.max_tokens,
@@ -158,9 +161,11 @@ def test_rejected_queued_gr_add_returns_error_then_valid_request_completes(core,
         bad = msgspec.structs.replace(bad, beam_params=params)
     free = core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     core._handle_submit_gr_session(bad)
-    # The input thread only preprocesses and queues; admission has not run.
-    assert core.input_queue.qsize() == 1
-    assert core.output_queue.empty()
+    # Public budget mismatches fail before ADD. Runtime KV/width admission
+    # remains on the core thread, before registering any owner.
+    assert core.input_queue.qsize() == (0 if rejection == "budget" else 1)
+    if rejection != "budget":
+        assert core.output_queue.empty()
     assert not getattr(core.scheduler, "_gr_v1_sessions", {})
     core._process_input_queue()
     assert_one_error(core, "bad")
@@ -275,3 +280,191 @@ def test_shutdown_add_keeps_native_abort_semantics(core):
     assert core.output_queue.empty()
     assert not core.scheduler.requests
     assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+
+
+def test_core_checks_once_and_scheduler_consumes_each_submission(core, monkeypatch):
+    from vllm_gr.v1.engine import beam_search_v1 as contract
+    from vllm_gr.v1.engine import gr_async_scheduler
+
+    validate = Mock(wraps=contract.validate_gr_request)
+    unexpected = Mock(side_effect=AssertionError("repeated admission check"))
+    monkeypatch.setattr(contract, "validate_gr_request", validate)
+    for module in (contract, gr_async_scheduler):
+        for name in ("validate_gr_execution_config", "validate_gr_device_config"):
+            monkeypatch.setattr(module, name, unexpected)
+    monkeypatch.setattr(gr_async_scheduler, "validate_gr_request", unexpected)
+    for name in ("first", "second"):
+        core._handle_submit_gr_session(batch(name))
+        _, (native, _) = core.input_queue.queue[0]
+        admission = native._gr_request_admission
+        assert admission.runtime is core.scheduler._gr_admission_runtime
+        core._process_input_queue()
+        assert not hasattr(native, "_gr_request_admission")
+        complete(core, name)
+    assert validate.call_count == 2
+    unexpected.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request_id", "changed"),
+        ("prompt_token_ids", []),
+        ("prompt_embeds", object()),
+        ("mm_features", [object()]),
+        ("lora_request", object()),
+        ("pooling_params", object()),
+        ("sampling_params", None),
+        ("ignore_eos", False),
+        ("max_tokens", 1),
+        ("n", 2),
+        ("prompt_length", 8),
+    ],
+)
+def test_mutation_between_core_validation_and_scheduler_add_is_rejected(core, field, value):
+    request = batch("changed-in-queue")
+    core._handle_submit_gr_session(request)
+    native = request.items[0].request
+    if field in ("ignore_eos", "max_tokens", "n"):
+        setattr(native.sampling_params, field, value)
+    elif field == "prompt_length":
+        native.prompt_token_ids.append(value)
+    else:
+        setattr(native, field, value)
+    core._process_input_queue()
+    assert_one_error(core, "changed-in-queue")
+    assert not core.scheduler.requests
+    assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+    assert getattr(core.scheduler, "_gr_owner_generation", 0) == 0
+
+
+@pytest.mark.parametrize("replacement", ["other_request", "other_runtime", "invalid_receipt"])
+def test_admission_cannot_be_reused_for_another_request_or_runtime(core, replacement):
+    from dataclasses import replace
+
+    request = batch("target")
+    core._handle_submit_gr_session(request)
+    _, (native, _) = core.input_queue.queue[0]
+    admission = native._gr_request_admission
+    if replacement == "other_request":
+        native.gr_batch_request = batch("target")
+    elif replacement == "other_runtime":
+        native._gr_request_admission = replace(admission, runtime=replace(admission.runtime))
+    else:
+        native._gr_request_admission = True
+    core._process_input_queue()
+    assert_one_error(core, "target")
+    assert not core.scheduler.requests
+
+
+@pytest.mark.parametrize("container", ["items", "stop_token_ids"])
+def test_mutable_contract_containers_keep_scheduler_validation(core, container):
+    request = batch("mutable-contract")
+    if container == "items":
+        request = msgspec.structs.replace(request, items=list(request.items))
+    else:
+        params = msgspec.structs.replace(request.beam_params, stop_token_ids=[2])
+        request = msgspec.structs.replace(request, beam_params=params)
+    core._handle_submit_gr_session(request)
+    _, (native, _) = core.input_queue.queue[0]
+    assert not hasattr(native, "_gr_request_admission")
+    if container == "items":
+        request.items[0] = msgspec.structs.replace(request.items[0], item_index=1)
+    else:
+        request.beam_params.stop_token_ids.append(-1)
+    core._process_input_queue()
+    assert_one_error(core, "mutable-contract")
+    assert not core.scheduler.requests
+    assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+
+
+def _startup_core():
+    config = SimpleNamespace(
+        additional_config={"vllm_gr_beam_execution_mode": "v1", "vllm_gr_beam_max_width": 4},
+        scheduler_config=SimpleNamespace(async_scheduling=True, enable_chunked_prefill=False),
+        device_config=SimpleNamespace(device="cuda"),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        model_config=SimpleNamespace(dtype="torch.bfloat16"),
+    )
+    return SimpleNamespace(
+        vllm_config=config,
+        scheduler=SimpleNamespace(vllm_config=config),
+        batch_queue=deque(),
+        batch_queue_size=2,
+    )
+
+
+@pytest.mark.parametrize(
+    "section,field,value,message",
+    [
+        ("scheduler_config", "async_scheduling", False, "async_scheduling=True"),
+        ("scheduler_config", "enable_chunked_prefill", True, "enable_chunked_prefill=False"),
+        ("scheduler_config", "long_prefill_token_threshold", 1, "partial Prefill"),
+        ("device_config", "device", "npu", "GPU V1 required"),
+        ("parallel_config", "tensor_parallel_size", 2, "TP/PP/DP/DCP/PCP=1"),
+        ("model_config", "dtype", "torch.float32", "FP16 or BF16"),
+        ("model_config", "is_multimodal_model", True, "uniform text decoder"),
+        ("model_config", "quantization", "awq", "quantization"),
+    ],
+)
+def test_invalid_static_contract_is_rejected_at_initialization(section, field, value, message):
+    core = _startup_core()
+    setattr(getattr(core.vllm_config, section), field, value)
+    with pytest.raises(ValueError, match=message):
+        initialize_gr_admission(core)
+    assert not hasattr(core, "_gr_admission_runtime")
+    assert not hasattr(core.scheduler, "_gr_admission_runtime")
+
+
+@pytest.mark.parametrize("size", [0, 1])
+def test_missing_batch_queue_is_rejected_at_initialization(size):
+    core = _startup_core()
+    core.batch_queue_size = size
+    with pytest.raises(RuntimeError, match="non-blocking EngineCore batch queue"):
+        initialize_gr_admission(core)
+
+
+def test_missing_fixed_width_is_rejected_at_initialization():
+    core = _startup_core()
+    del core.vllm_config.additional_config["vllm_gr_beam_max_width"]
+    with pytest.raises(ValueError, match="beam_max_width to be fixed at startup"):
+        initialize_gr_admission(core)
+
+
+def test_legacy_initialization_does_not_require_v1_constraints(monkeypatch):
+    from vllm_gr.v1.engine import beam_search_v1 as contract
+
+    core = _startup_core()
+    core.vllm_config.additional_config = {}
+    core.vllm_config.scheduler_config.async_scheduling = False
+    core.vllm_config.device_config.device = "cpu"
+    unexpected = Mock(side_effect=AssertionError("legacy initialized a V1 contract"))
+    monkeypatch.setattr(contract, "validate_gr_execution_config", unexpected)
+    initialize_gr_admission(core)
+    assert core._gr_admission_runtime is None
+    assert core.scheduler._gr_admission_runtime is None
+    unexpected.assert_not_called()
+
+
+def test_nested_engine_constructors_validate_before_input_start_once(monkeypatch):
+    from vllm_gr.v1.engine import beam_search_v1 as contract
+    from vllm_gr.v1.engine.engine_core_patch import make_patched_engine_core_init
+
+    validate = Mock(wraps=contract.validate_gr_execution_config)
+    monkeypatch.setattr(contract, "validate_gr_execution_config", validate)
+
+    def base_init(core):
+        core.__dict__.update(_startup_core().__dict__)
+
+    base = make_patched_engine_core_init(base_init)
+
+    def proc_init(core):
+        base(core)
+        assert core._gr_admission_runtime is core.scheduler._gr_admission_runtime
+        assert core._gr_admission_runtime.capacity.beam_width == 4
+        core.input_started = True
+
+    core = SimpleNamespace()
+    make_patched_engine_core_init(proc_init)(core)
+    assert core.input_started
+    validate.assert_called_once()

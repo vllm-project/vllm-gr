@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import regex as re
@@ -288,19 +289,85 @@ def main():
             beam_max_width = gen_config.get("num_beams", 1)
         logger.info(f"Beam KV pool upper bound (beam_max_width): {beam_max_width}")
         logger.info(f"\nInitializing vLLM with model: {args.model}")
-        try:
-            llm = GRLLM(
-                model=args.model,
-                trust_remote_code=True,
-                max_logprobs=gen_config.get("num_beams", 1) * 2,
+        # Select the V1 execution path for the GPU accuracy gate. Legacy mode
+        # retains its existing engine configuration.
+        beam_v1_mode = os.environ.get("VLLM_GR_BENCHMARK_V1") == "1"
+        beam_v1_kwargs: dict = {}
+        if beam_v1_mode:
+            # Compile the canonical Constraint Table before EngineCore startup
+            # so graph capture can use it. Workers load it through vllm_gr_config.
+            from tempfile import TemporaryDirectory
+
+            from transformers import AutoConfig, AutoTokenizer
+
+            from vllm_gr.constraints.artifact import save_constraint_table_artifact
+            from vllm_gr.constraints.artifact_compiler import (
+                ConstraintTableArtifactCompiler,
+            )
+            from vllm_gr.constraints.json_compiler import compile_relations_json
+            from vllm_gr.constraints.tokenizer_digest import compute_tokenizer_digest
+
+            tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+            vocab_size = AutoConfig.from_pretrained(args.model, trust_remote_code=True).vocab_size
+            document = json.loads(Path(args.catalog_path).read_text())
+            catalog = [[t["a"], t["b"], t["c"]] for t in document["triples"]]
+            tokenizer_digest = compute_tokenizer_digest(tokenizer)
+            table = ConstraintTableArtifactCompiler(
+                tokenizer, vocab_size, tokenizer_digest=tokenizer_digest
+            ).compile(compile_relations_json(catalog))
+            artifact_dir = TemporaryDirectory(prefix="issue398_v1_table_")
+            artifact = Path(artifact_dir.name) / "video_constraints.safetensors"
+            digest = save_constraint_table_artifact(table, artifact)
+            effective_steps = int(gen_config["max_new_tokens"]) - 2
+            v1_config = {
+                "schema_version": 1,
+                "attention_backend": "CUSTOM",
+                "beam": {
+                    "execution_mode": "v1",
+                    "graph_enabled": True,
+                    "worker_decision": True,
+                    "max_width": beam_max_width,
+                    "max_decode_steps": effective_steps,
+                },
+                "constraint_table": {
+                    "enabled": True,
+                    "backend": "cuda",
+                    "max_top_k": beam_max_width,
+                    "path": str(artifact),
+                    "format": "constraint_table_v1",
+                    "artifact_digest": digest,
+                    "tokenizer_digest": tokenizer_digest,
+                },
+            }
+            beam_v1_kwargs = dict(
+                vllm_gr_config=v1_config,
+                async_scheduling=True,
+                max_num_seqs=1,
+                enable_chunked_prefill=False,
+                enable_prefix_caching=True,
+            )
+            # The canonical table rides vllm_gr_config; keep the driver-side
+            # convenience installers off in V1 mode.
+            logger.info("VLLM_GR_BENCHMARK_V1=1: using beam_search_v1 execution mode")
+        gr_llm_kwargs: dict = dict(
+            model=args.model,
+            trust_remote_code=True,
+            max_logprobs=gen_config.get("num_beams", 1) * 2,
+            gpu_memory_utilization=0.7,
+        )
+        if beam_v1_mode:
+            gr_llm_kwargs.update(beam_v1_kwargs)
+        else:
+            gr_llm_kwargs.update(
                 catalog_path=args.catalog_path if args.catalog_path is not None else None,
                 constraint_backend=args.constraint_backend,
                 beam_max_width=beam_max_width,
                 attention_config={
                     "backend": args.backend if args.backend is not None else "CUSTOM"
                 },
-                gpu_memory_utilization=0.7,
             )
+        try:
+            llm = GRLLM(**gr_llm_kwargs)
         except Exception as e:
             logger.error(f"Failed to initialize vLLM: {e}")
             sys.exit(1)
@@ -311,7 +378,13 @@ def main():
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    loader = DataLoaderWrapper(tokenizer=tokenizer, data_dir=args.dataset_path)
+    custom_input_len = os.environ.get("VLLM_GR_ACC_CUSTOM_INPUT_LEN")
+    loader = DataLoaderWrapper(
+        tokenizer=tokenizer,
+        data_dir=args.dataset_path,
+        custom_input_len=int(custom_input_len) if custom_input_len else None,
+        truncate_side=os.environ.get("ONEREC_TRUNCATE_SIDE", "head"),
+    )
     split = task_config.get("splits", ["test"])[0]
     dataset = loader.load_data(
         task_name=args.task_type,
@@ -357,9 +430,14 @@ def main():
             params.end_token = "<|sid_end|>"
         prompts_dict = [{"prompt": prompt} for prompt in prompts]
         gen_start = time.perf_counter()
-        raw_offline_outputs = llm.beam_search(
-            prompts_dict, params, concurrency_limit=args.max_concurrency
-        )
+        if beam_v1_mode:
+            # beam_search_v1's public contract is one prompt per call (B=1).
+            params.ignore_eos = True
+            raw_offline_outputs = [llm.beam_search_v1([item], params)[0] for item in prompts_dict]
+        else:
+            raw_offline_outputs = llm.beam_search(
+                prompts_dict, params, concurrency_limit=args.max_concurrency
+            )
         assert len(raw_offline_outputs) == len(prompts)
         gen_end = time.perf_counter()
 
@@ -382,6 +460,32 @@ def main():
                 mock_completions.append(MockCompletionOutput(str(raw_output)))
 
             outputs.append(MockRequestOutput(prompts[i], mock_completions))
+
+        # Optionally retain ranked output text and scores for contract comparisons.
+        dump_path = os.environ.get("VLLM_GR_DUMP_SEQUENCES")
+        if dump_path:
+            import hashlib
+
+            dump = []
+            for i, raw_output in enumerate(raw_offline_outputs):
+                dump.append(
+                    {
+                        "prompt_sha256": hashlib.sha256(
+                            prompts[i].encode("utf-8", "replace")
+                        ).hexdigest(),
+                        "sequences": [
+                            {
+                                "cum_logprob": getattr(s, "cum_logprob", None),
+                                "rank_text": (
+                                    s.text[len(prompts[i]) :] if hasattr(s, "text") else str(s)
+                                ),
+                            }
+                            for s in getattr(raw_output, "sequences", [])
+                        ],
+                    }
+                )
+            Path(dump_path).write_text(json.dumps(dump, ensure_ascii=False))
+            logger.info(f"Dumped beam sequences to {dump_path}")
 
     # Print a sample output
     if outputs:

@@ -374,6 +374,41 @@ def test_result_rejects_invalid_finish_reason_and_bad_length_output() -> None:
         )
 
 
+@pytest.mark.parametrize("field", ["token_ids", "parent_beam_indices"])  # type: ignore[misc]
+@pytest.mark.parametrize("index", [0, 1, 2])  # type: ignore[misc]
+@pytest.mark.parametrize("bad_value", [-1, True, False, 1.0, "1", None])  # type: ignore[misc]
+def test_result_rejects_invalid_integer_fields_with_exact_location(
+    field: str, index: int, bad_value: object
+) -> None:
+    values: list[object] = [0, 1, 0]
+    values[index] = bad_value
+    sequence = BeamOutputSequence((1, 2, 3), -1.0, (0, 1, 0), "length", None)
+    sequence = msgspec.structs.replace(sequence, **{field: tuple(values)})
+    # Exercise a later item and sequence so diagnostics retain their full path.
+    first = BeamRequestOutput(0, "request-0", ())
+    second = BeamRequestOutput(
+        1, "request-1", (BeamOutputSequence((1,), -1.0, (0,), "length", None), sequence)
+    )
+    result = BeamBatchResult(1, "batch", BeamBatchOutput((first, second)), None)
+    with pytest.raises(BeamContractError) as exc:
+        validate_beam_batch_result(result)
+    assert str(exc.value) == (
+        f"output.items[1].sequences[1].{field}[{index}] must be a non-negative integer, "
+        f"got {bad_value!r}"
+    )
+
+
+def test_result_accepts_zero_and_integer_subclasses() -> None:
+    class Integer(int):
+        pass
+
+    sequence = BeamOutputSequence((0, Integer(1)), -1.0, (Integer(0), 1), "length", None)
+    result = BeamBatchResult(
+        1, "batch", BeamBatchOutput((BeamRequestOutput(0, "request-0", (sequence,)),)), None
+    )
+    validate_beam_batch_result(result)
+
+
 def test_failure_item_index_is_context_checked() -> None:
     plan = _plan()
     result = BeamBatchResult(

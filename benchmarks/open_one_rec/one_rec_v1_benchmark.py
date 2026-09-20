@@ -46,6 +46,7 @@ def run_v1_benchmark(args, tokenizer, requests):
         end_token="<|sid_end|>",
         include_stop_str_in_output=True,
         length_penalty=1.0,
+        ignore_eos=True,
     )
     engine_config = dict(
         async_scheduling=True,

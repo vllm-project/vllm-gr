@@ -35,6 +35,13 @@ if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is
 
 
 async def beam_search_test(loops: int) -> None:
+    # Earlier NPU tests initialize torch_npu in this main pytest process; the
+    # default fork start method then fails EngineCore startup with "Cannot
+    # re-initialize NPU in forked subprocess" (upstream _maybe_force_spawn()
+    # only checks CUDA/XPU). Same workaround as _run_gr_beam_search_target
+    # below and tests/test_offline_beam_search.py.
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
     raw_gpu_memory_utilization = os.getenv("VLLM_GR_TEST_GPU_MEMORY_UTILIZATION", "0.7")
     try:

@@ -1,3 +1,4 @@
+import os
 import random
 
 from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
@@ -23,6 +24,7 @@ class OneRecDataset(BenchmarkDataset):
         custom_input_len: int | None = None,
         sample_size: int | None = None,
         enable_thinking: bool | None = None,
+        truncate_side: str | None = None,
         tokenizer: TokenizerLike | None = None,
         # BenchmarkDataset parent params, declared explicitly so they are
         # discoverable on the signature instead of hidden in **kwargs.
@@ -54,6 +56,12 @@ class OneRecDataset(BenchmarkDataset):
         self.custom_input_len = custom_input_len
         self.sample_size = sample_size
         self.enable_thinking = enable_thinking
+        # Which end of an over-long prompt survives custom_input_len trimming.
+        # Env override (ONEREC_TRUNCATE_SIDE=head|tail) keeps the benchmark CLI
+        # unchanged while allowing tail-preserving tasks like interactive.
+        self.truncate_side = truncate_side or os.environ.get("ONEREC_TRUNCATE_SIDE", "head")
+        if self.truncate_side not in ("head", "tail"):
+            raise ValueError(f"truncate_side must be 'head' or 'tail', got {self.truncate_side!r}")
 
         # Explicitly forward parent params. tokenizer is NOT in kwargs anymore,
         # so BenchmarkDataset.__init__ never receives an unknown field.
@@ -69,6 +77,7 @@ class OneRecDataset(BenchmarkDataset):
             data_dir=self.dataset_path,
             enable_thinking=self.enable_thinking,
             custom_input_len=self.custom_input_len,
+            truncate_side=self.truncate_side,
         )
 
         self.load_data()

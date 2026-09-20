@@ -114,7 +114,7 @@ def assert_finished(core, names):
         _, output = core.output_queue.get_nowait()
         results.extend(out for out in output.outputs if out.finish_reason is not None)
     assert [out.request_id for out in results] == names
-    assert all(out.finish_reason is FinishReason.STOP for out in results)
+    assert all(out.finish_reason is FinishReason.LENGTH for out in results)
     for out in results:
         terminal = out.kv_transfer_params["gr_batch_result"]
         assert terminal.failure is None
@@ -183,7 +183,8 @@ def test_keep_retains_active_state_and_kv_after_in_flight_drain(core, in_flight)
     if paused is not None:
         assert paused.done() and paused.result() is None
     assert active.issued_stages == issued == 1
-    assert active.confirmed_token_count == 1
+    assert native.num_output_tokens == 1
+    assert native.num_output_placeholders == 0
     assert active.owner_generation == generation
     assert active.resource_status is GRResourceStatus.RUNNING
     assert waiting.resource_status is GRResourceStatus.WAITING

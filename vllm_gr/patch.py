@@ -281,6 +281,29 @@ def _validate_kv_hash_memo_patch() -> str | None:
     return None
 
 
+def _validate_attention_backend_registration() -> str | None:
+    """Verify the Beam backend is registered for Backend.CUSTOM resolution."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+
+    if not AttentionBackendEnum.CUSTOM.is_overridden():
+        return "Beam attention backend is not registered for Backend.CUSTOM"
+    try:
+        backend_class = AttentionBackendEnum.CUSTOM.get_class()
+    except Exception as exc:
+        return (
+            "Backend.CUSTOM registration does not resolve to the Beam "
+            f"attention backend ({type(exc).__name__}: {exc})"
+        )
+    return _verified(
+        backend_class is BeamAttentionBackend,
+        "Backend.CUSTOM resolves to "
+        f"{backend_class.__module__}.{backend_class.__qualname__} instead "
+        "of the Beam attention backend",
+    )
+
+
 def _validate_engine_core_request_group() -> str | None:
     failures = tuple(
         detail
@@ -384,6 +407,12 @@ def _engine_core_beam_patches() -> tuple[BeamPatch, ...]:
 
     return (
         patch(
+            "attention_backend",
+            "vllm_gr.v1.engine.engine_core_patch",
+            "apply_attention_backend_registration",
+            _validate_attention_backend_registration,
+        ),
+        patch(
             "engine_core_requests",
             "vllm_gr.v1.engine.engine_core_patch",
             "apply_engine_core_request_patches",
@@ -449,6 +478,29 @@ def _initialize_beam_patch_plan(patches: tuple[BeamPatch, ...]) -> BeamPatchRepo
 
         results.append(result)
         logger.info("Beam patch %s status=%s", patch.name, result.status.value)
+
+    # Applying the model runner patch imports vllm-ascend, whose attention
+    # module rebinds Backend.CUSTOM to vllm-ascend's own backend after the
+    # attention registration patch was already verified. Re-assert that
+    # registration once every patch has been applied so the final process
+    # state keeps the verified contract.
+    attention_patch = next((patch for patch in patches if patch.name == "attention_backend"), None)
+    if attention_patch is not None:
+        try:
+            attention_patch.apply()
+            verification_error = _validate_attention_backend_registration()
+            if verification_error is not None:
+                raise RuntimeError(verification_error)
+        except Exception as exc:
+            result = BeamPatchResult(
+                attention_patch.name,
+                BeamPatchStatus.FAILED,
+                f"{type(exc).__name__}: {exc}",
+            )
+            results.append(result)
+            _LAST_BEAM_PATCH_REPORT = BeamPatchReport(tuple(results))
+            logger.exception("Required Beam patch %s regressed", attention_patch.name)
+            raise BeamPatchInitializationError(_LAST_BEAM_PATCH_REPORT) from exc
 
     _LAST_BEAM_PATCH_REPORT = BeamPatchReport(tuple(results))
     return _LAST_BEAM_PATCH_REPORT

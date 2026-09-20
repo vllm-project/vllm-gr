@@ -8,7 +8,7 @@ import gc
 import threading
 import weakref
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -318,6 +318,12 @@ def test_sync_entrypoint_retries_cleanup_before_exiting(operation: str) -> None:
         def prepare_request(self, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
             return _request()
 
+        def build_output(
+            self, call: OfflineBeamSearchRequest, result: BeamBatchResult
+        ) -> list[Any]:
+            assert result.failure is not None
+            raise BeamSearchEngineError(result.failure)
+
         def close(self, session: BeamSearchSession) -> None:
             super().close(session)
             assert session.closed
@@ -425,24 +431,27 @@ def test_submission_rollback_fences_delayed_acceptance() -> None:
     asyncio.run(run())
 
 
-def test_a5_output_conversion_is_available_before_submission() -> None:
-    from vllm_gr.entrypoints.beam_search_v1.output_processor import (
-        BeamSearchOutputProcessor,
-    )
-
-    assert BeamSearchOutputProcessor.ensure_available() is None
-
-
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
-def test_terminal_failure_precedes_tokenizer_access(online: bool) -> None:
-    failure = BeamBatchFailure("beam_device_error", "original device failure", 0)
-    result = BeamBatchResult(BEAM_BATCH_PROTOCOL_VERSION, "session-1", None, failure)
-    with pytest.raises(BeamSearchEngineError) as caught:
-        if online:
-            client = AsyncBeamSearchClient(SimpleNamespace(engine_client=object()))
-            call = OnlineBeamSearchRequest([1, 2], "external", object())
-        else:
-            client = BeamSearchClient(SimpleNamespace(llm_engine=object()))
-            call = OfflineBeamSearchRequest([[1, 2]], object())
-        client.build_output(call, _request(), result)
-    assert caught.value.failure is failure
+def test_fatal_engine_cleanup_propagates_without_retry(online: bool) -> None:
+    from unittest.mock import Mock
+
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    session = BeamSearchSession("dead", "dead", object())
+    if online:
+        abort = AsyncMock(side_effect=EngineDeadError())
+        client = AsyncBeamSearchClient(
+            SimpleNamespace(engine_client=SimpleNamespace(abort_gr_session=abort))
+        )
+        with pytest.raises(EngineDeadError):
+            asyncio.run(client.close(session))
+        abort.assert_awaited_once()
+    else:
+        abort = Mock(side_effect=EngineDeadError())
+        client = BeamSearchClient(
+            SimpleNamespace(llm_engine=SimpleNamespace(abort_gr_session=abort))
+        )
+        with pytest.raises(EngineDeadError):
+            client.close(session)
+        abort.assert_called_once()
+    assert not session.closed
