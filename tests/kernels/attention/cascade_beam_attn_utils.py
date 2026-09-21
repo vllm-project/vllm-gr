@@ -163,6 +163,7 @@ def prepare_inputs(
 
 def iter_beam_segments(
     inputs: BeamAttnInputs,
+    cache_len: int | None = None,
 ) -> Iterator[tuple[int, int, torch.Tensor, torch.Tensor]]:
     """Replays the cascade metadata builder's per-beam bookkeeping.
 
@@ -171,6 +172,10 @@ def iter_beam_segments(
     ground-truth ``[prefix || suffix]`` KV segment (KV-head layout, not yet
     head-expanded) that beam attends to, and
     ``query[q_start : q_start + q_uncached]`` is the query slice it produces.
+
+    *cache_len* overrides the recompute-path default (block-aligned prefix
+    length) so a caller can replay a chunked-prefill step that already has
+    cached suffix KV in the paged cache (the ``suffix_past_coords`` case).
 
     Both device references (flash-attn packing on GPU, per-beam causal
     softmax on NPU) build on top of this same decomposition; only what they
@@ -188,7 +193,9 @@ def iter_beam_segments(
         steps = inputs.suffix_kv_len
         w = inputs.beam_width
 
-        b_cache_len = prefix_len // inputs.block_size * inputs.block_size
+        b_cache_len = (
+            cache_len if cache_len is not None else prefix_len // inputs.block_size * inputs.block_size
+        )
         chunk_budget = inputs.q_seq_len * inputs.beam_width
 
         for b in range(w):
@@ -224,6 +231,76 @@ def iter_beam_segments(
             b_cache_len += b_uncached
 
 
+def run_incremental_reference(
+    inputs: BeamAttnInputs,
+    vllm_flash_attn_version: int = 2,
+) -> torch.Tensor:
+    """Dense attention reference for incremental decode semantics.
+
+    Each beam contributes exactly 1 query token and attends to its complete
+    shared prefix + ``suffix_kv_len`` suffix KV rows (``decode_step + 1``).
+
+    This is what ``cascade_attention`` with the pool path or the gather path
+    must produce.  The existing ``iter_beam_segments`` uses recompute
+    semantics (chunking) and is NOT suitable for the incremental case.
+    """
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    device = inputs.query.device
+    w = inputs.beam_width
+    prefix_len = inputs.shared_tokens_len
+    suffix_len = inputs.suffix_kv_len
+    beam_seq_len = prefix_len + w * suffix_len
+
+    # Unpack the first request's block table to get dense KV.
+    phys_blocks = inputs.block_tables[0]
+    k_seq = inputs.key_cache[phys_blocks].flatten(0, 1)[:beam_seq_len]
+    v_seq = inputs.value_cache[phys_blocks].flatten(0, 1)[:beam_seq_len]
+    prefix_k = k_seq[:prefix_len]   # [prefix_len, H, D]
+    prefix_v = v_seq[:prefix_len]
+
+    # Per-beam suffix slice: [prefix_len + i*suffix_len : prefix_len + (i+1)*suffix_len]
+    dense_k_parts = []
+    dense_v_parts = []
+    seqlens_k = []
+    for i in range(w):
+        start = prefix_len + i * suffix_len
+        beam_k = torch.cat([prefix_k, k_seq[start : start + suffix_len]], dim=0)
+        beam_v = torch.cat([prefix_v, v_seq[start : start + suffix_len]], dim=0)
+        dense_k_parts.append(beam_k)
+        dense_v_parts.append(beam_v)
+        seqlens_k.append(prefix_len + suffix_len)
+
+    k_tensor = torch.cat(dense_k_parts, dim=0)
+    v_tensor = torch.cat(dense_v_parts, dim=0)
+
+    cu_seqlens_k = (
+        torch.tensor([0] + seqlens_k, dtype=torch.int32, device=device)
+        .cumsum(dim=0)
+        .to(torch.int32)
+    )
+    cu_seqlens_q = torch.arange(0, w + 1, dtype=torch.int32, device=device)
+
+    output = torch.zeros_like(inputs.query)
+    flash_attn_varlen_func(
+        q=inputs.query,
+        k=k_tensor,
+        v=v_tensor,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=1,
+        max_seqlen_k=prefix_len + suffix_len,
+        softmax_scale=inputs.scale,
+        causal=True,
+        window_size=(-1, -1),
+        softcap=inputs.soft_cap,
+        fa_version=vllm_flash_attn_version,
+    )
+    torch.accelerator.synchronize()
+    return output
+
+
 class MockCommonAttentionMetadata:
     def __init__(self, inputs: BeamAttnInputs, device: torch.device | str):
         self.num_reqs = inputs.num_reqs
@@ -247,24 +324,36 @@ def build_beam_attn_metadata(
     inputs: BeamAttnInputs,
     device: torch.device | str,
     npu_causal_atten_mask: torch.Tensor | None = None,
+    beam_session: Any = None,
+    decode_step: int | None = None,
 ) -> Any:
     """Builds attn_metadata via BeamAttentionMetadataBuilder, wiring the
-    BEAM_DATA_VAR contextvar the same way both device tests need."""
+    BEAM_DATA_VAR contextvar the same way both device tests need.
+
+    When *beam_session* and *decode_step* are supplied the builder takes
+    the incremental decode path (one query per beam + decode_step+1 suffix
+    KV rows).  Otherwise it falls back to the recompute/gather path.
+    """
     common_attn_metadata = MockCommonAttentionMetadata(inputs, device)
 
     beam_info: dict[str, Any] = {
         "beam_data": {},
         "req_ids": [f"req_{i}" for i in range(inputs.num_reqs)],
     }
+    if beam_session is not None:
+        beam_info["beam_session"] = beam_session
     beam_data = cast(dict[str, Any], beam_info["beam_data"])
     for i in range(inputs.num_reqs):
-        beam_data[f"req_{i}"] = {
+        entry: dict[str, Any] = {
             "is_beam_decode": True,
             "prefix_len": inputs.shared_tokens_len,
             "beam_width": inputs.beam_width,
             "beam_decode_steps": inputs.suffix_kv_len,
             "cache_len": inputs.shared_tokens_len // inputs.block_size * inputs.block_size,
         }
+        if decode_step is not None:
+            entry["decode_step"] = decode_step
+        beam_data[f"req_{i}"] = entry
 
     token = BEAM_DATA_VAR.set(beam_info)
     try:

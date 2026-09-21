@@ -299,3 +299,44 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
             assert sequence.cumulative_logprob is not None
         owner.request_release(GRRetireMetadata("session-0", 0, budget)).get_output()
         assert owner.graph is graph
+
+
+def test_build_async_is_pool_path_not_gather():
+    """V1 incremental decode must stay on the persistent-pool path.
+
+    The async builder emits one query per beam and reads suffix KV from the
+    session pool (``suffix_cu_seqlens_k_device`` offsets into the packed pool
+    slice).  It must NOT fall back to the recompute/gather path that pr1's
+    chunked-prefill projection fixes — that path would need ``suffix_past_coords``
+    / ``suffix_curr_coords`` and a populated ``suffix_slot_mapping_out``.
+    """
+    width = 4
+    m = replace(metadata(2, n=3), num_prompt_tokens=16)
+    binding = SimpleNamespace(session_id=m.session_id)
+    buffers = GRInputBuffers(width, 96, 16, "cuda")
+    prepared = buffers.prepare_cpu(m, binding, block_ids=[[1, 2]], slot=0)
+    views = buffers.upload(prepared)
+    session = SimpleNamespace(context=SimpleNamespace(max_decode_steps=8))
+    built = BeamAttentionMetadataBuilder.build_async(
+        layout=prepared.layout,
+        views=views,
+        session=session,
+        mask=torch.ones(width, device="cuda", dtype=torch.bool),
+        slots=torch.full((width,), -1, device="cuda", dtype=torch.int64),
+        block_size=16,
+        max_model_len=96,
+        num_heads=1,
+        num_kv_heads=1,
+    )
+    # Pool path semantics: no gather-side coordinates, session-bound.
+    assert built.is_beam_decode is True
+    assert built.beam_session is session
+    assert built.incremental_suffix_kv_len == 2
+    assert built.suffix_past_coords is None
+    assert built.suffix_curr_coords is None
+    assert built.suffix_slot_mapping_out is None
+    # Per-beam boundary: one query, decode_step+1 = 4 suffix KV rows.
+    assert built.suffix_max_q_len == 1
+    assert built.suffix_seqlens_kv_cpu == [2] * width
+    assert built.suffix_cu_seqlens_kv_cpu == [0, 2, 4, 6, 8]
+    assert built.suffix_total_tokens == 8

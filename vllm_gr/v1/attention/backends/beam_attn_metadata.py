@@ -93,6 +93,23 @@ class BeamAttentionMetadata:
     suffix_seqlens_kv_cpu: list | None = None
     suffix_cu_seqlens_kv_cpu: list | None = None
 
+    # Logical coordinates used to rebuild suffix physical slots when vLLM
+    # refreshes the block table between cache groups/chunks.  Incremental
+    # decode reads its resident beam pool and intentionally leaves these empty.
+    suffix_past_coords: torch.Tensor | None = None  # [N, 4]: out, req, block, offset
+    suffix_curr_coords: torch.Tensor | None = None  # [N, 2]: out, query
+
+    # CPU-derived layout facts about the coordinate lists above, captured
+    # while the lists are built (plain Python ints/bools).  The projection
+    # and block-table-rebuild paths must consult these instead of reading
+    # CUDA tensor values on the host (torch.equal / .max().item() force a
+    # device synchronization and put a bubble into the metadata path).
+    suffix_past_out_contiguous: bool = False
+    suffix_curr_out_contiguous: bool = False
+    suffix_past_max_req: int = -1
+    suffix_past_max_blk_col: int = -1
+    suffix_curr_max_query: int = -1
+
     # Slicing variables for block table updates
     std_req_idxs_cpu: list | None = None
     prefix_req_idxs_cpu: list | None = None
@@ -782,7 +799,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         max_prefix_len = max(beam_prefix_lens) if beam_prefix_lens else 0
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
-        out_slot = 0
         # Incremental decode emits ``prefix_indices`` as a single contiguous
         # ``range(q_start, q_start + w)`` per request, so the device-side
         # strided-arange fast path in ``_create_beam_tensors`` is always valid
@@ -847,7 +863,24 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     b, prefix_len, b_cache_len, steps, chunk_budget
                 )
 
-                full_mapping = np.arange(out_slot, out_slot + b_suffix_len, dtype=np.int32)
+                # A chunk can contain a cached suffix followed by current query
+                # tokens.  The former must be projected through the request's
+                # block table; the latter through slot_mapping.  Treating both
+                # as query offsets corrupts suffix KV for chunked prefill.
+                # Past tokens use a tuple (projection path); current tokens
+                # use a plain int (fast path when no past exists).
+                if b_past_suffix > 0:
+                    if prefix_len >= b_cache_len:
+                        b_suffix_start = b_cache_len
+                    else:
+                        b_suffix_start = prefix_len + b_physical * steps
+                    for suffix_offset in range(b_past_suffix):
+                        beam_suffix_slot_mapping_out_list.append(
+                            ("past", req_idx, b_suffix_start + suffix_offset)
+                        )
+
+                for query_offset in range(b_uncached):
+                    beam_suffix_slot_mapping_out_list.append(q_curr + query_offset)
 
                 # Invariant: Merge adjacent beams that share the exact same prefix length
                 # into a single prefix group to parallelize key/value lookup during attention.
@@ -856,7 +889,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 else:
                     prefix_groups.append([q_curr, b_uncached, b_prefix_len])
 
-                beam_suffix_slot_mapping_out_list.extend(full_mapping)
                 suffix_seqlens_q_cpu.append(b_uncached)
                 suffix_seqlens_kv_cpu.append(b_suffix_len)
 
@@ -864,7 +896,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 b_cache_len += b_uncached
                 q_curr += b_uncached
                 chunk_budget -= b_uncached
-                out_slot += b_uncached
                 b_prefix_len = min(b_cache_len, prefix_len)
 
             # Loop 2: Record grouped prefix indexing lists for the attention kernel
@@ -1116,6 +1147,18 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 suffix_cu_seqlens_k_device,
                 suffix_max_q_len,
                 prefix_scheduler_metadata,
+                None,
+                None,
+                # No suffix coordinates on the no-prefix path: the layout
+                # facts stay at their neutral defaults (guards in
+                # update_block_table/_project skip when coords are absent).
+                {
+                    "past_out_contiguous": False,
+                    "curr_out_contiguous": False,
+                    "past_max_req": -1,
+                    "past_max_blk_col": -1,
+                    "curr_max_query": -1,
+                },
             )
 
         num_prefix = len(prefix_indices)
@@ -1188,19 +1231,122 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         if suffix_slot_mapping_out_list:
             suffix_total_tokens = len(suffix_slot_mapping_out_list)
-            if num_prefix > 0:
-                suffix_map_tensor = torch.tensor(
+            if isinstance(suffix_slot_mapping_out_list[0], int):
+                # Fast path: every entry is a plain current-query offset (no
+                # cached suffix).  Project through slot_mapping in one
+                # vectorized op — no per-token Python coordinate lists, no
+                # device reads on the host.
+                mapping_tensor = torch.tensor(
                     suffix_slot_mapping_out_list, dtype=torch.long, device=device
-                ).clamp_(0, num_prefix - 1)
-                global_chunk_token_indices = prefix_indices_tensor[suffix_map_tensor]
+                )
                 suffix_slot_mapping_out = common_attn_metadata.slot_mapping[
-                    global_chunk_token_indices
+                    mapping_tensor
                 ].to(dtype=torch.int32)
+                # Keep the current coordinates for update_block_table: they
+                # map output rows to query tokens and project through the
+                # refreshed slot_mapping (vectorized, no Python loop).
+                suffix_curr_coords = torch.stack(
+                    [
+                        torch.arange(
+                            suffix_total_tokens, dtype=torch.long, device=device
+                        ),
+                        mapping_tensor,
+                    ],
+                    dim=1,
+                )
+                suffix_past_coords = None
+                suffix_coord_layout = {
+                    "past_out_contiguous": True,
+                    "curr_out_contiguous": True,
+                    "past_max_req": -1,
+                    "past_max_blk_col": -1,
+                    "curr_max_query": max(suffix_slot_mapping_out_list),
+                }
             else:
-                suffix_slot_mapping_out = self._empty_slot_out(device)
+                # Slow path: the chunk mixes cached-suffix (past) tokens with
+                # current-query tokens, so the projection needs the block
+                # table for the past coordinates and slot_mapping for the
+                # current ones.  Derive the projection hints on the host
+                # while the coordinate lists are built: whether each list
+                # covers every output row contiguously, plus the
+                # row/block/query maxima used by the block-table-rebuild
+                # bounds checks.  This keeps the projection and rebuild
+                # paths free of device reads (no host sync).
+                past_coords_list = []
+                curr_coords_list = []
+                past_out_contiguous = True
+                curr_out_contiguous = True
+                past_next_out = 0
+                curr_next_out = 0
+                past_max_req = -1
+                past_max_blk_col = -1
+                curr_max_query = -1
+                for output_index, item in enumerate(suffix_slot_mapping_out_list):
+                    if isinstance(item, tuple) and item[0] == "past":
+                        _, req_idx, past_token = item
+                        past_coords_list.append(
+                            (
+                                output_index,
+                                req_idx,
+                                past_token // self.block_size,
+                                past_token % self.block_size,
+                            )
+                        )
+                        past_max_req = max(past_max_req, req_idx)
+                        past_max_blk_col = max(
+                            past_max_blk_col, past_token // self.block_size
+                        )
+                        if output_index != past_next_out:
+                            past_out_contiguous = False
+                        past_next_out = output_index + 1
+                    else:
+                        query_index = item[1] if isinstance(item, tuple) else item
+                        curr_coords_list.append((output_index, query_index))
+                        curr_max_query = max(curr_max_query, query_index)
+                        if output_index != curr_next_out:
+                            curr_out_contiguous = False
+                        curr_next_out = output_index + 1
+
+                suffix_past_coords = (
+                    torch.tensor(past_coords_list, dtype=torch.long, device=device)
+                    if past_coords_list
+                    else None
+                )
+                suffix_curr_coords = (
+                    torch.tensor(curr_coords_list, dtype=torch.long, device=device)
+                    if curr_coords_list
+                    else None
+                )
+                suffix_coord_layout = {
+                    "past_out_contiguous": past_out_contiguous,
+                    "curr_out_contiguous": curr_out_contiguous,
+                    "past_max_req": past_max_req,
+                    "past_max_blk_col": past_max_blk_col,
+                    "curr_max_query": curr_max_query,
+                }
+                suffix_slot_mapping_out = self._project_suffix_slot_mapping(
+                    common_attn_metadata.slot_mapping,
+                    common_attn_metadata.block_table_tensor,
+                    self.block_size,
+                    suffix_total_tokens,
+                    suffix_past_coords,
+                    suffix_curr_coords,
+                    device,
+                    past_out_contiguous=past_out_contiguous,
+                    curr_out_contiguous=curr_out_contiguous,
+                )
         else:
             suffix_total_tokens = 0
             suffix_slot_mapping_out = self._empty_slot_out(device)
+            suffix_past_coords = None
+            suffix_curr_coords = None
+            suffix_coord_layout = {
+                "past_out_contiguous": False,
+                "curr_out_contiguous": False,
+                "past_max_req": -1,
+                "past_max_blk_col": -1,
+                "curr_max_query": -1,
+            }
 
         if self._fixed_buffers:
             num_prefix_groups = len(prefix_seqlens_kv_cpu)
@@ -1326,6 +1472,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_k_device,
             suffix_max_q_len,
             prefix_scheduler_metadata,
+            suffix_past_coords,
+            suffix_curr_coords,
+            suffix_coord_layout,
         )
 
     def build(
@@ -1578,6 +1727,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_k_device,
             suffix_max_q_len,
             prefix_scheduler_metadata,
+            suffix_past_coords,
+            suffix_curr_coords,
+            suffix_coord_layout,
         ) = self._create_beam_tensors(
             common_attn_metadata,
             prefix_indices,
@@ -1652,6 +1804,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_cu_seqlens_q_cpu=suffix_cu_seqlens_q_cpu,
             suffix_seqlens_kv_cpu=suffix_seqlens_kv_cpu,
             suffix_cu_seqlens_kv_cpu=suffix_cu_seqlens_kv_cpu,
+            suffix_past_coords=suffix_past_coords,
+            suffix_curr_coords=suffix_curr_coords,
+            suffix_past_out_contiguous=suffix_coord_layout["past_out_contiguous"],
+            suffix_curr_out_contiguous=suffix_coord_layout["curr_out_contiguous"],
+            suffix_past_max_req=suffix_coord_layout["past_max_req"],
+            suffix_past_max_blk_col=suffix_coord_layout["past_max_blk_col"],
+            suffix_curr_max_query=suffix_coord_layout["curr_max_query"],
             num_std_indices=len(std_indices) if std_indices else 0,
             num_prefix_indices=len(prefix_indices) if prefix_indices else 0,
             max_num_splits=max_num_splits,
@@ -1684,12 +1843,85 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             common_attn_metadata=common_attn_metadata,
         )
 
+    @staticmethod
+    def _project_suffix_slot_mapping(
+        slot_mapping: torch.Tensor,
+        block_table: torch.Tensor,
+        block_size: int,
+        suffix_total_tokens: int,
+        past_coords: torch.Tensor | None,
+        curr_coords: torch.Tensor | None,
+        device: torch.device,
+        past_out_contiguous: bool = False,
+        curr_out_contiguous: bool = False,
+    ) -> torch.Tensor:
+        """Project cached/current suffix coordinates to physical KV slots."""
+        if suffix_total_tokens == 0:
+            return torch.empty(0, dtype=torch.int32, device=device)
+
+        has_past = past_coords is not None and past_coords.numel() > 0
+        has_curr = curr_coords is not None and curr_coords.numel() > 0
+        if not has_past and not has_curr:
+            raise ValueError("non-empty suffix mapping has no logical coordinates")
+
+        if has_curr and not has_past:
+            assert curr_coords is not None
+            curr_slots = slot_mapping[curr_coords[:, 1]].to(torch.int32)
+            if curr_out_contiguous and curr_coords.shape[0] == suffix_total_tokens:
+                return curr_slots
+            output = torch.empty(suffix_total_tokens, dtype=torch.int32, device=device)
+            output[curr_coords[:, 0]] = curr_slots
+            return output
+
+        if has_past and not has_curr:
+            assert past_coords is not None
+            past_blocks = block_table[past_coords[:, 1], past_coords[:, 2]].to(torch.int32)
+            past_slots = past_blocks * block_size + past_coords[:, 3].to(torch.int32)
+            if past_out_contiguous and past_coords.shape[0] == suffix_total_tokens:
+                return past_slots
+            output = torch.empty(suffix_total_tokens, dtype=torch.int32, device=device)
+            output[past_coords[:, 0]] = past_slots
+            return output
+
+        assert past_coords is not None and curr_coords is not None
+        output = torch.empty(suffix_total_tokens, dtype=torch.int32, device=device)
+        past_blocks = block_table[past_coords[:, 1], past_coords[:, 2]].to(torch.int32)
+        output[past_coords[:, 0]] = past_blocks * block_size + past_coords[:, 3].to(torch.int32)
+        output[curr_coords[:, 0]] = slot_mapping[curr_coords[:, 1]].to(torch.int32)
+        return output
+
     def update_block_table(
         self,
         metadata: BeamAttentionMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> BeamAttentionMetadata:
+        if metadata.std_req_idxs_cpu and max(metadata.std_req_idxs_cpu) >= blk_table.shape[0]:
+            raise ValueError("updated block table does not contain every standard request row")
+        if metadata.prefix_req_idxs_cpu and max(metadata.prefix_req_idxs_cpu) >= blk_table.shape[0]:
+            raise ValueError("updated block table does not contain every prefix request row")
+        # The bounds are host-side layout facts captured at build time —
+        # reading the CUDA tensors here (.max().item()) would synchronize the
+        # compute stream on every block-table refresh.
+        if (
+            metadata.suffix_past_coords is not None
+            and metadata.suffix_past_coords.numel() > 0
+            and metadata.suffix_past_max_req >= blk_table.shape[0]
+        ):
+            raise ValueError("updated block table does not contain every suffix request row")
+        if (
+            metadata.suffix_past_coords is not None
+            and metadata.suffix_past_coords.numel() > 0
+            and metadata.suffix_past_max_blk_col >= blk_table.shape[1]
+        ):
+            raise ValueError("updated block table does not contain every suffix block column")
+        if (
+            metadata.suffix_curr_coords is not None
+            and metadata.suffix_curr_coords.numel() > 0
+            and metadata.suffix_curr_max_query >= slot_mapping.shape[0]
+        ):
+            raise ValueError("updated slot mapping does not contain every suffix query row")
+
         new_metadata = copy.copy(metadata)
         new_metadata.block_table = blk_table
         new_metadata.slot_mapping = slot_mapping
@@ -1719,5 +1951,18 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 new_metadata.prefix_block_table = blk_table[
                     metadata.prefix_req_idxs_cpu, : metadata.max_prefix_blocks_count
                 ].contiguous()
+
+        if metadata.suffix_total_tokens > 0:
+            new_metadata.suffix_slot_mapping_out = self._project_suffix_slot_mapping(
+                slot_mapping,
+                blk_table,
+                metadata.block_size,
+                metadata.suffix_total_tokens,
+                metadata.suffix_past_coords,
+                metadata.suffix_curr_coords,
+                blk_table.device,
+                past_out_contiguous=metadata.suffix_past_out_contiguous,
+                curr_out_contiguous=metadata.suffix_curr_out_contiguous,
+            )
 
         return new_metadata
