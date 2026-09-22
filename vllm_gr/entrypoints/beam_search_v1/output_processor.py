@@ -100,9 +100,13 @@ def _can_share_prompt_decode(tokenizer: Any, prepared_prompt: Sequence[int]) -> 
 
 
 class _V1BeamTailMaterializer:
-    """Populate one V1 Beam on first public access using PR380's lazy class."""
+    """Materialize V1 Beam fields independently on first public access."""
 
-    __slots__ = ("_tokenizer", "_prepared", "_shared_prompt", "_prompt_text")
+    __slots__ = ("_prepared", "_prompt_text", "_shared_prompt", "_tokenizer")
+
+    _TOKENS_PENDING = 1
+    _TEXT_PENDING = 2
+    _ALL_PENDING = _TOKENS_PENDING | _TEXT_PENDING
 
     def __init__(self, tokenizer: Any, prepared_prompt: Sequence[int]) -> None:
         self._tokenizer = tokenizer
@@ -110,12 +114,47 @@ class _V1BeamTailMaterializer:
         self._shared_prompt: bool | None = None
         self._prompt_text: str | None = None
 
-    def __call__(self, beam: Any) -> None:
+    @staticmethod
+    def _full_tokens(prepared: Sequence[int], suffix: Sequence[int]) -> list[int]:
+        full = list(prepared)
+        full.extend(suffix)
+        return full
+
+    def _finish_fields(self, beam: Any, completed: int) -> None:
+        # Absence means both fields are pending. Delaying this bookkeeping
+        # until first access preserves PR415's minimal build_output hot path.
+        pending = int(beam.__dict__.get("_v1_pending_fields", self._ALL_PENDING))
+        pending &= ~completed
+        if pending:
+            beam.__dict__["_v1_pending_fields"] = pending
+            return
+
         from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 
-        suffix = beam.__dict__.pop("_v1_suffix")
-        full = list(self._prepared)
-        full.extend(suffix)
+        beam.__dict__.pop("_v1_pending_fields", None)
+        beam.__dict__.pop("_v1_suffix", None)
+        beam.__dict__["_lazy_materializer"] = None
+        beam.__class__ = BeamSearchSequence
+
+    def materialize_field(self, beam: Any, name: str) -> None:
+        """Populate only the requested public field when work is required."""
+
+        pending = int(beam.__dict__.get("_v1_pending_fields", self._ALL_PENDING))
+        if name == "logprobs":
+            # V1 does not expose per-token logprobs. The final empty list is
+            # installed during output construction and needs no materialization.
+            return
+        if name == "tokens":
+            if not pending & self._TOKENS_PENDING:
+                return
+            suffix = beam.__dict__["_v1_suffix"]
+            beam.__dict__["tokens"] = self._full_tokens(self._prepared, suffix)
+            self._finish_fields(beam, self._TOKENS_PENDING)
+            return
+        if name != "text" or not pending & self._TEXT_PENDING:
+            return
+
+        suffix = beam.__dict__["_v1_suffix"]
         if self._shared_prompt is None:
             self._shared_prompt = _can_share_prompt_decode(self._tokenizer, self._prepared)
         if self._shared_prompt:
@@ -123,12 +162,23 @@ class _V1BeamTailMaterializer:
                 self._prompt_text = fast_decode(self._tokenizer, self._prepared)
             text = self._prompt_text + fast_decode(self._tokenizer, suffix)
         else:
+            # Full decoding needs a temporary complete list, but text-only
+            # consumers must not retain or expose ``tokens`` as a side effect.
+            if pending & self._TOKENS_PENDING:
+                full = self._full_tokens(self._prepared, suffix)
+            else:
+                full = beam.__dict__["tokens"]
             text = fast_decode(self._tokenizer, full)
-        beam.__dict__["tokens"] = full
-        beam.__dict__["logprobs"] = []
         beam.__dict__["text"] = text
-        beam.__dict__["_lazy_materializer"] = None
-        beam.__class__ = BeamSearchSequence
+        self._finish_fields(beam, self._TEXT_PENDING)
+
+    def field_assigned(self, beam: Any, name: str) -> None:
+        """Honor user assignments without later overwriting that field."""
+
+        if name == "tokens":
+            self._finish_fields(beam, self._TOKENS_PENDING)
+        elif name == "text":
+            self._finish_fields(beam, self._TEXT_PENDING)
 
 
 class BeamSearchOutputProcessor:

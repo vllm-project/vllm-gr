@@ -109,6 +109,7 @@ def test_output_boundaries_and_lazy_materialization(
     beams = processor.process_outputs(call, request, result)[0].sequences
     assert tokenizer.decode_calls == 0
     assert all(type(beam) is _LazyMaterializedBeamSequence for beam in beams)
+    assert all("_v1_pending_fields" not in beam.__dict__ for beam in beams)
     assert [beam.cum_logprob for beam in beams] == [-1.25, -2.5]
     assert tokenizer.decode_calls == 0
 
@@ -117,9 +118,21 @@ def test_output_boundaries_and_lazy_materialization(
         prefix + [3, 4] + ([20] if end else []),
         prefix + [5] + ([20] if include_stop else []),
     ]
-    getattr(beams[0], first_field)
-    assert tokenizer.decode_calls == 1
-    assert type(beams[0]) is BeamSearchSequence
+    value = getattr(beams[0], first_field)
+    if first_field == "tokens":
+        assert value == expected[0]
+        assert tokenizer.decode_calls == 0
+        assert beams[0].__dict__["text"] is None
+    elif first_field == "text":
+        assert value == "|".join(map(str, expected[0]))
+        assert tokenizer.decode_calls == 1
+        assert beams[0].__dict__["tokens"] == []
+    else:
+        assert value == []
+        assert tokenizer.decode_calls == 0
+        assert beams[0].__dict__["tokens"] == []
+        assert beams[0].__dict__["text"] is None
+    assert type(beams[0]) is _LazyMaterializedBeamSequence
     assert type(beams[1]) is _LazyMaterializedBeamSequence
     for i, beam in enumerate(beams):
         assert beam.tokens == expected[i]
@@ -131,6 +144,45 @@ def test_output_boundaries_and_lazy_materialization(
         assert beam.stop_reason == (None if i == 0 else 20)
     assert tokenizer.decode_calls == 2
     assert request.items[0].request.prompt_token_ids == prefix
+
+
+def test_shared_text_and_tokens_materialize_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.entrypoints.beam_search_v1 import output_processor
+
+    monkeypatch.setattr(output_processor, "_can_share_prompt_decode", lambda *_: True)
+    processor, call, request, result, tokenizer = _case()
+    beams = processor.process_outputs(call, request, result)[0].sequences
+
+    assert beams[0].tokens == [1, 2, 10, 3, 4, 20]
+    assert tokenizer.decode_calls == 0
+    assert beams[0].__dict__["text"] is None
+
+    assert beams[1].text == "1|2|10" + "5|20"
+    assert tokenizer.decode_calls == 2
+    assert beams[1].__dict__["tokens"] == []
+
+    assert beams[0].text == "1|2|10" + "3|4|20"
+    assert tokenizer.decode_calls == 3
+    assert type(beams[0]) is BeamSearchSequence
+    assert type(beams[1]) is _LazyMaterializedBeamSequence
+
+
+def test_user_assignment_is_not_overwritten_by_later_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.entrypoints.beam_search_v1 import output_processor
+
+    monkeypatch.setattr(output_processor, "_can_share_prompt_decode", lambda *_: True)
+    processor, call, request, result, tokenizer = _case()
+    beam = processor.process_outputs(call, request, result)[0].sequences[0]
+
+    beam.tokens = [99]
+    assert beam.text == "1|2|10" + "3|4|20"
+    assert beam.tokens == [99]
+    assert tokenizer.decode_calls == 2
+    assert type(beam) is BeamSearchSequence
 
 
 @pytest.mark.parametrize("operation", [copy.copy, replace, asdict])  # type: ignore[misc]

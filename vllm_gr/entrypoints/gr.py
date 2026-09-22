@@ -102,8 +102,8 @@ class _LazyBeamField:
 
     Assignments land directly in the instance ``__dict__`` (the same place a
     plain dataclass field lives), so construction and in-place updates are
-    unchanged.  A read first hands the beam to the per-request materializer
-    exactly once; afterwards the field behaves like an ordinary attribute.
+    unchanged. Field-aware materializers may populate only the requested
+    field; legacy callable materializers retain their one-shot behavior.
     """
 
     __slots__ = ("name",)
@@ -116,12 +116,21 @@ class _LazyBeamField:
             return self
         materializer = obj.__dict__.get("_lazy_materializer")
         if materializer is not None:
-            obj.__dict__["_lazy_materializer"] = None
-            materializer(obj)
+            materialize_field = getattr(materializer, "materialize_field", None)
+            if materialize_field is None:
+                obj.__dict__["_lazy_materializer"] = None
+                materializer(obj)
+            else:
+                materialize_field(obj, self.name)
         return obj.__dict__.get(self.name)
 
     def __set__(self, obj, value):
         obj.__dict__[self.name] = value
+        materializer = obj.__dict__.get("_lazy_materializer")
+        if materializer is not None:
+            field_assigned = getattr(materializer, "field_assigned", None)
+            if field_assigned is not None:
+                field_assigned(obj, self.name)
 
 
 @dataclass
@@ -131,6 +140,7 @@ class _LazyMaterializedBeamSequence(BeamSearchSequence):
     The class body rebinds the three expensive fields to descriptors without
     redeclaring them as dataclass fields (no annotations), so ``fields()``,
     ``replace()`` and the generated ``__init__`` keep working unchanged.
+    Materializers decide whether one field or all fields are populated.
     """
 
     tokens = _LazyBeamField()
