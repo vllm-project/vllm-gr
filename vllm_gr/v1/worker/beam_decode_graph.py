@@ -39,7 +39,10 @@ class BeamDecodeGraph:
         while isinstance(runnable, CUDAGraphWrapper):
             runnable = runnable.unwrap()
         self.wrapper = _BeamDecodeModel(self, runnable)
-        worker.model = self.wrapper
+        # Model ownership is explicit (R1): the wrapper is installed only for
+        # the capture window and restored immediately after, so the native
+        # model is the steady-state ``worker.model``.
+        self.installed = False
 
     @property
     def ready(self) -> bool:
@@ -50,12 +53,41 @@ class BeamDecodeGraph:
         if self.context is not self.worker._beam_context:
             raise RuntimeError("Beam graph context changed after capture")
 
+    def install(self) -> None:
+        """Take over ``worker.model`` so Beam FULL forwards route here."""
+        if self.installed:
+            return
+        if self.worker.model is not self.original_model:
+            raise RuntimeError("Beam graph install conflicts with a foreign model owner")
+        self.worker.model = self.wrapper
+        self.installed = True
+
+    def uninstall(self) -> None:
+        """Restore the native model; replay/eager decode no longer need it."""
+        if not self.installed:
+            return
+        if self.worker.model is not self.wrapper:
+            raise RuntimeError("Beam graph uninstall found an unexpected model owner")
+        self.worker.model = self.original_model
+        self.installed = False
+
     @torch.inference_mode()
     def capture(self, forward: Callable[[bool], Any]) -> None:
         """Run the caller's input adapter twice eager, then capture Forward."""
         if self.ready:
             self._check_context()
             return
+        from vllm_gr.v1.worker.model_runner_common import _use_v2_model_runner
+
+        # V1 replays beam FULL graphs through the native execute_model FULL
+        # branch calling ``worker.model`` — the wrapper must STAY installed
+        # for the engine's lifetime (uninstalled only by shutdown).  V2
+        # (beam_search_v1 stage path) replays explicitly through
+        # ``BeamDecodeGraph.replay()`` and never routes via ``worker.model``,
+        # so the wrapper is scoped to the capture window there.
+        persistent_install = not _use_v2_model_runner()
+        if persistent_install:
+            self.install()
         self.context = self.worker._beam_context
         stream = torch.cuda.current_stream(self.worker.device)
         side = torch.cuda.Stream(device=self.worker.device)  # type: ignore[no-untyped-call]
@@ -64,9 +96,15 @@ class BeamDecodeGraph:
         self.capturing = True
         try:
             with torch.cuda.stream(side):
-                forward(False)
-                forward(False)
-                forward(True)
+                if not persistent_install:
+                    self.install()
+                try:
+                    forward(False)
+                    forward(False)
+                    forward(True)
+                finally:
+                    if not persistent_install:
+                        self.uninstall()
             stream.wait_stream(side)
             stream.synchronize()
             if not self.ready:

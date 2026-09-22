@@ -29,6 +29,36 @@ _WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
 _WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
 _WORKER_MODEL_FORWARD_PATCH_MARKER = "_vllm_gr_prefill_model_forward_patch"
 
+# ModelRunner V2 patch markers.  The V2 runner has a different method surface
+# (``prepare_inputs``/``sample``/``sample_tokens`` instead of
+# ``_prepare_inputs``/``_bookkeeping_sync``/``_sample``), so the V2 wrappers
+# stamp their own markers while sharing the execute_model wrapper (and its
+# marker) with V1.
+_WORKER_V2_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_v2_patch"
+_WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER = "_vllm_gr_beam_sample_tokens_v2_patch"
+# P0 beam steady-state state-machine bypass (V2 only): finish/add wrappers.
+_WORKER_V2_FINISH_REQUESTS_PATCH_MARKER = "_vllm_gr_beam_finish_requests_v2_patch"
+_WORKER_V2_ADD_REQUESTS_PATCH_MARKER = "_vllm_gr_beam_add_requests_v2_patch"
+
+# Canonical Constraint Backend load/shutdown markers.  Defined here (the shared
+# home) so both the V1 dispatcher and the V2-aware validation gate can read the
+# same constants without a circular import.
+_CONSTRAINT_LOAD_PATCH_MARKER = "_vllm_gr_constraint_load_patched"
+_CONSTRAINT_SHUTDOWN_PATCH_MARKER = "_vllm_gr_constraint_shutdown_patched"
+
+
+def _use_v2_model_runner() -> bool:
+    """Return whether the active process opted into the V2 ModelRunner.
+
+    Reads the already-resolved ``vllm.envs.VLLM_USE_V2_MODEL_RUNNER`` flag (the
+    same source ``VllmConfig.use_v2_model_runner`` consults), so the patch
+    dispatcher and the native worker stay in agreement about which runner class
+    was constructed.
+    """
+    from vllm.envs import VLLM_USE_V2_MODEL_RUNNER
+
+    return bool(VLLM_USE_V2_MODEL_RUNNER)
+
 
 def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Safely extracts underlying hardware and host indexing position tensors."""
@@ -999,6 +1029,11 @@ def _reduce_sampler_output_for_worker_decision(runner: Any, sampler_output: Any)
     host_ids = decision.get("_host_token_ids")
     host_scores = decision.get("_host_log_probs")
     host_ranks = decision.get("_host_selected_token_ranks")
+    # The host-staged reduction is a V1 async-output optimization: V1's
+    # bookkeeping already copied the sampler payload to host, so publishing the
+    # O(W) compatibility row from the host copy avoids a second D2H.  (This
+    # helper is V1-only: the V2 sample path was removed with the LEGACY frame
+    # stack.)
     host_ready = bool(
         getattr(runner, "_beam_result_host_ready", False)
         and torch.is_tensor(host_ids)
@@ -1864,6 +1899,56 @@ def _dispatch_stage_frame(self, scheduler_output, orig_execute_model, *args, **k
 _NOT_A_STAGE_FRAME = object()
 
 
+def make_patched_execute_model_v2(_orig_execute_model):
+    """Slim execute_model wrapper for the V2 ModelRunner (beam_search_v1 only).
+
+    Refactor design §4.2: under V2 the beam surface is the persistent GR
+    stage path; the LEGACY ``beam_data`` frame stack (M1 remap / M2 inline
+    sample / session refresh / constraint prelaunch) is not supported.  The
+    wrapper therefore:
+
+    - dispatches retirement and stage control frames (shared helpers);
+    - FAILS FAST on a ``beam_data`` frame — the historical alternative was a
+      silent wrong-beam-results mode when the V1/V2 flag resolved differently
+      than the patch layer assumed (ISSUES §1.1); a loud error names both
+      remediations (execution_mode=v1, or unset the V2 flag);
+    Everything else is the untouched native ``execute_model``.
+    """
+    if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
+        return _orig_execute_model
+
+    @wraps(_orig_execute_model)
+    def _patched_execute_model_step_v2(self, scheduler_output, *args, **kwargs):
+        retirement = _dispatch_retirement_frame(self, scheduler_output)
+        if retirement is not None:
+            return retirement
+
+        stage = _dispatch_stage_frame(self, scheduler_output, _orig_execute_model, *args, **kwargs)
+        if stage is not _NOT_A_STAGE_FRAME:
+            return stage
+
+        if getattr(scheduler_output, "beam_data", {}):
+            raise ValueError(
+                "legacy beam_data frames are not supported under ModelRunnerV2; "
+                "use beam.execution_mode='v1' or unset VLLM_USE_V2_MODEL_RUNNER"
+            )
+
+        return _orig_execute_model(self, scheduler_output, *args, **kwargs)
+
+    @wraps(_orig_execute_model)
+    def patched_execute_model_v2(self, scheduler_output, *args, **kwargs):
+        # Same quiescent-boundary tracking as the V1 wrapper: the GC-freeze
+        # daemon waits for in-flight executions to drain before collecting.
+        _enter_worker_execute()
+        try:
+            return _patched_execute_model_step_v2(self, scheduler_output, *args, **kwargs)
+        finally:
+            _exit_worker_execute()
+
+    setattr(patched_execute_model_v2, _WORKER_EXECUTE_PATCH_MARKER, True)
+    return patched_execute_model_v2
+
+
 def make_patched_execute_model(_orig_execute_model):
     """Wrap execute_model to publish beam-request context for the run.
 
@@ -2026,15 +2111,41 @@ def make_patched_execute_model(_orig_execute_model):
     return patched_execute_model
 
 
+def is_worker_runner_v2_patched(runner_class) -> bool:
+    """Return whether all grouped-beam hooks are present on a V2 runner class.
+
+    The V2 runner (``vllm.v1.worker.gpu.model_runner.GPUModelRunner``) exposes
+    ``sample_tokens`` instead of the V1 ``_bookkeeping_sync`` surface. The
+    required V2 method set is the slim ``execute_model`` and ``sample_tokens``
+    stage bypass plus the canonical Constraint Backend load/shutdown markers.
+    Native ``sample`` remains untouched: V2 supports only beam_search_v1,
+    whose stage runner owns constrained sampling. ``prepare_inputs`` /
+    ``finish_requests`` / ``add_requests`` are NOT patched under V2 — the
+    stage path drives the native state machine directly (``consume_native_state``).
+    """
+    return bool(
+        getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)
+        and getattr(runner_class.sample_tokens, _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False)
+        and getattr(runner_class.load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False)
+        and getattr(runner_class.shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
+    )
+
+
 def is_worker_runner_patched(runner_class) -> bool:
     """Return whether all grouped-beam hooks are present on a runner class.
 
+    Dispatches between the V1 and V2 method surfaces: the V2 runner has a
+    ``prepare_inputs`` method and no ``_prepare_inputs``.
+
     The ``_determine_batch_execution_and_padding`` hook stamps the beam
-    determine marker on all platforms.  On GPU it overrides the dispatch
+    determine marker on all V1 platforms.  On GPU it overrides the dispatch
     result to force FULL CUDA Graph for beam decode; on NPU it is a no-op
     wrapper that preserves the original result — but the marker must still
     be present for the gate-check to pass.
     """
+    if hasattr(runner_class, "prepare_inputs") and not hasattr(runner_class, "_prepare_inputs"):
+        return is_worker_runner_v2_patched(runner_class)
+
     has_determine = hasattr(runner_class, "_determine_batch_execution_and_padding")
     return bool(
         getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)

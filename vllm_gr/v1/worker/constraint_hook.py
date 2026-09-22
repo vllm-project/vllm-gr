@@ -201,7 +201,9 @@ def _temperatures_for_rows(runner: Any, rows: Sequence[int], device: Any) -> tor
 
     Prefers the proxy-mapped per-logits-row temperature on the runner's
     sampling metadata (``InputBatchProxy`` maps it to one entry per logits row);
-    falls back to a scalar ``1.0`` default.  Always float32 on ``device``.
+    falls back to the V2 ``Sampler.sampling_states`` UVA temperature indexed by
+    ``expanded_idx_mapping`` when ``input_batch.sampling_metadata`` is absent;
+    otherwise a scalar ``1.0`` default.  Always float32 on ``device``.
     """
     s_meta = getattr(getattr(runner, "input_batch", None), "sampling_metadata", None)
     temps = getattr(s_meta, "temperature", None) if s_meta is not None else None
@@ -211,7 +213,35 @@ def _temperatures_for_rows(runner: Any, rows: Sequence[int], device: Any) -> tor
             return temps
         if temps.numel() >= max(rows) + 1:
             return temps.index_select(0, torch.tensor(rows, dtype=torch.long, device=temps.device))
+
+    # V2 adapter: no ``sampling_metadata``.  Read per-request temperatures from
+    # the sampler's UVA-backed ``SamplingStates`` and map each logits row back
+    # to its request via ``input_batch.expanded_idx_mapping``.
+    sampler = getattr(runner, "sampler", None)
+    sampling_states = getattr(sampler, "sampling_states", None)
+    gpu_temps = getattr(getattr(sampling_states, "temperature", None), "gpu", None)
+    input_batch = getattr(runner, "input_batch", None)
+    expanded_idx_mapping = getattr(input_batch, "expanded_idx_mapping", None)
+    if isinstance(gpu_temps, torch.Tensor) and gpu_temps.numel() > 0:
+        if gpu_temps.numel() == 1:
+            return gpu_temps.detach().float().to(device)
+        if isinstance(expanded_idx_mapping, torch.Tensor):
+            row_idx = torch.tensor(rows, dtype=torch.long, device=expanded_idx_mapping.device)
+            return gpu_temps[expanded_idx_mapping[row_idx]].detach().float().to(device)
     return torch.tensor([_DEFAULT_TEMPERATURE], dtype=torch.float32, device=device)
+
+
+def _update_async_output_token_ids(runner: Any) -> None:
+    """Refresh async output token ids, no-oping when the batch has no such hook.
+
+    The V1 ``InputBatchProxy`` exposes ``update_async_output_token_ids``; the
+    V2 ``InputBatch`` dataclass does not.  Constraint sampling still works under
+    V2 without that refresh (the V2 async output copies from the sampler output
+    directly), so the call is a no-op there instead of a hard requirement.
+    """
+    update = getattr(getattr(runner, "input_batch", None), "update_async_output_token_ids", None)
+    if callable(update):
+        update()
 
 
 def run_constrained_partition(
@@ -965,14 +995,11 @@ def launch_prepared_cuda_prefill_constraint(
     ):
         return False
 
-    update_async_output_token_ids = getattr(
-        getattr(runner, "input_batch", None),
-        "update_async_output_token_ids",
-        None,
-    )
-    if not callable(update_async_output_token_ids):
-        return False
-    update_async_output_token_ids()
+    # Refresh the V1 InputBatchProxy async-output token ids when present.  The
+    # V2 InputBatch dataclass has no such hook and does not need the refresh
+    # (its async output copies from the sampler output directly), so this is a
+    # no-op there — it must NOT hard-fail the prelaunch on V2.
+    _update_async_output_token_ids(runner)
 
     workspace = prepared.workspace
     width = prepared.width
@@ -1337,16 +1364,9 @@ def try_sample_with_constraint_backend(
             f"exactly once; mapped {expected_start}, expected {logits.shape[0]}"
         )
 
-    update_async_output_token_ids = getattr(
-        getattr(runner, "input_batch", None),
-        "update_async_output_token_ids",
-        None,
-    )
-    if not callable(update_async_output_token_ids):
-        raise RuntimeError(
-            "canonical constrained sampling requires input_batch.update_async_output_token_ids()"
-        )
-    update_async_output_token_ids()
+    # Refresh async output token ids when the batch exposes the hook (V1
+    # InputBatchProxy); the V2 InputBatch has no such hook, so this is a no-op.
+    _update_async_output_token_ids(runner)
 
     workspace_output = _try_sample_into_postprocess_workspace(
         runner,

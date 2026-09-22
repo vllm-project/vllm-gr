@@ -365,3 +365,41 @@ def test_validation_vocab_offset_and_slice_size() -> None:
 
     with pytest.raises(ValueError, match="vocab_slice_size"):
         validate_vocab_slice_size(True)
+
+
+def test_v2_compute_topk_logprobs_clamped_to_sliced_width() -> None:
+    """The V2 sampler's topk must clamp k to the sliced logits width.
+
+    With a narrow catalog vocabulary slice the lm_head produces far fewer
+    columns than a request's num_logprobs (an impossible 3-token catalog
+    slices to one column); the V1 ``gather_logprobs`` clamp cannot reach the
+    V2 worker-local ``compute_topk_logprobs`` because importers bind the name
+    into their own module namespace. The patch must rewrite every importer's
+    binding, and the clamp must keep k inside the slice.
+    """
+
+    import importlib
+
+    import pytest
+
+    from vllm_gr.ops import sliced_logits_patch
+
+    if not torch.cuda.is_available():
+        pytest.skip("V2 compute_topk_logprobs uses a Triton logprob kernel (CUDA only)")
+
+    sliced_logits_patch.apply_sliced_logits_patch()
+
+    # Importers bind the (patched) name at module import; importing after the
+    # patch mirrors the EngineCore worker where the patch runs at startup.
+    sampler = importlib.import_module("vllm.v1.worker.gpu.sample.sampler")
+    logprob = importlib.import_module("vllm.v1.worker.gpu.sample.logprob")
+
+    logits = torch.randn(3, 1, device="cuda")  # one-column slice (impossible catalog)
+    sampled = torch.zeros(3, dtype=torch.int64, device="cuda")  # 1-D per contract
+    # The unpatched function raises "selected index k out of range".
+    out = sampler.compute_topk_logprobs(logits, 5, sampled)
+    assert out.logprob_token_ids.shape[1] == 2  # sampled + clamped top-1
+
+    # The defining module is patched too (clamps at the source).
+    out2 = logprob.compute_topk_logprobs(logits, 5, sampled)
+    assert out2.logprob_token_ids.shape[1] == 2

@@ -151,7 +151,12 @@ def set_gr_constraint_resources(
 
 
 def _verify_runner_sample_hook(worker: Any) -> None:
-    """Raise when the worker's runner lacks the Constraint Table ``_sample`` hook.
+    """Raise when the worker's runner lacks the Constraint Table sample hook.
+
+    Accepts the V1 ``_sample`` hook or the V2 persistent-stage execute /
+    sample_tokens pair. ModelRunner V2 deliberately leaves native ``sample``
+    untouched because its only supported Beam path is beam_search_v1, whose
+    stage runner samples directly from the canonical Constraint Backend.
 
     Only meaningful once ``init_device`` has built ``model_runner`` (the driver
     injects after that point); skipped otherwise so unit tests and mocked
@@ -160,17 +165,32 @@ def _verify_runner_sample_hook(worker: Any) -> None:
     runner = getattr(worker, "model_runner", None)
     if runner is None:
         return
-    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
+    from vllm_gr.v1.worker.model_runner_common import (
+        _WORKER_EXECUTE_PATCH_MARKER,
+        _WORKER_SAMPLE_PATCH_MARKER,
+        _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
+    )
 
-    sample = getattr(type(runner), "_sample", None)
-    if sample is None or not getattr(sample, _WORKER_SAMPLE_PATCH_MARKER, False):
-        raise RuntimeError(
-            "constraint tables require the vllm-gr raw-logits hook on the "
-            f"active runner {type(runner).__name__}, but its _sample is not "
-            "patched (this platform lacks the hook). Constraint Tables cannot "
-            "start on this worker; refusing to degrade to unconstrained "
-            "sampling."
-        )
+    runner_cls = type(runner)
+    v1_sample = getattr(runner_cls, "_sample", None)
+    if v1_sample is not None and getattr(v1_sample, _WORKER_SAMPLE_PATCH_MARKER, False):
+        return
+    if getattr(
+        getattr(runner_cls, "execute_model", None),
+        _WORKER_EXECUTE_PATCH_MARKER,
+        False,
+    ) and getattr(
+        getattr(runner_cls, "sample_tokens", None),
+        _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
+        False,
+    ):
+        return
+    raise RuntimeError(
+        "constraint tables require either the vllm-gr V1 raw-logits hook or "
+        "the V2 persistent-stage execute/sample_tokens hooks on active runner "
+        f"{type(runner).__name__}. Constraint Tables cannot start on this "
+        "worker; refusing to degrade to unconstrained sampling."
+    )
 
 
 def install_worker_resource_hook(worker_cls: type) -> int:

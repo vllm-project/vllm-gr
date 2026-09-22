@@ -46,3 +46,54 @@ def test_native_model_discovery_unwraps_beam_wrapper() -> None:
     model = object.__new__(shared._BeamDecodeModel)
     model.runnable = object()
     assert GPUModelRunner.get_model(SimpleNamespace(model=model)) is model.runnable
+
+
+def test_install_uninstall_roundtrip() -> None:
+    """R1: install takes over worker.model; uninstall restores the native model."""
+    original = object()
+    wrapper = object()
+    graph = object.__new__(shared.BeamDecodeGraph)
+    graph.original_model = original
+    graph.wrapper = wrapper
+    graph.installed = False
+    graph.worker = SimpleNamespace(model=original)
+
+    graph.install()
+    assert graph.worker.model is wrapper
+    assert graph.installed
+
+    graph.uninstall()
+    assert graph.worker.model is original
+    assert not graph.installed
+
+
+def test_install_is_idempotent_and_uninstall_is_idempotent() -> None:
+    original = object()
+    wrapper = object()
+    graph = object.__new__(shared.BeamDecodeGraph)
+    graph.original_model = original
+    graph.wrapper = wrapper
+    graph.installed = False
+    graph.worker = SimpleNamespace(model=original)
+
+    graph.install()
+    graph.install()  # no-op
+    assert graph.worker.model is wrapper
+
+    graph.uninstall()
+    graph.uninstall()  # no-op
+    assert graph.worker.model is original
+
+
+def test_install_conflicts_with_foreign_model_owner() -> None:
+    original = object()
+    wrapper = object()
+    foreign = object()
+    graph = object.__new__(shared.BeamDecodeGraph)
+    graph.original_model = original
+    graph.wrapper = wrapper
+    graph.installed = False
+    graph.worker = SimpleNamespace(model=foreign)
+
+    with pytest.raises(RuntimeError, match="foreign model owner"):
+        graph.install()

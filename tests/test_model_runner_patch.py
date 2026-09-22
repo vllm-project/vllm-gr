@@ -14,6 +14,10 @@ from vllm_gr.v1.worker import gpu_model_runner_patch, model_runner_patch
 def test_dispatcher_selects_one_platform_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This test exercises the V1 platform routing; pin the V2 flag off so an
+    # ambient VLLM_USE_V2_MODEL_RUNNER=1 (e.g. a V2 CI shard) cannot reroute
+    # _active_runner_module_name to the V2 module.
+    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
     # Fake vllm.platforms so the test runs without a real vLLM install.
     fake_platforms = ModuleType("vllm.platforms")
     setattr(fake_platforms, "current_platform", SimpleNamespace(device_type="npu"))
@@ -52,6 +56,10 @@ def test_dispatcher_selects_one_platform_module(
 def test_dispatcher_installs_three_wrappers_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # V1-platform install test: pin the V2 flag off (see
+    # test_dispatcher_selects_one_platform_module).
+    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
+
     class Runner:
         def execute_model(self, scheduler_output: Any) -> None:
             return None
@@ -99,6 +107,9 @@ def test_dispatcher_installs_three_wrappers_once(
 def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # V1-platform install test: pin the V2 flag off (see
+    # test_dispatcher_selects_one_platform_module).
+    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
     from vllm_gr.v1.worker.model_runner_patch import (
         _CONSTRAINT_LOAD_PATCH_MARKER,
@@ -178,6 +189,9 @@ def test_npu_module_exports_sample_tokens_alias() -> None:
 def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # V1-platform install test: pin the V2 flag off (see
+    # test_dispatcher_selects_one_platform_module).
+    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_TOKENS_PATCH_MARKER
 
     class Runner:
@@ -225,3 +239,49 @@ def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     model_runner_patch.apply_worker_patches()
 
     assert getattr(Runner.sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, False)
+
+
+# ---------------------------------------------------------------------------
+# V2 dispatch: _active_runner_module_name + apply_worker_patches branching
+# ---------------------------------------------------------------------------
+
+
+def test_dispatcher_routes_to_v2_module_when_flag_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VLLM_USE_V2_MODEL_RUNNER selects the V2 patch module regardless of
+    platform (the V2 runner is GPU-only; NPU keeps the V1 path)."""
+    fake_platforms = ModuleType("vllm.platforms")
+    setattr(fake_platforms, "current_platform", SimpleNamespace(device_type="cuda"))
+    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+
+    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: True)
+    assert (
+        model_runner_patch._active_runner_module_name() == model_runner_patch._V2_GPU_PATCH_MODULE
+    )
+
+    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
+    assert model_runner_patch._active_runner_module_name() == model_runner_patch._GPU_PATCH_MODULE
+
+
+def test_apply_worker_patches_dispatches_to_v2_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under the V2 flag the V1 body must not run: the V1 installer does
+    unguarded _prepare_inputs access the V2 runner does not expose."""
+    called: list[str] = []
+
+    import vllm_gr.v1.worker.gpu_model_runner_v2_patch as v2_patch_module
+
+    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: True)
+    monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
+    # The platform path must not be touched under V2.
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_get_active_platform_module",
+        lambda: (_ for _ in ()).throw(AssertionError("V1 installer must not run")),
+    )
+    monkeypatch.setattr(v2_patch_module, "_apply_v2_runner_patches", lambda: called.append("v2"))
+
+    model_runner_patch.apply_worker_patches()
+    assert called == ["v2"]

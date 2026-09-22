@@ -1332,3 +1332,26 @@ def test_execute_wrapper_releases_depth_on_exception() -> None:
     with pytest.raises(ExpectedError):
         wrapped(runner, scheduler_output)
     assert common._WORKER_EXECUTE_DEPTH == 0
+
+
+def test_slim_v2_wrapper_fail_fast_on_legacy_beam_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refactor §4.3: the slim V2 execute_model wrapper must raise loudly on a
+    legacy beam_data frame instead of silently running the (deleted) LEGACY
+    stack under a runner whose patch layer no longer supports it."""
+    scheduler_output = SimpleNamespace(beam_data={"beam": {"is_beam_decode": True}})
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(additional_config={}))
+
+    def execute_model(self: Any, output: Any) -> str:
+        raise AssertionError("native execute_model must not run for a beam_data frame")
+
+    wrapped = common.make_patched_execute_model_v2(execute_model)
+    with pytest.raises(ValueError, match="legacy beam_data frames are not supported"):
+        wrapped(runner, scheduler_output)
+
+
+def test_slim_v2_wrapper_is_idempotent() -> None:
+    def execute_model(self: Any, output: Any) -> str:
+        return "result"
+
+    wrapped = common.make_patched_execute_model_v2(execute_model)
+    assert common.make_patched_execute_model_v2(wrapped) is wrapped

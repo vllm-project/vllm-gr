@@ -1138,3 +1138,43 @@ def test_cuda_worker_decision_publishes_compact_result_and_keeps_device_tensors(
         [1, 0, 3, 2],
     )
     assert state.kv_reorder == [1, 0, 3, 2]
+
+
+# ---------------------------------------------------------------------------
+# _select_candidates layout contract (V2 sample wrapper)
+# ---------------------------------------------------------------------------
+
+
+def test_select_candidates_v2_layout_keeps_all_columns() -> None:
+    """v2_layout=True declares a pure top-K layout: every column is a
+    candidate (no sampled-token column to drop).
+
+    The V1 layout (v2_layout=False) on a wide payload drops column 0 —
+    silently applying that to a V2 top-K payload would skew every beam's
+    candidate set.
+    """
+    width = 4
+    # Wide pure top-K payload: 2 beams x 5 candidates.  The V1 reader would
+    # treat column 0 as the sampled token and drop it.
+    candidates = torch.tensor([[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]], dtype=torch.int64)
+    probs = torch.rand(2, 5, dtype=torch.float64)
+    sampler_output = _sampler_output(candidates, probs)
+
+    tokens, scores = beam_decision._select_candidates(sampler_output, width, v2_layout=True)
+    assert tokens.tolist() == [[10, 11, 12, 13], [20, 21, 22, 23]]
+    assert torch.allclose(scores, probs[:, :width].float(), atol=1e-6)
+
+    # The V1 layout on the same payload drops the leading column — the flag
+    # is what prevents that misread.
+    v1_tokens, _ = beam_decision._select_candidates(sampler_output, width, v2_layout=False)
+    assert v1_tokens.tolist() == [[11, 12, 13, 14], [21, 22, 23, 24]]
+
+
+def test_select_candidates_v2_layout_rejects_narrow_payload() -> None:
+    """A payload with fewer columns than the beam width cannot serve W
+    candidates per beam — refuse (None) instead of silently clamping."""
+    candidates = torch.tensor([[10, 11]], dtype=torch.int64)
+    probs = torch.tensor([[0.6, 0.4]], dtype=torch.float64)
+    sampler_output = _sampler_output(candidates, probs)
+
+    assert beam_decision._select_candidates(sampler_output, 4, v2_layout=True) is None

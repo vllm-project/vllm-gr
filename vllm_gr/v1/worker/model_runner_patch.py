@@ -12,8 +12,11 @@ from vllm.logger import init_logger
 
 from vllm_gr.config import ConstraintTableBackendEnum
 from vllm_gr.v1.worker.model_runner_common import (
+    _CONSTRAINT_LOAD_PATCH_MARKER,
+    _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
     _WORKER_CAPTURE_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
+    _use_v2_model_runner,
     freeze_gc_after_graph_capture,
     freeze_gc_after_warmup,
     get_beam_graph_runtime_stats,
@@ -25,8 +28,7 @@ logger = init_logger(__name__)
 
 _GPU_PATCH_MODULE = "vllm_gr.v1.worker.gpu_model_runner_patch"
 _NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu_model_runner_patch"
-_CONSTRAINT_LOAD_PATCH_MARKER = "_vllm_gr_constraint_load_patched"
-_CONSTRAINT_SHUTDOWN_PATCH_MARKER = "_vllm_gr_constraint_shutdown_patched"
+_V2_GPU_PATCH_MODULE = "vllm_gr.v1.worker.gpu_model_runner_v2_patch"
 _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
 
 
@@ -187,8 +189,20 @@ def _active_platform_module_name() -> str:
     return _GPU_PATCH_MODULE
 
 
+def _active_runner_module_name() -> str:
+    """Return the patch module for the active runner (env- and platform-aware).
+
+    The V2 GPU runner is selected by ``VLLM_USE_V2_MODEL_RUNNER`` (opt-in), so
+    its patch module shadows the platform GPU module when the flag is set.  NPU
+    keeps the V1 path regardless.
+    """
+    if _use_v2_model_runner():
+        return _V2_GPU_PATCH_MODULE
+    return _active_platform_module_name()
+
+
 def _get_active_platform_module() -> ModuleType:
-    return import_module(_active_platform_module_name())
+    return import_module(_active_runner_module_name())
 
 
 def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
@@ -228,6 +242,17 @@ def apply_worker_patches() -> None:
     # even when all runner hooks were already present (idempotent) so canonical
     # Constraint Tables can be injected in both uniproc and multiproc engines.
     _install_active_worker_resource_hook()
+
+    if _use_v2_model_runner():
+        # V2 runner exposes ``prepare_inputs``/``sample``/``sample_tokens`` and
+        # no ``_prepare_inputs``/``_bookkeeping_sync``; the V1 body below does
+        # unguarded attribute access that V2 lacks, so dispatch to the
+        # V2-specific installer instead.
+        from vllm_gr.v1.worker import gpu_model_runner_v2_patch as v2
+
+        v2._apply_v2_runner_patches()
+        return
+
     platform_module = _get_active_platform_module()
     runners_to_patch = [
         (runner_name, runner_class)

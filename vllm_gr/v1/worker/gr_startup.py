@@ -75,9 +75,19 @@ def capture_async_forward(worker: Any) -> bool:
     owner.previous = m
     # The null block is a safe capture prefix. Real requests replace its
     # contents and actual length while the device table address stays fixed.
-    worker.requests[name] = SimpleNamespace(block_ids=[[0]])
+    # Published as kv_blocks so both runner surfaces (V1 request state and
+    # V2 scheduler-published metadata) find it identically.
+    from vllm_gr.v1.worker.model_runner_common import _use_v2_model_runner
+
+    if _use_v2_model_runner():
+        decode_meta = replace(m, kv_blocks=((0,),))
+        setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {name: decode_meta})
+    else:
+        worker.requests[name] = SimpleNamespace(block_ids=[[0]])
     try:
         decode = replace(m, kind=GRStageKind.DECODE, stage_index=1, decode_step=0)
+        if _use_v2_model_runner():
+            decode = replace(decode, kv_blocks=((0,),))
         owner.prepared = owner.prepare_cpu(decode, 0)
         owner._bind_attention(decode)
         owner.input_ids.zero_()
@@ -87,7 +97,8 @@ def capture_async_forward(worker: Any) -> bool:
         owner.capture_forward()
         torch.cuda.current_stream(worker.device).synchronize()
     finally:
-        worker.requests.pop(name, None)
+        if not _use_v2_model_runner():
+            worker.requests.pop(name, None)
         done = torch.Event()
         done.record()
         owner.release(owner.binding, consumer_done=done)

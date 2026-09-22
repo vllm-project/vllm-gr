@@ -432,7 +432,12 @@ def _decision_stub(
     monkeypatch.setattr(
         beam_decision,
         "run_beam_decision",
-        lambda runner, session, sampler_output, is_last_step, result_width: decision,
+        lambda runner,
+        session,
+        sampler_output,
+        is_last_step,
+        result_width,
+        v2_layout=False: decision,
     )
 
 

@@ -975,3 +975,38 @@ def test_hook_sequence_groups_are_accepted_by_real_torch_operator(
     )
     decode_result = execution.run(torch.randn(2, 20), decode_seq, torch.zeros(0), 1, 2)
     assert tuple(decode_result.top_tokens.shape) == (2, 2)
+
+
+# ---------------------------------------------------------------------------
+# _temperatures_for_rows — V2 sampling-states adapter
+# ---------------------------------------------------------------------------
+
+
+def test_temperatures_for_rows_v2_sampling_states_adapter() -> None:
+    """V2 has no sampling_metadata: temperatures come from the sampler's
+    SamplingStates, mapped to logits rows via expanded_idx_mapping."""
+    from vllm_gr.v1.worker.constraint_hook import _temperatures_for_rows
+
+    # Request 0 is hot, request 1 is greedy.
+    gpu_temps = torch.tensor([0.7, 0.0], dtype=torch.float32)
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            sampling_metadata=None,  # V2 InputBatch has no sampling_metadata
+            # 4 logits rows (one per beam of request 0) all map to request 0.
+            expanded_idx_mapping=torch.tensor([0, 0, 0, 0], dtype=torch.int32),
+        ),
+        sampler=SimpleNamespace(
+            sampling_states=SimpleNamespace(temperature=SimpleNamespace(gpu=gpu_temps))
+        ),
+    )
+    temps = _temperatures_for_rows(runner, [0, 1, 2, 3], torch.device("cpu"))
+    assert torch.equal(temps, torch.full((4,), 0.7, dtype=torch.float32))
+
+
+def test_temperatures_for_rows_falls_back_to_default() -> None:
+    """No V1 metadata and no sampler states: the scalar default (1.0)."""
+    from vllm_gr.v1.worker.constraint_hook import _temperatures_for_rows
+
+    runner = SimpleNamespace(input_batch=None, sampler=None)
+    temps = _temperatures_for_rows(runner, [0], torch.device("cpu"))
+    assert torch.equal(temps, torch.tensor([1.0], dtype=torch.float32))

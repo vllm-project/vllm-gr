@@ -415,6 +415,20 @@ class _StageExecutionHooks:
         return native.block_ids
 
 
+def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
+    """Resolve decode graph replay, preserving unexpected-missing invariants."""
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    requested = not worker.model_config.enforce_eager and _get_gr_config(worker).beam_graph_enabled
+    if not requested:
+        return False
+    if graph is not None:
+        return True
+    if getattr(worker, "_gr_async_decode_graph_capture_failed", False):
+        return False
+    raise RuntimeError("Asynchronous scheduling graph mode requires successful startup capture")
+
+
 class GPUBeamStageRunner:
     """One exclusive execution owner, using the existing session/state/workspace."""
 
@@ -663,17 +677,7 @@ class GPUBeamStageRunner:
                 self.hooks.consume_native_state(scheduler_output)
                 self._bind_attention(m)
                 self.prepare_decode(entry)
-                from vllm_gr.v1.worker.model_runner_common import _get_gr_config
-
-                graph_enabled = (
-                    not worker.model_config.enforce_eager
-                    and _get_gr_config(worker).beam_graph_enabled
-                )
-                if graph_enabled:
-                    if self.graph is None:
-                        raise RuntimeError(
-                            "Asynchronous scheduling graph mode requires successful startup capture"
-                        )
+                if should_replay_decode_graph(worker, self.graph):
                     self.logits = worker.model.compute_logits(self.graph.replay())
                 else:
                     self.logits = self._forward()
@@ -897,6 +901,12 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
 
     require_beam_execution_mode(worker.vllm_config, BeamExecutionMode.V1)
     hooks = _StageExecutionHooks(worker)
+    from vllm_gr.v1.worker.model_runner_common import _use_v2_model_runner
+
+    if _use_v2_model_runner():
+        from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import make_v2_stage_hooks
+
+        hooks = make_v2_stage_hooks(worker)
     existing = getattr(worker, "_gr_gpu_stage_runner", None)
     if existing is not None and not existing.closed:
         if getattr(worker, "constraint_backend", None) is not existing.backend:
