@@ -1813,6 +1813,57 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     return active_session
 
 
+def _dispatch_retirement_frame(self, scheduler_output):
+    """Handle a GR retirement control frame; returns the retire output.
+
+    Returns None when ``scheduler_output`` is not a retirement frame (the
+    caller continues with the normal dispatch).
+    """
+    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.config.execution import require_beam_execution_mode
+    from vllm_gr.v1.engine.gr_async_scheduler import GR_RETIRE_OUTPUT_ATTR
+
+    if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is None:
+        return None
+    from vllm_gr.v1.worker.gpu_beam_stage_runner import execute_gr_retirement
+
+    require_beam_execution_mode(self.vllm_config, BeamExecutionMode.V1)
+    return execute_gr_retirement(self, scheduler_output)
+
+
+def _dispatch_stage_frame(self, scheduler_output, orig_execute_model, *args, **kwargs):
+    """Handle a persistent GR stage frame (beam_search_v1 execution).
+
+    Returns ``_NOT_A_STAGE_FRAME`` when ``scheduler_output`` is not a stage
+    frame; otherwise the stage runner's execute() result.  On an execution
+    failure the error is recorded on the stage runner before re-raising —
+    the native BatchQueue associates the execute and sample Futures, so
+    sampling must also fail or valid-looking stale logits could hide a
+    failed execute Future from that native path.
+    """
+    from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
+
+    if not getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
+        return _NOT_A_STAGE_FRAME
+    if str(self.device).split(":")[0] != "cuda":
+        raise ValueError("persistent GR stage execution requires a CUDA runner")
+    from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
+
+    # get_stage_runner dispatches the runner-specific execution hooks
+    # (V1 _model_forward surface vs the V2 set_forward_context +
+    # ExecuteModelState surface) by the resolved V2 flag.
+    stage_runner = get_stage_runner(self, scheduler_output)
+    try:
+        return stage_runner.execute(scheduler_output, orig_execute_model, *args, **kwargs)
+    except Exception as error:
+        stage_runner.execution_error = error
+        raise
+
+
+# Sentinel distinguishing "not a stage frame" from a legitimate None result.
+_NOT_A_STAGE_FRAME = object()
+
+
 def make_patched_execute_model(_orig_execute_model):
     """Wrap execute_model to publish beam-request context for the run.
 
@@ -1825,31 +1876,14 @@ def make_patched_execute_model(_orig_execute_model):
     def _patched_execute_model_step(self, scheduler_output, *args, **kwargs):
         from vllm_gr.config import BeamExecutionMode
         from vllm_gr.config.execution import require_beam_execution_mode
-        from vllm_gr.v1.engine.gr_async_scheduler import (
-            GR_RETIRE_OUTPUT_ATTR,
-            GR_STAGE_OUTPUT_ATTR,
-        )
 
-        if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is not None:
-            from vllm_gr.v1.worker.gpu_beam_stage_runner import execute_gr_retirement
+        retirement = _dispatch_retirement_frame(self, scheduler_output)
+        if retirement is not None:
+            return retirement
 
-            require_beam_execution_mode(self.vllm_config, BeamExecutionMode.V1)
-            return execute_gr_retirement(self, scheduler_output)
-
-        if getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
-            if str(self.device).split(":")[0] != "cuda":
-                raise ValueError("persistent GR stage execution requires GPU V1")
-            from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
-
-            stage_runner = get_stage_runner(self, scheduler_output)
-            try:
-                return stage_runner.execute(scheduler_output, _orig_execute_model, *args, **kwargs)
-            except Exception as error:
-                # Native BatchQueue associates the execute and sample Futures.
-                # Sampling must also fail, otherwise valid-looking stale logits
-                # could hide a failed execute Future from that native path.
-                stage_runner.execution_error = error
-                raise
+        stage = _dispatch_stage_frame(self, scheduler_output, _orig_execute_model, *args, **kwargs)
+        if stage is not _NOT_A_STAGE_FRAME:
+            return stage
         if getattr(scheduler_output, "beam_data", {}):
             require_beam_execution_mode(self.vllm_config, BeamExecutionMode.LEGACY)
         gr_stage = getattr(self, "_gr_gpu_stage_runner", None)

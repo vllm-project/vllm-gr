@@ -253,6 +253,11 @@ class GRStageMetadata:
     session_init: BeamBatchRequest | None = None
     owner_generation: int = 0
     execution_capacity: GRExecutionCapacity | None = None
+    # Per-KV-group prompt block ids, published by the scheduler with every
+    # dispatch.  Runners without host-side request state (V2) build their beam
+    # attention block table from this instead of reaching into scheduler
+    # structures; V1 may still fall back to its own request state when None.
+    kv_blocks: tuple[tuple[int, ...], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)

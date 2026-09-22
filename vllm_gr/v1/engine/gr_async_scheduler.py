@@ -350,6 +350,37 @@ def attach_gr_stage_metadata(
     stage_index = session.issued_stages
     kind = GRStageKind.PREFILL if prefill_chunk or stage_index == 0 else GRStageKind.DECODE
     output_state = GRDeviceStateRef(req_id, stage_index)
+    manager = getattr(scheduler, "kv_cache_manager", None)
+    kv_blocks: tuple[tuple[int, ...], ...] | None = None
+    if manager is not None:
+        # Scheduler owns the native block refcounts. Python references in a
+        # Worker cannot prevent block reuse after abort or preemption.
+        kv = manager.get_blocks(req_id)
+        groups = tuple(tuple(group) for group in kv.blocks)
+        blocks = tuple(block for group in groups for block in group)
+        manager.block_pool.touch(blocks)
+        # The last reference determines eviction order. Match native free():
+        # preserve group order and release each group's prompt tail first.
+        session._kv_dispatch_leases[dispatch_id] = tuple(
+            block for group in groups for block in reversed(group)
+        )
+        # Publish the per-group block ids so a runner without host-side
+        # request state (V2) can build its beam attention block table without
+        # reaching back into scheduler-owned structures.  ``blocks`` holds
+        # KVCacheBlock objects; only the integer ids cross the boundary.
+        # Tuple-of-tuples so the frozen metadata stays hashable.  The
+        # attribute fallback covers stand-in KVCacheBlocks in tests.
+        block_ids = getattr(kv, "get_block_ids", None)
+        if callable(block_ids):
+            kv_blocks = tuple(tuple(group) for group in block_ids())
+        else:
+            kv_blocks = tuple(
+                tuple(
+                    block if isinstance(block, int) else getattr(block, "block_id", block)
+                    for block in group
+                )
+                for group in groups
+            )
     metadata = GRStageMetadata(
         session_id=req_id,
         dispatch_id=dispatch_id,
@@ -365,19 +396,8 @@ def attach_gr_stage_metadata(
         produces_output=not prefill_chunk,
         owner_generation=session.owner_generation,
         execution_capacity=scheduler._gr_execution_capacity,
+        kv_blocks=kv_blocks,
     )
-    manager = getattr(scheduler, "kv_cache_manager", None)
-    if manager is not None:
-        # Scheduler owns the native block refcounts. Python references in a
-        # Worker cannot prevent block reuse after abort or preemption.
-        groups = tuple(tuple(group) for group in manager.get_blocks(req_id).blocks)
-        blocks = tuple(block for group in groups for block in group)
-        manager.block_pool.touch(blocks)
-        # The last reference determines eviction order. Match native free():
-        # preserve group order and release each group's prompt tail first.
-        session._kv_dispatch_leases[dispatch_id] = tuple(
-            block for group in groups for block in reversed(group)
-        )
     session._next_dispatch_id += 1
     session._in_flight_dispatches.add(dispatch_id)
     session.worker_resources_allocated = True
