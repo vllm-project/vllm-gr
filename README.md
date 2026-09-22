@@ -42,7 +42,9 @@ The runner acquires an available accelerator and executes the repository's
 pre-commit and test gates. See [Development Utils Manual](docs/tools/README.md)
 for environment and model-cache options.
 
-refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark related test cases.
+Refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark-related test cases.
+The standalone offline `beam_search_v1` performance and timeline benchmark is
+documented in [benchmarks/qwen/README.md](benchmarks/qwen/README.md).
 
 ## Executing
 
