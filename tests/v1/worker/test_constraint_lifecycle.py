@@ -322,6 +322,11 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
 
 
 def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.platforms import current_platform
+
+    if current_platform.device_type == "npu":
+        pytest.skip("CUDA vocabulary projection slicing is not used on Ascend NPU")
+
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
     import vllm_gr.constraints.loader as loader
