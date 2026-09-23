@@ -166,20 +166,19 @@ def validate_gr_device_config(config: Any) -> None:
 def validate_gr_request(request: BeamBatchRequest) -> None:
     """Validate shared V1 semantics before native ADD or Worker allocation."""
     validate_beam_batch_request(request)
-    if len(request.items) != 1:
-        raise ValueError("beam_search_v1 requires batch size B=1")
-    native = request.items[0].request
-    params = native.sampling_params
-    if native.request_id != request.batch_id:
-        raise ValueError("batch_id and native request_id must match")
-    if native.prompt_embeds is not None or not native.prompt_token_ids:
-        raise ValueError("beam_search_v1 requires a nonempty token prompt")
-    if native.mm_features or native.lora_request is not None:
-        raise ValueError("beam_search_v1 does not support multimodal inputs or LoRA")
-    if params is None or params.ignore_eos is not True:
-        raise ValueError("beam_search_v1 requires ignore_eos=True")
-    if params.max_tokens != request.beam_params.max_tokens or params.n != 1:
-        raise ValueError("native and Beam generation budgets must match and n must be 1")
+    if request.items[0].request.request_id != request.batch_id:
+        raise ValueError("batch_id and the first native request_id must match")
+    for item in request.items:
+        native = item.request
+        params = native.sampling_params
+        if native.prompt_embeds is not None or not native.prompt_token_ids:
+            raise ValueError("beam_search_v1 requires a nonempty token prompt")
+        if native.mm_features or native.lora_request is not None:
+            raise ValueError("beam_search_v1 does not support multimodal inputs or LoRA")
+        if params is None or params.ignore_eos is not True:
+            raise ValueError("beam_search_v1 requires ignore_eos=True")
+        if params.max_tokens != request.beam_params.max_tokens or params.n != 1:
+            raise ValueError("native and Beam generation budgets must match and n must be 1")
     _validate_gr_generation_params(request.beam_params)
 
 
@@ -193,9 +192,9 @@ class GRDeviceStateRef:
 
 @dataclass(slots=True)
 class GRSessionState:
-    """Resource lifecycle for one resident native Request.
+    """EngineCore scheduling state for one fixed-membership GR batch session.
 
-    Native Request owns token progress and the effective budget. Frozen dispatch
+    Native Requests own token progress and the effective budget. Frozen dispatch
     records retain dependencies and receipt identity after native termination.
     """
 
@@ -222,8 +221,13 @@ class GRSessionState:
     def __post_init__(self) -> None:
         if not self.session_id:
             raise ValueError("session_id must not be empty")
-        if len(self.request.items) != 1:
-            raise ValueError("Beam Search V1 currently requires batch size B=1")
+        if self.session_id != self.request.batch_id:
+            raise ValueError("session_id must match the Beam batch_id")
+        if not self.request.items:
+            raise ValueError("Beam Search V1 batch must not be empty")
+        request_ids = self.request_ids
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("Beam Search V1 batch request IDs must be unique")
         if self.max_decode_steps < 0:
             raise ValueError("max_decode_steps must be non-negative")
         if self.max_decode_steps != self.request.beam_params.max_tokens - 1:
@@ -241,6 +245,15 @@ class GRSessionState:
     @property
     def completed_stages(self) -> int:
         return len(self._dispatch_records) - len(self._in_flight_dispatches)
+
+    @property
+    def request_ids(self) -> tuple[str, ...]:
+        """Stable caller-defined member order for every batch stage."""
+        return tuple(item.request.request_id for item in self.request.items)
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.request.items)
 
     @property
     def in_flight_stages(self) -> int:
@@ -263,7 +276,7 @@ class GRStageMetadata:
 
     SchedulerOutput.gr_stage_metadata is keyed by session_id. Asynchronous scheduling admits one
     execution owner; owner_generation distinguishes reuse of a session ID.
-    session_init carries the existing B=1 request (Beam parameters, output
+    session_init carries the caller-formed batch request (Beam parameters, output
     options and beam_params.constraint_resource_id) once, with Prefill only.
     Native SchedulerOutput supplies prompt/KV data. Stage k > 0 references
     (session_id, k - 1) even before host completion; A4 orders producer writes
@@ -285,11 +298,15 @@ class GRStageMetadata:
     session_init: BeamBatchRequest | None = None
     owner_generation: int = 0
     execution_capacity: GRExecutionCapacity | None = None
-    # Per-KV-group prompt block ids, published by the scheduler with every
-    # dispatch.  Runners without host-side request state (V2) build their beam
-    # attention block table from this instead of reaching into scheduler
-    # structures; V1 may still fall back to its own request state when None.
+    # One row of prompt block IDs per request_id, in the same order. GR
+    # execution supports one uniform KV cache group; for B=1 this retains
+    # the existing single-row representation used by V1 and V2 runners.
+    # None means block IDs were not published.
     kv_blocks: tuple[tuple[int, ...], ...] | None = None
+    # The batch is formed by the caller and remains ordered and immutable for
+    # the complete session. B=1 keeps the original representation.
+    request_ids: tuple[str, ...] = ()
+    num_prompt_tokens_by_request: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

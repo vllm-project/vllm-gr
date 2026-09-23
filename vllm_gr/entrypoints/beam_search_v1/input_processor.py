@@ -124,19 +124,26 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
             f"{gr_config.beam_max_decode_steps}"
         )
 
-    engine_request = request.items[0].request
-    prompt_tokens = engine_request.prompt_token_ids
     model_config = vllm_config.model_config
-    total_length = len(prompt_tokens) + request.beam_params.max_tokens
-    if total_length > model_config.max_model_len:
-        raise BeamSearchRequestError(
-            f"prompt plus Decode length {total_length} exceeds max_model_len "
-            f"{model_config.max_model_len}"
-        )
+    prompt_lengths = []
+    for item in request.items:
+        prompt_tokens = item.request.prompt_token_ids
+        if prompt_tokens is None:
+            raise BeamSearchRequestError("embedding prompts are not supported by beam_search_v1")
+        prompt_lengths.append(len(prompt_tokens))
+        total_length = len(prompt_tokens) + request.beam_params.max_tokens
+        if total_length > model_config.max_model_len:
+            raise BeamSearchRequestError(
+                f"prompt plus Decode length {total_length} exceeds max_model_len "
+                f"{model_config.max_model_len}"
+            )
     scheduler_config = vllm_config.scheduler_config
-    if len(prompt_tokens) > scheduler_config.max_num_batched_tokens:
+    if len(request.items) > getattr(scheduler_config, "max_num_seqs", len(request.items)):
+        raise BeamSearchRequestError("Beam batch size exceeds max_num_seqs")
+    total_prompt_tokens = sum(prompt_lengths)
+    if total_prompt_tokens > scheduler_config.max_num_batched_tokens:
         raise BeamSearchRequestError(
-            f"Prefill length {len(prompt_tokens)} exceeds max_num_batched_tokens "
+            f"Prefill length {total_prompt_tokens} exceeds max_num_batched_tokens "
             f"{scheduler_config.max_num_batched_tokens}"
         )
 
@@ -144,12 +151,15 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
 def _create_batch_request(
     *,
     session_id: str,
-    engine_request: EngineCoreRequest,
+    engine_requests: tuple[EngineCoreRequest, ...],
     params: Any,
     vllm_config: Any,
 ) -> BeamBatchRequest:
-    if engine_request.request_id != session_id:
-        raise BeamSearchRequestError("EngineCoreRequest.request_id must equal the GR session ID")
+    if not engine_requests or engine_requests[0].request_id != session_id:
+        raise BeamSearchRequestError(
+            "the first EngineCoreRequest.request_id must equal the GR session ID"
+        )
+    engine_request = engine_requests[0]
     sampling_params = engine_request.sampling_params
     if sampling_params is None or sampling_params.max_tokens is None:
         raise BeamSearchRequestError("beam_search_v1 requires sampling parameters with max_tokens")
@@ -179,7 +189,10 @@ def _create_batch_request(
     request = BeamBatchRequest(
         protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
         batch_id=session_id,
-        items=(BeamBatchItem(item_index=0, request=engine_request),),
+        items=tuple(
+            BeamBatchItem(item_index=index, request=request)
+            for index, request in enumerate(engine_requests)
+        ),
         beam_params=batch_params,
         output_options=output_options,
     )
@@ -195,8 +208,8 @@ class BeamSearchInputProcessor:
         self.boundary_token_ids: tuple[int | None, int | None] = (None, None)
 
     def process_offline_inputs(self, llm: Any, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
-        if len(call.prompts) != 1:
-            raise BeamSearchRequestError("beam_search_v1 currently requires one prompt")
+        if not call.prompts:
+            raise BeamSearchRequestError("beam_search_v1 requires at least one prompt")
         if call.concurrency_limit is not None and call.concurrency_limit <= 0:
             raise BeamSearchRequestError("concurrency_limit must be positive or None")
         tokenizer = llm.get_tokenizer()
@@ -204,22 +217,26 @@ class BeamSearchInputProcessor:
             call.params, tokenizer
         )
         engine_inputs = llm._preprocess_cmpl(call.prompts)
-        lora_requests = llm._lora_request_to_seq(call.lora_request, 1)
-        request_id = _generate_request_id()
-        engine_request = self.engine.input_processor.process_inputs(
-            request_id,
-            engine_inputs[0],
-            sampling_params,
-            supported_tasks=self.engine.get_supported_tasks(),
-            arrival_time=time.time(),
-            lora_request=lora_requests[0],
-        )
-        _prepare_prompt(engine_request, begin_token_id)
-        self.engine.input_processor.assign_request_id(engine_request)
-        session_id = engine_request.request_id
+        lora_requests = llm._lora_request_to_seq(call.lora_request, len(engine_inputs))
+        engine_requests = []
+        arrival_time = time.time()
+        supported_tasks = self.engine.get_supported_tasks()
+        for engine_input, lora_request in zip(engine_inputs, lora_requests, strict=True):
+            engine_request = self.engine.input_processor.process_inputs(
+                _generate_request_id(),
+                engine_input,
+                sampling_params,
+                supported_tasks=supported_tasks,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+            )
+            _prepare_prompt(engine_request, begin_token_id)
+            self.engine.input_processor.assign_request_id(engine_request)
+            engine_requests.append(engine_request)
+        session_id = engine_requests[0].request_id
         request = _create_batch_request(
             session_id=session_id,
-            engine_request=engine_request,
+            engine_requests=tuple(engine_requests),
             params=call.params,
             vllm_config=self.engine.vllm_config,
         )
@@ -255,7 +272,7 @@ class BeamSearchInputProcessor:
         session_id = engine_request.request_id
         request = _create_batch_request(
             session_id=session_id,
-            engine_request=engine_request,
+            engine_requests=(engine_request,),
             params=call.params,
             vllm_config=self.engine.vllm_config,
         )

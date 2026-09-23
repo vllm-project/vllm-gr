@@ -7,7 +7,7 @@ from vllm_gr.v1.beam.batch_contracts import BeamBatchFailure
 
 
 class BeamSearchRequestError(ValueError):
-    """A request that cannot be admitted as a B=1 GR session."""
+    """A request that cannot be admitted as a GR batch session."""
 
 
 class BeamSearchEngineError(RuntimeError):

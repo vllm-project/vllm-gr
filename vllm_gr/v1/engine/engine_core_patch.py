@@ -128,7 +128,28 @@ def make_patched_handle_client_request(original):
         from vllm_gr.v1.engine.core import dispatch_gr_engine_core_input
         from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
 
-        if dispatch_gr_engine_core_input(self, request_type, request):
+        if (
+            request_type == EngineCoreRequestType.SUBMIT_GR_SESSION
+            and request.items
+            and self._reject_add_in_shutdown(request.items[0].request)
+        ):
+            return None
+
+        try:
+            if dispatch_gr_engine_core_input(self, request_type, request):
+                return None
+        except GRAdmissionError as error:
+            if request_type != EngineCoreRequestType.SUBMIT_GR_SESSION:
+                raise
+            native_request = request.items[0].request
+            logger.warning(
+                "Rejecting GR batch %s during admission: %s",
+                request.batch_id,
+                error,
+            )
+            self._send_error_outputs_to_client(
+                [native_request.request_id], native_request.client_index
+            )
             return None
         if request_type == EngineCoreRequestType.ADD:
             # Admission runs here, after the socket thread has queued ADD.
@@ -373,16 +394,40 @@ def make_patch_get_computed_blocks(
     return patch_get_computed_blocks
 
 
+def _expand_gr_abort_request_ids(scheduler, request_ids, finished_status):
+    """Expand cancellation of any GR member to its complete fixed batch."""
+    if getattr(finished_status, "name", "") != "FINISHED_ABORTED":
+        return request_ids
+    if request_ids is None:
+        return None
+    requested = (request_ids,) if isinstance(request_ids, str) else tuple(request_ids)
+    sessions = getattr(scheduler, "_gr_v1_sessions", {})
+    request_sessions = getattr(scheduler, "_gr_v1_request_sessions", {})
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for request_id in requested:
+        session_id = request_sessions.get(request_id, request_id)
+        session = sessions.get(session_id)
+        members = session.request_ids if session is not None else (request_id,)
+        for member_id in members:
+            if member_id in seen:
+                continue
+            seen.add(member_id)
+            expanded.append(member_id)
+    return expanded
+
+
 def _sync_gr_sessions_after_native_finish(scheduler, finished_requests, finished_status) -> None:
     """Mirror native finish results into GR state using consumed request IDs."""
     from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
 
     status_name = getattr(finished_status, "name", "")
     sessions = getattr(scheduler, "_gr_v1_sessions", {})
+    request_sessions = getattr(scheduler, "_gr_v1_request_sessions", {})
     gr_finalizing_ids = getattr(scheduler, _GR_FINALIZING_IDS_ATTR, ())
     gr_native_update_ids = getattr(scheduler, _GR_NATIVE_UPDATE_IDS_ATTR, ())
     for req_id, _client_index in finished_requests:
-        session = sessions.get(req_id)
+        session = sessions.get(request_sessions.get(req_id, req_id))
         if session is None:
             continue
         # Native EOS/stop detection may finish a Request while processing a GR
@@ -472,13 +517,39 @@ def apply_scheduler_patch():
                     "Asynchronous scheduling requests cannot mix with ordinary or legacy Beam requests"
                 )
             if batch_request is not None:
-                if request.request_id != batch_request.batch_id:
-                    raise GRAdmissionError("native request_id and GR batch_id must be identical")
+                member_index = getattr(request, "gr_batch_member_index", None)
+                matching_indices = tuple(
+                    index
+                    for index, item in enumerate(batch_request.items)
+                    if item.request.request_id == request.request_id
+                )
+                if len(matching_indices) != 1 or (
+                    member_index is not None
+                    and (type(member_index) is not int or member_index != matching_indices[0])
+                ):
+                    raise GRAdmissionError("native request does not match its GR batch member")
                 if request.request_id in self.requests:
                     raise GRAdmissionError(f"GR request already exists: {request.request_id}")
-                # All expected rejections precede native queue insertion. GR
-                # registration follows native ADD so a failed insertion cannot
-                # leave a ghost session/owner or consume a generation number.
+                session = sessions.get(batch_request.batch_id)
+                if session is not None:
+                    if session.request is not batch_request:
+                        raise GRAdmissionError(
+                            f"GR session already exists: {batch_request.batch_id}"
+                        )
+                    return original_add_request(self, request)
+                # The caller supplied the complete immutable batch. Validate
+                # it once before publishing the first native member; the core
+                # handles every member synchronously before it can schedule.
+                duplicate_id = next(
+                    (
+                        item.request.request_id
+                        for item in batch_request.items
+                        if item.request.request_id in self.requests
+                    ),
+                    None,
+                )
+                if duplicate_id is not None:
+                    raise GRAdmissionError(f"GR request already exists: {duplicate_id}")
                 session = _prepare_gr_session(self, batch_request)
                 result = original_add_request(self, request)
                 _register_gr_session(self, session)
@@ -493,6 +564,7 @@ def apply_scheduler_patch():
 
         @wraps(original_finish_requests)
         def patched_finish_requests(self, request_ids, finished_status):
+            request_ids = _expand_gr_abort_request_ids(self, request_ids, finished_status)
             result = original_finish_requests(self, request_ids, finished_status)
             _sync_gr_sessions_after_native_finish(self, result, finished_status)
             return result
@@ -616,13 +688,20 @@ def apply_scheduler_patch():
             output.beam_data = beam_data
             output.beam_finished_session_ids = beam_finished_session_ids
             gr_stages = {}
-            for req_id in output.num_scheduled_tokens:
-                session = getattr(self, "_gr_v1_sessions", {}).get(req_id)
+            sessions = getattr(self, "_gr_v1_sessions", {})
+            request_sessions = getattr(self, "_gr_v1_request_sessions", {})
+            scheduled_session_ids = dict.fromkeys(
+                request_sessions[req_id]
+                for req_id in output.num_scheduled_tokens
+                if req_id in request_sessions
+            )
+            for session_id in scheduled_session_ids:
+                session = sessions.get(session_id)
                 if session is None:
                     continue
                 metadata = self.attach_gr_stage_metadata(output, session)
                 if metadata is not None:
-                    gr_stages[req_id] = metadata
+                    gr_stages[session_id] = metadata
             setattr(output, GR_STAGE_OUTPUT_ATTR, gr_stages)
             attach_gr_retirement(self, output)
             return output
@@ -665,7 +744,15 @@ def _reconcile_native_gr_termination(scheduler, result, session) -> None:
 
     if session.status not in (GRSessionStatus.WAITING, GRSessionStatus.RUNNING):
         return
-    if not _native_request_terminated(scheduler, result, session.session_id):
+    terminated_member = next(
+        (
+            request_id
+            for request_id in session.request_ids
+            if _native_request_terminated(scheduler, result, request_id)
+        ),
+        None,
+    )
+    if terminated_member is None:
         return
 
     session.resource_status = GRResourceStatus.DRAINING
@@ -675,7 +762,8 @@ def _reconcile_native_gr_termination(scheduler, result, session) -> None:
         session._pending_terminal_result = _make_failure_result(
             session,
             "native_termination_without_gr_result",
-            "Native request terminated before GR produced a terminal result",
+            f"Native batch member {terminated_member} terminated before GR produced "
+            "a terminal result",
         )
 
 
@@ -685,6 +773,19 @@ def _suppress_native_terminal(result, request_id, target_output) -> None:
     for engine_outputs in result.values():
         if engine_outputs.finished_requests is not None:
             engine_outputs.finished_requests.discard(request_id)
+
+
+def _suppress_batch_member_outputs(result, session) -> None:
+    """Keep internal batch members off the single batch-result channel."""
+    internal_ids = frozenset(session.request_ids[1:])
+    if not internal_ids:
+        return
+    for engine_outputs in result.values():
+        engine_outputs.outputs[:] = [
+            output for output in engine_outputs.outputs if output.request_id not in internal_ids
+        ]
+        if engine_outputs.finished_requests is not None:
+            engine_outputs.finished_requests.difference_update(internal_ids)
 
 
 def _finish_native_gr_request(scheduler, request, request_id, request_status) -> None:
@@ -750,11 +851,16 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
         # the request open at the frontend until the GR session has drained;
         # the finalizer will synthesize the one authoritative terminal frame.
         if session.status == GRSessionStatus.FINISHING and session.terminal_result_pending:
-            _suppress_native_terminal(result, request_id, target_output)
+            for member_id in session.request_ids:
+                _, member_output = _find_gr_output(result, member_id)
+                _suppress_native_terminal(result, member_id, member_output)
         return
 
     terminal_result = _gr_terminal_result(session)
-    native_request = scheduler.requests.get(request_id)
+    native_requests = {
+        member_id: scheduler.requests.get(member_id) for member_id in session.request_ids
+    }
+    native_request = native_requests[request_id]
     client_index = (
         native_request.client_index
         if native_request is not None
@@ -770,7 +876,8 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
         FinishReason.ERROR if terminal_result.failure is not None else FinishReason.LENGTH
     )
 
-    _finish_native_gr_request(scheduler, native_request, request_id, request_status)
+    for member_id, member_request in native_requests.items():
+        _finish_native_gr_request(scheduler, member_request, member_id, request_status)
 
     if target_outputs is None:
         target_outputs = result.get(client_index)
@@ -800,12 +907,13 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
     # publishing the same finished ID again on the next update. A Worker that
     # already proved the release has no cached request left, so the pending
     # native finish must not survive either.
-    _discard_pending_native_finish(
-        scheduler,
-        client_index,
-        request_id,
-        worker_released=not session.worker_resources_allocated,
-    )
+    for member_id in session.request_ids:
+        _discard_pending_native_finish(
+            scheduler,
+            client_index,
+            member_id,
+            worker_released=not session.worker_resources_allocated,
+        )
 
     _close_gr_session(scheduler, session)
 
@@ -817,9 +925,8 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
     it returns (see ``_attach_beam_search_result`` in model_runner_common).
     This wrapper reads it and injects it into the first EngineCoreOutput's
     ``kv_transfer_params`` so the frontend can consume it from the streamed
-    RequestOutput without an extra round trip.  Pure beam-decode batches carry
-    exactly one logical session request by design (max_batch=1), so attaching
-    to the first output of a beam session is unambiguous.
+    RequestOutput without an extra round trip. A caller-formed batch has one
+    external session owner, so attaching to that owner remains unambiguous.
     """
     marker = "_vllm_gr_update_from_output_patch"
     if getattr(scheduler_cls.update_from_output, marker, False):
@@ -844,7 +951,7 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
             and metadata.owner_generation == sessions[sid].owner_generation
             and metadata.dispatch_id in sessions[sid]._in_flight_dispatches
         }
-        # B=1 dispatches never mix with ordinary requests. Stale results must
+        # GR dispatches never mix with ordinary requests. Stale results must
         # not reach native token accounting, even if a new owner reuses the ID.
         if gr_stages and not dispatched_sessions:
             return {}
@@ -856,7 +963,12 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         if native_update_ids is None:
             native_update_ids = set()
             setattr(self, _GR_NATIVE_UPDATE_IDS_ATTR, native_update_ids)
-        added_update_ids = set(dispatched_sessions).difference(native_update_ids)
+        dispatched_request_ids = {
+            request_id
+            for session in dispatched_sessions.values()
+            for request_id in session.request_ids
+        }
+        added_update_ids = dispatched_request_ids.difference(native_update_ids)
         native_update_ids.update(added_update_ids)
         try:
             # A malformed active receipt is a request failure, not a native
@@ -871,6 +983,9 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
             native_update_ids.difference_update(added_update_ids)
             if not native_update_ids:
                 delattr(self, _GR_NATIVE_UPDATE_IDS_ATTR)
+
+        for session in dispatched_sessions.values():
+            _suppress_batch_member_outputs(result, session)
 
         updated_sessions = []
         for session in dispatched_sessions.values():

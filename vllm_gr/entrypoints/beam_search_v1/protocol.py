@@ -14,10 +14,10 @@ from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest, BeamBatchResult
 
 @dataclass(frozen=True, slots=True)
 class OfflineBeamSearchRequest:
-    """Offline arguments; A2 must reject multiple prompts for now.
+    """Offline arguments for one caller-formed, fixed-membership batch.
 
-    Submit-once means once per B=1 session. Future multi-prompt support needs
-    an outer adapter enforcing concurrency_limit and restoring input order.
+    Submit-once means exactly once for the complete batch session. The runtime
+    preserves input order and never adds, removes, or dynamically pairs items.
     """
 
     prompts: list[Any]

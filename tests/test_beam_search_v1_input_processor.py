@@ -253,6 +253,37 @@ def test_public_result_keeps_the_accepted_boundary_ids(
     assert lookups == [token for token in (begin, end) if token is not None]
 
 
+def test_offline_inputs_preserve_caller_formed_batch_order() -> None:
+    engine = _make_engine()
+    engine.get_supported_tasks = lambda: ("generate",)
+    tokenizer = SimpleNamespace(
+        eos_token_id=2,
+        convert_tokens_to_ids=lambda token: {"<begin>": 7, "<end>": 8}[token],
+    )
+    llm = SimpleNamespace(
+        get_tokenizer=lambda: tokenizer,
+        _preprocess_cmpl=lambda prompts: prompts,
+        _lora_request_to_seq=lambda lora, size: [lora] * size,
+    )
+
+    request = BeamSearchInputProcessor(engine).process_offline_inputs(
+        llm,
+        OfflineBeamSearchRequest(
+            prompts=[[10, 11], [20, 21, 22]],
+            params=BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+        ),
+    )
+
+    assert len(request.items) == 2
+    assert [item.item_index for item in request.items] == [0, 1]
+    assert [item.request.prompt_token_ids for item in request.items] == [
+        [10, 11],
+        [20, 21, 22],
+    ]
+    assert request.batch_id == request.items[0].request.request_id
+    assert request.items[1].request.request_id != request.batch_id
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     "additional_config",
     [

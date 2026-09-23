@@ -14,10 +14,11 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCore, EngineCoreProc, EngineShutdownState
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 
 from tests.test_async_scheduling_scheduler import receipt, release_receipt
 from tests.test_async_scheduling_scheduler import scheduler as _scheduler_fixture
-from tests.test_gr_async_scheduler import _batch_request
+from tests.test_gr_async_scheduler import _batch_request, _multi_batch_request
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchOutput,
     BeamBatchResult,
@@ -234,6 +235,27 @@ def test_input_loop_consumes_valid_add_after_rejection_in_same_queue(core):
     assert core.input_queue.empty()
     assert set(core.scheduler.requests) == {"good"}
     complete(core, "good")
+
+
+def test_public_abort_finishes_all_gr_batch_members(core):
+    request = _multi_batch_request()
+    core.scheduler.scheduler_config.max_num_seqs = 2
+    core.scheduler.scheduler_config.max_num_batched_tokens = 8
+    core._handle_submit_gr_session(request)
+    core._process_input_queue()
+
+    assert set(core.scheduler.requests) == {"session-0", "session-0:1"}
+    core.abort_requests([request.batch_id])
+
+    assert not core.scheduler.requests
+    assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+    assert not getattr(core.scheduler, "_gr_v1_request_sessions", {})
+
+
+def test_native_abort_all_preserves_none_sentinel(core):
+    finished = core.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+
+    assert finished == []
 
 
 @pytest.mark.parametrize("error_type", [ValueError, RuntimeError])

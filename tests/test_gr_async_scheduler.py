@@ -50,6 +50,7 @@ from vllm_gr.v1.engine.engine_core_patch import (
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
+    GRAdmissionError,
     _gr_session_ready_to_finalize,
     add_gr_session,
     attach_gr_stage_metadata,
@@ -98,6 +99,28 @@ def _batch_request(max_tokens: int = 3) -> BeamBatchRequest:
     )
 
 
+def _multi_batch_request(max_tokens: int = 3) -> BeamBatchRequest:
+    first = _batch_request(max_tokens)
+    second = EngineCoreRequest(
+        request_id="session-0:1",
+        prompt_token_ids=[4, 5],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0.0, ignore_eos=True),
+        pooling_params=None,
+        arrival_time=1.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    return BeamBatchRequest(
+        protocol_version=first.protocol_version,
+        batch_id=first.batch_id,
+        items=(first.items[0], BeamBatchItem(item_index=1, request=second)),
+        beam_params=first.beam_params,
+        output_options=first.output_options,
+    )
+
+
 def _scheduler() -> SimpleNamespace:
     native_request = SimpleNamespace(
         request_id="session-0",
@@ -115,6 +138,110 @@ def _scheduler() -> SimpleNamespace:
 
 def _scheduler_output() -> SimpleNamespace:
     return SimpleNamespace(num_scheduled_tokens={"session-0": 1})
+
+
+def test_caller_formed_batch_is_one_ordered_scheduler_session() -> None:
+    request = _multi_batch_request()
+    scheduler = _scheduler()
+    scheduler.scheduler_config.max_num_seqs = 2
+    scheduler.scheduler_config.max_num_batched_tokens = 8
+    scheduler.requests["session-0:1"] = SimpleNamespace(
+        request_id="session-0:1",
+        is_prefill_chunk=False,
+        num_prompt_tokens=2,
+        num_computed_tokens=2,
+    )
+
+    session = add_gr_session(scheduler, request)
+    output = SimpleNamespace(num_scheduled_tokens={"session-0": 3, "session-0:1": 2})
+    metadata = attach_gr_stage_metadata(scheduler, output, session)
+
+    assert session.session_id == "session-0"
+    assert session.request_ids == ("session-0", "session-0:1")
+    assert session.batch_size == 2
+    assert metadata is not None
+    assert metadata.request_ids == session.request_ids
+    assert metadata.num_prompt_tokens == 5
+    assert metadata.num_prompt_tokens_by_request == (3, 2)
+
+
+@pytest.mark.parametrize("native_block_ids", [False, True])
+def test_caller_formed_batch_publishes_kv_blocks_in_member_order(
+    native_block_ids: bool,
+) -> None:
+    scheduler = _scheduler()
+    scheduler.scheduler_config.max_num_seqs = 2
+    scheduler.scheduler_config.max_num_batched_tokens = 8
+    scheduler.requests["session-0:1"] = SimpleNamespace(
+        request_id="session-0:1",
+        is_prefill_chunk=False,
+        num_prompt_tokens=2,
+        num_computed_tokens=2,
+    )
+    blocks = {
+        "session-0": (SimpleNamespace(block_id=11), SimpleNamespace(block_id=12)),
+        "session-0:1": (SimpleNamespace(block_id=21),),
+    }
+    touched: list[Any] = []
+
+    def get_blocks(request_id: str) -> Any:
+        groups = (blocks[request_id],)
+        return KVCacheBlocks(groups) if native_block_ids else SimpleNamespace(blocks=groups)
+
+    scheduler.kv_cache_manager = SimpleNamespace(
+        get_blocks=get_blocks,
+        block_pool=SimpleNamespace(touch=touched.extend, num_gpu_blocks=8),
+        max_model_len=4096,
+    )
+    session = add_gr_session(scheduler, _multi_batch_request())
+    output = SimpleNamespace(num_scheduled_tokens={"session-0": 3, "session-0:1": 2})
+
+    metadata = attach_gr_stage_metadata(scheduler, output, session)
+
+    assert metadata is not None
+    assert metadata.request_ids == ("session-0", "session-0:1")
+    assert metadata.kv_blocks == ((11, 12), (21,))
+    assert [block.block_id for block in touched] == [11, 12, 21]
+    assert [block.block_id for block in session._kv_dispatch_leases[0]] == [12, 11, 21]
+
+
+def test_caller_formed_batch_rejects_effective_scheduling_budget() -> None:
+    request = _multi_batch_request()
+    scheduler = _scheduler()
+    scheduler.scheduler_config.max_num_seqs = 2
+    scheduler.scheduler_config.max_num_batched_tokens = 64
+    scheduler.max_num_scheduled_tokens = 4
+
+    with pytest.raises(GRAdmissionError, match="effective native scheduling token budget"):
+        add_gr_session(scheduler, request)
+
+    assert not getattr(scheduler, "_gr_v1_sessions", {})
+
+
+def test_caller_formed_batch_rejects_partial_native_schedule() -> None:
+    request = _multi_batch_request()
+    scheduler = _scheduler()
+    scheduler.scheduler_config.max_num_seqs = 2
+    scheduler.scheduler_config.max_num_batched_tokens = 8
+    scheduler.requests["session-0:1"] = SimpleNamespace(
+        request_id="session-0:1",
+        is_prefill_chunk=False,
+        num_prompt_tokens=2,
+        num_computed_tokens=2,
+    )
+    session = add_gr_session(scheduler, request)
+
+    with pytest.raises(RuntimeError, match="split an atomic GR batch stage"):
+        attach_gr_stage_metadata(scheduler, _scheduler_output(), session)
+
+
+def test_session_rejects_native_chunked_prefill() -> None:
+    scheduler = _scheduler()
+    session = add_gr_session(scheduler, _batch_request())
+    scheduler.requests[session.session_id].is_prefill_chunk = True
+
+    with pytest.raises(RuntimeError, match="cannot schedule partial Prefill"):
+        attach_gr_stage_metadata(scheduler, _scheduler_output(), session)
 
 
 def _failure_result(batch_id: str = "session-0") -> BeamBatchResult:
@@ -832,7 +959,12 @@ def test_dispatch_lease_preserves_native_eviction_order(
         refs_before = [block.ref_cnt for group in groups for block in group]
         m = attach_gr_stage_metadata(scheduler, output, session)
         assert m is not None
-        assert m.kv_blocks == tuple(tuple(block.block_id for block in group) for group in groups)
+        expected_blocks = (
+            tuple(tuple(block.block_id for block in group) for group in groups)
+            if num_groups == 1
+            else None
+        )
+        assert m.kv_blocks == expected_blocks
         assert [block.ref_cnt for group in groups for block in group] == [
             count + 1 for count in refs_before
         ]

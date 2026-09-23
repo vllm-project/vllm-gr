@@ -243,11 +243,32 @@ def is_gr_session_retired(self: Any, session_id: str) -> bool:
 
 
 def _handle_submit_gr_session(self, batch_request) -> None:
-    """Preprocess once, then let Scheduler register and run the persistent session."""
+    """Keep a caller-formed batch atomic across the input-thread boundary."""
     if not batch_request.items:
         logger.error("Rejecting an empty beam_search_v1 batch")
         return
-    engine_request = batch_request.items[0].request
+    try:
+        from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
+        validate_gr_request(batch_request)
+    except Exception:
+        handler = getattr(self, "_handle_request_preproc_error", None)
+        if handler is None:
+            raise
+        handler(batch_request.items[0].request)
+        return
+    if hasattr(self, "input_queue"):
+        self.input_queue.put_nowait((EngineCoreRequestType.SUBMIT_GR_SESSION, batch_request))
+        return
+    _admit_gr_session(self, batch_request)
+
+
+def _admit_gr_session(self, batch_request) -> None:
+    """Preprocess and admit one complete GR session on the core thread."""
+    if not batch_request.items:
+        logger.error("Rejecting an empty beam_search_v1 batch")
+        return
+    engine_requests = tuple(item.request for item in batch_request.items)
     try:
         from vllm_gr.v1.engine.beam_search_v1 import (
             validate_gr_device_config,
@@ -260,28 +281,32 @@ def _handle_submit_gr_session(self, batch_request) -> None:
         validate_gr_device_config(self.vllm_config)
         if self.batch_queue is None or self.batch_queue_size < 2:
             raise RuntimeError("beam_search_v1 requires a non-blocking EngineCore batch queue")
-        owned_request = copy(engine_request)
-        # Native Request construction only reads nested sampling fields. GR
-        # replaces stop_token_ids below; it never mutates the original list.
-        # The Worker separately detaches every mutable field it retains.
-        owned_request.sampling_params = copy(engine_request.sampling_params)
-        preprocessed = self.preprocess_add_request(owned_request)
+        preprocessed_batch = []
+        for engine_request in engine_requests:
+            owned_request = copy(engine_request)
+            # Native Request construction only reads nested sampling fields. GR
+            # replaces stop_token_ids below; it never mutates the original list.
+            # The Worker separately detaches every mutable field it retains.
+            owned_request.sampling_params = copy(engine_request.sampling_params)
+            preprocessed_batch.append(self.preprocess_add_request(owned_request))
     except Exception:
         handler = getattr(self, "_handle_request_preproc_error", None)
         if handler is None:
             raise  # InprocClient has no output-socket error handler.
-        handler(engine_request)
+        # The batch has one external result channel, owned by the first item.
+        handler(engine_requests[0])
         return
-    native_request = preprocessed[0]
-    # GR owns stop-token/EOS handling. The native token is only a placeholder
-    # for an asynchronously maintained beam state and must not terminate the
-    # Request before GR has produced its authoritative terminal result.
-    native_request.sampling_params.ignore_eos = True
-    native_request.sampling_params.stop_token_ids = []
-    native_request.gr_batch_request = batch_request
-    # Multiprocess admission is handled when the core thread consumes ADD.
-    # In-process callers receive the original admission exception directly.
-    _add_preprocessed_request(self, preprocessed)
+    for member_index, preprocessed in enumerate(preprocessed_batch):
+        native_request = preprocessed[0]
+        # GR owns stop-token/EOS handling. Native tokens are placeholders for
+        # the device-owned batch state and cannot terminate members alone.
+        native_request.sampling_params.ignore_eos = True
+        native_request.sampling_params.stop_token_ids = []
+        native_request.gr_batch_request = batch_request
+        native_request.gr_batch_member_index = member_index
+        # SUBMIT_GR_SESSION reaches this handler as one busy-loop message, so
+        # native scheduling cannot observe a partially inserted batch.
+        self.add_request(*preprocessed)
 
 
 def _apply_beam_step(self, update) -> bool:
@@ -843,7 +868,7 @@ def dispatch_gr_engine_core_input(self, request_type, payload) -> bool:
         self._handle_submit_session(submit_requests, submit_template)
         return True
     if request_type == EngineCoreRequestType.SUBMIT_GR_SESSION:
-        self._handle_submit_gr_session(payload)
+        _admit_gr_session(self, payload)
         return True
     return False
 
@@ -946,6 +971,12 @@ def process_input_sockets(
                     except Exception:
                         self._handle_request_preproc_error(req)
                         continue
+
+                elif request_type == EngineCoreRequestType.SUBMIT_GR_SESSION:
+                    # Preserve the caller-formed batch as one queue item. The
+                    # busy-loop handler preprocesses and admits every member
+                    # before native scheduling can run.
+                    request = decoded_payload
 
                 elif dispatch_gr_engine_core_input(self, request_type, decoded_payload):
                     continue

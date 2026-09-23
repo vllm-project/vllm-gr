@@ -61,6 +61,14 @@ def _sessions(scheduler: Any) -> dict[str, GRSessionState]:
     return sessions
 
 
+def _request_sessions(scheduler: Any) -> dict[str, str]:
+    mapping = getattr(scheduler, "_gr_v1_request_sessions", None)
+    if mapping is None:
+        mapping = {}
+        scheduler._gr_v1_request_sessions = mapping
+    return mapping
+
+
 def has_gr_cleanup_work(scheduler: Any) -> bool:
     """Keep terminal delivery and Worker retirement live under native pause."""
     # Retained sessions are not necessarily runnable: native pause policy
@@ -98,11 +106,12 @@ def _admit_owner(scheduler: Any) -> GRSessionState | None:
 class _AdmissionQueue:
     """Filtered native queue: hidden requests retain their objects and FIFO positions."""
 
-    def __init__(self, queue: Any, owner_id: str):
-        self.queue, self.owner_id = queue, owner_id
+    def __init__(self, queue: Any, owner_ids: tuple[str, ...]):
+        self.queue = queue
+        self.owner_ids = frozenset(owner_ids)
 
     def __iter__(self):
-        return (r for r in self.queue if r.request_id == self.owner_id)
+        return (r for r in self.queue if r.request_id in self.owner_ids)
 
     def __len__(self):
         return sum(1 for _ in self)
@@ -134,8 +143,11 @@ def gr_admission(scheduler: Any):
     manager = scheduler.kv_cache_manager
     allocate = manager.allocate_slots
 
+    owner_ids = owner.request_ids
+    owner_id_set = frozenset(owner_ids)
+
     def reserve(request, num_new_tokens, *args, **kwargs):
-        if request.request_id != owner.session_id:
+        if request.request_id not in owner_id_set:
             raise RuntimeError("Asynchronous scheduling allocation escaped the execution owner")
         computed = request.num_computed_tokens + kwargs.get("num_new_computed_tokens", 0)
         extent = request.num_prompt_tokens + owner.max_decode_steps
@@ -147,8 +159,8 @@ def gr_admission(scheduler: Any):
             )
         return result
 
-    scheduler.waiting = _AdmissionQueue(waiting, owner.session_id)
-    scheduler.skipped_waiting = _AdmissionQueue(skipped, owner.session_id)
+    scheduler.waiting = _AdmissionQueue(waiting, owner_ids)
+    scheduler.skipped_waiting = _AdmissionQueue(skipped, owner_ids)
     manager.allocate_slots = reserve
     if not can_issue_gr_stage(scheduler, owner):
         scheduler.max_num_scheduled_tokens = 0
@@ -173,6 +185,10 @@ def _drain_resources(scheduler: Any, session: GRSessionState) -> None:
 def _release_owner(scheduler: Any, session: GRSessionState) -> None:
     session.resource_status = GRResourceStatus.CLOSED
     _sessions(scheduler).pop(session.session_id, None)
+    request_sessions = _request_sessions(scheduler)
+    for request_id in session.request_ids:
+        if request_sessions.get(request_id) == session.session_id:
+            request_sessions.pop(request_id, None)
     if getattr(scheduler, "_gr_owner", None) == session.session_id:
         scheduler._gr_owner = None
     _progress(scheduler)
@@ -261,9 +277,17 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     except ValueError as error:
         raise GRAdmissionError(str(error)) from error
     session_id = request.batch_id
-    engine_request = request.items[0].request
-    if session_id in getattr(scheduler, "_gr_v1_sessions", {}):
+    engine_requests = tuple(item.request for item in request.items)
+    request_ids = tuple(engine_request.request_id for engine_request in engine_requests)
+    sessions = getattr(scheduler, "_gr_v1_sessions", {})
+    if session_id in sessions:
         raise GRAdmissionError(f"GR session already exists: {session_id}")
+    request_sessions = _request_sessions(scheduler)
+    duplicate_ids = tuple(
+        request_id for request_id in request_ids if request_id in request_sessions
+    )
+    if duplicate_ids:
+        raise GRAdmissionError(f"GR request already belongs to a session: {duplicate_ids[0]}")
     capacity = getattr(scheduler, "_gr_execution_capacity", None)
     if capacity is None:
         from vllm_gr.config import GRConfig
@@ -282,17 +306,35 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     if manager is not None:
         pool = manager.block_pool
         block_size = scheduler.cache_config.block_size
-        extent = len(engine_request.prompt_token_ids) + request.beam_params.max_tokens - 1
-        if (
-            extent >= manager.max_model_len
-            or (extent + block_size - 1) // block_size > pool.num_gpu_blocks - 1
-        ):
+        required_blocks = 0
+        for engine_request in engine_requests:
+            extent = len(engine_request.prompt_token_ids) + request.beam_params.max_tokens - 1
+            required_blocks += (extent + block_size - 1) // block_size
+            if extent >= manager.max_model_len:
+                raise GRAdmissionError(
+                    "Asynchronous scheduling request exceeds the total native KV capacity"
+                )
+        if required_blocks > pool.num_gpu_blocks - 1:
             raise GRAdmissionError(
-                "Asynchronous scheduling request exceeds the total native KV capacity"
+                "Asynchronous scheduling batch exceeds the total native KV capacity"
             )
-    max_prefill = getattr(scheduler.scheduler_config, "max_num_batched_tokens", None)
-    if max_prefill is not None and len(engine_request.prompt_token_ids) > max_prefill:
-        raise GRAdmissionError("Prefill length exceeds max_num_batched_tokens")
+    scheduler_config = scheduler.scheduler_config
+    max_num_seqs = getattr(scheduler_config, "max_num_seqs", len(engine_requests))
+    if len(engine_requests) > max_num_seqs:
+        raise GRAdmissionError("Beam batch size exceeds the native Scheduler max_num_seqs")
+    total_prompt_tokens = sum(
+        len(engine_request.prompt_token_ids) for engine_request in engine_requests
+    )
+    scheduling_token_budget = getattr(scheduler, "max_num_scheduled_tokens", None)
+    if scheduling_token_budget is None:
+        scheduling_token_budget = getattr(
+            scheduler_config, "max_num_batched_tokens", total_prompt_tokens
+        )
+    if total_prompt_tokens > scheduling_token_budget:
+        raise GRAdmissionError(
+            "Beam batch Prefill exceeds the effective native scheduling token "
+            "budget; chunked Prefill is not supported by this scheduling layer"
+        )
     return GRSessionState(
         session_id=session_id,
         request=request,
@@ -310,11 +352,13 @@ def _register_gr_session(scheduler: Any, session: GRSessionState) -> None:
             session.request.beam_params.beam_width
         )
     _sessions(scheduler)[session.session_id] = session
+    request_sessions = _request_sessions(scheduler)
+    request_sessions.update((request_id, session.session_id) for request_id in session.request_ids)
     _admit_owner(scheduler)
 
 
 def add_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionState:
-    """Register one validated B=1 session for direct Scheduler callers."""
+    """Register one validated fixed-membership batch session."""
     session = _prepare_gr_session(scheduler, request)
     _register_gr_session(scheduler, session)
     return session
@@ -325,7 +369,7 @@ def can_issue_gr_stage(scheduler: Any, session: GRSessionState) -> bool:
         getattr(scheduler, "_gr_owner", None) == session.session_id
         and session.resource_status is GRResourceStatus.RUNNING
         and session.status in (GRSessionStatus.WAITING, GRSessionStatus.RUNNING)
-        and session.session_id in scheduler.requests
+        and all(request_id in scheduler.requests for request_id in session.request_ids)
         and len(session._in_flight_dispatches) < GR_LOOKAHEAD_DEPTH
     )
 
@@ -333,67 +377,86 @@ def can_issue_gr_stage(scheduler: Any, session: GRSessionState) -> bool:
 def attach_gr_stage_metadata(
     scheduler: Any, scheduler_output: Any, session: GRSessionState
 ) -> GRStageMetadata | None:
-    req_id = session.session_id
-    if req_id not in scheduler_output.num_scheduled_tokens:
+    request_ids = session.request_ids
+    scheduled_ids = tuple(
+        request_id
+        for request_id in request_ids
+        if request_id in scheduler_output.num_scheduled_tokens
+    )
+    if not scheduled_ids:
         return None
-    native_request = scheduler.requests.get(req_id)
-    if native_request is None:
-        return None
+    if scheduled_ids != request_ids:
+        raise RuntimeError(
+            "native Scheduler split an atomic GR batch stage; all fixed members "
+            "must be scheduled together"
+        )
+    native_requests = tuple(scheduler.requests.get(request_id) for request_id in request_ids)
+    if any(native_request is None for native_request in native_requests):
+        raise RuntimeError("native Scheduler lost a GR batch member")
     if not can_issue_gr_stage(scheduler, session):
         raise RuntimeError("native Scheduler selected a blocked Asynchronous scheduling dispatch")
 
-    if native_request.is_prefill_chunk:
+    prefill_states = tuple(
+        bool(native_request.is_prefill_chunk) for native_request in native_requests
+    )
+    if any(prefill_states):
         raise RuntimeError("beam_search_v1 cannot schedule partial Prefill or recompute")
     dispatch_id = session._next_dispatch_id
     # Native _update_after_schedule already advanced this extent, independently
     # of host consumption of preceding dispatches.
-    stage_index = native_request.num_computed_tokens - native_request.num_prompt_tokens
+    stage_indices = tuple(
+        int(native_request.num_computed_tokens - native_request.num_prompt_tokens)
+        for native_request in native_requests
+    )
+    if len(set(stage_indices)) != 1:
+        raise RuntimeError("GR batch members crossed the Prefill/Decode stage boundary")
+    stage_index = stage_indices[0]
     if not 0 <= stage_index < session.total_stages:
         raise RuntimeError("native GR stage exceeds the effective generation budget")
     previous = session.latest_device_state
     if (stage_index == 0 and previous is not None) or (
-        stage_index > 0 and previous != GRDeviceStateRef(req_id, stage_index - 1)
+        stage_index > 0 and previous != GRDeviceStateRef(session.session_id, stage_index - 1)
     ):
         raise RuntimeError("GR rejects recompute or nonconsecutive native progress")
     kind = GRStageKind.PREFILL if stage_index == 0 else GRStageKind.DECODE
-    output_state = GRDeviceStateRef(req_id, stage_index)
+    output_state = GRDeviceStateRef(session.session_id, stage_index)
+    prompt_tokens = tuple(int(request.num_prompt_tokens) for request in native_requests)
     manager = getattr(scheduler, "kv_cache_manager", None)
     kv_blocks: tuple[tuple[int, ...], ...] | None = None
     if manager is not None:
         # Scheduler owns the native block refcounts. Python references in a
         # Worker cannot prevent block reuse after abort or preemption.
-        kv = manager.get_blocks(req_id)
-        groups = kv.blocks
-        if groups:
-            # Build both sequences in one pass over the groups. The last
-            # reference determines eviction order: match native free() by
-            # preserving group order and releasing each prompt tail first.
-            touched: list[Any] = []
-            lease: list[Any] = []
-            for group in groups:
+        touched: list[Any] = []
+        lease: list[Any] = []
+        block_rows: list[tuple[int, ...]] = []
+        for request_id in request_ids:
+            kv = manager.get_blocks(request_id)
+            for group in kv.blocks:
                 touched.extend(group)
                 lease.extend(reversed(group))
+            # Only one uniform KV group can be represented as one row per
+            # request. Keep the lease for every group even when publication is
+            # unavailable; the Worker rejects unsupported multi-group GR.
+            if len(kv.blocks) == 1:
+                block_ids = getattr(kv, "get_block_ids", None)
+                if callable(block_ids):
+                    groups = block_ids()
+                    if len(groups) == 1:
+                        block_rows.append(tuple(groups[0]))
+                else:
+                    block_rows.append(
+                        tuple(
+                            block if isinstance(block, int) else getattr(block, "block_id", block)
+                            for block in kv.blocks[0]
+                        )
+                    )
+        if len(block_rows) == len(request_ids):
+            kv_blocks = tuple(block_rows)
+        if touched:
             manager.block_pool.touch(touched)
             session._kv_dispatch_leases[dispatch_id] = tuple(lease)
-        # Publish the per-group block ids so a runner without host-side
-        # request state (V2) can build its beam attention block table without
-        # reaching back into scheduler-owned structures.  ``groups`` holds
-        # KVCacheBlock objects; only the integer ids cross the boundary.
-        # Tuple-of-tuples so the frozen metadata stays hashable.  The
-        # attribute fallback covers stand-in KVCacheBlocks in tests.
-        block_ids = getattr(kv, "get_block_ids", None)
-        if callable(block_ids):
-            kv_blocks = tuple(tuple(group) for group in block_ids())
-        else:
-            kv_blocks = tuple(
-                tuple(
-                    block if isinstance(block, int) else getattr(block, "block_id", block)
-                    for block in group
-                )
-                for group in groups
-            )
     metadata = GRStageMetadata(
-        session_id=req_id,
+        session_id=session.session_id,
         dispatch_id=dispatch_id,
         stage_index=stage_index,
         kind=kind,
@@ -403,11 +466,14 @@ def attach_gr_stage_metadata(
         output_device_state=output_state,
         beam_params=session.request.beam_params,
         output_options=session.request.output_options,
-        num_prompt_tokens=int(native_request.num_prompt_tokens),
+        num_prompt_tokens=sum(prompt_tokens),
+        produces_output=True,
         session_init=session.request if stage_index == 0 else None,
         owner_generation=session.owner_generation,
         execution_capacity=scheduler._gr_execution_capacity,
         kv_blocks=kv_blocks,
+        request_ids=request_ids,
+        num_prompt_tokens_by_request=prompt_tokens,
     )
     session._dispatch_records[dispatch_id] = metadata
     session._next_dispatch_id += 1
@@ -643,7 +709,8 @@ def abort_gr_session(scheduler: Any, session_id: str) -> None:
     if session is not None:
         session.status = GRSessionStatus.ABORTED
         session.terminal_result_pending = False
-    scheduler.finish_requests(session_id, RequestStatus.FINISHED_ABORTED)
+    request_ids = session.request_ids if session is not None else (session_id,)
+    scheduler.finish_requests(list(request_ids), RequestStatus.FINISHED_ABORTED)
     if session is not None and not session._in_flight_dispatches:
         _drain_resources(scheduler, session)
 
