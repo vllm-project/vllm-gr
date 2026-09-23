@@ -86,6 +86,9 @@ def test_attention_selector_contracts() -> None:
 def test_gpu_model_runner_private_method_contracts() -> None:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+    # Optional vendor arguments are safe: every GR wrapper forwards *args/**kwargs.
+    load_model_params = _parameter_names(GPUModelRunner.load_model)
+    assert load_model_params[0] == "self"
     assert _parameter_names(GPUModelRunner._prepare_inputs) == [
         "self",
         "scheduler_output",

@@ -74,10 +74,17 @@ class BeamSearchSession:
         # a corrupted cumulative state.
         decision = getattr(self.context, "decision", None)
         if decision is not None:
-            if decision_index is None:
+            if decision_index is not None:
+                decision.reset(decision_index)
+            elif self.context.max_batch == 1:
                 decision.reset()
             else:
-                decision.reset(decision_index)
+                # Synchronized multi-request execution keeps one persistent
+                # decision row per registry slot. Reset only this request's
+                # row; slot 0 starts the cohort and owns the shared step count.
+                decision.reset(self.slot)
+                if self.slot == 0:
+                    decision.worker_decode_steps = 0
 
     def end_session(self):
         """End a beam search session. Releases slot from registry."""

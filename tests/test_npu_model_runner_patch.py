@@ -157,6 +157,65 @@ def test_npu_bookkeeping_collapses_beam_rows_before_host_copy(
     assert sampler_output.sampled_token_ids.tolist() == [[0]]
 
 
+def test_npu_bookkeeping_materializes_batched_sync_logprobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    original_batch = SimpleNamespace()
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(_obj=original_batch),
+        use_async_scheduling=False,
+    )
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[11], [21]], dtype=torch.int32),
+        logprobs_tensors=LogprobsTensors(
+            logprob_token_ids=torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+            logprobs=torch.tensor(
+                [[-0.1, -0.2], [-0.3, -0.4]], dtype=torch.float32
+            ),
+            selected_token_ranks=torch.tensor([0, 0], dtype=torch.int64),
+        ),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={"beam-0": {}, "beam-1": {}},
+        _gr_request_row_configs=[
+            ("beam-0", 0, 1, [0]),
+            ("beam-1", 1, 1, [1]),
+        ],
+        finished_req_ids=set(),
+    )
+
+    def original(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        return (object(), [[99], [98]], {}, ["physical"], {"physical": 0}, [])
+
+    monkeypatch.setattr(
+        npu_patch,
+        "_reduce_sampler_output_for_worker_decision",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        npu_patch,
+        "_beam_collapse_bookkeeping",
+        lambda *_args: (["beam-0", "beam-1"], {"beam-0": 0, "beam-1": 1}, 2),
+    )
+
+    result = npu_patch.make_patched_bookkeeping_sync(original)(
+        runner,
+        scheduler_output,
+        sampler_output,
+    )
+
+    assert result[0].slice_request(0, 1).logprob_token_ids.tolist() == [[11, 12]]
+    assert result[0].slice_request(1, 1).logprob_token_ids.tolist() == [[21, 22]]
+    assert result[1] == [[11], [21]]
+    assert result[3:5] == (
+        ["beam-0", "beam-1"],
+        {"beam-0": 0, "beam-1": 1},
+    )
+    assert runner.input_batch is original_batch
+
+
 def test_npu_sample_patch_is_signature_agnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

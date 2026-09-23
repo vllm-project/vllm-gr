@@ -137,6 +137,8 @@ aligned with it.
 - Behavior:
     - registers active GR CLI options;
     - writes GR values into `VllmConfig.additional_config`;
+    - validates and propagates the fixed per-worker Beam session capacity
+      configured by `beam_max_batch_size`;
     - applies active NPU compatibility defaults.
 - Descriptor assumptions:
     - `add_cli_args` is a `staticmethod`;
@@ -180,6 +182,10 @@ aligned with it.
 - Added values:
     - `ADD_BATCH = b"\x06"`
     - `BEAM_REQUEST_STEP_UPDATE = b"\x07"`
+    - `BEAM_SESSION_TEMPLATE = b"\x08"`
+    - `SUBMIT_SESSION = b"\x09"`
+    - `SUBMIT_GR_SESSION = b"\x0a"`
+    - `BEAM_STEP_BATCH = b"\x0b"`
 - Risk: Critical
 - Current compatibility: upstream vLLM 0.22.1 uses values `0x00` through `0x05`.
 - Private dependencies:
@@ -198,6 +204,8 @@ aligned with it.
     - GR Beam request handlers
 - Risk: Critical
 - Behavior: integrates grouped Beam request processing into EngineCore.
+- Synchronous multi-request Beam updates use one wire frame plus an
+  EngineCore busy-loop gate so the scheduler sees the complete cohort.
 - Compatibility-sensitive upstream behavior includes:
     - ZMQ socket construction;
     - READY and coordinator handshakes;
@@ -229,12 +237,19 @@ aligned with it.
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
+    - `GPUModelRunner.load_model`
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
     - `GPUModelRunner._bookkeeping_sync`
 - Platform: GPU
 - Risk: Critical
+- Behavior:
+    - reserves fixed-address Beam session storage before KV-cache profiling;
+    - accounts the reserved device tensors in `model_memory_usage`;
+    - keeps multi-request execution fail-closed until layout and result fan-out
+      are installed together.
 - Dependencies:
+    - `load_model()` completes before native KV-cache capacity profiling;
     - private method signatures;
     - the 2-item `_prepare_inputs` result;
     - the 7-item `_bookkeeping_sync` result;
@@ -247,12 +262,22 @@ aligned with it.
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
 - Targets:
+    - `NPUModelRunner.load_model`
     - `NPUModelRunner.execute_model`
     - `NPUModelRunner._prepare_inputs`
     - `NPUModelRunner._bookkeeping_sync`
 - Platform: NPU
 - Risk: Critical
+- Behavior:
+    - applies the same fixed-capacity allocation and memory accounting as GPU;
+    - presents fixed storage as ``[1, capacity * W]`` to fused attention,
+      while restoring ``[capacity, W]`` for xllm cache writes;
+    - preserves ``[B, W]`` decision rows and fans each result out by request
+      ID;
+    - requires synchronous, single-device xllm execution when capacity is
+      greater than one.
 - Dependencies:
+    - `load_model()` completes before native KV-cache capacity profiling;
     - NPU-specific private method signatures;
     - the 4-item `_prepare_inputs` result;
     - the 6-item `_bookkeeping_sync` result;
@@ -265,6 +290,8 @@ aligned with it.
 - Mutation: supported process-global registry override
 - Risk: High
 - Behavior: registers the GR Beam Attention backend in the official CUSTOM slot.
+- Multi-batch contract: per-layer pool caching is shape-aware when execution
+  switches between ``[capacity, W]`` and ``[1, capacity * W]`` views.
 - Ownership:
     - Beam Attention metadata and builder:
       `vllm_gr.v1.attention.backends.beam_attn_metadata`;

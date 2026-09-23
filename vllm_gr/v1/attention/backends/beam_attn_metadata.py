@@ -1354,6 +1354,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         # Get beam_session early so _segment_requests can use it for slot lookup
         beam_session = beam_info.get("beam_session") if beam_info else None
+        from vllm_gr.v1.beam.execution_batch import validate_batch_order
+
+        validate_batch_order(beam_session, req_ids, beam_data)
 
         # Check if we have an active beam session for incremental decode.
         # Derived directly from the SCHEDULED requests' beam_data (not from

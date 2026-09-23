@@ -18,6 +18,7 @@ from vllm_gr.v1.worker.model_runner_common import (
     freeze_gc_after_warmup,
     get_beam_graph_runtime_stats,
     is_worker_runner_patched,
+    make_load_model_with_batch_context,
     make_patched_execute_model,
 )
 
@@ -249,6 +250,12 @@ def apply_worker_patches() -> None:
             getattr(runner_class, "load_model", None)
         ):
             runner_class.load_model = workspace_load_patcher(runner_class.load_model)
+
+        batch_context_load = getattr(runner_class, "load_model", None)
+        if callable(batch_context_load):
+            runner_class.load_model = make_load_model_with_batch_context(
+                batch_context_load
+            )
 
         shutdown = getattr(runner_class, "shutdown", None)
         if not getattr(shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):

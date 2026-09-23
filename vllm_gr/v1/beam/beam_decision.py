@@ -1089,8 +1089,16 @@ def init_beam_decision_from_parents(
     device = bufs.sequence.device
     sequence_tensor = torch.tensor(parent_sequences, dtype=torch.int32, device=device)
     score_tensor = torch.tensor(scores, dtype=torch.float32, device=device)
-    bufs.sequence[0, :width, :steps].copy_(sequence_tensor)
-    bufs.beam_scores[0, :width].copy_(score_tensor)
+    row = int(getattr(session, "slot", 0))
+    if row < 0 or row >= bufs.sequence.shape[0]:
+        raise RuntimeError(
+            f"worker beam decision slot {row} exceeds decision capacity "
+            f"{bufs.sequence.shape[0]}"
+        )
+    bufs.sequence[row, :width, :steps].copy_(sequence_tensor)
+    bufs.beam_scores[row, :width].copy_(score_tensor)
+    if bufs.worker_decode_steps not in (0, steps):
+        raise RuntimeError("synchronized beam sessions have inconsistent parent sequence lengths")
     bufs.worker_decode_steps = steps
 
 
@@ -1240,6 +1248,8 @@ def _reorder_kv_same_step(
                     block_table = torch.tensor(
                         [session.slot], dtype=torch.int32, device=beam_index.device
                     )
+                else:
+                    block_table = block_table[session.slot : session.slot + 1]
                 beam_ops.select_unshared_kv(
                     beam_index.contiguous(),
                     [p.unshared_key for p in pools],
@@ -1307,11 +1317,12 @@ def _finalize_decision(
 
     state = session._state
     if not state.is_last_step:
-        # The shared beam context serves a single active session (max_batch=1
-        # design): its operator row is batch row 0.  Only that row's mapping
-        # may feed the pool reorder — flattening every batch row would push a
-        # [B*W] parent mapping into a [W]-wide pool.
-        _reorder_kv_same_step(session, local_idx[0], local_prefix[0])
+        # Each session owns one W-wide pool row.  Apply each request-local
+        # mapping to its own row; flattening all B rows would incorrectly feed
+        # a [B*W] mapping into a [W]-wide session pool.
+        sessions = getattr(session, "_batch_sessions", (session,))
+        for row, item in enumerate(sessions):
+            _reorder_kv_same_step(item, local_idx[row], local_prefix[row])
         # The applied mapping is NOT materialized here: reading
         # ``local_idx[0].tolist()`` is a device→host sync that stalls the
         # pipeline every step (~30ms on NPU, profiling bw128_1k_t3).  The
@@ -1667,6 +1678,59 @@ def run_beam_decision(
     return decision
 
 
+def _run_batch_worker_decision(runner: Any, batch: Any, sampler_output: Any) -> None:
+    """Run one device decision and publish request-local synchronous results."""
+    first = batch.sessions[0]
+    first._batch_sessions = batch.sessions
+    beam_data = runner._current_beam_info["beam_data"]
+    result_widths = {
+        int(beam_data[session.session_id].get("result_width") or session.beam_width)
+        for session in batch.sessions
+    }
+    if len(result_widths) != 1:
+        del first._batch_sessions
+        raise RuntimeError("multi-request beam decision requires one common result width")
+    try:
+        with torch.autograd.profiler.record_function("beam_decision_device"):
+            decision = run_beam_decision(
+                runner,
+                first,
+                sampler_output,
+                is_last_step=first._state.is_last_step,
+                result_width=next(iter(result_widths)),
+            )
+    finally:
+        del first._batch_sessions
+    if decision is None:
+        raise RuntimeError("batched worker decision unavailable; refusing partial output")
+
+    keys = ("out_token_ids", "out_token_index", "out_log_probs", "out_sequence")
+    host = {
+        key: decision[key].detach().to("cpu").tolist()
+        for key in keys
+        if torch.is_tensor(decision.get(key))
+    }
+    from vllm_gr.v1.beam.execution_batch import split_batch_decision
+
+    request_ids = [session.session_id for session in batch.sessions]
+    results = split_batch_decision(
+        request_ids,
+        first.beam_width,
+        host,
+        first._state.is_last_step,
+    )
+    for session in batch.sessions:
+        if not session._state.is_last_step:
+            session._state.kv_reorder = results[session.session_id]["out_token_index"][0]
+    runner._beam_decision_tensors = {
+        key: value
+        for key, value in decision.items()
+        if key in ("out_token_ids", "out_log_probs", "out_token_index")
+        and torch.is_tensor(value)
+    }
+    runner._beam_decision_result = {"by_request": results}
+
+
 def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
     """Run and publish the active accelerator's worker-side beam decision."""
     fast_prefill = _run_cuda_prefill_postprocess(runner, sampler_output)
@@ -1701,6 +1765,10 @@ def maybe_run_worker_beam_decision(runner: Any, sampler_output: Any) -> None:
     session = beam_info.get("beam_session") if beam_info else None
     if session is None:
         runner._beam_decision_result = None
+        return
+
+    if hasattr(session, "sessions"):
+        _run_batch_worker_decision(runner, session, sampler_output)
         return
 
     state = session._state

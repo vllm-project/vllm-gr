@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 import threading
 import time
+from copy import copy
 from functools import wraps
 from typing import Any
 
@@ -28,6 +29,7 @@ _WORKER_SAMPLE_TOKENS_PATCH_MARKER = "_vllm_gr_beam_sample_tokens_patch"
 _WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
 _WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
 _WORKER_MODEL_FORWARD_PATCH_MARKER = "_vllm_gr_prefill_model_forward_patch"
+_WORKER_BATCH_CONTEXT_LOAD_PATCH_MARKER = "_vllm_gr_beam_batch_context_load_patch"
 
 
 def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -393,10 +395,10 @@ class InputBatchProxy:
         # misses and re-gathers from its own params.  A hit skips the
         # per-frame stack + index_select + unbind gather chain entirely.
         object.__setattr__(self, "_shared_sampling_cache", shared_sampling_cache)
-        # Remapped sampling metadata, cached for this proxy's lifetime.
-        # Holds the underlying ``sampling_metadata`` object after its
-        # per-request tensors were remapped onto logits rows; validated by
-        # identity so a mid-step rebuild (refresh_metadata) is picked up.
+        # (source, remapped-copy), cached for this proxy's lifetime.  The
+        # source object belongs to upstream InputBatch and must remain intact:
+        # mutating it makes a later logical request inherit another request's
+        # expanded beam-row sampling tensors.
         object.__setattr__(self, "_sampling_metadata_cache", None)
         # (device, tensor) cache for the shared logits-row index tensor.
         object.__setattr__(self, "_logits_idx_tensor_cache", None)
@@ -437,16 +439,18 @@ class InputBatchProxy:
                 return s_meta
 
             cached = object.__getattribute__(self, "_sampling_metadata_cache")
-            if cached is not None and cached is s_meta:
+            if cached is not None and cached[0] is s_meta:
                 # Fast path: this exact metadata object was already remapped.
                 # Repeated accesses within the step (sampler, constraint
                 # hook, bookkeeping) skip the per-attribute loop entirely.
-                return cached
+                return cached[1]
 
             orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
+            remapped_meta = copy(s_meta)
+            needs_remap = tuple(logits_map) != tuple(range(orig_req_len))
             shared_sampling = object.__getattribute__(self, "_shared_sampling_cache")
             remap_key = None
-            if shared_sampling is not None and orig_req_len != len(logits_map):
+            if shared_sampling is not None and needs_remap:
                 # Beam-row expansion is a per-REQUEST constant: vLLM v1
                 # per-request sampling params are immutable once the request
                 # is admitted, and the logits_map pins the batch layout.  The
@@ -462,9 +466,11 @@ class InputBatchProxy:
                 hit = shared_sampling.get(remap_key)
                 if hit is not None:
                     for attr_name, tensor in hit.items():
-                        object.__setattr__(s_meta, attr_name, tensor)
-                    object.__setattr__(self, "_sampling_metadata_cache", s_meta)
-                    return s_meta
+                        object.__setattr__(remapped_meta, attr_name, tensor)
+                    object.__setattr__(
+                        self, "_sampling_metadata_cache", (s_meta, remapped_meta)
+                    )
+                    return remapped_meta
             # Group per-request sampling tensors by dtype and remap each group
             # with a single device gather instead of one ``aten::index`` kernel
             # per attribute (7 kernels per decode step in profiling).  The
@@ -474,7 +480,7 @@ class InputBatchProxy:
             for attr in _SAMPLING_META_ATTRS:
                 val = getattr(s_meta, attr, None)
                 if isinstance(val, torch.Tensor) and val.numel() > 0:
-                    if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
+                    if val.shape[0] == orig_req_len and needs_remap:
                         pending.setdefault(val.dtype, []).append((attr, val))
             if pending:
                 first_val = next(iter(next(iter(pending.values()))))[1]
@@ -493,7 +499,7 @@ class InputBatchProxy:
                     stacked = torch.stack([v for _, v in items], dim=0)
                     gathered = stacked.index_select(1, idx_tensor)
                     for attr_name, col in zip(names, gathered.unbind(dim=0)):
-                        object.__setattr__(s_meta, attr_name, col)
+                        object.__setattr__(remapped_meta, attr_name, col)
                         remapped[attr_name] = col
                 if shared_sampling is not None and remap_key is None:
                     remap_key = (
@@ -507,8 +513,8 @@ class InputBatchProxy:
                     # one beam session; a geometry change replaces the entry.
                     shared_sampling.clear()
                     shared_sampling[remap_key] = remapped
-            object.__setattr__(self, "_sampling_metadata_cache", s_meta)
-            return s_meta
+            object.__setattr__(self, "_sampling_metadata_cache", (s_meta, remapped_meta))
+            return remapped_meta
 
         elif name == "req_ids":
             return BeamReqIdsProxy(obj.req_ids, req_map)
@@ -1548,6 +1554,109 @@ def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     )
 
 
+def _beam_context_device_memory_bytes(context: Any) -> int:
+    """Return unique device-tensor bytes owned by a beam context."""
+
+    tensors = [value for value in vars(context).values() if torch.is_tensor(value)]
+    tensors.extend(
+        value for value in vars(context.decision).values() if torch.is_tensor(value)
+    )
+    tensors.extend(
+        tensor
+        for pool in context.pools
+        for tensor in (pool.unshared_key, pool.unshared_value)
+    )
+    unique_tensors: dict[tuple[str, int], torch.Tensor] = {}
+    for tensor in tensors:
+        unique_tensors[(str(tensor.device), tensor.data_ptr())] = tensor
+    return sum(tensor.numel() * tensor.element_size() for tensor in unique_tensors.values())
+
+
+def make_load_model_with_batch_context(original):
+    """Reserve multi-session Beam storage before native KV-cache profiling."""
+
+    if getattr(original, _WORKER_BATCH_CONTEXT_LOAD_PATCH_MARKER, False):
+        return original
+
+    @wraps(original)
+    def load_model_with_batch_context(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        config = _get_gr_config(self)
+        count = int(getattr(config, "beam_max_batch_size", 1))
+        if count <= 1:
+            return result
+
+        width = getattr(config, "beam_max_width", None)
+        if width is None:
+            raise ValueError("beam_max_batch_size > 1 requires beam_max_width")
+        if not bool(getattr(config, "beam_worker_decision", False)):
+            raise ValueError("beam_max_batch_size > 1 requires worker-side beam decision")
+        if bool(getattr(self, "use_async_scheduling", False)):
+            raise ValueError(
+                "beam_max_batch_size > 1 currently requires synchronous scheduling"
+            )
+
+        parallel = self.parallel_config
+        parallel_sizes = (
+            int(getattr(parallel, "tensor_parallel_size", 1)),
+            int(getattr(parallel, "pipeline_parallel_size", 1)),
+            int(getattr(parallel, "data_parallel_size", 1)),
+        )
+        if parallel_sizes != (1, 1, 1):
+            raise ValueError(
+                "beam_max_batch_size > 1 currently requires TP=1, PP=1, and DP=1"
+            )
+
+        scheduler = self.vllm_config.scheduler_config
+        max_num_seqs = int(getattr(scheduler, "max_num_seqs", 0))
+        max_num_batched_tokens = int(getattr(scheduler, "max_num_batched_tokens", 0))
+        required_tokens = count * int(width)
+        if max_num_seqs < count or max_num_batched_tokens < required_tokens:
+            raise ValueError(
+                "beam_max_batch_size requires scheduler capacity for B sessions "
+                f"and B*W tokens (B={count}, W={width}, "
+                f"max_num_seqs={max_num_seqs}, "
+                f"max_num_batched_tokens={max_num_batched_tokens})"
+            )
+
+        if str(self.device.type).lower() != "npu":
+            raise ValueError(
+                "beam_max_batch_size > 1 is currently supported only on NPU"
+            )
+        from vllm_gr.v1.beam.beam_decision import _xllm_decode_mode_active
+
+        if not _xllm_decode_mode_active():
+            raise ValueError("NPU beam_max_batch_size > 1 requires xllm decode execution")
+
+        context = getattr(self, "_beam_context", None)
+        if context is None:
+            context = _create_beam_context(self, config, max_batch=count)
+            self._beam_context = context
+        elif int(context.max_batch) != count:
+            raise RuntimeError(
+                "existing Beam context capacity does not match beam_max_batch_size "
+                f"({context.max_batch} != {count})"
+            )
+
+        context_bytes = _beam_context_device_memory_bytes(context)
+        self.model_memory_usage = int(getattr(self, "model_memory_usage", 0)) + context_bytes
+        logger.info(
+            "vllm-gr: reserved Beam multi-session context "
+            "(batch=%d, width=%d, device_bytes=%d)",
+            count,
+            width,
+            context_bytes,
+        )
+        return result
+
+    setattr(
+        load_model_with_batch_context,
+        _WORKER_BATCH_CONTEXT_LOAD_PATCH_MARKER,
+        True,
+    )
+    return load_model_with_batch_context
+
+
 def _seed_beam_decision_from_metadata(session: Any, mdata: dict[str, Any]) -> None:
     """Synchronize decision state with the authoritative selected parents."""
     parent_scores = mdata.get("parent_cumulative_logprobs")
@@ -1590,11 +1699,11 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
       (whose req_ids are no longer in beam_data) are released as a safety
       net for unexpected abort/error paths.
 
-    Concurrency: the shared context is created with ``max_batch=1`` — a
-    single active beam session by design (pool slots, suffix buffers and the
-    captured FULL graphs all bake one session).  Batches carrying more than
-    one incremental beam-decode request are rejected with an explicit
-    RuntimeError below.
+    Concurrency: the shared context capacity is configured by
+    ``beam_max_batch_size``.  Multi-request execution is admitted only as
+    one synchronized, fixed-membership NPU/xllm cohort; partial scheduling,
+    reordering, asymmetric EOS/cancellation, and interleaving with another
+    cohort fail closed.
     """
     runner._beam_sessions = getattr(runner, "_beam_sessions", {})
 
@@ -1606,6 +1715,11 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         if session is not None:
             session.end_session()
             tore_down_session = True
+    active_cohort = getattr(runner, "_beam_active_cohort_ids", None)
+    if active_cohort is not None and not any(
+        session_id in runner._beam_sessions for session_id in active_cohort
+    ):
+        del runner._beam_active_cohort_ids
     if tore_down_session:
         # A full beam-search request just finished in this (EngineCore/worker)
         # process.  Schedule the one-time post-warmup GC freeze on a background
@@ -1624,24 +1738,79 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     if not incremental_ids:
         return None
 
-    # The shared beam context serves a SINGLE active session: the pools, the
-    # suffix buffers, the xllm block-table buffer and the captured FULL
-    # graphs are all sized/created with max_batch=1 (see step 3 below and the
-    # capture paths).  A second concurrent beam-decode request would exhaust
-    # the slot registry mid-batch, and the stale-session retry inside the
-    # allocate path below cannot free a slot because BOTH ids are active —
-    # the batch would die with the generic "No free beam session slots"
-    # error.  Reject the unsupported concurrency explicitly instead.
-    if len(incremental_ids) > 1:
+    # The context is capacity-sized once.  Multi-request batches must preserve
+    # exact cohort membership and order for every decode step; this keeps slot,
+    # suffix-buffer, block-table, and decision-row mappings stable.
+    gr_cfg = _get_gr_config(runner)
+    capacity = int(getattr(gr_cfg, "beam_max_batch_size", 1))
+    if len(incremental_ids) > capacity:
         raise RuntimeError(
-            "vllm-gr concurrent incremental beam decode requests are not "
-            "supported: the beam KV pool holds a single active session "
-            f"(max_batch=1), but this batch carries {len(incremental_ids)} "
-            f"({incremental_ids}). Serialize beam search requests or wait "
-            "for the active one to finish."
+            f"beam batch size {len(incremental_ids)} exceeds configured "
+            f"capacity {capacity}"
         )
 
-    gr_cfg = _get_gr_config(runner)
+    active_cohort = getattr(runner, "_beam_active_cohort_ids", None)
+    if active_cohort is not None and tuple(active_cohort) != tuple(incremental_ids):
+        raise RuntimeError(
+            "active beam cohort was split, reordered, cancelled, or reached "
+            "EOS asymmetrically"
+        )
+
+    if len(incremental_ids) == 1 and active_cohort is None:
+        stale = set(runner._beam_sessions) - set(incremental_ids)
+        if stale:
+            raise RuntimeError(
+                "cannot interleave a single beam session while other sessions "
+                f"occupy context slots: {sorted(stale)}"
+            )
+
+    if len(incremental_ids) > 1:
+        if str(getattr(getattr(runner, "device", None), "type", "")).lower() != "npu":
+            raise RuntimeError("multi-request beam decode is currently supported only on NPU")
+        if bool(getattr(runner, "use_async_scheduling", False)):
+            raise RuntimeError("multi-request beam decode requires synchronous scheduling")
+
+        widths = {int(beam_data[req_id]["beam_width"]) for req_id in incremental_ids}
+        steps = {int(beam_data[req_id]["decode_step"]) for req_id in incremental_ids}
+        if widths != {int(gr_cfg.beam_max_width or 0)} or len(steps) != 1:
+            raise RuntimeError(
+                "multi-request beam decode requires the configured exact width "
+                "and one synchronized decode step"
+            )
+        scheduled = getattr(scheduler_output, "num_scheduled_tokens", {})
+        if any(
+            int(scheduled.get(req_id, -1)) != int(beam_data[req_id]["beam_width"])
+            for req_id in incremental_ids
+        ):
+            raise RuntimeError(
+                "multi-request beam decode must schedule all W tokens for every request"
+            )
+        if any(
+            beam_data[req_id].get("parent_cumulative_logprobs") is None
+            or not beam_data[req_id].get("beam_suffix")
+            for req_id in incremental_ids
+        ):
+            raise RuntimeError(
+                "multi-request worker decision requires parent scores and beam suffixes"
+            )
+
+        cohort = tuple(incremental_ids)
+        active_cohort = getattr(runner, "_beam_active_cohort_ids", None)
+        if active_cohort is None:
+            if steps != {0}:
+                raise RuntimeError("a new beam cohort must start at decode_step=0")
+            stale = set(runner._beam_sessions) - set(cohort)
+            if stale:
+                raise RuntimeError(
+                    "cannot start a beam cohort while stale sessions occupy slots: "
+                    f"{sorted(stale)}"
+                )
+            runner._beam_active_cohort_ids = cohort
+        elif tuple(active_cohort) != cohort:
+            raise RuntimeError(
+                "active beam cohort was split, reordered, cancelled, or reached "
+                "EOS asymmetrically"
+            )
 
     # Beam decode requests are scheduled incrementally (the scheduler freezes
     # the paged cache at the prefix; decode KV belongs in the beam pool).  With
@@ -1662,7 +1831,11 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     #    as the dummy-capture paths — a single source of truth prevents
     #    silent size mismatches that would invalidate captured graphs.
     if not hasattr(runner, "_beam_context"):
-        runner._beam_context = _create_beam_context(runner, gr_cfg, max_batch=1)
+        runner._beam_context = _create_beam_context(
+            runner,
+            gr_cfg,
+            max_batch=int(getattr(gr_cfg, "beam_max_batch_size", 1)),
+        )
 
     # 4. Per-request session management
     active_session = None
@@ -1831,6 +2004,14 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
         if active_session is None:
             active_session = session
 
+    if len(incremental_ids) > 1:
+        from vllm_gr.v1.beam.execution_batch import BeamExecutionBatch
+
+        active_session = BeamExecutionBatch(
+            [runner._beam_sessions[req_id] for req_id in incremental_ids]
+        )
+    runner._beam_decode_forward_count = getattr(runner, "_beam_decode_forward_count", 0) + 1
+    runner._beam_last_decode_batch_size = len(incremental_ids)
     return active_session
 
 
@@ -1933,11 +2114,10 @@ def make_patched_execute_model(_orig_execute_model):
                 if hasattr(context, "decode_step_1based_buf"):
                     context.decode_step_1based_buf.fill_(decode_step + 1)
                 if hasattr(context, "xllm_block_table_buf"):
-                    # max_batch-sized; request 0 maps to the active session's
-                    # pool slot (the registry is max_batch=1, so one active
-                    # session).
                     context.xllm_block_table_buf.fill_(0)
-                    context.xllm_block_table_buf[0] = beam_session.slot
+                    sessions = getattr(beam_session, "sessions", (beam_session,))
+                    for row, session in enumerate(sessions):
+                        context.xllm_block_table_buf[row] = session.slot
 
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info
@@ -2022,9 +2202,14 @@ def is_worker_runner_patched(runner_class) -> bool:
     wrapper that preserves the original result — but the marker must still
     be present for the gate-check to pass.
     """
+    load_model = getattr(runner_class, "load_model", None)
     has_determine = hasattr(runner_class, "_determine_batch_execution_and_padding")
     return bool(
         getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)
+        and (
+            not callable(load_model)
+            or getattr(load_model, _WORKER_BATCH_CONTEXT_LOAD_PATCH_MARKER, False)
+        )
         and getattr(runner_class._prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False)
         and getattr(
             runner_class._bookkeeping_sync,
