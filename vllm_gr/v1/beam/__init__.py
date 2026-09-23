@@ -21,12 +21,22 @@ if TYPE_CHECKING:
     from vllm_gr.v1.beam.beam_session_registry import (
         BeamSessionRegistry as BeamSessionRegistry,
     )
+    from vllm_gr.v1.beam.execution_batch import (
+        BeamBatchExecutionView as BeamBatchExecutionView,
+    )
+    from vllm_gr.v1.beam.execution_batch import (
+        BeamExecutionContractError as BeamExecutionContractError,
+    )
+    from vllm_gr.v1.beam.execution_batch import BeamExecutionStage as BeamExecutionStage
 
 _LAZY_EXPORTS = {
     "BeamAttentionContext": "vllm_gr.v1.beam.beam_attention_context",
     "BeamAttentionPool": "vllm_gr.v1.beam.beam_attention_pool",
     "BeamSearchSession": "vllm_gr.v1.beam.beam_search_session",
     "BeamSessionRegistry": "vllm_gr.v1.beam.beam_session_registry",
+    "BeamBatchExecutionView": "vllm_gr.v1.beam.execution_batch",
+    "BeamExecutionContractError": "vllm_gr.v1.beam.execution_batch",
+    "BeamExecutionStage": "vllm_gr.v1.beam.execution_batch",
 }
 
 __all__ = sorted(_LAZY_EXPORTS)
