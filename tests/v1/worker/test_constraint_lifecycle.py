@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import gc
+import weakref
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -208,6 +210,49 @@ def test_shutdown_is_installed_when_runner_has_no_native_method() -> None:
 
     assert backend.close_calls == 1
     assert runner.constraint_backend is None
+
+
+@pytest.mark.parametrize("shutdown_fails", [False, True])  # type: ignore[misc]
+def test_shutdown_releases_model_bytecode_hooks_only(shutdown_fails: bool) -> None:
+    from torch._dynamo.convert_frame import _bytecode_hooks, register_bytecode_hook
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    runner = _runner()
+    runner.model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    layer_ref = weakref.ref(runner.model[0])
+    weight_ref = weakref.ref(runner.model[0].weight)
+    other_model = torch.nn.Linear(2, 2)
+    hook_fn = TorchCompileWithNoGuardsWrapper.bytecode_hook
+    # AOT loading can register the same model's hook more than once.
+    owned = [
+        register_bytecode_hook(MethodType(hook_fn, runner.model[0])),
+        register_bytecode_hook(MethodType(hook_fn, runner.model[0])),
+    ]
+    foreign = register_bytecode_hook(MethodType(hook_fn, other_model))
+    unrelated = register_bytecode_hook(lambda old, new: None)
+
+    def native_shutdown(self: SimpleNamespace) -> None:
+        self.model = None
+        if shutdown_fails:
+            raise RuntimeError("native shutdown failed")
+
+    try:
+        shutdown = make_shutdown_with_constraint_backend(native_shutdown)
+        for _ in range(2):
+            if shutdown_fails:
+                with pytest.raises(RuntimeError, match="native shutdown failed"):
+                    shutdown(runner)
+            else:
+                shutdown(runner)
+        gc.collect()
+        assert layer_ref() is None
+        assert weight_ref() is None
+        assert all(handle.id not in _bytecode_hooks for handle in owned)
+        assert _bytecode_hooks[foreign.id].__self__ is other_model
+        assert unrelated.id in _bytecode_hooks
+    finally:
+        for handle in (*owned, foreign, unrelated):
+            handle.remove()
 
 
 def test_disabled_configuration_never_calls_loader(

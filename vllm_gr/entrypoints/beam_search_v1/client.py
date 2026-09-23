@@ -11,6 +11,8 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from vllm.v1.engine.exceptions import EngineDeadError
+
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchEngineError
 from vllm_gr.entrypoints.beam_search_v1.input_processor import BeamSearchInputProcessor
 from vllm_gr.entrypoints.beam_search_v1.output_processor import (
@@ -44,6 +46,8 @@ def _run_sync_cleanup(cleanup: Callable[[], None], session_id: str) -> None:
         try:
             cleanup()
             return
+        except EngineDeadError:
+            raise
         except Exception:
             logger.exception("GR session %s cleanup failed; retrying", session_id)
             time.sleep(delay)
@@ -60,6 +64,10 @@ def _start_async_cleanup(
         while True:
             try:
                 await cleanup()
+            except EngineDeadError as exc:
+                if not first_attempt.done():
+                    first_attempt.set_exception(exc)
+                raise
             except Exception as exc:
                 if not first_attempt.done():
                     first_attempt.set_exception(exc)
@@ -109,10 +117,14 @@ class BeamSearchClient:
     def __init__(self, llm: Any) -> None:
         self.llm = llm
         self.engine = llm.llm_engine
+        self._boundary_tokens: tuple[str, tuple[int | None, int | None]] | None = None
 
     def prepare_request(self, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
         BeamSearchOutputProcessor.ensure_available()
-        return BeamSearchInputProcessor(self.engine).process_offline_inputs(self.llm, call)
+        processor = BeamSearchInputProcessor(self.engine)
+        request = processor.process_offline_inputs(self.llm, call)
+        self._boundary_tokens = (request.batch_id, processor.boundary_token_ids)
+        return request
 
     def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
         submit = _get_engine_method(self.engine, "submit_gr_session")
@@ -120,6 +132,8 @@ class BeamSearchClient:
         _get_engine_method(self.engine, "release_gr_session")
         try:
             handle = submit(request)
+        except EngineDeadError:
+            raise
         except Exception as exc:
             _run_sync_cleanup(lambda: abort(request.batch_id), request.batch_id)
             failure = BeamBatchFailure("submit_failed", str(exc), None)
@@ -141,6 +155,8 @@ class BeamSearchClient:
             session.terminal = True
             session.failed = result.failure is not None
             return result
+        except EngineDeadError:
+            raise
         except Exception as exc:  # noqa: BLE001 - EngineCore failure boundary
             session.failed = True
             return _create_failure_result(session.batch_id, "execution_failed", exc)
@@ -153,9 +169,13 @@ class BeamSearchClient:
     ) -> list[Any]:
         if result.failure is not None:
             raise BeamSearchEngineError(result.failure)
-        return BeamSearchOutputProcessor(self.llm.get_tokenizer()).process_outputs(
-            call, request, result
+        prepared = self._boundary_tokens
+        boundaries = (
+            prepared[1] if prepared is not None and prepared[0] == request.batch_id else None
         )
+        return BeamSearchOutputProcessor(
+            self.llm.get_tokenizer(), boundary_token_ids=boundaries
+        ).process_outputs(call, request, result)
 
     def abort(self, session: BeamSearchSession) -> None:
         if session.terminal or session.closed:
@@ -181,11 +201,15 @@ class AsyncBeamSearchClient:
     def __init__(self, serving: Any) -> None:
         self.serving = serving
         self.engine = serving.engine_client
+        self._boundary_tokens: tuple[str, tuple[int | None, int | None]] | None = None
         self._close_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def prepare_request(self, call: OnlineBeamSearchRequest) -> BeamBatchRequest:
         BeamSearchOutputProcessor.ensure_available()
-        return await BeamSearchInputProcessor(self.engine).process_online_inputs(self.serving, call)
+        processor = BeamSearchInputProcessor(self.engine)
+        request = await processor.process_online_inputs(self.serving, call)
+        self._boundary_tokens = (request.batch_id, processor.boundary_token_ids)
+        return request
 
     async def submit_once(self, request: BeamBatchRequest) -> BeamSearchSession:
         submit = _get_engine_method(self.engine, "submit_gr_session")
@@ -201,6 +225,8 @@ class AsyncBeamSearchClient:
                 handle = await asyncio.shield(submission)
         except asyncio.CancelledError:
             await self._rollback_submission(request.batch_id, submission)
+            raise
+        except EngineDeadError:
             raise
         except Exception as exc:
             await self._rollback_submission(request.batch_id, submission)
@@ -222,6 +248,8 @@ class AsyncBeamSearchClient:
             if submission is not None:
                 try:
                     await submission
+                except EngineDeadError:
+                    raise
                 except (Exception, asyncio.CancelledError):
                     pass
             await self._abort_session(session_id)
@@ -229,6 +257,8 @@ class AsyncBeamSearchClient:
         _, first_attempt = _start_async_cleanup(cleanup, session_id)
         try:
             await asyncio.shield(first_attempt)
+        except EngineDeadError:
+            raise
         except Exception:
             # The retained task owns retries before the original submission
             # exception returns to a caller that has no session handle.
@@ -246,6 +276,8 @@ class AsyncBeamSearchClient:
             session.terminal = True
             session.failed = result.failure is not None
             return result
+        except EngineDeadError:
+            raise
         except Exception as exc:  # noqa: BLE001 - EngineCore failure boundary
             session.failed = True
             return _create_failure_result(session.batch_id, "execution_failed", exc)
@@ -261,7 +293,13 @@ class AsyncBeamSearchClient:
         tokenizer = self.serving.input_processor.tokenizer
         if tokenizer is None:
             raise RuntimeError("beam_search_v1 tokenizer became unavailable")
-        return BeamSearchOutputProcessor(tokenizer).process_online_outputs(call, request, result)
+        prepared = self._boundary_tokens
+        boundaries = (
+            prepared[1] if prepared is not None and prepared[0] == request.batch_id else None
+        )
+        return BeamSearchOutputProcessor(
+            tokenizer, boundary_token_ids=boundaries
+        ).process_online_outputs(call, request, result)
 
     async def abort(self, session: BeamSearchSession) -> None:
         if session.terminal or session.closed:

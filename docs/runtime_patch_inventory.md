@@ -54,6 +54,7 @@ aligned with it.
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
+| GR-PATCH-016 | `vllm/utils/system_utils.py` | `npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -315,6 +316,20 @@ aligned with it.
 - Activation: hooks are installed during runtime initialization; sliced projection is
   used only when a valid vocabulary slice is configured.
 - Removal condition: vLLM exposes stable output-projection and logprob-width extension points.
+
+### GR-PATCH-016 — NPU-aware Spawn Start Method
+
+- Source / Installer: `vllm_gr/npu_spawn_patch.py`
+- Orchestration: `vllm_gr/patch.py`
+- Targets:
+    - `vllm.utils.system_utils._maybe_force_spawn` (module attribute)
+    - `vllm.v1.executor.multiproc_executor._maybe_force_spawn` (from-import binding)
+- Risk: Medium
+- Activation: installed when engine configuration loads the vllm.general_plugins
+  entry point; the NPU branch fires only when `torch.npu.is_initialized()` is true
+  in the process that is about to create worker subprocesses.
+- Removal condition: upstream `_maybe_force_spawn()` covers NPU (or delegates the
+  decision to the platform interface).
 
 ## Benchmark-only Runtime Mutations
 

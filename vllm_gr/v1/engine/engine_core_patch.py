@@ -170,6 +170,7 @@ def apply_engine_core_request_patches() -> None:
         _handle_beam_session_template,
         _handle_submit_gr_session,
         _handle_submit_session,
+        is_gr_session_retired,
         process_input_sockets,
     )
 
@@ -187,6 +188,7 @@ def apply_engine_core_request_patches() -> None:
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
     EngineCore._handle_beam_session_template = _handle_beam_session_template
     EngineCore._handle_submit_session = _handle_submit_session
+    EngineCore.is_gr_session_retired = is_gr_session_retired
     EngineCore._handle_submit_gr_session = _handle_submit_gr_session
     EngineCore._apply_beam_step = _apply_beam_step
     EngineCore._beam_self_advance = _beam_self_advance
@@ -658,7 +660,7 @@ def _native_request_terminated(scheduler, result, request_id) -> bool:
 
 
 def _reconcile_native_gr_termination(scheduler, result, session) -> None:
-    from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
+    from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus, GRSessionStatus
     from vllm_gr.v1.engine.gr_async_scheduler import _make_failure_result
 
     if session.status not in (GRSessionStatus.WAITING, GRSessionStatus.RUNNING):
@@ -666,6 +668,7 @@ def _reconcile_native_gr_termination(scheduler, result, session) -> None:
     if not _native_request_terminated(scheduler, result, session.session_id):
         return
 
+    session.resource_status = GRResourceStatus.DRAINING
     session.status = GRSessionStatus.FINISHING
     session.terminal_result_pending = True
     if session._pending_terminal_result is None:
@@ -761,9 +764,11 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
     request_status = (
         RequestStatus.FINISHED_ERROR
         if terminal_result.failure is not None
-        else RequestStatus.FINISHED_STOPPED
+        else RequestStatus.FINISHED_LENGTH_CAPPED
     )
-    finish_reason = FinishReason.ERROR if terminal_result.failure is not None else FinishReason.STOP
+    finish_reason = (
+        FinishReason.ERROR if terminal_result.failure is not None else FinishReason.LENGTH
+    )
 
     _finish_native_gr_request(scheduler, native_request, request_id, request_status)
 
@@ -829,12 +834,24 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
             consume_gr_retirement,
         )
 
-        consume_gr_retirement(self, scheduler_output, model_runner_output)
+        retired_session = consume_gr_retirement(self, scheduler_output, model_runner_output)
         gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, {})
         sessions = getattr(self, "_gr_v1_sessions", {})
         dispatched_sessions = {
-            session_id: sessions[session_id] for session_id in gr_stages if session_id in sessions
+            sid: sessions[sid]
+            for sid, metadata in gr_stages.items()
+            if sid in sessions
+            and metadata.owner_generation == sessions[sid].owner_generation
+            and metadata.dispatch_id in sessions[sid]._in_flight_dispatches
         }
+        # B=1 dispatches never mix with ordinary requests. Stale results must
+        # not reach native token accounting, even if a new owner reuses the ID.
+        if gr_stages and not dispatched_sessions:
+            return {}
+        completions = [
+            self.update_gr_from_output(session, scheduler_output, model_runner_output)
+            for session in dispatched_sessions.values()
+        ]
         native_update_ids = getattr(self, _GR_NATIVE_UPDATE_IDS_ATTR, None)
         if native_update_ids is None:
             native_update_ids = set()
@@ -842,7 +859,14 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         added_update_ids = set(dispatched_sessions).difference(native_update_ids)
         native_update_ids.update(added_update_ids)
         try:
-            result = _original_update(self, scheduler_output, model_runner_output, *args, **kwargs)
+            # A malformed active receipt is a request failure, not a native
+            # sampled token. The normal finalizer clears remaining placeholders
+            # only after drain and matching Worker release confirmation.
+            result = (
+                {}
+                if any(completion.error for completion in completions)
+                else _original_update(self, scheduler_output, model_runner_output, *args, **kwargs)
+            )
         finally:
             native_update_ids.difference_update(added_update_ids)
             if not native_update_ids:
@@ -850,9 +874,15 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
 
         updated_sessions = []
         for session in dispatched_sessions.values():
-            self.update_gr_from_output(session, scheduler_output, model_runner_output)
             _reconcile_native_gr_termination(self, result, session)
             updated_sessions.append(session)
+
+        if retired_session is not None and retired_session.terminal_result_pending:
+            updated_sessions.append(retired_session)
+        for outputs in result.values():
+            for output in outputs.outputs:
+                if output.request_id in dispatched_sessions:
+                    output.new_token_ids = []
 
         # A terminal result may arrive before a look-ahead successor. Buffer it
         # in GRSessionState and publish only after every physical dispatch has

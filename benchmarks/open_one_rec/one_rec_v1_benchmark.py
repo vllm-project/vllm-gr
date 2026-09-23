@@ -42,6 +42,7 @@ def run_v1_benchmark(args, tokenizer, requests):
         beam_width=args.n,
         max_tokens=max_tokens,
         temperature=0.0,
+        ignore_eos=True,
         begin_token="<|sid_begin|>",
         end_token="<|sid_end|>",
         include_stop_str_in_output=True,

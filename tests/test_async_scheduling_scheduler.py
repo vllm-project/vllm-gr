@@ -79,10 +79,10 @@ def scheduler(tmp_path, request):
         scheduler_config=SchedulerConfig(
             max_model_len=64,
             is_encoder_decoder=False,
-            max_num_batched_tokens=16,
+            max_num_batched_tokens=64,
             max_num_seqs=4,
             async_scheduling=True,
-            enable_chunked_prefill=True,
+            enable_chunked_prefill=False,
         ),
         additional_config={"vllm_gr_beam_execution_mode": "v1", "vllm_gr_beam_max_width": 4},
     )
@@ -142,6 +142,7 @@ def receipt(scheduled, *, finished=None, released=None):
             m.output_device_state,
             worker_finished,
             resources_released=resources_released,
+            owner_generation=m.owner_generation,
         )
     out = ModelRunnerOutput(
         req_ids=ids, req_id_to_index={r: i for i, r in enumerate(ids)}, sampled_token_ids=sampled
@@ -200,18 +201,17 @@ def test_early_terminal_releases_on_last_lookahead_receipt(scheduler):
     assert list(next_output.num_scheduled_tokens) == ["B"]
 
 
-def test_chunked_prefill_saturates_without_output_placeholders(scheduler):
-    a = add(scheduler, "A", prompt=49)
-    add(scheduler, "B")
-    first, second = scheduler.schedule(), scheduler.schedule()
-    assert first.num_scheduled_tokens == second.num_scheduled_tokens == {"A": 16}
-    assert scheduler.requests["A"].num_output_placeholders == 0
-    assert a.issued_stages == 0
-    assert len(scheduler.kv_cache_manager.get_blocks("A").blocks[0]) == 4
-    assert scheduler.schedule().total_num_scheduled_tokens == 0
-    assert scheduler.requests["A"].num_computed_tokens == 32
-    scheduler.update_from_output(first, receipt(first))
-    assert scheduler.schedule().num_scheduled_tokens == {"A": 16}
+def test_chunked_prefill_configuration_rejected_without_ghost_session(scheduler):
+    scheduler.scheduler_config.enable_chunked_prefill = True
+    with pytest.raises(ValueError, match="enable_chunked_prefill=False"):
+        add(scheduler, "A", prompt=49)
+    assert not scheduler.requests
+    assert not getattr(scheduler, "_gr_v1_sessions", {})
+    scheduler.scheduler_config.enable_chunked_prefill = False
+    session = add(scheduler, "B", prompt=49)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"B": 49}
+    assert session.issued_stages == 1
 
 
 def test_last_cancelled_request_keeps_work_until_release(scheduler):
@@ -265,7 +265,7 @@ def test_temporary_kv_shortage_applies_backpressure(scheduler):
     assert scheduler.schedule().total_num_scheduled_tokens == 0
     assert not session.worker_resources_allocated
     pool.free_blocks(held)
-    assert scheduler.schedule().num_scheduled_tokens == {"A": 16}
+    assert scheduler.schedule().num_scheduled_tokens == {"A": 33}
     assert len(scheduler.kv_cache_manager.get_blocks("A").blocks[0]) == 3
 
 
@@ -371,3 +371,162 @@ def test_prefix_cache_hit_reuses_only_full_prompt_blocks(scheduler):
     m = getattr(output, GR_STAGE_OUTPUT_ATTR)["B"]
     assert m.produces_output and m.stage_index == 0
     assert len(scheduler.kv_cache_manager.get_blocks("B").blocks[0]) == 3
+
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_native_progress_retains_request_and_suppresses_placeholders(scheduler, n):
+    from tests.test_gr_admission_queue import worker_receipt
+
+    session = add(scheduler, "A", prompt=17, n=n)
+    native = scheduler.requests["A"]
+    pending: list[Any] = []
+    stages = []
+    terminal: list[Any] = []
+    while scheduler.has_requests() or pending:
+        scheduled = scheduler.schedule()
+        if scheduled.total_num_scheduled_tokens:
+            assert scheduler.requests["A"] is native
+            m = scheduled.gr_stage_metadata["A"]
+            stages.append(m.stage_index)
+            assert native.num_computed_tokens == 17 + m.stage_index
+            assert scheduled.num_scheduled_tokens["A"] == (17 if m.stage_index == 0 else 1)
+            pending.append(scheduled)
+        if pending and (len(pending) == 2 or not scheduled.total_num_scheduled_tokens):
+            consumed = pending.pop(0)
+            result = scheduler.update_from_output(consumed, worker_receipt(scheduler, consumed))
+            for outputs in result.values():
+                assert all(output.new_token_ids == [] for output in outputs.outputs)
+                terminal.extend(output for output in outputs.outputs if output.finished)
+    assert stages == list(range(n))
+    assert len(terminal) == 1
+    assert terminal[0].kv_transfer_params["gr_batch_result"].failure is None
+    assert session.resource_status is GRResourceStatus.CLOSED
+    assert not session._kv_dispatch_leases
+
+
+def test_duplicate_and_old_generation_do_not_consume_new_placeholders(scheduler):
+    first_owner = add(scheduler, "A", n=1)
+    old = scheduler.schedule()
+    old_receipt = receipt(old)
+    scheduler.update_from_output(old, old_receipt)
+    assert first_owner.resource_status is GRResourceStatus.CLOSED
+    second_owner = add(scheduler, "A", n=3)
+    new = scheduler.schedule()
+    native = scheduler.requests["A"]
+    before = (native.num_computed_tokens, native.num_output_placeholders, native.num_output_tokens)
+    assert scheduler.update_from_output(old, old_receipt) == {}
+    assert before == (
+        native.num_computed_tokens,
+        native.num_output_placeholders,
+        native.num_output_tokens,
+    )
+    assert second_owner._in_flight_dispatches == {0}
+    scheduler.update_from_output(new, receipt(new))
+    before = (native.num_computed_tokens, native.num_output_placeholders, native.num_output_tokens)
+    assert scheduler.update_from_output(new, receipt(new)) == {}
+    assert before == (
+        native.num_computed_tokens,
+        native.num_output_placeholders,
+        native.num_output_tokens,
+    )
+
+
+@pytest.mark.parametrize("fault", ["missing", "generation", "dispatch"])
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_active_receipt_failure_requires_retirement_and_preserves_cancel(
+    scheduler, fault, cancelled
+):
+    from vllm_gr.v1.engine.beam_search_v1 import GRSessionStatus
+
+    session = add(scheduler, "A", n=1)
+    scheduled = scheduler.schedule()
+    out = receipt(scheduled)
+    result = getattr(out, GR_WORKER_RESULT_ATTR)["A"]
+    if fault == "missing":
+        setattr(out, GR_WORKER_RESULT_ATTR, {})
+    else:
+        attr = "owner_generation" if fault == "generation" else "dispatch_id"
+        setattr(
+            out, GR_WORKER_RESULT_ATTR, {"A": replace(result, **{attr: getattr(result, attr) + 1})}
+        )
+    native = scheduler.requests["A"]
+    if cancelled:
+        scheduler.finish_requests("A", RequestStatus.FINISHED_ABORTED)
+    assert scheduler.update_from_output(scheduled, out) == {}
+    assert native.num_output_tokens == 0
+    assert session.worker_resources_allocated
+    assert session.resource_status is GRResourceStatus.DRAINING
+    assert not session._in_flight_dispatches and not session._kv_dispatch_leases
+    retirement = scheduler.schedule()
+    assert retirement.total_num_scheduled_tokens == 0
+    final = scheduler.update_from_output(retirement, release_receipt(retirement))
+    assert session.resource_status is GRResourceStatus.CLOSED
+    assert not scheduler.has_requests()
+    outputs = [output for client in final.values() for output in client.outputs]
+    if cancelled:
+        assert session.status is GRSessionStatus.ABORTED
+        assert outputs == []
+    else:
+        assert len(outputs) == 1
+        assert (
+            outputs[0].kv_transfer_params["gr_batch_result"].failure.code == "worker_protocol_error"
+        )
+    assert scheduler.update_from_output(retirement, release_receipt(retirement)) == {}
+
+
+def test_worker_input_isolates_retained_nested_objects(scheduler):
+    from vllm.sampling_params import StructuredOutputsParams
+
+    from vllm_gr.v1.worker.gr_execution import worker_input
+
+    add(scheduler, "A")
+    scheduled = scheduler.schedule()
+    native = scheduler.requests["A"]
+    native.sampling_params.skip_clone = True
+    native.sampling_params.stop_token_ids = [2]
+    native.sampling_params.logit_bias = {7: -1.0}
+    native.sampling_params.allowed_token_ids = [7, 8]
+    native.sampling_params.extra_args = {
+        "stop_ids": native.sampling_params.stop_token_ids,
+        "bias": native.sampling_params.logit_bias,
+    }
+    native.sampling_params.structured_outputs = StructuredOutputsParams(choice=["yes"])
+    # StructuredOutputsParams validates/copies constructor lists. Establish
+    # the actual cross-field alias after that normalization.
+    native.sampling_params.stop = native.sampling_params.structured_outputs.choice
+    native.sampling_params._bad_words_token_ids = [[7, 8]]
+    native.sampling_params.all_stop_token_ids.add(2)
+    native.sampling_params.retained_metadata = {"values": [1]}
+    local = worker_input(scheduled)
+    local.num_scheduled_tokens["A"] = 128
+    local.finished_req_ids.add("A")
+    owned = local.scheduled_new_reqs[0]
+    owned.prompt_token_ids[0] = 9
+    owned.block_ids[0].append(99)
+    owned.sampling_params.max_tokens = 99
+    owned.sampling_params.stop_token_ids.append(3)
+    owned.sampling_params.logit_bias[7] = -2.0
+    owned.sampling_params.allowed_token_ids.append(9)
+    owned.sampling_params.structured_outputs.choice.append("no")
+    owned.sampling_params.bad_words_token_ids[0].append(9)
+    owned.sampling_params.all_stop_token_ids.add(3)
+    owned.sampling_params.retained_metadata["values"].append(2)
+    assert scheduled.num_scheduled_tokens == {"A": 7}
+    assert not scheduled.finished_req_ids
+    assert native.prompt_token_ids == [1] * 7
+    assert native.sampling_params.max_tokens == 3
+    assert native.sampling_params.stop_token_ids == [2]
+    assert native.sampling_params.stop == ["yes"]
+    assert native.sampling_params.logit_bias == {7: -1.0}
+    assert native.sampling_params.allowed_token_ids == [7, 8]
+    assert native.sampling_params.extra_args == {"stop_ids": [2], "bias": {7: -1.0}}
+    assert owned.sampling_params.extra_args["stop_ids"] is owned.sampling_params.stop_token_ids
+    assert owned.sampling_params.extra_args["bias"] is owned.sampling_params.logit_bias
+    assert owned.sampling_params.structured_outputs.choice is owned.sampling_params.stop
+    assert native.sampling_params.structured_outputs.choice == ["yes"]
+    assert native.sampling_params.bad_words_token_ids == [[7, 8]]
+    assert native.sampling_params.all_stop_token_ids == {2}
+    assert native.sampling_params.retained_metadata == {"values": [1]}
+    assert 99 not in scheduled.scheduled_new_reqs[0].block_ids[0]
+    assert local.gr_stage_metadata is scheduled.gr_stage_metadata
+    assert local.scheduled_cached_reqs is scheduled.scheduled_cached_reqs

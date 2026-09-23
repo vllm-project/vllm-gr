@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -107,6 +110,106 @@ def test_grllm_v1_entry_uses_new_frontend(monkeypatch: pytest.MonkeyPatch) -> No
     assert isinstance(result[0], OfflineBeamSearchRequest)
     assert result[0].use_tqdm is True
     assert result[0].concurrency_limit == 4
+
+
+@pytest.mark.parametrize("fail_shutdown", [False, True])  # type: ignore[misc]
+def test_v1_heap_is_prepared_before_serving_and_released_on_close(
+    monkeypatch: pytest.MonkeyPatch, fail_shutdown: bool
+) -> None:
+    from vllm.entrypoints.llm import LLM
+
+    from vllm_gr.entrypoints.gr import GRLLM
+    from vllm_gr.utils import engine_lifecycle
+
+    events: list[str] = []
+
+    def shutdown() -> None:
+        events.append("shutdown")
+        if fail_shutdown:
+            raise RuntimeError("engine shutdown failed")
+
+    def initialize(llm: Any, **kwargs: Any) -> None:
+        llm.llm_engine = SimpleNamespace(
+            vllm_config=SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"}),
+            shutdown=shutdown,
+        )
+        events.append("engine_ready")
+
+    monkeypatch.setattr(LLM, "__init__", initialize)
+    monkeypatch.setattr("vllm_gr.plugin.initialize_runtime", lambda: {})
+    monkeypatch.setattr(
+        "vllm_gr.entrypoints.openai.beam_search_patch.patch_engine_core_process_entrypoint",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        engine_lifecycle, "acquire_frontend_startup_heap", lambda: events.append("freeze")
+    )
+    monkeypatch.setattr(
+        engine_lifecycle, "release_frontend_startup_heap", lambda: events.append("unfreeze")
+    )
+    monkeypatch.setattr("vllm_gr.entrypoints.gr.release_accelerator_memory", lambda: None)
+    monkeypatch.setattr("vllm_gr.entrypoints.gr.gc.collect", lambda: 0)
+    frontend = _Frontend()
+    monkeypatch.setattr(GRLLM, "_create_beam_search_v1_client", lambda self: frontend)
+
+    llm = GRLLM(model="/fake/v1")
+    assert events == ["engine_ready", "freeze"]
+    llm.beam_search_v1([[1, 2]], object())
+    llm.beam_search_v1([[1, 2]], object())
+    assert events == ["engine_ready", "freeze"]
+    if fail_shutdown:
+        with pytest.raises(RuntimeError, match="engine shutdown failed"):
+            llm.shutdown()
+    else:
+        llm.shutdown()
+    llm.shutdown()
+    assert events == ["engine_ready", "freeze", "shutdown", "unfreeze"]
+
+
+def test_v1_startup_heap_keeps_dynamic_cycles_collectible_and_releases_owners() -> None:
+    # GC is process-wide. Exercise real collection in an isolated interpreter
+    # so the test runner's objects and existing freeze ownership stay intact.
+    script = textwrap.dedent(
+        """
+        import gc
+        import weakref
+        from vllm_gr.utils.engine_lifecycle import (
+            acquire_frontend_startup_heap, release_frontend_startup_heap,
+        )
+
+        class Node:
+            def __init__(self):
+                self.peer = self
+
+        threshold, enabled = gc.get_threshold(), gc.isenabled()
+        for _ in range(2):
+            startup = Node()
+            startup_ref = weakref.ref(startup)
+            acquire_frontend_startup_heap()
+            acquire_frontend_startup_heap()
+            assert gc.get_freeze_count() > 0
+            del startup
+            transient = Node()
+            transient_ref = weakref.ref(transient)
+            del transient
+            gc.collect()
+            assert transient_ref() is None
+            assert startup_ref() is not None
+            release_frontend_startup_heap()
+            gc.collect()
+            assert startup_ref() is not None
+            release_frontend_startup_heap()
+            assert gc.get_freeze_count() == 0
+            gc.collect()
+            assert startup_ref() is None
+
+        assert gc.get_threshold() == threshold and gc.isenabled() == enabled
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_v1_async_flow_awaits_preparation_before_submitting_and_closes() -> None:

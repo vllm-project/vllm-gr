@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm_gr import lmcache_patch
+from vllm_gr import lmcache_patch, npu_spawn_patch
 from vllm_gr.ops import sliced_logits_patch
 from vllm_gr.v1 import ascend_compat
 
@@ -491,13 +491,16 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
 def _apply_patches(force: bool = False) -> int:
     """Apply all runtime patches needed by vllm-gr."""
+    # Install the NPU-aware spawn guard before anything can create worker
+    # processes, so engine startup inherits the corrected start-method choice.
+    npu_spawn_count = int(npu_spawn_patch.apply_npu_spawn_patch())
     ascend_attn_count = ascend_compat.apply_ascend_attention_backend_patch(force=force)
     # Import/patch NPUWorker before the beam patch tries to access
     # NPUModelRunner. vllm-ascend's worker module deliberately initializes
     # vllm_ascend.ops first, avoiding an import-order cycle through device_op.
     npu_worker_count = ascend_compat.patch_npu_worker_init_device()
     beam_count = _apply_gr_beam_patches(force=force)
-    return ascend_attn_count + npu_worker_count + beam_count
+    return npu_spawn_count + ascend_attn_count + npu_worker_count + beam_count
 
 
 def re_apply_patches() -> int:

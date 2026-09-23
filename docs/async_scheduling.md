@@ -11,29 +11,43 @@ For a runnable OneRec-1.7B setup before reading this execution contract, see
 
 - GPU ModelRunner V1, FP16/BF16, uniform text decoder with Beam Attention and a
   canonical CUDA constraint table; the existing model, KV and head-size checks apply.
-- B=1, one execution owner, two physical dispatch slots including initial Prefill chunks.
+- B=1, one execution owner, Q=2 in-flight stage dispatches. Q is not request concurrency.
 - W is fixed at startup, 1–256. Effective N is 1, 2 or 3 and includes the first
   token sampled from Prefill. TP/PP/DP/DCP/PCP are all 1.
+- `ignore_eos=True` is required. A legal EOS remains an ordinary candidate;
+  generation ends by length after N outputs. Disable Chunked Prefill; partial
+  Prefill and recompute after generation are rejected. Prefix-cache hit/miss is supported.
 - Native async scheduling and an Executor batch queue of at least two entries.
   No ordinary/legacy Beam request mixing while an asynchronous scheduling session owns resources.
 - No speculative decoding, LoRA, KV/EC transfer, quantization, sliding-window
   attention, multimodal inputs, hybrid models or microbatching.
 
-Public output-consumer readiness checks remain in place. This contract covers
-native Scheduler and Worker execution; public output delivery is separate.
+Public offline and online `beam_search_v1()` return complete sequences and
+cumulative scores only after matching resource-release confirmation. The legacy
+`beam_search()` API retains its existing execution path.
 
-## Existing baseline and new behavior
+## Native progress and execution ownership
 
-The base is upstream `6bca38c` (the same tree as `632f7d2`): native
-BatchQueue/Executor/Futures, two-dispatch lookahead,
-device Beam state, individual dispatch KV leases, Beam update/KV reorder kernels
-and an independent control D2H stream already existed.
+One native Request is added once and remains resident across Prefill and Decode.
+After native `_update_after_schedule`, the stage index is
+`num_computed_tokens - num_prompt_tokens`: zero is Prefill, and positive values
+are Decode with `decode_step = stage_index - 1`. The native Scheduler counts one
+logical token per Decode; the Worker runs W physical rows using its own mutable
+input view. GR stores dispatch/generation identities, dependency records and KV
+leases, without a separate token/placeholder budget.
 
-Asynchronous scheduling adds:
+For P=900 and N=3, a cache miss schedules 900 Prefill tokens; a hit reusing
+896 tokens schedules 4. Both reach computed=900, stage=0. Subsequent Decode
+stages reach computed=901/902 and schedule one logical token each. Worker
+snapshots carry the pre-schedule count and validate this same token extent.
+
+The refactor retains the baseline's native BatchQueue/Executor/Futures, two-slot
+lookahead, GPU Beam state, streams, staging, graph capture, kernels and output
+packing. The responsibilities are:
 
 1. **Admission before native selection.** A view of native waiting queues exposes
    only the FIFO execution owner, retaining the original Request objects and queue
-   ordering. A zero native token budget blocks both Decode and Prefill chunks when
+   ordering. A zero native token budget blocks new stage dispatches when
    either physical slot is unavailable. Admission reserves P+N-1 native KV positions
    through `allocate_slots(num_lookahead_tokens=...)`. Temporary shortage applies
    backpressure; impossible capacity is rejected. Recompute after generation is rejected.
@@ -56,7 +70,7 @@ Asynchronous scheduling adds:
    A requested but unavailable graph is an error; requests never capture graphs.
    Asynchronous Prefill reuses the existing project Prefill runner, including padded
    graph replay: 900 scheduled tokens can use a captured 1024-token bucket. Bucket
-   selection uses the scheduled token count after prefix-cache hits and chunking.
+   selection uses the scheduled token count after prefix-cache hits.
    Replay refreshes static buffers, preserves real Attention lengths and masks padded
    KV writes. Missing startup graphs, unsupported live inputs, missing metadata or
    slot mapping, and exceeded captured KV-length or buffer bounds still fall back
@@ -64,13 +78,15 @@ Asynchronous scheduling adds:
    Padding alone does not trigger eager fallback. It can change BF16 results and
    Beam candidate ordering; the historical exact-bucket results do not establish
    precision for the padded path, whose matching validation remains outstanding.
-5. **Independent retirement proof.** Result completion and resource completion
-   are separate. Resources transition `WAITING → RUNNING → DRAINING → RETIRING →
-   CLOSED`. A zero-token SchedulerOutput carries session, owner generation and
-   retirement ID. Worker drains control consumers and GPU work, clears actual
-   session/workspace ownership, then returns a normal ModelRunnerOutput proof.
-   Only the matching proof allows the next owner. Cancelled waiting requests that
-   never allocated Worker resources close immediately.
+5. **Matching release proof.** Terminal data waits until all in-flight dispatches
+   drain and resource release is confirmed. The last terminal output consumer can
+   report `resources_released=True`, preserving the existing normal path. When
+   that proof is unavailable, a zero-token SchedulerOutput carries session,
+   owner generation and retirement ID. Worker drains consumers/GPU work and
+   clears session/workspace ownership before acknowledging retirement. Pending
+   terminal data survives this round trip and is delivered once, then the next
+   owner can start. Cancelled waiting requests allocate no Worker resources;
+   running cancellation drains and releases without sending a late success.
 6. **Native queue progress and errors.** Retirement counts as pending work even
    for the last request. Submissions, receipt consumption, retirement and admission
    increment Host progress and avoid the fixed idle sleep. Each active dispatch
@@ -94,24 +110,29 @@ sequenceDiagram
     W->>G: Ordered upload / bind / Forward(k+1)
     G-->>C: Independent control copy(k)
     C-->>E: Retire dispatch(k)
-    E->>W: Zero-token retirement frame after drain
-    W-->>E: Release proof after actual cleanup
+    alt Last terminal consumer released resources
+        C-->>E: Terminal receipt with matching release proof
+    else Independent cleanup required
+        E->>W: Zero-token retirement frame after drain
+        W-->>E: Matching release proof after actual cleanup
+    end
+    E->>E: Deliver terminal result once (unless cancelled)
     E->>W: Admit next session
 ```
 
 ### First Decode after Prefill
 
-The final Prefill chunk advances the issued-stage count when it is scheduled;
+Native scheduling records complete Prefill progress when it is scheduled;
 its real output need not have reached the CPU. Once Worker has submitted both
-Prefill execution and sampling, EngineCore can submit D1 into the second slot.
-Worker begins D1's CPU layout preparation inside `execute_model(D1)`. It then
+Prefill execution and sampling, EngineCore can submit D0 into the second slot.
+Worker begins D0's CPU layout preparation inside `execute_model(D0)`. It then
 checks the native pinned-input fence, updates native request state, uploads the
 layout, builds attention metadata, and submits device binding and Forward.
 The fence protects Host buffer reuse; it does not wait for Prefill Forward.
 Actual token/Beam-state reads remain ordered after Prefill sampling on the GPU.
 
 Prefill Graph reduces the time spent submitting model operations on the Host.
-That leaves a larger GPU execution window for D1 preparation in the same Worker
+That leaves a larger GPU execution window for D0 preparation in the same Worker
 thread. Graph replay and asynchronous queue progress are both needed to explain
 the observed benefit; graph replay alone does not move CPU preparation earlier
 when the benchmark deliberately waits for each receipt. Short eager fallbacks
@@ -119,7 +140,7 @@ can still finish before the next dispatch's CPU preparation starts.
 
 ## Validation
 
-See [the validation summary](async_scheduling_validation.md) for supported
-inputs, precision results and regression commands. Experimental benchmarks,
+The [validation summary](async_scheduling_validation.md) records historical
+execution work. Experimental benchmarks,
 trace analysis and diagnostic instrumentation are maintained outside the
 production change.

@@ -100,6 +100,7 @@ def main() -> None:
         beam_width=128,
         max_tokens=5,
         temperature=0.0,
+        ignore_eos=True,
         begin_token="<|sid_begin|>",
         end_token="<|sid_end|>",
         include_stop_str_in_output=True,
@@ -114,8 +115,9 @@ def main() -> None:
             _ = s.text
         elapsed = (time.perf_counter_ns() - start) / 1e6
         seq = last["result"].output.items[0].sequences
+        # Public V1 outputs omit the Worker-internal parent beam history.
         assert len(seq) == 128 and all(
-            len(s.token_ids) == 3 and len(s.parent_beam_indices) == 3 for s in seq
+            len(s.token_ids) == 3 and not s.parent_beam_indices for s in seq
         )
         return {
             "e2e_ms": elapsed,

@@ -93,7 +93,7 @@ Video history: <|sid_begin|><s_a_346><s_b_6566><s_c_5603><|sid_end|>. Recommend 
 Save it as `$ONEREC_WORKDIR/prompt.txt`, then run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
+USE_TF=0 \
 python examples/offline_inference/beam_search/offline_beam_search_v1.py \
   --model "$ONEREC_MODEL" \
   --catalog "$ONEREC_WORKDIR/video_constraint_triples.json" \
@@ -119,7 +119,10 @@ switch for arbitrary requests. Keep these values for the first reproduction:
 | --- | ---: | --- |
 | Scheduling | `async_scheduling=True` | EngineCore submits the next stage early. |
 | Beam width | 128 | Startup allocates the KV pool and captures a fixed-shape graph; request width must match exactly. |
-| Generation steps `N` | 3 | Only 1, 2, and 3 are currently supported. |
+| Generation steps `N` | 3 | N includes the first token from Prefill; only 1, 2, and 3 are supported. |
+| EOS | `ignore_eos=True` | Legal EOS candidates are retained; finish after N outputs. |
+| Prefill | `enable_chunked_prefill=False` | The complete remaining prompt must fit the native token budget. |
+| Dispatch capacity `Q` | 2 | Two stages may be in flight for the same logical owner; this does not make B=2. |
 | `max_tokens` | 5 | The example has begin and end positions, so `N = 5 - 2 = 3`. |
 | Constraint | CUDA Constraint Table | Produces catalog-valid SIDs. |
 | Parallelism and requests | TP/PP/DP/DCP/PCP are 1; one request | One execution owner holds the physical dispatch slots. |
@@ -132,11 +135,12 @@ client `beam_width`.
 
 ## 5. Validate and troubleshoot
 
-With real model weights, run the system test to cover Prefill, Prefix Cache,
-graph replay, and resource release:
+With real model weights, run the system test for actual offline and online V1
+calls, N=1/2/3, Prefix Cache, graph replay, cancellation/reuse and release at return.
+Select an available GPU using the environment's existing device allocation rules:
 
 ```bash
-USE_TF=0 CUDA_VISIBLE_DEVICES=0 \
+USE_TF=0 \
 VLLM_GR_TEST_MODEL="$ONEREC_MODEL" \
 python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py
 ```
@@ -147,11 +151,12 @@ python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py
 | Width or generation-step error | Keep request width equal to `max_width` and use 1 through 3 effective generation steps. |
 | Constraint Table digest or tokenizer mismatch | Rebuild the artifact from the current model directory and triples document. |
 | CUDA graph or out-of-memory error | Start with width 128 and the default `--gpu-memory-utilization 0.5`; check for competing GPU processes. |
-| HTTP reproduction is needed | Verify the offline V1 path first. Existing online examples have different parameters and output boundaries. |
+| Online V1 validation is needed | The system test calls `OpenAIServing.beam_search_v1()` with a real asynchronous multiprocess engine. Legacy HTTP gates remain separate. |
+| EOS or Prefill admission error | Set `ignore_eos=True`, disable Chunked Prefill and allow the complete prompt in `max_num_batched_tokens`. |
 
 ## Further reading
 
 - [Asynchronous scheduling execution contract](async_scheduling.md): scheduling, Prefill/Decode overlap, and retirement.
 - [Offline Beam Search V1 reference](../examples/offline_inference/beam_search/README.md#beam-search-v1): full configuration fields and script arguments.
-- [Asynchronous scheduling validation](async_scheduling_validation.md): system tests and precision or graph-replay boundaries.
+- [Asynchronous scheduling validation](async_scheduling_validation.md): historical precision and graph-replay results.
 - [OneRec benchmark](benchmarks/README.md): dataset, online benchmarks, and accuracy evaluation.

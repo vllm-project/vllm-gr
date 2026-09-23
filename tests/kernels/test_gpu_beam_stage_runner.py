@@ -74,7 +74,11 @@ def dispatch(m):
 def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
     context = BeamAttentionContext(3, 6, 1, 5, 8, 2, torch.device("cuda"), dtype)
     state = BeamSearchState(
-        context.decision, beam_width=4, max_new_tokens=n, stop_token_ids=stop_token_ids
+        context.decision,
+        beam_width=4,
+        max_new_tokens=n,
+        stop_token_ids=stop_token_ids,
+        ignore_stop_tokens=True,
     )
     # State row 2, workspace row 1 and KV slot 0 are intentionally distinct.
     slot = context.registry.allocate("session-0", 4, 7)
@@ -379,15 +383,14 @@ def test_terminal_successor_preserves_all_layer_kv(graph):
     assert owner.positions.tolist() == [0] * 4
 
 
-def test_chunks_identity_and_admission_before_writes():
+def test_partial_prefill_and_dispatch_identity_rejected_before_writes():
     owner = runtime()
-    m = metadata(output=False)
-    owner.admit(dispatch(m))
-    result = owner.sample().get_output()
-    assert getattr(result, GR_WORKER_RESULT_ATTR)[m.session_id].produced_token_count == 0
+    with pytest.raises(ValueError, match="complete"):
+        owner.admit(dispatch(metadata(output=False)))
+    assert owner.pending is None and owner.previous is None
+    assert not any(owner.control_busy)
     assert owner.beam.state.num_generated_tokens.sum() == 0
-    continuation = metadata(dispatch=1)
-    owner.admit(dispatch(continuation))
+    owner.admit(dispatch(metadata()))
     owner.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
     owner.sample().get_output()
     before = owner.beam.state.sequence.clone()
@@ -395,13 +398,13 @@ def test_chunks_identity_and_admission_before_writes():
         owner.admit(dispatch(metadata(stage=1, dispatch=99)))
     with pytest.raises(ValueError, match="second active"):
         other = replace(
-            metadata(stage=1, dispatch=2),
+            metadata(stage=1, dispatch=1),
             session_id="other",
             output_device_state=GRDeviceStateRef("other", 1),
             input_device_state=GRDeviceStateRef("other", 0),
         )
         owner.admit(dispatch(other))
-    mixed = dispatch(metadata(1, dispatch=2))
+    mixed = dispatch(metadata(1, dispatch=1))
     mixed.num_scheduled_tokens["ordinary"] = 1
     with pytest.raises(ValueError, match="mix"):
         owner.admit(mixed)
@@ -438,7 +441,7 @@ def test_session_init_binding_rejected_before_writes(fault):
     else:
         request.items[0].request.prompt_token_ids = [1]
     before = owner.beam.state.sequence.clone()
-    with pytest.raises(ValueError, match="session_init disagrees"):
+    with pytest.raises(ValueError, match="session_init disagrees|protocol_version|item_index"):
         owner.admit(dispatch(replace(m, session_init=request)))
     assert owner.pending is None and owner.previous is None and not any(owner.control_busy)
     torch.testing.assert_close(owner.beam.state.sequence, before)
@@ -666,3 +669,29 @@ def test_fresh_metadata_updates_contents_without_changing_graph_addresses():
     assert owner.metadata.num_reqs == 1
     assert owner.metadata.query_start_loc_cpu == [0, 4]
     assert owner.metadata.prefix_max_seq_len == 64
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_terminal_materialization_preserves_fatal_error_channel(monkeypatch, fatal):
+    owner = runtime(torch.float16, 1)
+    owner.admit(dispatch(metadata(n=1)))
+    owner.logits = torch.zeros((1, 6), dtype=torch.float16, device="cuda")
+    receipt = owner.sample()
+    error = RuntimeError("CUDA device failure") if fatal else ValueError("invalid output shape")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(owner.final_output, "consume", fail)
+    if fatal:
+        with pytest.raises(RuntimeError, match="CUDA device failure"):
+            receipt.get_output()
+        assert not owner.closed
+        assert not any(owner.control_busy)
+        done = torch.Event()
+        done.record()
+        owner.release(owner.binding, consumer_done=done)
+    else:
+        result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+        assert result.terminal_result.failure.code == "beam_final_output_error"
+        assert result.resources_released and owner.closed

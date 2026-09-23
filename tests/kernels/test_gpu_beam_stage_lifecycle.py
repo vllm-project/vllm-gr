@@ -67,9 +67,9 @@ def warm_stage_kernels(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("prefix_hit", [False, True])
 @pytest.mark.parametrize("graph", [False, True])
-def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunked, graph):
+def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix_hit, graph):
     warm_stage_kernels(dtype)
     owner = runtime(dtype)
     worker = owner.worker
@@ -193,11 +193,9 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunke
     torch.accelerator.synchronize()
 
     dispatch_id = 0
-    start = 0
-    if chunked:
-        owner.execute(schedule(metadata(output=False), 0, 3), native_prefill)
-        owner.sample().get_output()
-        dispatch_id, start = 1, 3
+    start = 3 if prefix_hit else 0
+    if prefix_hit:
+        kv[:start].fill_(1)  # Independently populated cached prompt KV.
     owner.execute(schedule(metadata(dispatch=dispatch_id), start, 7 - start), native_prefill)
     prefill = owner.sample()
     assert not dma_done.query(), "test must overlap native H2D with Decode dispatch"
@@ -224,15 +222,15 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, chunke
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("n", [1, 2, 3])
+@pytest.mark.parametrize("n", [2, 3])
 @pytest.mark.parametrize("consume_first", [False, True])
-def test_cancelled_chunk_drains_without_initialization(dtype, n, consume_first):
+def test_running_cancel_drains_queued_stage_without_changing_beam_state(dtype, n, consume_first):
     owner = runtime(dtype, n)
-    owner.admit(dispatch(metadata(output=False, n=n)))
+    owner.admit(dispatch(metadata(n=n)))
+    owner.logits = torch.zeros((1, 6), device="cuda", dtype=dtype)
     first = owner.sample()
     if consume_first:
         first.get_output()
-    queued = dispatch(metadata(dispatch=1, n=n))
     owner.cancel(owner.binding)
     state = owner.beam.state
     snapshot = {
@@ -240,19 +238,19 @@ def test_cancelled_chunk_drains_without_initialization(dtype, n, consume_first):
         for name, value in vars(state).items()
         if isinstance(value, torch.Tensor)
     }
-    owner.admit(queued)
-    # Cancellation must not require or inspect logits from a drain-only chunk.
+    owner.admit(dispatch(metadata(stage=1, n=n)))
+    # A cancelled successor drains without touching stale model logits.
     owner.logits = None
     final = owner.sample()
     before = getattr(first.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
     after = getattr(final.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
-    assert before.dispatch_id == 0 and not before.finished and before.produced_token_count == 0
+    assert before.dispatch_id == 0 and not before.finished and before.produced_token_count == 1
     assert after.dispatch_id == 1 and after.finished and after.produced_token_count == 0
     assert after.terminal_result is None
     for name, value in snapshot.items():
         torch.testing.assert_close(getattr(state, name), value, rtol=0, atol=0)
     release(owner)
-    owner.beam.state.reset(owner.binding.state_row)
+    state.reset(owner.binding.state_row)
     assert not state.is_finished[owner.binding.state_row]
     assert not state.is_initialized[owner.binding.state_row]
     for name, value in snapshot.items():

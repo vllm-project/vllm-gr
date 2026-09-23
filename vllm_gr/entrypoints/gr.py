@@ -45,7 +45,7 @@ from vllm_gr.beam_search_decision_utils import (
     select_top_beams,
     select_top_indices,
 )
-from vllm_gr.config import ConstraintBackend, GRConfig
+from vllm_gr.config import BeamExecutionMode, ConstraintBackend, GRConfig
 from vllm_gr.config.validation import validate_beam_max_width, validate_beam_width
 from vllm_gr.constraints import (
     BeamConstraintCoordinator,
@@ -866,6 +866,7 @@ class GRLLM(LLM):
         patch_engine_core_process_entrypoint()
 
         self._shutdown_complete = False
+        self._frontend_gc_registered = False
 
         # Thread the GR values into the EngineArgs that LLM.__init__ builds
         # internally (EngineArgs(model=..., **kwargs)); the arg_utils_gr patch
@@ -985,6 +986,16 @@ class GRLLM(LLM):
                     vocab_size=vocab_size,
                 )
                 self.constraint_strategy.digest = resource.digest
+
+        if resolved_gr.beam_execution_mode is BeamExecutionMode.V1:
+            from vllm_gr.utils.engine_lifecycle import acquire_frontend_startup_heap
+
+            try:
+                acquire_frontend_startup_heap()
+            except Exception:
+                self.shutdown()
+                raise
+            self._frontend_gc_registered = True
 
     def beam_search_v1(
         self,
@@ -1525,9 +1536,16 @@ class GRLLM(LLM):
 
         from vllm_gr.utils.engine_lifecycle import shutdown_sync_engine
 
-        if hasattr(self, "llm_engine") and self.llm_engine is not None:
-            shutdown_sync_engine(self.llm_engine)
-            self.llm_engine = None
+        try:
+            if hasattr(self, "llm_engine") and self.llm_engine is not None:
+                shutdown_sync_engine(self.llm_engine)
+                self.llm_engine = None
+        finally:
+            if getattr(self, "_frontend_gc_registered", False):
+                from vllm_gr.utils.engine_lifecycle import release_frontend_startup_heap
+
+                self._frontend_gc_registered = False
+                release_frontend_startup_heap()
 
         gc.collect()
         release_accelerator_memory()

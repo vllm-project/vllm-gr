@@ -1852,25 +1852,15 @@ def make_patched_execute_model(_orig_execute_model):
         )
 
         if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is not None:
-            from vllm_gr.v1.worker.gpu_beam_stage_runner import execute_gr_retirement
+            from vllm_gr.v1.worker.gr_execution import execute_gr_retirement
 
             require_beam_execution_mode(self.vllm_config, BeamExecutionMode.V1)
             return execute_gr_retirement(self, scheduler_output)
 
         if getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
-            if str(self.device).split(":")[0] != "cuda":
-                raise ValueError("persistent GR stage execution requires GPU V1")
-            from vllm_gr.v1.worker.gpu_beam_stage_runner import get_stage_runner
+            from vllm_gr.v1.worker.gr_execution import execute_gr_stage
 
-            stage_runner = get_stage_runner(self, scheduler_output)
-            try:
-                return stage_runner.execute(scheduler_output, _orig_execute_model, *args, **kwargs)
-            except Exception as error:
-                # Native BatchQueue associates the execute and sample Futures.
-                # Sampling must also fail, otherwise valid-looking stale logits
-                # could hide a failed execute Future from that native path.
-                stage_runner.execution_error = error
-                raise
+            return execute_gr_stage(self, scheduler_output, _orig_execute_model, *args, **kwargs)
         if getattr(scheduler_output, "beam_data", {}):
             require_beam_execution_mode(self.vllm_config, BeamExecutionMode.LEGACY)
         gr_stage = getattr(self, "_gr_gpu_stage_runner", None)

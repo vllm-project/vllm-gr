@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from importlib import import_module
 from unittest import mock
 
@@ -47,6 +48,10 @@ def test_runtime_patch_order_preserves_ascend_initialization(
 
     call_order: list[str] = []
 
+    def apply_npu_spawn() -> int:
+        call_order.append("npu_spawn")
+        return 1
+
     def apply_attention(force: bool = False) -> int:
         call_order.append("attention")
         return 1
@@ -59,6 +64,11 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         call_order.append("beam")
         return 1
 
+    monkeypatch.setattr(
+        runtime_patch.npu_spawn_patch,
+        "apply_npu_spawn_patch",
+        apply_npu_spawn,
+    )
     monkeypatch.setattr(
         runtime_patch.ascend_compat,
         "apply_ascend_attention_backend_patch",
@@ -75,8 +85,8 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_beam,
     )
 
-    assert runtime_patch._apply_patches(force=True) == 3
-    assert call_order == ["attention", "npu_worker", "beam"]
+    assert runtime_patch._apply_patches(force=True) == 4
+    assert call_order == ["npu_spawn", "attention", "npu_worker", "beam"]
 
 
 def test_optional_patch_count_tracks_actual_installation(
@@ -664,3 +674,54 @@ def test_chain_miss_traffic_bypasses_per_block_memo() -> None:
         kv_cache_utils.hash_block_tokens = orig_hash
         kv_cache_utils.get_request_block_hasher = orig_factory
         _vllm_engine.core.get_request_block_hasher = orig_core_factory
+
+
+def test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.utils.system_utils as system_utils
+    import vllm.v1.executor.multiproc_executor as multiproc_executor
+
+    from vllm_gr import npu_spawn_patch
+
+    upstream_calls: list[str] = []
+
+    def upstream() -> None:
+        upstream_calls.append("upstream")
+
+    monkeypatch.setattr(system_utils, "_maybe_force_spawn", upstream)
+    monkeypatch.setattr(multiproc_executor, "_maybe_force_spawn", upstream)
+
+    assert npu_spawn_patch.apply_npu_spawn_patch() is True
+    wrapped = system_utils._maybe_force_spawn
+    assert multiproc_executor._maybe_force_spawn is wrapped
+    assert hasattr(wrapped, "_vllm_gr_npu_spawn_original")
+
+    monkeypatch.setattr(npu_spawn_patch, "_npu_is_initialized", lambda: False)
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    wrapped()
+    assert upstream_calls == ["upstream"]
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ
+
+    # Re-applying over the wrapped target must not stack another layer.
+    assert npu_spawn_patch.apply_npu_spawn_patch() is False
+
+
+def test_npu_spawn_patch_forces_spawn_only_when_npu_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr import npu_spawn_patch
+
+    monkeypatch.setattr(npu_spawn_patch, "_npu_is_initialized", lambda: True)
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    npu_spawn_patch._force_spawn_if_npu_initialized()
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+    # An explicit spawn choice or an uninitialized NPU leaves the env alone.
+    npu_spawn_patch._force_spawn_if_npu_initialized()
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    monkeypatch.setattr(npu_spawn_patch, "_npu_is_initialized", lambda: False)
+    npu_spawn_patch._force_spawn_if_npu_initialized()
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ

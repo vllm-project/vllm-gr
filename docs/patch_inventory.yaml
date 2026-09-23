@@ -229,3 +229,17 @@ patches:
     risk: medium
     contract: sliced-vocabulary-projection
     removal_condition: vLLM exposes stable output-projection and logprob-width hooks
+
+  - id: GR-PATCH-016
+    owner: vllm_gr/npu_spawn_patch.py
+    installer: vllm_gr.npu_spawn_patch.apply_npu_spawn_patch
+    activation: engine configuration loading triggers the vllm.general_plugins entry point
+    validator_or_test:
+      - vllm_gr.npu_spawn_patch.apply_npu_spawn_patch return value
+      - tests/test_patch_initialization.py::test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings
+      - tests/test_patch_initialization.py::test_npu_spawn_patch_forces_spawn_only_when_npu_initialized
+    process_roles: [main, engine_core]
+    target: vllm.utils.system_utils._maybe_force_spawn
+    risk: medium
+    contract: npu-spawn-start-method
+    removal_condition: upstream _maybe_force_spawn() covers NPU (or delegates to the platform interface)

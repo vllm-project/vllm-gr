@@ -99,11 +99,8 @@ def _run_offline_beam_search(
 
 def _run_offline_gr_beam_search_target(loops: int, npu_decode_execution: str = "default") -> None:
     # The memory-delta check below needs two engine lifecycles in one process.
-    # After the first lifecycle the parent has initialized the NPU runtime,
-    # and vLLM's default fork start method would fail EngineCore startup with
-    # "Cannot re-initialize NPU in forked subprocess" (upstream only force-
-    # spawns when CUDA/XPU is initialized). Force spawn for the second run.
-    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    # After the first lifecycle the parent has initialized the NPU runtime;
+    # the NPU-aware _maybe_force_spawn patch then selects spawn automatically.
     device = torch.cuda
     if hasattr(torch, "npu") and torch.npu.is_available():
         device = torch.npu

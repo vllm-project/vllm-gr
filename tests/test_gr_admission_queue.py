@@ -158,9 +158,11 @@ def test_rejected_queued_gr_add_returns_error_then_valid_request_completes(core,
         bad = msgspec.structs.replace(bad, beam_params=params)
     free = core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     core._handle_submit_gr_session(bad)
-    # The input thread only preprocesses and queues; admission has not run.
-    assert core.input_queue.qsize() == 1
-    assert core.output_queue.empty()
+    # Invalid shared semantics fail during preprocessing; capacity/owner
+    # admission still runs on the Core thread without leaving ghost sessions.
+    assert core.input_queue.qsize() == (0 if rejection == "budget" else 1)
+    if rejection != "budget":
+        assert core.output_queue.empty()
     assert not getattr(core.scheduler, "_gr_v1_sessions", {})
     core._process_input_queue()
     assert_one_error(core, "bad")

@@ -44,6 +44,30 @@ def close_constraint_backend(runner: object) -> None:
         backend.close()
 
 
+def _remove_model_bytecode_hooks(runner: object) -> None:
+    """Release native compiler callbacks owned by this runner's model."""
+    model = getattr(runner, "model", None)
+    if model is None:
+        return
+
+    from torch._dynamo.convert_frame import _bytecode_hooks
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    # vLLM 0.22 registers bound methods but discards their RemovableHandles.
+    # The global registry then keeps the model/weights alive after shutdown,
+    # even after gc.unfreeze()/collect(). AOT loading can register duplicates.
+    # CUDAGraphWrapper forwards modules() to the underlying model. Remove all
+    # native hooks for those modules before native shutdown drops self.model;
+    # hooks for other engines or unrelated callbacks must remain registered.
+    module_ids = {id(module) for module in model.modules()}
+    for key, hook in tuple(_bytecode_hooks.items()):
+        if (
+            id(getattr(hook, "__self__", None)) in module_ids
+            and getattr(hook, "__func__", None) is TorchCompileWithNoGuardsWrapper.bytecode_hook
+        ):
+            _bytecode_hooks.pop(key, None)
+
+
 def _runner_vocab_size(runner: object) -> int:
     """Read the effective model vocabulary through the upstream public API."""
 
@@ -152,7 +176,7 @@ def make_load_model_with_constraint_backend(original):
 
 
 def make_shutdown_with_constraint_backend(original=None):
-    """Detach the canonical Backend before running native runner shutdown."""
+    """Release model callbacks and Backend before native runner shutdown."""
 
     if original is not None and getattr(original, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
         return original
@@ -161,12 +185,14 @@ def make_shutdown_with_constraint_backend(original=None):
 
         def shutdown_with_constraint_backend(self, *args, **kwargs):
             del args, kwargs
+            _remove_model_bytecode_hooks(self)
             close_constraint_backend(self)
 
     else:
 
         @wraps(original)
         def shutdown_with_constraint_backend(self, *args, **kwargs):
+            _remove_model_bytecode_hooks(self)
             close_constraint_backend(self)
             return original(self, *args, **kwargs)
 

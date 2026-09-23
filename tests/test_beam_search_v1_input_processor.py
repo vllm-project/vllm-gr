@@ -14,6 +14,10 @@ from vllm.inputs import embeds_input, tokens_input
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 
+from vllm_gr.entrypoints.beam_search_v1.client import (
+    AsyncBeamSearchClient,
+    BeamSearchClient,
+)
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
 from vllm_gr.entrypoints.beam_search_v1.input_processor import BeamSearchInputProcessor
 from vllm_gr.entrypoints.beam_search_v1.protocol import (
@@ -21,7 +25,13 @@ from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OnlineBeamSearchRequest,
 )
 from vllm_gr.sampling_params import BeamSearchParams
-from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
+from vllm_gr.v1.beam.batch_contracts import (
+    BeamBatchOutput,
+    BeamBatchRequest,
+    BeamBatchResult,
+    BeamOutputSequence,
+    BeamRequestOutput,
+)
 
 
 def _canonical_gr_config(*, enabled: bool = True, backend: str = "cuda") -> dict[str, Any]:
@@ -104,7 +114,7 @@ def test_online_request_preserves_native_external_id_routing(
                 OnlineBeamSearchRequest(
                     prompt=[1, 2],
                     request_id=request_id,
-                    params=BeamSearchParams(beam_width=2, max_tokens=3),
+                    params=BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
                 ),
             )
             for request_id in (external_id, external_id, "unrelated-request")
@@ -135,7 +145,7 @@ def test_beam_metadata_uses_native_normalized_temperature(temperature: float) ->
     serving = SimpleNamespace(
         input_processor=SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
     )
-    params = BeamSearchParams(beam_width=2, max_tokens=3, temperature=temperature)
+    params = BeamSearchParams(beam_width=2, max_tokens=3, temperature=temperature, ignore_eos=True)
     request = asyncio.run(
         BeamSearchInputProcessor(engine).process_online_inputs(
             serving, OnlineBeamSearchRequest([1, 2], "request-1", params)
@@ -172,6 +182,77 @@ def _prepare_request(
     return processor.process_offline_inputs(llm, OfflineBeamSearchRequest([prompt], params))
 
 
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(
+    "begin,end", [(None, None), ("<begin>", None), (None, "<end>"), ("<begin>", "<end>")]
+)  # type: ignore[misc]
+def test_public_result_keeps_the_accepted_boundary_ids(
+    online: bool, begin: str | None, end: str | None
+) -> None:
+    engine = _make_engine()
+    lookups: list[str] = []
+
+    def resolve(token: str) -> int:
+        lookups.append(token)
+        return {"<begin>": 7, "<end>": 8}[token]
+
+    tokenizer = SimpleNamespace(
+        eos_token_id=2,
+        convert_tokens_to_ids=resolve,
+        decode=lambda ids, **kwargs: "|".join(map(str, ids)),
+        batch_decode=lambda rows, **kwargs: ["|".join(map(str, ids)) for ids in rows],
+    )
+    params = BeamSearchParams(
+        beam_width=2, max_tokens=3, ignore_eos=True, begin_token=begin, end_token=end
+    )
+    if online:
+        serving = SimpleNamespace(
+            engine_client=engine, input_processor=SimpleNamespace(tokenizer=tokenizer)
+        )
+        client: Any = AsyncBeamSearchClient(serving)
+        call: Any = OnlineBeamSearchRequest([1, 2], "external-id", params)
+        request = asyncio.run(client.prepare_request(call))
+    else:
+        engine.get_supported_tasks = lambda: ("generate",)
+        llm = SimpleNamespace(
+            llm_engine=engine,
+            get_tokenizer=lambda: tokenizer,
+            _preprocess_cmpl=lambda prompts: prompts,
+            _lora_request_to_seq=lambda lora, size: [lora],
+        )
+        client = BeamSearchClient(llm)
+        call = OfflineBeamSearchRequest([[1, 2]], params)
+        request = client.prepare_request(call)
+    assert lookups == [token for token in (begin, end) if token is not None]
+    assert not request.output_options.include_parent_beam_indices
+    suffix = (9,) * (3 - int(begin is not None) - int(end is not None))
+    result = BeamBatchResult(
+        request.protocol_version,
+        request.batch_id,
+        BeamBatchOutput(
+            (
+                BeamRequestOutput(
+                    0, request.batch_id, (BeamOutputSequence(suffix, -1.25, (), "length", None),)
+                ),
+            )
+        ),
+        None,
+    )
+    # A caller mutation after admission must not alter the accepted boundaries
+    # or trigger another tokenizer lookup when the response is constructed.
+    params.begin_token = params.end_token = "changed-after-admission"
+    output = client.build_output(call, request, result)[0]
+    boundaries = ([7] if begin else []) + list(suffix) + ([8] if end else [])
+    if online:
+        assert output.prompt_token_ids == [1, 2]
+        assert output.outputs[0].token_ids == boundaries
+        assert output.outputs[0].cumulative_logprob == -1.25
+    else:
+        assert output.sequences[0].tokens == [1, 2] + boundaries
+        assert output.sequences[0].cum_logprob == -1.25
+    assert lookups == [token for token in (begin, end) if token is not None]
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     "additional_config",
     [
@@ -192,7 +273,7 @@ def test_request_requires_enabled_canonical_cuda_constraint_table(
         _prepare_request(
             engine,
             [1, 2],
-            BeamSearchParams(beam_width=2, max_tokens=3),
+            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
             online=True,
         )
 
@@ -217,6 +298,15 @@ def test_beam_metadata_uses_native_effective_stop_tokens(
 ) -> None:
     engine = _make_engine()
     engine.input_processor.generation_config_fields = {"eos_token_id": model_eos}
+    if not ignore_eos:
+        with pytest.raises(BeamSearchRequestError, match="ignore_eos=True"):
+            _prepare_request(
+                engine,
+                [10, 11],
+                BeamSearchParams(beam_width=2, max_tokens=3, end_token=end_token, ignore_eos=False),
+                online=online,
+            )
+        return
     request = _prepare_request(
         engine,
         [10, 11],
@@ -259,7 +349,7 @@ def test_embedding_inputs_are_rejected_before_prompt_mutation(
         _prepare_request(
             engine,
             prompt,
-            BeamSearchParams(beam_width=2, max_tokens=3, begin_token=begin_token),
+            BeamSearchParams(beam_width=2, max_tokens=3, begin_token=begin_token, ignore_eos=True),
             online=online,
         )
     assert len(processed_requests) == 1
@@ -279,5 +369,10 @@ def test_online_entrypoint_rejects_dp_before_submission(local_only: bool, local_
         )
     )
     with pytest.raises(BeamSearchRequestError, match="TP/PP/DP/DCP/PCP=1"):
-        _prepare_request(engine, [1, 2], BeamSearchParams(beam_width=2, max_tokens=3), online=True)
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+            online=True,
+        )
     engine.submit_gr_session.assert_not_called()

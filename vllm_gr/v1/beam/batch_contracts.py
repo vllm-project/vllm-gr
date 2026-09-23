@@ -11,8 +11,9 @@ KV cache, or invoke a ModelRunner.
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
-from typing import Literal, NoReturn, TypeGuard
+from typing import Annotated, Literal, NoReturn, TypeGuard
 
 import msgspec
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -119,9 +120,11 @@ class BeamOutputSequence(
     frozen=True,
     gc=False,
 ):  # type: ignore[call-arg]
-    token_ids: tuple[int, ...]
-    cumulative_logprob: float | None
-    parent_beam_indices: tuple[int, ...]
+    token_ids: tuple[Annotated[int, msgspec.Meta(ge=0)], ...]
+    cumulative_logprob: (
+        Annotated[float, msgspec.Meta(ge=-sys.float_info.max, le=sys.float_info.max)] | None
+    )
+    parent_beam_indices: tuple[Annotated[int, msgspec.Meta(ge=0)], ...]
     finish_reason: Literal["stop", "length"]
     stop_token_id: int | None
 

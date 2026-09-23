@@ -3,14 +3,15 @@
 # mypy: disable-error-code="misc,no-untyped-call,no-any-return"
 """Real OneRec weights through the V1 multiprocess Scheduler/Worker pipeline.
 
-A5 public output conversion is not implemented yet. Submit through the native
-session API and inspect the completed device records after Worker retirement;
-no Forward, scheduler, sampling, output conversion or release hook is replaced.
-This guards scheduling and device results, not the public beam_search_v1 API.
+Exercise the public offline/online APIs and inspect release at return. Optional
+environment settings select representative width/dtype/eager configurations;
+test-only observers record actual dispatch/replay without changing execution.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import os
 import signal
@@ -23,7 +24,8 @@ from typing import Any
 
 import pytest
 
-_BEAM_WIDTH = 128
+_BEAM_WIDTH = int(os.environ.get("VLLM_GR_TEST_WIDTH", "128"))
+_EAGER = os.environ.get("VLLM_GR_TEST_EAGER", "0") == "1"
 
 
 class OneRecV1STWorkerExtension:
@@ -31,6 +33,66 @@ class OneRecV1STWorkerExtension:
 
     def onerec_v1_st_snapshot(self) -> dict[str, Any]:
         return _worker_snapshot(self)
+
+    def onerec_v1_st_observe(self) -> None:
+        from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
+        from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+            AsyncGPUBeamOutput,
+            GPUBeamStageRunner,
+        )
+        from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+
+        events: list[dict[str, Any]] = []
+        self._onerec_events = events
+
+        # Observe calls only; each original method executes exactly once with
+        # unchanged arguments/results. These probes are excluded from timing runs.
+        def wrap(cls: type, name: str, describe: Any) -> None:
+            original = getattr(cls, name)
+
+            def observed(instance: Any, *args: Any, **kwargs: Any) -> Any:
+                event = {"method": name, "start_ns": time.perf_counter_ns()}
+                event.update(describe(instance, args))
+                events.append(event)
+                result = original(instance, *args, **kwargs)
+                event["end_ns"] = time.perf_counter_ns()
+                if name == "execute_model_prefill":
+                    event["outcome"] = instance.last_replay_reason
+                return result
+
+            setattr(cls, name, observed)
+
+        def stage(owner: Any, args: Any) -> dict[str, Any]:
+            m = next(iter(args[0].gr_stage_metadata.values()))
+            return {
+                "session_id": m.session_id,
+                "stage": m.stage_index,
+                "scheduled": args[0].num_scheduled_tokens[m.session_id],
+            }
+
+        wrap(GPUBeamStageRunner, "execute", stage)
+        wrap(
+            GPUBeamStageRunner,
+            "prepare_cpu",
+            lambda owner, args: {
+                "session_id": args[0].session_id,
+                "stage": args[0].stage_index,
+                "predecessor_gpu_pending": not owner.last_work.query(),
+            },
+        )
+        wrap(
+            AsyncGPUBeamOutput,
+            "get_output",
+            lambda output, args: {
+                "session_id": output.execution.entries[0].metadata.session_id,
+                "stage": output.execution.entries[0].metadata.stage_index,
+            },
+        )
+        wrap(BeamDecodeGraph, "replay", lambda graph, args: {})
+        wrap(GPUPrefillGraphRunner, "execute_model_prefill", lambda graph, args: {})
+
+    def onerec_v1_st_events(self) -> list[dict[str, Any]]:
+        return self._onerec_events
 
 
 def _worker_snapshot(worker: Any) -> dict[str, Any]:
@@ -95,20 +157,13 @@ def _completed_sequences(
     return sorted(sequences, key=lambda item: (-item[1], item[0]))[:_BEAM_WIDTH]
 
 
-def _run_onerec_v1_scheduler(work_dir: Path) -> None:
+def _inputs(work_dir: Path) -> tuple[Any, ...]:
     from transformers import AutoConfig, AutoTokenizer
 
-    from vllm_gr.config import BeamExecutionMode, GRConfig
     from vllm_gr.constraints.artifact import save_constraint_table_artifact
     from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler
     from vllm_gr.constraints.json_compiler import compile_relations_json
     from vllm_gr.constraints.tokenizer_digest import compute_tokenizer_digest
-    from vllm_gr.entrypoints.beam_search_v1.input_processor import (
-        BeamSearchInputProcessor,
-    )
-    from vllm_gr.entrypoints.beam_search_v1.protocol import OfflineBeamSearchRequest
-    from vllm_gr.entrypoints.gr import GRLLM
-    from vllm_gr.sampling_params import BeamSearchParams
 
     model = os.environ.get("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
@@ -117,13 +172,15 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
     # catalogs while leaving all 128 beams valid at each of the three stages.
     triples = [
         [f"<s_a_{a}>", f"<s_b_{b}>", f"<s_c_{c}>"]
-        for a, b, c in product(range(_BEAM_WIDTH), range(4), range(4))
+        for a, b, c in product(range(max(128, _BEAM_WIDTH)), range(4), range(4))
     ]
     tokenizer_digest = compute_tokenizer_digest(tokenizer)
     table = ConstraintTableArtifactCompiler(
         tokenizer, vocab_size, tokenizer_digest=tokenizer_digest
     ).compile(compile_relations_json(triples))
-    artifact = work_dir / "onerec_v1_constraints.safetensors"
+    artifact = Path(
+        os.environ.get("VLLM_GR_TEST_ARTIFACT", str(work_dir / "onerec_v1_constraints.safetensors"))
+    )
     digest = save_constraint_table_artifact(table, artifact)
     legal = {tuple(tokenizer.convert_tokens_to_ids(triple)) for triple in triples}
     config = {
@@ -131,7 +188,7 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
         "attention_backend": "CUSTOM",
         "beam": {
             "execution_mode": "v1",
-            "graph_enabled": True,
+            "graph_enabled": not _EAGER,
             "worker_decision": True,
             "max_width": _BEAM_WIDTH,
             "max_decode_steps": 3,
@@ -150,100 +207,236 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
     source = tokenizer.encode(prompt_text, add_special_tokens=False)
     newline = tokenizer.encode("\n", add_special_tokens=False)
     assert len(newline) == 1
-    with GRLLM(
+    return model, tokenizer, config, source, newline, legal
+
+
+def _engine_kwargs(model: str, config: dict[str, Any]) -> dict[str, Any]:
+    return dict(
+        distributed_executor_backend=os.environ.get("VLLM_GR_TEST_EXECUTOR"),
         model=model,
         trust_remote_code=True,
-        dtype="bfloat16",
+        dtype=os.environ.get("VLLM_GR_TEST_DTYPE", "bfloat16"),
         seed=0,
-        vllm_gr_config=config,
         async_scheduling=True,
-        worker_extension_cls="tests.st.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
         max_num_seqs=1,
         max_model_len=2048,
-        max_num_batched_tokens=512,
+        max_num_batched_tokens=2048,
         max_logprobs=_BEAM_WIDTH,
-        enable_chunked_prefill=True,
+        enable_chunked_prefill=False,
         enable_prefix_caching=True,
         gpu_memory_utilization=0.5,
-    ) as llm:
-        engine = llm.llm_engine
-        assert (
-            GRConfig.from_vllm_config(engine.vllm_config).beam_execution_mode
-            is BeamExecutionMode.V1
+        enforce_eager=_EAGER,
+        worker_extension_cls="tests.st.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
+    )
+
+
+def _params(steps: int) -> Any:
+    from vllm_gr.sampling_params import BeamSearchParams
+
+    return BeamSearchParams(
+        beam_width=_BEAM_WIDTH,
+        max_tokens=steps + 2,
+        temperature=0.0,
+        ignore_eos=True,
+        begin_token="<|sid_begin|>",
+        end_token="<|sid_end|>",
+    )
+
+
+# The first three requests exercise cache miss/hit and N=1/2/3. The
+# remaining cold prompts straddle KV-block and graph-bucket boundaries.
+_CASES = (
+    (900, 1, True),
+    (900, 2, False),
+    (900, 3, False),
+    (1023, 3, True),
+    (1024, 3, True),
+    (1025, 3, True),
+    (1024, 3, True),
+)
+
+
+def _check_snapshot(
+    snapshot: dict[str, Any], steps: int, legal: set[tuple[int, ...]]
+) -> list[tuple[tuple[int, ...], float]]:
+    assert snapshot["retired"], "Public result arrived before Worker release"
+    assert not snapshot["active_sessions"] and snapshot["registry_size"] == 0
+    assert snapshot["context_released"] and snapshot["workspace_released"]
+    assert not any(snapshot["control_busy"]) and not snapshot["pending"]
+    assert snapshot["error_code"] == 0
+    assert snapshot["generated"] == steps
+    assert snapshot["decode_steps"] == steps - 1
+    assert snapshot["stage_index"] == steps - 1
+    assert snapshot["graph_captured"] is not _EAGER
+    sequences = _completed_sequences(snapshot, steps)
+    assert all(tokens in {t[:steps] for t in legal} for tokens, _ in sequences)
+    return sequences
+
+
+def _write_evidence(
+    work_dir: Path, mode: str, rows: list[dict[str, Any]], events: list[dict[str, Any]]
+) -> None:
+    dispatches = [e for e in events if e["method"] == "execute"]
+    assert any(e["stage"] == 0 and e["scheduled"] < 900 for e in dispatches), "no cache hit"
+    assert all(e["scheduled"] == 1 for e in dispatches if e["stage"] > 0)
+    if not _EAGER:
+        assert any(e["method"] == "replay" for e in events), "no actual Decode replay"
+        assert any(e.get("outcome") == "replay" for e in events), "no actual Prefill replay"
+    report = dict(
+        mode=mode,
+        width=_BEAM_WIDTH,
+        eager=_EAGER,
+        dtype=os.environ.get("VLLM_GR_TEST_DTYPE", "bfloat16"),
+        rows=rows,
+        events=events,
+    )
+    (work_dir / f"{mode}.json").write_text(json.dumps(report, indent=2))
+    print(f"V1 {mode}: {len(rows)} public results, {len(dispatches)} dispatches", flush=True)
+
+
+def _run_onerec_v1_scheduler(work_dir: Path) -> None:
+    from vllm_gr.entrypoints.gr import GRLLM
+
+    model, tokenizer, config, source, newline, legal = _inputs(work_dir)
+    rows: list[dict[str, Any]] = []
+    reference: dict[tuple[int, int], list[tuple[tuple[int, ...], float]]] = {}
+    with GRLLM(vllm_gr_config=config, **_engine_kwargs(model, config)) as llm:
+        expected_client = (
+            "InprocClient"
+            if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"
+            else "SyncMPClient"
         )
-        assert engine.vllm_config.scheduler_config.async_scheduling
-        assert type(engine.engine_core).__name__ == "SyncMPClient"
-        processor = BeamSearchInputProcessor(engine)
-        previous_ids = set()
-        first_sequences = None
+        assert type(llm.llm_engine.engine_core).__name__ == expected_client
+        llm.collective_rpc("onerec_v1_st_observe")
         state_address = None
-        # Long Prefill crosses two native chunks; the intervening requests
-        # change length/budget and reuse the 900-token prompt's cached KV.
-        for index, (length, steps) in enumerate(((1024, 3), (900, 1), (900, 2), (1024, 3))):
-            if index == 3:
-                # Exact BF16 equality needs matching Prefill geometry: a cache
-                # hit can change the bucket and rounding without a scheduler bug.
+        for length, steps, cold in _CASES:
+            if cold:
                 assert llm.reset_prefix_cache()
             ids = (newline * length + source)[-(length - 1) :]
-            params = BeamSearchParams(
-                beam_width=_BEAM_WIDTH,
-                max_tokens=steps + 2,
-                temperature=0.0,
-                ignore_eos=True,
-                begin_token="<|sid_begin|>",
-                end_token="<|sid_end|>",
+            public = llm.beam_search_v1([{"prompt_token_ids": ids}], _params(steps))[0]
+            snapshot = llm.collective_rpc("onerec_v1_st_snapshot")[0]
+            sequences = _check_snapshot(snapshot, steps, legal)
+            assert [
+                (tuple(s.tokens[len(ids) + 1 : -1]), s.cum_logprob) for s in public.sequences
+            ] == sequences
+            assert all(s.finish_reason == "length" for s in public.sequences)
+            assert all(s.tokens[: len(ids)] == ids for s in public.sequences)
+            assert all(
+                s.tokens[len(ids)] == tokenizer.convert_tokens_to_ids("<|sid_begin|>")
+                and s.tokens[-1] == tokenizer.convert_tokens_to_ids("<|sid_end|>")
+                for s in public.sequences
             )
-            # Direct native submission deliberately stops below the missing
-            # A5 frontend converter. The production scheduling path is intact.
-            request = processor.process_offline_inputs(
-                llm, OfflineBeamSearchRequest([{"prompt_token_ids": ids}], params)
-            )
-            assert request.batch_id not in previous_ids
-            previous_ids.add(request.batch_id)
-            handle = engine.submit_gr_session(request)
-            result = engine.wait_gr_session(request.batch_id, handle)
-            assert result.batch_id == request.batch_id
-            if result.failure is not None:
-                assert result.failure.code == "worker_result_unavailable", result.failure
+            assert not llm.llm_engine.has_unfinished_requests()
+            if state_address is not None:
+                assert state_address == snapshot["state_address"]
+            state_address = snapshot["state_address"]
+            if cold and (length, steps) in reference:
+                assert sequences == reference[length, steps]
+            reference[length, steps] = sequences
+            rows.append(dict(prompt=length, n=steps, cold=cold, sequences=sequences))
+        _write_evidence(work_dir, "offline", rows, llm.collective_rpc("onerec_v1_st_events")[0])
+        assert llm.reset_prefix_cache()
 
-            deadline = time.monotonic() + 30
-            while True:
-                snapshot = llm.collective_rpc("onerec_v1_st_snapshot", timeout=30)[0]
-                if snapshot["retired"] and snapshot["session_id"] == request.batch_id:
-                    break
-                assert time.monotonic() < deadline, "V1 Worker retirement did not finish"
-                time.sleep(0.01)
-            assert not engine.has_unfinished_requests()
-            assert snapshot["active_sessions"] == []
-            assert snapshot["registry_size"] == 0
-            assert snapshot["context_released"] and snapshot["workspace_released"]
-            assert not any(snapshot["control_busy"]) and not snapshot["pending"]
-            assert snapshot["error_code"] == 0
-            assert snapshot["generated"] == steps
-            assert snapshot["decode_steps"] == steps - 1
-            assert snapshot["stage_index"] == steps - 1
-            assert snapshot["graph_captured"]
-            sequences = _completed_sequences(snapshot, steps)
-            prefixes = {tokens[:steps] for tokens in legal}
-            assert all(tokens in prefixes for tokens, _ in sequences)
-            if state_address is None:
-                state_address = snapshot["state_address"]
-                first_sequences = sequences
-            else:
-                assert snapshot["state_address"] == state_address
-            if index == 3:
-                assert sequences == first_sequences, "same-geometry repeat changed device results"
-            engine.release_gr_session(request.batch_id)
-            print(
-                f"V1 OneRec: prompt={length}, steps={steps}, beams={len(sequences)}, retired",
-                flush=True,
-            )
-        assert llm.reset_prefix_cache(), "Scheduler retained resources after Worker retirement"
+
+async def _run_online(work_dir: Path) -> None:
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.entrypoints.openai.api_server import (
+        build_async_engine_client_from_engine_args,
+    )
+    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    from vllm.entrypoints.openai.models.serving import (
+        BaseModelPath,
+        OpenAIServingModels,
+    )
+    from vllm.inputs import tokens_input
+
+    from vllm_gr.plugin import initialize_runtime
+
+    initialize_runtime()
+    model, tokenizer, config, source, newline, legal = _inputs(work_dir)
+    args = AsyncEngineArgs(additional_config={"vllm_gr": config}, **_engine_kwargs(model, config))
+    async with build_async_engine_client_from_engine_args(args) as engine:
+        serving = OpenAIServing(
+            engine_client=engine,
+            request_logger=None,
+            models=OpenAIServingModels(
+                engine_client=engine,
+                base_model_paths=[BaseModelPath(name=model, model_path=model)],
+                lora_modules=None,
+            ),
+        )
+        await engine.collective_rpc("onerec_v1_st_observe")
+        rows = []
+
+        async def run(length: int, steps: int, cold: bool, request_id: str) -> None:
+            if cold:
+                assert await engine.reset_prefix_cache()
+            ids = (newline * length + source)[-(length - 1) :]
+            outputs = [
+                out
+                async for out in serving.beam_search_v1(
+                    tokens_input(ids), request_id, _params(steps)
+                )
+            ]
+            assert len(outputs) == 1 and outputs[0].finished
+            output = outputs[0]
+            assert output.request_id == request_id and output.prompt_token_ids == ids
+            snapshot = (await engine.collective_rpc("onerec_v1_st_snapshot"))[0]
+            sequences = _check_snapshot(snapshot, steps, legal)
+            assert [
+                (tuple(c.token_ids[1:-1]), c.cumulative_logprob) for c in output.outputs
+            ] == sequences
+            for index, completion in enumerate(output.outputs):
+                assert completion.index == index and completion.finish_reason == "length"
+                assert completion.stop_reason is None and completion.logprobs is None
+                assert len(completion.token_ids) == steps + 2
+                assert completion.token_ids[0] == tokenizer.convert_tokens_to_ids("<|sid_begin|>")
+                assert completion.token_ids[-1] == tokenizer.convert_tokens_to_ids("<|sid_end|>")
+            assert not engine.output_processor.has_unfinished_requests()
+            rows.append(dict(prompt=length, n=steps, cold=cold, sequences=sequences))
+
+        for length, steps, cold in _CASES:
+            await run(length, steps, cold, "same-public-id")
+
+        async def cancel(*, waiting: bool) -> None:
+            if waiting:
+                await engine.pause_generation(mode="keep", clear_cache=False)
+            before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
+            stream = serving.beam_search_v1(tokens_input(newline * 1023), "cancelled", _params(3))
+            task = asyncio.create_task(anext(stream))
+            try:
+                if waiting:
+                    await asyncio.sleep(0.05)
+                    assert len((await engine.collective_rpc("onerec_v1_st_events"))[0]) == before
+                else:
+                    deadline = time.monotonic() + 30
+                    while True:
+                        events = (await engine.collective_rpc("onerec_v1_st_events"))[0][before:]
+                        if any(e["method"] == "execute" for e in events):
+                            break
+                        assert not task.done() and time.monotonic() < deadline
+                        await asyncio.sleep(0.001)
+                assert not task.done(), "cancellation missed the active request"
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                await stream.aclose()
+                if waiting:
+                    await engine.resume_generation()
+            await run(1024, 3, False, "after-cancel")
+
+        await cancel(waiting=True)
+        await cancel(waiting=False)
+        _write_evidence(
+            work_dir, "online", rows, (await engine.collective_rpc("onerec_v1_st_events"))[0]
+        )
 
 
 @pytest.mark.slow
 @pytest.mark.timeout(660)
-def test_onerec_v1_async_scheduling(tmp_path: Path) -> None:
+@pytest.mark.parametrize("online", [False, True])
+def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool) -> None:
     import torch
 
     if not torch.cuda.is_available():
@@ -252,10 +445,14 @@ def test_onerec_v1_async_scheduling(tmp_path: Path) -> None:
     env.update(
         USE_TF="0",
         VLLM_USE_V2_MODEL_RUNNER="0",
-        VLLM_ENABLE_V1_MULTIPROCESSING="1",
+        VLLM_ENABLE_V1_MULTIPROCESSING=(
+            "1" if online else os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+        ),
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
     command = [sys.executable, "-m", "tests.st.test_onerec_v1_scheduler_st", str(tmp_path)]
+    if online:
+        command.append("--online")
     with subprocess.Popen(
         command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
     ) as process:
@@ -268,4 +465,7 @@ def test_onerec_v1_async_scheduling(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    _run_onerec_v1_scheduler(Path(sys.argv[1]))
+    if "--online" in sys.argv:
+        asyncio.run(_run_online(Path(sys.argv[1])))
+    else:
+        _run_onerec_v1_scheduler(Path(sys.argv[1]))

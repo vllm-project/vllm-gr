@@ -54,9 +54,13 @@ def _prompt_boundaries(
     tokenizer: Any,
     request: BeamBatchRequest,
     params: Any,
+    boundary_token_ids: tuple[int | None, int | None] | None = None,
 ) -> tuple[list[Sequence[int]], list[Sequence[int]], int | None, int | None]:
-    begin_token_id = _token_id(tokenizer, getattr(params, "begin_token", None), "begin_token")
-    end_token_id = _token_id(tokenizer, getattr(params, "end_token", None), "end_token")
+    if boundary_token_ids is None:
+        begin_token_id = _token_id(tokenizer, getattr(params, "begin_token", None), "begin_token")
+        end_token_id = _token_id(tokenizer, getattr(params, "end_token", None), "end_token")
+    else:
+        begin_token_id, end_token_id = boundary_token_ids
     prepared_prompts: list[Sequence[int]] = []
     original_prompts: list[Sequence[int]] = []
     for item in request.items:
@@ -134,10 +138,15 @@ class _V1BeamTailMaterializer:
 class BeamSearchOutputProcessor:
     """Convert one trusted terminal result without retaining session state."""
 
-    def __init__(self, tokenizer: Any) -> None:
+    def __init__(
+        self, tokenizer: Any, *, boundary_token_ids: tuple[int | None, int | None] | None = None
+    ) -> None:
         if tokenizer is None:
             raise ValueError("beam_search_v1 output conversion requires a tokenizer")
         self.tokenizer = tokenizer
+        # Prepared IDs describe the accepted request, even if caller params
+        # change while it runs. Direct output-converter callers still resolve.
+        self._boundary_token_ids = boundary_token_ids
 
     @classmethod
     def ensure_available(cls) -> None:
@@ -152,7 +161,7 @@ class BeamSearchOutputProcessor:
         output = _result_output(result)
         try:
             prepared, original, _, end_token_id = _prompt_boundaries(
-                self.tokenizer, request, call.params
+                self.tokenizer, request, call.params, self._boundary_token_ids
             )
 
             from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
@@ -209,7 +218,7 @@ class BeamSearchOutputProcessor:
         output = _result_output(result)
         try:
             _, original, begin_token_id, end_token_id = _prompt_boundaries(
-                self.tokenizer, request, call.params
+                self.tokenizer, request, call.params, self._boundary_token_ids
             )
 
             from vllm.outputs import CompletionOutput, RequestOutput

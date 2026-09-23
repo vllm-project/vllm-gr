@@ -52,6 +52,43 @@ _frontend_inflight = 0
 _frontend_inflight_cond = threading.Condition()
 
 
+# Offline V1 lacks the HTTP server's startup lifespan, which freezes the
+# frontend's static heap. Keep this ownership separate from the legacy
+# post-request freeze: startup work must finish before requests are admitted.
+_startup_gc_lock = threading.RLock()
+_startup_gc_users = 0
+
+
+def acquire_frontend_startup_heap() -> None:
+    """Freeze static objects before serving, retaining normal automatic GC.
+
+    Construct engines during application startup. GC freeze/unfreeze affects
+    the entire process, just as in native EngineCore/server startup. A lease
+    avoids thawing another live GRLLM's heap. Later engines do not freeze
+    serving objects; the last close ends this process's offline serving phase.
+    """
+    global _startup_gc_users
+    with _startup_gc_lock:
+        if _startup_gc_users == 0:
+            from vllm.utils.gc_utils import freeze_gc_heap
+
+            # CPython itself can already have a small permanent generation;
+            # get_freeze_count() cannot tell whether model startup is covered.
+            freeze_gc_heap()
+        _startup_gc_users += 1
+
+
+def release_frontend_startup_heap() -> None:
+    """Restore collection of startup cycles when the last offline owner closes."""
+    global _startup_gc_users
+    with _startup_gc_lock:
+        if _startup_gc_users <= 0:
+            raise RuntimeError("frontend startup heap has no active owner")
+        _startup_gc_users -= 1
+        if _startup_gc_users == 0:
+            gc.unfreeze()
+
+
 def _enter_frontend_request() -> None:
     global _frontend_inflight
     with _frontend_inflight_cond:

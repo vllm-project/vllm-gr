@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,8 +13,11 @@ import msgspec
 
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
+    BeamBatchOutput,
     BeamBatchRequest,
     BeamBatchResult,
+    BeamOutputSequence,
+    BeamRequestOutput,
 )
 
 
@@ -27,16 +32,115 @@ class AsyncGRSessionHandle:
     output_collector: Any
 
 
+def _normalize_inproc_result(result: BeamBatchResult) -> BeamBatchResult:
+    # Strip only Struct wrappers before typed conversion. Token/parent tuples
+    # stay intact, and convert still validates their elements and constraints.
+    # Unexpected container shapes retain the ordinary typed wire boundary.
+    try:
+        if type(result) is not BeamBatchResult:
+            raise TypeError
+        output = result.output
+        if type(output) is not BeamBatchOutput or result.failure is not None:
+            raise TypeError
+        if type(output.items) is not tuple:
+            raise TypeError
+        items = []
+        astuple = msgspec.structs.astuple
+        for item in output.items:
+            if type(item) is not BeamRequestOutput or type(item.sequences) is not tuple:
+                raise TypeError
+            sequences = []
+            for sequence in item.sequences:
+                if type(sequence) is not BeamOutputSequence:
+                    raise TypeError
+                sequences.append(astuple(sequence))
+            items.append((item.item_index, item.request_id, sequences))
+        return msgspec.convert(
+            (result.protocol_version, result.batch_id, (items,), None), type=BeamBatchResult
+        )
+    except TypeError:
+        return msgspec.msgpack.decode(msgspec.msgpack.encode(result), type=BeamBatchResult)
+
+
 def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
     params = getattr(output, "kv_transfer_params", None) or {}
     result = params.get("gr_batch_result")
     # kv_transfer_params is an untyped IPC field, so array-like msgspec
     # structs arrive as plain lists after a multiprocess round trip.
-    if isinstance(result, (list, tuple)):
+    # msgspec.convert trusts constructed Structs. Strip those wrappers before
+    # typed conversion so inproc values receive the same nested validation.
+    if isinstance(result, BeamBatchResult):
+        result = _normalize_inproc_result(result)
+    elif isinstance(result, (list, tuple)):
         result = msgspec.convert(result, type=BeamBatchResult)
     if isinstance(result, BeamBatchResult):
+        # Typed conversion checks every nested field on both transports,
+        # including nonnegative indices and finite cumulative scores.
+        # Check the V1 envelope and request-dependent semantics once here.
+        if result.protocol_version != request.protocol_version:
+            raise ValueError("terminal Beam result protocol version changed")
+        if (result.output is None) == (result.failure is None):
+            raise ValueError("terminal Beam result requires exactly one output or failure")
         if result.batch_id != request.batch_id:
             raise ValueError("terminal Beam result belongs to a different session")
+        if result.failure is not None and result.failure.item_index not in (None, 0):
+            raise ValueError("terminal Beam failure has an invalid item identity")
+        if result.failure is not None and (
+            not result.failure.code.strip() or not result.failure.message.strip()
+        ):
+            raise ValueError("terminal Beam failure requires a code and message")
+        if result.output is not None:
+            if len(result.output.items) != len(request.items):
+                raise ValueError("terminal Beam result item count changed")
+            options = request.output_options
+            budget = request.beam_params.max_tokens
+            width = request.beam_params.beam_width
+            include_scores = options.include_cumulative_logprob
+            include_parents = options.include_parent_beam_indices
+            expected_sequence = (
+                "length",
+                budget,
+                None,
+                include_scores,
+                budget if include_parents else 0,
+            )
+            for item, source in zip(result.output.items, request.items):
+                if (
+                    item.request_id != source.request.request_id
+                    or item.item_index != source.item_index
+                ):
+                    raise ValueError("terminal Beam result item identity changed")
+                if not item.sequences or len(item.sequences) > options.num_return_sequences:
+                    raise ValueError("terminal Beam result has an invalid sequence count")
+                for sequence in item.sequences:
+                    parents = sequence.parent_beam_indices
+                    # Compare the request-dependent shape together. Typed
+                    # conversion above has already checked every field's type.
+                    if (
+                        sequence.finish_reason,
+                        len(sequence.token_ids),
+                        sequence.stop_token_id,
+                        sequence.cumulative_logprob is not None,
+                        len(parents),
+                    ) != expected_sequence:
+                        # Keep precise protocol failures on malformed results.
+                        if (
+                            sequence.finish_reason != "length"
+                            or len(sequence.token_ids) != budget
+                            or sequence.stop_token_id is not None
+                        ):
+                            raise ValueError("terminal Beam result violates the effective budget")
+                        if include_scores != (sequence.cumulative_logprob is not None):
+                            raise ValueError(
+                                "terminal Beam score presence differs from requested options"
+                            )
+                        if not include_parents and parents:
+                            raise ValueError(
+                                "terminal Beam result contains unrequested parent indices"
+                            )
+                        raise ValueError("terminal Beam result has invalid parent indices")
+                    if include_parents and max(parents) >= width:
+                        raise ValueError("terminal Beam result has invalid parent indices")
         return result
     return BeamBatchResult(
         protocol_version=request.protocol_version,
@@ -71,7 +175,16 @@ def wait_gr_session_sync(
 
 
 def abort_gr_session_sync(engine: Any, session_id: str) -> None:
-    engine.abort_request([session_id], internal=True)
+    # A retry must reach Core even after frontend routing has been removed.
+    engine.output_processor.abort_requests([session_id], internal=True)
+    core = engine.engine_core
+    core.abort_requests([session_id])
+    if hasattr(core, "engine_core"):
+        while not core.engine_core.is_gr_session_retired(session_id):
+            engine.step()
+    else:
+        while not core.call_utility("is_gr_session_retired", session_id):
+            time.sleep(0.001)
 
 
 def release_gr_session_sync(engine: Any, session_id: str) -> None:
@@ -102,7 +215,11 @@ async def wait_gr_session_async(
 
 
 async def abort_gr_session_async(engine: Any, session_id: str) -> None:
-    await engine.abort(session_id, internal=True)
+    engine.output_processor.abort_requests([session_id], internal=True)
+    core = engine.engine_core
+    await core.abort_requests_async([session_id])
+    while not await core.call_utility_async("is_gr_session_retired", session_id):
+        await asyncio.sleep(0.001)
 
 
 async def release_gr_session_async(engine: Any, session_id: str) -> None:

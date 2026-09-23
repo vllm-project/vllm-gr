@@ -191,7 +191,7 @@ def test_retirement_waits_for_output_consumer_and_returns_release_proof():
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_partial_eos_keeps_active_beams_with_delayed_receipts(dtype):
+def test_legal_eos_is_an_ordinary_candidate_with_delayed_receipts(dtype):
     owner = runtime(dtype, stop_token_ids=(1,))
     receipts: list[Any] = []
     for step in range(3):
@@ -205,8 +205,8 @@ def test_partial_eos_keeps_active_beams_with_delayed_receipts(dtype):
         owner.logits = torch.zeros((1 if step == 0 else 4, 6), device="cuda", dtype=dtype)
         receipts.append(owner.sample())
         if step == 0:
-            assert owner.beam.state.active_mask[2].sum().item() == 1
-            assert owner.beam.state.num_completed[2].item() == 1
+            assert owner.beam.state.active_mask[2].sum().item() == 2
+            assert owner.beam.state.num_completed[2].item() == 0
     for step, receipt in enumerate(receipts):
         result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
         assert result.produced_token_count == 1
@@ -219,7 +219,8 @@ def test_partial_eos_keeps_active_beams_with_delayed_receipts(dtype):
             assert result.resources_released
     count = owner.beam.state.num_completed[2].item()
     lengths = owner.beam.state.completed_lengths[2, :count].tolist()
-    assert 1 in lengths and 3 in lengths
+    assert lengths and all(length == 3 for length in lengths)
+    assert 1 in owner.beam.state.history_token_ids[2, 0].tolist()
     assert owner.closed
 
 

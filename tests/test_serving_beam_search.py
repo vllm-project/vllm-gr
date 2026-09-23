@@ -128,13 +128,6 @@ def _run_gr_beam_search_target(loops: int) -> None:
 
     from vllm_gr.patch import re_apply_patches
 
-    # The parent process initializes the NPU runtime during the first engine
-    # lifetime; the second engine must then spawn (not fork) its EngineCore,
-    # or torch_npu raises "Cannot re-initialize NPU in forked subprocess".
-    # Upstream _maybe_force_spawn() only checks CUDA/XPU, so set it here
-    # (same workaround as tests/test_offline_beam_search.py).
-    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
     re_apply_patches()
     assert hasattr(BeamSearchParams, "begin_token")
 

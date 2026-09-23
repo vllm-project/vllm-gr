@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from copy import copy
 from typing import Any
 
 from vllm.logger import init_logger
@@ -236,6 +237,11 @@ def _publish_beam_session_error(self, update) -> None:
     )
 
 
+def is_gr_session_retired(self: Any, session_id: str) -> bool:
+    """Ordered Core-thread query; never block the thread that drains BatchQueue."""
+    return session_id not in getattr(self.scheduler, "_gr_v1_sessions", {})
+
+
 def _handle_submit_gr_session(self, batch_request) -> None:
     """Preprocess once, then let Scheduler register and run the persistent session."""
     if not batch_request.items:
@@ -243,17 +249,23 @@ def _handle_submit_gr_session(self, batch_request) -> None:
         return
     engine_request = batch_request.items[0].request
     try:
-        from vllm_gr.config import BeamExecutionMode
-        from vllm_gr.config.execution import require_beam_execution_mode
+        from vllm_gr.v1.engine.beam_search_v1 import (
+            validate_gr_device_config,
+            validate_gr_execution_config,
+            validate_gr_request,
+        )
 
-        require_beam_execution_mode(self.vllm_config, BeamExecutionMode.V1)
-        if len(batch_request.items) != 1:
-            raise ValueError("Beam Search V1 currently requires batch size B=1")
-        if not self.vllm_config.scheduler_config.async_scheduling:
-            raise RuntimeError("beam_search_v1 requires vLLM async_scheduling")
+        validate_gr_request(batch_request)
+        validate_gr_execution_config(self.vllm_config)
+        validate_gr_device_config(self.vllm_config)
         if self.batch_queue is None or self.batch_queue_size < 2:
             raise RuntimeError("beam_search_v1 requires a non-blocking EngineCore batch queue")
-        preprocessed = self.preprocess_add_request(engine_request)
+        owned_request = copy(engine_request)
+        # Native Request construction only reads nested sampling fields. GR
+        # replaces stop_token_ids below; it never mutates the original list.
+        # The Worker separately detaches every mutable field it retains.
+        owned_request.sampling_params = copy(engine_request.sampling_params)
+        preprocessed = self.preprocess_add_request(owned_request)
     except Exception:
         handler = getattr(self, "_handle_request_preproc_error", None)
         if handler is None:

@@ -8,7 +8,7 @@ import gc
 import threading
 import weakref
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, NoReturn, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -446,3 +446,70 @@ def test_terminal_failure_precedes_tokenizer_access(online: bool) -> None:
             call = OfflineBeamSearchRequest([[1, 2]], object())
         client.build_output(call, _request(), result)
     assert caught.value.failure is failure
+
+
+@pytest.mark.parametrize("operation", ["submit", "wait", "close"])  # type: ignore[misc]
+def test_engine_dead_propagates_without_sync_cleanup_retries(operation: str) -> None:
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    from tests.test_gr_async_scheduler import _batch_request
+
+    calls = []
+
+    def dead(*args: Any) -> NoReturn:
+        calls.append(args)
+        raise EngineDeadError()
+
+    engine = SimpleNamespace(
+        submit_gr_session=dead,
+        wait_gr_session=dead,
+        abort_gr_session=dead,
+        release_gr_session=dead,
+    )
+    client = BeamSearchClient(SimpleNamespace(llm_engine=engine))
+    session = BeamSearchSession(batch_id="A", session_id="A", handle=object())
+    with pytest.raises(EngineDeadError):
+        if operation == "submit":
+            client.submit_once(_batch_request())
+        elif operation == "wait":
+            client.wait_final(session)
+        else:
+            client.close(session)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("operation", ["submit", "wait", "close"])  # type: ignore[misc]
+def test_engine_dead_propagates_and_ends_async_cleanup(operation: str) -> None:
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    from tests.test_gr_async_scheduler import _batch_request
+    from vllm_gr.entrypoints.beam_search_v1.client import _ASYNC_CLEANUP_TASKS
+
+    async def run() -> None:
+        calls = []
+
+        async def dead(*args: Any) -> NoReturn:
+            calls.append(args)
+            raise EngineDeadError()
+
+        engine = SimpleNamespace(
+            submit_gr_session=dead,
+            wait_gr_session=dead,
+            abort_gr_session=dead,
+            release_gr_session=dead,
+        )
+        client = AsyncBeamSearchClient(SimpleNamespace(engine_client=engine))
+        session = BeamSearchSession(batch_id="A", session_id="A", handle=object())
+        before = set(_ASYNC_CLEANUP_TASKS)
+        with pytest.raises(EngineDeadError):
+            if operation == "submit":
+                await client.submit_once(_batch_request())
+            elif operation == "wait":
+                await client.wait_final(session)
+            else:
+                await client.close(session)
+        await asyncio.sleep(0)
+        assert len(calls) == 1
+        assert _ASYNC_CLEANUP_TASKS == before
+
+    asyncio.run(run())

@@ -9,8 +9,7 @@ so expanding storage capacity does not implicitly enable concurrent scratch use.
 
 from __future__ import annotations
 
-import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Condition, Lock
 from typing import Any, cast
@@ -23,7 +22,6 @@ from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
-    DEFAULT_CONSTRAINT_RESOURCE_ID,
     BeamBatchFailure,
     BeamBatchResult,
 )
@@ -31,13 +29,13 @@ from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
 from vllm_gr.v1.engine.beam_search_v1 import (
-    GRDeviceStateRef,
     GRExecutionCapacity,
     GRRetireMetadata,
     GRRetireResult,
     GRStageKind,
     GRStageMetadata,
     GRWorkerResult,
+    validate_dispatch,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_RETIRE_OUTPUT_ATTR,
@@ -80,135 +78,6 @@ class BeamDispatchExecution:
     entries: tuple[BeamDispatchEntry, ...]
     num_model_rows: int
     metadata_abi: int = METADATA_ABI
-
-
-def validate_dispatch(
-    scheduler_output: Any,
-    *,
-    previous: GRStageMetadata | None = None,
-    binding: BeamRequestBinding | None = None,
-) -> tuple[GRStageMetadata, ...]:
-    """Validate the whole metadata map before any Worker resource mutation."""
-    mapping = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
-    if not isinstance(mapping, Mapping) or not mapping:
-        raise ValueError("GR dispatch requires a nonempty metadata mapping")
-    scheduled = scheduler_output.num_scheduled_tokens
-    if set(mapping) != set(scheduled) or getattr(scheduler_output, "beam_data", {}):
-        raise ValueError("GR dispatch cannot mix ordinary or legacy Beam requests")
-    if getattr(scheduler_output, "total_num_scheduled_tokens", sum(scheduled.values())) != sum(
-        scheduled.values()
-    ):
-        raise ValueError("GR dispatch total disagrees with native scheduled counts")
-    # Central admission boundary. Other code operates on explicit bindings.
-    if len(mapping) != 1:
-        raise ValueError("persistent GPU Beam currently requires B=1")
-    stages = tuple(mapping.values())
-    for key, m in mapping.items():
-        if not isinstance(m, GRStageMetadata) or key != m.session_id:
-            raise ValueError("invalid GR metadata identity")
-        for number in (m.dispatch_id, m.stage_index, m.num_prompt_tokens, m.owner_generation):
-            if isinstance(number, bool) or not isinstance(number, int) or number < 0:
-                raise ValueError(
-                    "GR dispatch indices and prompt length must be nonnegative integers"
-                )
-        if not m.num_prompt_tokens or not isinstance(m.produces_output, bool):
-            raise ValueError("GR requires a nonempty prompt and boolean produces_output")
-        new_requests = {r.req_id: r for r in getattr(scheduler_output, "scheduled_new_reqs", ())}
-        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-        computed = None
-        if key in new_requests:
-            native = new_requests[key]
-            if (
-                m.kind is GRStageKind.DECODE
-                or len(native.prompt_token_ids or ()) != m.num_prompt_tokens
-            ):
-                raise ValueError("GR native request identity or prompt geometry changed")
-            computed = native.num_computed_tokens
-        elif cached is not None and key in cached.req_ids:
-            if key in cached.resumed_req_ids and m.stage_index > 0:
-                raise ValueError("GR rejects recompute after generation")
-            computed = cached.num_computed_tokens[cached.req_ids.index(key)]
-        if computed is None and (new_requests or cached is not None):
-            raise ValueError("GR metadata has no matching native request")
-        if computed is not None:
-            if m.kind is GRStageKind.PREFILL:
-                if not (0 <= computed < m.num_prompt_tokens) or m.produces_output != (
-                    computed + scheduled[key] == m.num_prompt_tokens
-                ):
-                    raise ValueError(
-                        "GR Prefill chunk output flag disagrees with native token extent"
-                    )
-            elif computed < m.num_prompt_tokens:
-                raise ValueError("GR rejects recompute after generation")
-        if (
-            not isinstance(m.is_last_stage, bool)
-            or (m.decode_step is not None and type(m.decode_step) is not int)
-            or type(scheduled[key]) is not int
-            or scheduled[key] <= 0
-        ):
-            raise ValueError("GR dispatch flags, step and scheduled count have invalid types")
-        params = m.beam_params
-        if m.execution_capacity is not None:
-            m.execution_capacity.validate(params)
-        if (
-            type(params.beam_width) is not int
-            or not 1 <= params.beam_width <= 256
-            or type(params.max_tokens) is not int
-            or params.max_tokens not in (1, 2, 3)
-            or not math.isfinite(params.temperature)
-            or params.temperature < 0
-            or params.constraint_resource_id != DEFAULT_CONSTRAINT_RESOURCE_ID
-        ):
-            raise ValueError("GR requires fixed W<=256, effective N=1/2/3 and CUDA constraints")
-        if not 0 <= m.stage_index < params.max_tokens:
-            raise ValueError("GR logical stage exceeds generation budget")
-        if m.output_device_state != GRDeviceStateRef(key, m.stage_index):
-            raise ValueError("GR output device-state identity mismatch")
-        if m.kind is GRStageKind.PREFILL:
-            if m.stage_index != 0 or m.decode_step is not None or m.input_device_state is not None:
-                raise ValueError("GR rejects recompute after generation")
-        elif m.kind is GRStageKind.DECODE:
-            if (
-                not m.produces_output
-                or m.decode_step != m.stage_index - 1
-                or m.input_device_state != GRDeviceStateRef(key, m.stage_index - 1)
-                or scheduled[key] != 1
-            ):
-                raise ValueError("invalid GR Decode dependency or logical token count")
-        else:
-            raise ValueError("unknown GR stage kind")
-        if m.is_last_stage != (m.produces_output and m.stage_index == params.max_tokens - 1):
-            raise ValueError("GR last-stage flag disagrees with effective budget")
-        if m.session_init is not None:
-            request = m.session_init
-            if (
-                m.kind is not GRStageKind.PREFILL
-                or request.protocol_version != BEAM_BATCH_PROTOCOL_VERSION
-                or len(request.items) != 1
-                or request.batch_id != key
-                or type(request.items[0].item_index) is not int
-                or request.items[0].item_index != 0
-                or request.items[0].request.request_id != key
-                or len(request.items[0].request.prompt_token_ids or ()) != m.num_prompt_tokens
-                or request.beam_params != params
-                or request.output_options != m.output_options
-            ):
-                raise ValueError("GR session_init disagrees with dispatch metadata")
-        if binding is not None and key != binding.session_id:
-            raise ValueError("a second active GR session cannot use shared execution scratch")
-        if previous is None:
-            if m.dispatch_id != 0 or m.kind is not GRStageKind.PREFILL:
-                raise ValueError("GR session must start with dispatch 0 Prefill")
-        elif (
-            m.dispatch_id != previous.dispatch_id + 1
-            or m.stage_index != previous.stage_index + int(previous.produces_output)
-            or m.owner_generation != previous.owner_generation
-            or params != previous.beam_params
-            or m.output_options != previous.output_options
-            or m.num_prompt_tokens != previous.num_prompt_tokens
-        ):
-            raise ValueError("GR dispatch order, configuration or prompt binding changed")
-    return stages
 
 
 class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
@@ -277,7 +146,14 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
             )
             terminal = self.owner.final_output.failure(self.owner, failure)
             results[m.session_id] = GRWorkerResult(
-                m.session_id, m.dispatch_id, m.stage_index, 0, m.output_device_state, True, terminal
+                m.session_id,
+                m.dispatch_id,
+                m.stage_index,
+                0,
+                m.output_device_state,
+                True,
+                terminal,
+                owner_generation=m.owner_generation,
             )
         setattr(out, GR_WORKER_RESULT_ATTR, results)
         return out
@@ -305,7 +181,7 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
             elif finished and not self.owner.cancelled:
                 try:
                     terminal = final_output.consume(self.owner, ready=final_ready)
-                except Exception as exc:
+                except (ValueError, TypeError, IndexError) as exc:
                     failure = BeamBatchResult(
                         protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
                         batch_id=m.session_id,
@@ -329,6 +205,7 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                 m.output_device_state,
                 bool(finished),
                 terminal,
+                owner_generation=m.owner_generation,
             )
         out = ModelRunnerOutput(
             req_ids=req_ids,
