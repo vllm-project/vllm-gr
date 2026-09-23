@@ -118,7 +118,7 @@ def make_patched_handle_client_request(original):
     dispatch. Native ADD is consumed here on the core thread, where Scheduler
     admission failures can be returned to the requesting client.
     """
-    if getattr(original, _CLIENT_REQUEST_PATCH_MARKER, False):
+    if getattr(original, _CLIENT_REQUEST_PATCH_MARKER, False) is True:
         return original
 
     @wraps(original)
@@ -127,6 +127,37 @@ def make_patched_handle_client_request(original):
 
         from vllm_gr.v1.engine.core import dispatch_gr_engine_core_input
         from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
+
+        if request_type == EngineCoreRequestType.ADD:
+            core_request = request[0] if isinstance(request, tuple) else request
+            cohort_key = getattr(core_request, "_vllm_gr_beam_cohort_key", None)
+            if cohort_key is not None:
+                from vllm_gr.v1.engine.core import _ensure_beam_state
+
+                _ensure_beam_state(self)
+                with self.beam_cache_lock:
+                    expected = self._beam_cohort_expected.get(cohort_key)
+                    if expected is None:
+                        raise RuntimeError(
+                            f"beam cohort {cohort_key} reached ADD without registration"
+                        )
+                    pending = self._beam_cohort_pending[cohort_key]
+                    request_id = core_request.request_id
+                    if any(item[0].request_id == request_id for item in pending):
+                        raise RuntimeError(
+                            f"duplicate request {request_id} in beam cohort {cohort_key}"
+                        )
+                    pending.append(request)
+                    if len(pending) < expected:
+                        return None
+                    if len(pending) > expected:
+                        raise RuntimeError(f"beam cohort {cohort_key} exceeded expected size")
+                    ready = tuple(pending)
+                    self._beam_cohort_pending.pop(cohort_key, None)
+                    self._beam_cohort_expected.pop(cohort_key, None)
+                for item in ready:
+                    original(self, request_type, item, *args, **kwargs)
+                return None
 
         if dispatch_gr_engine_core_input(self, request_type, request):
             return None
@@ -808,13 +839,10 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
 def _patch_scheduler_update_from_output(scheduler_cls) -> None:
     """Carry ``ModelRunnerOutput.beam_search_result`` through kv_transfer_params.
 
-    The NPU worker attaches the beam decision dict to the ModelRunnerOutput
-    it returns (see ``_attach_beam_search_result`` in model_runner_common).
-    This wrapper reads it and injects it into the first EngineCoreOutput's
-    ``kv_transfer_params`` so the frontend can consume it from the streamed
-    RequestOutput without an extra round trip.  Pure beam-decode batches carry
-    exactly one logical session request by design (max_batch=1), so attaching
-    to the first output of a beam session is unambiguous.
+    Batched NPU decisions carry a ``by_request`` mapping and are attached to
+    the matching EngineCoreOutput for each logical session. Legacy decisions
+    retain their session-owner/fallback behavior. Both paths reach the frontend
+    through streamed RequestOutput metadata without an extra round trip.
     """
     marker = "_vllm_gr_update_from_output_patch"
     if getattr(scheduler_cls.update_from_output, marker, False):
@@ -882,11 +910,32 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
             beam_search_result.get("session_id") if isinstance(beam_search_result, dict) else None
         )
 
-        def _attach(target_out) -> bool:
+        def _attach(target_out, payload=beam_search_result) -> bool:
             kv_params = dict(target_out.kv_transfer_params or {})
-            kv_params["beam_search_result"] = beam_search_result
+            kv_params["beam_search_result"] = payload
             target_out.kv_transfer_params = kv_params
             return True
+        by_request = (
+            beam_search_result.get("by_request")
+            if isinstance(beam_search_result, dict)
+            else None
+        )
+        if isinstance(by_request, dict):
+            attached_ids = set()
+            for ec_outputs in result.values():
+                for out in getattr(ec_outputs, "outputs", []):
+                    payload = by_request.get(out.request_id)
+                    if payload is not None:
+                        _attach(out, payload)
+                        attached_ids.add(out.request_id)
+            missing = set(by_request) - attached_ids
+            if missing:
+                logger.debug(
+                    "vllm-gr: no EngineCoreOutput for batched beam decisions: %s",
+                    sorted(missing),
+                )
+            return result
+
 
         attached = False
         fallback = None
@@ -902,7 +951,7 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
             if attached:
                 break
         if not attached and fallback is not None:
-            _attach(fallback)
+            attached = _attach(fallback)
         if not attached:
             logger.debug(
                 "vllm-gr: beam_search_result present but no matching EngineCoreOutput "

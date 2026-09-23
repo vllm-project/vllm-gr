@@ -18,6 +18,7 @@ from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.engine.wire import (
     ADD_BATCH_WIRE_VALUE,
     BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE,
+    BEAM_STEP_BATCH_WIRE_VALUE,
     BEAM_SESSION_TEMPLATE_WIRE_VALUE,
     SUBMIT_GR_SESSION_WIRE_VALUE,
     SUBMIT_SESSION_WIRE_VALUE,
@@ -39,6 +40,7 @@ GR_REQUEST_WIRE_VALUES = {
     "BEAM_SESSION_TEMPLATE": b"\x08",
     "SUBMIT_SESSION": b"\x09",
     "SUBMIT_GR_SESSION": b"\x0a",
+    "BEAM_STEP_BATCH": b"\x0b",
 }
 
 ENGINE_CORE_REQUEST_FIELDS = (
@@ -85,6 +87,7 @@ BEAM_STEP_UPDATE_FIELDS = (
     "max_decode_steps",
     "constraint_step",
     "parent_cumulative_logprobs",
+    "cohort_id",
 )
 
 
@@ -115,6 +118,7 @@ def test_engine_core_wire_value_inventory() -> None:
     assert BEAM_SESSION_TEMPLATE_WIRE_VALUE == b"\x08"
     assert SUBMIT_SESSION_WIRE_VALUE == b"\x09"
     assert SUBMIT_GR_SESSION_WIRE_VALUE == b"\x0a"
+    assert BEAM_STEP_BATCH_WIRE_VALUE == b"\x0b"
     register_engine_core_request_types()
     register_engine_core_request_types()
 
@@ -169,6 +173,7 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
         # still decode on legacy streams (covered in test_beam_request_unit).
         constraint_step=2,
         parent_cumulative_logprobs=[-1.0, -2.0],
+        cohort_id=7,
     )
     raw_payload = msgspec.msgpack.decode(msgspec.msgpack.encode(update))
 
@@ -177,7 +182,7 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
     assert raw_payload[8:13] == [2, 3, 4, 5, 6]
     assert raw_payload[13] is None
     assert raw_payload[14:16] == ["cache-salt", {"traceparent": "trace-0"}]
-    assert raw_payload[16:] == [[0, 0], 4, 2, [-1.0, -2.0]]
+    assert raw_payload[16:] == [[0, 0], 4, 2, [-1.0, -2.0], 7]
 
 
 def test_scheduler_beam_metadata_shape() -> None:

@@ -221,6 +221,16 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "pool (default 3, matching OneRec SID: max_tokens=5 minus begin/end).",
     )
     model_group.add_argument(
+        "--beam-max-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Fixed per-worker capacity for simultaneous logical beam sessions "
+            "(default 1). Each session reserves beam_max_width physical rows. "
+            "Values above 1 are used by the synchronized multi-batch path."
+        ),
+    )
+    model_group.add_argument(
         "--beam-worker-decision",
         action="store_true",
         default=None,
@@ -276,7 +286,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     if hasattr(args, "constraint_backend"):
         engine_args.constraint_backend = args.constraint_backend
     engine_args._vllm_gr_config_input = getattr(args, "vllm_gr_config", None)
-    for attr in ("beam_max_width", "beam_max_decode_steps"):
+    for attr in ("beam_max_width", "beam_max_decode_steps", "beam_max_batch_size"):
         setattr(engine_args, attr, getattr(args, attr, None))
     engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
     engine_args.beam_worker_decision = getattr(args, "beam_worker_decision", None)
@@ -427,6 +437,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         catalog_path is not None
         or (constraint_backend is not None and constraint_backend is not ConstraintBackend.TRIE)
         or getattr(self, "beam_max_width", None) is not None
+        or getattr(self, "beam_max_batch_size", None) is not None
         or getattr(self, "beam_max_decode_steps", None) is not None
         or bool(getattr(self, "no_beam_graph", False))
         or getattr(self, "beam_worker_decision", None) is not None
@@ -608,6 +619,11 @@ def create_engine_config(self, usage_context=None, headless=False):
                 getattr(self, "beam_max_decode_steps", None)
                 if getattr(self, "beam_max_decode_steps", None) is not None
                 else existing_gr_config.beam_max_decode_steps
+            ),
+            beam_max_batch_size=(
+                getattr(self, "beam_max_batch_size", None)
+                if getattr(self, "beam_max_batch_size", None) is not None
+                else existing_gr_config.beam_max_batch_size
             ),
             beam_worker_decision=effective_beam_worker_decision,
             beam_engine_driven=effective_beam_engine_driven,

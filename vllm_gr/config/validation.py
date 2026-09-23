@@ -230,6 +230,15 @@ def validate_beam_max_width(value: object) -> int | None:
     return width
 
 
+def validate_beam_max_batch_size(value: object) -> int:
+    batch_size = _validate_positive_int(value, "beam_max_batch_size")
+    if batch_size > 128:
+        raise ValueError(
+            f"vllm-gr beam_max_batch_size must be <= 128, got {batch_size}"
+        )
+    return batch_size
+
+
 def validate_beam_width(value: object) -> int:
     width = _validate_positive_int(value, "beam_width")
     if width > MAX_BEAM_WIDTH:

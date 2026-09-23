@@ -67,6 +67,7 @@ def test_build_engine_core_decoders_shares_oob_tensor_provider() -> None:
     assert decoders.add_batch.oob_tensor_provider is provider
     assert decoders.beam_step_update.oob_tensor_provider is provider
     assert decoders.submit_session.oob_tensor_provider is provider
+    assert decoders.beam_step_batch.oob_tensor_provider is provider
     assert decoders.generic.oob_tensor_provider is provider
 
 
@@ -117,6 +118,24 @@ def test_decode_beam_step_update_preserves_constraint_step() -> None:
     )
 
     assert decoded.constraint_step == 2
+
+
+def test_decode_beam_step_batch_payload() -> None:
+    decoders = build_engine_core_decoders(None)
+    first = _beam_step_update()
+    first.cohort_id = 7
+    second = _beam_step_update()
+    second.session_id = "session-1"
+    second.cohort_id = 7
+
+    decoded = decode_engine_core_payload(
+        decoders,
+        EngineCoreRequestType.BEAM_STEP_BATCH,
+        _frames([first, second]),
+    )
+
+    assert [update.session_id for update in decoded] == ["session-0", "session-1"]
+    assert [update.cohort_id for update in decoded] == [7, 7]
 
 
 def test_decode_submit_session_payload() -> None:

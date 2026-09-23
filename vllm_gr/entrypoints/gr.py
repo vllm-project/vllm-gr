@@ -46,7 +46,11 @@ from vllm_gr.beam_search_decision_utils import (
     select_top_indices,
 )
 from vllm_gr.config import ConstraintBackend, GRConfig
-from vllm_gr.config.validation import validate_beam_max_width, validate_beam_width
+from vllm_gr.config.validation import (
+    validate_beam_max_batch_size,
+    validate_beam_max_width,
+    validate_beam_width,
+)
 from vllm_gr.constraints import (
     BeamConstraintCoordinator,
     ParentCandidateBuilder,
@@ -260,6 +264,7 @@ def _prepare_beam_step_requests(
 ) -> list["EngineCoreRequest"]:
     """Prepare EngineCoreRequest items for active instances at this step."""
     engine_core_requests = []
+    beam_step_updates = []
     for j, instance in enumerate(instances_batch):
         if len(instance.beams) == 0:
             # This instance has no active beams (finished)
@@ -363,7 +368,7 @@ def _prepare_beam_step_requests(
                 # re-registration must not run again for this step.
                 instance_self_advance_chained.discard(j)
             else:
-                llm_engine.engine_core.beam_request_step_update(update)
+                beam_step_updates.append(update)
 
             # Update tracking variables
             instance_prev_beam_internal_ids[j] = child_beam_ids
@@ -387,6 +392,13 @@ def _prepare_beam_step_requests(
             llm_engine.output_processor.add_request(ec_req, None, None, 0)
             engine_core_requests.append(ec_req)
 
+    if len(beam_step_updates) == 1:
+        llm_engine.engine_core.beam_request_step_update(beam_step_updates[0])
+    elif beam_step_updates:
+        cohort_id = (int(prompt_start) << 32) | int(token)
+        for update in beam_step_updates:
+            update.cohort_id = cohort_id
+        llm_engine.engine_core.beam_request_step_update_batch(beam_step_updates)
     return engine_core_requests
 
 
@@ -837,9 +849,12 @@ class GRLLM(LLM):
         beam_graph_enabled: bool | None = None,
         beam_max_width: int | None = None,
         beam_max_decode_steps: int | None = None,
+        beam_max_batch_size: int | None = None,
         **kwargs,
     ):
         beam_max_width = validate_beam_max_width(beam_max_width)
+        if beam_max_batch_size is not None:
+            beam_max_batch_size = validate_beam_max_batch_size(beam_max_batch_size)
         # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
         # vllm-gr default before LLM.__init__ constructs VllmConfig so the V1
         # beam-search worker patches remain active.
@@ -929,6 +944,8 @@ class GRLLM(LLM):
             beam_updates["vllm_gr_beam_max_width"] = beam_max_width
         if beam_max_decode_steps is not None:
             beam_updates["vllm_gr_beam_max_decode_steps"] = beam_max_decode_steps
+        if beam_max_batch_size is not None:
+            beam_updates["vllm_gr_beam_max_batch_size"] = beam_max_batch_size
         if beam_updates:
             additional_config = dict(kwargs.pop("additional_config", None) or {})
             additional_config.update(beam_updates)

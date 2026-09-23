@@ -44,6 +44,8 @@ def _ensure_beam_state(self) -> None:
     if (
         getattr(self, "beam_cache", None) is not None
         and getattr(self, "beam_cache_lock", None) is not None
+        and getattr(self, "_beam_cohort_expected", None) is not None
+        and getattr(self, "_beam_cohort_pending", None) is not None
     ):
         return
 
@@ -55,6 +57,10 @@ def _ensure_beam_state(self) -> None:
             self.beam_cache: dict[str, dict] = {}
         if getattr(self, "beam_cache_lock", None) is None:
             self.beam_cache_lock = threading.Lock()
+        if getattr(self, "_beam_cohort_expected", None) is None:
+            self._beam_cohort_expected = {}
+        if getattr(self, "_beam_cohort_pending", None) is None:
+            self._beam_cohort_pending = {}
 
 
 # ------------------------------------------------------------------------------------
@@ -427,6 +433,12 @@ def _apply_beam_step(self, update) -> bool:
     )
     # Store max decode steps for KV pool pre-allocation
     req.max_decode_steps = update.max_decode_steps
+    if update.cohort_id is not None:
+        req._vllm_gr_beam_cohort_key = (
+            int(update.client_index),
+            int(update.current_wave),
+            int(update.cohort_id),
+        )
 
     # Parent beam token sequences ride along for every beam decode request:
     # the Worker seeds its beam-decision state from them when a session is
@@ -820,6 +832,63 @@ def dispatch_gr_engine_core_input(self, request_type, payload) -> bool:
             self._cache_beam_request(request[0])
             _add_preprocessed_request(self, request)
         return True
+    if request_type == EngineCoreRequestType.BEAM_STEP_BATCH:
+        updates = list(payload)
+        if len(updates) < 2:
+            raise ValueError("BEAM_STEP_BATCH requires at least two updates")
+        from vllm_gr.config import GRConfig
+
+        config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
+        capacity = int(getattr(config, "beam_max_batch_size", 1))
+        if len(updates) > capacity:
+            raise ValueError(
+                f"BEAM_STEP_BATCH size {len(updates)} exceeds capacity {capacity}"
+            )
+        route_keys = {
+            (update.client_index, update.current_wave, update.cohort_id)
+            for update in updates
+        }
+        session_ids = [update.session_id for update in updates]
+        if len(route_keys) != 1 or next(iter(route_keys))[2] is None:
+            raise ValueError("BEAM_STEP_BATCH updates must share one non-null cohort key")
+        if len(set(session_ids)) != len(session_ids):
+            raise ValueError("BEAM_STEP_BATCH contains duplicate session IDs")
+        if any(update.beam_width < 1 for update in updates):
+            raise ValueError("BEAM_STEP_BATCH cannot contain cleanup updates")
+
+        _ensure_beam_state(self)
+        key = next(iter(route_keys))
+        with self.beam_cache_lock:
+            missing = [
+                session_id
+                for session_id in session_ids
+                if session_id not in self.beam_cache
+            ]
+            if missing:
+                raise RuntimeError(f"BEAM_STEP_BATCH sessions are not cached: {missing}")
+            if key in self._beam_cohort_expected:
+                raise RuntimeError(f"duplicate active BEAM_STEP_BATCH cohort key: {key}")
+            self._beam_cohort_expected[key] = len(updates)
+            self._beam_cohort_pending[key] = []
+        try:
+            for update in updates:
+                if not _apply_beam_step(self, update):
+                    raise RuntimeError(
+                        f"BEAM_STEP_BATCH failed to enqueue session {update.session_id}"
+                    )
+        except Exception:
+            with self.beam_cache_lock:
+                self._beam_cohort_expected.pop(key, None)
+                self._beam_cohort_pending.pop(key, None)
+            raise
+        if not hasattr(self, "input_queue"):
+            # In-process EngineCore.add_request is synchronous and bypasses
+            # the busy-loop gate, so no pending registry entry may remain.
+            with self.beam_cache_lock:
+                self._beam_cohort_expected.pop(key, None)
+                self._beam_cohort_pending.pop(key, None)
+        return True
+
     if request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
         self._handle_beam_request_step_update(payload)
         return True

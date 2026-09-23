@@ -160,6 +160,9 @@ class GRConfig:
     # chain consumes worker beam decisions).
     beam_engine_driven: bool | None = None
     beam_execution_mode: BeamExecutionMode = BeamExecutionMode.LEGACY
+    # Added after pre-existing fields to preserve positional construction.
+    # One logical session occupies beam_max_width physical rows.
+    beam_max_batch_size: int = 1
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
