@@ -46,12 +46,20 @@ class _PayloadLayout:
     width: int
     steps: int
     row_stride: int
+    batch_size: int
+    member_stride: int
     size: int
 
     @classmethod
-    def create(cls, width: int, steps: int) -> _PayloadLayout:
+    def create(cls, width: int, steps: int, batch_size: int = 1) -> _PayloadLayout:
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("terminal payload batch_size must be positive")
         row_stride = 2 * steps + 4
-        return cls(width, steps, row_stride, _CONTROL_WORDS + 1 + width * row_stride)
+        member_stride = 1 + width * row_stride
+        return cls(
+            width, steps, row_stride, batch_size, member_stride,
+            _CONTROL_WORDS + batch_size * member_stride,
+        )
 
 
 def _build_result(
@@ -107,24 +115,92 @@ def _build_result(
     )
 
 
+def _build_batch_result(
+    payload: Any,
+    layout: _PayloadLayout,
+    *,
+    session_id: str,
+    bindings: tuple[BeamRequestBinding, ...],
+    options: BeamOutputOptions,
+) -> BeamBatchResult:
+    values = payload.numpy() if isinstance(payload, torch.Tensor) else payload
+    outputs = []
+    steps = layout.steps
+    stride = layout.row_stride
+    for request_index, binding in enumerate(bindings):
+        start = _CONTROL_WORDS + request_index * layout.member_stride
+        count = int(values[start])
+        rows = values[start + 1 : start + layout.member_stride].reshape(
+            layout.width, stride
+        )
+        sequences = []
+        for row in struct.iter_unpack(f"={2 * steps}ifiii", rows[:count].tobytes()):
+            length, reason, stop_token = row[-3:]
+            stopped = reason == FINISH_STOP
+            token_count = length - (stopped and not options.include_stop_token)
+            sequences.append(
+                BeamOutputSequence(
+                    row[:token_count],
+                    row[-4] if options.include_cumulative_logprob else None,
+                    (
+                        row[steps : steps + length]
+                        if options.include_parent_beam_indices
+                        else ()
+                    ),
+                    "stop" if stopped else "length",
+                    stop_token if stopped else None,
+                )
+            )
+        if not sequences:
+            return BeamBatchResult(
+                protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                batch_id=session_id,
+                output=None,
+                failure=BeamBatchFailure(
+                    "no_valid_beams",
+                    "No valid final Beam candidates",
+                    binding.item_index,
+                ),
+            )
+        outputs.append(
+            BeamRequestOutput(
+                binding.item_index,
+                binding.native_request_id,
+                tuple(sequences),
+            )
+        )
+    return BeamBatchResult(
+        BEAM_BATCH_PROTOCOL_VERSION,
+        session_id,
+        BeamBatchOutput(tuple(outputs)),
+        None,
+    )
+
+
 class GPUBeamFinalOutput:
     """Rank and materialize final paths on GPU, then transfer one compact payload."""
 
     def __init__(
         self,
         owner: GPUBeamStageRunner,
-        binding: BeamRequestBinding,
+        binding: BeamRequestBinding | tuple[BeamRequestBinding, ...],
         params: BeamBatchParams,
         options: BeamOutputOptions,
     ) -> None:
         state = owner.beam.state
+        bindings = binding if isinstance(binding, tuple) else (binding,)
+        if not bindings:
+            raise ValueError("terminal output requires at least one binding")
         self._storage_key = (
             state.beam_width,
             state.max_new_tokens,
             state.completed_capacity,
             state.device,
+            len(bindings),
         )
-        self.layout = _PayloadLayout.create(state.beam_width, state.max_new_tokens)
+        self.layout = _PayloadLayout.create(
+            state.beam_width, state.max_new_tokens, len(bindings)
+        )
         with torch.inference_mode(False):
             self.device = torch.empty(self.layout.size, dtype=torch.int32, device=state.device)
             self.host = torch.empty(self.layout.size, dtype=torch.int32, pin_memory=True)
@@ -151,15 +227,18 @@ class GPUBeamFinalOutput:
     def reset(
         self,
         owner: GPUBeamStageRunner,
-        binding: BeamRequestBinding,
+        binding: BeamRequestBinding | tuple[BeamRequestBinding, ...],
         params: BeamBatchParams,
         options: BeamOutputOptions,
     ) -> None:
         with self._lock:
-            self.binding = binding
+            self.bindings = binding if isinstance(binding, tuple) else (binding,)
+            self.binding = self.bindings[0]
             self.options = options
             self.length_penalty = params.length_penalty
-            self.prompt_length = owner.beam.session._state.prefix_len
+            self.prompt_lengths = tuple(
+                runner.session._state.prefix_len for runner in getattr(owner.beam, "runners", (owner.beam,))
+            )
             self._result: BeamBatchResult | None = None
             self._enqueued = False
             self._delivered = False
@@ -174,6 +253,7 @@ class GPUBeamFinalOutput:
             state.max_new_tokens,
             state.completed_capacity,
             state.device,
+            len(getattr(owner, "bindings", (owner.binding,))),
         )
 
     def _record_done(self, owner: GPUBeamStageRunner) -> None:
@@ -194,56 +274,65 @@ class GPUBeamFinalOutput:
         if self._enqueued:
             return
         state = owner.beam.state
-        row = self.binding.state_row
         result_width = self.options.num_return_sequences
         produced = torch.cuda.current_stream(state.device)
         produced.wait_event(owner.last_work)
-        ranking_scores = state.completed_scores[row : row + 1]
         if control is not None:
             self.device[:_CONTROL_WORDS].copy_(control)
             self._control_embedded = True
-        if self.length_penalty != 0:
-            beam_state_ops._rank_final_beams_kernel[(triton.cdiv(state.completed_capacity, 256),)](
+        for request_index, binding in enumerate(self.bindings):
+            row = binding.state_row
+            ranking_scores = state.completed_scores[row : row + 1]
+            if self.length_penalty != 0:
+                beam_state_ops._rank_final_beams_kernel[(
+                    triton.cdiv(state.completed_capacity, 256),
+                )](
+                    ranking_scores,
+                    state.completed_lengths[row],
+                    state.completed_finish_reasons[row],
+                    self._ranking_scores,
+                    CAPACITY=state.completed_capacity,
+                    PROMPT_LENGTH=self.prompt_lengths[request_index],
+                    MAX_TOKENS=state.max_new_tokens,
+                    LENGTH_PENALTY=self.length_penalty,
+                    BLOCK=256,
+                )
+                ranking_scores = self._ranking_scores
+            _, selected_indices, _ = _hierarchical_topk_out(
+                self._zero_score,
                 ranking_scores,
+                None,
+                1,
+                1,
+                state.completed_capacity,
+                result_width,
+                self._selection,
+            )
+            member_offset = _CONTROL_WORDS + request_index * self.layout.member_stride
+            beam_state_ops._pack_final_beams_kernel[(result_width,)](
+                selected_indices,
+                state.num_completed[row : row + 1],
+                state.completed_token_ids[row],
+                state.completed_scores[row],
+                state.completed_parent_ids[row],
                 state.completed_lengths[row],
                 state.completed_finish_reasons[row],
-                self._ranking_scores,
-                CAPACITY=state.completed_capacity,
-                PROMPT_LENGTH=self.prompt_length,
-                MAX_TOKENS=state.max_new_tokens,
-                LENGTH_PENALTY=self.length_penalty,
-                BLOCK=256,
+                state.history_token_ids[row],
+                state.history_parent_ids[row],
+                self.device[member_offset:],
+                WIDTH=state.beam_width,
+                STEPS=state.max_new_tokens,
+                RESULT_WIDTH=result_width,
+                ROW_STRIDE=self.layout.row_stride,
+                ROW_BLOCK=triton.next_power_of_2(2 * state.max_new_tokens),
             )
-            ranking_scores = self._ranking_scores
-        _, selected_indices, _ = _hierarchical_topk_out(
-            self._zero_score,
-            ranking_scores,
-            None,
-            1,
-            1,
-            state.completed_capacity,
-            result_width,
-            self._selection,
-        )
-        beam_state_ops._pack_final_beams_kernel[(result_width,)](
-            selected_indices,
-            state.num_completed[row : row + 1],
-            state.completed_token_ids[row],
-            state.completed_scores[row],
-            state.completed_parent_ids[row],
-            state.completed_lengths[row],
-            state.completed_finish_reasons[row],
-            state.history_token_ids[row],
-            state.history_parent_ids[row],
-            self.device[_CONTROL_WORDS:],
-            WIDTH=state.beam_width,
-            STEPS=state.max_new_tokens,
-            RESULT_WIDTH=result_width,
-            ROW_STRIDE=self.layout.row_stride,
-            ROW_BLOCK=triton.next_power_of_2(2 * state.max_new_tokens),
-        )
         self.pack_ready.record(produced)
-        copy_words = _CONTROL_WORDS + 1 + result_width * self.layout.row_stride
+        copy_words = (
+            _CONTROL_WORDS
+            + (len(self.bindings) - 1) * self.layout.member_stride
+            + 1
+            + result_width * self.layout.row_stride
+        )
         with torch.cuda.stream(owner.copy_stream):
             owner.copy_stream.wait_event(self.pack_ready)
             self.host[:copy_words].copy_(self.device[:copy_words], non_blocking=True)
@@ -299,12 +388,11 @@ class GPUBeamFinalOutput:
             self._enqueue(owner)
             if not ready:
                 self.ready.synchronize()
-            self._result = _build_result(
+            self._result = _build_batch_result(
                 self.host_numpy,
                 self.layout,
                 session_id=self.binding.session_id,
-                request_id=self.binding.native_request_id,
-                item_index=self.binding.item_index,
+                bindings=self.bindings,
                 options=self.options,
             )
             self._delivered = True
