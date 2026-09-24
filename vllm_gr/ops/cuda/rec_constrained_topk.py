@@ -8,11 +8,12 @@ import torch
 import triton
 import triton.language as tl
 
+from vllm_gr.constraints.scoring import INVALID_LOGIT
+
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
 
 
-INVALID_LOGIT = -1.0e20
 MAX_TOP_K = 256
 MAX_SORT_BLOCK = 65536
 
@@ -97,6 +98,7 @@ def _fused_topk_kernel(
     device_step,
     DEVICE_STEP: tl.constexpr,
     BLOCK: tl.constexpr,
+    WINDOW_BLOCK: tl.constexpr,
 ):
     if DEVICE_STEP:
         step = tl.minimum(tl.maximum(tl.load(device_step), 0), 2)
@@ -167,10 +169,57 @@ def _fused_topk_kernel(
     score = tl.where(score == score, score, -float("inf"))
     row_max = tl.max(score, axis=0)
     normalizable = (valid_degree > 0) & (row_max != -float("inf"))
-    safe_row_max = tl.where(normalizable, row_max, 0.0)
+
+    # Full-window logsumexp over the complete logits window so candidate
+    # scores are comparable across parent rows (the scoring contract).  The
+    # kernel walks the window once per row with a numerically stable online
+    # reduction: a running max rescales the running exp-sum, so every window
+    # element is loaded and divided exactly once instead of once per pass.
+    full_denominator = 0.0
+    if valid_degree > 0:
+        window_offsets = tl.arange(0, WINDOW_BLOCK)
+        n_chunks = tl.cdiv(logits_vocab_size, WINDOW_BLOCK)
+        window_max = tl.full((), -float("inf"), tl.float32)
+        window_sum = tl.zeros((), tl.float32)
+        for c in tl.range(0, n_chunks):
+            idx = c * WINDOW_BLOCK + window_offsets
+            mask = idx < logits_vocab_size
+            v = tl.load(
+                logits + row * logits_row_stride + idx * logits_vocab_stride,
+                mask=mask,
+                other=-float("inf"),
+            ).to(tl.float32)
+            v = v / temperature
+            # NaN logits intentionally stay NaN: they propagate through the
+            # running exp-sum into a NaN logsumexp, surfacing the engine's
+            # protocol error (beam_device_error) exactly as +inf logits do.
+            chunk_max = tl.max(v, axis=0)
+            new_max = tl.maximum(window_max, chunk_max)
+            # A leading all -inf chunk must not inject NaN into the running
+            # exp-sum: exp(-inf - -inf) is NaN, so mask it out (an all -inf
+            # window is detected by the final ``window_max`` guard anyway).
+            window_sum = window_sum * tl.where(
+                window_max == -float("inf"),
+                0.0,
+                tl.exp(window_max - new_max),
+            ) + tl.sum(
+                tl.where(
+                    mask & (new_max != -float("inf")),
+                    tl.exp(v - new_max),
+                    0.0,
+                ),
+                axis=0,
+            )
+            window_max = new_max
+        full_denominator = tl.where(
+            window_max != -float("inf"),
+            window_max + tl.log(window_sum),
+            0.0,
+        )
+
     denominator = tl.where(
         normalizable,
-        safe_row_max + tl.log(tl.sum(tl.exp(score - safe_row_max), axis=0)),
+        full_denominator,
         0.0,
     )
 
@@ -489,6 +538,7 @@ def _launch_rec_constrained_topk_cuda_out(
         device_step=device_step,
         DEVICE_STEP=device_step is not None,
         BLOCK=block,
+        WINDOW_BLOCK=2048,
         num_warps=8 if block >= 2048 else 4,
     )
     return out_token_ids, out_logprobs, out_valid_mask, out_valid_counts

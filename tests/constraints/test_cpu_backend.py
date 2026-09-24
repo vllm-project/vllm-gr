@@ -84,15 +84,31 @@ def test_cpu_backend_step_zero_one_two(step: int, prefix: list[int], allowed: li
     )
 
 
-def test_cpu_backend_normalizes_over_all_legal_candidates_before_topk() -> None:
+def test_cpu_backend_normalizes_over_shared_logits_window_before_topk() -> None:
     logits = torch.tensor([[0.0, -100.0, 1.0, -100.0, 2.0, 100.0]])
     output = _select(_backend(), logits, [[1, 0, 0]], step=1, top_k=1)
 
-    # Token 5 is the global maximum but is illegal. The denominator still
-    # contains both legal candidates 2 and 4 even though only token 4 returns.
+    # Token 5 is illegal and cannot be returned, but remains part of the
+    # model-probability denominator shared by every parent beam.
     assert output.token_ids.item() == 4
-    expected = torch.tensor(2.0) - torch.logsumexp(torch.tensor([1.0, 2.0]), dim=0)
+    expected = torch.tensor(2.0) - torch.logsumexp(logits[0], dim=0)
     torch.testing.assert_close(output.logprobs.squeeze(), expected)
+
+
+def test_cpu_backend_nan_candidate_never_wins_topk() -> None:
+    # torch.topk treats NaN as the largest value, but the backend must mirror
+    # the fused CUDA kernel and sort poisoned candidates last, so a finite
+    # candidate wins selection on a row with a NaN candidate.  The poisoned
+    # candidate stays in the shared window, so the row's logprob surfaces the
+    # engine's protocol error (NaN -> beam_device_error).
+    logits = torch.tensor([[0.0, 0.0, 1.0, 0.0, float("nan"), 0.0]])
+    output = _select(_backend(), logits, [[1, 0, 0]], step=1, top_k=1)
+
+    # Legal candidates for prefix 1 at step 1 are tokens {2, 4}; token 4 is
+    # poisoned (NaN), so token 2 (logit 1.0) must win selection.
+    assert output.token_ids.tolist() == [[2]]
+    assert output.valid_mask.tolist() == [[True]]
+    assert torch.isnan(output.logprobs).all()
 
 
 def test_cpu_backend_validity_does_not_collide_with_low_legal_logprob() -> None:

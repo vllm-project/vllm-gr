@@ -224,6 +224,49 @@ def _readiness_backend(
     )
 
 
+def _fused_candidate_set_op(*args: object) -> tuple[torch.Tensor, torch.Tensor]:
+    """Simulate the fused NPU operator: torch selection, candidate-set scoring.
+
+    NPU readiness validates the fused operator's established candidate-set
+    normalization domain.  Readiness cases keep every legal candidate within
+    the Top-K slots, so the candidate set equals the valid selected slots.
+    """
+    tokens, _ = rec_constrained_topk_torch(*args)
+    logits = cast(torch.Tensor, args[0])
+    temperatures = cast(torch.Tensor, args[8])
+    prefix1_offsets = cast(torch.Tensor, args[3])
+    current_step = int(cast(int, args[9]))
+    top_k = int(cast(int, args[10]))
+    counts = constraint_candidate_counts(
+        cast(torch.Tensor, args[1]),
+        cast(torch.Tensor, args[2]),
+        prefix1_offsets,
+        cast(torch.Tensor, args[5]),
+        cast(torch.Tensor, args[6]),
+        current_step=current_step,
+        vocab_size=int(prefix1_offsets.numel()) - 1,
+    )
+    valid = valid_mask_from_counts(counts, top_k)
+    divisor = torch.where(
+        temperatures == 0,
+        torch.ones_like(temperatures),
+        temperatures,
+    ).reshape(-1, 1)
+    scores = logits.float().gather(1, tokens.to(torch.long).clamp(0, logits.shape[1] - 1)) / divisor
+    scores = torch.where(torch.isnan(scores), torch.full_like(scores, float("-inf")), scores)
+    log_denominators = torch.logsumexp(
+        torch.where(valid, scores, torch.full_like(scores, float("-inf"))),
+        dim=1,
+        keepdim=True,
+    )
+    logprobs = torch.where(
+        valid,
+        scores - log_denominators,
+        torch.full_like(scores, INVALID_LOGIT),
+    )
+    return tokens.to(torch.int32), logprobs.contiguous()
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_readiness_accepts_normalized_reference_at_top_k_256(
     dtype: torch.dtype,
@@ -231,11 +274,7 @@ def test_readiness_accepts_normalized_reference_at_top_k_256(
 ) -> None:
     table = make_table(first_token_ids=np.asarray([1, 3, 4], dtype=np.int32))
 
-    def reference_op(*args: object) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens, logprobs = rec_constrained_topk_torch(*args)
-        return tokens.to(torch.int32), logprobs
-
-    backend = _readiness_backend(reference_op, table=table, top_k=256)
+    backend = _readiness_backend(_fused_candidate_set_op, table=table, top_k=256)
     monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
     try:
         loader._run_npu_readiness(  # noqa: SLF001
@@ -339,8 +378,7 @@ def test_readiness_failure_closes_backend_and_preserves_exception(
     def op(*args: object) -> tuple[torch.Tensor, torch.Tensor]:
         if args[9] == failed_step:
             raise error
-        tokens, logprobs = rec_constrained_topk_torch(*args)
-        return tokens.to(torch.int32), logprobs
+        return _fused_candidate_set_op(*args)
 
     backend = NPUConstraintBackend(
         **tensors,

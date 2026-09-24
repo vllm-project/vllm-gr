@@ -533,7 +533,14 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
         torch.testing.assert_close(
             sliced_logits, full_logits[:, offset : offset + 9], atol=2e-3, rtol=2e-3
         )
-        # All three steps must preserve global token IDs and candidate scores.
+        # All three steps must preserve global token IDs and the validity mask.
+        # The scoring contract normalizes over the logits window that was
+        # actually computed: full_logits uses the full window, sliced_logits
+        # uses the 9-token slice window.  The two normalize over different
+        # domains, so their absolute logprobs legitimately differ; each must
+        # match the shared full-window implementation over its own window.
+        from vllm_gr.constraints.scoring import score_selected_tokens
+
         for step in range(3):
             metadata = ConstraintMetadata(
                 prefix_token_ids=torch.tensor(
@@ -547,7 +554,21 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
             actual = runner.constraint_backend.select(sliced_logits, metadata)
             assert torch.equal(actual.token_ids, expected.token_ids)
             assert torch.equal(actual.valid_mask, expected.valid_mask)
-            torch.testing.assert_close(actual.logprobs, expected.logprobs, atol=2e-3, rtol=2e-3)
+            full_ref = score_selected_tokens(
+                full_logits,
+                expected.token_ids,
+                expected.valid_mask,
+                torch.ones(1, device="cuda"),
+            )
+            slice_ref = score_selected_tokens(
+                sliced_logits,
+                actual.token_ids,
+                actual.valid_mask,
+                torch.ones(1, device="cuda"),
+                vocab_offset=offset,
+            )
+            torch.testing.assert_close(actual.logprobs, slice_ref, atol=2e-3, rtol=2e-3)
+            torch.testing.assert_close(expected.logprobs, full_ref, atol=2e-3, rtol=2e-3)
         # A reload must clear the old slice before constructing the next model.
         load(runner)
         assert runner.model[0]._gr_vocab_slice == (offset, 9)
@@ -555,3 +576,75 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     finally:
         shutdown(runner)
     assert not is_vocab_slice_enabled()
+
+
+def test_cuda_backend_scores_over_full_window_not_candidate_set(
+    tmp_path: Path,
+) -> None:
+    """The CUDA backend must score over the full logits window.
+
+    A row whose legal candidate set is a single token would normalize to
+    logprob zero under the legacy per-candidate-set domain, erasing the
+    model's preference across parent rows.  The scoring contract requires
+    the full-window domain; verify ``backend.select`` returns the
+    full-window logprob, not the candidate-set zero.
+    """
+    path = tmp_path / "table.safetensors"
+    digest = save_constraint_table_artifact(make_table(), path)
+    backend = load_constraint_backend(
+        ConstraintTableConfig(
+            enabled=True,
+            backend=ConstraintTableBackendEnum.CUDA,
+            path=str(path),
+            artifact_digest=digest,
+            tokenizer_digest="sha256:" + "b" * 64,
+            max_top_k=4,
+        ),
+        device=torch.device("cuda"),
+        vocab_size=6,
+        dtype=torch.bfloat16,
+        max_rows=2,
+    )
+    assert backend is not None
+
+    # vocab=6, candidate set for step0 is first_token_ids=[1,3].  Row 0 gets
+    # logit 5 on token 3, logit 1 on token 1, -inf elsewhere.  Under the
+    # legacy candidate-set domain the selected logprobs would normalize over
+    # {1,3} only; the scoring contract requires the full-window domain.
+    logits = torch.tensor(
+        [[-1e20, 1.0, -1e20, 5.0, -1e20, -1e20]],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = backend.select(
+        logits,
+        ConstraintMetadata(
+            prefix_token_ids=torch.tensor([[0, 0, 0]], dtype=torch.int32, device="cuda"),
+            temperatures=torch.ones(1, dtype=torch.float32, device="cuda"),
+            current_step=0,
+            top_k=4,
+        ),
+    )
+    assert output.token_ids.dtype == torch.int32
+    assert output.logprobs.dtype == torch.float32
+    valid = output.valid_mask[0]
+    tokens = output.token_ids[0][valid]
+    logprobs = output.logprobs[0][valid]
+    assert tokens.cpu().tolist() == [3, 1]
+    # Full-window domain: each logprob must reflect the model score minus the
+    # whole-vocab normalizer (logsumexp over all 6 positions).  The legacy
+    # candidate-set domain would instead normalize over {1,3}, so token 3
+    # would sit at ~0.0 regardless of the -inf background.
+    full_lse = torch.logsumexp(logits[0].float(), dim=0)
+    expected_3 = 5.0 - full_lse.item()
+    assert logprobs[0].item() == pytest.approx(expected_3, rel=1e-3)
+    # It must match the shared full-window reference implementation.
+    from vllm_gr.constraints.scoring import score_selected_tokens
+
+    expected = score_selected_tokens(
+        logits,
+        output.token_ids,
+        output.valid_mask,
+        torch.ones(1, dtype=torch.float32, device="cuda"),
+    )
+    torch.testing.assert_close(output.logprobs, expected, rtol=2e-3, atol=2e-3)

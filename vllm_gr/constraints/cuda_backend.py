@@ -30,7 +30,7 @@ class _BackendState(Enum):
 
 
 class CUDAConstraintBackend:
-    """Own GPU-resident canonical tables and dispatch CUDA constrained Top-K."""
+    """Dispatch full-window normalized Top-K over GPU-resident canonical tables."""
 
     __slots__ = (
         "_first_token_ids",
@@ -180,6 +180,9 @@ class CUDAConstraintBackend:
                 **launch_kwargs,
             )
         if not build_output:
+            # Fixed-address (V1 Worker) path: the fused kernel now outputs
+            # full-window normalized logprobs directly (the scoring contract),
+            # so nothing needs rescoring here.
             return None
         return build_constraint_output(
             token_ids,

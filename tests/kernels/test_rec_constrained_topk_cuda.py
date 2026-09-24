@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from tests.constraints.test_table import make_table
+from vllm_gr.constraints.scoring import score_selected_tokens
 from vllm_gr.ops.cuda.rec_constrained_topk import (
     _rec_constrained_topk_cuda_out_unchecked,
     rec_constrained_topk_cuda,
@@ -89,6 +90,225 @@ def _uniform_degree_inputs(
     )
 
 
+def _wide_window_inputs(
+    dtype: torch.dtype,
+    rows: int,
+    vocab: int,
+    degree: int,
+) -> tuple[torch.Tensor, ...]:
+    """Uniform-degree inputs over an arbitrarily wide window (multi-chunk)."""
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(20260827)
+    logits = torch.randn((rows, vocab), dtype=dtype, device=device, generator=generator)
+    prefixes = torch.zeros((rows, 3), dtype=torch.int32, device=device)
+    candidates = torch.arange(degree, dtype=torch.int32, device=device)
+    prefix1_offsets = torch.full((vocab + 1,), degree, dtype=torch.int32, device=device)
+    prefix1_offsets[0] = 0
+    pair_keys = torch.zeros(1, dtype=torch.int64, device=device)
+    prefix2_offsets = torch.tensor([0, degree], dtype=torch.int32, device=device)
+    temperatures = torch.tensor(
+        [float(index % 3) for index in range(rows)],
+        dtype=torch.float32,
+        device=device,
+    )
+    return (
+        logits,
+        prefixes,
+        candidates,
+        prefix1_offsets,
+        candidates,
+        pair_keys,
+        prefix2_offsets,
+        candidates,
+        temperatures,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_wide_window_multi_chunk_matches_reference(dtype: torch.dtype) -> None:
+    # The real model vocab (~50k) spans many WINDOW_BLOCK=2048 chunks; the
+    # online-softmax rescale across chunk boundaries must match the shared
+    # contract exactly.  Poison the window with -inf (a legitimate sentinel
+    # that logsumexp absorbs) and force a large running-max update late in the
+    # window; NaN poisoning is covered by
+    # test_cuda_nan_window_parity_with_shared_contract.
+    vocab, degree = 5000, 4
+    inputs = list(_wide_window_inputs(dtype, rows=2, vocab=vocab, degree=degree))
+    inputs[0][:, vocab - 1] = 40.0
+    inputs[0][0, 100] = float("-inf")
+    inputs[0][1, 2500] = float("-inf")
+    tokens, logprobs, mask, counts = rec_constrained_topk_cuda(
+        *inputs,
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=degree,
+        max_prefix2_degree=degree,
+    )
+    expected_tokens, _ = rec_constrained_topk_torch(
+        *inputs,
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=degree,
+        max_prefix2_degree=degree,
+    )
+    assert torch.equal(tokens, expected_tokens.to(torch.int32))
+    expected = score_selected_tokens(inputs[0], tokens, mask, inputs[8])
+    torch.testing.assert_close(logprobs, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_nan_window_parity_with_shared_contract(dtype: torch.dtype) -> None:
+    # Mixed row: a single NaN candidate must not win selection, and its
+    # presence in the shared window makes both paths surface the engine's
+    # protocol error (NaN logprobs -> beam_device_error), matching +inf.
+    inputs = list(_wide_window_inputs(dtype, rows=2, vocab=512, degree=3))
+    inputs[0][0, 2] = float("nan")
+    tokens, logprobs, mask, counts = rec_constrained_topk_cuda(
+        *inputs,
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=3,
+        max_prefix2_degree=3,
+    )
+    assert int(tokens[0, 0].item()) != 2
+    expected = score_selected_tokens(inputs[0], tokens, mask, inputs[8])
+    assert torch.isnan(expected[0]).all()
+    assert torch.isfinite(expected[1]).all()
+    torch.testing.assert_close(logprobs, expected, rtol=2e-3, atol=2e-3, equal_nan=True)
+
+    # Fully NaN row: the kernel keeps base "no viable candidate" semantics
+    # (all candidates sanitized to -inf -> -inf logprobs), while the torch
+    # reference propagates NaN.  Both kill the row; the divergence is the
+    # base kernel's candidate-level sanitization, out of scope for this PR.
+    inputs = list(_wide_window_inputs(dtype, rows=1, vocab=512, degree=3))
+    inputs[0] = torch.full((1, 512), float("nan"), dtype=dtype, device="cuda")
+    tokens, logprobs, mask, counts = rec_constrained_topk_cuda(
+        *inputs,
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=3,
+        max_prefix2_degree=3,
+    )
+    assert torch.isneginf(logprobs).all()
+    expected_tokens, _ = rec_constrained_topk_torch(
+        *inputs,
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=3,
+        max_prefix2_degree=3,
+    )
+    assert torch.equal(tokens, expected_tokens.to(torch.int32))
+    expected = score_selected_tokens(inputs[0], tokens, mask, inputs[8])
+    assert torch.isnan(expected).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_inf_window_surfaces_device_error_signal(dtype: torch.dtype) -> None:
+    # +inf logits are a device-error injection: the fused kernel must surface
+    # non-finite logprobs (NaN) so the engine raises beam_device_error.  NaN
+    # logits propagate the same way; only the all-(-inf) "no viable candidate"
+    # sentinel yields -inf.
+    inputs = list(_wide_window_inputs(dtype, rows=1, vocab=512, degree=3))
+    inputs[0][0, 400] = float("inf")
+    tokens, logprobs, mask, counts = rec_constrained_topk_cuda(
+        *inputs,
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=3,
+        max_prefix2_degree=3,
+    )
+    assert torch.isnan(logprobs[mask]).all()
+
+    inputs = list(_wide_window_inputs(dtype, rows=1, vocab=512, degree=3))
+    inputs[0][0, 2] = float("inf")
+    tokens, logprobs, mask, counts = rec_constrained_topk_cuda(
+        *inputs,
+        current_step=1,
+        top_k=2,
+        max_prefix1_degree=3,
+        max_prefix2_degree=3,
+    )
+    assert int(tokens[0, 0].item()) == 2
+    assert torch.isnan(logprobs[0, 0])
+
+
+def _full_window_logprobs(
+    inputs: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    token_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    current_step: int,
+    vocab_offset: int = 0,
+) -> torch.Tensor:
+    """Reference scores normalized over the full logits window.
+
+    Candidate scores must be comparable across parent rows, so the reference
+    normalizes over the complete window (``score - logsumexp(row_logits)``),
+    not each row's legal candidate set.  ``candidates`` is still resolved to
+    decide whether the row has any legal token at all.
+    """
+    (
+        logits,
+        sequence_group,
+        first_token_ids,
+        prefix1_offsets,
+        prefix1_values,
+        prefix1_pair_keys,
+        prefix2_value_offsets,
+        prefix2_values,
+        temperatures,
+    ) = inputs
+    prefixes = sequence_group.reshape(sequence_group.shape[0], -1)
+    vocab_end = vocab_offset + logits.shape[1]
+    output = torch.full(token_ids.shape, -1.0e20, dtype=torch.float32, device=logits.device)
+
+    for row in range(logits.shape[0]):
+        if current_step == 0:
+            candidates = first_token_ids
+        elif current_step == 1:
+            first = int(prefixes[row, 0].item())
+            if first < 0 or first + 1 >= prefix1_offsets.numel():
+                continue
+            begin = int(prefix1_offsets[first].item())
+            end = int(prefix1_offsets[first + 1].item())
+            candidates = prefix1_values[begin:end]
+        else:
+            vocab_size = prefix1_offsets.numel() - 1
+            first = int(prefixes[row, 0].item())
+            second = int(prefixes[row, 1].item())
+            if not (0 <= first < vocab_size and 0 <= second < vocab_size):
+                continue
+            key = first * vocab_size + second
+            pair_index = int(
+                torch.searchsorted(
+                    prefix1_pair_keys,
+                    torch.tensor(key, device=prefix1_pair_keys.device),
+                ).item()
+            )
+            if (
+                pair_index >= prefix1_pair_keys.numel()
+                or int(prefix1_pair_keys[pair_index].item()) != key
+            ):
+                continue
+            begin = int(prefix2_value_offsets[pair_index].item())
+            end = int(prefix2_value_offsets[pair_index + 1].item())
+            candidates = prefix2_values[begin:end]
+
+        candidates = candidates[candidates.ge(vocab_offset) & candidates.lt(vocab_end)].long()
+        if candidates.numel() == 0:
+            continue
+        temperature = temperatures[0] if temperatures.numel() == 1 else temperatures[row]
+        divisor = torch.where(temperature == 0, torch.ones_like(temperature), temperature)
+        row_logits = logits[row].float() / divisor
+        row_valid = valid_mask[row]
+        selected = token_ids[row, row_valid].long() - vocab_offset
+        output[row, row_valid] = row_logits.index_select(0, selected) - torch.logsumexp(
+            row_logits,
+            dim=0,
+        )
+    return output
+
+
 def _assert_cuda_supported_shape(
     dtype: torch.dtype,
     step: int,
@@ -104,7 +324,7 @@ def _assert_cuda_supported_shape(
         max_prefix1_degree=degree,
         max_prefix2_degree=degree,
     )
-    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
+    expected_tokens, _ = rec_constrained_topk_torch(
         *inputs,
         current_step=step,
         top_k=top_k,
@@ -112,6 +332,12 @@ def _assert_cuda_supported_shape(
         max_prefix2_degree=degree,
     )
     expected_counts = torch.full((rows,), degree, dtype=torch.int32, device="cuda")
+    expected_logprobs = _full_window_logprobs(
+        inputs,
+        expected_tokens,
+        actual[2],
+        current_step=step,
+    )
     assert torch.equal(actual[0], expected_tokens.to(torch.int32))
     torch.testing.assert_close(actual[1], expected_logprobs, rtol=2e-3, atol=2e-3)
     assert actual[2].all()
@@ -147,7 +373,7 @@ def test_cuda_matches_torch_reference(dtype: torch.dtype, step: int, top_k: int)
         max_prefix1_degree=table.metadata.max_prefix1_degree,
         max_prefix2_degree=table.metadata.max_prefix2_degree,
     )
-    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
+    expected_tokens, _ = rec_constrained_topk_torch(
         *inputs,
         current_step=step,
         top_k=top_k,
@@ -163,6 +389,12 @@ def test_cuda_matches_torch_reference(dtype: torch.dtype, step: int, top_k: int)
     expected_mask = torch.arange(top_k, device="cuda").unsqueeze(0) < valid_counts.unsqueeze(1)
     assert torch.equal(valid_mask, expected_mask)
     assert torch.equal(actual_tokens, expected_tokens.to(torch.int32))
+    expected_logprobs = _full_window_logprobs(
+        inputs,
+        expected_tokens,
+        expected_mask,
+        current_step=step,
+    )
     torch.testing.assert_close(actual_logprobs, expected_logprobs, rtol=2e-3, atol=2e-3)
     assert actual_tokens.dtype == torch.int32
     assert actual_logprobs.dtype == torch.float32
@@ -186,7 +418,7 @@ def test_cuda_sliced_logits_keep_global_table_token_ids(dtype: torch.dtype) -> N
     )
     reference_inputs = list(inputs)
     reference_inputs[0] = full_logits
-    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
+    expected_tokens, _ = rec_constrained_topk_torch(
         *reference_inputs,
         current_step=1,
         top_k=2,
@@ -195,6 +427,13 @@ def test_cuda_sliced_logits_keep_global_table_token_ids(dtype: torch.dtype) -> N
     )
 
     assert torch.equal(actual_tokens, expected_tokens.to(torch.int32))
+    expected_logprobs = _full_window_logprobs(
+        inputs,
+        actual_tokens,
+        valid_mask,
+        current_step=1,
+        vocab_offset=1,
+    )
     torch.testing.assert_close(actual_logprobs, expected_logprobs, rtol=2e-3, atol=2e-3)
     assert valid_counts.cpu().tolist() == [2, 1]
     expected_mask = torch.tensor([[True, True], [True, False]], device="cuda")
@@ -219,7 +458,12 @@ def test_cuda_sliced_logits_exclude_table_tokens_outside_window() -> None:
     assert tokens[:, 0].cpu().tolist() == [3, 3]
     assert valid_counts.cpu().tolist() == [1, 1]
     assert torch.equal(valid_mask, torch.tensor([[True, False], [True, False]], device="cuda"))
-    torch.testing.assert_close(logprobs[:, 0], torch.zeros(2, device="cuda"), rtol=0, atol=0)
+    # Full-window domain over the sliced window: token 3 (local index 1) is
+    # the only legal candidate in each row, but its score is normalized over
+    # the whole 4-column window, not the single-token candidate set (which
+    # would score exactly 0.0).
+    expected = torch.tensor([-2.129404067993164, -0.20581769943237305], device="cuda")
+    torch.testing.assert_close(logprobs[:, 0], expected, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("step", [0, 1, 2])
@@ -234,15 +478,21 @@ def test_cuda_exact_tie_uses_lower_table_offset(step: int) -> None:
         max_prefix1_degree=table.metadata.max_prefix1_degree,
         max_prefix2_degree=table.metadata.max_prefix2_degree,
     )
-    expected = rec_constrained_topk_torch(
+    expected_tokens, _ = rec_constrained_topk_torch(
         *inputs,
         current_step=step,
         top_k=2,
         max_prefix1_degree=table.metadata.max_prefix1_degree,
         max_prefix2_degree=table.metadata.max_prefix2_degree,
     )
-    assert torch.equal(actual[0], expected[0].to(torch.int32))
-    torch.testing.assert_close(actual[1], expected[1], rtol=2e-3, atol=2e-3)
+    expected_logprobs = _full_window_logprobs(
+        inputs,
+        expected_tokens,
+        actual[2],
+        current_step=step,
+    )
+    assert torch.equal(actual[0], expected_tokens.to(torch.int32))
+    torch.testing.assert_close(actual[1], expected_logprobs, rtol=2e-3, atol=2e-3)
 
 
 def test_cuda_invalid_prefix_returns_only_padding() -> None:
@@ -287,8 +537,12 @@ def test_cuda_step_zero_supports_top_k_256(dtype: torch.dtype) -> None:
     tokens, logprobs, valid_mask, counts = rec_constrained_topk_cuda(
         *inputs, current_step=0, top_k=256
     )
-    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
-        *inputs, current_step=0, top_k=256
+    expected_tokens, _ = rec_constrained_topk_torch(*inputs, current_step=0, top_k=256)
+    expected_logprobs = _full_window_logprobs(
+        inputs,
+        expected_tokens,
+        valid_mask,
+        current_step=0,
     )
     assert torch.equal(tokens, expected_tokens.to(torch.int32))
     torch.testing.assert_close(logprobs, expected_logprobs, rtol=2e-3, atol=2e-3)
@@ -325,7 +579,7 @@ def test_cuda_out_variant_supports_fixed_address_graph_replay() -> None:
     with torch.cuda.graph(graph):
         run()
     inputs[0].copy_(inputs[0].flip(1))
-    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
+    expected_tokens, _ = rec_constrained_topk_torch(
         *inputs,
         current_step=1,
         top_k=top_k,
@@ -334,6 +588,12 @@ def test_cuda_out_variant_supports_fixed_address_graph_replay() -> None:
     )
     graph.replay()
     torch.accelerator.synchronize()
+    expected_logprobs = _full_window_logprobs(
+        inputs,
+        expected_tokens,
+        outputs[2],
+        current_step=1,
+    )
     assert tuple(tensor.data_ptr() for tensor in outputs) == addresses
     assert torch.equal(outputs[0], expected_tokens.to(torch.int32))
     torch.testing.assert_close(outputs[1], expected_logprobs, rtol=2e-3, atol=2e-3)
@@ -474,12 +734,18 @@ def test_cuda_step_zero_accepts_empty_prefix_extent() -> None:
         max_prefix1_degree=2,
         max_prefix2_degree=2,
     )
-    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
+    expected_tokens, _ = rec_constrained_topk_torch(
         *inputs,
         current_step=0,
         top_k=2,
         max_prefix1_degree=2,
         max_prefix2_degree=2,
+    )
+    expected_logprobs = _full_window_logprobs(
+        inputs,
+        expected_tokens,
+        actual[2],
+        current_step=0,
     )
     assert torch.equal(actual[0], expected_tokens.to(torch.int32))
     torch.testing.assert_close(actual[1], expected_logprobs, rtol=2e-3, atol=2e-3)
@@ -497,12 +763,18 @@ def test_cuda_degree_less_equal_greater_than_top_k(step: int, degree: int) -> No
         max_prefix1_degree=degree,
         max_prefix2_degree=degree,
     )
-    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
+    expected_tokens, _ = rec_constrained_topk_torch(
         *inputs,
         current_step=step,
         top_k=top_k,
         max_prefix1_degree=degree,
         max_prefix2_degree=degree,
+    )
+    expected_logprobs = _full_window_logprobs(
+        inputs,
+        expected_tokens,
+        actual[2],
+        current_step=step,
     )
     assert torch.equal(actual[0], expected_tokens.to(torch.int32))
     torch.testing.assert_close(actual[1], expected_logprobs, rtol=2e-3, atol=2e-3)

@@ -11,9 +11,9 @@ from typing import Protocol, runtime_checkable
 import torch
 
 from vllm_gr.config.models import ConstraintTableBackendEnum
+from vllm_gr.constraints.scoring import INVALID_LOGIT
 from vllm_gr.constraints.table import ConstraintTableMetadata
 
-INVALID_LOGIT = -1.0e20
 _LOGIT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -35,8 +35,10 @@ class ConstraintMetadata:
 
     ``temperatures`` is a caller-validated tensor of finite, non-negative
     values.  Zero has the established constrained-operator meaning of one:
-    logits are left unscaled, rather than divided by zero.  Positive values
-    scale logits before normalization over the complete legal candidate set.
+    logits are left unscaled, rather than divided by zero. Positive values
+    scale logits before normalization. The CPU and CUDA Backends normalize
+    over the complete shared logits window so candidate scores are
+    comparable across parent rows.
 
     Value-domain validation intentionally remains at the request boundary.
     Inspecting a device tensor here would synchronize every NPU ``select``;
