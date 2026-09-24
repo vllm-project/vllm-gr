@@ -13,6 +13,23 @@ from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
 from vllm_gr.v1.worker import model_runner_common as common
 
 
+def _prefill_stage(*request_ids: str) -> SimpleNamespace:
+    prompt_tokens = (4,) * len(request_ids)
+    return SimpleNamespace(
+        session_id=request_ids[0],
+        dispatch_id=0,
+        stage_index=0,
+        kind=GRStageKind.PREFILL,
+        decode_step=None,
+        owner_generation=0,
+        request_ids=request_ids,
+        num_prompt_tokens_by_request=prompt_tokens,
+        num_prompt_tokens=sum(prompt_tokens),
+        beam_params=SimpleNamespace(beam_width=4),
+        produces_output=True,
+    )
+
+
 def test_async_scheduling_decode_bypasses_prefill_graph_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -47,7 +64,7 @@ def test_async_scheduling_prefill_reuses_existing_padded_graph_without_runtime_c
     hidden, eager = object(), object()
     calls: list[str] = []
     output = SimpleNamespace(
-        gr_stage_metadata={"request": SimpleNamespace(kind=GRStageKind.PREFILL)},
+        gr_stage_metadata={"request": _prefill_stage("request")},
         num_scheduled_tokens={"request": 4},
         total_num_scheduled_tokens=4,
     )
@@ -103,7 +120,7 @@ def test_async_prefill_padding_preserves_input_guards(
         model_config=SimpleNamespace(enforce_eager=False),
         _prefill_graph_runner=prefill,
         _current_scheduler_output=SimpleNamespace(
-            gr_stage_metadata={"request": SimpleNamespace(kind=GRStageKind.PREFILL)},
+            gr_stage_metadata={"request": _prefill_stage("request")},
             num_scheduled_tokens={"request": 4},
             total_num_scheduled_tokens=4,
         ),
@@ -129,9 +146,7 @@ def test_async_scheduling_prefill_never_initializes_a_graph_runner_during_reques
     enforce_eager: bool,
 ) -> None:
     runner = SimpleNamespace(
-        _current_scheduler_output=SimpleNamespace(
-            gr_stage_metadata={"r": SimpleNamespace(kind=GRStageKind.PREFILL)}
-        ),
+        _current_scheduler_output=SimpleNamespace(gr_stage_metadata={"r": _prefill_stage("r")}),
         model_config=SimpleNamespace(enforce_eager=enforce_eager),
     )
 
@@ -141,6 +156,95 @@ def test_async_scheduling_prefill_never_initializes_a_graph_runner_during_reques
     monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
     monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", forbidden)
     assert gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(runner) == "eager"
+
+
+def test_batch_session_prefill_selects_exact_four_request_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_ids = ("r0", "r1", "r2", "r3")
+    scheduled_tokens = dict.fromkeys(request_ids, 1)
+    tokens = torch.arange(4, dtype=torch.int32)
+    positions = torch.arange(4)
+    hidden = object()
+    calls: list[str] = []
+
+    def has_captured_graph(bucket: int, num_reqs: int) -> bool:
+        calls.append(f"select:{bucket}:{num_reqs}")
+        return bucket == 4 and num_reqs == 4
+
+    def execute_model_prefill(**kwargs: Any) -> object:
+        assert tuple(kwargs["num_scheduled_tokens"]) == request_ids
+        calls.append("replay")
+        return hidden
+
+    prefill = SimpleNamespace(
+        match_bucket=lambda total: total,
+        has_captured_graph=has_captured_graph,
+        execute_model_prefill=execute_model_prefill,
+    )
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        _prefill_graph_runner=prefill,
+        _current_scheduler_output=SimpleNamespace(
+            gr_stage_metadata={"session": _prefill_stage(*request_ids)},
+            num_scheduled_tokens=scheduled_tokens,
+            total_num_scheduled_tokens=4,
+        ),
+        input_batch=SimpleNamespace(
+            block_table=[SimpleNamespace(slot_mapping=SimpleNamespace(gpu=positions))]
+        ),
+    )
+
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
+    result = gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(
+        runner, tokens, positions
+    )
+
+    assert result is hidden
+    assert calls == ["select:4:4", "replay"]
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "scheduled_ids",
+    [
+        ("r0", "r1", "r2"),
+        ("r1", "r0", "r2", "r3"),
+        ("r0", "r1", "r2", "other"),
+    ],
+)
+def test_batch_session_prefill_rejects_partial_or_reordered_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduled_ids: tuple[str, ...],
+) -> None:
+    request_ids = ("r0", "r1", "r2", "r3")
+    tokens = torch.arange(len(scheduled_ids), dtype=torch.int32)
+    positions = torch.arange(len(scheduled_ids))
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        _prefill_graph_runner=SimpleNamespace(),
+        _current_scheduler_output=SimpleNamespace(
+            gr_stage_metadata={"session": _prefill_stage(*request_ids)},
+            num_scheduled_tokens=dict.fromkeys(scheduled_ids, 1),
+            total_num_scheduled_tokens=len(scheduled_ids),
+        ),
+    )
+    eager_calls: list[bool] = []
+
+    def eager(*args: Any, **kwargs: Any) -> str:
+        eager_calls.append(True)
+        return "eager"
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("invalid Batch Session reached graph selection")
+
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(gpu_patch, "is_prefill_phase_batch", lambda *args: True)
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", forbidden)
+    result = gpu_patch.make_patched_model_forward(eager)(runner, tokens, positions)
+
+    assert result == "eager"
+    assert eager_calls == [True]
 
 
 def test_gpu_prepare_preserves_order_and_two_item_contract(

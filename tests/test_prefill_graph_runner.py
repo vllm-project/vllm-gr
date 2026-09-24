@@ -666,6 +666,103 @@ def test_gpu_replay_falls_back_without_slot_mapping() -> None:
     assert gpu_runner.last_replay_reason == "missing_slot_mapping"
 
 
+def test_gpu_multi_request_replay_refreshes_request_local_buffers() -> None:
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
+
+    request_ids = ("r0", "r1", "r2", "r3")
+    token_counts = {"r0": 3, "r1": 4, "r2": 2, "r3": 5}
+    total_tokens = sum(token_counts.values())
+    live_query_start_loc = torch.tensor([0, 3, 7, 9, 14], dtype=torch.int32)
+    live_seq_lens = torch.tensor([3, 14, 22, 35], dtype=torch.int32)
+    live_block_table = torch.arange(16, dtype=torch.int32).reshape(4, 4)
+    live_slots = torch.arange(total_tokens, dtype=torch.int64)
+
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(
+            req_id_to_index={request_id: index for index, request_id in enumerate(request_ids)},
+            num_computed_tokens_cpu=np.array([0, 10, 20, 30]),
+            block_table=[
+                SimpleNamespace(
+                    block_table=SimpleNamespace(gpu=live_block_table),
+                )
+            ],
+        ),
+        query_start_loc=SimpleNamespace(gpu=live_query_start_loc),
+        seq_lens=live_seq_lens,
+    )
+    graph_runner = GPUPrefillGraphRunner(runner, buckets=[16])
+    buf = graph_runner.buffers[16]
+    replayed: list[bool] = []
+
+    class Graph:
+        def replay(self) -> None:
+            replayed.append(True)
+
+    buf.captured_graphs[4] = Graph()
+    buf.output_bufs[4] = torch.zeros(16, 8)
+    buf.max_seq_len_bounds[4] = 64
+    buf.block_table_buf = torch.zeros_like(live_block_table)
+
+    input_ids = torch.arange(total_tokens, dtype=torch.int32)
+    positions = torch.arange(total_tokens, dtype=torch.int64)
+    output = graph_runner.execute_model_prefill(
+        bucket=16,
+        input_ids=input_ids,
+        positions=positions,
+        slot_mapping=live_slots,
+        num_scheduled_tokens=token_counts,
+    )
+
+    assert output is buf.output_bufs[4]
+    assert replayed == [True]
+    assert graph_runner.last_replay_reason == "replay"
+    assert torch.equal(buf.input_ids_buf[:total_tokens], input_ids)
+    assert torch.all(buf.input_ids_buf[total_tokens:] == buf.pad_token_id)
+    assert torch.equal(buf.positions_buf[:total_tokens], positions)
+    assert torch.all(buf.positions_buf[total_tokens:] == 0)
+    assert torch.equal(buf.slot_mapping_buf[:total_tokens], live_slots)
+    assert torch.all(buf.slot_mapping_buf[total_tokens:] == -1)
+    assert torch.equal(buf.query_start_loc_buf[:5], live_query_start_loc)
+    assert torch.equal(buf.seq_lens_buf[:4], live_seq_lens)
+    assert torch.equal(buf.block_table_buf, live_block_table)
+
+    runner.input_batch.req_id_to_index = {
+        "r0": 1,
+        "r1": 0,
+        "r2": 2,
+        "r3": 3,
+    }
+    assert (
+        graph_runner.execute_model_prefill(
+            bucket=16,
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=live_slots,
+            num_scheduled_tokens=token_counts,
+        )
+        is None
+    )
+    assert graph_runner.last_replay_reason == "request_order_mismatch"
+    assert replayed == [True]
+
+    assert (
+        graph_runner.execute_model_prefill(
+            bucket=16,
+            input_ids=torch.zeros(17, dtype=torch.int32),
+            positions=torch.zeros(17, dtype=torch.int64),
+            slot_mapping=torch.zeros(17, dtype=torch.int64),
+            num_scheduled_tokens={"r0": 5, "r1": 4, "r2": 4, "r3": 4},
+        )
+        is None
+    )
+    assert graph_runner.last_replay_reason == "token_count_exceeds_bucket"
+
+
 def test_get_max_context_len() -> None:
     from types import SimpleNamespace
 
@@ -930,7 +1027,21 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
             total_num_scheduled_tokens=length,
         )
         if async_stage:
-            scheduled.gr_stage_metadata = {"r": SimpleNamespace(kind=GRStageKind.PREFILL)}
+            scheduled.gr_stage_metadata = {
+                "r": SimpleNamespace(
+                    session_id="r",
+                    dispatch_id=index,
+                    stage_index=0,
+                    kind=GRStageKind.PREFILL,
+                    decode_step=None,
+                    owner_generation=0,
+                    request_ids=("r",),
+                    num_prompt_tokens_by_request=(2048,),
+                    num_prompt_tokens=2048,
+                    beam_params=SimpleNamespace(beam_width=4),
+                    produces_output=True,
+                )
+            }
         runner._current_scheduler_output = scheduled
         runner.query_start_loc.gpu[1] = length
         runner.seq_lens[0] = length

@@ -14,6 +14,7 @@ logger = init_logger(__name__)
 
 PREFILL_GRAPH_BUCKET_STEP_DEFAULT = 128
 PREFILL_GRAPH_MAX_BUCKET_DEFAULT = 8192
+PREFILL_GRAPH_CAPTURE_NUM_REQS = (1, 4)
 # Small exact buckets, available as an opt-in extension of the configured
 # grid (see get_default_buckets). A prefix-cache hit schedules only the
 # uncached tail ((((N - 1) mod block_size) + 1) <= 16 tokens at block_size
@@ -42,7 +43,11 @@ DEFAULT_PREFILL_BUCKETS = list(
 )
 # Public compatibility alias. Both platforms use the configured bucket range.
 NPU_DEFAULT_PREFILL_BUCKETS = list(DEFAULT_PREFILL_BUCKETS)
-SUPPORTED_NUM_REQS = [1, 2, 3, 4, 5, 6, 7, 8]
+
+# Backend capability range. This is separate from the capture configuration:
+# NPU can rebind request counts on one graph, while GPU captures the exact
+# request counts declared by PREFILL_GRAPH_CAPTURE_NUM_REQS above.
+SUPPORTED_NUM_REQS = tuple(range(1, 9))
 
 ENV_ENABLE_PREFILL_GRAPH = "VLLM_ENABLE_PREFILL_CUDAGRAPH"
 ENV_PREFILL_GRAPH_BUCKET_STEP = "VLLM_GR_PREFILL_GRAPH_BUCKET_STEP"

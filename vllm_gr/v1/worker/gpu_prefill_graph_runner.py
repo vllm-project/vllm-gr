@@ -9,16 +9,17 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.config import BeamExecutionMode, GRConfig
 from vllm_gr.utils.npu_adapter import is_cuda_available
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_ENABLE_PREFILL_GRAPH,
+    PREFILL_GRAPH_CAPTURE_NUM_REQS,
     BasePrefillGraphRunner,
     get_kv_capture_bound,
     is_prefill_graph_enabled,
 )
 
 logger = init_logger(__name__)
-GPU_PREFILL_CAPTURE_NUM_REQS = (1,)
 
 
 class GPUPrefillGraphRunner(BasePrefillGraphRunner):
@@ -43,7 +44,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         )
 
     def capture_graphs(self, runner: Any) -> None:
-        """Capture one-request CUDA graphs for every configured prefill bucket."""
+        """Capture configured request-count CUDA graphs for each prefill bucket."""
         if not is_prefill_graph_enabled():
             logger.info(
                 "Prefill CUDA Graph capture is disabled via environment variable (%s=0).",
@@ -63,10 +64,27 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         from vllm.forward_context import set_forward_context
         from vllm.platforms import current_platform
 
+        scheduler_config = getattr(runner, "scheduler_config", None)
+        if scheduler_config is None:
+            scheduler_config = getattr(
+                getattr(runner, "vllm_config", None), "scheduler_config", None
+            )
+        max_num_seqs = int(
+            getattr(scheduler_config, "max_num_seqs", PREFILL_GRAPH_CAPTURE_NUM_REQS[-1])
+        )
+        capture_num_reqs = tuple(
+            count for count in PREFILL_GRAPH_CAPTURE_NUM_REQS if count <= max_num_seqs
+        )
+        # Legacy Beam Search dispatches one request at a time. Keep its
+        # original capture footprint; reserve B=4 graphs for V1 sessions.
+        mode = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None)).beam_execution_mode
+        if mode is not BeamExecutionMode.V1:
+            capture_num_reqs = capture_num_reqs[:1]
+
         logger.info(
             "Beginning Prefill CUDA graph capture for buckets: %s (batch sizes: %s)",
             self.buckets,
-            GPU_PREFILL_CAPTURE_NUM_REQS,
+            capture_num_reqs,
         )
 
         pool = current_platform.get_global_graph_pool()
@@ -108,7 +126,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                 for layer_name in kv_cache_config.kv_cache_groups[0].layer_names:
                     slot_mappings_by_layer[layer_name] = buf.slot_mapping_buf
 
-            for num_reqs in GPU_PREFILL_CAPTURE_NUM_REQS:
+            for num_reqs in capture_num_reqs:
                 if bucket < num_reqs:
                     continue
 
@@ -193,7 +211,7 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                             or bt_shape[1] > buf.block_table_buf.shape[1]
                         ):
                             buf.block_table_buf = torch.zeros(
-                                (GPU_PREFILL_CAPTURE_NUM_REQS[-1], bt_shape[1]),
+                                (PREFILL_GRAPH_CAPTURE_NUM_REQS[-1], bt_shape[1]),
                                 dtype=meta.block_table.dtype,
                                 device=runner.device,
                             )
@@ -346,8 +364,21 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             else list(num_scheduled_tokens)
         )
         num_reqs = len(token_counts)
-        total_actual = sum(token_counts)
         self.last_replay_reason = "graph_not_captured"
+        if num_reqs == 0 or any(count <= 0 for count in token_counts):
+            self.last_replay_reason = "invalid_token_counts"
+            return None
+
+        total_actual = sum(token_counts)
+        if total_actual > bucket:
+            self.last_replay_reason = "token_count_exceeds_bucket"
+            logger.warning(
+                "GPU prefill graph replay: scheduled token count %d exceeds bucket %d; "
+                "falling back to eager prefill.",
+                total_actual,
+                bucket,
+            )
+            return None
         buf = self.buffers.get(bucket)
         if buf is None or not buf.has_captured_graph(num_reqs):
             return None
@@ -383,6 +414,27 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             )
             return None
 
+        # Attention rows must follow the caller-defined request order. The
+        # static graph metadata is request-major, so accepting a reordered or
+        # non-prefix InputBatch would bind one request's sequence length and
+        # block table to another request's tokens. Validate before mutating
+        # any persistent staging buffer.
+        if isinstance(num_scheduled_tokens, dict):
+            input_batch = getattr(self.model_runner, "input_batch", None)
+            req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+            if req_id_to_index is None:
+                self.last_replay_reason = "missing_request_rows"
+                return None
+            request_rows = tuple(req_id_to_index.get(req_id) for req_id in num_scheduled_tokens)
+            if request_rows != tuple(range(num_reqs)):
+                self.last_replay_reason = "request_order_mismatch"
+                logger.debug(
+                    "GPU prefill graph replay: scheduled request rows %s do not "
+                    "match the graph's request-major rows; falling back to eager.",
+                    request_rows,
+                )
+                return None
+
         # Refresh the static buffers with plain on-stream D2D copies from the
         # live per-batch tensors. _prepare_inputs has already computed all of
         # them (positions, slot mapping, seq_lens, query start loc) for THIS
@@ -404,7 +456,8 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         buf.slot_mapping_buf[:total_actual].copy_(slot_mapping[:total_actual], non_blocking=True)
 
         # Per-request attention metadata: copy the live GPU tensors
-        # _prepare_inputs just computed, in the InputBatch row order.
+        # _prepare_inputs just computed. The ordering check above proves that
+        # these prefix rows match num_scheduled_tokens insertion order.
         qsl_gpu = getattr(self.model_runner, "query_start_loc", None)
         if qsl_gpu is None or not hasattr(qsl_gpu, "gpu"):
             self.last_replay_reason = "missing_query_start_loc"
