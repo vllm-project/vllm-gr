@@ -63,6 +63,8 @@ def metadata(stage=0, dispatch=None, output=True, n=3):
         output_options=request.output_options,
         num_prompt_tokens=7,
         produces_output=output,
+        request_ids=(request.batch_id,),
+        num_prompt_tokens_by_request=(7,),
     )
 
 
@@ -661,7 +663,7 @@ def test_fresh_metadata_updates_contents_without_changing_graph_addresses():
     old = owner.metadata
     graph = owner.graph = object()
     owner.worker.requests["session-0"].block_ids = ([2],)
-    changed = replace(metadata(2), num_prompt_tokens=8)
+    changed = replace(metadata(2), num_prompt_tokens=8, num_prompt_tokens_by_request=(8,))
     owner.prepared = owner.prepare_cpu(changed, 1)
     owner._bind_attention(changed)
     assert owner.metadata is not old

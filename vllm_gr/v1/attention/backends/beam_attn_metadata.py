@@ -138,6 +138,46 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
     supports_update_block_table: bool = True
 
     @staticmethod
+    def build_async_batch_layout(
+        *,
+        width: int,
+        prompt_lengths: list[int],
+        decode_step: int,
+        block_ids_by_request: list[list[int]],
+        max_blocks: int,
+    ) -> dict[str, list[int]]:
+        """Build request-major metadata for B logical requests and B*W rows."""
+        batch = len(prompt_lengths)
+        if (
+            type(width) is not int
+            or width < 1
+            or not batch
+            or len(block_ids_by_request) != batch
+            or any(type(length) is not int or length < 1 for length in prompt_lengths)
+        ):
+            raise ValueError("Asynchronous scheduling batch geometry is invalid")
+        query = [item * width for item in range(batch + 1)]
+        rows = batch * width
+        blocks: list[int] = []
+        for request_blocks in block_ids_by_request:
+            if len(request_blocks) > max_blocks:
+                raise ValueError("Asynchronous scheduling prefix block table exceeds capacity")
+            blocks.extend(request_blocks)
+            blocks.extend([0] * (max_blocks - len(request_blocks)))
+        suffix_length = decode_step + 1
+        return {
+            "positions": [prompt + decode_step for prompt in prompt_lengths for _ in range(width)],
+            "query": query,
+            "sequence": [prompt + suffix_length for prompt in prompt_lengths],
+            "prefix_lengths": list(prompt_lengths),
+            "blocks": blocks,
+            "logits": list(range(rows)),
+            "suffix_query": list(range(rows + 1)),
+            "suffix_lengths": [suffix_length] * rows,
+            "suffix_offsets": [item * suffix_length for item in range(rows + 1)],
+        }
+
+    @staticmethod
     def build_async_layout(
         *,
         width: int,
@@ -169,17 +209,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             )
         if len(block_ids) > max_blocks:
             raise ValueError("Asynchronous scheduling prefix block table exceeds model capacity")
-        return {
-            "positions": [prompt_len + decode_step] * width,
-            "query": [0, width],
-            "sequence": list(seq_lens_cpu),
-            "prefix_lengths": [prompt_len],
-            "blocks": list(block_ids) + [0] * (max_blocks - len(block_ids)),
-            "logits": list(range(width)),
-            "suffix_query": list(range(width + 1)),
-            "suffix_lengths": [decode_step + 1] * width,
-            "suffix_offsets": [i * (decode_step + 1) for i in range(width + 1)],
-        }
+        return BeamAttentionMetadataBuilder.build_async_batch_layout(
+            width=width,
+            prompt_lengths=[prompt_len],
+            decode_step=decode_step,
+            block_ids_by_request=[block_ids],
+            max_blocks=max_blocks,
+        )
 
     @staticmethod
     def build_async(
@@ -199,12 +235,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         The GPU V1 adapter uses the existing FA2 incremental path (no AOT
         schedule). Both eager and graph use block-aligned model/pool bounds.
         """
-        width = len(layout["positions"])
-        prefix = layout["prefix_lengths"][0]
-        blocks = views["blocks"].view(1, -1)
+        rows = len(layout["positions"])
+        batch = len(layout["prefix_lengths"])
+        width = rows // batch
+        blocks = views["blocks"].view(batch, -1)
         return BeamAttentionMetadata(
-            num_actual_tokens=width,
-            num_reqs=1,
+            num_actual_tokens=rows,
+            num_reqs=batch,
             max_query_len=width,
             query_start_loc=views["query"],
             query_start_loc_cpu=list(layout["query"]),
@@ -217,22 +254,22 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             beam_session=session,
             beam_active_mask=mask,
             prefix_indices=views["logits"],
-            num_prefix_indices=width,
+            num_prefix_indices=rows,
             prefix_cu_seqlens_q_device=views["query"],
             prefix_seqlens_kv_device=views["prefix_lengths"],
             prefix_max_q_len=width,
             prefix_max_seq_len=((max_model_len + block_size - 1) // block_size) * block_size,
             prefix_block_table=blocks,
-            prefix_seqlens_q_cpu=[width],
+            prefix_seqlens_q_cpu=[width] * batch,
             prefix_cu_seqlens_q_cpu=list(layout["query"]),
-            prefix_seqlens_kv_cpu=[prefix],
-            prefix_cu_seqlens_kv_cpu=[0, prefix],
+            prefix_seqlens_kv_cpu=list(layout["prefix_lengths"]),
+            prefix_cu_seqlens_kv_cpu=None,
             suffix_cu_seqlens_q_device=views["suffix_query"],
             suffix_cu_seqlens_k_device=views["suffix_offsets"],
             suffix_seqlens_kv_device=views["suffix_lengths"],
             suffix_max_q_len=1,
             suffix_max_seq_len=session.context.max_decode_steps,
-            suffix_seqlens_q_cpu=[1] * width,
+            suffix_seqlens_q_cpu=[1] * rows,
             suffix_cu_seqlens_q_cpu=list(layout["suffix_query"]),
             suffix_seqlens_kv_cpu=list(layout["suffix_lengths"]),
             suffix_cu_seqlens_kv_cpu=list(layout["suffix_offsets"]),

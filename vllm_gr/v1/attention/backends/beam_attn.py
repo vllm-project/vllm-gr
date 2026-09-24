@@ -285,17 +285,18 @@ class BeamAttentionImpl(AttentionImpl):
         is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
 
         if is_beam_decode and beam_session is not None and beam_session.is_active:
-            # Resolve this layer's KV pool with module-level caching.
-            # First touch: extract the layer index from layer_name via
-            # extract_layer_index (loud AssertionError on ambiguous names
-            # instead of silently defaulting to layer 0).  Subsequent
-            # forwards reuse the cached pool, zero per-step lookup cost.
-            pool = getattr(layer, "_beam_pool", None)
-            if pool is None:
+            # Cache only the layer index. The pool object is session-specific:
+            # multi-request GPU execution replaces each physical [B, W, ...]
+            # pool with a request-major [1, B*W, ...] view. Reusing the pool
+            # cached by the startup B=1 capture would bypass that view and make
+            # later kernels address neighbouring request slots by logically
+            # indexing past W.
+            layer_idx = getattr(layer, "_beam_pool_index", None)
+            if layer_idx is None:
                 layer_name = getattr(layer, "layer_name", "")
                 layer_idx = extract_layer_index(layer_name)
-                pool = beam_session.pools[layer_idx]
-                layer._beam_pool = pool
+                layer._beam_pool_index = layer_idx
+            pool = beam_session.pools[layer_idx]
 
             # Extract the beam tokens' KV from the key/value tensors (they
             # contain all scheduled tokens).  The gather runs inside the

@@ -1119,8 +1119,12 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     )
     graph = object.__new__(shared.BeamDecodeGraph)
     graph.worker, graph.width = runner, 4
+    graph.signature = shared.BeamDecodeGraphSignature(1, 4, 4)
+    graph._bindings = {}
+    graph.capture_inputs = graph.capture_attention = None
     graph.descriptor = BatchDescriptor(num_tokens=4, uniform=True)
-    graph.wrapper = SimpleNamespace(concrete_cudagraph_entries={})
+    entries: dict[Any, Any] = {}
+    graph.wrapper = SimpleNamespace(concrete_cudagraph_entries=entries, clear_graphs=entries.clear)
     # R1 install/uninstall state (normally set in __init__, bypassed by
     # object.__new__): V1's capture() installs the wrapper persistently, so
     # the ownership pair must be present and consistent.
@@ -1259,11 +1263,12 @@ def test_capture_create_dummy_context_creates_session_and_beam_info() -> None:
 
 
 def test_beam_full_graph_ready_uses_worker_registry() -> None:
-    runner = SimpleNamespace(_beam_decode_graph=SimpleNamespace(width=4, ready=True))
-    assert common._beam_full_graph_ready(runner, 4)
-    assert not common._beam_full_graph_ready(runner, 8)
-    runner._beam_decode_graph.ready = False
+    graph = SimpleNamespace(signature=SimpleNamespace(num_model_rows=8), ready=True)
+    runner = SimpleNamespace(_beam_decode_graph=graph)
+    assert common._beam_full_graph_ready(runner, 8)
     assert not common._beam_full_graph_ready(runner, 4)
+    runner._beam_decode_graph.ready = False
+    assert not common._beam_full_graph_ready(runner, 8)
 
 
 def test_beam_full_graph_ready_ignores_other_native_graphs() -> None:

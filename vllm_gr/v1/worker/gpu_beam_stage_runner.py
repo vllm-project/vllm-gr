@@ -338,6 +338,11 @@ class GPUBeamStageRunner:
         ):
             raise RuntimeError("Beam context already has an execution owner")
         self.worker, self.beam, self.binding, self.backend = worker, beam, binding, backend
+        # Device indexing is part of Decode binding and must not upload a CPU
+        # index tensor while a CUDA graph is being captured.
+        self.state_rows = torch.tensor(
+            (binding.state_row,), dtype=torch.long, device=beam.state.device
+        )
         self.hooks = hooks if hooks is not None else _StageExecutionHooks(worker)
         self.previous: GRStageMetadata | None = None
         self.pending: tuple[BeamDispatchExecution, int] | None = None
@@ -504,11 +509,15 @@ class GPUBeamStageRunner:
     def prepare_decode(self, entry: BeamDispatchEntry) -> None:
         # Device binding has no dependency on Host output consumption.
         prepared = self.prepared
-        if (
-            prepared is None
-            or prepared.metadata != entry.metadata
-            or prepared.binding != entry.binding
-        ):
+        if prepared is None:
+            raise RuntimeError(
+                "Asynchronous scheduling device binding does not match the prepared dispatch"
+            )
+        prepared_bindings = (
+            prepared.binding if isinstance(prepared.binding, tuple) else (prepared.binding,)
+        )
+        entry_bindings = entry.binding if isinstance(entry.binding, tuple) else (entry.binding,)
+        if prepared.metadata != entry.metadata or prepared_bindings != entry_bindings:
             raise RuntimeError(
                 "Asynchronous scheduling device binding does not match the prepared dispatch"
             )

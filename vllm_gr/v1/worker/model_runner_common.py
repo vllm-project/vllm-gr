@@ -1229,7 +1229,7 @@ def _beam_full_graph_ready(runner: Any, num_tokens: int) -> bool:
     """Query the GPU Beam component; retain the device-neutral NPU key contract."""
     graph = getattr(runner, "_beam_decode_graph", None)
     if graph is not None:
-        return bool(graph.ready and num_tokens == graph.width)
+        return bool(graph.ready and num_tokens == graph.signature.num_model_rows)
     beam_keys = getattr(runner, "_beam_graph_keys", None)
     return beam_keys is not None and num_tokens in beam_keys
 

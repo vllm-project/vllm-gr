@@ -486,8 +486,22 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
     value_cache = torch.empty_like(key_cache)
 
     pool = session.pools[0]
+    stale_context = BeamAttentionContext(
+        max_batch=1,
+        max_beams=4,
+        num_kv_heads=2,
+        max_decode_steps=3,
+        head_dim=8,
+        num_layers=1,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+    )
+    stale_pool = stale_context.pools[0]
     layer = SimpleNamespace(
-        layer_name="model.layers.0.self_attn", _k_scale=None, _v_scale=None, _beam_pool=pool
+        layer_name="model.layers.0.self_attn",
+        _k_scale=None,
+        _v_scale=None,
+        _beam_pool=stale_pool,
     )
 
     returned = impl.forward(
@@ -502,6 +516,8 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
 
     assert returned is output
     # Verify that cascade_attention was called with beam_pool
+    assert not stale_pool.unshared_key.count_nonzero()
+    assert not stale_pool.unshared_value.count_nonzero()
     assert "beam_pool" in calls
     assert calls["beam_pool"] is pool
     # Verify pool KV was written by cache_unshared_kv

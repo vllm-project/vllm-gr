@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unav
 @pytest.mark.parametrize("n", [2, 3])
 def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, n):
     buffers = GRInputBuffers(width, 96, 16, "cuda")
-    binding = SimpleNamespace(session_id="session-0")
+    binding = SimpleNamespace(session_id="session-0", native_request_id="session-0")
 
     def forbidden(*args, **kwargs):
         raise AssertionError(
@@ -48,6 +48,7 @@ def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, 
         m = replace(
             metadata(step + 1, n=n),
             num_prompt_tokens=17 + step,
+            num_prompt_tokens_by_request=(17 + step,),
             beam_params=msgspec.structs.replace(metadata(n=n).beam_params, beam_width=width),
         )
         with monkeypatch.context() as patch:
@@ -112,7 +113,7 @@ def test_missing_cpu_mirrors_fail_without_device_fallback(mirror, monkeypatch):
 
 def test_staging_slot_waits_for_its_own_h2d_before_host_write():
     buffers = GRInputBuffers(4, 64, 16, "cuda")
-    binding = SimpleNamespace(session_id="session-0")
+    binding = SimpleNamespace(session_id="session-0", native_request_id="session-0")
     first = buffers.prepare_cpu(metadata(1), binding, block_ids=[[1]], slot=0)
     buffers.upload(first)
     torch.accelerator.synchronize()
@@ -280,7 +281,11 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
 
     monkeypatch.setattr(GPUBeamStageRunner, "_forward", unexpected_forward)
     for prompt, budget in [(7, 1), (21, 3), (11, 1)]:
-        first = replace(metadata(n=budget), num_prompt_tokens=prompt)
+        first = replace(
+            metadata(n=budget),
+            num_prompt_tokens=prompt,
+            num_prompt_tokens_by_request=(prompt,),
+        )
         assert get_stage_runner(worker, dispatch(first)) is owner
         worker.requests["session-0"] = SimpleNamespace(block_ids=[[1, 2]])
 
@@ -293,7 +298,11 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         for step in range(budget):
             if step == 2:
                 receipts[0].get_output()
-            m = replace(metadata(step, n=budget), num_prompt_tokens=prompt)
+            m = replace(
+                metadata(step, n=budget),
+                num_prompt_tokens=prompt,
+                num_prompt_tokens_by_request=(prompt,),
+            )
             owner.execute(dispatch(m), prefill)
             if step == 0:
                 final = owner.final_output

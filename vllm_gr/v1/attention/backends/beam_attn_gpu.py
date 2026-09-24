@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from typing import Any, NoReturn, cast
 
 import torch
@@ -39,6 +40,63 @@ else:
     reshape_and_cache_flash = _flash_attn_varlen_unavailable
     merge_attn_states = _flash_attn_varlen_unavailable
     flash_attn_supports_sinks = _flash_attn_varlen_unavailable
+
+
+class GPUBeamAttentionBatch:
+    """Zero-copy request-major attention view over contiguous Beam slots."""
+
+    def __init__(self, sessions: tuple[Any, ...]) -> None:
+        if not sessions:
+            raise ValueError("GPU Beam attention batch must not be empty")
+        first = sessions[0]
+        self.sessions = sessions
+        self.context = first.context
+        self.slot = 0
+        self.batch_size = len(sessions)
+        self.request_width = first.beam_width
+        self.beam_width = self.batch_size * self.request_width
+        self.session_id = first.session_id
+        if tuple(session.slot for session in sessions) != tuple(range(self.batch_size)):
+            raise RuntimeError("GPU Beam batch requires contiguous ordered KV slots")
+        if any(session.context is not self.context for session in sessions):
+            raise RuntimeError("GPU Beam batch sessions must share one context")
+        geometry = (first.beam_width, first.decode_step)
+        if any((session.beam_width, session.decode_step) != geometry for session in sessions):
+            raise RuntimeError("GPU Beam batch members changed width or Decode step")
+        if self.request_width != self.context.max_beams:
+            raise RuntimeError("GPU Beam batch requires the configured exact Beam width")
+
+        self.pools = []
+        for source in self.context.pools:
+            pool = copy(source)
+            storage_rows = self.batch_size * self.request_width
+            pool.max_batch = 1
+            pool.max_beams = storage_rows
+            pool.unshared_key = source.unshared_key[: self.batch_size].reshape(
+                1, storage_rows, *source.unshared_key.shape[2:]
+            )
+            pool.unshared_value = source.unshared_value[: self.batch_size].reshape(
+                1, storage_rows, *source.unshared_value.shape[2:]
+            )
+            self.pools.append(pool)
+
+    @property
+    def is_active(self) -> bool:
+        return all(session.is_active for session in self.sessions)
+
+    @property
+    def decode_step(self) -> int:
+        return int(self.sessions[0].decode_step)
+
+    @property
+    def suffix_k_buf(self) -> torch.Tensor:
+        rows = self.beam_width * self.context.max_decode_steps
+        return self.context.suffix_k_buf[:rows]
+
+    @property
+    def suffix_v_buf(self) -> torch.Tensor:
+        rows = self.beam_width * self.context.max_decode_steps
+        return self.context.suffix_v_buf[:rows]
 
 
 def _num_splits(default: int) -> int:

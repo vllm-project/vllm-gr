@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared Beam Forward capture and replay for both execution interfaces."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -22,6 +25,23 @@ class BeamDecodeCaptureUnsupported(RuntimeError):
     """Capture was refused; startup must still verify cleanup and device health."""
 
 
+@dataclass(frozen=True, slots=True)
+class BeamDecodeGraphSignature:
+    batch_size: int
+    beam_width: int
+    num_model_rows: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.batch_size) is not int
+            or type(self.beam_width) is not int
+            or self.batch_size < 1
+            or self.beam_width < 1
+            or self.num_model_rows != self.batch_size * self.beam_width
+        ):
+            raise ValueError("invalid Beam Decode graph signature")
+
+
 class BeamDecodeGraph:
     """One engine's fixed-width graph, with a Beam-only native graph registry.
 
@@ -32,11 +52,12 @@ class BeamDecodeGraph:
 
     def __init__(self, worker: Any, width: int) -> None:
         self.worker = worker
-        self.width = width
+        self.signature = BeamDecodeGraphSignature(1, width, width)
         self.descriptor = BatchDescriptor(num_tokens=width, uniform=True)
         self.context: Any = None
         self.capture_inputs: Any = None
         self.capture_attention: Any = None
+        self._bindings: dict[BeamDecodeGraphSignature, tuple[Any, Any, Any]] = {}
         self.capturing = False
         self.original_model = worker.model
         runnable = worker.model
@@ -53,6 +74,12 @@ class BeamDecodeGraph:
     def ready(self) -> bool:
         entry = self.wrapper.concrete_cudagraph_entries.get(self.descriptor)
         return entry is not None and entry.cudagraph is not None
+
+    def select(self, batch_size: int, beam_width: int) -> BeamDecodeGraph:
+        signature = BeamDecodeGraphSignature(batch_size, beam_width, batch_size * beam_width)
+        self.signature = signature
+        self.descriptor = BatchDescriptor(num_tokens=signature.num_model_rows, uniform=True)
+        return self
 
     def _check_context(self) -> None:
         if self.context is not self.worker._beam_context:
@@ -79,6 +106,7 @@ class BeamDecodeGraph:
     def clear(self) -> None:
         """Discard graph entries and captured views after an aborted startup."""
         self.wrapper.clear_graphs()
+        self._bindings.clear()
         self.capture_inputs = self.capture_attention = None
         self.worker._beam_graph_keys = set()
 
@@ -125,15 +153,32 @@ class BeamDecodeGraph:
             stream.synchronize()
             if not self.ready:
                 raise RuntimeError("Beam Forward did not register its startup CUDA graph")
-            self.worker._beam_graph_keys = {self.width}
+            self._bindings[self.signature] = (
+                self.context,
+                self.capture_inputs,
+                self.capture_attention,
+            )
+            self.worker._beam_graph_keys = {
+                signature.num_model_rows for signature in self._bindings
+            }
         except Exception:
-            self.clear()
+            if self._bindings:
+                # A failed capture of another batch size must not evict graphs
+                # already bound to a successfully captured signature.
+                self.wrapper.concrete_cudagraph_entries.pop(self.descriptor, None)
+                self.capture_inputs = self.capture_attention = None
+            else:
+                self.clear()
             raise
         finally:
             self.capturing = False
             set_cudagraph_capturing_enabled(False)
 
     def replay(self) -> torch.Tensor:
+        binding = self._bindings.get(self.signature)
+        if binding is None:
+            raise RuntimeError("Beam graph miss for the exact batch signature")
+        self.context, self.capture_inputs, self.capture_attention = binding
         self._check_context()
         if not self.ready:
             raise RuntimeError("Beam graph replay requires successful startup capture")
@@ -146,6 +191,8 @@ class BeamDecodeGraph:
         context = get_forward_context()
         if context.batch_descriptor != self.descriptor:
             raise RuntimeError("Beam FULL dispatch does not match the startup graph width")
+        if context.batch_descriptor.num_tokens != self.signature.num_model_rows:
+            raise RuntimeError("Beam FULL dispatch changed physical row geometry")
         self._check_context()
         if self.capturing:
             self.capture_inputs = (args, kwargs)
@@ -188,11 +235,17 @@ class _BeamDecodeModel(CUDAGraphWrapper):
         return self.graph.original_model(*args, **kwargs)
 
 
-def get_beam_decode_graph(worker: Any) -> BeamDecodeGraph:
+def get_beam_decode_graph(
+    worker: Any,
+    *,
+    batch_size: int = 1,
+    beam_width: int | None = None,
+) -> BeamDecodeGraph:
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
     graph = getattr(worker, "_beam_decode_graph", None)
     if graph is None:
         graph = BeamDecodeGraph(worker, int(_get_gr_config(worker).beam_max_width))
         worker._beam_decode_graph = graph
-    return graph
+    width = int(_get_gr_config(worker).beam_max_width) if beam_width is None else beam_width
+    return graph.select(batch_size, width)

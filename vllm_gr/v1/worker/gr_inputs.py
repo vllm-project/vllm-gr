@@ -10,6 +10,7 @@ import torch
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadataBuilder,
 )
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.engine.beam_search_v1 import GRStageMetadata
 
 ERROR_DISPATCH_STATE = 6
@@ -21,6 +22,7 @@ class PreparedGRInputs:
     binding: Any
     staging_slot: int
     layout: dict[str, list[int]]
+    batch_view: BeamBatchExecutionView | None = None
 
     @property
     def identity(self) -> tuple[str, int, int]:
@@ -37,20 +39,31 @@ class GRInputBuffers:
     """
 
     def __init__(
-        self, width: int, max_model_len: int, block_size: int, device: torch.device | str
+        self,
+        width: int,
+        max_model_len: int,
+        block_size: int,
+        device: torch.device | str,
+        *,
+        max_batch: int = 1,
     ) -> None:
-        self.width, self.max_model_len, self.block_size = width, max_model_len, block_size
+        if type(max_batch) is not int or max_batch < 1:
+            raise ValueError("max_batch must be a positive integer")
+        self.width = width
+        self.max_batch = max_batch
+        self.max_model_len, self.block_size = max_model_len, block_size
         self.max_blocks = (max_model_len + block_size - 1) // block_size
+        rows = max_batch * width
         sizes = {
-            "positions": width,
-            "query": 2,
-            "sequence": 1,
-            "prefix_lengths": 1,
-            "blocks": self.max_blocks,
-            "logits": width,
-            "suffix_query": width + 1,
-            "suffix_lengths": width,
-            "suffix_offsets": width + 1,
+            "positions": rows,
+            "query": max_batch + 1,
+            "sequence": max_batch,
+            "prefix_lengths": max_batch,
+            "blocks": max_batch * self.max_blocks,
+            "logits": rows,
+            "suffix_query": rows + 1,
+            "suffix_lengths": rows,
+            "suffix_offsets": rows + 1,
         }
         self.host = torch.empty((2, sum(sizes.values())), dtype=torch.int32, pin_memory=True)
         self.device = torch.empty(sum(sizes.values()), dtype=torch.int32, device=device)
@@ -66,44 +79,75 @@ class GRInputBuffers:
     def prepare_cpu(
         self, metadata: GRStageMetadata, binding: Any, *, block_ids: list[list[int]], slot: int
     ) -> PreparedGRInputs:
-        if metadata.decode_step is None or metadata.beam_params.beam_width != self.width:
+        return self.prepare_cpu_batch(
+            metadata,
+            (binding,),
+            block_ids_by_request=(block_ids,),
+            slot=slot,
+        )
+
+    def prepare_cpu_batch(
+        self,
+        metadata: GRStageMetadata,
+        bindings: tuple[Any, ...],
+        *,
+        block_ids_by_request: tuple[list[list[int]], ...],
+        slot: int,
+    ) -> PreparedGRInputs:
+        view = BeamBatchExecutionView.from_stage_metadata(metadata)
+        if view.kind != "decode" or view.beam_width != self.width:
             raise ValueError(
                 "Asynchronous scheduling input preparation requires fixed-width Decode metadata"
             )
-        if metadata.session_id != binding.session_id or slot not in (0, 1):
+        if (
+            view.batch_size > self.max_batch
+            or len(bindings) != view.batch_size
+            or len(block_ids_by_request) != view.batch_size
+            or tuple(binding.native_request_id for binding in bindings) != view.request_ids
+            or any(binding.session_id != view.session_id for binding in bindings)
+            or slot not in (0, 1)
+        ):
             raise ValueError("Asynchronous scheduling input binding or staging slot mismatch")
-        prompt, step = metadata.num_prompt_tokens, metadata.decode_step
+        step = view.decode_step
         if (
             type(step) is not int
             or step < 0
             or step > 1
-            or prompt + step >= self.max_model_len
-            or not isinstance(block_ids, (tuple, list))
-            or any(not isinstance(group, (tuple, list)) for group in block_ids)
-            or any(type(block) is not int or block < 0 for group in block_ids for block in group)
+            or any(
+                prompt + step >= self.max_model_len for prompt in view.num_prompt_tokens_by_request
+            )
         ):
             raise ValueError(
                 "Asynchronous scheduling inputs require supported CPU geometry and Host block IDs"
             )
-        required = (prompt + self.block_size - 1) // self.block_size
-        if len(block_ids) != 1 or len(block_ids[0]) < required:
-            raise ValueError("Asynchronous scheduling request is missing prompt KV block IDs")
-        layout = BeamAttentionMetadataBuilder.build_async_layout(
+        prompt_blocks: list[list[int]] = []
+        for prompt, block_ids in zip(view.num_prompt_tokens_by_request, block_ids_by_request):
+            if (
+                not isinstance(block_ids, (tuple, list))
+                or len(block_ids) != 1
+                or not isinstance(block_ids[0], (tuple, list))
+                or any(type(block) is not int or block < 0 for block in block_ids[0])
+            ):
+                raise ValueError("Asynchronous scheduling inputs require Host block IDs")
+            required = (prompt + self.block_size - 1) // self.block_size
+            if len(block_ids[0]) < required:
+                raise ValueError("Asynchronous scheduling request is missing prompt KV block IDs")
+            prompt_blocks.append(list(block_ids[0][:required]))
+        layout = BeamAttentionMetadataBuilder.build_async_batch_layout(
             width=self.width,
-            prompt_len=prompt,
+            prompt_lengths=list(view.num_prompt_tokens_by_request),
             decode_step=step,
-            block_ids=block_ids[0][:required],
+            block_ids_by_request=prompt_blocks,
             max_blocks=self.max_blocks,
-            query_start_loc_cpu=[0, self.width],
-            seq_lens_cpu=[prompt + step + 1],
         )
         # Only the selected slot's previous H2D can block this CPU write.
         if self.uploaded[slot] and not self.h2d_done[slot].query():
             self.h2d_done[slot].synchronize()
         host = self.host[slot].numpy()
         for name, values in layout.items():
-            host[self.slices[name]] = values
-        prepared = PreparedGRInputs(metadata, binding, slot, layout)
+            span = self.slices[name]
+            host[span.start : span.start + len(values)] = values
+        prepared = PreparedGRInputs(metadata, bindings, slot, layout, view)
         self.identities[slot] = prepared.identity
         return prepared
 
@@ -115,41 +159,57 @@ class GRInputBuffers:
         self.h2d_done[slot].record(torch.cuda.current_stream(self.device.device))
         self.uploaded[slot] = True
         # Fresh views are intentional: no layout/view cache participates.
-        return {name: self.device[span] for name, span in self.slices.items()}
+        return {
+            name: self.device[span.start : span.start + len(prepared.layout[name])]
+            for name, span in self.slices.items()
+        }
 
 
 def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
     """Read the predecessor's device state on the compute stream, without D2H."""
-    m, b = prepared.metadata, prepared.binding
-    if b != owner.binding or m.session_id != owner.binding.session_id:
+    m = prepared.metadata
+    bindings = prepared.binding if isinstance(prepared.binding, tuple) else (prepared.binding,)
+    owner_bindings = getattr(owner, "bindings", (getattr(owner, "binding", None),))
+    if bindings != owner_bindings or any(b.session_id != m.session_id for b in bindings):
         raise ValueError(
             "Asynchronous scheduling prepared inputs belong to a different execution owner"
         )
     state = owner.beam.state
-    row = slice(b.state_row, b.state_row + 1)
+    rows = owner.state_rows
     step = m.decode_step
     if step is None:
         raise ValueError("Asynchronous scheduling device binding requires Decode metadata")
-    initialized, finished = state.is_initialized[row], state.is_finished[row]
-    error = state.error_code[row]
-    count, actual_step = state.num_generated_tokens[row], state.num_decode_steps[row]
+    initialized, finished = state.is_initialized[rows], state.is_finished[rows]
+    error = state.error_code[rows]
+    count, actual_step = state.num_generated_tokens[rows], state.num_decode_steps[rows]
     mismatch = (
         ~finished & (error == 0) & (~initialized | (actual_step != step) | (count != step + 1))
     )
-    error.copy_(torch.where(mismatch, ERROR_DISPATCH_STATE, error))
-    running = initialized & ~finished & (error == 0)
-    mask = running & state.active_mask[b.state_row]
-    owner.execution_mask.copy_(mask)
-    owner.input_ids.copy_(torch.where(mask, state.input_ids[b.state_row], 0))
-    owner.positions.copy_(torch.where(mask, owner.device_positions, 0))
-    owner.beam.session.context.decode_step_buf.copy_(torch.where(running, step, -1))
+    dispatch_error = torch.where(mismatch, ERROR_DISPATCH_STATE, error)
+    state.error_code[rows] = dispatch_error
+    running = initialized & ~finished & (dispatch_error == 0)
+    mask = running[:, None] & state.active_mask[rows]
+    flat_mask = mask.reshape(-1)
+    owner.execution_mask.copy_(flat_mask)
+    owner.input_ids.copy_(torch.where(flat_mask, state.input_ids[rows].reshape(-1), 0))
+    owner.positions.copy_(torch.where(flat_mask, owner.device_positions, 0))
+    owner.beam.session.context.decode_step_buf.copy_(
+        torch.where(running.all(), step, -1).reshape(1)
+    )
     owner.prefixes.fill_(-1)
     columns = min(step + 1, owner.prefixes.shape[1], state.sequence.shape[2])
     owner.prefixes[:, :columns].copy_(
-        torch.where(mask[:, None], state.sequence[b.state_row, :, :columns], -1)
+        torch.where(
+            mask.reshape(-1, 1),
+            state.sequence[rows, :, :columns].reshape(-1, columns),
+            -1,
+        )
     )
-    length = torch.where(running, step + 1, 1)
-    owner.metadata.suffix_seqlens_kv_device.copy_(length.expand(state.beam_width))
-    # The prebuilt query offsets also equal [0, 1, ..., W].
-    offsets = owner.metadata.suffix_cu_seqlens_q_device
-    owner.metadata.suffix_cu_seqlens_k_device.copy_(offsets * length)
+    lengths = torch.where(running, step + 1, 1).repeat_interleave(state.beam_width)
+    owner.metadata.suffix_seqlens_kv_device.copy_(lengths)
+    owner.metadata.suffix_cu_seqlens_k_device[0].zero_()
+    torch.cumsum(
+        lengths,
+        dim=0,
+        out=owner.metadata.suffix_cu_seqlens_k_device[1:],
+    )

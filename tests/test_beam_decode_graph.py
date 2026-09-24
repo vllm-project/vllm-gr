@@ -37,6 +37,8 @@ def test_only_beam_full_uses_beam_registry(
 def test_context_replacement_fails_before_graph_launch() -> None:
     graph = object.__new__(shared.BeamDecodeGraph)
     graph.context = object()
+    graph.signature = shared.BeamDecodeGraphSignature(1, 1, 1)
+    graph._bindings = {graph.signature: (graph.context, None, None)}
     graph.worker = SimpleNamespace(_beam_context=object())
     with pytest.raises(RuntimeError, match="context changed"):
         graph.replay()
@@ -88,6 +90,10 @@ def test_install_conflicts_with_foreign_model_owner() -> None:
 def capture_graph(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Mock, Mock]:
     graph = object.__new__(shared.BeamDecodeGraph)
     graph.width = 4
+    graph.signature = shared.BeamDecodeGraphSignature(1, 4, 4)
+    graph._bindings = {}
+    graph.capture_inputs = None
+    graph.capture_attention = None
     graph.descriptor = object()
     graph.original_model = object()
     graph.worker = SimpleNamespace(

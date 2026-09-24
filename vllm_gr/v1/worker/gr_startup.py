@@ -87,6 +87,8 @@ def capture_async_forward(
         beam_params=BeamBatchParams(width, 1, 0.0, (), True),
         output_options=BeamOutputOptions(width, True, True, True),
         num_prompt_tokens=1,
+        request_ids=(name,),
+        num_prompt_tokens_by_request=(1,),
     )
     scheduled = SimpleNamespace(num_scheduled_tokens={name: 1})
     setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {name: m})
