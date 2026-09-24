@@ -173,6 +173,7 @@ def test_gpu_model_forward_intercepts_pure_prefill(
             return output_buf
 
     monkeypatch.setattr(gpu_patch_mod, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(gpu_patch_mod, "SUPPORTED_NUM_REQS", [1, 2])
     monkeypatch.setattr(
         gpu_patch_mod,
         "is_prefill_phase_batch",

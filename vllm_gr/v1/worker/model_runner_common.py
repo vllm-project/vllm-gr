@@ -20,6 +20,8 @@ logger = init_logger(__name__)
 _WORKER_EXECUTE_PATCH_MARKER = "_vllm_gr_beam_execute_patch"
 _WORKER_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_patch"
 _WORKER_BOOKKEEPING_PATCH_MARKER = "_vllm_gr_beam_bookkeeping_patch"
+_WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
+_WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
 
 
 def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -127,6 +129,67 @@ def _process_beam_decode_request(
     return valid_rows_for_req, logits_row_cnt, curr_offset, active_beam_ids
 
 
+def _prune_beam_candidates_gpu(
+    parent_cum_lps: list[float],
+    req_lps: torch.Tensor,
+    req_lp_ids: torch.Tensor,
+    target_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prunes W * K candidates down to top-W on GPU using parent cumulative scores.
+
+    Returns:
+        (top_local_lps, top_token_ids, top_parent_indices) each of shape [1, target_topk].
+    """
+    W, actual_K = req_lps.shape
+    parent_cum = torch.tensor(
+        parent_cum_lps,
+        dtype=req_lps.dtype,
+        device=req_lps.device,
+    ).unsqueeze(1)
+
+    if actual_K > 1:
+        sampled_id = req_lp_ids[:, 0:1]
+        topk_ids = req_lp_ids[:, 1:]
+        topk_lps = req_lps[:, 1:]
+        matches = (topk_ids == sampled_id).any(dim=1)
+        if matches.all():
+            cand_ids = topk_ids
+            cand_lps = topk_lps
+        else:
+            cand_ids = topk_ids.clone()
+            cand_lps = topk_lps.clone()
+            no_match = ~matches
+            cand_ids[no_match] = req_lp_ids[no_match, : topk_ids.shape[1]]
+            cand_lps[no_match] = req_lps[no_match, : topk_lps.shape[1]]
+    else:
+        cand_ids = req_lp_ids
+        cand_lps = req_lps
+
+    K_cand = cand_lps.shape[1]
+    cum_scores = parent_cum + cand_lps
+
+    flat_scores = cum_scores.reshape(-1)
+    flat_ids = cand_ids.reshape(-1)
+    flat_lps = cand_lps.reshape(-1)
+
+    k_to_select = min(target_topk, flat_scores.numel())
+    _, best_flat_idx = torch.topk(flat_scores, k=k_to_select, largest=True, sorted=True)
+
+    best_parent_idx = best_flat_idx // K_cand
+    best_token_ids = flat_ids[best_flat_idx].unsqueeze(0)
+    best_local_lps = flat_lps[best_flat_idx].unsqueeze(0)
+    # Encode as a negative value: FlatLogprobs.ranks doubles as the per-token
+    # logprob display rank on the non-pruned path (always >= 0, see
+    # sampler.py's batched_count_greater_than), and the serving side cannot
+    # otherwise tell the two encodings apart from shape alone in a mixed
+    # batch. -(idx + 1) is unambiguous and round-trips exactly (idx in
+    # [0, W) -> value in [-W, -1]); the serving side recovers idx via
+    # -(value + 1).
+    best_parents = (-(best_parent_idx.unsqueeze(0) + 1)).to(torch.int32)
+
+    return best_local_lps, best_token_ids, best_parents
+
+
 def _remux_logprobs_tensors(
     request_row_configs: List[Tuple[Any, int, int]],
     max_chained_dim: int,
@@ -135,13 +198,15 @@ def _remux_logprobs_tensors(
     orig_lp_ids: Optional[torch.Tensor],
     orig_ranks: Optional[torch.Tensor],
     st_ids: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    beam_data: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], bool]:
     """Merges and aligns sampler tensor slices sequentially across runtime waves."""
     if max_chained_dim == 0 or orig_lps.numel() == 0:
-        return st_ids, orig_lps, orig_lp_ids, orig_ranks
+        return st_ids, orig_lps, orig_lp_ids, orig_ranks, False
 
     new_st_ids, new_lps, new_lp_ids, new_ranks = [], [], [], []
     gpu_row_cursor = 0
+    is_any_pruned = False
 
     for req_id, _, W_logits, *_ in request_row_configs:
         # CASE A: INTERMEDIATE CHUNKED PREFILL (No output rows generated)
@@ -171,9 +236,41 @@ def _remux_logprobs_tensors(
                 )
             continue
 
-        # CASE B: ACTIVE SAMPLING PATH (Captures the full multi-beam footprint)
+        # CASE B: ACTIVE SAMPLING PATH
         new_st_ids.append(st_ids[gpu_row_cursor : gpu_row_cursor + 1, :])
 
+        mdata = beam_data.get(req_id) if (req_id is not None and beam_data) else None
+        parent_cum_lps = mdata.get("parent_cum_logprobs") if mdata else None
+        target_topk = mdata.get("target_beam_width", W_logits) if mdata else W_logits
+        can_prune = (
+            parent_cum_lps is not None
+            and len(parent_cum_lps) == W_logits
+            and W_logits > 0
+            and orig_lp_ids is not None
+        )
+
+        if can_prune:
+            is_any_pruned = True
+            req_lps_raw = orig_lps[gpu_row_cursor : gpu_row_cursor + W_logits]
+            req_lp_ids_raw = orig_lp_ids[gpu_row_cursor : gpu_row_cursor + W_logits]
+            pruned_lps, pruned_lp_ids, pruned_ranks = _prune_beam_candidates_gpu(
+                parent_cum_lps,
+                req_lps_raw,
+                req_lp_ids_raw,
+                target_topk,
+            )
+            if pruned_lps.shape[1] < max_chained_dim:
+                pad_len = max_chained_dim - pruned_lps.shape[1]
+                pruned_lps = torch.nn.functional.pad(pruned_lps, (0, pad_len), value=float("-inf"))
+                pruned_lp_ids = torch.nn.functional.pad(pruned_lp_ids, (0, pad_len), value=0)
+                pruned_ranks = torch.nn.functional.pad(pruned_ranks, (0, pad_len), value=0)
+            new_lps.append(pruned_lps)
+            new_lp_ids.append(pruned_lp_ids)
+            new_ranks.append(pruned_ranks)
+            gpu_row_cursor += W_logits
+            continue
+
+        # Standard unpruned multi-beam remuxing
         req_lps = orig_lps[gpu_row_cursor : gpu_row_cursor + W_logits, :target_K].reshape(
             1, W_logits * target_K
         )
@@ -207,7 +304,8 @@ def _remux_logprobs_tensors(
         torch.cat(new_st_ids, dim=0),
         torch.cat(new_lps, dim=0),
         torch.cat(new_lp_ids, dim=0) if orig_lp_ids is not None else None,
-        torch.cat(new_ranks, dim=0) if orig_ranks is not None else None,
+        torch.cat(new_ranks, dim=0) if new_ranks else None,
+        is_any_pruned,
     )
 
 
@@ -402,7 +500,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
 
         mdata = beam_data.get(req_id)
         if mdata and mdata.get("is_beam_decode", False):
-            beams_count, beams_count_with_logits, next_offset, active_beam_ids = (
+            beams_count, beams_count_with_logits, _next_offset, active_beam_ids = (
                 _process_beam_decode_request(
                     mdata,
                     seq_len,
@@ -477,112 +575,128 @@ def _beam_collapse_bookkeeping(
 
             max_chained_dim = 0
             for req_id, _, W, *_ in request_row_configs:
-                if req_id is not None and req_id in beam_data:
-                    m_width = beam_data[req_id].get(
-                        "log_probs_num", beam_data[req_id].get("beam_width", 1)
-                    )
+                mdata = beam_data.get(req_id) if (req_id is not None and beam_data) else None
+                parent_cum_lps = mdata.get("parent_cum_logprobs") if mdata else None
+                can_prune = parent_cum_lps is not None and len(parent_cum_lps) == W and W > 0
+                if can_prune:
+                    needed_dim = mdata.get("target_beam_width", W) if mdata else W
+                elif mdata:
+                    m_width = mdata.get("log_probs_num", mdata.get("beam_width", 1))
                     needed_dim = m_width * actual_K
                 else:
                     needed_dim = W * actual_K
-                if needed_dim > max_chained_dim:
-                    max_chained_dim = needed_dim
+                max_chained_dim = max(max_chained_dim, needed_dim)
 
-            final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
-                request_row_configs,
-                max_chained_dim,
-                actual_K,
-                orig_lps,
-                orig_lp_ids,
-                orig_ranks,
-                st_ids,
+            final_st_ids, final_lps, final_lp_ids, final_ranks, is_any_pruned = (
+                _remux_logprobs_tensors(
+                    request_row_configs,
+                    max_chained_dim,
+                    actual_K,
+                    orig_lps,
+                    orig_lp_ids,
+                    orig_ranks,
+                    st_ids,
+                    beam_data=beam_data,
+                )
             )
             if not hasattr(runner, "_beam_logprobs_cache"):
                 runner._beam_logprobs_cache = {}
 
             req_id_to_config = {r[0]: (r[2], r[3]) for r in request_row_configs if r[0] is not None}
 
-            for idx, req_id in enumerate(collapsed_req_ids_copy):
-                mdata = beam_data.get(req_id)
-                if mdata and mdata.get("is_beam_decode", False):
-                    logits_num, active_beams = req_id_to_config.get(req_id, (0, []))
-                    log_probs_num = mdata.get("log_probs_num", mdata.get("beam_width", 1))
+            if not is_any_pruned:
+                for idx, req_id in enumerate(collapsed_req_ids_copy):
+                    mdata = beam_data.get(req_id)
+                    if mdata and mdata.get("is_beam_decode", False):
+                        logits_num, active_beams = req_id_to_config.get(req_id, (0, []))
+                        log_probs_num = mdata.get("log_probs_num", mdata.get("beam_width", 1))
 
-                    if logits_num > 0:
-                        # FAST-PATH: This chunk contains ALL beams directly.
-                        if logits_num == log_probs_num:
-                            if req_id in runner._beam_logprobs_cache:
+                        if logits_num > 0:
+                            # FAST-PATH: This chunk contains ALL beams directly.
+                            if logits_num == log_probs_num:
+                                if req_id in runner._beam_logprobs_cache:
+                                    del runner._beam_logprobs_cache[req_id]
+                                continue
+
+                            # SLOW-PATH: Handle split chunked prefills across steps.
+                            actual_lps = final_lps[idx, : logits_num * actual_K].view(
+                                logits_num, actual_K
+                            )
+                            actual_lp_ids = (
+                                final_lp_ids[idx, : logits_num * actual_K].view(
+                                    logits_num, actual_K
+                                )
+                                if final_lp_ids is not None
+                                else None
+                            )
+                            actual_ranks = (
+                                final_ranks[idx, :logits_num] if final_ranks is not None else None
+                            )
+
+                            if req_id not in runner._beam_logprobs_cache:
+                                runner._beam_logprobs_cache[req_id] = {
+                                    "lps": torch.full(
+                                        (log_probs_num, actual_K),
+                                        float("-inf"),
+                                        device=orig_lps.device,
+                                        dtype=orig_lps.dtype,
+                                    ),
+                                    "lp_ids": (
+                                        torch.zeros(
+                                            (log_probs_num, actual_K),
+                                            dtype=(
+                                                orig_lp_ids.tensor.dtype
+                                                if hasattr(orig_lp_ids, "tensor")
+                                                else torch.long
+                                            ),
+                                            device=orig_lps.device,
+                                        )
+                                        if orig_lp_ids is not None
+                                        else None
+                                    ),
+                                    "ranks": (
+                                        torch.zeros(
+                                            log_probs_num, dtype=torch.long, device=orig_lps.device
+                                        )
+                                        if orig_ranks is not None
+                                        else None
+                                    ),
+                                    "completed_beams": set(),
+                                }
+
+                            cache_entry = runner._beam_logprobs_cache[req_id]
+
+                            for local_row_idx, physical_beam_id in enumerate(active_beams):
+                                if physical_beam_id not in cache_entry["completed_beams"]:
+                                    cache_entry["lps"][physical_beam_id] = actual_lps[local_row_idx]
+                                    if actual_lp_ids is not None:
+                                        cache_entry["lp_ids"][physical_beam_id] = actual_lp_ids[
+                                            local_row_idx
+                                        ]
+                                    if actual_ranks is not None:
+                                        cache_entry["ranks"][physical_beam_id] = actual_ranks[
+                                            local_row_idx
+                                        ]
+                                    cache_entry["completed_beams"].add(physical_beam_id)
+
+                            if len(cache_entry["completed_beams"]) >= log_probs_num:
+                                # The remuxed row is padded to the batch-wide
+                                # max_chained_dim, which may exceed this request's
+                                # own log_probs_num * actual_K when requests with
+                                # different beam widths are batched together.
+                                # Copy only the request's own footprint; the tail
+                                # stays as the -inf/zero padding already written
+                                # by _remux_logprobs_tensors.
+                                req_elems = log_probs_num * actual_K
+                                final_lps[idx, :req_elems].copy_(cache_entry["lps"].view(-1))
+                                if final_lp_ids is not None:
+                                    final_lp_ids[idx, :req_elems].copy_(
+                                        cache_entry["lp_ids"].view(-1)
+                                    )
+                                if final_ranks is not None:
+                                    final_ranks[idx, :log_probs_num].copy_(cache_entry["ranks"])
+
                                 del runner._beam_logprobs_cache[req_id]
-                            continue
-
-                        # SLOW-PATH: Handle split chunked prefills across steps.
-                        actual_lps = final_lps[idx, : logits_num * actual_K].view(
-                            logits_num, actual_K
-                        )
-                        actual_lp_ids = (
-                            final_lp_ids[idx, : logits_num * actual_K].view(logits_num, actual_K)
-                            if final_lp_ids is not None
-                            else None
-                        )
-                        actual_ranks = (
-                            final_ranks[idx, :logits_num] if final_ranks is not None else None
-                        )
-
-                        if req_id not in runner._beam_logprobs_cache:
-                            runner._beam_logprobs_cache[req_id] = {
-                                "lps": torch.full(
-                                    (log_probs_num, actual_K),
-                                    float("-inf"),
-                                    device=orig_lps.device,
-                                    dtype=orig_lps.dtype,
-                                ),
-                                "lp_ids": torch.zeros(
-                                    (log_probs_num, actual_K),
-                                    dtype=orig_lp_ids.tensor.dtype
-                                    if hasattr(orig_lp_ids, "tensor")
-                                    else torch.long,
-                                    device=orig_lps.device,
-                                )
-                                if orig_lp_ids is not None
-                                else None,
-                                "ranks": torch.zeros(
-                                    log_probs_num, dtype=torch.long, device=orig_lps.device
-                                )
-                                if orig_ranks is not None
-                                else None,
-                                "completed_beams": set(),
-                            }
-
-                        cache_entry = runner._beam_logprobs_cache[req_id]
-
-                        for local_row_idx, physical_beam_id in enumerate(active_beams):
-                            if physical_beam_id not in cache_entry["completed_beams"]:
-                                cache_entry["lps"][physical_beam_id] = actual_lps[local_row_idx]
-                                if actual_lp_ids is not None:
-                                    cache_entry["lp_ids"][physical_beam_id] = actual_lp_ids[
-                                        local_row_idx
-                                    ]
-                                if actual_ranks is not None:
-                                    cache_entry["ranks"][physical_beam_id] = actual_ranks[
-                                        local_row_idx
-                                    ]
-                                cache_entry["completed_beams"].add(physical_beam_id)
-
-                        if len(cache_entry["completed_beams"]) >= log_probs_num:
-                            # The remuxed row is padded to the batch-wide
-                            # max_chained_dim, which may exceed this request's
-                            # own log_probs_num * actual_K when requests with
-                            # different beam widths are batched together.
-                            # Copy only the request's own footprint; the tail
-                            # stays as the -inf/zero padding already written
-                            # by _remux_logprobs_tensors.
-                            req_elems = log_probs_num * actual_K
-                            final_lps[idx, :req_elems].copy_(cache_entry["lps"].view(-1))
-                            if final_lp_ids is not None:
-                                final_lp_ids[idx, :req_elems].copy_(cache_entry["lp_ids"].view(-1))
-                            if final_ranks is not None:
-                                final_ranks[idx, :log_probs_num].copy_(cache_entry["ranks"])
-
-                            del runner._beam_logprobs_cache[req_id]
 
             try:
                 st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
@@ -590,16 +704,33 @@ def _beam_collapse_bookkeeping(
 
                 if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
                     lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
-                if orig_ranks is not None and final_ranks is not None:
-                    clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
-                    lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
-                        clean_ranks_slice
-                    )
+                if final_ranks is not None:
+                    if is_any_pruned:
+                        lp_tensors.selected_token_ranks.resize_(final_ranks.shape).copy_(
+                            final_ranks
+                        )
+                    elif orig_ranks is not None:
+                        clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
+                        lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(
+                            clean_ranks_slice
+                        )
             except Exception as e:
                 logger.critical("Inplace copy failed during beam collapse: %s", e)
                 raise RuntimeError("Inplace copy failed during beam collapse") from e
 
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
+
+
+def _get_gr_config(runner) -> Any:
+    """Return the worker's GRConfig, cached on the runner (frozen dataclass)."""
+    cached = getattr(runner, "_vllm_gr_config", None)
+    if cached is not None:
+        return cached
+    from vllm_gr.config import GRConfig
+
+    cfg = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+    runner._vllm_gr_config = cfg
+    return cfg
 
 
 def make_patched_execute_model(_orig_execute_model):

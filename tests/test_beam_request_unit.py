@@ -189,6 +189,7 @@ def _make_engine_self(
         output_queue=queue.SimpleQueue(),
         aborts_queue=queue.SimpleQueue(),
         engine_index=engine_index,
+        scheduler=SimpleNamespace(),
     )
 
 
@@ -223,6 +224,7 @@ def _make_beam_update(
     client_index: int = 0,
     current_wave: int = 0,
     data_parallel_rank: int | None = None,
+    is_last_step: bool = False,
 ) -> BeamRequestStepUpdate:
     return BeamRequestStepUpdate(
         session_id=session_id,
@@ -237,6 +239,7 @@ def _make_beam_update(
         client_index=client_index,
         current_wave=current_wave,
         data_parallel_rank=data_parallel_rank,
+        is_last_step=is_last_step,
     )
 
 
@@ -775,6 +778,8 @@ class TestBeamCache:
 
         assert not eng.input_queue.empty(), "Request must be pushed to input_queue"
         _, kwargs = MockReq.call_args
+        # Cascade Attention schedules the full suffix token history for each beam:
+        # prefill + beam0 + beam1.
         assert kwargs["prompt_token_ids"] == prefill + beam0 + beam1
         assert kwargs["request_id"] == "session-0"
         assert mock_req.is_beam is True
@@ -1127,6 +1132,49 @@ class TestBeamCache:
         aborted = eng.aborts_queue.get_nowait()
         assert aborted == "dead-0"
         assert eng.aborts_queue.empty(), "Only the pruned ID must be aborted, not the session"
+
+    def test_handle_is_last_step_pops_cache_without_aborting_session(self) -> None:
+        """is_last_step=True on an active decode step (beam_width > 0) must
+        pop the local beam_cache dict, and the final-step request itself
+        must still be enqueued so it gets a chance to run.
+
+        Unlike the beam_width == 0 cleanup path, this must NOT push
+        session_id onto aborts_queue: EngineCoreProc.step() drains
+        aborts_queue and aborts the request BEFORE scheduler.update_from_output()
+        runs for that same step, so an abort queued alongside this final
+        step's ADD would race ahead of -- and can silently discard -- the
+        output this very step is about to produce, hanging the client
+        forever. (Regression covered by an integration-level hang found via
+        tests/test_serving_beam_search.py::test_serving_beam_search at
+        beam_width=512 -- too slow/GPU-bound to run as a unit test.) The
+        request completes and its resources are released on its own once
+        this step's output is processed, same as any normal request
+        reaching its stop condition -- no explicit session-finished
+        bookkeeping is needed (an earlier `_beam_finished_session_ids`
+        mechanism was removed: it had no runtime consumer anywhere in the
+        codebase and never actually released anything)."""
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+        update = _make_beam_update(
+            session_id="s0",
+            parent_beam_ids=["p0"],
+            child_beam_ids=["c0"],
+            beam_tokens=[[50]],
+            beam_width=1,
+            is_last_step=True,
+        )
+
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = MagicMock()
+            mock_req.block_hashes = []
+            MockReq.return_value = mock_req
+            _handle_beam_request_step_update(eng, update)
+
+        assert "s0" not in eng.beam_cache
+        # The final-step request must still be added to input_queue (it has
+        # not been skipped/dropped).
+        assert not eng.input_queue.empty(), "Final decode step must still be scheduled"
+        # Must NOT be aborted alongside its own final output -- see docstring.
+        assert eng.aborts_queue.empty()
 
     def test_handle_session_evolves_across_steps(self) -> None:
         """Three-step lifecycle: step → step → B=0 teardown."""
@@ -1965,9 +2013,10 @@ class TestIntegrationCrossProcess:
             if name in ("ADD_BATCH", "BEAM_REQUEST_STEP_UPDATE"):
                 continue
             member = getattr(EngineCoreRequestType, name)
-            assert member.value not in (b"\x06", b"\x07"), (
-                f"Collision: upstream member {name!r} already uses value {member.value!r}"
-            )
+            assert member.value not in (
+                b"\x06",
+                b"\x07",
+            ), f"Collision: upstream member {name!r} already uses value {member.value!r}"
 
     def test_beam_request_step_update_encode_decode(self) -> None:
         from vllm.v1.serial_utils import MsgpackDecoder

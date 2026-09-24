@@ -109,6 +109,7 @@ def _prepare_beam_step_requests(
     instance_fork_info: dict[int, ForkInfo],
     instance_prefix_len: dict[int, int],
     instance_completed_sessions: set[int],
+    max_decode_steps: int = 0,
 ) -> list["EngineCoreRequest"]:
     """Prepare EngineCoreRequest items for active instances at this step."""
     engine_core_requests = []
@@ -179,10 +180,12 @@ def _prepare_beam_step_requests(
                 prefix_len=prefix_len,
                 beam_width=W,
                 sampling_params=decode_sampling_params,
-                eos_token_id=sid_end_token_id
-                if sid_end_token_id is not None
-                else tokenizer.eos_token_id,
+                eos_token_id=(
+                    sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
+                ),
                 lora_request=instance.beams[0].lora_request,
+                parent_beam_indices=[parent_beam_idx for parent_beam_idx, _ in fork_info_j],
+                max_decode_steps=max_decode_steps,
             )
             llm_engine.engine_core.beam_request_step_update(update)
 
@@ -411,6 +414,7 @@ def _custom_beam_search_batch(
             instance_fork_info=instance_fork_info,
             instance_prefix_len=instance_prefix_len,
             instance_completed_sessions=instance_completed_sessions,
+            max_decode_steps=len(token_iter),
         )
 
         if engine_core_requests:

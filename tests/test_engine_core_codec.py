@@ -50,6 +50,8 @@ def _beam_step_update() -> BeamRequestStepUpdate:
         prefix_len=8,
         beam_width=2,
         sampling_params=_sampling_params(),
+        parent_beam_indices=[1, 0],
+        max_decode_steps=3,
     )
 
 
@@ -101,3 +103,31 @@ def test_decode_beam_step_update_payload() -> None:
     assert isinstance(decoded, BeamRequestStepUpdate)
     assert decoded.session_id == "session-0"
     assert decoded.beam_width == 2
+    assert decoded.parent_beam_indices == [1, 0]
+    assert decoded.max_decode_steps == 3
+
+
+def test_decode_beam_step_update_payload_legacy_defaults() -> None:
+    """Updates without the incremental fields decode with their defaults.
+
+    ``omit_defaults=True`` means an update built without the new fields
+    encodes exactly like a legacy payload, and decoding yields the defaults.
+    """
+    decoders = build_engine_core_decoders(None)
+    legacy_update = BeamRequestStepUpdate(
+        session_id="session-0",
+        parent_beam_ids=["parent-0", "parent-1"],
+        child_beam_ids=["child-0", "child-1"],
+        beam_tokens=[[11], [12]],
+        pruned_ids=[],
+        prefix_len=8,
+        beam_width=2,
+        sampling_params=_sampling_params(),
+    )
+    decoded = decode_engine_core_payload(
+        decoders,
+        EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE,
+        _frames(legacy_update),
+    )
+    assert decoded.parent_beam_indices is None
+    assert decoded.max_decode_steps == 0

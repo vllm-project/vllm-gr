@@ -345,6 +345,8 @@ def _handle_beam_request_step_update(self, update) -> None:
     if beam_width == 0:
         with self.beam_cache_lock:
             self.beam_cache.pop(session_id, None)
+
+        # We MUST abort the running beam-request session_id itself!
         self.aborts_queue.put_nowait(session_id)
         for request_id in update.pruned_ids:
             self.aborts_queue.put_nowait(request_id)
@@ -456,6 +458,29 @@ def _handle_beam_request_step_update(self, update) -> None:
         prefix_len=update.prefix_len,
     )
     req.log_probs_num = beam_width
+    req.parent_beam_indices = update.parent_beam_indices
+    req.max_decode_steps = update.max_decode_steps
+    req.parent_cum_logprobs = update.parent_cum_logprobs
+    req.target_beam_width = getattr(update, "target_beam_width", 0) or update.beam_width
+    req.is_last_step = getattr(update, "is_last_step", False)
+
+    if getattr(update, "is_last_step", False):
+        with self.beam_cache_lock:
+            self.beam_cache.pop(session_id, None)
+        # Deliberately do NOT push session_id onto self.aborts_queue here
+        # (unlike the beam_width == 0 path): EngineCoreProc.step() drains
+        # aborts_queue and calls abort_requests() BEFORE
+        # scheduler.update_from_output() runs for that same step, so an
+        # abort queued alongside this final step's ADD can race ahead of --
+        # and silently discard -- the output this very step is about to
+        # produce, hanging the client forever waiting on it. The
+        # beam_width == 0 cleanup call carries no output of its own (the
+        # real final output was already delivered by a prior step), so that
+        # path's abort can't race against anything. The request still
+        # completes and is removed from the scheduler on its own once this
+        # final step's output is processed, same as any normal request
+        # reaching its stop condition.
+
     self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, update.current_wave)))
     for request_id in update.pruned_ids:
         self.aborts_queue.put_nowait(request_id)

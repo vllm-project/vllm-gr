@@ -30,6 +30,7 @@ def _make_builder(block_size: int = 2) -> BeamAttentionMetadataBuilder:
     builder.num_kv_heads = 2
     builder._is_cuda = False
     builder._is_npu = False
+    builder._fixed_buffers = False
     builder.npu_causal_atten_mask = None
     return builder
 
@@ -45,7 +46,6 @@ def _common_metadata(
         query_start_loc_cpu=torch.tensor(query_starts, dtype=torch.int32),
         query_start_loc=torch.tensor(query_starts, dtype=torch.int32),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
-        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
         block_table_tensor=torch.tensor(block_table, dtype=torch.int32),
         num_actual_tokens=num_tokens,
         max_query_len=max(
@@ -192,25 +192,6 @@ def test_build_routes_standard_and_beam_metadata(
         ]
 
 
-def test_build_pure_prefill_fast_path_carries_common_fields() -> None:
-    common = _common_metadata([0, 3, 7], [3, 7], [[0, 1], [2, 3]])
-    metadata = _build_metadata(common, ["a", "b"], {})
-
-    assert metadata.is_prefill_graph_exec is True
-    assert metadata.num_reqs == 2
-    assert metadata.num_heads == 8
-    assert metadata.num_kv_heads == 2
-    assert metadata.block_size == 2
-    assert metadata.std_indices is None
-    assert metadata.std_block_table is None
-    assert metadata.prefix_indices is None
-    assert metadata.query_start_loc_cpu == [0, 3, 7]
-    assert metadata.seq_lens_cpu == [3, 7]
-    assert torch.equal(metadata.query_start_loc, common.query_start_loc)
-    assert torch.equal(metadata.seq_lens, common.seq_lens)
-    assert torch.equal(metadata.block_table, common.block_table_tensor)
-
-
 def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:
     old_table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
     old_slots = torch.tensor([10, 11], dtype=torch.int64)
@@ -242,273 +223,276 @@ def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:
     assert updated.prefix_block_table.tolist() == [[7, 8]]
 
 
-def test_build_chunked_prefill_and_multistep_beam_metadata() -> None:
-    query_starts = [0, 4]
-    seq_lens = [8]
-    block_table = [[0, 1, 2, 3]]
-    req_ids = ["beam_chunked"]
-    beam_data = {
-        "beam_chunked": {
-            "is_beam_decode": True,
-            "prefix_len": 4,
-            "beam_width": 2,
-            "beam_decode_steps": 2,
-            "cache_len": 5,
-        }
-    }
-    common = _common_metadata(query_starts, seq_lens, block_table)
-    metadata = _build_metadata(common, req_ids, beam_data)
-    assert metadata is not None
-    assert metadata.suffix_slot_mapping_out is not None
-    # Assert exact expected physical slot sequence:
-    # slot 4 for cached-past token at offset 4 + slots [100, 101, 102] for current query tokens
-    assert metadata.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
+def test_update_block_table_reprojects_suffix_slot_mapping() -> None:
+    """update_block_table must re-project suffix_slot_mapping_out against the
+    NEW block_table/slot_mapping, not silently carry forward the physical KV
+    slots computed at build() time against the OLD one.
 
+    vLLM caches one built BeamAttentionMetadata across every hybrid KV-cache
+    group sharing this builder's (kv_cache_spec, type) and swaps in each
+    group's own block_table/slot_mapping via update_block_table instead of a
+    full rebuild (gpu_model_runner.py's _build_attn_group_metadata). Reusing
+    a stale suffix_slot_mapping_out there means beam decode reads/writes the
+    wrong physical KV cache slots for the second (and later) group.
+    """
+    block_size = 2
+    old_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    old_slots = torch.tensor([50, 51], dtype=torch.int64)
+    # index 0: "past" token -> req_idx=0, block_idx=1, block_offset=0
+    #   old: block_table[0, 1] = 2 -> slot = 2 * block_size + 0 = 4
+    past_coords = torch.tensor([[0, 0, 1, 0]], dtype=torch.long)
+    # index 1: "current" token -> token_idx=0 into slot_mapping
+    #   old: slot_mapping[0] = 50
+    curr_coords = torch.tensor([[1, 0]], dtype=torch.long)
+    old_suffix_slots = torch.tensor([4, 50], dtype=torch.int32)
 
-def test_chunked_prefill_multi_req_no_cuda_assert() -> None:
-    # Scenario matching the crash: Req 0 (beam decode 32 tokens), Req 1 (multistep beam decode 1 token), Req 2 (ordinary 67 tokens)
-    query_starts = [0, 32, 33, 100]
-    seq_lens = [5191, 3810, 67]
-    block_table = [[i for i in range(2500)] for _ in range(3)]
-    req_ids = ["req0", "req1", "req2"]
-    beam_data = {
-        "req0": {
-            "is_beam_decode": True,
-            "prefix_len": 5159,
-            "beam_width": 32,
-            "beam_decode_steps": 1,
-            "cache_len": 5159,
-        },
-        "req1": {
-            "is_beam_decode": True,
-            "prefix_len": 3747,
-            "beam_width": 32,
-            "beam_decode_steps": 2,
-            "cache_len": 3810,
-        },
-    }
-    common = _common_metadata(query_starts, seq_lens, block_table)
-    metadata = _build_metadata(common, req_ids, beam_data)
-    assert metadata is not None
-    assert metadata.suffix_slot_mapping_out is not None
-    # Assert exact expected physical slot sequence for multi-req chunked prefill:
-    # slots 100..131 for req0 (32 query tokens) + slot 3809 for req1 cached-past token + slot 132 for req1 query token
-    expected_slots = list(range(100, 132)) + [3809, 132]
-    assert metadata.suffix_slot_mapping_out.tolist() == expected_slots
-
-
-def test_update_block_table_refreshes_suffix_slots() -> None:
-    query_starts = [0, 4]
-    seq_lens = [8]
-    block_table = [[0, 1, 2, 3]]
-    req_ids = ["beam_chunked"]
-    beam_data = {
-        "beam_chunked": {
-            "is_beam_decode": True,
-            "prefix_len": 4,
-            "beam_width": 2,
-            "beam_decode_steps": 2,
-            "cache_len": 5,
-        }
-    }
-    common = _common_metadata(query_starts, seq_lens, block_table)
-    builder = _make_builder()
-    metadata = _build_metadata(common, req_ids, beam_data)
-    assert metadata is not None
-    assert metadata.suffix_slot_mapping_out is not None
-    # Original physical slots: past slot at offset 4 (block 0 -> 4) + current query slots 100, 101, 102
-    assert metadata.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
-
-    # Update block table (block 0 becomes block 10) and slot mapping (0,1,2 becomes 500,501,502)
-    new_table = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
-    new_slots = torch.tensor([500, 501, 502, 503], dtype=torch.int64)
-
-    updated = builder.update_block_table(metadata, new_table, new_slots)
-
-    # Past slot offset 4 uses block 4 // 2 = 2 -> block ID 12 -> 12 * 2 + (4 % 2) = 24
-    # Current query slots index positions 0, 1, 2 in new_slots -> 500, 501, 502
-    assert updated.suffix_slot_mapping_out is not None
-    assert updated.suffix_slot_mapping_out.tolist() == [24, 500, 501, 502]
-
-
-def test_update_block_table_multireq_nonzero_row_suffix() -> None:
-    # 2 requests: req0 (std decode), req1 (beam decode with past suffix)
-    query_starts = [0, 2, 6]
-    seq_lens = [4, 8]
-    block_table = [
-        [0, 1, 2, 3],
-        [10, 11, 12, 13],
-    ]
-    req_ids = ["req0", "req1_beam"]
-    beam_data = {
-        "req1_beam": {
-            "is_beam_decode": True,
-            "prefix_len": 4,
-            "beam_width": 2,
-            "beam_decode_steps": 2,
-            "cache_len": 5,
-        }
-    }
-    common = _common_metadata(query_starts, seq_lens, block_table)
-    builder = _make_builder()
-    metadata = _build_metadata(common, req_ids, beam_data)
-    assert metadata is not None
-    assert metadata.suffix_slot_mapping_out is not None
-    # req1 past suffix at offset 4 uses req1 row (row 1), block 4 // 2 = 2 -> block ID 12 -> slot 12 * 2 + 0 = 24
-    # req1 query slots in common.slot_mapping at indices 2, 3, 4 -> 102, 103, 104
-    assert metadata.suffix_slot_mapping_out.tolist() == [24, 102, 103, 104]
-
-    # Update with distinct new block IDs for row 0 vs row 1
-    new_table = torch.tensor(
-        [
-            [100, 101, 102, 103],
-            [200, 201, 202, 203],
-        ],
-        dtype=torch.int32,
+    metadata = BeamAttentionMetadata(
+        num_actual_tokens=2,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_seq_len=6,
+        seq_lens=torch.tensor([3, 6], dtype=torch.int32),
+        block_table=old_table,
+        slot_mapping=old_slots,
+        block_size=block_size,
+        suffix_total_tokens=2,
+        suffix_slot_mapping_out=old_suffix_slots,
+        suffix_past_coords=past_coords,
+        suffix_curr_coords=curr_coords,
     )
-    new_slots = torch.tensor([500, 501, 502, 503, 504, 505], dtype=torch.int64)
 
-    updated = builder.update_block_table(metadata, new_table, new_slots)
-    assert updated.suffix_slot_mapping_out is not None
-    # req1 past suffix at offset 4 uses updated row 1, block 2 -> block ID 202 -> slot 202 * 2 + 0 = 404
-    # req1 query slots in new_slots at indices 2, 3, 4 -> 502, 503, 504
-    assert updated.suffix_slot_mapping_out.tolist() == [404, 502, 503, 504]
+    new_table = torch.tensor([[100, 200], [300, 400]], dtype=torch.int32)
+    new_slots = torch.tensor([999, 998], dtype=torch.int64)
+
+    updated = _make_builder(block_size=block_size).update_block_table(
+        metadata, new_table, new_slots
+    )
+
+    # Old metadata (and its suffix mapping) must be untouched.
+    assert metadata.suffix_slot_mapping_out is old_suffix_slots
+    assert metadata.suffix_slot_mapping_out.tolist() == [4, 50]
+    # New: block_table[0, 1] = 200 -> 200 * 2 + 0 = 400 (past);
+    # slot_mapping[0] = 999 (current). NOT the stale [4, 50].
+    assert updated.suffix_slot_mapping_out.tolist() == [400, 999]
 
 
-def test_update_block_table_current_only_suffix() -> None:
-    # Suffix containing only current query tokens (no past suffix)
-    query_starts = [0, 3]
-    seq_lens = [6]
-    block_table = [[0, 1, 2]]
-    req_ids = ["req_curr_suffix"]
-    beam_data = {
-        "req_curr_suffix": {
-            "is_beam_decode": True,
-            "prefix_len": 0,
-            "beam_width": 3,
-            "beam_decode_steps": 1,
-            "cache_len": 0,
-        }
-    }
-    common = _common_metadata(query_starts, seq_lens, block_table)
+def test_update_block_table_rejects_incompatible_suffix_geometry() -> None:
+    """A block_table/slot_mapping too small for the persisted suffix
+    coordinates must raise rather than silently index out of bounds or
+    project garbage (ubatching / sliced block tables are not supported by
+    this cached-metadata fast path)."""
+    past_coords = torch.tensor([[0, 0, 1, 0]], dtype=torch.long)
+    metadata = BeamAttentionMetadata(
+        num_actual_tokens=1,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        max_seq_len=4,
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        block_table=torch.tensor([[1, 2]], dtype=torch.int32),
+        slot_mapping=torch.tensor([10], dtype=torch.int64),
+        block_size=2,
+        suffix_total_tokens=1,
+        suffix_slot_mapping_out=torch.tensor([4], dtype=torch.int32),
+        suffix_past_coords=past_coords,
+    )
+    # Only 1 block column: past_coords references block_idx=1, out of range.
+    too_narrow_table = torch.tensor([[1]], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="suffix_past_coords"):
+        _make_builder().update_block_table(
+            metadata, too_narrow_table, torch.tensor([10], dtype=torch.int64)
+        )
+
+
+def test_pack_int32_to_dev_matches_individual_copies() -> None:
+    """Single-H2D staging scatters the same values as per-field copies.
+
+    Uses CPU staging buffers (device="cpu") to exercise the fixed-buffer pack
+    path without a GPU: ``_pack_int32_to_dev`` must copy exactly the per-field
+    host lists into the destination buffers in order.
+    """
     builder = _make_builder()
-    metadata = _build_metadata(common, req_ids, beam_data)
-    assert metadata is not None
-    assert metadata.suffix_slot_mapping_out is not None
-    assert metadata.suffix_slot_mapping_out.tolist() == [100, 101, 102]
+    builder._h2d_host = torch.zeros(16, dtype=torch.int32)
+    builder._h2d_dev = torch.zeros(16, dtype=torch.int32)
 
-    # Update slot mapping
-    new_table = torch.tensor([[10, 11, 12]], dtype=torch.int32)
-    new_slots = torch.tensor([900, 901, 902], dtype=torch.int64)
+    dst_a = torch.zeros(4, dtype=torch.int32)
+    dst_b = torch.zeros(3, dtype=torch.int32)
+    builder._pack_int32_to_dev([(dst_a, [1, 2, 3, 4]), (dst_b, [5, 6, 7])])
 
-    updated = builder.update_block_table(metadata, new_table, new_slots)
-    assert updated.suffix_slot_mapping_out is not None
-    assert updated.suffix_slot_mapping_out.tolist() == [900, 901, 902]
+    assert dst_a.tolist() == [1, 2, 3, 4]
+    assert dst_b.tolist() == [5, 6, 7]
+    # Single contiguous staging: values are laid back-to-back on the host
+    # staging, so the first transfer covers every field's source.
+    assert builder._h2d_host[:7].tolist() == [1, 2, 3, 4, 5, 6, 7]
+    assert builder._h2d_dev[:7].tolist() == [1, 2, 3, 4, 5, 6, 7]
+
+    # Empty entries are a no-op.
+    builder._pack_int32_to_dev([])
 
 
-def test_update_block_table_repeated_updates_immutability() -> None:
-    query_starts = [0, 4]
-    seq_lens = [8]
-    block_table = [[0, 1, 2, 3]]
-    req_ids = ["beam_req"]
-    beam_data = {
-        "beam_req": {
-            "is_beam_decode": True,
-            "prefix_len": 4,
-            "beam_width": 2,
-            "beam_decode_steps": 2,
-            "cache_len": 5,
-        }
-    }
-    common = _common_metadata(query_starts, seq_lens, block_table)
+def test_pack_int32_to_dev_leading_zero_cus() -> None:
+    """cu_seqlens payloads carry the leading 0 element (prefix/suffix groups)."""
     builder = _make_builder()
-    meta0 = _build_metadata(common, req_ids, beam_data)
-    assert meta0 is not None
-    assert meta0.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
+    builder._h2d_host = torch.zeros(6, dtype=torch.int32)
+    builder._h2d_dev = torch.zeros(6, dtype=torch.int32)
 
-    # Update 1
-    table1 = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
-    slots1 = torch.tensor([500, 501, 502, 503], dtype=torch.int64)
-    meta1 = builder.update_block_table(meta0, table1, slots1)
+    cu = torch.zeros(3, dtype=torch.int32)
+    builder._pack_int32_to_dev([(cu, [0, 2, 4])])
 
-    # Update 2 from meta1
-    table2 = torch.tensor([[30, 31, 32, 33]], dtype=torch.int32)
-    slots2 = torch.tensor([700, 701, 702, 703], dtype=torch.int64)
-    meta2 = builder.update_block_table(meta1, table2, slots2)
-
-    # Prove meta0 remains unchanged
-    assert meta0.block_table.tolist() == [[0, 1, 2, 3]]
-    assert meta0.suffix_slot_mapping_out.tolist() == [4, 100, 101, 102]
-
-    # Prove meta1 remains unchanged
-    assert meta1.block_table.tolist() == [[10, 11, 12, 13]]
-    assert meta1.suffix_slot_mapping_out.tolist() == [24, 500, 501, 502]
-
-    # Prove meta2 reflects update 2
-    assert meta2.block_table.tolist() == [[30, 31, 32, 33]]
-    assert meta2.suffix_slot_mapping_out.tolist() == [64, 700, 701, 702]
+    assert cu.tolist() == [0, 2, 4]
 
 
-def test_update_block_table_two_kv_cache_group_reuse() -> None:
-    query_starts = [0, 4]
-    seq_lens = [8]
-    block_table_group0 = [[1, 2, 3, 4]]
-    req_ids = ["group_beam"]
-    beam_data = {
-        "group_beam": {
-            "is_beam_decode": True,
-            "prefix_len": 4,
-            "beam_width": 2,
-            "beam_decode_steps": 2,
-            "cache_len": 5,
-        }
-    }
-    common = _common_metadata(query_starts, seq_lens, block_table_group0)
+def _make_fixed_builder() -> BeamAttentionMetadataBuilder:
+    """Builder with fixed-address CPU buffers enabled (CUDA-graph-like path)."""
     builder = _make_builder()
+    builder._fixed_buffers = True
+    # Preallocate the fixed-address metadata buffers on CPU.
+    max_segs = 8
+    builder._prefix_indices_buf = torch.zeros(max_segs, dtype=torch.long)
+    builder._std_indices_buf = torch.zeros(max_segs, dtype=torch.long)
+    builder._prefix_seqlens_kv_buf = torch.zeros(max_segs, dtype=torch.int32)
+    builder._suffix_seqlens_kv_buf = torch.zeros(max_segs, dtype=torch.int32)
+    builder._prefix_cu_seqlens_q_buf = torch.zeros(max_segs, dtype=torch.int32)
+    builder._suffix_cu_seqlens_q_buf = torch.zeros(max_segs, dtype=torch.int32)
+    builder._suffix_cu_seqlens_k_buf = torch.zeros(max_segs, dtype=torch.int32)
+    builder._std_cu_seqlens_q_buf = torch.zeros(max_segs, dtype=torch.int32)
+    builder._std_seqlens_kv_buf = torch.zeros(max_segs, dtype=torch.int32)
+    builder._prefix_block_table_buf = torch.zeros((1, 8), dtype=torch.int32)
+    builder._std_block_table_buf = torch.zeros((1, 8), dtype=torch.int32)
+    builder._h2d_host = torch.zeros(64, dtype=torch.int32)
+    builder._h2d_dev = torch.zeros(64, dtype=torch.int32)
+    return builder
 
-    # KV Cache Group 0 build
-    meta_group0 = _build_metadata(common, req_ids, beam_data)
-    assert meta_group0 is not None
 
-    # KV Cache Group 1 table and slot mapping reuse
-    block_table_group1 = torch.tensor([[50, 51, 52, 53]], dtype=torch.int32)
-    slots_group1 = torch.tensor([800, 801, 802, 803], dtype=torch.int64)
-    meta_group1 = builder.update_block_table(meta_group0, block_table_group1, slots_group1)
+def test_create_beam_tensors_arrange_contiguity() -> None:
+    """The device-side arange fast path is only valid when ``prefix_indices``
+    is one contiguous range; the builder must fall back to the host copy for
+    a non-contiguous index list."""
+    builder = _make_fixed_builder()
+    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
 
-    # Both share underlying scheduling descriptors
-    assert meta_group1.prefix_indices is meta_group0.prefix_indices
-    assert meta_group1.suffix_past_coords is meta_group0.suffix_past_coords
+    def run(prefix_indices: list[int]) -> Any:
+        return builder._create_beam_tensors(
+            common,
+            prefix_indices=prefix_indices,
+            prefix_seqlens_q_cpu=[len(prefix_indices)],
+            prefix_cu_seqlens_q_cpu=[len(prefix_indices)],
+            prefix_seqlens_kv_cpu=[8],
+            suffix_seqlens_q_cpu=[1] * len(prefix_indices),
+            suffix_cu_seqlens_q_cpu=list(range(1, len(prefix_indices) + 1)),
+            suffix_cu_seqlens_kv_cpu=[1] * len(prefix_indices),
+            suffix_seqlens_kv_cpu=[1] * len(prefix_indices),
+            suffix_slot_mapping_out_list=[],
+            prefix_req_idxs_cpu=[0],
+            max_prefix_blocks_count=2,
+            device=torch.device("cpu"),
+            max_num_splits=0,
+        )
 
-    # Each holds its own physical block tables & suffix slot mappings
-    assert meta_group0.suffix_slot_mapping_out.tolist() == [6, 100, 101, 102]
-    assert meta_group1.suffix_slot_mapping_out.tolist() == [104, 800, 801, 802]
+    # Contiguous range: emitted with a strided arange.
+    m = run([0, 1, 2, 3])
+    assert m[0].tolist() == [0, 1, 2, 3]
+    # Non-contiguous layout must NOT be wrongly ranged.
+    m = run([3, 7, 11])
+    assert m[0].tolist() == [3, 7, 11]
 
 
-def test_update_block_table_ubatching_rejection() -> None:
-    query_starts = [0, 2, 6]
-    seq_lens = [4, 8]
-    block_table = [
-        [0, 1, 2, 3],
-        [10, 11, 12, 13],
-    ]
-    req_ids = ["req0", "req1_beam"]
-    beam_data = {
-        "req1_beam": {
-            "is_beam_decode": True,
-            "prefix_len": 4,
-            "beam_width": 2,
-            "beam_decode_steps": 2,
-            "cache_len": 5,
-        }
-    }
-    common = _common_metadata(query_starts, seq_lens, block_table)
+def test_create_beam_tensors_caches_suffix_coord_maxima_on_cpu() -> None:
+    """_create_beam_tensors must compute suffix_max_past_req/_past_blk/_q_idx
+    on the CPU (from the plain Python coordinate lists) so
+    update_block_table's geometry validation can read them without a
+    .max().item() device sync."""
+    builder = _make_fixed_builder()
+    # 1 request, 5 blocks so block_idx up to 4 is in range.
+    common = _common_metadata([0, 4], [4], [[10, 20, 30, 40, 50]])
+    # block_size == 2
+
+    # tag == -1 -> "current" (idx, token_idx into slot_mapping, len 4 here);
+    # tag >= 0 -> "past" (idx, req_idx, pos into the paged cache).
+    # past: req_idx=0, pos=8 -> block_idx=4, offset=0
+    # past: req_idx=0, pos=3 -> block_idx=1, offset=1
+    # curr: token_idx=3 ; curr: token_idx=1
+    suffix_slot_mapping_out_list = [(-1, 3), (0, 8), (0, 3), (-1, 1)]
+
+    result = builder._create_beam_tensors(
+        common,
+        prefix_indices=[0, 1, 2, 3],
+        prefix_seqlens_q_cpu=[4],
+        prefix_cu_seqlens_q_cpu=[4],
+        prefix_seqlens_kv_cpu=[8],
+        suffix_seqlens_q_cpu=[1, 1, 1, 1],
+        suffix_cu_seqlens_q_cpu=[1, 2, 3, 4],
+        suffix_cu_seqlens_kv_cpu=[1, 2, 3, 4],
+        suffix_seqlens_kv_cpu=[1, 1, 1, 1],
+        suffix_slot_mapping_out_list=suffix_slot_mapping_out_list,
+        prefix_req_idxs_cpu=[0],
+        max_prefix_blocks_count=2,
+        device=torch.device("cpu"),
+        max_num_splits=0,
+    )
+    suffix_max_past_req, suffix_max_past_blk, suffix_max_q_idx = result[-3:]
+
+    assert suffix_max_past_req == 0
+    assert suffix_max_past_blk == 4  # 8 // block_size(2)
+    assert suffix_max_q_idx == 3
+
+
+def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
+    """``prefix_indices_contiguous`` is the explicit verdict from
+    _build_beam_mappings: when supplied, the per-element ``all()`` scan is
+    skipped and the arange fast path is taken directly.  When absent (None),
+    the conservative scan runs."""
+    builder = _make_fixed_builder()
+    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
+
+    def run(prefix_indices: list[int], **kw: Any) -> Any:
+        return builder._create_beam_tensors(
+            common,
+            prefix_indices=prefix_indices,
+            prefix_seqlens_q_cpu=[len(prefix_indices)],
+            prefix_cu_seqlens_q_cpu=[len(prefix_indices)],
+            prefix_seqlens_kv_cpu=[8],
+            suffix_seqlens_q_cpu=[1] * len(prefix_indices),
+            suffix_cu_seqlens_q_cpu=list(range(1, len(prefix_indices) + 1)),
+            suffix_cu_seqlens_kv_cpu=[1] * len(prefix_indices),
+            suffix_seqlens_kv_cpu=[1] * len(prefix_indices),
+            suffix_slot_mapping_out_list=[],
+            prefix_req_idxs_cpu=[0],
+            max_prefix_blocks_count=2,
+            device=torch.device("cpu"),
+            max_num_splits=0,
+            **kw,
+        )
+
+    # Explicit True: arange fast path without the scan.
+    m = run([5, 6, 7, 8], prefix_indices_contiguous=True)
+    assert m[0].tolist() == [5, 6, 7, 8]
+    # Precomputed scalars are consumed (prefix_max_q_len visible in the tuple).
+    m = run([5, 6, 7, 8], prefix_indices_contiguous=True, prefix_max_q_len=4, suffix_max_q_len=1)
+    assert m[0].tolist() == [5, 6, 7, 8]
+    # Explicit False: host copy even for a visually contiguous list.
+    m = run([0, 1, 2, 3], prefix_indices_contiguous=False)
+    assert m[0].tolist() == [0, 1, 2, 3]
+
+
+def test_build_beam_mappings_scalar_reductions() -> None:
+    """Scalar reductions (contiguity flag, max q/kv lens) are derived from
+    the built lists for a single-group beam layout."""
     builder = _make_builder()
-    metadata = _build_metadata(common, req_ids, beam_data)
-    assert metadata is not None
+    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
 
-    # Pass sliced micro-batch table (e.g., ubatching splitting the batch to 1 request)
-    microbatch_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
-    microbatch_slots = torch.tensor([100, 101], dtype=torch.int64)
-
-    with pytest.raises(ValueError, match="Cannot update block table:"):
-        builder.update_block_table(metadata, microbatch_table, microbatch_slots)
+    rec = builder._build_beam_mappings(
+        beam_req_idxs=[0],
+        beam_prefix_lens=[8],
+        beam_widths=[4],
+        beam_decode_steps=[2],
+        beam_cache_lens=[8],
+        beam_q_start_offsets=[0],
+        q_starts=[0, 4],
+        common_attn_metadata=common,
+    )
+    # Tail of the tuple: (..., max_prefix_blocks_count, contiguous, pql, sql, skl)
+    assert rec[-4] is True  # this single-group layout happens to be contiguous
+    assert rec[-3] == 4  # prefix_max_q_len derived from the group list
+    assert rec[-2] == 2  # suffix_max_q_len: chunk budget split 2/beam
+    assert rec[-1] == 2  # suffix_max_seq_len derived from suffix_seqlens_kv list

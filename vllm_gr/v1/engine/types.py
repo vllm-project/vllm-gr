@@ -42,6 +42,18 @@ class BeamRequestStepUpdate(
     lora_request: LoRARequest | None = None
     cache_salt: str | None = None
     trace_headers: Mapping[str, str] | None = None
+    # Numeric parent beam indices for incremental decode KV reordering
+    # (pool-based BeamSearchSession). Defaults keep legacy updates
+    # serialization-compatible (omit_defaults=True).
+    parent_beam_indices: list[int] | None = None
+    # Maximum number of decode steps for KV pool pre-allocation.
+    max_decode_steps: int = 0
+    # Parent cumulative logprobs for worker-side candidate pruning.
+    parent_cum_logprobs: list[float] | None = None
+    # Target beam width for worker-side candidate pruning (defaults to beam_width).
+    target_beam_width: int = 0
+    # True if this is the final decode step, so worker/engine teardown can happen inline.
+    is_last_step: bool = False
 
 
 class BeamForkRequest(

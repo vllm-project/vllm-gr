@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 
-def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional[Dict[str, Any]]:
+def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> dict[str, Any] | None:
     """Build scheduler metadata for a grouped beam-decode request.
 
     ``beam_width`` is execution metadata carried by ``BeamRequestStepUpdate``;
@@ -38,4 +38,7 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
         "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
         "prefix_len": getattr(req, "prefix_len", 0),
         "cache_len": req.num_computed_tokens - num_scheduled_tokens,
+        "parent_cum_logprobs": getattr(req, "parent_cum_logprobs", None),
+        "target_beam_width": getattr(req, "target_beam_width", beam_width),
+        "is_last_step": getattr(req, "is_last_step", False),
     }

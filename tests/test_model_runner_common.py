@@ -117,7 +117,7 @@ def test_logprob_remux_preserves_flattening_and_placeholder_rows() -> None:
     token_ids = torch.tensor([[1, 2], [3, 4], [5, 6]])
     ranks = torch.tensor([7, 8, 9])
 
-    final_st, final_lps, final_ids, final_ranks = common._remux_logprobs_tensors(
+    final_st, final_lps, final_ids, final_ranks, is_any_pruned = common._remux_logprobs_tensors(
         [
             ("ordinary", 0, 1, []),
             ("beam", 1, 2, [0, 1]),
@@ -139,6 +139,7 @@ def test_logprob_remux_preserves_flattening_and_placeholder_rows() -> None:
     assert torch.isneginf(final_lps[2]).all()
     assert final_ids.tolist() == [[1, 2, 0, 0], [3, 4, 5, 6], [0, 0, 0, 0]]
     assert final_ranks.tolist() == [[7, 0, 0, 0], [8, 9, 0, 0], [0, 0, 0, 0]]
+    assert is_any_pruned is False
 
 
 def test_beam_collapse_accumulates_partial_rows_and_clears_cache() -> None:

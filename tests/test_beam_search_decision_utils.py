@@ -9,6 +9,7 @@ from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
 
 from vllm_gr.beam_search_decision_utils import (
+    ChainedTokens,
     complete_eos_candidates,
     extract_and_dedup_segment,
     mask_candidate_logprobs,
@@ -204,3 +205,43 @@ def test_materialize_selected_beams_uses_explicit_nonuniform_parent_mapping() ->
     assert [beam._lp_parent for beam in new_beams] == [parents[2], parents[0]]
     assert [beam._lp_step_data for beam in new_beams] == [cache[2], cache[0]]
     assert fork_info == [(2, 32), (0, 11)]
+
+
+class TestChainedTokens:
+    """ChainedTokens subclasses list[int] but stores its elements in
+    _prefix/_suffix rather than the (empty) underlying C-level list. Without
+    explicit __eq__/__contains__/__add__, the inherited list versions would
+    silently compare against that empty list instead of the real content."""
+
+    def test_eq_against_list_and_tuple(self) -> None:
+        ct = ChainedTokens([1, 2, 3], [4, 5])
+        assert ct == [1, 2, 3, 4, 5]
+        assert ct == (1, 2, 3, 4, 5)
+        assert ct != [1, 2, 3, 4]
+        assert ct != [1, 2, 3, 4, 5, 6]
+        assert not (ct == "not a sequence")
+
+    def test_eq_against_another_chained_tokens(self) -> None:
+        a = ChainedTokens([1, 2, 3], [4, 5])
+        b = ChainedTokens([1, 2], [3, 4, 5])  # same content, different split
+        assert a == b
+
+    def test_contains_checks_both_prefix_and_suffix(self) -> None:
+        ct = ChainedTokens([1, 2, 3], [4, 5])
+        assert 1 in ct  # prefix
+        assert 5 in ct  # suffix
+        assert 99 not in ct
+
+    def test_add_returns_full_content_as_plain_list(self) -> None:
+        ct = ChainedTokens([1, 2, 3], [4, 5])
+        assert ct + [6, 7] == [1, 2, 3, 4, 5, 6, 7]
+        assert isinstance(ct + [6], list)
+
+    def test_len_getitem_iter_unaffected(self) -> None:
+        ct = ChainedTokens([1, 2, 3], [4, 5])
+        assert len(ct) == 5
+        assert list(ct) == [1, 2, 3, 4, 5]
+        assert ct[0] == 1
+        assert ct[4] == 5
+        assert ct[-1] == 5
+        assert ct[1:4] == [2, 3, 4]

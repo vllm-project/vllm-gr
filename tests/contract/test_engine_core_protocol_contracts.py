@@ -75,6 +75,11 @@ BEAM_STEP_UPDATE_FIELDS = (
     "lora_request",
     "cache_salt",
     "trace_headers",
+    "parent_beam_indices",
+    "max_decode_steps",
+    "parent_cum_logprobs",
+    "target_beam_width",
+    "is_last_step",
 )
 
 
@@ -157,7 +162,15 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
     assert len(raw_payload) == len(BEAM_STEP_UPDATE_FIELDS)
     assert raw_payload[8:13] == [2, 3, 4, 5, 6]
     assert raw_payload[13] is None
-    assert raw_payload[14:] == ["cache-salt", {"traceparent": "trace-0"}]
+    assert raw_payload[14:] == [
+        "cache-salt",
+        {"traceparent": "trace-0"},
+        None,  # parent_beam_indices (default)
+        0,  # max_decode_steps (default)
+        None,  # parent_cum_logprobs (default)
+        0,  # target_beam_width (default)
+        False,  # is_last_step (default)
+    ]
 
 
 def test_scheduler_beam_metadata_shape() -> None:
@@ -179,6 +192,9 @@ def test_scheduler_beam_metadata_shape() -> None:
         "beam_decode_steps": 3,
         "prefix_len": 8,
         "cache_len": 8,
+        "parent_cum_logprobs": None,
+        "target_beam_width": 2,
+        "is_last_step": False,
     }
 
 

@@ -42,6 +42,21 @@ CUDA_DEVICE = is_cuda_available()
 _ASCEND_FULL_GRAPH_UPDATE: Any | None = None
 _ASCEND_FULL_GRAPH_UPDATE_RESOLVED = False
 _NPU_PREFILL_ENTRY_CLS: Any | None = None
+_NPU_DECODE_EXECUTION_MODE: str | None = None
+
+
+def _get_npu_decode_execution() -> str:
+    """Resolve the NPU decode execution mode (cascade | xllm).
+
+    The fused xllm execution layer is not yet available in this tree, so the
+    mode always resolves to ``cascade`` (the Triton pool path). Kept as a
+    function so callers (beam reorder dispatcher) share one resolution point
+    with the upstream design.
+    """
+    global _NPU_DECODE_EXECUTION_MODE
+    if _NPU_DECODE_EXECUTION_MODE is None:
+        _NPU_DECODE_EXECUTION_MODE = "cascade"
+    return _NPU_DECODE_EXECUTION_MODE
 
 
 def _get_npu_prefill_entry_cls() -> Any | None:
@@ -309,6 +324,7 @@ class BeamAttentionImpl(AttentionImpl):
 
         sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
 
+        # Cascade attention (prefill & eager beam decode)
         platform_execution.cascade_attention(
             output=output,
             query=query,

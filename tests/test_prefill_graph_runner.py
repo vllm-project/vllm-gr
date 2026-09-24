@@ -29,6 +29,18 @@ class MockModelRunner:
         self.vllm_config = None
 
 
+def test_default_prefill_buckets_include_small_sizes() -> None:
+    """Review finding (yoni64, PR #364): an all-256-step bucket list (no
+    bucket below 256) pads a short prompt (e.g. 10-30 tokens) by up to
+    ~25x. Small buckets must be present alongside the 256-step range."""
+    small = (16, 64, 128)
+    assert all(b in prefill_graph_common.DEFAULT_PREFILL_BUCKETS for b in small)
+    assert all(b in prefill_graph_common.NPU_DEFAULT_PREFILL_BUCKETS for b in small)
+    # And the large-prompt range is still intact.
+    assert 256 in prefill_graph_common.DEFAULT_PREFILL_BUCKETS
+    assert 4096 in prefill_graph_common.DEFAULT_PREFILL_BUCKETS
+
+
 def test_match_bucket_excessive_padding_fallback() -> None:
     runner = MockModelRunner()
 

@@ -65,6 +65,27 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         default=None,
         help="Optional JSON catalog used to constrain generation results.",
     )
+    model_group.add_argument(
+        "--beam-max-width",
+        type=int,
+        default=None,
+        help=(
+            "Upper bound on the beam width for beam-search requests; enables "
+            "the startup beam-decode CUDA graph capture and sizes the beam "
+            "attention pool."
+        ),
+    )
+    model_group.add_argument(
+        "--beam-max-decode-steps",
+        type=int,
+        default=None,
+        help="Maximum beam decode steps per request (pool dimension).",
+    )
+    model_group.add_argument(
+        "--no-beam-graph",
+        action="store_true",
+        help="Disable the startup beam-decode CUDA graph capture.",
+    )
     return parser
 
 
@@ -75,6 +96,15 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.catalog_path = None
     if hasattr(args, "catalog_path"):
         engine_args.catalog_path = args.catalog_path
+    engine_args.beam_max_width = None
+    if hasattr(args, "beam_max_width"):
+        engine_args.beam_max_width = args.beam_max_width
+    engine_args.beam_max_decode_steps = None
+    if hasattr(args, "beam_max_decode_steps"):
+        engine_args.beam_max_decode_steps = args.beam_max_decode_steps
+    engine_args.no_beam_graph = False
+    if hasattr(args, "no_beam_graph"):
+        engine_args.no_beam_graph = bool(args.no_beam_graph)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -113,9 +143,11 @@ def _explicit_gr_attention_backend(
     if nested_backend_is_explicit or configured_backend is not None:
         return (
             True,
-            GRAttentionBackend.CUSTOM
-            if configured_backend == AttentionBackendEnum.CUSTOM
-            else None,
+            (
+                GRAttentionBackend.CUSTOM
+                if configured_backend == AttentionBackendEnum.CUSTOM
+                else None
+            ),
         )
     return False, None
 
@@ -162,6 +194,9 @@ def create_engine_config(self, usage_context=None, headless=False):
     existing_gr_config = GRConfig.from_vllm_config(config)
     catalog_path = getattr(self, "catalog_path", None)
     backend_is_explicit, backend_override = _explicit_gr_attention_backend(self)
+    beam_max_width = getattr(self, "beam_max_width", None)
+    beam_max_decode_steps = getattr(self, "beam_max_decode_steps", None)
+    no_beam_graph = bool(getattr(self, "no_beam_graph", False))
 
     effective_catalog_path = (
         catalog_path if catalog_path is not None else existing_gr_config.catalog_path
@@ -191,9 +226,18 @@ def create_engine_config(self, usage_context=None, headless=False):
             backend_override if backend_is_explicit else existing_gr_config.attention_backend
         ),
         vocab_offset=offset if offset is not None else existing_gr_config.vocab_offset,
-        vocab_slice_size=slice_size
-        if slice_size is not None
-        else existing_gr_config.vocab_slice_size,
+        vocab_slice_size=(
+            slice_size if slice_size is not None else existing_gr_config.vocab_slice_size
+        ),
+        beam_graph_enabled=(False if no_beam_graph else existing_gr_config.beam_graph_enabled),
+        beam_max_width=(
+            beam_max_width if beam_max_width is not None else existing_gr_config.beam_max_width
+        ),
+        beam_max_decode_steps=(
+            beam_max_decode_steps
+            if beam_max_decode_steps is not None
+            else existing_gr_config.beam_max_decode_steps
+        ),
     )
     if effective_gr_config != existing_gr_config:
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields

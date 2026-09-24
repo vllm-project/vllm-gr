@@ -38,6 +38,33 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
     return _get_active_platform_module().discover_worker_runners()
 
 
+def _make_patched_capture_model(_orig_capture_model, beam_capture):
+    """Wrap capture_model to chain the startup beam-decode graph capture.
+
+    Runs the native capture_model first, then the beam-decode dummy capture;
+    any failure falls back to eager beam decode (the capture function already
+    logs + returns False on failure).
+    """
+    from functools import wraps
+
+    from vllm_gr.v1.worker.model_runner_common import _WORKER_CAPTURE_PATCH_MARKER
+
+    @wraps(_orig_capture_model)
+    def patched_capture_model(self, *args, **kwargs):
+        result = _orig_capture_model(self, *args, **kwargs)
+        try:
+            beam_capture(self)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "vllm-gr: beam decode graph capture failed (%r); beam decode will run eager",
+                exc,
+            )
+        return result
+
+    setattr(patched_capture_model, _WORKER_CAPTURE_PATCH_MARKER, True)
+    return patched_capture_model
+
+
 def apply_worker_patches() -> None:
     """Install grouped-Beam hooks on active-platform ModelRunner targets."""
     platform_module = _get_active_platform_module()
@@ -66,6 +93,23 @@ def apply_worker_patches() -> None:
         ):
             runner_class._model_forward = platform_module.make_patched_model_forward(
                 runner_class._model_forward
+            )
+        if hasattr(runner_class, "_determine_batch_execution_and_padding") and hasattr(
+            platform_module, "make_patched_determine_batch_execution_and_padding"
+        ):
+            runner_class._determine_batch_execution_and_padding = (
+                platform_module.make_patched_determine_batch_execution_and_padding(
+                    runner_class._determine_batch_execution_and_padding
+                )
+            )
+        beam_capture = getattr(platform_module, "capture_beam_decode_graph", None)
+        if (
+            beam_capture is not None
+            and hasattr(runner_class, "capture_model")
+            and not getattr(runner_class.capture_model, "_vllm_gr_beam_capture_patch", False)
+        ):
+            runner_class.capture_model = _make_patched_capture_model(
+                runner_class.capture_model, beam_capture
             )
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)

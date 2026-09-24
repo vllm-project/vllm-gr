@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from vllm_gr.config.models import GRAttentionBackend
+from vllm_gr.config.models import MAX_BEAM_WIDTH, GRAttentionBackend
 
 
 def validate_catalog_path(value: object) -> str | None:
@@ -66,3 +66,43 @@ def validate_vocab_slice_size(value: object) -> int | None:
         raise ValueError(
             f"vllm-gr vocab_slice_size must be a positive integer or null, got {value!r}"
         ) from exc
+
+
+def validate_beam_graph_enabled(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    raise ValueError("vllm-gr beam_graph_enabled must be a boolean")
+
+
+def _validate_positive_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"vllm-gr {name} must be an integer")
+    if value <= 0:
+        raise ValueError(f"vllm-gr {name} must be a positive integer")
+    return value
+
+
+def validate_beam_max_width(value: object) -> int | None:
+    if value is None:
+        return None
+    width = _validate_positive_int(value, "beam_max_width")
+    if width > MAX_BEAM_WIDTH:
+        raise ValueError(f"vllm-gr beam_max_width must be <= {MAX_BEAM_WIDTH}, got {width}")
+    return width
+
+
+def validate_beam_max_decode_steps(value: object) -> int:
+    from vllm_gr.config.models import _BEAM_MAX_DECODE_STEPS_DEFAULT
+
+    return _validate_positive_int(
+        value if value is not None else _BEAM_MAX_DECODE_STEPS_DEFAULT,
+        "beam_max_decode_steps",
+    )

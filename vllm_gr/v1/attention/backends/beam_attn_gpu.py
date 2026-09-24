@@ -89,7 +89,7 @@ def prefill_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
-    attn_metadata: Any,
+    attn_metadata: BeamAttentionMetadata,
     sliding_window_size: list[int] | tuple[int, int] | None,
     scale: float,
     logits_soft_cap: float,
@@ -97,7 +97,7 @@ def prefill_attention(
     s_aux: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
 ) -> None:
-    """Dedicated pure prefill attention execution using CommonAttentionMetadata."""
+    """Dedicated pure prefill attention execution for the prefill graph path."""
     cu_seqlens_q = getattr(attn_metadata, "query_start_loc", None)
     max_q_len = getattr(attn_metadata, "max_query_len", 0)
     seqused_k = getattr(attn_metadata, "seq_lens", None)
@@ -204,6 +204,7 @@ def cascade_attention(
             s_aux=s_aux,
         )
 
+        # Standard beam decode path: extract_suffix_kv from paged cache
         contig_k, contig_v = extract_suffix_kv(
             key_cache,
             value_cache,
@@ -230,13 +231,14 @@ def cascade_attention(
             return_softmax_lse=True,
             fa_version=vllm_flash_attn_version,
         )
+
+        # FA2 GQA de-swizzle: with grouped-query attention (group_size > 1) and a
+        # single query token, flash-attention returns softmax_lse laid out as
+        # [num_kv_heads, group_size, num_tokens] instead of [num_heads, num_tokens].
+        # Transpose back so merge_attn_states sees the per-head layout. FA3 already
+        # returns the head layout, and the prefix call (max_q > 1) is unaffected.
         group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
-        if (
-            attn_metadata.suffix_max_q_len == 1
-            and attn_metadata.suffix_max_seq_len == 1
-            and group_size > 1
-            and not vllm_flash_attn_version == 3
-        ):
+        if attn_metadata.suffix_max_q_len == 1 and group_size > 1 and vllm_flash_attn_version != 3:
             suffix_lse = (
                 suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
                 .transpose(1, 2)
@@ -246,6 +248,7 @@ def cascade_attention(
 
         out = torch.empty_like(beam_query)
         merge_attn_states(out, prefix_out, prefix_lse, suffix_out, suffix_lse)
+
         if attn_metadata.std_indices is None:
             output[: attn_metadata.num_prefix_indices] = out
         else:

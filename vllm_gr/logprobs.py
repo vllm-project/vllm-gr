@@ -5,11 +5,49 @@ per-element append."""
 
 import itertools
 from collections.abc import Iterable
+from typing import Any
 
 __all__ = [
     "append_fast",
+    "append_logprobs_for_next_position",
     "reconstruct_beam_logprobs",
 ]
+
+
+def append_logprobs_for_next_position(
+    request_logprobs: Any,
+    token_ids: list[int],
+    logprobs: list[float],
+    decoded_tokens: Iterable[str | None],
+    rank: Any,
+    num_logprobs: int,
+) -> None:
+    """Appends logprobs for the next position, supporting list/array of ranks."""
+    if isinstance(rank, (list, tuple)):
+        ranks: Iterable[Any] = rank
+    elif hasattr(rank, "tolist"):
+        ranks = rank.tolist()
+    else:
+        if num_logprobs == -1:
+            num_logprobs = len(logprobs)
+        topk_ranks = range(1, num_logprobs + 1)
+        ranks = itertools.chain((rank,), topk_ranks)
+
+    from vllm.logprobs import FlatLogprobs, Logprob
+
+    if isinstance(request_logprobs, FlatLogprobs):
+        request_logprobs.append_fast(token_ids, logprobs, ranks, decoded_tokens)
+    else:
+        request_logprobs.append(
+            {
+                token_id: Logprob(
+                    logprob=logprob,
+                    rank=r,
+                    decoded_token=token,
+                )
+                for token_id, logprob, r, token in zip(token_ids, logprobs, ranks, decoded_tokens)
+            }
+        )
 
 
 def append_fast(
@@ -25,11 +63,15 @@ def append_fast(
     # ranks/decoded_tokens may be lazy or infinite iterators
     # (e.g. itertools.chain, itertools.repeat) -- use islice to bound them.
     # When they are already lists, extend directly (C-level memcpy).
-    if isinstance(ranks, list):
+    if ranks is None:
+        self.ranks.extend(itertools.repeat(None, len(token_ids)))
+    elif isinstance(ranks, list):
         self.ranks.extend(ranks)
     else:
         self.ranks.extend(itertools.islice(ranks, len(token_ids)))
-    if isinstance(decoded_tokens, list):
+    if decoded_tokens is None:
+        self.decoded_tokens.extend(itertools.repeat(None, len(token_ids)))
+    elif isinstance(decoded_tokens, list):
         self.decoded_tokens.extend(decoded_tokens)
     else:
         self.decoded_tokens.extend(itertools.islice(decoded_tokens, len(token_ids)))
@@ -62,7 +104,11 @@ def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):
         decoded_tokens=list(initial_logprobs.decoded_tokens),
     )
     for sd in steps:
-        lp.append_fast(sd[0], sd[1], sd[2], sd[3])
+        t_ids = sd[0].tolist() if hasattr(sd[0], "tolist") else sd[0]
+        lps = sd[1].tolist() if hasattr(sd[1], "tolist") else sd[1]
+        r = sd[2].tolist() if hasattr(sd[2], "tolist") else sd[2]
+        d = sd[3].tolist() if hasattr(sd[3], "tolist") else sd[3]
+        lp.append_fast(t_ids, lps, r, d)
     if sid_end_token_id is not None and beam.finish_reason != "stop":
         lp.append_fast([sid_end_token_id], [0.0], [None], [None])
     beam.logprobs = lp

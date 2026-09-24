@@ -12,8 +12,22 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-DEFAULT_PREFILL_BUCKETS = [16, 128, 256, 512, 768, 1024]
-NPU_DEFAULT_PREFILL_BUCKETS = [128, 256, 512, 768, 1024]
+PREFILL_GRAPH_BUCKET_STEP_DEFAULT = 256
+PREFILL_GRAPH_MAX_BUCKET_DEFAULT = 4096
+# Small buckets below the 256 step so short prompts (a common case) don't pad
+# up to a 256-token minimum -- review finding (yoni64, PR #364): the prior
+# all-256-step bucket list padded a 10-30 token prompt by up to ~25x.
+PREFILL_GRAPH_SMALL_BUCKETS_DEFAULT = (16, 64, 128)
+DEFAULT_PREFILL_BUCKETS = list(PREFILL_GRAPH_SMALL_BUCKETS_DEFAULT) + list(
+    range(
+        PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
+        PREFILL_GRAPH_MAX_BUCKET_DEFAULT + 1,
+        PREFILL_GRAPH_BUCKET_STEP_DEFAULT,
+    )
+)
+# Kept as a public compatibility alias; both platforms now use the configured
+# bucket step and maximum.
+NPU_DEFAULT_PREFILL_BUCKETS = list(DEFAULT_PREFILL_BUCKETS)
 MAX_PAD_RATIO_DEFAULT = 0.10
 MAX_PAD_TOKENS_DEFAULT = 128
 SUPPORTED_NUM_REQS = [1, 2, 3, 4, 5, 6, 7, 8]

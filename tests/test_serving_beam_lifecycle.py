@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any
@@ -60,6 +61,24 @@ async def test_final_wait_fails_when_beamproc_exits(
             4,
             1.0,
         )
+
+
+@pytest.mark.asyncio
+async def test_spawn_background_task_retains_strong_reference() -> None:
+    """asyncio only holds a weak reference to a task once nothing else does;
+    _spawn_background_task must keep a strong one for the task's lifetime
+    (so it can't be silently GC'd mid-run) and release it once done."""
+
+    async def _noop() -> str:
+        return "done"
+
+    task = serving_engine._spawn_background_task(_noop())
+    assert task in serving_engine._background_tasks
+
+    result = await task
+
+    assert result == "done"
+    assert task not in serving_engine._background_tasks
 
 
 class _Tokenizer:
@@ -431,9 +450,10 @@ def test_grouped_beam_request_lifecycle(
 
     assert add_step.await_count == 1
     assert beam_step.await_count == 2
-    assert cleanup.await_count == 1
+    # Cleanup is piggybacked on the final decode step via is_last_step=True
+    assert cleanup.await_count == 0
 
-    decode_step_1, decode_step_2, cleanup_update = engine.beam_updates
+    decode_step_1, decode_step_2 = engine.beam_updates
     assert decode_step_1.session_id == "request-0-step-0-beam-0"
     assert decode_step_1.parent_beam_ids == [
         "request-0-step-0-beam-0",
@@ -445,6 +465,7 @@ def test_grouped_beam_request_lifecycle(
     ]
     assert decode_step_1.beam_tokens == [[11], [12]]
     assert decode_step_1.pruned_ids == []
+    assert decode_step_1.is_last_step is False
 
     assert decode_step_2.parent_beam_ids == [
         "request-0-step-1-beam-0",
@@ -456,10 +477,7 @@ def test_grouped_beam_request_lifecycle(
     ]
     assert decode_step_2.beam_tokens == [[11, 21], [11, 22]]
     assert decode_step_2.pruned_ids == ["request-0-step-1-beam-1"]
-
-    assert cleanup_update.session_id == "request-0-step-0-beam-0"
-    assert cleanup_update.beam_width == 0
-    assert cleanup_update.pruned_ids == decode_step_2.child_beam_ids
+    assert decode_step_2.is_last_step is True
     assert all(update.data_parallel_rank == 1 for update in engine.beam_updates)
     assert engine.prepare_calls[0].data_parallel_rank == 1
     assert all(call.kwargs["data_parallel_rank"] == 1 for call in engine.register_calls)
@@ -563,7 +581,14 @@ def test_terminal_catalog_beams_are_completed_not_lost(
     assert [choice.finish_reason for choice in choices] == ["stop", "stop"]
     assert [choice.token_ids for choice in choices] == [[11, 21], [12, 31]]
     assert [choice.cumulative_logprob for choice in choices] == pytest.approx([-0.6, -0.8])
-    assert engine.beam_updates[-1].beam_width == 0
+    assert len(engine.beam_updates) == 2
+    assert engine.beam_updates[-1].is_last_step is True
+    # dev/60ms fires the terminal _beam_request_cleanup (beam_width=0) via
+    # asyncio.create_task rather than awaiting it, to avoid adding that RPC's
+    # latency to the tail of every early-terminated beam-search request. That
+    # task is not guaranteed to run within this synchronous test, so its
+    # separate beam_width=0 update isn't observable in engine.beam_updates
+    # here (unlike upstream's synchronous/awaited cleanup).
 
 
 def test_grouped_step_exception_still_cleans_up_session(
@@ -599,6 +624,160 @@ def test_grouped_step_exception_still_cleans_up_session(
     assert engine.beam_updates[-1].beam_width == 0
     assert engine.beam_updates[-1].session_id == "request-0-step-0-beam-0"
     assert engine.beam_updates[-1].pruned_ids == engine.beam_updates[0].child_beam_ids
+
+
+def test_pruned_worker_beam_lifecycle(
+    monkeypatch: Any,
+) -> None:
+    """Verify pruned worker outputs (top-W candidates with parent indices in ranks)."""
+    _install_deterministic_request_ids(monkeypatch)
+
+    def _pruned_flat(
+        token_ids: list[int],
+        logprobs: list[float],
+        parent_ranks: list[int],
+    ) -> FlatLogprobs:
+        # _prune_beam_candidates_gpu encodes parent-beam indices as
+        # -(idx + 1) so the serving side can tell them apart from ordinary
+        # (always >= 0) logprob display ranks by sign alone.
+        return FlatLogprobs(
+            start_indices=[0],
+            end_indices=[len(token_ids)],
+            token_ids=token_ids,
+            logprobs=logprobs,
+            ranks=[-(p + 1) for p in parent_ranks],
+            decoded_tokens=[str(t) for t in token_ids],
+        )
+
+    # Beam width 2. Step 0 (prepare) outputs tokens 11, 12.
+    # Step 1: Worker prunes to top 2: token 21 (parent 0, lp -0.1), token 22 (parent 1, lp -0.2)
+    # Step 2: Worker prunes to top 2: token 31 (parent 0, lp -0.1), token 32 (parent 0, lp -0.3)
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(_pruned_flat([21, 22], [-0.1, -0.2], [0, 1])),
+            _engine_output(_pruned_flat([31, 32], [-0.1, -0.3], [0, 0])),
+        ],
+        data_parallel_size=1,
+    )
+    outputs = _run_search(engine, max_tokens=3)
+    assert len(outputs) == 1
+    output = outputs[0]
+    assert output.finished is True
+    assert len(output.outputs) == 2
+    # Verify parent cumulative logprobs were passed to beam_updates
+    decode_step_1, decode_step_2 = engine.beam_updates
+    assert decode_step_1.parent_cum_logprobs is not None
+    assert len(decode_step_1.parent_cum_logprobs) == 2
+    assert decode_step_1.is_last_step is False
+    assert decode_step_2.parent_cum_logprobs is not None
+    assert len(decode_step_2.parent_cum_logprobs) == 2
+    assert decode_step_2.is_last_step is True
+
+
+def test_non_pruned_ranks_within_beam_bounds_do_not_misdetect_as_pruned(
+    monkeypatch: Any,
+) -> None:
+    """A genuine (non-pruned) stride response must not be misread as a
+    worker-pruned one just because its truncated display ranks happen to
+    fall inside [0, len(all_beams)).
+
+    logprobs_num == beam_width here (see beam_search()), so each beam's raw
+    stride block is [sampled_tok, *topk_toks] with ranks
+    [sampled_rank, 1, ..., beam_width]; truncating to k = beam_width drops
+    the one rank (== beam_width) that would fall outside all_beams, leaving
+    only in-bounds values. A bounds-only check (accepting any
+    0 <= rank < len(all_beams)) would misdetect this as pruned and read
+    ranks as parent-beam indices, silently keeping only the first two raw
+    tokens (both 101) and losing every other real candidate (102, 201, 202).
+    """
+    _install_deterministic_request_ids(monkeypatch)
+
+    def _stride_flat(blocks: list[tuple[list[int], list[float]]]) -> FlatLogprobs:
+        token_ids: list[int] = []
+        logprobs: list[float] = []
+        ranks: list[int] = []
+        for toks, lps in blocks:
+            token_ids.extend(toks)
+            logprobs.extend(lps)
+            ranks.extend(range(len(toks)))  # genuine display ranks, all >= 0
+        return FlatLogprobs(
+            start_indices=[0],
+            end_indices=[len(token_ids)],
+            token_ids=token_ids,
+            logprobs=logprobs,
+            ranks=ranks,
+            decoded_tokens=[str(t) for t in token_ids],
+        )
+
+    # beam_width=2 -> logprobs_num=2 -> stride_k=3. Each block:
+    # [sampled, topk_0, topk_1] with sampled == topk_0 (so it dedups to
+    # [topk_0, topk_1], matching the non-pruned "matches" branch).
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(
+                _stride_flat(
+                    [
+                        ([101, 101, 102], [-0.1, -0.1, -0.2]),
+                        ([201, 201, 202], [-0.15, -0.15, -0.25]),
+                    ]
+                )
+            ),
+        ],
+        data_parallel_size=1,
+    )
+    outputs = _run_search(engine, max_tokens=2)
+    assert len(outputs) == 1
+
+    # This is the terminal step (max_tokens=2, one grouped_outputs entry), so
+    # the parsed candidates surface directly in the final token_ids rather
+    # than in a subsequent beam_updates entry.
+    surviving_tokens = {tok for choice in outputs[0].outputs for tok in choice.token_ids}
+    # The misdetected-as-pruned path can only ever surface raw_token_ids[:2]
+    # == [101, 101] (it never reads past index k=beam_width); genuinely
+    # reaching 102 or 201/202 proves the stride path ran instead.
+    assert surviving_tokens & {102, 201, 202}
+
+
+def test_gc_reenabled_before_post_loop_processing(
+    monkeypatch: Any,
+) -> None:
+    """gc.disable() around the decode loop must not stay in effect through
+    the post-loop processing (sorting, catalog fill, logprob reconstruction,
+    batch decode) -- it should bracket only the token decode loop itself, as
+    the PR description states. record_beam_search_metrics is one of the last
+    calls before the final `yield out`, so if GC is still disabled there,
+    the disable window leaked well past the loop."""
+    _install_deterministic_request_ids(monkeypatch)
+
+    observed_gc_enabled: list[bool] = []
+
+    def _record_metrics(*args: Any, **kwargs: Any) -> None:
+        observed_gc_enabled.append(gc.isenabled())
+
+    monkeypatch.setattr(serving_engine, "record_beam_search_metrics", _record_metrics)
+
+    was_enabled = gc.isenabled()
+    if not was_enabled:
+        gc.enable()
+    try:
+        engine = _GroupedEngineClient(
+            prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+            grouped_outputs=[
+                _engine_output(
+                    _combined_flat([([21, 22], [-0.1, -0.11]), ([31, 32], [-5.0, -6.0])])
+                )
+            ],
+            data_parallel_size=1,
+        )
+        outputs = _run_search(engine, max_tokens=2)
+        assert len(outputs) == 1
+    finally:
+        if not was_enabled:
+            gc.disable()
+
+    assert observed_gc_enabled == [True]
 
 
 def test_zero_decode_steps_skip_beamproc_and_model_generation(

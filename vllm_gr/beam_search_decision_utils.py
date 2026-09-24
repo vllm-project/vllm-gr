@@ -11,7 +11,7 @@ an intermediate beam domain model.
 from __future__ import annotations
 
 import threading
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -40,8 +40,7 @@ class GlobalRunningStats:
         with self._lock:
             # 1. Update Maximum
             batch_max = np.max(x)
-            if batch_max > self.max_val:
-                self.max_val = batch_max
+            self.max_val = max(self.max_val, batch_max)
 
             # 2. Calculate Batch Stats for Variance
             batch_mean = np.mean(x)
@@ -221,22 +220,89 @@ def find_eos_indices(token_ids: np.ndarray, eos_token_id: int) -> np.ndarray:
     return np.where(token_ids == eos_token_id)[0]
 
 
+class ChainedTokens(list[int]):
+    """Zero-copy list view that prefixes a shared prompt without allocating full-length copies."""
+
+    __slots__ = ("_len_p", "_len_s", "_prefix", "_suffix")
+
+    def __init__(self, prefix: list[int], suffix: list[int]):
+        super().__init__()
+        self._prefix = prefix
+        self._suffix = suffix
+        self._len_p = len(prefix)
+        self._len_s = len(suffix)
+
+    def __len__(self) -> int:
+        return self._len_p + self._len_s
+
+    def __getitem__(self, idx: Any) -> Any:
+        if isinstance(idx, slice):
+            start = idx.start or 0
+            if start < 0:
+                start += self._len_p + self._len_s
+            if start >= self._len_p:
+                stop = idx.stop
+                if stop is not None and stop < 0:
+                    stop += self._len_p + self._len_s
+                if stop is None:
+                    return self._suffix[start - self._len_p :]
+                return self._suffix[start - self._len_p : stop - self._len_p]
+            return (self._prefix + self._suffix)[idx]
+        if idx < 0:
+            idx += self._len_p + self._len_s
+        if idx < self._len_p:
+            return self._prefix[idx]
+        return self._suffix[idx - self._len_p]
+
+    def append(self, x: int) -> None:
+        self._suffix.append(x)
+        self._len_s += 1
+
+    def __iter__(self) -> Iterator[int]:
+        yield from self._prefix
+        yield from self._suffix
+
+    def __repr__(self) -> str:
+        return f"ChainedTokens(prefix_len={self._len_p}, suffix={self._suffix})"
+
+    # Subclassing list[int] with an empty underlying C-level list (elements
+    # live in _prefix/_suffix instead) means the inherited list.__eq__ /
+    # list.__contains__ / list.__add__ would silently compare against that
+    # empty list rather than the real content -- no current caller in this
+    # module hits that (everything here uses manual indexing and the
+    # explicit ChainedTokens(...) constructor instead), but exposing a
+    # ChainedTokens beyond this module without these would violate the
+    # standard sequence contract, so implement them for real.
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, (list, tuple)):
+            return len(self) == len(other) and all(a == b for a, b in zip(self, other))
+        return NotImplemented
+
+    def __contains__(self, item: Any) -> bool:
+        return item in self._prefix or item in self._suffix
+
+    def __add__(self, other: Any) -> list[int]:
+        return list(self) + list(other)
+
+
 def complete_eos_candidates(
     *,
-    parents: Sequence[BeamSearchSequence],
     token_ids: np.ndarray,
     scores: np.ndarray,
     beam_idx: np.ndarray,
+    parents: Sequence[BeamSearchSequence],
     beam_flat_cache: Sequence[BeamCandidateCache | None],
-    stop_token_ids: Collection[int],
     initial_logprobs: FlatLogprobs,
-    include_eos_token: bool,
-    inherit_lora_request: bool,
+    stop_token_ids: Collection[int],
+    include_eos_token: bool = True,
+    inherit_lora_request: bool = True,
 ) -> tuple[list[BeamSearchSequence], np.ndarray]:
     """Materialize stop-token candidates and mask their scores on a copy."""
 
     eos_beams: list[BeamSearchSequence] = []
     eos_indices = np.where(np.isin(token_ids, tuple(stop_token_ids)))[0]
+    if eos_indices.size == 0:
+        return eos_beams, scores
     for candidate_index in eos_indices:
         if not np.isfinite(scores[candidate_index]):
             continue
@@ -245,9 +311,19 @@ def complete_eos_candidates(
         cached = beam_flat_cache[parent_index]
         assert cached is not None
         stop_token_id = int(token_ids[candidate_index])
+        p_tok = parent.tokens
+        if include_eos_token:
+            if isinstance(p_tok, ChainedTokens):
+                eos_tok = ChainedTokens(p_tok._prefix, p_tok._suffix + [stop_token_id])
+            elif len(p_tok) > 64:
+                eos_tok = ChainedTokens(p_tok, [stop_token_id])
+            else:
+                eos_tok = p_tok + [stop_token_id]
+        else:
+            eos_tok = p_tok
         eos_beam = BeamSearchSequence(
             orig_prompt=parent.orig_prompt,
-            tokens=(parent.tokens + [stop_token_id] if include_eos_token else parent.tokens),
+            tokens=eos_tok,
             logprobs=initial_logprobs,
             cum_logprob=float(scores[candidate_index]),
             finish_reason="stop",
@@ -266,14 +342,12 @@ def complete_eos_candidates(
 def select_top_indices(scores: np.ndarray, beam_width: int) -> np.ndarray:
     """Return top finite-score candidate indices, always at least one.
 
-    ``-inf`` entries (catalog-invalid candidates) are always discarded.  If
-    every entry is ``-inf``, fall back to the single best index so that the
-    beam keeps one candidate alive instead of being eliminated.
+    If all candidates have non-finite scores, returns the single argmax index
+    to match legacy behavior.
     """
     if scores.size == 0:
         return np.empty(0, dtype=np.intp)
-    finite_mask = np.isfinite(scores)
-    finite_idx = np.where(finite_mask)[0]
+    finite_idx = np.where(np.isfinite(scores))[0]
     if finite_idx.size == 0:
         # No finite candidates — keep the beam alive with one index anyway.
         return np.array([int(np.argmax(scores))], dtype=np.intp)
@@ -300,22 +374,37 @@ def materialize_selected_beams(
 
     new_beams: list[BeamSearchSequence] = []
     fork_info: ForkInfo = []
-    for candidate_index in selected_indices:
-        parent_index = int(beam_idx[candidate_index])
-        parent = parents[parent_index]
-        token_id = int(token_ids[candidate_index])
-        cached = beam_flat_cache[parent_index]
+    if len(selected_indices) == 0 or len(parents) == 0:
+        return new_beams, fork_info
+
+    p_indices = beam_idx[selected_indices].tolist()
+    t_ids = token_ids[selected_indices].tolist()
+    scs = scores[selected_indices].tolist()
+    orig_prompt = parents[0].orig_prompt
+    lora_req = parents[0].lora_request
+
+    for p_idx, token_id, sc in zip(p_indices, t_ids, scs):
+        parent = parents[p_idx]
+        cached = beam_flat_cache[p_idx]
         assert cached is not None
+        p_tok = parent.tokens
+        if isinstance(p_tok, ChainedTokens):
+            new_tokens = ChainedTokens(p_tok._prefix, p_tok._suffix + [token_id])
+        elif len(p_tok) > 64:
+            new_tokens = ChainedTokens(p_tok, [token_id])
+        else:
+            new_tokens = p_tok + [token_id]
+
         new_beam = BeamSearchSequence(
-            orig_prompt=parent.orig_prompt,
-            tokens=parent.tokens + [token_id],
+            orig_prompt=orig_prompt,
+            tokens=new_tokens,
             logprobs=initial_logprobs,
-            lora_request=parent.lora_request,
-            cum_logprob=float(scores[candidate_index]),
+            lora_request=lora_req,
+            cum_logprob=float(sc),
         )
         new_beam._lp_parent = parent
         new_beam._lp_step_data = cached
         new_beams.append(new_beam)
-        fork_info.append((parent_index, token_id))
+        fork_info.append((p_idx, token_id))
 
     return new_beams, fork_info
