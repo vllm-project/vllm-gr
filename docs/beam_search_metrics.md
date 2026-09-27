@@ -29,6 +29,12 @@ All metrics are exposed at the `/metrics` endpoint (Prometheus format) with labe
 5. **`vllm_gr_beam_search_total_beams_generated_total`**
    - Total number of beams generated across all requests
 
+6. **`vllm_gr_beam_search_p2d_requests_total`**
+   - Total number of P2D beam search requests processed
+
+7. **`vllm_gr_beam_search_processed_tokens_total`**
+   - Total number of processed tokens across all beam search requests
+
 ### Histogram Metrics (Distributions)
 
 1. **`vllm_gr_beam_search_prefill_duration_seconds`**

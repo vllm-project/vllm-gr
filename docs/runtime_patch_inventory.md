@@ -47,7 +47,7 @@ aligned with it.
 | GR-PATCH-006 | `entrypoints/openai/serving_models.py` | `patch_OpenAIServingModels_init` | required frontend plan finds the constructor absent | `_validate_serving_models_patch`; serving Catalog tests | API server |
 | GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds grouped client methods incomplete | `_validate_batch_and_fork_patch`; BeamRequest and DP tests | API server |
 | GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
-| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; BeamRequest tests | EngineCore |
+| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py`, `v1/core/kv_cache_utils_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; `test_cache_salt.py`, BeamRequest tests | EngineCore |
 | GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `scheduler_metadata.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
 | GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active GPU runner hooks are incomplete | `_validate_model_runner_patch`; GPU and dispatcher tests | GPU worker |
 | GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
@@ -196,6 +196,8 @@ aligned with it.
     - `EngineCoreProc.__init__`
     - `EngineCoreProc.process_input_sockets`
     - `EngineCoreProc.run_engine_core`
+    - `vllm.v1.core.kv_cache_utils.generate_block_hash_extra_keys`
+    - `vllm.v1.request.Request.__init__`
     - GR Beam request handlers
 - Risk: Critical
 - Behavior: integrates grouped Beam request processing into EngineCore.
@@ -232,6 +234,7 @@ aligned with it.
 - Targets:
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
+    - `GPUModelRunner._sample` (bypasses standard sampler and dummy LM head GEMM when P2D result is active)
     - `GPUModelRunner._bookkeeping_sync`
 - Platform: GPU
 - Risk: Critical
@@ -250,14 +253,45 @@ aligned with it.
 - Targets:
     - `NPUModelRunner.execute_model`
     - `NPUModelRunner._prepare_inputs`
-    - `NPUModelRunner._bookkeeping_sync`
+    - `NPUModelRunner._bookkeeping_sync` (beam collapse + shared P2D result branch)
+    - `NPUModelRunner._capture_cudagraphs` (prefill graph capture trigger, GPU parity)
+    - `NPUModelRunner._sample` (P2D sampler bypass)
+    - `NPUModelRunner._model_forward` (prefill-phase batch interception: P2D two-tier
+      priority — monolithic P2D graph (pass 0 + 2 decodes) when the batch matches
+      a monolithic bucket within the 10% padding threshold, otherwise prefill
+      graph/eager prefill + captured 2D decode graph replay — then NPU prefill
+      graph replay)
 - Platform: NPU
 - Risk: Critical
 - Dependencies:
     - NPU-specific private method signatures;
     - the 4-item `_prepare_inputs` result;
     - the 6-item `_bookkeeping_sync` result;
-    - speculative decoding and token-compression state.
+    - speculative decoding and token-compression state;
+    - the NPU prefill graph runner (`vllm_gr/v1/worker/npu_prefill_graph_runner.py`),
+      including the P2D decode-graph capture (`capture_2d_graphs`, 4 static-shape
+      graphs over `{1,2}` reqs x `{32,128}` beams, no bucket dimension), the
+      monolithic capture (`capture_monolithic_p2d_graphs`, one graph per
+      (bucket, num_reqs, beam_width) over `[128, 256, 512, 768, 1024]`), and the
+      replays (`execute_p2d` with staged slot mapping + request/beam block tables,
+      `execute_decode_p2d` with beam-replicated block-table staging);
+    - the NPU attention graph task-group capture path
+      (`vllm_gr/v1/attention/backends/beam_attn_npu.py`): task-group capture,
+      weak-tensor address carriers, per-layer `graph_task_update` on a
+      dedicated stream with `wait_stream` ordering; `p2d_attention` implements
+      the P2D passes with pass-0 paged full-context attention (chunk KV write +
+      FIA over the paged cache), decode prefix attention over the paged KV
+      cache (block-table FIA task groups), and suffix attention via plain torch
+      ops (default, `BeamAttentionImpl.use_manual_p2d_suffix=True`) or FIA task
+      groups; monolithic/decode entries and their per-kind update functions
+      (`update_monolithic_graph_params`, `update_decode_graph_params`);
+    - platform bucket/threshold dispatch in
+      `vllm_gr/v1/worker/prefill_graph_common.py` (shared bucket list
+      `[128, 256, 512, 768, 1024]` on both platforms, `MONOLITHIC_MAX_PAD_RATIO=0.10`,
+      the `max_num_batched_tokens` bucket clamp, the shared decode-pass beam math
+      (`run_decode_passes`, `step0_select_topk`), the universal P2D kill switch
+      (`VLLM_GR_DISABLE_P2D`), and the `kv_cache` pass-through in
+      `BeamAttentionImpl.p2d_forward`).
 - Removal condition: vLLM-Ascend exposes stable grouped input and output adaptation hooks.
 
 ### GR-PATCH-013 — CUSTOM Attention Backend Registration

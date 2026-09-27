@@ -52,6 +52,46 @@ def _restore_modules(saved: dict[str, types.ModuleType]) -> None:
         sys.modules[name] = module
 
 
+def _drop_modules_created_during(
+    prefixes: tuple[str, ...],
+    saved: dict[str, types.ModuleType],
+) -> None:
+    """Remove modules under `prefixes` that were created after the purge snapshot.
+
+    `_restore_modules` only overwrites entries present in the snapshot; modules
+    imported for the first time during the test (e.g. a stub-era
+    ``benchmarks.open_one_rec.one_rec_patch``) would otherwise leak into
+    ``sys.modules`` and shadow the real modules for later test classes.
+    """
+    for name in list(sys.modules):
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes):
+            if name not in saved:
+                sys.modules.pop(name, None)
+
+
+def _rebind_parent_attrs(prefixes: tuple[str, ...]) -> None:
+    """Re-sync parent-package attribute bindings with ``sys.modules``.
+
+    Importing a submodule binds it as an attribute on its parent package, but
+    purge/restore cycles do not undo that binding: after a test that imported
+    a fresh ``vllm.benchmarks`` against stubs, ``vllm.benchmarks`` (the
+    attribute) can point at a discarded module object while ``sys.modules``
+    holds a different one.  Re-bind every module under `prefixes` onto its
+    parent so attribute access and ``sys.modules`` agree again.
+    """
+    for name, module in list(sys.modules.items()):
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes):
+            parent_name, _, child = name.rpartition(".")
+            if not parent_name:
+                continue
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                try:
+                    setattr(parent, child, module)
+                except (AttributeError, TypeError):
+                    pass
+
+
 def _install_stub_third_party() -> dict[str, types.ModuleType]:
     """Install stub modules for third-party libs the patch chain imports.
 
@@ -219,12 +259,15 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
         "RequestFuncInput",
         "RequestFuncOutput",
         "StreamedResponseHandler",
+    ):
+        setattr(erf, sym, type(sym, (), {}))
+    for sym in (
         "_get_chat_content",
         "_update_headers_common",
         "_update_payload_common",
         "_validate_api_url",
     ):
-        setattr(erf, sym, type(sym, (), {}))
+        setattr(erf, sym, lambda *a, **k: None)
     erf.RequestFuncInput.__init__ = lambda self, *a, **k: None
 
     return modules
@@ -284,10 +327,15 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
 
     def tearDown(self) -> None:
         # Drop our stubs first so they don't leak into other tests, then
-        # restore whatever was there before.
+        # restore whatever was there before.  Stub-era repo-local modules
+        # imported against the fake vllm are dropped as well (never drop
+        # real "vllm" modules: re-importing them re-runs module-level side
+        # effects such as torch opaque-type registration).
         for name in list(self._stub_modules):
             sys.modules.pop(name, None)
         _restore_modules(self._saved)
+        _drop_modules_created_during(("vllm_gr", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "vllm_gr", "benchmarks"))
 
     def test_package_import_does_not_patch_vllm(self) -> None:
         """Importing the package alone MUST NOT replace any vllm.benchmarks symbol."""
@@ -538,6 +586,8 @@ class TestOneRecDatasetInitContract(unittest.TestCase):
         for name in list(self._stub_vllm):
             sys.modules.pop(name, None)
         _restore_modules(self._saved)
+        _drop_modules_created_during(("vllm_gr", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "vllm_gr", "benchmarks"))
 
     def _make(self, **overrides):
         """Build a OneRecDataset with defaults that satisfy validation."""
@@ -656,6 +706,8 @@ class TestOneRecDatasetSampleContract(unittest.TestCase):
         for name in list(self._stub_vllm):
             sys.modules.pop(name, None)
         _restore_modules(self._saved)
+        _drop_modules_created_during(("vllm_gr", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "vllm_gr", "benchmarks"))
 
     def _make_dataset(self, **overrides):
         defaults: dict[str, object] = {
@@ -781,6 +833,8 @@ class TestOneRecDatasetExpectedOutputLen(unittest.TestCase):
         for name in list(self._stub_vllm):
             sys.modules.pop(name, None)
         _restore_modules(self._saved)
+        _drop_modules_created_during(("vllm_gr", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "vllm_gr", "benchmarks"))
 
     def _build_for_task(self, task_type: str):
         return self._ds_mod.OneRecDataset(
@@ -858,6 +912,13 @@ class TestPatchTriggerContractWithRealVllm(unittest.TestCase):
 
     def tearDown(self) -> None:
         _restore_modules(self._saved)
+        # The fresh real vllm.benchmarks submodules imported during the test
+        # were patched by a patch-module instance that we also drop below;
+        # removing them keeps the restored snapshot consistent (the patch
+        # module binds submodules onto whatever vllm.benchmarks package is
+        # in sys.modules at import time).
+        _drop_modules_created_during(("vllm.benchmarks", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "benchmarks"))
 
     def test_package_import_does_not_patch_real_vllm(self) -> None:
         # isort: off
@@ -926,6 +987,8 @@ class TestMakeMetadataSerializable(unittest.TestCase):
         for name in list(self._stub_vllm):
             sys.modules.pop(name, None)
         _restore_modules(self._saved)
+        _drop_modules_created_during(("vllm_gr", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "vllm_gr", "benchmarks"))
 
     def test_drops_answer_and_injects_row_index(self) -> None:
         meta = {"answer": "gt_value", "answer_pid": [1, 2], "extra": "keep"}
@@ -1004,6 +1067,8 @@ class TestPatchedValidateArgs(unittest.TestCase):
         for name in list(self._stub_vllm):
             sys.modules.pop(name, None)
         _restore_modules(self._saved)
+        _drop_modules_created_during(("vllm_gr", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "vllm_gr", "benchmarks"))
 
     def _args(self, **overrides):
         from argparse import Namespace
@@ -1054,6 +1119,373 @@ class TestPatchedValidateArgs(unittest.TestCase):
             self.assertIs(calls[0], args)
         finally:
             self._patch_mod.original_validate_args = original
+
+
+class TestP2DModeOption(unittest.TestCase):
+    """Unit tests for --p2d-mode CLI option parsing and vllm_xargs handling."""
+
+    _STUB_PREFIXES = (
+        "vllm",
+        # setUp replaces the parent package itself, so save and restore the
+        # complete tree.  Saving only sampling_params leaves already-imported
+        # children in sys.modules without rebinding them on the restored
+        # vllm_gr package, making later string-based monkeypatch resolution
+        # depend on test order.
+        "vllm_gr",
+        "vllm_gr.sampling_params",
+        "benchmarks.open_one_rec",
+    )
+
+    def setUp(self) -> None:
+        self._saved = _purge_modules(*self._STUB_PREFIXES)
+        self._stubs = _install_stub_vllm_benchmarks()
+        self._stubs.update(_install_stub_third_party())
+        vllm_gr = types.ModuleType("vllm_gr")
+        vllm_gr.__path__ = []
+        sys.modules["vllm_gr"] = vllm_gr
+        self._stubs["vllm_gr"] = vllm_gr
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        self._patch_mod = patch_mod
+
+    def tearDown(self) -> None:
+        for name in list(self._stubs.keys()):
+            sys.modules.pop(name, None)
+        _restore_modules(self._saved)
+        _drop_modules_created_during(("vllm_gr", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "vllm_gr", "benchmarks"))
+
+    def test_get_p2d_mode_from_argv(self) -> None:
+        with mock.patch.object(sys, "argv", ["script.py", "--p2d-mode", "eager_p2d"]):
+            val = self._patch_mod._get_p2d_mode_from_argv()
+            self.assertEqual(val, "eager_p2d")
+
+        with mock.patch.object(sys, "argv", ["script.py"]):
+            val = self._patch_mod._get_p2d_mode_from_argv()
+            self.assertIsNone(val)
+
+    def test_add_beams_arguments_registers_p2d_mode(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        self._patch_mod._add_beams_arguments(parser)
+        args = parser.parse_args(["--p2d-mode", "monolithic"])
+        self.assertEqual(args.p2d_mode, "monolithic")
+
+
+class TestStepBeamWidthsOption(unittest.TestCase):
+    """Verifies --step-beam-widths plumbing in one_rec_patch."""
+
+    def setUp(self) -> None:
+        self._saved = _purge_modules(
+            "vllm",
+            "vllm_gr",
+            "benchmarks.open_one_rec",
+        )
+        self._stub_vllm = _install_stub_vllm_benchmarks()
+        self._stub_vllm.update(_install_stub_third_party())
+        vllm_gr = types.ModuleType("vllm_gr")
+        vllm_gr.__path__ = []
+        sys.modules["vllm_gr"] = vllm_gr
+        self._stub_vllm["vllm_gr"] = vllm_gr
+
+        from benchmarks.open_one_rec import one_rec_patch as patch_mod
+
+        self._patch_mod = patch_mod
+
+    def tearDown(self) -> None:
+        for name in list(self._stub_vllm):
+            sys.modules.pop(name, None)
+        _restore_modules(self._saved)
+        _drop_modules_created_during(("vllm_gr", "benchmarks.open_one_rec"), self._saved)
+        _rebind_parent_attrs(("vllm", "vllm_gr", "benchmarks"))
+
+    def test_get_step_beam_widths_from_argv_tokens(self) -> None:
+        with mock.patch.object(sys, "argv", ["script.py", "--step-beam-widths", "128,64,32"]):
+            self.assertEqual(self._patch_mod._get_step_beam_widths_from_argv(), [128, 64, 32])
+
+    def test_get_step_beam_widths_from_argv_equals(self) -> None:
+        with mock.patch.object(sys, "argv", ["script.py", "--step-beam-widths=128,64,32"]):
+            self.assertEqual(self._patch_mod._get_step_beam_widths_from_argv(), [128, 64, 32])
+
+    def test_get_step_beam_widths_from_argv_malformed(self) -> None:
+        for bad in ("128,64", "128,-1,32", "abc,1,2", "128,64,32,16"):
+            with mock.patch.object(sys, "argv", ["script.py", "--step-beam-widths", bad]):
+                self.assertIsNone(self._patch_mod._get_step_beam_widths_from_argv())
+
+    def test_get_step_beam_widths_from_argv_absent(self) -> None:
+        with mock.patch.object(sys, "argv", ["script.py"]):
+            self.assertIsNone(self._patch_mod._get_step_beam_widths_from_argv())
+
+    def test_parse_step_beam_widths_value(self) -> None:
+        self.assertEqual(self._patch_mod._parse_step_beam_widths_value("128,64,32"), [128, 64, 32])
+        self.assertIsNone(self._patch_mod._parse_step_beam_widths_value("128,64"))
+        self.assertIsNone(self._patch_mod._parse_step_beam_widths_value("abc"))
+        self.assertIsNone(self._patch_mod._parse_step_beam_widths_value(None))
+
+    def test_add_beams_arguments_registers_step_beam_widths(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        self._patch_mod._add_beams_arguments(parser)
+        args = parser.parse_args(["--step-beam-widths", "32,128,32"])
+        self.assertEqual(args.step_beam_widths, "32,128,32")
+
+    def test_request_func_input_carries_step_beam_widths(self) -> None:
+        from benchmarks.open_one_rec.one_rec_patch import RequestFuncInput
+
+        req = RequestFuncInput(model="m", prompt="p", step_beam_widths=[128, 64, 32])
+        self.assertEqual(req.step_beam_widths, [128, 64, 32])
+        req_default = RequestFuncInput(model="m", prompt="p")
+        self.assertEqual(req_default.step_beam_widths, self._patch_mod.ARGS_STEP_BEAM_WIDTHS)
+
+    def test_patched_async_request_openai_chat_completions_includes_step_beam_widths(
+        self,
+    ) -> None:
+        import asyncio
+
+        from benchmarks.open_one_rec.one_rec_patch import RequestFuncInput
+
+        patch = self._patch_mod
+        patch._validate_api_url = lambda *a, **k: None
+        patch._update_payload_common = lambda *a, **k: None
+        patch._update_headers_common = lambda *a, **k: None
+        patch._get_chat_content = lambda *a, **k: "hello"
+        patch.RequestFuncOutput = type("RequestFuncOutput", (), {})
+        patch.StreamedResponseHandler = type("StreamedResponseHandler", (), {})
+
+        async def _run():
+            fake_resp = mock.MagicMock()
+            fake_resp.status = 400
+            fake_resp.__aenter__ = mock.AsyncMock(return_value=fake_resp)
+            fake_resp.__aexit__ = mock.AsyncMock(return_value=False)
+            fake_session = mock.MagicMock()
+            fake_session.post.return_value = fake_resp
+            req = RequestFuncInput(model="m", prompt="p", step_beam_widths=[128, 64, 32])
+            req.api_url = "http://localhost:8000/v1/chat/completions"
+            req.model_name = None
+            req.model = "m"
+            req.output_len = 8
+            req.prompt_len = 10
+            await patch.patched_async_request_openai_chat_completions(req, fake_session)
+            return fake_session.post.call_args.kwargs["json"]
+
+        payload = asyncio.run(_run())
+        self.assertEqual(payload["vllm_xargs"]["step_beam_widths"], [128, 64, 32])
+        self.assertTrue(payload["use_beam_search"])
+        self.assertEqual(payload["n"], 32)
+
+        async def _run_absent():
+            fake_resp = mock.MagicMock()
+            fake_resp.status = 400
+            fake_resp.__aenter__ = mock.AsyncMock(return_value=fake_resp)
+            fake_resp.__aexit__ = mock.AsyncMock(return_value=False)
+            fake_session = mock.MagicMock()
+            fake_session.post.return_value = fake_resp
+            req = RequestFuncInput(model="m", prompt="p")
+            req.api_url = "http://localhost:8000/v1/chat/completions"
+            req.model_name = None
+            req.model = "m"
+            req.output_len = 8
+            req.prompt_len = 10
+            await patch.patched_async_request_openai_chat_completions(req, fake_session)
+            return fake_session.post.call_args.kwargs["json"]
+
+        payload_absent = asyncio.run(_run_absent())
+        self.assertNotIn("step_beam_widths", payload_absent["vllm_xargs"])
+
+
+class TestPrintBeamSearchDelta(unittest.TestCase):
+    def test_print_beam_search_delta_format(self):
+        import io
+        from unittest.mock import patch
+
+        from benchmarks.open_one_rec.one_rec_patch import _print_beam_search_delta
+
+        before = {
+            "requests": 0,
+            "p2d_requests": 0,
+            "execution_time": 0.0,
+            "prefill_time": 0.0,
+            "decode_time": 0.0,
+            "sort_time": 0.0,
+        }
+        after = {
+            "requests": 10,
+            "p2d_requests": 10,
+            "execution_time": 1.0,
+            "prefill_time": 0.0,
+            "decode_time": 0.0,
+            "sort_time": 0.0,
+            "_seen": {"requests", "p2d_requests"},
+        }
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            _print_beam_search_delta(before, after)
+
+        output = buf.getvalue()
+        self.assertIn("P2D Requests:                            10", output)
+        self.assertIn("Beam Search Requests (total):            10", output)
+        self.assertNotIn("Tier 1 Requests", output)
+        self.assertNotIn("Tier 2 Requests", output)
+        self.assertNotIn("Tier 3 Requests", output)
+        self.assertNotIn("Eager Requests", output)
+        self.assertNotIn("Graph Requests", output)
+
+
+class TestPatchedAsyncRequestOpenAIChatCompletionsStreaming(unittest.TestCase):
+    """Verifies that patched_async_request_openai_chat_completions handles
+
+    empty SSE lines, keepalive comments, malformed chunks, and chunk boundaries
+    robustly without crashing with json.decoder.JSONDecodeError.
+    """
+
+    def setUp(self):
+        from vllm.benchmarks.lib.endpoint_request_func import (
+            RequestFuncOutput,
+            StreamedResponseHandler,
+        )
+
+        from benchmarks.open_one_rec import one_rec_patch as patch
+
+        self.patch = patch
+        self._orig_validate = getattr(patch, "_validate_api_url", None)
+        self._orig_update_headers = getattr(patch, "_update_headers_common", None)
+        self._orig_update_payload = getattr(patch, "_update_payload_common", None)
+        self._orig_get_chat = getattr(patch, "_get_chat_content", None)
+        self._orig_handler = getattr(patch, "StreamedResponseHandler", None)
+        self._orig_output = getattr(patch, "RequestFuncOutput", None)
+
+        patch._validate_api_url = lambda *a, **k: None
+        patch._update_headers_common = lambda *a, **k: None
+        patch._update_payload_common = lambda *a, **k: None
+        patch._get_chat_content = lambda *a, **k: [{"type": "text", "text": "p"}]
+        patch.StreamedResponseHandler = StreamedResponseHandler
+        patch.RequestFuncOutput = RequestFuncOutput
+
+    def tearDown(self):
+        patch = self.patch
+        if self._orig_validate is not None:
+            patch._validate_api_url = self._orig_validate
+        if self._orig_update_headers is not None:
+            patch._update_headers_common = self._orig_update_headers
+        if self._orig_update_payload is not None:
+            patch._update_payload_common = self._orig_update_payload
+        if self._orig_get_chat is not None:
+            patch._get_chat_content = self._orig_get_chat
+        if self._orig_handler is not None:
+            patch.StreamedResponseHandler = self._orig_handler
+        if self._orig_output is not None:
+            patch.RequestFuncOutput = self._orig_output
+
+    def _create_mock_response(self, chunks: list[bytes]):
+        class MockContent:
+            def __init__(self, data):
+                self._data = data
+
+            async def iter_any(self):
+                for c in self._data:
+                    yield c
+
+        fake_resp = mock.MagicMock()
+        fake_resp.status = 200
+        fake_resp.reason = "OK"
+        fake_resp.content = MockContent(chunks)
+        fake_resp.__aenter__ = mock.AsyncMock(return_value=fake_resp)
+        fake_resp.__aexit__ = mock.AsyncMock(return_value=False)
+        return fake_resp
+
+    def test_handles_empty_lines_and_sse_pings_without_json_decode_error(self):
+        import asyncio
+
+        from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
+
+        from benchmarks.open_one_rec import one_rec_patch as patch
+
+        chunks = [
+            b": keepalive\n\n",
+            b"data:\n\n",
+            b"data: \n\n",
+            b"event: ping\n\n",
+            b"id: 12345\n\n",
+            b'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        fake_resp = self._create_mock_response(chunks)
+        fake_session = mock.MagicMock()
+        fake_session.post.return_value = fake_resp
+
+        req = RequestFuncInput(
+            prompt="p",
+            api_url="http://localhost:8000/v1/chat/completions",
+            prompt_len=10,
+            output_len=8,
+            model="m",
+        )
+
+        output = asyncio.run(patch.patched_async_request_openai_chat_completions(req, fake_session))
+        self.assertTrue(output.success)
+        self.assertEqual(output.generated_text, "hello")
+        self.assertFalse(output.error)
+
+    def test_handles_split_chunks_across_tcp_packets(self):
+        import asyncio
+
+        from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
+
+        from benchmarks.open_one_rec import one_rec_patch as patch
+
+        chunks = [
+            b'data: {"choices": [{"delta": {"content": "wo',
+            b'rld"}}]}\n',
+            b"\ndata: [DONE]\n\n",
+        ]
+        fake_resp = self._create_mock_response(chunks)
+        fake_session = mock.MagicMock()
+        fake_session.post.return_value = fake_resp
+
+        req = RequestFuncInput(
+            prompt="p",
+            api_url="http://localhost:8000/v1/chat/completions",
+            prompt_len=10,
+            output_len=8,
+            model="m",
+        )
+
+        output = asyncio.run(patch.patched_async_request_openai_chat_completions(req, fake_session))
+        self.assertTrue(output.success)
+        self.assertEqual(output.generated_text, "world")
+        self.assertFalse(output.error)
+
+    def test_handles_malformed_chunk_gracefully(self):
+        import asyncio
+
+        from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
+
+        from benchmarks.open_one_rec import one_rec_patch as patch
+
+        chunks = [
+            b"data: {bad json\n\n",
+            b'data: {"choices": [{"delta": {"content": "good"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        fake_resp = self._create_mock_response(chunks)
+        fake_session = mock.MagicMock()
+        fake_session.post.return_value = fake_resp
+
+        req = RequestFuncInput(
+            prompt="p",
+            api_url="http://localhost:8000/v1/chat/completions",
+            prompt_len=10,
+            output_len=8,
+            model="m",
+        )
+
+        output = asyncio.run(patch.patched_async_request_openai_chat_completions(req, fake_session))
+        self.assertTrue(output.success)
+        self.assertEqual(output.generated_text, "good")
+        self.assertFalse(output.error)
 
 
 if __name__ == "__main__":

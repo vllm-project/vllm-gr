@@ -235,3 +235,106 @@ def test_compact_output_matches_full_without_materialization(
 def test_invalid_output_mode_fails_before_inference() -> None:
     with pytest.raises(ValueError, match="output_mode"):
         GRLLM.beam_search(SimpleNamespace(), [], _lazy_params(), output_mode="invalid")
+
+
+def _p2d_root(initial_logprobs: FlatLogprobs) -> BeamSearchSequence:
+    root = BeamSearchSequence(
+        orig_prompt=tokens_input([10, 11]),
+        tokens=[],
+        logprobs=initial_logprobs,
+        lora_request=None,
+        cum_logprob=0.0,
+    )
+    root._prompt_token_ids = [10, 11, 1]
+    root._lp_parent = None
+    root._lp_step_data = None
+    return root
+
+
+def test_materialize_p2d_final_beams_offline() -> None:
+    from vllm_gr.entrypoints.gr import _materialize_p2d_final_beams
+    from vllm_gr.logprobs import reconstruct_beam_logprobs_batch
+    from vllm_gr.v1.worker.prefill_graph_runner import P2D_SENTINEL_RANK
+
+    # begin token id 1 seeds the shared initial logprobs; beams carry three
+    # generated tokens each.  The third beam is a worker-marked dead beam.
+    initial_logprobs = FlatLogprobs()
+    initial_logprobs.append_fast([1], [0.0], [None], [None])
+    flat = FlatLogprobs(
+        start_indices=[0],
+        end_indices=[9],
+        token_ids=[20, 21, 22, 30, 31, 32, -1, -1, -1],
+        logprobs=[-0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -10.0, -10.0, -10.0],
+        ranks=[P2D_SENTINEL_RANK] * 9,
+        decoded_tokens=[None] * 9,
+    )
+    root = _p2d_root(initial_logprobs)
+
+    beams = _materialize_p2d_final_beams(
+        flat=flat,
+        root=root,
+        beam_width=3,
+        num_steps=3,
+        ignore_eos=False,
+        eos_token_id=2,
+        sid_end_token_id=3,
+    )
+
+    # Dead beam skipped; live beams carry the full tail including sid_end.
+    assert [beam.tokens for beam in beams] == [[20, 21, 22, 3], [30, 31, 32, 3]]
+    assert [beam.cum_logprob for beam in beams] == [pytest.approx(-0.6), pytest.approx(-1.5)]
+    assert [beam.finish_reason for beam in beams] == [None, None]
+
+    # Lazy logprob reconstruction replays the same per-step structure as the
+    # engine-driven fork loop: begin + one segment per generated token + end.
+    reconstruct_beam_logprobs_batch(beams, initial_logprobs, sid_end_token_id=3)
+    assert list(beams[0].logprobs.token_ids) == [1, 20, 21, 22, 3]
+    assert list(beams[0].logprobs.logprobs) == [
+        pytest.approx(v) for v in (0.0, -0.1, -0.2, -0.3, 0.0)
+    ]
+
+    # EOS pruning: a beam whose second token is EOS terminates there, drops the
+    # post-EOS tokens, and never appends the session-end marker.
+    eos_flat = FlatLogprobs(
+        start_indices=[0],
+        end_indices=[3],
+        token_ids=[20, 2, 22],
+        logprobs=[-0.1, -0.2, -0.3],
+        ranks=[P2D_SENTINEL_RANK] * 3,
+        decoded_tokens=[None] * 3,
+    )
+    eos_beams = _materialize_p2d_final_beams(
+        flat=eos_flat,
+        root=root,
+        beam_width=1,
+        num_steps=3,
+        ignore_eos=False,
+        eos_token_id=2,
+        sid_end_token_id=3,
+    )
+    assert eos_beams[0].tokens == [20, 2]
+    assert eos_beams[0].cum_logprob == pytest.approx(-0.3)
+    assert eos_beams[0].finish_reason == "stop"
+    reconstruct_beam_logprobs_batch(eos_beams, initial_logprobs, sid_end_token_id=3)
+    assert list(eos_beams[0].logprobs.token_ids) == [1, 20, 2]
+
+    # Nested first-row unwrap (serving-engine wire shape) is accepted.
+    nested = FlatLogprobs(
+        start_indices=[0],
+        end_indices=[3],
+        token_ids=[[20, 21, 22]],
+        logprobs=[[-0.1, -0.2, -0.3]],
+        ranks=[P2D_SENTINEL_RANK],
+        decoded_tokens=[None],
+    )
+    nested_beams = _materialize_p2d_final_beams(
+        flat=nested,
+        root=root,
+        beam_width=1,
+        num_steps=3,
+        ignore_eos=False,
+        eos_token_id=2,
+        sid_end_token_id=None,
+    )
+    assert nested_beams[0].tokens == [20, 21, 22]
+    assert nested_beams[0].cum_logprob == pytest.approx(-0.6)

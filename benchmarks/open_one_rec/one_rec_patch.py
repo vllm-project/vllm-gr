@@ -59,20 +59,30 @@ def _fetch_prometheus_metrics(metrics_url: str) -> dict:
             return {}
 
         metrics = {
+            "execution_time": 0.0,
             "prefill_time": 0.0,
             "decode_time": 0.0,
             "sort_time": 0.0,
             "requests": 0.0,
+            "p2d_requests": 0.0,
             "beams": 0.0,
         }
 
         metric_names = {
+            "execution_time": "vllm_gr_beam_search_execution_time_seconds_total",
             "prefill_time": "vllm_gr_beam_search_prefill_time_seconds_total",
             "decode_time": "vllm_gr_beam_search_decode_time_seconds_total",
             "sort_time": "vllm_gr_beam_search_sort_time_seconds_total",
             "requests": "vllm_gr_beam_search_requests_total",
+            "p2d_requests": "vllm_gr_beam_search_p2d_requests_total",
+            "p2d_requests_legacy": "vllm_gr_beam_search_execution_duration_seconds_count",
             "beams": "vllm_gr_beam_search_total_beams_generated_total",
         }
+
+        # Track which metrics were actually exported by the server so we can
+        # detect servers running an older vllm_gr without the expected
+        # counters (in that case the fields would silently report 0).
+        seen: set[str] = set()
 
         # Parse exposition format line-by-line
         for line in response.text.split("\n"):
@@ -86,11 +96,17 @@ def _fetch_prometheus_metrics(metrics_url: str) -> dict:
                     try:
                         value = float(line.split()[-1])
                         metrics[key] = value
+                        seen.add(key)
                     except (ValueError, IndexError):
                         pass
 
+        if "p2d_requests" not in seen and "p2d_requests_legacy" in seen:
+            metrics["p2d_requests"] = metrics.get("p2d_requests_legacy", 0.0)
+            seen.add("p2d_requests")
+
+        metrics["_seen"] = seen
         return metrics
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {}
 
 
@@ -111,16 +127,24 @@ def _print_beam_search_delta(before: dict, after: dict):
     num = after.get("requests", 0) - before.get("requests", 0)
     if num <= 0:
         return
+    avg_exec = (after.get("execution_time", 0) - before.get("execution_time", 0)) / num
     avg_prefill = (after.get("prefill_time", 0) - before.get("prefill_time", 0)) / num
     avg_decode = (after.get("decode_time", 0) - before.get("decode_time", 0)) / num
     avg_sort = (after.get("sort_time", 0) - before.get("sort_time", 0)) / num
-    total = avg_prefill + avg_decode + avg_sort
+    p2d_reqs = after.get("p2d_requests", 0) - before.get("p2d_requests", 0)
+    seen_after = after.get("_seen", set())
+    total = avg_exec + avg_prefill + avg_decode + avg_sort
+    if "p2d_requests" in seen_after or "p2d_requests_legacy" in seen_after:
+        p2d_reqs = max(0.0, min(float(num), p2d_reqs))
+    elif avg_exec > 0 and avg_prefill == 0 and avg_decode == 0:
+        p2d_reqs = float(num)
+    else:
+        p2d_reqs = 0.0
+
     print("---------------Beam Search Metrics----------------")
-    print(f"Avg Prefill Time (ms):                   {avg_prefill * 1000:.2f}")
-    print(f"Avg Decode Time (ms):                    {avg_decode * 1000:.2f}")
-    print(f"Avg Sort Time (ms):                      {avg_sort * 1000:.3f}")
     print(f"Total Beam Time (ms):                    {total * 1000:.2f}")
-    print(f"Beam Search Requests:                    {int(num)}")
+    print(f"P2D Requests:                            {int(p2d_reqs)}")
+    print(f"Beam Search Requests (total):            {int(num)}")
     print("=" * 50)
 
 
@@ -177,9 +201,74 @@ def _get_output_len_from_argv():
     return 0
 
 
+def _get_beam_star_from_argv():
+    """
+    Parses sys.argv to find the value for --beam-star.
+    NOTE: Reading directly from sys.argv at module import is a fallback
+    for when RequestFuncInput is initialized directly.
+    """
+    try:
+        if "--beam-star" in sys.argv:
+            idx = sys.argv.index("--beam-star")
+            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
+                return float(sys.argv[idx + 1])
+            return 3.3
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _get_p2d_mode_from_argv():
+    """Parses sys.argv to find the value for --p2d-mode."""
+    try:
+        if "--p2d-mode" in sys.argv:
+            idx = sys.argv.index("--p2d-mode")
+            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
+                return sys.argv[idx + 1].lower()
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _parse_step_beam_widths_value(raw_value: str | None) -> list[int] | None:
+    """Validates a step-beam-widths string: 3 positive integers, else None."""
+    if raw_value is None:
+        return None
+    try:
+        widths = [int(x.strip()) for x in raw_value.split(",") if x.strip()]
+    except (TypeError, ValueError) as exc:
+        logger.warning("Invalid --step-beam-widths=%r: %r; ignoring.", raw_value, exc)
+        return None
+    if len(widths) != 3 or any(w <= 0 for w in widths):
+        logger.warning(
+            "Invalid --step-beam-widths=%r: expected 3 positive integers; ignoring.",
+            raw_value,
+        )
+        return None
+    return widths
+
+
+def _get_step_beam_widths_from_argv():
+    """Parses sys.argv to find --step-beam-widths (space- or equals-separated)."""
+    try:
+        for idx, arg in enumerate(sys.argv):
+            if arg.startswith("--step-beam-widths="):
+                return _parse_step_beam_widths_value(arg.split("=", 1)[1])
+            if arg == "--step-beam-widths" and idx + 1 < len(sys.argv):
+                next_arg = sys.argv[idx + 1]
+                if not next_arg.startswith("-"):
+                    return _parse_step_beam_widths_value(next_arg)
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
 USE_BEAM_SEARCH = _consume_use_beam_search_flag()
 ARGS_N_BEAMS = _get_n_beams_from_argv()
 ARGS_OUTPUT_LEN = _get_output_len_from_argv()
+ARGS_BEAM_STAR = _get_beam_star_from_argv()
+ARGS_P2D_MODE = _get_p2d_mode_from_argv()
+ARGS_STEP_BEAM_WIDTHS = _get_step_beam_widths_from_argv()
 
 # ============================================================================
 # Beam Search Patching
@@ -193,12 +282,18 @@ def __init__(
     use_beam_search=USE_BEAM_SEARCH,
     n=ARGS_N_BEAMS,
     args_output_len=ARGS_OUTPUT_LEN,
+    beam_star=ARGS_BEAM_STAR,
+    p2d_mode=ARGS_P2D_MODE,
+    step_beam_widths=ARGS_STEP_BEAM_WIDTHS,
     **kwargs,
 ):
     """Patched init to support beam search parameters."""
     original_init(self, *args, **kwargs)
     self.use_beam_search = use_beam_search
     self.n = n
+    self.beam_star = beam_star
+    self.p2d_mode = p2d_mode
+    self.step_beam_widths = step_beam_widths
     if args_output_len > 0:
         logger.info(f"Setting output_len to {args_output_len} based on command line argument")
         self.output_len = args_output_len
@@ -221,29 +316,52 @@ async def patched_async_request_openai_chat_completions(
     temperature = 0.0
     if hasattr(request_func_input, "temperature") and request_func_input.temperature is not None:
         temperature = request_func_input.temperature
-    elif hasattr(request_func_input, "extra_body") and request_func_input.extra_body is not None:
-        if (
-            hasattr(request_func_input.extra_body, "temperature")
-            and request_func_input.extra_body.temperature is not None
-        ):
-            temperature = request_func_input.extra_body.temperature
+    elif (
+        hasattr(request_func_input, "extra_body")
+        and request_func_input.extra_body is not None
+        and hasattr(request_func_input.extra_body, "temperature")
+        and request_func_input.extra_body.temperature is not None
+    ):
+        temperature = request_func_input.extra_body.temperature
+    vllm_xargs = {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"}
+    beam_star_val = getattr(request_func_input, "beam_star", None)
+    if beam_star_val is None:
+        beam_star_val = ARGS_BEAM_STAR
+    if beam_star_val is not None:
+        vllm_xargs["beam_star"] = True
+        vllm_xargs["beam_star_coef"] = float(beam_star_val)
+
+    step_bw = getattr(request_func_input, "step_beam_widths", None) or ARGS_STEP_BEAM_WIDTHS
+    if step_bw:
+        vllm_xargs["step_beam_widths"] = [int(w) for w in step_bw]
+    # When --n was not passed (defaults to 1) but step widths are active, size
+    # the request's beam count to the final width so the response carries w2
+    # beams and the engine reserves enough logprob space.
+    request_n = request_func_input.n
+    if step_bw and request_n in (None, 1):
+        request_n = step_bw[-1]
+
     payload = {
-        "model": request_func_input.model_name
-        if request_func_input.model_name
-        else request_func_input.model,
+        "model": (
+            request_func_input.model_name
+            if request_func_input.model_name
+            else request_func_input.model
+        ),
         "messages": [
             {"role": "user", "content": content},
         ],
-        "use_beam_search": request_func_input.use_beam_search,
-        "n": request_func_input.n,
+        "use_beam_search": bool(request_func_input.use_beam_search) or (step_bw is not None),
+        "n": request_n,
         "temperature": temperature,
         "max_tokens": request_func_input.output_len,
         "stream": True,
         "stream_options": {
             "include_usage": True,
         },
-        "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
+        "vllm_xargs": vllm_xargs,
     }
+    if getattr(request_func_input, "p2d_mode", None):
+        payload["extra_body"] = {"p2d_mode": request_func_input.p2d_mode}
     _update_payload_common(payload, request_func_input)
 
     headers = {
@@ -265,45 +383,55 @@ async def patched_async_request_openai_chat_completions(
             if response.status == HTTP_OK:
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
-                    chunk_bytes = chunk_bytes.strip()
                     if not chunk_bytes:
                         continue
 
                     messages = handler.add_chunk(chunk_bytes)
                     for message in messages:
+                        message = message.strip()
+                        if not message:
+                            continue
+
                         # NOTE: SSE comments (often used as pings) start with
                         # a colon. These are not JSON data payload and should
                         # be skipped.
-                        if message.startswith(":"):
+                        if message.startswith((":", "event:", "id:")):
                             continue
 
-                        chunk = message.removeprefix("data: ")
+                        if not message.startswith("data:"):
+                            continue
 
-                        if chunk != "[DONE]":
-                            timestamp = time.perf_counter()
+                        chunk = message.removeprefix("data:").strip()
+                        if not chunk or chunk == "[DONE]":
+                            continue
+
+                        timestamp = time.perf_counter()
+                        try:
                             data = json.loads(chunk)
+                        except json.JSONDecodeError:
+                            continue
 
-                            if choices := data.get("choices"):
-                                delta = choices[0]["delta"]
-                                content = delta.get("content")
-                                reasoning_content = delta.get("reasoning_content")
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
+                        if choices := data.get("choices"):
+                            delta = choices[0]["delta"]
+                            content = delta.get("content")
+                            reasoning_content = delta.get("reasoning_content")
+                            # First token
+                            if ttft == 0.0:
+                                ttft = timestamp - st
+                                output.ttft = ttft
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
 
-                                if reasoning_content:
-                                    generated_text += reasoning_content
-                                if content:
-                                    generated_text += content
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
+                            if reasoning_content:
+                                generated_text += reasoning_content
+                            if content:
+                                generated_text += content
+                        elif usage := data.get("usage"):
+                            output.output_tokens = usage.get("completion_tokens")
 
-                            most_recent_timestamp = timestamp
+                        most_recent_timestamp = timestamp
 
                 output.generated_text = generated_text
                 output.success = True
@@ -311,7 +439,7 @@ async def patched_async_request_openai_chat_completions(
             else:
                 output.error = response.reason or ""
                 output.success = False
-    except Exception:
+    except Exception:  # noqa: BLE001
         output.success = False
         exc_info = sys.exc_info()
         output.error = "".join(traceback.format_exception(*exc_info))
@@ -391,6 +519,30 @@ def _add_beams_arguments(parser):
             type=int,
             default=ARGS_N_BEAMS,
             help="Number of beams for beam search",
+        )
+    if not _has_option(parser, "--beam-star"):
+        beams_group.add_argument(
+            "--beam-star",
+            type=float,
+            nargs="?",
+            const=3.3,
+            default=None,
+            help="Enable beam* candidate path masking with given coefficient (default: 3.3)",
+        )
+    if not _has_option(parser, "--p2d-mode"):
+        beams_group.add_argument(
+            "--p2d-mode",
+            type=str,
+            default=None,
+            choices=["auto", "monolithic", "eager_p2d"],
+            help="P2D execution mode override: auto, monolithic, or eager_p2d",
+        )
+    if not _has_option(parser, "--step-beam-widths"):
+        beams_group.add_argument(
+            "--step-beam-widths",
+            type=str,
+            default=None,
+            help="Comma-separated per-step beam widths (W0,W1,W2) for P2D.",
         )
 
 
@@ -561,9 +713,36 @@ def _run_offline_beam_search_benchmark(args):
     if hasattr(BeamSearchParams, "begin_token"):
         params.begin_token = "<|sid_begin|>"
         params.end_token = "<|sid_end|>"
+    beam_star_val = getattr(args, "beam_star", ARGS_BEAM_STAR)
+    if beam_star_val is not None:
+        params.beam_star = True
+        params.beam_star_coef = float(beam_star_val)
+    step_bw = getattr(args, "step_beam_widths", None) or ARGS_STEP_BEAM_WIDTHS
+    widths = None
+    if step_bw:
+        if isinstance(step_bw, str):
+            widths = _parse_step_beam_widths_value(step_bw)
+        elif isinstance(step_bw, (list, tuple)):
+            widths = [int(w) for w in step_bw]
+    if widths and hasattr(BeamSearchParams, "step_beam_widths"):
+        params.step_beam_widths = widths
 
     logger.info(f"Running beam search benchmark with {beam_width} beams on {len(prompts)} prompts")
     logger.info(f"Max tokens per request: {max_tokens}")
+
+    # The throughput CLI registers --max-logprobs through
+    # AsyncEngineArgs.add_cli_args with a default of 20, so the attribute is
+    # always present even when the operator never set it.  Beam search samples
+    # beam_width logprobs per step, so raise the floor to beam_width + 1 (one
+    # extra row for the sampled token) unless an explicit larger value was
+    # passed on the command line.
+    max_logprobs = max(getattr(args, "max_logprobs", None) or 0, beam_width + 1)
+    logger.info(f"Offline beam search max_logprobs: {max_logprobs}")
+
+    # Beam decode on the CUSTOM backend requires a persistent beam KV pool
+    # sized to the maximum served beam width; the throughput CLI has no
+    # --beam-max-width flag, so derive it from the request beam width.
+    beam_max_width = getattr(args, "beam_max_width", None) or beam_width
 
     # Keep engine cleanup scoped to the process that owns the offline engine.
     # Online benchmarks are clients of a separate server and must not register
@@ -572,7 +751,8 @@ def _run_offline_beam_search_benchmark(args):
     with GRLLM(
         model=args.model,
         trust_remote_code=True,
-        max_logprobs=args.max_logprobs if hasattr(args, "max_logprobs") else 2048,
+        max_logprobs=max_logprobs,
+        beam_max_width=beam_max_width,
         attention_config={"backend": "CUSTOM"},
         # Add other relevant vLLM arguments if available in args
         **(
@@ -624,6 +804,7 @@ def patched_main(args):
         getattr(args, "beam_search_v1", False)
         or USE_BEAM_SEARCH
         or (hasattr(args, "n") and args.n and args.n > 1)
+        or bool(getattr(args, "step_beam_widths", None))
     )
     is_offline = not hasattr(args, "endpoint") or not args.endpoint
 
@@ -649,7 +830,11 @@ def patched_serve_add_cli_args(parser):
 def patched_serve_main(args):
     """Patch serve.main to collect beam search metrics before/after."""
     metrics_url = _get_metrics_url(args)
-    is_beam_search = USE_BEAM_SEARCH or (hasattr(args, "n") and getattr(args, "n", 1) > 1)
+    is_beam_search = (
+        USE_BEAM_SEARCH
+        or (hasattr(args, "n") and getattr(args, "n", 1) > 1)
+        or bool(getattr(args, "step_beam_widths", None))
+    )
 
     metrics_before = None
     if is_beam_search and metrics_url:

@@ -14,6 +14,8 @@ class RequestStateStats(BaseRequestStateStats):
     beam_search_overhead: float = 0.0
     beam_search_prefill_time: float = 0.0
     beam_search_decode_time: float = 0.0
+    beam_search_execution_time: float = 0.0
     beam_search_sort_time: float = 0.0
     num_generation_tokens: int = 0
     num_beams: int = 0
+    is_p2d: bool = False

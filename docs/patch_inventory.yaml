@@ -123,15 +123,16 @@ patches:
     removal_condition: stable upstream messages carry grouped Beam operations without Enum mutation
 
   - id: GR-PATCH-009
-    owner: vllm_gr/v1/engine/core.py and engine_core_patch.py
+    owner: vllm_gr/v1/engine/core.py, engine_core_patch.py, and vllm_gr/v1/core/kv_cache_utils_patch.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
     activation: the EngineCore patch plan detects request dispatch is incomplete
     validator_or_test:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
+      - tests/test_cache_salt.py
       - tests/test_beam_request_unit.py
     process_roles: [engine_core]
-    target: vllm.v1.engine.core.EngineCoreProc
+    target: vllm.v1.engine.core.EngineCoreProc and vllm.v1.core.kv_cache_utils.generate_block_hash_extra_keys
     risk: critical
     contract: engine-core-signatures
     removal_condition: vLLM exposes stable control-message and request-dispatch extension points
@@ -162,6 +163,11 @@ patches:
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
     risk: critical
     contract: gpu-model-runner-signatures
+    contract_surface:
+      _prepare_inputs: two-item return contract plus _current_scheduler_output
+        publication (required by the prefill-graph interception)
+      _model_forward: pure-prefill batch interception and CUDA graph replay
+      _sample: bypasses standard sampler and dummy LM head GEMM when P2D result is active
     removal_condition: stable upstream grouped input and output hooks replace private runner mutation
 
   - id: GR-PATCH-012
@@ -176,7 +182,30 @@ patches:
     process_roles: [npu_worker]
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
     risk: critical
-    contract: null
+    contract: npu-model-runner-preflight
+    contract_surface:
+      _prepare_inputs: four-item return contract plus _current_scheduler_output publication
+      _bookkeeping_sync: six-item return contract with beam collapse and the
+        shared P2D result branch (model_runner_common._build_p2d_bookkeeping_result)
+      _capture_cudagraphs: GPU-parity prefill graph capture trigger (FULL mode)
+      _model_forward: "prefill-phase batch interception, P2D first priority
+        (prefill graph/eager prefill + captured 2D decode graph replay), then
+        NPU prefill graph replay (gate predicate is_npu_prefill_phase_batch:
+        prefill-phase requests only, beam-decode/spec-decode/encoder excluded)"
+      _sample: bypasses standard sampler when the P2D result is active
+      prefill_graph_runner: vllm_gr/v1/worker/npu_prefill_graph_runner.py
+        (prefill buckets + P2D 2D decode graph capture and replay; decode
+        prefix attention reads the paged KV cache via a block-table FIA task
+        group with beam-replicated block-table staging — no contiguous prompt pool)
+      prefill_graph_common: "platform bucket dispatch (get_default_buckets /
+        get_dynamic_thresholds; NPU buckets capped at 1024, GPU list unchanged)
+        and max_num_batched_tokens bucket clamp (shared, both platforms)"
+      npu_attention_graph: "vllm_gr/v1/attention/backends/beam_attn_npu.py
+        (task-group capture, weak-tensor address carriers, per-layer
+        graph_task_update on a dedicated stream with wait_stream ordering;
+        p2d_attention implements the P2D decode passes with prefix FIA task
+        groups and suffix attention via plain torch ops (default,
+        BeamAttentionImpl.use_manual_p2d_suffix=True) or FIA task groups)"
     removal_condition: vLLM-Ascend exposes stable grouped input and output hooks
 
   - id: GR-PATCH-013

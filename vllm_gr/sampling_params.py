@@ -43,6 +43,11 @@ class BeamSearchParams(
     # historical "fill"; the Constraint Table backend rejects an explicit
     # value because candidate validity is enforced in the Worker.
     catalog_strategy: str | None = None
+    # Per-step beam widths (W0, W1, W2) for the P2D fast path.
+    # Must be 3 integers in [1, MAX_BEAM_WIDTH]. W0 controls prefill beam count,
+    # W1 controls step-1 decode width, and W2 controls step-2 decode width and
+    # final output beam count. If None, beam_width is used uniformly for all steps.
+    step_beam_widths: list[int] | tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -55,6 +60,23 @@ class BeamSearchParams(
                 parameter="beam_width",
                 value=self.beam_width,
             )
+        widths = self.step_beam_widths
+        if widths is not None:
+            if (
+                not isinstance(widths, (list, tuple))
+                or len(widths) != 3
+                or any(
+                    isinstance(w, bool) or not isinstance(w, int) or not 1 <= w <= MAX_BEAM_WIDTH
+                    for w in widths
+                )
+            ):
+                raise VLLMValidationError(
+                    f"step_beam_widths must be three integers in [1, {MAX_BEAM_WIDTH}]",
+                    parameter="step_beam_widths",
+                    value=widths,
+                )
+            # Normalize so downstream consumers always see a uniform list.
+            self.step_beam_widths = list(widths)
         if self.catalog_strategy is not None and self.catalog_strategy not in ("fill", "null"):
             raise VLLMValidationError(
                 f"catalog_strategy must be 'fill', 'null', or None, got {self.catalog_strategy!r}",

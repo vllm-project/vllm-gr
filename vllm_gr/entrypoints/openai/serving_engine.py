@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import gc
+import math
 import time
 from collections.abc import AsyncGenerator, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
@@ -37,12 +39,258 @@ from vllm_gr.constraints.strategies import (
     validate_constraint_table_protocol,
 )
 from vllm_gr.logprobs import reconstruct_beam_logprobs_batch
+from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.tokenizer_fast import fast_batch_decode
 from vllm_gr.utils.engine_lifecycle import frontend_request_scope
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
+from vllm_gr.v1.worker.prefill_graph_runner import (
+    DEFAULT_DECODE_STEPS,
+    P2D_SENTINEL_RANK,
+    P2D_TOTAL_STEPS_HEADER,
+)
+
+
+def _is_p2d_sentinel(ranks: Any) -> bool:
+    if ranks is None or len(ranks) == 0:
+        return False
+    first = ranks[0]
+    if isinstance(first, (list, tuple, np.ndarray)):
+        return len(first) > 0 and first[0] == P2D_SENTINEL_RANK
+    return first == P2D_SENTINEL_RANK
+
+
+def _p2d_dead_end_beam(
+    *,
+    orig_prompt: Any,
+    initial_tokens: list[int],
+    initial_logprobs: Any,
+    lora_request: Any,
+    eos_token_id: int | None,
+) -> Any:
+    """Fallback beam for catalog dead-ends so ``outputs`` is never empty.
+
+    The worker marks every beam invalid (-1 tokens) when the catalog has no
+    legal completion for the prompt. Emit one finished completion carrying the
+    EOS token so downstream API handlers never index an empty ``outputs`` list.
+    """
+    fallback_tok = eos_token_id if eos_token_id is not None else 0
+    lp = FlatLogprobs(
+        start_indices=list(initial_logprobs.start_indices),
+        end_indices=list(initial_logprobs.end_indices),
+        token_ids=list(initial_logprobs.token_ids),
+        logprobs=list(initial_logprobs.logprobs),
+        ranks=list(initial_logprobs.ranks),
+        decoded_tokens=list(initial_logprobs.decoded_tokens),
+    )
+    lp.append_fast([fallback_tok], [0.0], [1], [None])
+    return BeamSearchSequence(
+        orig_prompt=orig_prompt,
+        tokens=initial_tokens + [fallback_tok],
+        cum_logprob=float("-inf"),
+        logprobs=lp,
+        lora_request=lora_request,
+        finish_reason="stop"
+        if (eos_token_id is not None and fallback_tok == eos_token_id)
+        else "length",
+        stop_reason=fallback_tok
+        if (eos_token_id is not None and fallback_tok == eos_token_id)
+        else None,
+    )
+
+
+def _p2d_eos_boundary(
+    tokens: list[int],
+    eos_token_id: int,
+    ignore_eos: bool,
+) -> tuple[list[int], str | None, int | None]:
+    """Terminate a P2D beam at its first EOS token.
+
+    The P2D graph executes every decode pass unconditionally, so an EOS
+    selected at an early pass is followed by post-EOS tokens.  With
+    ``ignore_eos=False`` the beam must end at the first EOS: every token
+    after it is pruned and the beam is marked finished with reason "stop",
+    mirroring ``complete_eos_candidates``.  With ``ignore_eos=True`` the
+    full pass output is kept and no finish reason is assigned.
+    """
+    if ignore_eos:
+        return tokens, None, None
+    try:
+        eos_pos = tokens.index(eos_token_id)
+    except ValueError:
+        return tokens, None, None
+    return tokens[: eos_pos + 1], "stop", eos_token_id
+
+
+def _build_p2d_request_output(
+    *,
+    request_id: str,
+    prompt_text: str,
+    prompt_token_ids: list[int],
+    tokenized_length: int,
+    raw_token_ids: Any,
+    raw_logprobs: Any,
+    initial_tokens: list[int],
+    initial_logprobs: Any,
+    orig_prompt: Any,
+    tokenizer: Any,
+    model_name: str,
+    w2_effective: int,
+    max_step_w: int,
+    num_steps: int = 3,
+    ignore_eos: bool = False,
+    eos_token_id: int | None = None,
+    sid_end_token_id: int | None = None,
+    lora_request: Any = None,
+    beam_search_start: float = 0.0,
+    generation_time: float = 0.0,
+) -> RequestOutput:
+    """Build the finished P2D RequestOutput from the worker's sentinel flat.
+
+    Shared by the decode-step and prefill-step P2D handlers: unwraps the
+    nested flat, counts valid beams, materializes the beam sequences (with
+    the dead-end fallback and EOS pruning), decodes texts, records metrics,
+    and returns the output. Pure and synchronous — no yielding, no engine interaction.
+    """
+    if len(raw_token_ids) > 0 and isinstance(raw_token_ids[0], (list, tuple, np.ndarray)):
+        raw_token_ids = raw_token_ids[0]
+    if len(raw_logprobs) > 0 and isinstance(raw_logprobs[0], (list, tuple, np.ndarray)):
+        raw_logprobs = raw_logprobs[0]
+    total_captured_beams = len(raw_token_ids) // num_steps
+    valid_beam_cnt = 0
+    for b in range(total_captured_beams):
+        first_tok = raw_token_ids[b * num_steps]
+        if isinstance(first_tok, (int, np.integer)) and int(first_tok) >= 0:
+            valid_beam_cnt += 1
+    actual_beams = min(w2_effective, total_captured_beams, valid_beam_cnt)
+
+    base_start = list(initial_logprobs.start_indices)
+    base_end = list(initial_logprobs.end_indices)
+    base_tokens = list(initial_logprobs.token_ids)
+    base_lps = list(initial_logprobs.logprobs)
+    base_ranks = list(initial_logprobs.ranks)
+    base_dec = list(initial_logprobs.decoded_tokens)
+    step_ranks = [1] * num_steps
+    step_dec = [None] * num_steps
+
+    best_beams = []
+    for b in range(actual_beams):
+        b_offset = b * num_steps
+        b_toks = raw_token_ids[b_offset : b_offset + num_steps]
+        # The flat carries the true per-token local scores.
+        b_step_lps = [float(v) for v in raw_logprobs[b_offset : b_offset + num_steps]]
+        b_toks_list = b_toks.tolist() if hasattr(b_toks, "tolist") else list(b_toks)
+        finish_reason = None
+        stop_reason = None
+        if eos_token_id is not None:
+            b_toks_list, finish_reason, stop_reason = _p2d_eos_boundary(
+                b_toks_list, eos_token_id, ignore_eos
+            )
+        gen_len = len(b_toks_list)
+        # Recompute cumulative logprob based on the surviving tokens after EOS pruning
+        b_lp = sum(b_step_lps[:gen_len])
+        all_toks = initial_tokens + b_toks_list
+        if sid_end_token_id is not None and stop_reason is None:
+            all_toks.append(sid_end_token_id)
+
+        lp = FlatLogprobs(
+            start_indices=base_start.copy(),
+            end_indices=base_end.copy(),
+            token_ids=base_tokens.copy(),
+            logprobs=base_lps.copy(),
+            ranks=base_ranks.copy(),
+            decoded_tokens=base_dec.copy(),
+        )
+        lp.append_fast(
+            b_toks_list,
+            b_step_lps[:gen_len],
+            step_ranks[:gen_len],
+            step_dec[:gen_len],
+        )
+        if sid_end_token_id is not None and stop_reason is None:
+            lp.append_fast([sid_end_token_id], [0.0], [None], [None])
+
+        seq = BeamSearchSequence(
+            orig_prompt=orig_prompt,
+            tokens=all_toks,
+            cum_logprob=b_lp,
+            logprobs=lp,
+            lora_request=lora_request,
+            finish_reason=finish_reason,
+            stop_reason=stop_reason,
+        )
+        best_beams.append(seq)
+
+    if not best_beams:
+        # Catalog dead-end: every beam was marked invalid. Emit one finished
+        # fallback completion so the API layer never sees an empty outputs
+        # list.
+        best_beams = [
+            _p2d_dead_end_beam(
+                orig_prompt=orig_prompt,
+                initial_tokens=initial_tokens,
+                initial_logprobs=initial_logprobs,
+                lora_request=lora_request,
+                eos_token_id=eos_token_id,
+            )
+        ]
+
+    tokens_list = []
+    for beam in best_beams:
+        if getattr(beam, "cum_logprob", 0.0) == float("-inf"):
+            # Dead-end fallback beam: output empty string without decoding begin token
+            tokens_list.append([])
+        elif eos_token_id is not None and beam.tokens[-1] == eos_token_id and not ignore_eos:
+            tokens_list.append(beam.tokens[tokenized_length:-1])
+        else:
+            tokens_list.append(beam.tokens[tokenized_length:])
+    decoded_texts = fast_batch_decode(tokenizer, tokens_list)
+    for beam, text in zip(best_beams, decoded_texts):
+        beam.text = text
+
+    beam_search_execution_time = time.perf_counter() - beam_search_start
+    beam_search_overhead = beam_search_execution_time - generation_time
+    metrics = RequestStateStats(
+        beam_search_overhead=beam_search_overhead,
+        beam_search_prefill_time=0.0,
+        beam_search_decode_time=0.0,
+        beam_search_execution_time=beam_search_execution_time,
+        beam_search_sort_time=0.0,
+        num_generation_tokens=max(actual_beams, 1) * num_steps,
+        num_beams=w2_effective,
+        is_p2d=True,
+    )
+
+    out = RequestOutput(
+        request_id=request_id,
+        prompt=prompt_text,
+        outputs=[
+            CompletionOutput(
+                text=beam.text,
+                cumulative_logprob=beam.cum_logprob,
+                token_ids=beam.tokens[tokenized_length:],
+                index=idx,
+                logprobs=beam.logprobs,
+                finish_reason=(
+                    beam.finish_reason
+                    if getattr(beam, "finish_reason", None) is not None
+                    else "length"
+                ),
+                stop_reason=getattr(beam, "stop_reason", None),
+            )
+            for idx, beam in enumerate(best_beams)
+        ],
+        finished=True,
+        prompt_token_ids=prompt_token_ids,
+        prompt_logprobs=None,
+        metrics=metrics,
+    )
+
+    record_beam_search_metrics(metrics, engine="0", model_name=model_name)
+    return out
+
 
 if TYPE_CHECKING:
     from vllm_gr.entrypoints.beam_search_v1.protocol import AsyncBeamSearchFrontend
@@ -160,14 +408,18 @@ def _worker_decision_flatten(
         parent_cum = np.asarray([p.cum_logprob for p in parents], dtype=np.float64)
         high = parent_np >= n_parents
         cum = np.where(high, 0.0, parent_cum[np.where(high, 0, parent_np)])
-        local = (lps_np - cum).tolist()
+        with np.errstate(invalid="ignore"):
+            diff = lps_np - cum
+        local = np.where(np.isnan(diff), 0.0, diff).tolist()
         return ids, lps, parent, [([tid], [loc], [0], [None]) for tid, loc in zip(ids, local)]
     # Exotic indices: reproduce the original per-beam loop (raises
     # IndexError for pid < -n_parents exactly like list indexing).
     cache: list = []
     for pid, tid, lp in zip(parent, ids, lps):
-        parent_cum = parents[pid].cum_logprob if pid < len(parents) else 0.0
-        cache.append(([tid], [lp - parent_cum], [0], [None]))
+        parent_cum = parents[pid].cum_logprob if pid < n_parents else 0.0
+        diff = lp - parent_cum
+        loc = 0.0 if math.isnan(diff) else diff
+        cache.append(([tid], [loc], [0], [None]))
     return ids, lps, parent, cache
 
 
@@ -329,6 +581,7 @@ async def _beam_request_step(
     max_decode_steps: int = 0,
     is_constrained: bool = False,
     self_advance_chained: bool = False,
+    is_last_step: bool = False,
 ):
     """BEAM_REQUEST path: single logical message update for all active branches."""
     parent_beam_ids = []
@@ -402,6 +655,7 @@ async def _beam_request_step(
                 # Constraint Tables: the Worker's raw-logits hook needs the step to
                 # run (1/2 for decode; 0 reserved for the constrained prefill).
                 constraint_step=len(beam_tokens[0]) if is_constrained else 0,
+                is_last_step=is_last_step,
             )
         )
 
@@ -413,7 +667,9 @@ async def _beam_request_step(
     return [single_output], child_beam_ids
 
 
-async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
+async def _beam_request_cleanup(
+    engine_client, session_id, final_ids, rank, is_last_step: bool = False
+):
     """Signals the core engine to fully purge all remaining session cache allocations."""
     if not final_ids:
         return
@@ -429,6 +685,7 @@ async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
                 beam_width=0,
                 sampling_params=SamplingParams(),
                 data_parallel_rank=rank,
+                is_last_step=is_last_step,
             )
         )
     except Exception as e:
@@ -450,6 +707,15 @@ async def beam_search(
     require_beam_execution_mode(
         getattr(self.engine_client, "vllm_config", None), BeamExecutionMode.LEGACY
     )
+    # Resolve once for every metrics record in this request (the model name
+    # may be a property or method on the serving models).
+    try:
+        model_name = self.models.model_name
+        if callable(model_name):
+            model_name = model_name()
+        model_name = str(model_name)
+    except Exception:  # noqa: BLE001
+        model_name = "unknown"
     generation_time: float = 0.0
     num_generation_tokens: int = 0
     beam_width = params.beam_width
@@ -546,8 +812,22 @@ async def beam_search(
     tokenized_length = len(prompt_token_ids)
     logprobs_num = beam_width
 
+    # Per-step beam widths (W0, W1, W2) for the P2D fast path. When absent the
+    # uniform scalar beam_width applies to all three steps.
+    step_beam_widths = getattr(params, "step_beam_widths", None)
+    step_bws: list[int] | None = None
+    if step_beam_widths is not None:
+        try:
+            w0, w1, w2 = (int(x) for x in step_beam_widths)
+        except (TypeError, ValueError):
+            w0 = w1 = w2 = beam_width
+        if w0 > 0 and w1 > 0 and w2 > 0:
+            step_bws = [w0, w1, w2]
+    w2_effective = step_bws[2] if step_bws is not None else beam_width
+    max_step_w = max(step_bws) if step_bws is not None else beam_width
+
     beam_search_params = SamplingParams(
-        logprobs=logprobs_num,
+        logprobs=max(logprobs_num, max_step_w),
         max_tokens=1,
         temperature=temperature,
         detokenize=False,
@@ -588,7 +868,7 @@ async def beam_search(
     all_beams[0]._lp_step_data = None
     completed = []
 
-    beam_search_start: int = time.perf_counter()
+    beam_search_start: float = time.perf_counter()
     prefill_start = beam_search_start  # Track initial start for prefill measurement
     pre_calc = 0 if sid_begin_token_id is None else 1
     if sid_end_token_id is not None:
@@ -599,6 +879,20 @@ async def beam_search(
             parameter="max_tokens",
             value=max_tokens,
         )
+
+    # The worker's P2D fast path generates exactly p2d_num_steps tokens per
+    # beam; the sentinel branches below are only entered for requests whose
+    # remaining budget matches. vLLM 0.22.1 SamplingParams has no extra_body,
+    # so the total step count travels to the worker through the request's
+    # trace_headers (a free-form mapping carried by EngineCoreRequest ->
+    # Request); is_p2d_eligible declines batches whose stamped step count
+    # differs from p2d_num_steps before any graph capture.
+    p2d_num_steps = 1 + DEFAULT_DECODE_STEPS
+    merged_headers = dict(trace_headers or {})
+    merged_headers[P2D_TOTAL_STEPS_HEADER] = str(max_tokens - pre_calc)
+    if step_bws is not None:
+        merged_headers["vllm_gr_step_beam_widths"] = ",".join(str(w) for w in step_bws)
+    trace_headers = merged_headers
 
     if _is_constrained:
         # Constraint Tables are a fixed 3-level FSM; requesting more steps than
@@ -659,290 +953,190 @@ async def beam_search(
     # must then skip its beam_request_step_update send (see
     # _beam_request_step) and only await the chained step's output.
     prev_step_self_advance_chained = False
+    cleaned_up = False
+    last_step_suppressed = False
 
-    for token in range(max_tokens - pre_calc):
-        if not all_beams:
-            # Catalog filtering eliminated every active beam (no valid continuation).
-            # This is not an engine error — fall through to the normal post-loop path
-            # so any EOS beams already in `completed` are returned.
-            if use_beam_request and prev_beam_internal_ids:
-                await _beam_request_cleanup(
-                    self.engine_client, prefill_id, prev_beam_internal_ids, rank
-                )
-                prev_beam_internal_ids = []
-            break
-        if token == 1:
-            beam_search_start = time.perf_counter()
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        for token in range(max_tokens - pre_calc):
+            if not all_beams:
+                # Catalog filtering eliminated every active beam (no valid continuation).
+                # This is not an engine error — fall through to the normal post-loop path
+                # so any EOS beams already in `completed` are returned.
+                if use_beam_request and prev_beam_internal_ids:
+                    await _beam_request_cleanup(
+                        self.engine_client, prefill_id, prev_beam_internal_ids, rank
+                    )
+                    prev_beam_internal_ids = []
+                    cleaned_up = True
+                break
+            if token == 1:
+                beam_search_start = time.perf_counter()
 
-        prompts_batch, lora_req_batch = zip(
-            *[
-                (
-                    beam.get_prompt(),
-                    beam.lora_request,
-                )
-                for beam in all_beams
-            ]
-        )
-        if token > 0:
-            num_generation_tokens += len(all_beams)
-        request_id_batch = f"{request_id}-{random_uuid()}"
-
-        # Launch catalog filtering in parallel with the engine step.
-        # Constraint Tables generate candidates in the Worker, so the Trie
-        # lookup must not run (ConstraintTableStrategy.valid_next_token_ids
-        # raises by contract).
-        catalog_task = None
-        if constraint_coordinator.enabled and not _is_constrained:
-
-            def get_valid_tokens_set(beam) -> set[int]:
-                generated_tokens = beam.tokens[len(prompt_token_ids) :]
-                valid_token_ids = constraint_coordinator.valid_next_token_ids(generated_tokens)
-                assert valid_token_ids is not None
-                return valid_token_ids
-
-            async def _run_catalog(coros):
-                return list(await asyncio.gather(*coros))
-
-            catalog_task = asyncio.create_task(
-                _run_catalog([asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams])
+            prompts_batch, lora_req_batch = zip(
+                *[
+                    (
+                        beam.get_prompt(),
+                        beam.lora_request,
+                    )
+                    for beam in all_beams
+                ]
             )
+            if token > 0:
+                num_generation_tokens += len(all_beams)
+            request_id_batch = f"{request_id}-{random_uuid()}"
 
-        gen_start = time.perf_counter()
+            # Launch catalog filtering in parallel with the engine step.
+            # Constraint Tables generate candidates in the Worker, so the Trie
+            # lookup must not run (ConstraintTableStrategy.valid_next_token_ids
+            # raises by contract).
+            catalog_task = None
+            if constraint_coordinator.enabled and not _is_constrained:
 
-        # Execute Engine Step Pass
-        if use_beam_request and fork_info is not None:
-            output, prev_beam_internal_ids = await _beam_request_step(
-                self.engine_client,
-                session_id=prefill_id,
-                fork_info=fork_info,
-                prev_beam_internal_ids=prev_beam_internal_ids,
-                all_beams=all_beams,
-                request_id_batch=request_id_batch,
-                beam_search_params=beam_search_params,
-                eos_token_id=eos_token_id,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                prefix_len=len(initial_tokens),
-                priority=priority,
-                data_parallel_rank=rank,
-                max_decode_steps=max_tokens - pre_calc,
-                is_constrained=_is_constrained,
-                # EngineCore chained the previous step from the worker's
-                # beam decision (engine-driven); re-sending the step
-                # update would duplicate the session request id.
-                self_advance_chained=prev_step_self_advance_chained,
-            )
-        else:
-            # Prefill session template: fields EngineCore cannot derive
-            # itself when it constructs the step-0 BeamRequestStepUpdate
-            # in-process from the worker's constrained-prefill decision.
-            # Sent unconditionally on the constrained beam path;
-            # EngineCore-side gating (beam_engine_driven) decides whether
-            # to consume it.
-            prefill_session_template = None
-            if use_beam_request and _is_constrained:
-                prefill_session_template = BeamRequestStepUpdate(
-                    session_id="",  # stamped by _add_batch_step from the request ids
-                    parent_beam_ids=[],
-                    child_beam_ids=[],
-                    beam_tokens=[],
-                    pruned_ids=[],
-                    prefix_len=len(initial_tokens),
-                    beam_width=beam_width,
-                    sampling_params=clone_beam_decode_sampling_params(beam_search_params),
+                def get_valid_tokens_set(beam) -> set[int]:
+                    generated_tokens = beam.tokens[len(prompt_token_ids) :]
+                    valid_token_ids = constraint_coordinator.valid_next_token_ids(generated_tokens)
+                    assert valid_token_ids is not None
+                    return valid_token_ids
+
+                async def _run_catalog(coros):
+                    return list(await asyncio.gather(*coros))
+
+                catalog_task = asyncio.create_task(
+                    _run_catalog(
+                        [asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams]
+                    )
+                )
+
+            gen_start = time.perf_counter()
+
+            # Execute Engine Step Pass
+            if use_beam_request and fork_info is not None:
+                is_final_step = token == max_tokens - pre_calc - 1
+                parent_cum_lps = None
+                if catalog_task is None:
+                    parent_cum_lps = [float(b.cum_logprob) for b in all_beams]
+                output, prev_beam_internal_ids = await _beam_request_step(
+                    self.engine_client,
+                    session_id=prefill_id,
+                    fork_info=fork_info,
+                    prev_beam_internal_ids=prev_beam_internal_ids,
+                    all_beams=all_beams,
+                    request_id_batch=request_id_batch,
+                    beam_search_params=beam_search_params,
                     eos_token_id=eos_token_id,
+                    lora_request=lora_request,
                     trace_headers=trace_headers,
-                    data_parallel_rank=rank,
+                    prefix_len=len(initial_tokens),
                     priority=priority,
+                    data_parallel_rank=rank,
                     max_decode_steps=max_tokens - pre_calc,
-                    # Constraint Tables: 1 = constrained decode step 0 (the
-                    # value the frontend itself puts on the step-0 update).
-                    constraint_step=1,
+                    is_constrained=_is_constrained,
+                    # EngineCore chained the previous step from the worker's
+                    # beam decision (engine-driven); re-sending the step
+                    # update would duplicate the session request id.
+                    self_advance_chained=prev_step_self_advance_chained,
+                    is_last_step=is_final_step,
                 )
-            output, new_ids = await _add_batch_step(
-                self.engine_client,
-                prompts_batch,
-                lora_req_batch,
-                request_id_batch,
-                beam_search_params,
-                use_beam_request,
-                trace_headers,
-                priority=priority,
-                data_parallel_rank=rank,
-                session_template=prefill_session_template,
-            )
-            if new_ids:
-                prev_beam_internal_ids = new_ids
-                if prefill_id is None:
-                    prefill_id = new_ids[0]
-
-        valid_tokens_sets = None
-        if catalog_task is not None:
-            valid_tokens_sets = await catalog_task
-        if token > 0:
-            generation_time += time.perf_counter() - gen_start
-        candidate_builder = ParentCandidateBuilder(
-            layout=(
-                CandidateLayout.CONSTRAINED_TOPK
-                if _is_constrained
-                else CandidateLayout.STANDARD_SAMPLER
-            )
-        )
-        # Worker-side beam decision result. Initialised here so
-        # the per-beam extraction below can overwrite it and the bottom-of-loop
-        # selection always has a defined value even on the prefill/batch path
-        # (where the use_beam_request branch never runs).
-        worker_candidates = None
-
-        # Constraint prefill also has a canonical CUDA worker decision.  It
-        # arrives through the same result channel as decode, but this first
-        # iteration uses the ADD_BATCH branch (``fork_info is None``).
-        if use_beam_request and _is_constrained and fork_info is None and len(output) == 1:
-            prefill_decision = _worker_decision_from_result(output[0])
-            if prefill_decision is not None:
-                worker_candidates = _worker_decision_flatten(
-                    prefill_decision, beam_width, all_beams
-                )
-                # EngineCore chained step-0 in-process from this prefill
-                # decision (engine-driven).  Iteration 1 must then use the
-                # existing skip path (only collector registration + await;
-                # re-sending the step update would re-ADD the running session
-                # request and trip scheduler.add_request's duplicate-id assert).
-                prev_step_self_advance_chained = bool(
-                    prefill_decision.get("beam_self_advance_chained")
-                )
-
-        # -------------------------------------------------------------------------
-        # STRIDE-AWARE METADATA EXTRACTION FOR GENERATED BEAMS
-        # -------------------------------------------------------------------------
-        if use_beam_request and fork_info is not None:
-            # Under the optimized mode, 'output' contains exactly 1 combined RequestOutput instance
-            beam_result = output[0]
-            if beam_result.outputs[0].finish_reason == "error":
-                await _beam_request_cleanup(
-                    self.engine_client, prefill_id, prev_beam_internal_ids, rank
-                )
-                yield RequestOutput(
-                    request_id=request_id,
-                    prompt=prompt_text,
-                    outputs=[
-                        CompletionOutput(
-                            index=0,
-                            text="",
-                            token_ids=[],
-                            cumulative_logprob=None,
-                            logprobs=None,
-                            finish_reason="error",
-                        )
-                    ],
-                    finished=True,
-                    prompt_token_ids=prompt_token_ids,
-                    prompt_logprobs=None,
-                )
-                return
-
-            # Worker-side beam decision (accelerator path): the worker
-            # already selected the surviving beams, so skip the frontend flat
-            # logprobs extraction + NumPy top-k entirely and feed the worker's
-            # winners into the existing EOS / materialisation pipeline.
-            worker_decision = _worker_decision_from_result(beam_result)
-            worker_candidates = None
-            if worker_decision is not None:
-                worker_candidates = _worker_decision_flatten(worker_decision, beam_width, all_beams)
-            # EngineCore chained this step's successor from the worker's
-            # decision (engine-driven): the next iteration skips its
-            # beam_request_step_update and only awaits the chained output.
-            # Missing flag (terminal decision / skip / fallback) leaves the
-            # frontend-driven path in charge.
-            prev_step_self_advance_chained = bool(
-                worker_decision is not None and worker_decision.get("beam_self_advance_chained")
-            )
-
-            flat = beam_result.outputs[0].logprobs
-            if worker_candidates is not None:
-                # Workers already decided: no per-beam flat segment to parse.
-                pass
-            elif flat is not None:
-                # Extract tracking attributes cleanly
-                raw_token_ids = flat.token_ids
-                raw_logprobs = flat.logprobs
-                raw_ranks = getattr(flat, "ranks", None)
-                raw_decoded = getattr(flat, "decoded_tokens", None)
-                total_logprobs = len(raw_token_ids)
-
-                stride_k = total_logprobs // logprobs_num
-
-                # Each logical beam block should extract its top choices natively
-                for b_idx in range(len(fork_info)):
-                    current_beam = all_beams[b_idx]
-
-                    # Compute the true exact allocation footprint boundaries
-                    # from the flat remuxed vector block for this specific beam
-                    start_offset = b_idx * stride_k
-                    end_offset = start_offset + stride_k
-
-                    if _is_constrained:
-                        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
-                            extract_constrained_segment(
-                                raw_token_ids,
-                                raw_logprobs,
-                                raw_ranks,
-                                raw_decoded,
-                                start_offset,
-                                end_offset,
-                                logprobs_num,
-                            )
-                        )
+                if is_final_step:
+                    if prev_step_self_advance_chained:
+                        last_step_suppressed = True
                     else:
-                        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
-                            extract_and_dedup_segment(
-                                raw_token_ids,
-                                raw_logprobs,
-                                raw_ranks,
-                                raw_decoded,
-                                start_offset,
-                                end_offset,
-                                logprobs_num,
-                            )
-                        )
-
-                    constraint_coordinator.add_parent_candidates(
-                        candidate_builder,
-                        parent_index=b_idx,
-                        parent_cumulative_logprob=current_beam.cum_logprob,
-                        token_ids=token_ids_pos,
-                        logprobs=logprobs_pos,
-                        ranks=ranks_pos,
-                        decoded_tokens=decoded_pos,
-                        valid_token_ids=(
-                            None
-                            if _is_constrained
-                            else valid_tokens_sets[b_idx]
-                            if valid_tokens_sets is not None
-                            else None
-                        ),
-                        candidate_strategy=catalog_strategy,
-                    )
+                        cleaned_up = True
             else:
-                for b_idx, current_beam in enumerate(all_beams):
-                    constraint_coordinator.add_parent_candidates(
-                        candidate_builder,
-                        parent_index=b_idx,
-                        parent_cumulative_logprob=current_beam.cum_logprob,
-                        token_ids=[],
-                        logprobs=[],
-                        ranks=None,
-                        decoded_tokens=None,
-                        valid_token_ids=None,
-                        candidate_strategy=catalog_strategy,
+                # Prefill session template: fields EngineCore cannot derive
+                # itself when it constructs the step-0 BeamRequestStepUpdate
+                # in-process from the worker's constrained-prefill decision.
+                # Sent unconditionally on the constrained beam path;
+                # EngineCore-side gating (beam_engine_driven) decides whether
+                # to consume it.
+                prefill_session_template = None
+                if use_beam_request and _is_constrained:
+                    prefill_session_template = BeamRequestStepUpdate(
+                        session_id="",  # stamped by _add_batch_step from the request ids
+                        parent_beam_ids=[],
+                        child_beam_ids=[],
+                        beam_tokens=[],
+                        pruned_ids=[],
+                        prefix_len=len(initial_tokens),
+                        beam_width=beam_width,
+                        sampling_params=clone_beam_decode_sampling_params(beam_search_params),
+                        eos_token_id=eos_token_id,
+                        trace_headers=trace_headers,
+                        data_parallel_rank=rank,
+                        priority=priority,
+                        max_decode_steps=max_tokens - pre_calc,
+                        # Constraint Tables: 1 = constrained decode step 0 (the
+                        # value the frontend itself puts on the step-0 update).
+                        constraint_step=1,
                     )
-        else:
-            # Baseline execution path for prefill / batch loops
-            for i, result in enumerate(output):
-                if worker_candidates is not None:
-                    break
-                current_beam = all_beams[i]
-                if result.outputs[0].finish_reason == "error":
+                output, new_ids = await _add_batch_step(
+                    self.engine_client,
+                    prompts_batch,
+                    lora_req_batch,
+                    request_id_batch,
+                    beam_search_params,
+                    use_beam_request,
+                    trace_headers,
+                    priority=priority,
+                    data_parallel_rank=rank,
+                    session_template=prefill_session_template,
+                )
+                if new_ids:
+                    prev_beam_internal_ids = new_ids
+                    if prefill_id is None:
+                        prefill_id = new_ids[0]
+
+            valid_tokens_sets = None
+            if catalog_task is not None:
+                valid_tokens_sets = await catalog_task
+            if token > 0:
+                generation_time += time.perf_counter() - gen_start
+            candidate_builder = ParentCandidateBuilder(
+                layout=(
+                    CandidateLayout.CONSTRAINED_TOPK
+                    if _is_constrained
+                    else CandidateLayout.STANDARD_SAMPLER
+                )
+            )
+            # Worker-side beam decision result. Initialised here so
+            # the per-beam extraction below can overwrite it and the bottom-of-loop
+            # selection always has a defined value even on the prefill/batch path
+            # (where the use_beam_request branch never runs).
+            worker_candidates = None
+
+            # Constraint prefill also has a canonical CUDA worker decision.  It
+            # arrives through the same result channel as decode, but this first
+            # iteration uses the ADD_BATCH branch (``fork_info is None``).
+            if use_beam_request and _is_constrained and fork_info is None and len(output) == 1:
+                prefill_decision = _worker_decision_from_result(output[0])
+                if prefill_decision is not None:
+                    worker_candidates = _worker_decision_flatten(
+                        prefill_decision, beam_width, all_beams
+                    )
+                    # EngineCore chained step-0 in-process from this prefill
+                    # decision (engine-driven).  Iteration 1 must then use the
+                    # existing skip path (only collector registration + await;
+                    # re-sending the step update would re-ADD the running session
+                    # request and trip scheduler.add_request's duplicate-id assert).
+                    prev_step_self_advance_chained = bool(
+                        prefill_decision.get("beam_self_advance_chained")
+                    )
+
+            # -------------------------------------------------------------------------
+            # STRIDE-AWARE METADATA EXTRACTION FOR GENERATED BEAMS
+            # -------------------------------------------------------------------------
+            pruned_flat: tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple | None]] | None = None
+            if use_beam_request and fork_info is not None:
+                # Under the optimized mode, 'output' contains exactly 1 combined RequestOutput instance
+                beam_result = output[0]
+                if beam_result.outputs[0].finish_reason == "error":
+                    await _beam_request_cleanup(
+                        self.engine_client, prefill_id, prev_beam_internal_ids, rank
+                    )
+                    prev_beam_internal_ids = []
                     yield RequestOutput(
                         request_id=request_id,
                         prompt=prompt_text,
@@ -962,123 +1156,407 @@ async def beam_search(
                     )
                     return
 
-                if result.outputs[0].logprobs is not None:
-                    flat = result.outputs[0].logprobs
+                # Worker-side beam decision (accelerator path): the worker
+                # already selected the surviving beams, so skip the frontend flat
+                # logprobs extraction + NumPy top-k entirely and feed the worker's
+                # winners into the existing EOS / materialisation pipeline.
+                worker_decision = _worker_decision_from_result(beam_result)
+                worker_candidates = None
+                if worker_decision is not None:
+                    worker_candidates = _worker_decision_flatten(
+                        worker_decision, beam_width, all_beams
+                    )
+                    if worker_candidates is not None:
+                        # Rare race: the worker decision may index into a
+                        # session beam set that momentarily outlives the
+                        # frontend's EOS-pruned all_beams. Reject decisions
+                        # whose parent indices cannot map onto the current
+                        # beams; the flat extraction below then drives the
+                        # step instead of crashing in complete_eos_candidates.
+                        parent_arr = np.asarray(worker_candidates[2], dtype=np.intp)
+                        if parent_arr.size and int(parent_arr.max()) >= len(all_beams):
+                            worker_candidates = None
+                # EngineCore chained this step's successor from the worker's
+                # decision (engine-driven): the next iteration skips its
+                # beam_request_step_update and only awaits the chained output.
+                # Missing flag (terminal decision / skip / fallback) leaves the
+                # frontend-driven path in charge.
+                prev_step_self_advance_chained = bool(
+                    worker_decision is not None and worker_decision.get("beam_self_advance_chained")
+                )
 
-                    if _is_constrained:
-                        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
-                            extract_constrained_flat_logprobs(flat, logprobs_num)
+                flat = beam_result.outputs[0].logprobs
+                if worker_candidates is not None:
+                    # Workers already decided: no per-beam flat segment to parse.
+                    pass
+                elif flat is not None:
+                    # Extract tracking attributes cleanly
+                    raw_token_ids = flat.token_ids
+                    raw_logprobs = flat.logprobs
+                    raw_ranks = getattr(flat, "ranks", None)
+                    raw_decoded = getattr(flat, "decoded_tokens", None)
+                    total_logprobs = len(raw_token_ids)
+
+                    # P2D fast path: the worker generated every decode step in a
+                    # single monolithic P+2D graph pass; the final tokens arrive
+                    # directly, keyed by the P2D sentinel rank. Catalog
+                    # constraints were already enforced worker-side (global
+                    # token IDs, no offset add-back, no frontend filtering);
+                    # dead beams (fewer legal triples than the beam width) are
+                    # marked with -1 first tokens by the worker bookkeeping.
+                    if (
+                        _is_p2d_sentinel(raw_ranks)
+                        and (max_tokens - pre_calc - token) == p2d_num_steps
+                    ):
+                        out = _build_p2d_request_output(
+                            request_id=request_id,
+                            prompt_text=prompt_text,
+                            prompt_token_ids=prompt_token_ids,
+                            tokenized_length=tokenized_length,
+                            raw_token_ids=raw_token_ids,
+                            raw_logprobs=raw_logprobs,
+                            initial_tokens=initial_tokens,
+                            initial_logprobs=initial_logprobs,
+                            orig_prompt=orig_prompt,
+                            tokenizer=tokenizer,
+                            model_name=model_name,
+                            w2_effective=w2_effective,
+                            max_step_w=max_step_w,
+                            num_steps=p2d_num_steps,
+                            ignore_eos=ignore_eos,
+                            eos_token_id=eos_token_id,
+                            sid_end_token_id=sid_end_token_id,
+                            lora_request=lora_request,
+                            beam_search_start=beam_search_start,
+                            generation_time=generation_time,
+                        )
+                        yield out
+                        return
+
+                    # Worker-pruned flat (P2D): ranks carry the surviving parent
+                    # indices, so the frontend top-k is skipped entirely.  The
+                    # pruned flat holds exactly one entry per surviving beam
+                    # (<= beam_width), unlike the standard per-beam topk block.
+                    is_pruned = (
+                        valid_tokens_sets is None
+                        and parent_cum_lps is not None
+                        and raw_ranks is not None
+                        and len(raw_token_ids) == len(raw_ranks)
+                        and 0 < len(raw_token_ids) <= beam_width
+                        and int(np.max(raw_ranks)) < len(all_beams)
+                    )
+                    if is_pruned:
+                        k = min(beam_width, len(raw_token_ids))
+                        cand_parents = np.asarray(raw_ranks[:k], dtype=np.intp)
+                        cand_tokens = np.asarray(raw_token_ids[:k], dtype=np.int64)
+                        cand_lps = np.asarray(raw_logprobs[:k], dtype=np.float64)
+                        if is_vocab_slice_enabled():
+                            offset, slice_size, _ = get_vocab_slice_config()
+                            if offset is not None and slice_size is not None and slice_size > 0:
+                                slice_mask = (cand_tokens >= 0) & (cand_tokens < slice_size)
+                                cand_tokens = cand_tokens.copy()
+                                cand_tokens[slice_mask] += offset
+
+                        cum_lps = np.fromiter(
+                            (all_beams[p].cum_logprob for p in cand_parents),
+                            dtype=np.float64,
+                            count=len(cand_parents),
+                        )
+                        cand_scores = cum_lps + cand_lps
+
+                        pruned_cache: list[tuple | None] = [None] * len(all_beams)
+                        for c in range(len(cand_parents)):
+                            p = cand_parents[c]
+                            if pruned_cache[p] is None:
+                                pruned_cache[p] = (
+                                    [int(cand_tokens[c])],
+                                    [float(cand_lps[c])],
+                                    [1],
+                                    [None],
+                                )
+                            else:
+                                prev = pruned_cache[p]
+                                pruned_cache[p] = (
+                                    prev[0] + [int(cand_tokens[c])],
+                                    prev[1] + [float(cand_lps[c])],
+                                    prev[2] + [len(prev[2]) + 1],
+                                    prev[3] + [None],
+                                )
+                        pruned_flat = (cand_tokens, cand_scores, cand_parents, pruned_cache)
+
+                    stride_k = total_logprobs // logprobs_num
+
+                    vocab_slice_offset: int | None = None
+                    if is_vocab_slice_enabled():
+                        offset, slice_size, _ = get_vocab_slice_config()
+                        if offset is not None and slice_size is not None and slice_size > 0:
+                            vocab_slice_offset = (offset, slice_size)
+
+                    # Each logical beam block should extract its top choices natively
+                    for b_idx in range(len(fork_info)):
+                        current_beam = all_beams[b_idx]
+
+                        # Compute the true exact allocation footprint boundaries
+                        # from the flat remuxed vector block for this specific beam
+                        start_offset = b_idx * stride_k
+                        end_offset = start_offset + stride_k
+
+                        if _is_constrained:
+                            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                                extract_constrained_segment(
+                                    raw_token_ids,
+                                    raw_logprobs,
+                                    raw_ranks,
+                                    raw_decoded,
+                                    start_offset,
+                                    end_offset,
+                                    logprobs_num,
+                                )
+                            )
+                        else:
+                            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                                extract_and_dedup_segment(
+                                    raw_token_ids,
+                                    raw_logprobs,
+                                    raw_ranks,
+                                    raw_decoded,
+                                    start_offset,
+                                    end_offset,
+                                    logprobs_num,
+                                )
+                            )
+                            if vocab_slice_offset is not None:
+                                offset, slice_size = vocab_slice_offset
+                                pos_arr = np.asarray(token_ids_pos, dtype=np.int64)
+                                slice_mask = (pos_arr >= 0) & (pos_arr < slice_size)
+                                pos_arr = pos_arr.copy()
+                                pos_arr[slice_mask] += offset
+                                token_ids_pos = pos_arr.tolist()
+
+                        constraint_coordinator.add_parent_candidates(
+                            candidate_builder,
+                            parent_index=b_idx,
+                            parent_cumulative_logprob=current_beam.cum_logprob,
+                            token_ids=token_ids_pos,
+                            logprobs=logprobs_pos,
+                            ranks=ranks_pos,
+                            decoded_tokens=decoded_pos,
+                            valid_token_ids=(
+                                None
+                                if _is_constrained
+                                else valid_tokens_sets[b_idx]
+                                if valid_tokens_sets is not None
+                                else None
+                            ),
+                            candidate_strategy=catalog_strategy,
+                        )
+                else:
+                    for b_idx, current_beam in enumerate(all_beams):
+                        constraint_coordinator.add_parent_candidates(
+                            candidate_builder,
+                            parent_index=b_idx,
+                            parent_cumulative_logprob=current_beam.cum_logprob,
+                            token_ids=[],
+                            logprobs=[],
+                            ranks=None,
+                            decoded_tokens=None,
+                            valid_token_ids=None,
+                            candidate_strategy=catalog_strategy,
+                        )
+            else:
+                # Baseline execution path for prefill / batch loops
+                for i, result in enumerate(output):
+                    if worker_candidates is not None:
+                        break
+                    current_beam = all_beams[i]
+                    if result.outputs[0].finish_reason == "error":
+                        yield RequestOutput(
+                            request_id=request_id,
+                            prompt=prompt_text,
+                            outputs=[
+                                CompletionOutput(
+                                    index=0,
+                                    text="",
+                                    token_ids=[],
+                                    cumulative_logprob=None,
+                                    logprobs=None,
+                                    finish_reason="error",
+                                )
+                            ],
+                            finished=True,
+                            prompt_token_ids=prompt_token_ids,
+                            prompt_logprobs=None,
+                        )
+                        return
+
+                    if result.outputs[0].logprobs is not None:
+                        flat = result.outputs[0].logprobs
+                        raw_ranks = getattr(flat, "ranks", None)
+                        if (
+                            _is_p2d_sentinel(raw_ranks)
+                            and (max_tokens - pre_calc - token) == p2d_num_steps
+                        ):
+                            out = _build_p2d_request_output(
+                                request_id=request_id,
+                                prompt_text=prompt_text,
+                                prompt_token_ids=prompt_token_ids,
+                                tokenized_length=tokenized_length,
+                                raw_token_ids=flat.token_ids,
+                                raw_logprobs=flat.logprobs,
+                                initial_tokens=initial_tokens,
+                                initial_logprobs=initial_logprobs,
+                                orig_prompt=orig_prompt,
+                                tokenizer=tokenizer,
+                                model_name=model_name,
+                                w2_effective=w2_effective,
+                                max_step_w=max_step_w,
+                                num_steps=p2d_num_steps,
+                                ignore_eos=ignore_eos,
+                                eos_token_id=eos_token_id,
+                                sid_end_token_id=sid_end_token_id,
+                                lora_request=lora_request,
+                                beam_search_start=beam_search_start,
+                                generation_time=generation_time,
+                            )
+                            yield out
+                            return
+
+                        if _is_constrained:
+                            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                                extract_constrained_flat_logprobs(flat, logprobs_num)
+                            )
+                        else:
+                            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                                extract_and_dedup_flat_logprobs(flat, logprobs_num)
+                            )
+                        constraint_coordinator.add_parent_candidates(
+                            candidate_builder,
+                            parent_index=i,
+                            parent_cumulative_logprob=current_beam.cum_logprob,
+                            token_ids=token_ids_pos,
+                            logprobs=logprobs_pos,
+                            ranks=ranks_pos,
+                            decoded_tokens=decoded_pos,
+                            valid_token_ids=(
+                                None
+                                if _is_constrained
+                                else valid_tokens_sets[i]
+                                if valid_tokens_sets is not None
+                                else None
+                            ),
+                            candidate_strategy=catalog_strategy,
                         )
                     else:
-                        token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
-                            extract_and_dedup_flat_logprobs(flat, logprobs_num)
+                        constraint_coordinator.add_parent_candidates(
+                            candidate_builder,
+                            parent_index=i,
+                            parent_cumulative_logprob=current_beam.cum_logprob,
+                            token_ids=[],
+                            logprobs=[],
+                            ranks=None,
+                            decoded_tokens=None,
+                            valid_token_ids=None,
+                            candidate_strategy=catalog_strategy,
                         )
-                    constraint_coordinator.add_parent_candidates(
-                        candidate_builder,
-                        parent_index=i,
-                        parent_cumulative_logprob=current_beam.cum_logprob,
-                        token_ids=token_ids_pos,
-                        logprobs=logprobs_pos,
-                        ranks=ranks_pos,
-                        decoded_tokens=decoded_pos,
-                        valid_token_ids=(
-                            None
-                            if _is_constrained
-                            else valid_tokens_sets[i]
-                            if valid_tokens_sets is not None
-                            else None
-                        ),
-                        candidate_strategy=catalog_strategy,
-                    )
+
+            if pruned_flat is not None:
+                (
+                    all_beams_token_id,
+                    all_beams_logprob,
+                    all_beams_beam_idx_arr,
+                    beam_flat_cache,
+                ) = pruned_flat
+            else:
+                candidate_batch = candidate_builder.build()
+                if worker_candidates is not None:
+                    # Worker side already selected the surviving beams; the candidate
+                    # batch built from the (skipped) flat segments is meaningless, so
+                    # swap in the worker's winners directly.
+                    (
+                        all_beams_token_id,
+                        all_beams_logprob,
+                        all_beams_beam_idx_arr,
+                        beam_flat_cache,
+                    ) = worker_candidates
+                    all_beams_token_id = np.asarray(all_beams_token_id, dtype=np.int64)
+                    all_beams_logprob = np.asarray(all_beams_logprob, dtype=np.float64)
+                    all_beams_beam_idx_arr = np.asarray(all_beams_beam_idx_arr, dtype=np.intp)
                 else:
-                    constraint_coordinator.add_parent_candidates(
-                        candidate_builder,
-                        parent_index=i,
-                        parent_cumulative_logprob=current_beam.cum_logprob,
-                        token_ids=[],
-                        logprobs=[],
-                        ranks=None,
-                        decoded_tokens=None,
-                        valid_token_ids=None,
-                        candidate_strategy=catalog_strategy,
-                    )
+                    all_beams_token_id = candidate_batch.token_ids
+                    all_beams_logprob = candidate_batch.cumulative_logprobs
+                    all_beams_beam_idx_arr = candidate_batch.parent_indices
+                    beam_flat_cache = candidate_batch.parent_cache
 
-        candidate_batch = candidate_builder.build()
-        if worker_candidates is not None:
-            # Worker side already selected the surviving beams; the candidate
-            # batch built from the (skipped) flat segments is meaningless, so
-            # swap in the worker's winners directly.
-            (
-                all_beams_token_id,
-                all_beams_logprob,
-                all_beams_beam_idx_arr,
-                beam_flat_cache,
-            ) = worker_candidates
-            all_beams_token_id = np.asarray(all_beams_token_id, dtype=np.int64)
-            all_beams_logprob = np.asarray(all_beams_logprob, dtype=np.float64)
-            all_beams_beam_idx_arr = np.asarray(all_beams_beam_idx_arr, dtype=np.intp)
-        else:
-            all_beams_token_id = candidate_batch.token_ids
-            all_beams_logprob = candidate_batch.cumulative_logprobs
-            all_beams_beam_idx_arr = candidate_batch.parent_indices
-            beam_flat_cache = candidate_batch.parent_cache
+            eos_beams: list[BeamSearchSequence] = []
+            if not ignore_eos:
+                stop_token_ids = {eos_token_id}
+                if sid_end_token_id is not None:
+                    stop_token_ids.add(sid_end_token_id)
+                eos_beams, all_beams_logprob = complete_eos_candidates(
+                    parents=all_beams,
+                    token_ids=all_beams_token_id,
+                    scores=all_beams_logprob,
+                    beam_idx=all_beams_beam_idx_arr,
+                    beam_flat_cache=beam_flat_cache,
+                    stop_token_ids=stop_token_ids,
+                    initial_logprobs=initial_logprobs,
+                    include_eos_token=include_stop_str_in_output,
+                    inherit_lora_request=False,
+                )
+                completed.extend(eos_beams)
 
-        eos_beams: list[BeamSearchSequence] = []
-        if not ignore_eos:
-            stop_token_ids = {eos_token_id}
-            if sid_end_token_id is not None:
-                stop_token_ids.add(sid_end_token_id)
-            eos_beams, all_beams_logprob = complete_eos_candidates(
+            # Processing non-EOS tokens
+            topn_idx = (
+                range(len(all_beams_token_id))
+                if worker_candidates is not None
+                else select_top_indices(
+                    all_beams_logprob,
+                    beam_width,
+                    catalog_strategy,
+                    exclude_nonfinite=bool(eos_beams),
+                )
+            )
+            new_beams, selected_fork_info = materialize_selected_beams(
                 parents=all_beams,
+                selected_indices=topn_idx,
                 token_ids=all_beams_token_id,
                 scores=all_beams_logprob,
                 beam_idx=all_beams_beam_idx_arr,
                 beam_flat_cache=beam_flat_cache,
-                stop_token_ids=stop_token_ids,
                 initial_logprobs=initial_logprobs,
-                include_eos_token=include_stop_str_in_output,
-                inherit_lora_request=False,
             )
-            completed.extend(eos_beams)
 
-        # Processing non-EOS tokens
-        topn_idx = (
-            range(len(all_beams_token_id))
-            if worker_candidates is not None and not eos_beams
-            else select_top_indices(
-                all_beams_logprob,
-                beam_width,
-                catalog_strategy,
-                exclude_nonfinite=bool(eos_beams),
+            # Build fork_info for next iteration's BEAM_FORK.
+            if use_beam_request:
+                fork_info = selected_fork_info
+
+            if not new_beams:
+                all_beams = []
+                if use_beam_request and prev_beam_internal_ids:
+                    await _beam_request_cleanup(
+                        self.engine_client, prefill_id, prev_beam_internal_ids, rank
+                    )
+                    prev_beam_internal_ids = []
+                break
+
+            all_beams = new_beams
+
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        # Session teardown must run on EVERY exit path — including the P2D
+        # fast-path returns and exceptions — so the EngineCore beam session
+        # cache and its resources are always purged. The in-loop cleanup
+        # paths reset prev_beam_internal_ids (and/or set cleaned_up), so
+        # this send is a no-op when teardown already happened.
+        if use_beam_request and prev_beam_internal_ids and not cleaned_up:
+            await _beam_request_cleanup(
+                self.engine_client,
+                prefill_id,
+                prev_beam_internal_ids,
+                rank,
+                is_last_step=last_step_suppressed,
             )
-        )
-        new_beams, selected_fork_info = materialize_selected_beams(
-            parents=all_beams,
-            selected_indices=topn_idx,
-            token_ids=all_beams_token_id,
-            scores=all_beams_logprob,
-            beam_idx=all_beams_beam_idx_arr,
-            beam_flat_cache=beam_flat_cache,
-            initial_logprobs=initial_logprobs,
-        )
-
-        # Build fork_info for next iteration's BEAM_FORK.
-        if use_beam_request:
-            fork_info = selected_fork_info
-
-        if not new_beams:
-            all_beams = []
-            if use_beam_request and prev_beam_internal_ids:
-                await _beam_request_cleanup(
-                    self.engine_client, prefill_id, prev_beam_internal_ids, rank
-                )
-                prev_beam_internal_ids = []
-            break
-
-        all_beams = new_beams
-
-    if use_beam_request and prev_beam_internal_ids:
-        await _beam_request_cleanup(self.engine_client, prefill_id, prev_beam_internal_ids, rank)
 
     if sid_end_token_id is not None:
         for beam in all_beams:
@@ -1097,7 +1575,7 @@ async def beam_search(
 
     tokens_list = [
         beam.tokens[tokenized_length:-1]
-        if beam.tokens[-1] == eos_token_id and not ignore_eos
+        if eos_token_id is not None and beam.tokens[-1] == eos_token_id and not ignore_eos
         else beam.tokens[tokenized_length:]
         for beam in best_beams
     ]
@@ -1138,15 +1616,8 @@ async def beam_search(
         metrics=metrics,
     )
 
-    # Record beam search metrics for Prometheus
-    # Get the model name - it could be a property or method
-    try:
-        model_name = self.models.model_name
-        if callable(model_name):
-            model_name = model_name()
-        model_name = str(model_name)
-    except Exception:
-        model_name = "unknown"
+    # Record beam search metrics for Prometheus (model_name was resolved once
+    # at the top of this generator).
     record_beam_search_metrics(metrics, engine="0", model_name=model_name)
 
     # Multi-process deployments run this serving frontend in a process

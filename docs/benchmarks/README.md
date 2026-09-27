@@ -16,6 +16,7 @@ OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchma
 - [Evaluation](#evaluation)
 - [Troubleshooting](#troubleshooting)
 - [Video-100 CI accuracy gate](parent_score_gate.md)
+- [Variadic Beam Width (P2D)](../variadic_beam_width.md)
 
 ## Overview
 
@@ -242,6 +243,14 @@ Each Parquet file must contain these columns:
 | `--task-types` | str | All 6 tasks | Comma-separated list of task types to run |
 | `--use-beam-search` | bool | False | Enable beam search during generation |
 | `--n` | int | 8 | Number of beams for beam search |
+| `--step-beam-widths` | str | None | Comma-separated per-step beam widths (W0,W1,W2) for P2D (e.g. `128,64,32`) |
+
+> [!TIP]
+> **Variadic Beam Width (`--step-beam-widths`)**:
+> In 3-step recommendation tasks (e.g. `video`, `interactive`), generative models emit hierarchical SID tokens (P0, D0, D1).
+> You can specify different candidate widths per step using `--step-beam-widths W0,W1,W2` (e.g. `--step-beam-widths 128,64,32`).
+> The final beam width returned to the client will match $W_2$ (32 in this example).
+> For architectural and routing details, see the [Variadic Beam Width Guide](../variadic_beam_width.md).
 
 #### Generation Arguments
 

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
 from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
 
@@ -216,6 +217,7 @@ def _params(
     max_tokens: int,
     ignore_eos: bool = False,
     end_token: str | None = None,
+    step_beam_widths: list[int] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         beam_width=2,
@@ -226,6 +228,7 @@ def _params(
         end_token=end_token,
         include_stop_str_in_output=False,
         catalog_strategy="fill",
+        step_beam_widths=step_beam_widths,
     )
 
 
@@ -242,6 +245,7 @@ def _run_search(
     ignore_eos: bool = False,
     request_id: str = "request-0",
     end_token: str | None = None,
+    step_beam_widths: list[int] | None = None,
 ) -> list[RequestOutput]:
     return asyncio.run(
         _collect_outputs(
@@ -256,6 +260,7 @@ def _run_search(
                     max_tokens=max_tokens,
                     ignore_eos=ignore_eos,
                     end_token=end_token,
+                    step_beam_widths=step_beam_widths,
                 ),
                 trace_headers={"trace": "value"},
             )
@@ -330,9 +335,10 @@ def test_grouped_beam_request_lifecycle(
 
     assert add_step.await_count == 1
     assert beam_step.await_count == 2
-    assert cleanup.await_count == 1
+    # Cleanup is piggybacked on the final decode step via is_last_step=True
+    assert cleanup.await_count == 0
 
-    decode_step_1, decode_step_2, cleanup_update = engine.beam_updates
+    decode_step_1, decode_step_2 = engine.beam_updates
     assert decode_step_1.session_id == "request-0-step-0-beam-0"
     assert decode_step_1.parent_beam_ids == [
         "request-0-step-0-beam-0",
@@ -344,6 +350,7 @@ def test_grouped_beam_request_lifecycle(
     ]
     assert decode_step_1.beam_tokens == [[11], [12]]
     assert decode_step_1.pruned_ids == []
+    assert decode_step_1.is_last_step is False
 
     assert decode_step_2.parent_beam_ids == [
         "request-0-step-1-beam-0",
@@ -355,10 +362,7 @@ def test_grouped_beam_request_lifecycle(
     ]
     assert decode_step_2.beam_tokens == [[11, 21], [11, 22]]
     assert decode_step_2.pruned_ids == ["request-0-step-1-beam-1"]
-
-    assert cleanup_update.session_id == "request-0-step-0-beam-0"
-    assert cleanup_update.beam_width == 0
-    assert cleanup_update.pruned_ids == decode_step_2.child_beam_ids
+    assert decode_step_2.is_last_step is True
     assert all(update.data_parallel_rank == 1 for update in engine.beam_updates)
     assert engine.prepare_calls[0].data_parallel_rank == 1
     assert all(call.kwargs["data_parallel_rank"] == 1 for call in engine.register_calls)
@@ -495,7 +499,8 @@ def test_self_advance_chained_step_skips_frontend_update(
     assert all(call.session_id == "request-0-step-0-beam-0" for call in engine.register_calls)
 
     assert len(outputs) == 1
-    _assert_normal_output(outputs[0], "request-0")
+    assert len(engine.beam_updates) == 2
+    assert engine.beam_updates[-1].is_last_step is True
 
 
 def test_self_advance_unflagged_decision_keeps_frontend_driven(
@@ -525,10 +530,11 @@ def test_self_advance_unflagged_decision_keeps_frontend_driven(
         ],
     )
 
-    outputs = _run_search(engine, max_tokens=3)
+    _run_search(engine, max_tokens=3)
 
-    # Both decode steps sent their frontend-driven updates.
-    decode_step_1, decode_step_2, _cleanup = engine.beam_updates
+    # Both decode steps sent their frontend-driven updates; cleanup is
+    # piggybacked on the final decode step via is_last_step=True.
+    decode_step_1, decode_step_2 = engine.beam_updates
     assert decode_step_1.child_beam_ids == [
         "request-0-step-1-beam-0",
         "request-0-step-1-beam-1",
@@ -538,6 +544,473 @@ def test_self_advance_unflagged_decision_keeps_frontend_driven(
         "request-0-step-2-beam-1",
     ]
     assert len(engine.register_calls) == 2
+    assert decode_step_2.is_last_step is True
+    assert len(engine.beam_updates) == 2
 
+
+def test_pruned_worker_beam_lifecycle(
+    monkeypatch: Any,
+) -> None:
+    """Verify pruned worker outputs (top-W candidates with parent indices in ranks)."""
+    _install_deterministic_request_ids(monkeypatch)
+
+    def _pruned_flat(
+        token_ids: list[int],
+        logprobs: list[float],
+        parent_ranks: list[int],
+    ) -> FlatLogprobs:
+        return FlatLogprobs(
+            start_indices=[0],
+            end_indices=[len(token_ids)],
+            token_ids=token_ids,
+            logprobs=logprobs,
+            ranks=parent_ranks,
+            decoded_tokens=[str(t) for t in token_ids],
+        )
+
+    # Beam width 2. Step 0 (prepare) outputs tokens 11, 12.
+    # Step 1: Worker prunes to top 2: token 21 (parent 0, lp -0.1), token 22 (parent 1, lp -0.2)
+    # Step 2: Worker prunes to top 2: token 31 (parent 0, lp -0.1), token 32 (parent 0, lp -0.3)
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(_pruned_flat([21, 22], [-0.1, -0.2], [0, 1])),
+            _engine_output(_pruned_flat([31, 32], [-0.1, -0.3], [0, 0])),
+        ],
+        data_parallel_size=1,
+    )
+    outputs = _run_search(engine, max_tokens=3)
     assert len(outputs) == 1
-    _assert_normal_output(outputs[0], "request-0")
+    output = outputs[0]
+    assert output.finished is True
+    assert len(output.outputs) == 2
+    decode_step_1, decode_step_2 = engine.beam_updates
+    assert decode_step_1.is_last_step is False
+    assert decode_step_2.is_last_step is True
+
+
+def test_p2d_dead_end_beam_fallback() -> None:
+    """Catalog dead-end fallback emits one finished completion, never empty."""
+    initial_logprobs = FlatLogprobs(
+        start_indices=[0],
+        end_indices=[1],
+        token_ids=[7],
+        logprobs=[-0.1],
+        ranks=[1],
+        decoded_tokens=["<s_a_1>"],
+    )
+    beam = serving_engine._p2d_dead_end_beam(
+        orig_prompt=None,
+        initial_tokens=[7],
+        initial_logprobs=initial_logprobs,
+        lora_request=None,
+        eos_token_id=2,
+    )
+    assert beam is not None
+    assert beam.tokens == [7, 2]
+    assert beam.cum_logprob == float("-inf")
+    assert beam.logprobs.token_ids == [7, 2]
+
+    # No EOS token configured: falls back to 0.
+    beam_zero = serving_engine._p2d_dead_end_beam(
+        orig_prompt=None,
+        initial_tokens=[7],
+        initial_logprobs=initial_logprobs,
+        lora_request=None,
+        eos_token_id=None,
+    )
+    assert beam_zero.tokens == [7, 0]
+
+
+def test_p2d_sentinel_exit_purges_beam_session(
+    monkeypatch: Any,
+) -> None:
+    """The P2D fast-path return must send the beam_width=0 teardown."""
+    from vllm_gr.v1.worker.prefill_graph_runner import P2D_SENTINEL_RANK
+
+    _install_deterministic_request_ids(monkeypatch)
+
+    def _p2d_flat() -> FlatLogprobs:
+        # Two captured beams, three tokens each, keyed by the P2D sentinel.
+        token_ids = [101, 201, 301, 102, 202, 302]
+        return FlatLogprobs(
+            start_indices=[0],
+            end_indices=[len(token_ids)],
+            token_ids=token_ids,
+            logprobs=[-0.1, -0.2, -0.3, -0.4, -0.5, -0.6],
+            ranks=[P2D_SENTINEL_RANK] * len(token_ids),
+            decoded_tokens=[str(t) for t in token_ids],
+        )
+
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_p2d_flat())],
+        grouped_outputs=[],
+        data_parallel_size=1,
+    )
+    p2d_num_steps = 1 + serving_engine.DEFAULT_DECODE_STEPS
+    outputs = _run_search(engine, max_tokens=p2d_num_steps)
+    assert len(outputs) == 1
+    output = outputs[0]
+    assert output.finished is True
+    assert len(output.outputs) == 2
+    assert all(choice.token_ids for choice in output.outputs)
+    # The finally-block teardown must purge the session exactly once.
+    teardown_updates = [u for u in engine.beam_updates if u.beam_width == 0]
+    assert len(teardown_updates) == 1
+    assert teardown_updates[0].session_id == "request-0-step-0-beam-0"
+
+
+def test_p2d_prefill_uses_w2_effective_with_step_widths(
+    monkeypatch: Any,
+) -> None:
+    """Per-step widths: the prefill branch must return w2 (not beam_width) beams."""
+    from vllm_gr.v1.worker.prefill_graph_runner import P2D_SENTINEL_RANK
+
+    _install_deterministic_request_ids(monkeypatch)
+
+    def _p2d_flat_w4() -> FlatLogprobs:
+        # Four captured beams (w2), three tokens each, sentinel-keyed.
+        token_ids = [
+            101,
+            201,
+            301,
+            102,
+            202,
+            302,
+            103,
+            203,
+            303,
+            104,
+            204,
+            304,
+        ]
+        return FlatLogprobs(
+            start_indices=[0],
+            end_indices=[len(token_ids)],
+            token_ids=token_ids,
+            logprobs=[-0.1 * i for i in range(1, len(token_ids) + 1)],
+            ranks=[P2D_SENTINEL_RANK] * len(token_ids),
+            decoded_tokens=[str(t) for t in token_ids],
+        )
+
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_p2d_flat_w4())],
+        grouped_outputs=[],
+        data_parallel_size=1,
+    )
+    p2d_num_steps = 1 + serving_engine.DEFAULT_DECODE_STEPS
+    outputs = _run_search(
+        engine,
+        max_tokens=p2d_num_steps,
+        step_beam_widths=[2, 3, 4],
+    )
+    assert len(outputs) == 1
+    output = outputs[0]
+    assert output.finished is True
+    # beam_width=2 must NOT truncate the four w2=4 beams.
+    assert len(output.outputs) == 4
+    assert output.metrics.num_beams == 4
+    assert [choice.token_ids[:3] for choice in output.outputs] == [
+        [101, 201, 301],
+        [102, 202, 302],
+        [103, 203, 303],
+        [104, 204, 304],
+    ]
+
+
+def test_build_p2d_request_output_direct() -> None:
+    """Direct helper: beam count, metrics formula, and unwrap of nested flat."""
+    initial_logprobs = FlatLogprobs(
+        start_indices=[0],
+        end_indices=[1],
+        token_ids=[10],
+        logprobs=[-0.1],
+        ranks=[1],
+        decoded_tokens=["prompt"],
+    )
+    token_ids = [101, 201, 301, 102, 202, 302, 103, 203, 303, 104, 204, 304]
+    raw_logprobs = [-0.01 * i for i in range(1, len(token_ids) + 1)]
+
+    # Uniform: max_step_w == w2_effective == 4.
+    out = serving_engine._build_p2d_request_output(
+        request_id="r1",
+        prompt_text="prompt text",
+        prompt_token_ids=[10],
+        tokenized_length=1,
+        raw_token_ids=[token_ids],  # nested list exercises the unwrap
+        raw_logprobs=[raw_logprobs],
+        initial_tokens=[10],
+        initial_logprobs=initial_logprobs,
+        orig_prompt="prompt text",
+        tokenizer=_Tokenizer(),
+        model_name="test-model",
+        w2_effective=4,
+        max_step_w=4,
+    )
+    assert len(out.outputs) == 4
+    assert out.metrics.num_beams == 4
+    assert out.metrics.is_p2d is True
+    assert [c.token_ids[:3] for c in out.outputs] == [
+        [101, 201, 301],
+        [102, 202, 302],
+        [103, 203, 303],
+        [104, 204, 304],
+    ]
+    # The flat carries true per-token scores; the cumulative is their sum.
+    assert out.outputs[0].cumulative_logprob == pytest.approx(-0.01 - 0.02 - 0.03)
+    assert out.outputs[0].logprobs.logprobs[-3:] == pytest.approx([-0.01, -0.02, -0.03])
+
+
+def test_build_p2d_request_output_dead_end_and_model_name(
+    monkeypatch: Any,
+) -> None:
+    """All-invalid flat falls back to one finished beam; model name passes through."""
+    recorded: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        serving_engine,
+        "record_beam_search_metrics",
+        lambda metrics, engine, model_name: recorded.append((engine, model_name)),
+    )
+    initial_logprobs = FlatLogprobs(
+        start_indices=[0],
+        end_indices=[1],
+        token_ids=[10],
+        logprobs=[-0.1],
+        ranks=[1],
+        decoded_tokens=["prompt"],
+    )
+    out = serving_engine._build_p2d_request_output(
+        request_id="r1",
+        prompt_text="prompt text",
+        prompt_token_ids=[10],
+        tokenized_length=1,
+        raw_token_ids=[-1] * 12,
+        raw_logprobs=[-1.0] * 12,
+        initial_tokens=[10],
+        initial_logprobs=initial_logprobs,
+        orig_prompt="prompt text",
+        tokenizer=_Tokenizer(),
+        model_name="test-model",
+        w2_effective=4,
+        max_step_w=4,
+        eos_token_id=2,
+    )
+    assert len(out.outputs) == 1
+    assert out.outputs[0].token_ids == [2]
+    assert recorded == [("0", "test-model")]
+
+
+def test_build_p2d_request_output_early_eos_logprob_pruning() -> None:
+    """EOS at step 1: cumulative logprob sums only the surviving step scores."""
+    initial_logprobs = FlatLogprobs(
+        start_indices=[0],
+        end_indices=[1],
+        token_ids=[10],
+        logprobs=[-0.1],
+        ranks=[1],
+        decoded_tokens=["prompt"],
+    )
+    token_ids = [101, 2, 301, 102, 202, 302, 103, 203, 303, 104, 204, 304]
+    raw_logprobs = [-0.01 * i for i in range(1, len(token_ids) + 1)]
+    out = serving_engine._build_p2d_request_output(
+        request_id="r1",
+        prompt_text="prompt text",
+        prompt_token_ids=[10],
+        tokenized_length=1,
+        raw_token_ids=[token_ids],
+        raw_logprobs=[raw_logprobs],
+        initial_tokens=[10],
+        initial_logprobs=initial_logprobs,
+        orig_prompt="prompt text",
+        tokenizer=_Tokenizer(),
+        model_name="test-model",
+        w2_effective=4,
+        max_step_w=4,
+        eos_token_id=2,
+    )
+    # Beam 0 hits EOS at step 1: [101, 2] survives, -0.03 is pruned.
+    first = out.outputs[0]
+    assert first.token_ids == [101, 2]
+    assert first.cumulative_logprob == pytest.approx(-0.01 + -0.02)
+    assert first.finish_reason == "stop"
+    assert first.stop_reason == 2
+    assert len(first.logprobs.token_ids) == 3  # base [10] + [101, 2]
+    # Beam 1 has no EOS: full three-step sum, no stop reason.
+    second = out.outputs[1]
+    assert second.cumulative_logprob == pytest.approx(-0.04 + -0.05 + -0.06)
+    assert second.finish_reason == "length"
+
+
+def test_build_p2d_request_output_dead_end_decodes_empty_text(
+    monkeypatch: Any,
+) -> None:
+    """Dead-end fallback beam decodes to "" — never the leading sid token."""
+    monkeypatch.setattr(
+        serving_engine,
+        "record_beam_search_metrics",
+        lambda metrics, engine, model_name: None,
+    )
+    initial_logprobs = FlatLogprobs(
+        start_indices=[0],
+        end_indices=[2],
+        token_ids=[10, 1],
+        logprobs=[-0.1, -0.2],
+        ranks=[1, 1],
+        decoded_tokens=["prompt", "<s_a_1>"],
+    )
+    out = serving_engine._build_p2d_request_output(
+        request_id="r1",
+        prompt_text="prompt text",
+        prompt_token_ids=[10],
+        tokenized_length=1,
+        raw_token_ids=[-1] * 12,
+        raw_logprobs=[-1.0] * 12,
+        initial_tokens=[10, 1],
+        initial_logprobs=initial_logprobs,
+        orig_prompt="prompt text",
+        tokenizer=_Tokenizer(),
+        model_name="test-model",
+        w2_effective=4,
+        max_step_w=4,
+        eos_token_id=2,
+    )
+    assert len(out.outputs) == 1
+    assert out.outputs[0].text == ""
+    assert out.outputs[0].cumulative_logprob == float("-inf")
+
+
+def _p2d_sentinel_flat(
+    token_ids: list[int],
+    logprobs: list[float],
+    *,
+    nested: bool = False,
+) -> FlatLogprobs:
+    """Build a P2D worker flat keyed by the sentinel rank.
+
+    The decode (beam-request) transport delivers one flat list holding
+    ``num_beams * p2d_num_steps`` tokens, while the prefill/batch transport
+    delivers one nested row per request; ``nested`` selects the latter.
+    """
+    if nested:
+        return FlatLogprobs(
+            start_indices=[0],
+            end_indices=[len(token_ids)],
+            token_ids=[list(token_ids)],
+            logprobs=[list(logprobs)],
+            ranks=[[serving_engine.P2D_SENTINEL_RANK] * len(token_ids)],
+            decoded_tokens=[None] * len(token_ids),
+        )
+    return FlatLogprobs(
+        start_indices=[0],
+        end_indices=[len(token_ids)],
+        token_ids=token_ids,
+        logprobs=logprobs,
+        ranks=[serving_engine.P2D_SENTINEL_RANK] + [1] * (len(token_ids) - 1),
+        decoded_tokens=[str(token_id) for token_id in token_ids],
+    )
+
+
+def test_p2d_decode_prunes_post_eos_tokens(
+    monkeypatch: Any,
+) -> None:
+    """P2D fast path: an EOS at an early or final decode pass terminates the beam.
+
+    The P2D graph always executes both decode passes, so a mid-sequence EOS is
+    followed by post-EOS tokens.  With ignore_eos=False the final beams must be
+    pruned at the first EOS and reported with finish_reason="stop".
+    """
+    _install_deterministic_request_ids(monkeypatch)
+    p2d_num_steps = 1 + serving_engine.DEFAULT_DECODE_STEPS
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(
+                _p2d_sentinel_flat(
+                    # Beam 0: EOS at pass 1; beam 1: EOS at the final pass.
+                    [21, 2, 23, 31, 32, 2],
+                    [-0.1, -0.11, -0.12, -0.5, -0.6, -0.7],
+                )
+            ),
+        ],
+    )
+    outputs = _run_search(engine, max_tokens=1 + p2d_num_steps)
+    assert len(outputs) == 1
+    choices = outputs[0].outputs
+    assert [choice.finish_reason for choice in choices] == ["stop", "stop"]
+    assert [choice.stop_reason for choice in choices] == [2, 2]
+    assert [choice.token_ids for choice in choices] == [[21, 2], [31, 32, 2]]
+    assert [choice.text for choice in choices] == ["21", "31 32"]
+
+
+def test_p2d_decode_ignore_eos_keeps_post_eos_tokens(
+    monkeypatch: Any,
+) -> None:
+    """ignore_eos=True keeps the full P2D pass output and reports "length"."""
+    _install_deterministic_request_ids(monkeypatch)
+    p2d_num_steps = 1 + serving_engine.DEFAULT_DECODE_STEPS
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(
+                _p2d_sentinel_flat(
+                    [21, 2, 23, 31, 32, 33],
+                    [-0.1, -0.11, -0.12, -0.5, -0.6, -0.7],
+                )
+            ),
+        ],
+    )
+    outputs = _run_search(engine, max_tokens=1 + p2d_num_steps, ignore_eos=True)
+    assert len(outputs) == 1
+    choices = outputs[0].outputs
+    assert [choice.finish_reason for choice in choices] == ["length", "length"]
+    assert [choice.stop_reason for choice in choices] == [None, None]
+    assert [choice.token_ids for choice in choices] == [[21, 2, 23], [31, 32, 33]]
+    assert [choice.text for choice in choices] == ["21 2 23", "31 32 33"]
+
+
+def test_p2d_decode_no_eos_reports_length(
+    monkeypatch: Any,
+) -> None:
+    """Beams without EOS keep the previous P2D behavior (length finish)."""
+    _install_deterministic_request_ids(monkeypatch)
+    p2d_num_steps = 1 + serving_engine.DEFAULT_DECODE_STEPS
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(
+                _p2d_sentinel_flat(
+                    [21, 22, 23, 31, 32, 33],
+                    [-0.1, -0.11, -0.12, -0.5, -0.6, -0.7],
+                )
+            ),
+        ],
+    )
+    outputs = _run_search(engine, max_tokens=1 + p2d_num_steps)
+    assert len(outputs) == 1
+    choices = outputs[0].outputs
+    assert [choice.finish_reason for choice in choices] == ["length", "length"]
+    assert [choice.stop_reason for choice in choices] == [None, None]
+    assert [choice.token_ids for choice in choices] == [[21, 22, 23], [31, 32, 33]]
+
+
+def test_p2d_batch_prunes_post_eos_tokens() -> None:
+    """Prefill/batch P2D transport: the nested sentinel row is pruned at EOS."""
+    p2d_num_steps = 1 + serving_engine.DEFAULT_DECODE_STEPS
+    engine = _OrdinaryEngineClient(
+        prepare_outputs=[
+            _engine_output(
+                _p2d_sentinel_flat(
+                    [21, 2, 23],
+                    [-0.1, -0.11, -0.12],
+                    nested=True,
+                )
+            ),
+        ],
+    )
+    outputs = _run_search(engine, max_tokens=p2d_num_steps)
+    assert len(outputs) == 1
+    choices = outputs[0].outputs
+    assert [choice.finish_reason for choice in choices] == ["stop"]
+    assert [choice.stop_reason for choice in choices] == [2]
+    assert [choice.token_ids for choice in choices] == [[21, 2]]
+    assert [choice.text for choice in choices] == ["21"]
