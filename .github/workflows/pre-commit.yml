@@ -23,6 +23,12 @@ on:
   push:
     branches: [main, decode_graph]
   workflow_dispatch:
+    inputs:
+      rebuild_pre_commit_cache:
+        description: Delete and rebuild this runner's local pre-commit cache
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: >-
@@ -230,6 +236,7 @@ jobs:
           echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
           echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
+          echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311" >> "$GITHUB_ENV"
 
       - name: Check for single commit
         if: >-
@@ -268,9 +275,21 @@ jobs:
       - name: Kill stale process on device
         run: bash ./scripts/kill_vllm_on_device.sh
 
-      - uses: pre-commit/action@v3.0.1
-        with:
-          extra_args: --all-files
+      - name: Install pre-commit
+        run: uv pip install pre-commit==4.6.2
+
+      - name: Reset local pre-commit cache
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.rebuild_pre_commit_cache
+        run: pre-commit clean
+
+      - name: Run pre-commit
+        run: >-
+          pre-commit run
+          --show-diff-on-failure
+          --color=always
+          --all-files
 
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
