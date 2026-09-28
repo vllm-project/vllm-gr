@@ -10,6 +10,53 @@ import torch
 
 from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
 from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
+from vllm_gr.v1.worker.npu_beam_stage_adapter import (
+    NPUEagerFirstDecodeHandoff,
+    NPUEagerStagePlan,
+    validate_npu_eager_capabilities,
+)
+
+
+def _eager_stage_output(*, kind: str, batch_size: int = 2, beam_width: int = 3) -> SimpleNamespace:
+    request_ids = tuple(f"request-{index}" for index in range(batch_size))
+    prompt_lengths = tuple(range(2, batch_size + 2))
+    stage_index = 0 if kind == "prefill" else 1
+    metadata = SimpleNamespace(
+        session_id="batch-0",
+        dispatch_id=stage_index,
+        stage_index=stage_index,
+        kind=kind,
+        decode_step=None if kind == "prefill" else 0,
+        owner_generation=1,
+        request_ids=request_ids,
+        num_prompt_tokens_by_request=prompt_lengths,
+        num_prompt_tokens=sum(prompt_lengths),
+        beam_params=SimpleNamespace(beam_width=beam_width),
+        produces_output=True,
+        execution_capacity=SimpleNamespace(beam_width=beam_width),
+    )
+    counts = prompt_lengths if kind == "prefill" else (1,) * batch_size
+    return SimpleNamespace(
+        gr_stage_metadata={metadata.session_id: metadata},
+        num_scheduled_tokens=dict(zip(request_ids, counts)),
+        total_num_scheduled_tokens=sum(counts),
+        beam_data={},
+    )
+
+
+def test_npu_eager_plan_keeps_logical_prefill_and_expands_decode_rows() -> None:
+    prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
+    assert prefill.logical_scheduled_tokens == (2, 3)
+    assert prefill.model_token_count == 5
+    assert prefill.logits_indices == (1, 4)
+    assert prefill.sampling_row_indices == (0, 1)
+
+    decode = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
+    assert decode.logical_scheduled_tokens == (1, 1)
+    assert decode.model_token_count == 6
+    assert decode.logits_indices == tuple(range(6))
+    assert decode.sampling_row_indices == (0, 0, 0, 1, 1, 1)
+    assert decode.decode_positions == (2, 2, 2, 3, 3, 3)
 
 
 def test_npu_prepare_unproxies_and_preserves_four_item_contract(
@@ -967,3 +1014,67 @@ def test_npu_verify_and_record_appends_to_existing_keys(
     )
     assert npu_patch._verify_and_record_captured_graph_npu(runner, width=8) is True
     assert runner._beam_graph_keys == {4, 8}
+
+
+def test_npu_eager_decode_binds_winners_and_sampling_rows() -> None:
+    prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
+    plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
+    input_ids = torch.full((8,), -1, dtype=torch.int32)
+    positions = torch.full((8,), -1, dtype=torch.int64)
+    winners = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
+    handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
+
+    handoff.bind_first_decode(plan, input_ids, positions)
+
+    assert input_ids.tolist() == [11, 12, 13, 21, 22, 23, -1, -1]
+    assert positions.tolist() == [2, 2, 2, 3, 3, 3, -1, -1]
+    source = SimpleNamespace(
+        temperature=torch.tensor([0.5, 0.9]),
+        top_p=torch.tensor([0.8, 0.7]),
+    )
+    remapped = plan.remap_sampling_metadata(source)
+    assert remapped is not source
+    assert remapped.temperature.tolist() == pytest.approx([0.5] * 3 + [0.9] * 3)
+    assert remapped.top_p.tolist() == pytest.approx([0.8] * 3 + [0.7] * 3)
+    assert source.temperature.tolist() == pytest.approx([0.5, 0.9])
+
+
+def test_npu_eager_attention_layout_keeps_request_ownership() -> None:
+    plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
+    layout = plan.build_decode_attention_layout(
+        block_ids_by_request=((10, 11), (20, 21)),
+        pool_slots=(4, 7),
+    )
+
+    assert layout.row_request_indices == (0, 0, 0, 1, 1, 1)
+    assert layout.row_beam_indices == (0, 1, 2, 0, 1, 2)
+    assert layout.query_start_locations == tuple(range(7))
+    assert layout.prefix_sequence_lengths == (2, 2, 2, 3, 3, 3)
+    assert layout.suffix_sequence_lengths == (1,) * 6
+    assert layout.prefix_block_tables[:3] == ((10, 11),) * 3
+    assert layout.prefix_block_tables[3:] == ((20, 21),) * 3
+    assert layout.pool_slots == (4, 7)
+
+
+def test_npu_eager_capability_gate_is_npu_only_and_eager_only() -> None:
+    worker = SimpleNamespace(
+        device="npu",
+        model_config=SimpleNamespace(enforce_eager=True, dtype=torch.bfloat16),
+        use_async_scheduling=True,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+        ),
+        speculative_config=None,
+    )
+    validate_npu_eager_capabilities(worker)
+    worker.model_config.enforce_eager = False
+    with pytest.raises(ValueError, match="eager mode"):
+        validate_npu_eager_capabilities(worker)
+
+    worker.model_config.enforce_eager = True
+
+    worker.device = "cuda"
+    with pytest.raises(ValueError, match="NPU worker"):
+        validate_npu_eager_capabilities(worker)
