@@ -106,9 +106,15 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     # limits and the configured Constraint Table remain to check here.
     gr_config = GRConfig.from_vllm_config(vllm_config)
     table = gr_config.constraint_table
-    if table is None or not table.enabled or table.backend is not ConstraintTableBackendEnum.CUDA:
+    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
+    device_type = str(device).split(":")[0]
+    required_backend = (
+        ConstraintTableBackendEnum.NPU if device_type == "npu" else ConstraintTableBackendEnum.CUDA
+    )
+    if table is None or not table.enabled or table.backend is not required_backend:
         raise BeamSearchRequestError(
-            "beam_search_v1 requires an enabled canonical CUDA constraint table"
+            "beam_search_v1 requires an enabled canonical "
+            f"{required_backend.value.upper()} constraint table"
         )
     max_width = gr_config.beam_max_width
     if max_width is None:

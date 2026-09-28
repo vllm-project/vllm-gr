@@ -355,6 +355,31 @@ def test_request_requires_enabled_canonical_cuda_constraint_table(
         )
 
 
+@pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
+def test_request_rejects_width_below_fixed_runtime_before_submission(device: str) -> None:
+    canonical = _canonical_gr_config(backend=device)
+    canonical["beam"]["max_width"] = 128
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device=device)
+    with pytest.raises(BeamSearchRequestError, match="fixed runtime width 128"):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=4, max_tokens=3, ignore_eos=True),
+            online=True,
+        )
+    engine.submit_gr_session.assert_not_called()
+
+
+def test_npu_request_accepts_matching_width_and_canonical_backend() -> None:
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(backend="npu")})
+    engine.vllm_config.device_config = SimpleNamespace(device="npu")
+    request = _prepare_request(
+        engine, [1, 2], BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True), online=True
+    )
+    assert request.beam_params.beam_width == 2
+
+
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     "model_eos,end_token,ignore_eos,expected_stops",

@@ -21,6 +21,7 @@ Also covers:
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -349,29 +350,64 @@ def test_xllm_submax_width_matches_cascade(beam_width: int) -> None:
 
 
 def test_xllm_cache_unshared_kv_matches_reference() -> None:
-    """The xllm pool write must reproduce the reference slot/0-based write."""
+    """The flattened B*W attention view must preserve B request-local writes."""
     torch.manual_seed(99)
-    beam_width, max_steps = 4, 8
-    pool = torch.zeros(1, beam_width, NUM_KV_HEADS, max_steps, HEAD_DIM, dtype=DTYPE, device=DEVICE)
+    batch_size, beam_width, max_steps = 2, 4, 8
+    shape = (
+        batch_size,
+        beam_width,
+        NUM_KV_HEADS,
+        max_steps,
+        HEAD_DIM,
+    )
+    pool = torch.zeros(shape, dtype=DTYPE, device=DEVICE)
+    pool_v = torch.zeros_like(pool)
     pool_ref = torch.zeros_like(pool)
+    pool_ref_v = torch.zeros_like(pool)
 
-    curr_k = (torch.randn(beam_width, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * 0.1).to(DEVICE)
-    curr_v = (torch.randn(beam_width, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * 0.1).to(DEVICE)
-    slot, decode_step = 0, 3
+    rows = batch_size * beam_width
+    curr_k = (torch.randn(rows, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * 0.1).to(DEVICE)
+    curr_v = (torch.randn(rows, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * 0.1).to(DEVICE)
+    decode_step = 3
+    context = SimpleNamespace(
+        xllm_block_table_buf=torch.arange(batch_size, dtype=torch.int32, device=DEVICE),
+        decode_step_1based_buf=torch.tensor([decode_step + 1], dtype=torch.int32, device=DEVICE),
+    )
+    session = SimpleNamespace(
+        context=context,
+        request_width=beam_width,
+        beam_width=beam_width,
+    )
 
-    beam_attn_npu_xllm.cache_unshared_kv(pool, pool.clone(), curr_k, curr_v, slot, decode_step)
-    # Reference: the original beam_kernels semantics (slot/0-based).
-    pool_ref[slot, :beam_width, :, decode_step : decode_step + 1, :] = curr_k.unsqueeze(2)
-    pool_ref_v = pool_ref.clone()
-    pool_ref_v[slot, :beam_width, :, decode_step : decode_step + 1, :] = curr_v.unsqueeze(2)
+    beam_attn_npu_xllm.cache_unshared_kv(
+        pool.view(1, rows, *pool.shape[2:]),
+        pool_v.view(1, rows, *pool_v.shape[2:]),
+        curr_k,
+        curr_v,
+        slot=0,
+        decode_step=decode_step,
+        beam_session=session,
+    )
+    pool_ref[:, :, :, decode_step : decode_step + 1, :] = curr_k.view(
+        batch_size, beam_width, NUM_KV_HEADS, HEAD_DIM
+    ).unsqueeze(3)
+    pool_ref_v[:, :, :, decode_step : decode_step + 1, :] = curr_v.view(
+        batch_size, beam_width, NUM_KV_HEADS, HEAD_DIM
+    ).unsqueeze(3)
 
     torch.testing.assert_close(pool, pool_ref, rtol=0, atol=0)
+    torch.testing.assert_close(pool_v, pool_ref_v, rtol=0, atol=0)
 
-    # And the fused op itself must agree with the same reference layout.
     pool2 = torch.zeros_like(pool)
     pool2_v = torch.zeros_like(pool)
-    block_table = torch.tensor([slot], dtype=torch.int32, device=DEVICE)
-    beam_ops.cache_unshared_kv(pool2, pool2_v, curr_k, curr_v, block_table, decode_step + 1)
+    beam_ops.cache_unshared_kv(
+        pool2,
+        pool2_v,
+        curr_k,
+        curr_v,
+        context.xllm_block_table_buf,
+        context.decode_step_1based_buf,
+    )
     torch.testing.assert_close(pool2, pool_ref, rtol=0, atol=0)
     torch.testing.assert_close(pool2_v, pool_ref_v, rtol=0, atol=0)
 

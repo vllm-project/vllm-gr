@@ -92,14 +92,25 @@ def execute_gr_stage(
     hooks_type: type[Any] | None = None,
     **kwargs: Any,
 ) -> Any:
-    _require_device(worker)
-    from vllm_gr.v1.worker.gpu_beam_stage_runner import (
-        _StageExecutionHooks,
-        get_stage_runner,
-    )
-
     local = worker_input(scheduled)
-    stage_runner = get_stage_runner(worker, local, hooks_type=hooks_type or _StageExecutionHooks)
+    device_type = str(worker.device).split(":")[0]
+    if device_type == "cuda":
+        from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+            _StageExecutionHooks,
+            get_stage_runner,
+        )
+
+        stage_runner = get_stage_runner(
+            worker,
+            local,
+            hooks_type=hooks_type or _StageExecutionHooks,
+        )
+    elif device_type == "npu":
+        from vllm_gr.v1.worker.npu_beam_stage_runner import get_npu_stage_runner
+
+        stage_runner = get_npu_stage_runner(worker, local)
+    else:
+        raise ValueError("beam_search_v1 has no execution adapter for this device")
     try:
         return stage_runner.execute(local, original, *args, **kwargs)
     except Exception as error:

@@ -161,8 +161,10 @@ def validate_gr_execution_runtime(config: Any) -> None:
 def validate_gr_device_config(config: Any) -> None:
     """Reject unavailable adapters without importing a device runtime."""
     device = getattr(getattr(config, "device_config", None), "device", None)
-    if device is not None and str(device).split(":")[0] != "cuda":
-        raise ValueError("Asynchronous scheduling requires a CUDA ModelRunner")
+    if device is not None and str(device).split(":")[0] not in ("cuda", "npu"):
+        raise ValueError(
+            "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
+        )
 
 
 def validate_gr_request(request: BeamBatchRequest) -> None:

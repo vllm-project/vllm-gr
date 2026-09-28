@@ -1915,8 +1915,6 @@ def _dispatch_stage_frame(
 
     if not getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None):
         return _NOT_A_STAGE_FRAME
-    if str(self.device).split(":")[0] != "cuda":
-        raise ValueError("persistent GR stage execution requires a CUDA runner")
     from vllm_gr.v1.worker.gr_execution import execute_gr_stage
 
     return execute_gr_stage(

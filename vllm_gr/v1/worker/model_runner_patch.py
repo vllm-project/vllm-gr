@@ -312,6 +312,9 @@ def apply_worker_patches() -> None:
             )
 
         runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
+        update_states_patch = getattr(platform_module, "make_patched_update_states", None)
+        if update_states_patch is not None:
+            runner_class._update_states = update_states_patch(runner_class._update_states)
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )

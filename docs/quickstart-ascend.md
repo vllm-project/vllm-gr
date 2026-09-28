@@ -141,6 +141,12 @@ See [getting_started/installation/npu/npu.inc.md](getting_started/installation/n
 
 ## NPU decode execution mode
 
+Beam Search V1 uses a fixed request width equal to `beam.max_width`
+(`vllm_gr_beam_max_width` in the legacy configuration encoding). A smaller
+request width is rejected before submission; the NPU batch pool is not a
+variable-width view. Native request state advances by one token per request
+at Decode, while the NPU model executes `batch_size * beam_width` tokens.
+
 The incremental beam decode branch on Ascend NPU has two execution modes,
 selected through the engine's `additional_config`:
 

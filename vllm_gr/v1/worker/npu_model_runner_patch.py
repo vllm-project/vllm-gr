@@ -39,6 +39,28 @@ from vllm_gr.v1.worker.prefill_graph_runner import (
 logger = init_logger(__name__)
 
 
+def make_patched_update_states_npu(_orig_update_states):
+    """Keep native request progression logical while forward counts are physical."""
+    marker = "_vllm_gr_npu_update_states_patch"
+    if getattr(_orig_update_states, marker, False):
+        return _orig_update_states
+
+    @wraps(_orig_update_states)
+    def patched_update_states(self, scheduler_output, *args, **kwargs):
+        stage = getattr(self, "_gr_npu_stage_runner", None)
+        if (
+            stage is not None
+            and stage.pending_plan is not None
+            and stage.pending_plan.execution.kind == "decode"
+            and scheduler_output is self._current_scheduler_output
+        ):
+            scheduler_output = stage.logical_scheduler_output
+        return _orig_update_states(self, scheduler_output, *args, **kwargs)
+
+    setattr(patched_update_states, marker, True)
+    return patched_update_states
+
+
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
     """Wrap the NPU four-item ``_prepare_inputs`` contract."""
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
@@ -53,6 +75,14 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         # NPU sampling can leave a proxy behind when bookkeeping is skipped.
         if isinstance(self.input_batch, InputBatchProxy):
             self.input_batch = object.__getattribute__(self.input_batch, "_obj")
+
+        stage_runner = getattr(self, "_gr_npu_stage_runner", None)
+        if stage_runner is not None and stage_runner.pending_plan is not None:
+            return stage_runner.prepare_inputs(
+                _orig_prepare_inputs,
+                scheduler_output,
+                num_scheduled_tokens,
+            )
 
         # NPU builds attention metadata inside the original _prepare_inputs.
         if getattr(self, "_current_beam_info", None) is not None:
@@ -207,6 +237,11 @@ def make_patched_sample_tokens_npu(_orig_sample_tokens):
 
     @wraps(_orig_sample_tokens)
     def patched_sample_tokens(self, grammar_output, *args, **kwargs):
+        stage_runner = getattr(self, "_gr_npu_stage_runner", None)
+        if stage_runner is not None and (
+            stage_runner.pending_plan is not None or stage_runner.execution_error is not None
+        ):
+            return stage_runner.sample(grammar_output)
         from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
 
         out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
@@ -769,6 +804,7 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
 
 
 make_patched_prepare_inputs = make_patched_prepare_inputs_npu
+make_patched_update_states = make_patched_update_states_npu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_npu
 make_patched_sample = make_patched_sample_npu
 # The dispatcher (model_runner_patch.py) looks up this exact name; without the

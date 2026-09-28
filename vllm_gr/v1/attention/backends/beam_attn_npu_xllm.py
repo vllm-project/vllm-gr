@@ -25,6 +25,7 @@ from vllm_gr.v1.attention.backends import beam_attn_npu
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
 )
+from vllm_gr.v1.beam.npu_execution_batch import restore_npu_cache_pool_layout
 
 # Fail fast when the mode selects this module but the operator library is
 # missing: without this check the failure would surface at the first beam
@@ -92,8 +93,20 @@ def cache_unshared_kv(
     step = getattr(context, "decode_step_1based_buf", None)
     if block_table is None or step is None:
         # Eager fallback: per-call tensors (previous behavior).
-        block_table = torch.tensor([slot], dtype=torch.int32, device=unshared_key.device)
+        sessions = getattr(beam_session, "sessions", None)
+        slots = [session.slot for session in sessions] if sessions else [slot]
+        block_table = torch.tensor(slots, dtype=torch.int32, device=unshared_key.device)
         step = decode_step + 1
+    request_width = int(
+        getattr(beam_session, "request_width", getattr(beam_session, "beam_width", 0))
+    )
+    if request_width < 1 or curr_key.shape[0] % request_width:
+        raise RuntimeError("xllm Beam rows are not divisible by the request Beam width")
+    active_batch = curr_key.shape[0] // request_width
+    block_table = block_table[:active_batch]
+    unshared_key = restore_npu_cache_pool_layout(unshared_key, request_width)
+    unshared_value = restore_npu_cache_pool_layout(unshared_value, request_width)
+
     beam_ops.cache_unshared_kv(
         unshared_key,
         unshared_value,
@@ -125,7 +138,7 @@ def _xllm_incremental_decode(
     """
     step = beam_session.decode_step  # 0-based host int
     slot = beam_session.slot
-    beam_width = beam_session.beam_width
+    beam_width = int(getattr(beam_session, "attention_width", beam_session.beam_width))
     head_dim = key_cache.shape[-1]
 
     if abs(scale - (1.0 / math.sqrt(head_dim))) > 1e-6:

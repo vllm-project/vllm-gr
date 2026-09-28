@@ -398,7 +398,7 @@ def make_patch_get_computed_blocks(
 
 def _expand_gr_abort_request_ids(scheduler, request_ids, finished_status):
     """Expand cancellation of any GR member to its complete fixed batch."""
-    if getattr(finished_status, "name", "") != "FINISHED_ABORTED":
+    if request_ids is None or getattr(finished_status, "name", "") != "FINISHED_ABORTED":
         return request_ids
     if request_ids is None:
         return None
