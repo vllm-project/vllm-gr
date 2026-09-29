@@ -160,12 +160,17 @@ class GRConfig:
     # chain consumes worker beam decisions).
     beam_engine_driven: bool | None = None
     beam_execution_mode: BeamExecutionMode = BeamExecutionMode.LEGACY
+    # Exact logical B captured by the NPU Beam graph adapter. This is a graph
+    # signature dimension, not a scheduler capacity: other B values do not use
+    # the Beam FULL graph (native PIECEWISE/NONE dispatch remains available).
+    beam_graph_batch_size: int = 1
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
             validate_beam_engine_driven,
             validate_beam_execution_mode,
+            validate_beam_graph_batch_size,
             validate_beam_graph_enabled,
             validate_beam_max_decode_steps,
             validate_beam_max_width,
@@ -197,6 +202,11 @@ class GRConfig:
             self,
             "beam_graph_enabled",
             validate_beam_graph_enabled(self.beam_graph_enabled),
+        )
+        object.__setattr__(
+            self,
+            "beam_graph_batch_size",
+            validate_beam_graph_batch_size(self.beam_graph_batch_size),
         )
         object.__setattr__(self, "beam_max_width", validate_beam_max_width(self.beam_max_width))
         object.__setattr__(

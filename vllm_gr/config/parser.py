@@ -21,6 +21,7 @@ from vllm_gr.config.validation import (
     validate_attention_backend,
     validate_beam_engine_driven,
     validate_beam_execution_mode,
+    validate_beam_graph_batch_size,
     validate_beam_graph_enabled,
     validate_beam_max_decode_steps,
     validate_beam_max_width,
@@ -47,6 +48,7 @@ ATTENTION_BACKEND_KEY: Final = "vllm_gr_attention_backend"
 VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
 VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
 BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
+BEAM_GRAPH_BATCH_SIZE_KEY: Final = "vllm_gr_beam_graph_batch_size"
 BEAM_MAX_WIDTH_KEY: Final = "vllm_gr_beam_max_width"
 BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
 NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
@@ -62,6 +64,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         VOCAB_OFFSET_KEY,
         VOCAB_SLICE_SIZE_KEY,
         BEAM_GRAPH_ENABLED_KEY,
+        BEAM_GRAPH_BATCH_SIZE_KEY,
         BEAM_MAX_WIDTH_KEY,
         BEAM_MAX_DECODE_STEPS_KEY,
         NPU_DECODE_EXECUTION_KEY,
@@ -76,6 +79,7 @@ _TOP_LEVEL_KEYS: Final = frozenset(
 _BEAM_KEYS: Final = frozenset(
     {
         "graph_enabled",
+        "graph_batch_size",
         "max_width",
         "max_decode_steps",
         "worker_decision",
@@ -181,6 +185,7 @@ def gr_config_from_mapping(
     return GRConfig(
         attention_backend=validate_attention_backend(mapping.get("attention_backend")),
         beam_graph_enabled=graph_enabled,
+        beam_graph_batch_size=validate_beam_graph_batch_size(beam_raw.get("graph_batch_size", 1)),
         beam_max_width=validate_beam_max_width(beam_raw.get("max_width")),
         beam_max_decode_steps=validate_beam_max_decode_steps(
             beam_raw.get("max_decode_steps", _BEAM_MAX_DECODE_STEPS_DEFAULT)
@@ -228,6 +233,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         "max_width": config.beam_max_width,
         "max_decode_steps": config.beam_max_decode_steps,
     }
+    if config.beam_graph_batch_size != 1:
+        beam["graph_batch_size"] = config.beam_graph_batch_size
     # Keep omitted values omitted so existing schema-v1 artifacts round-trip
     # byte-for-byte at the mapping level.  Explicit False is significant: it
     # is the CUDA runtime-default opt-out and must survive Driver -> Worker
@@ -329,6 +336,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_graph_enabled=validate_beam_graph_enabled(
             additional_config.get(BEAM_GRAPH_ENABLED_KEY, True)
         ),
+        beam_graph_batch_size=validate_beam_graph_batch_size(
+            additional_config.get(BEAM_GRAPH_BATCH_SIZE_KEY, 1)
+        ),
         beam_max_width=validate_beam_max_width(additional_config.get(BEAM_MAX_WIDTH_KEY)),
         beam_max_decode_steps=validate_beam_max_decode_steps(
             additional_config.get(BEAM_MAX_DECODE_STEPS_KEY, _BEAM_MAX_DECODE_STEPS_DEFAULT)
@@ -399,6 +409,11 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(BEAM_GRAPH_ENABLED_KEY, None)
     else:
         additional_config[BEAM_GRAPH_ENABLED_KEY] = False
+
+    if gr_config.beam_graph_batch_size == 1:
+        additional_config.pop(BEAM_GRAPH_BATCH_SIZE_KEY, None)
+    else:
+        additional_config[BEAM_GRAPH_BATCH_SIZE_KEY] = gr_config.beam_graph_batch_size
 
     if gr_config.beam_max_width is None:
         additional_config.pop(BEAM_MAX_WIDTH_KEY, None)

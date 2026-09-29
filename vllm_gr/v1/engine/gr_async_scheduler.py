@@ -388,7 +388,11 @@ def attach_gr_stage_metadata(
     if scheduled_ids != request_ids:
         raise RuntimeError(
             "native Scheduler split an atomic GR batch stage; all fixed members "
-            "must be scheduled together"
+            "must be scheduled together: "
+            f"session_id={session.session_id!r}, expected_ids={request_ids!r}, "
+            f"scheduled_session_ids={scheduled_ids!r}, "
+            f"scheduled_output_ids={tuple(scheduler_output.num_scheduled_tokens)!r}, "
+            f"scheduled_tokens={dict(scheduler_output.num_scheduled_tokens)!r}"
         )
     native_requests = tuple(scheduler.requests.get(request_id) for request_id in request_ids)
     if any(native_request is None for native_request in native_requests):
@@ -396,11 +400,23 @@ def attach_gr_stage_metadata(
     if not can_issue_gr_stage(scheduler, session):
         raise RuntimeError("native Scheduler selected a blocked Asynchronous scheduling dispatch")
 
-    prefill_states = tuple(
-        bool(native_request.is_prefill_chunk) for native_request in native_requests
+    progress = tuple(
+        {
+            "request_id": request_id,
+            "scheduled_tokens": scheduler_output.num_scheduled_tokens[request_id],
+            "num_computed_tokens": native_request.num_computed_tokens,
+            "num_prompt_tokens": native_request.num_prompt_tokens,
+            "num_output_placeholders": getattr(native_request, "num_output_placeholders", None),
+            "is_prefill_chunk": bool(native_request.is_prefill_chunk),
+        }
+        for request_id, native_request in zip(request_ids, native_requests, strict=True)
     )
+    prefill_states = tuple(item["is_prefill_chunk"] for item in progress)
     if any(prefill_states):
-        raise RuntimeError("beam_search_v1 cannot schedule partial Prefill or recompute")
+        raise RuntimeError(
+            "beam_search_v1 cannot schedule partial Prefill or recompute: "
+            f"session_id={session.session_id!r}, progress={progress!r}"
+        )
     dispatch_id = session._next_dispatch_id
     # Native _update_after_schedule already advanced this extent, independently
     # of host consumption of preceding dispatches.
@@ -409,15 +425,36 @@ def attach_gr_stage_metadata(
         for native_request in native_requests
     )
     if len(set(stage_indices)) != 1:
-        raise RuntimeError("GR batch members crossed the Prefill/Decode stage boundary")
+        raise RuntimeError(
+            "GR batch members crossed the Prefill/Decode stage boundary: "
+            f"session_id={session.session_id!r}, dispatch_id={dispatch_id}, "
+            f"scheduled_output_ids={tuple(scheduler_output.num_scheduled_tokens)!r}, "
+            f"stage_indices={stage_indices!r}, progress={progress!r}"
+        )
     stage_index = stage_indices[0]
     if not 0 <= stage_index < session.total_stages:
-        raise RuntimeError("native GR stage exceeds the effective generation budget")
+        raise RuntimeError(
+            "native GR stage exceeds the effective generation budget: "
+            f"session_id={session.session_id!r}, dispatch_id={dispatch_id}, "
+            f"stage_index={stage_index}, total_stages={session.total_stages}, "
+            f"progress={progress!r}"
+        )
     previous = session.latest_device_state
-    if (stage_index == 0 and previous is not None) or (
-        stage_index > 0 and previous != GRDeviceStateRef(session.session_id, stage_index - 1)
-    ):
-        raise RuntimeError("GR rejects recompute or nonconsecutive native progress")
+    expected_previous = (
+        None if stage_index == 0 else GRDeviceStateRef(session.session_id, stage_index - 1)
+    )
+    if previous != expected_previous:
+        raise RuntimeError(
+            "GR rejects recompute or nonconsecutive native progress: "
+            f"session_id={session.session_id!r}, dispatch_id={dispatch_id}, "
+            f"stage_index={stage_index}, previous={previous!r}, "
+            f"expected_previous={expected_previous!r}, "
+            f"scheduled_output_ids={tuple(scheduler_output.num_scheduled_tokens)!r}, "
+            f"session_request_ids={request_ids!r}, "
+            f"in_flight_dispatches={tuple(sorted(session._in_flight_dispatches))!r}, "
+            f"issued_stages={session.issued_stages}, "
+            f"completed_stages={session.completed_stages}, progress={progress!r}"
+        )
     kind = GRStageKind.PREFILL if stage_index == 0 else GRStageKind.DECODE
     output_state = GRDeviceStateRef(session.session_id, stage_index)
     prompt_tokens = tuple(int(request.num_prompt_tokens) for request in native_requests)

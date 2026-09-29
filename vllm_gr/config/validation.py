@@ -213,6 +213,15 @@ def validate_beam_graph_enabled(value: object) -> bool:
     raise ValueError("vllm-gr beam_graph_enabled must be a boolean")
 
 
+def validate_beam_graph_batch_size(value: object) -> int:
+    """Validate the exact logical batch shape captured for Beam graph replay."""
+
+    batch_size = _validate_positive_int(value, "beam_graph_batch_size")
+    if batch_size > 128:
+        raise ValueError(f"vllm-gr beam_graph_batch_size must be <= 128, got {batch_size}")
+    return batch_size
+
+
 def _validate_positive_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"vllm-gr {name} must be an integer")

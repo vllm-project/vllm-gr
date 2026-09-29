@@ -58,6 +58,37 @@ def test_v1_requires_native_async() -> None:
         require_beam_execution_mode(config, BeamExecutionMode.LEGACY)
 
 
+def test_v1_npu_startup_routes_to_acl_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker import gr_startup, npu_model_runner_patch
+
+    capture = Mock(return_value=True)
+    monkeypatch.setattr(
+        npu_model_runner_patch,
+        "capture_beam_decode_graph",
+        capture,
+    )
+    worker = SimpleNamespace(
+        device="npu",
+        model_config=SimpleNamespace(enforce_eager=False),
+        vllm_config=SimpleNamespace(
+            additional_config={"vllm_gr_beam_execution_mode": "v1"},
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+        ),
+        _vllm_gr_config=SimpleNamespace(
+            beam_execution_mode=BeamExecutionMode.V1,
+            beam_graph_enabled=True,
+            beam_max_width=4,
+            beam_worker_decision=True,
+            constraint_table=SimpleNamespace(enabled=True),
+        ),
+    )
+
+    assert gr_startup.capture_async_forward(worker)
+    capture.assert_called_once_with(worker)
+
+
 def test_wrong_mode_rejected_before_core_preprocessing() -> None:
     from tests.test_gr_async_scheduler import _batch_request
     from vllm_gr.v1.engine.core import _handle_submit_gr_session

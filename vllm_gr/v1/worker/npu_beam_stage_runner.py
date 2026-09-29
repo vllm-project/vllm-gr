@@ -101,14 +101,40 @@ class NPUEagerBeamStageRunner:
         execution = plan.execution
         if self.prefill_candidates is None:
             raise RuntimeError("Decode state requires Prefill candidates")
-        context = _create_beam_context(
-            self.worker,
-            _get_gr_config(self.worker),
-            max_batch=execution.batch_size,
-        )
+        config = _get_gr_config(self.worker)
         required_steps = self._metadata(
             self.worker._current_scheduler_output
         ).beam_params.max_tokens
+        shape = (execution.batch_size, execution.beam_width)
+        captured_shapes = getattr(
+            self.worker,
+            "_gr_npu_beam_graph_shapes",
+            set(),
+        )
+        graph_context = getattr(self.worker, "_gr_npu_graph_context", None)
+        if shape in captured_shapes:
+            if (
+                graph_context is None
+                or graph_context.max_batch != execution.batch_size
+                or graph_context.max_beams != execution.beam_width
+            ):
+                raise RuntimeError("captured NPU Beam graph has no matching fixed-address context")
+            context = graph_context
+        else:
+            context = getattr(self.worker, "_gr_npu_eager_context", None)
+            if (
+                context is None
+                or context.max_batch != execution.batch_size
+                or context.max_beams != execution.beam_width
+            ):
+                if context is not None and context.registry.num_active_sessions:
+                    raise RuntimeError("cannot replace an active NPU Beam eager fallback context")
+                context = _create_beam_context(
+                    self.worker,
+                    config,
+                    max_batch=execution.batch_size,
+                )
+                self.worker._gr_npu_eager_context = context
         if required_steps > context.decision.sequence.shape[2]:
             raise ValueError("NPU Beam history exceeds the configured Decode capacity")
         sessions = []
@@ -171,6 +197,7 @@ class NPUEagerBeamStageRunner:
         runtime.total_num_scheduled_tokens = plan.model_token_count
         return runtime
 
+    @torch.inference_mode()
     def execute(
         self,
         scheduler_output: Any,
@@ -315,6 +342,7 @@ class NPUEagerBeamStageRunner:
         logits_indices = _materialize_logits_indices(self.worker, list(plan.logits_indices))
         return logits_indices, spec_metadata, total, compressed
 
+    @torch.inference_mode()
     def sample(self, grammar_output: Any = None) -> Any:
         if self.execution_error is not None:
             raise RuntimeError("NPU GR execute_model failed") from self.execution_error

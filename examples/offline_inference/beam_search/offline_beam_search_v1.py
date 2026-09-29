@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Run one offline Beam Search V1 request with a canonical Constraint Table."""
+"""Run or benchmark offline Beam Search V1 with a canonical Constraint Table."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from statistics import mean
+from time import perf_counter
 from typing import Any
 
 os.environ.setdefault("USE_TF", "0")
@@ -32,9 +34,15 @@ def parse_args() -> argparse.Namespace:
         "--constraint-backend",
         choices=("cuda", "npu"),
         default="cuda",
-        help="Constraint Table device backend; NPU uses the eager V1 runtime",
+        help="Constraint Table device backend (CUDA or NPU)",
     )
     parser.add_argument("--prompt", type=Path, required=True)
+    parser.add_argument(
+        "--execution",
+        choices=("eager", "graph"),
+        default="eager",
+        help="NPU Decode execution mode; CUDA keeps its existing graph behavior",
+    )
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--generated-steps", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--beam-width", type=int, default=128)
@@ -43,7 +51,164 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--print-beams", type=int, default=5)
-    return parser.parse_args()
+    parser.add_argument("--repeat", type=int, help="Benchmark this many batches without a profiler")
+    parser.add_argument(
+        "--warmup-runs", type=int, default=3, help="Untimed warmup batches (requires --repeat)"
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        help="Save benchmark summary and per-run timings (requires --repeat)",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        help="Save Worker profiler traces; exclude engine startup and output printing",
+    )
+    parser.add_argument(
+        "--profile-warmup-runs",
+        type=int,
+        default=1,
+        help="Unprofiled warmup batches before collection (requires --profile-dir)",
+    )
+    parser.add_argument(
+        "--profile-runs",
+        type=int,
+        default=1,
+        help="Complete batches to profile; print only the last result (requires --profile-dir)",
+    )
+    args = parser.parse_args()
+    if args.profile_warmup_runs < 0 or args.profile_runs <= 0:
+        parser.error("--profile-warmup-runs must be nonnegative and --profile-runs positive")
+    if args.warmup_runs < 0 or (args.repeat is not None and args.repeat <= 0):
+        parser.error("--warmup-runs must be nonnegative and --repeat positive")
+    if args.repeat is not None and args.profile_dir is not None:
+        parser.error(
+            "--repeat cannot be combined with --profile-dir; profile overhead affects latency"
+        )
+    if args.output_json is not None and args.repeat is None:
+        parser.error("--output-json requires --repeat")
+    return args
+
+
+def profiler_engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    if args.profile_dir is None:
+        return {}
+    profile_dir = args.profile_dir.resolve()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "profiler_config": {
+            "profiler": "torch",
+            "torch_profiler_dir": str(profile_dir),
+            "torch_profiler_with_stack": False,
+            "torch_profiler_record_shapes": False,
+            "torch_profiler_with_memory": False,
+            "torch_profiler_use_gzip": False,
+            "torch_profiler_dump_cuda_time_total": False,
+            "ignore_frontend": True,
+        }
+    }
+
+
+def isolate_prompts(prompts: list[Any], suffix: str) -> list[Any]:
+    # Keep prefix caching enabled, but force full Prefill for every row/run.
+    return [
+        dict(
+            prompt,
+            prompt_token_ids=list(prompt["prompt_token_ids"]),
+            cache_salt=f"{prompt['cache_salt']}-{suffix}",
+        )
+        for prompt in prompts
+    ]
+
+
+def benchmark_beam_search(
+    llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
+) -> tuple[list[Any], dict[str, Any]]:
+    for iteration in range(args.warmup_runs):
+        llm.beam_search_v1(isolate_prompts(prompts, f"warmup-{iteration}"), params)
+
+    latencies_ms: list[float] = []
+    returned_beams: list[int] = []
+    outputs: list[Any] = []
+    for iteration in range(args.repeat):
+        isolated = isolate_prompts(prompts, f"benchmark-{iteration}")
+        started = perf_counter()
+        outputs = llm.beam_search_v1(isolated, params)
+        latencies_ms.append((perf_counter() - started) * 1000.0)
+        if len(outputs) != len(prompts):
+            raise RuntimeError(f"expected {len(prompts)} request outputs, got {len(outputs)}")
+        # Count candidates outside timing; do not tokenize/decode or print here.
+        returned_beams.append(sum(len(output.sequences) for output in outputs))
+
+    ordered = sorted(latencies_ms)
+
+    def percentile(fraction: float) -> float:
+        position = (len(ordered) - 1) * fraction
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+    total_seconds = sum(latencies_ms) / 1000.0
+    report: dict[str, Any] = {
+        "model": str(args.model.resolve()),
+        "catalog": str(args.catalog.resolve()),
+        "prompt": str(args.prompt.resolve()),
+        "constraint_backend": args.constraint_backend,
+        "execution": args.execution,
+        "batch_size": args.batch_size,
+        "beam_width": args.beam_width,
+        "input_len": args.input_len,
+        "generated_steps": args.generated_steps,
+        "length_penalty": args.length_penalty,
+        "max_model_len": args.max_model_len,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "warmup_runs": args.warmup_runs,
+        "repeat": args.repeat,
+        "prefix_caching": "enabled; isolated salt per row and run (cold Prefill)",
+        "timing_scope": "beam_search_v1 API call until output objects return; excludes engine startup, "
+        "warmup, pre-call prompt preparation and post-call result inspection/printing",
+        "batch_latency_ms": {
+            "mean": mean(latencies_ms),
+            "p50": percentile(0.50),
+            "p95": percentile(0.95),
+            "min": ordered[0],
+            "max": ordered[-1],
+        },
+        "total_timed_seconds": total_seconds,
+        "requests_per_second": len(prompts) * len(latencies_ms) / total_seconds,
+        "returned_beams_per_second": sum(returned_beams) / total_seconds,
+        "runs": [
+            {"run": index + 1, "batch_latency_ms": latency, "returned_beams": beams}
+            for index, (latency, beams) in enumerate(zip(latencies_ms, returned_beams, strict=True))
+        ],
+    }
+    return outputs, report
+
+
+def run_beam_search(
+    llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
+) -> list[Any]:
+    if args.profile_dir is None:
+        outputs: list[Any] = llm.beam_search_v1(prompts, params)
+        return outputs
+
+    def run_once(iteration: int) -> list[Any]:
+        isolated = isolate_prompts(prompts, f"profile-{iteration}")
+        result: list[Any] = llm.beam_search_v1(isolated, params)
+        return result
+
+    for iteration in range(args.profile_warmup_runs):
+        run_once(iteration)
+    llm.start_profile(f"offline_beam_v1_{args.execution}_b{args.batch_size}_w{args.beam_width}")
+    try:
+        for iteration in range(
+            args.profile_warmup_runs, args.profile_warmup_runs + args.profile_runs
+        ):
+            outputs = run_once(iteration)
+    finally:
+        llm.stop_profile()
+    return outputs
 
 
 def load_triples(path: Path) -> list[list[str]]:
@@ -98,6 +263,8 @@ def make_prompt(tokenizer: Any, path: Path, input_len: int) -> list[int]:
 
 
 def run(args: argparse.Namespace, artifact_path: Path) -> None:
+    from vllm.inputs import tokens_input
+
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
 
@@ -113,7 +280,8 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         "attention_backend": "CUSTOM",
         "beam": {
             "execution_mode": "v1",
-            "graph_enabled": not is_npu,
+            "graph_enabled": not is_npu or args.execution == "graph",
+            "graph_batch_size": args.batch_size,
             "worker_decision": True,
             "max_width": args.beam_width,
             "max_decode_steps": args.generated_steps,
@@ -152,14 +320,53 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         max_num_seqs=max(args.beam_width, args.batch_size),
         max_logprobs=args.beam_width,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=is_npu,
+        enforce_eager=is_npu and args.execution == "eager",
+        **profiler_engine_kwargs(args),
     ) as llm:
         tokenizer = llm.get_tokenizer()
         prompt_token_ids = make_prompt(tokenizer, args.prompt.resolve(), args.input_len)
-        outputs = llm.beam_search_v1(
-            [{"prompt_token_ids": list(prompt_token_ids)} for _ in range(args.batch_size)],
-            params,
-        )
+        # Keep prefix caching enabled, but prevent duplicate batch rows from
+        # sharing the same prompt block before their atomic Prefill completes.
+        request_prompts = [
+            tokens_input(
+                list(prompt_token_ids),
+                cache_salt=f"offline-beam-v1-row-{request_index}",
+            )
+            for request_index in range(args.batch_size)
+        ]
+        benchmark = None
+        if args.repeat is not None:
+            outputs, benchmark = benchmark_beam_search(llm, args, request_prompts, params)
+        else:
+            outputs = run_beam_search(llm, args, request_prompts, params)
+        if is_npu and args.execution == "graph":
+            stats = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
+            print(
+                json.dumps(
+                    {"npu_beam_graph": stats},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            expected_shape = (args.batch_size, args.beam_width)
+            captured_shapes = {tuple(shape) for shape in stats.get("captured_shapes", ())}
+            # N=1 finishes in Prefill and must not require a Decode graph.
+            if args.generated_steps > 1 and (
+                expected_shape not in captured_shapes or not stats["full_dispatches"]
+            ):
+                raise RuntimeError("NPU Beam graph capture/replay was not observed")
+            if benchmark is not None:
+                benchmark["npu_beam_graph"] = stats
+
+        if benchmark is not None:
+            print(json.dumps({"beam_benchmark": benchmark}, ensure_ascii=False, sort_keys=True))
+            if args.output_json is not None:
+                output_path = args.output_json.resolve()
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    json.dumps(benchmark, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                print(f"benchmark_json={output_path}")
 
         for request_index, output in enumerate(outputs):
             sequences = output.sequences

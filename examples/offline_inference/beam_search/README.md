@@ -240,4 +240,182 @@ CUDA_VISIBLE_DEVICES=0 python offline_beam_search_v1.py \
 ```
 
 Run `python offline_beam_search_v1.py --help` to see optional memory, length
-penalty, and output-count arguments.
+penalty, output-count, and measurement arguments.
+
+On NPU, `--generated-steps 1` completes in Prefill, so a zero Decode
+`full_dispatches` counter is expected. Only runs with Decode (`N > 1`) require
+the requested Beam graph shape to be captured and replayed. The `fallbacks`
+counter means Beam FULL graph was not used: native FULL is rejected, while
+native PIECEWISE/NONE is retained. It does not count exclusively eager forwards.
+
+### NPU graph correctness regression
+
+The focused CPU tests cover flat EngineArgs B=1/2/4 preservation, Prefill-only
+example output, native NONE/PIECEWISE/FULL shape misses, and captured-context
+reuse across B=2 -> B=1 -> B=2. They do not load a model or execute NPU kernels.
+
+On a configured Ascend server, run the opt-in public-API regression:
+
+```bash
+VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
+  python -m pytest --run-slow -s -v --tb=short \
+  tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
+```
+
+This test uses W=8, N=3 and a small catalog, loads eager, native-without-Beam-FULL
+and graph engines sequentially, then checks B=2 -> B=1 -> B=2 on the same graph
+Worker. By default it uses two **different raw 127-token prompts**. The API adds
+one SID begin token to each, giving **128+128=256 actual Prefill tokens** (not
+two raw 128-token prompts, which would give 258). The test subprocess enables
+independent Prefill graphs with buckets `[128, 256]`, overriding inherited
+Prefill bucket settings for this bounded regression. It checks actual input
+IDs/positions, request lengths, and a real `{"256": 1}` Prefill replay delta;
+native compilation and Beam FULL Decode remain enabled. Captured B=2 outputs must
+match the eager B=2 baseline (ordered tokens; scores within `abs=1e-4, rel=1e-5`).
+The uncaptured B=1 must remain valid without Beam FULL replay; cross-B exact
+determinism is not asserted. Captured context/KV/state-buffer addresses must stay
+unchanged, replay must resume for the final B=2, and N=1 must finish without Decode
+dispatches. This is a correctness test, not a profile or performance measurement.
+
+#### Open precision limitation: NPU-PREFILL-PADDING-001
+
+The exact-bucket regression narrows coverage; it **does not fix or certify padded
+Prefill precision**. Clear `VLLM_GR_TEST_PADDED_PREFILL` for the default test.
+The temporary layer/operator probes are not part of this submission; only small
+forward metadata and real replay counters are observed, without model hooks.
+The unequal-length eager-only public API test is also unchanged.
+
+Observed on 2026-10-15 with OneRec Qwen3 1.7B, BF16, TP=1, B=2, W=8, N=3,
+prefix caching enabled with independent request salts, and native compilation:
+
+| Actual Prefill / configuration | Observed strict comparison |
+| --- | --- |
+| 290 tokens, independent Prefill graph disabled; Beam FULL Decode retained | Passed |
+| 290 tokens, exact 290 bucket replay | Passed |
+| 290 tokens, single 384 bucket or multiple buckets selecting 384 | Failed; eager/graph ranks and scores differ; request 1 shares 7/8 candidates |
+| 290 tokens padded to 384, direct compiled execution without independent Prefill replay | Matches graph; still differs from eager |
+| 128+128 actual-token / 256-bucket regression | Passed: both requests have identical 8/8 ordered Beams and zero eager/graph score difference |
+
+The earliest observed mismatch is at layer 0 attention input Q/K; V is identical.
+Padding/shape-dependent execution reproduces the difference without replay, but
+the responsible operator is not isolated. The later layer-0 probe stopped on a
+missing `vllm.unquantized_gemm` observation in eager; fusion-on/off is **unverified**.
+The 290/384 evidence uses identical inputs, unlike the new equal-length regression.
+Passing the new test alone cannot prove a unique root cause or resolve this issue.
+Evidence logs: `npu_prefill_off_20261015_095103.log`,
+`npu_prefill_exact290_20261015_104950.log`,
+`npu_prefill_single384_20261015_110649.log`,
+`npu_prefill_384_noreplay_20261015_113506/run.log`, and
+`npu_layer0_384_20261015_144555/run.log` in the local `test_results` archive.
+
+The server run `npu_exact128x2_20261015_150212/run.log` finished with
+`1 passed, 16 warnings in 286.65s`. The native control and all three graph B=2
+runs reported an actual `256` Prefill replay. Prefill and both Decode stages'
+recorded arrays matched eager exactly; Decode FULL counts progressed 2 -> 4 -> 6.
+The intervening B=1 produced two expected `shape_miss` fallbacks, captured buffer
+addresses stayed stable, and N=1 completed without additional Decode dispatches.
+Cross-B eager B=1/B=2 remained diagnostic: 8/8 candidate overlap but different
+ordering, with maximum score difference 0.405815125. This is separate from same-B
+eager/graph parity. The elapsed 286.65s is whole-suite time, not inference latency.
+This hardware log predates diagnostic cleanup and carries no server Git SHA;
+the final cleaned submission must not be described as independently NPU-retested.
+
+Retain the original strict failing regression as an explicit opt-in (no xfail,
+skip, warning-only comparison, or relaxed tolerance). Run:
+
+```bash
+VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
+VLLM_GR_TEST_PADDED_PREFILL=1 VLLM_ENABLE_PREFILL_CUDAGRAPH=1 \
+VLLM_GR_PREFILL_GRAPH_BUCKET_STEP=384 VLLM_GR_PREFILL_GRAPH_MAX_BUCKET=384 \
+  python -m pytest --run-slow -s -v --tb=short \
+  tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
+```
+
+For a same-input exact-bucket control, change both `384` values to `290`.
+Before merging, reviewers must explicitly accept this unresolved padded case;
+a green bounded regression is not a claim of full Prefill parity. Production
+padding behavior is unchanged by this test-scope adjustment.
+
+### Measure latency without profiling
+
+Use `--repeat 20 --warmup-runs 3` to time 20 complete API calls after three
+untimed warmup batches, without configuring a profiler. Each call submits
+`batch-size` copies of the prompt. Prefix caching stays enabled, but each row
+and run uses an independent cache salt, so Prefill is included in every sample.
+
+The `beam_benchmark` JSON log reports batch latency in milliseconds (mean, P50,
+P95, min/max), requests per second, actual returned Beams per second, and every
+sample. Percentiles use linear interpolation. `--output-json` optionally saves
+the same data and test conditions to a file. Only the last batch's Beams are
+printed. The timer covers `beam_search_v1` until output objects return; engine
+startup, graph capture, warmup, pre-call prompt preparation, post-call result
+inspection, statistics collection and printing are excluded. Work performed
+inside the API is included. `--repeat` cannot be combined with `--profile-dir`.
+Without either option, the script still runs one batch.
+
+For NPU graph B=1/2/4, run this loop from the repository root. Each B starts a
+separate engine and captures its own fixed `(B, W)` shape:
+
+```bash
+set -o pipefail
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+BENCH_RUN="$PWD/test-results/graph_latency_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BENCH_RUN"
+for B in 1 2 4; do
+  python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+    --model /path/to/OneRec_Qwen3_1.7B \
+    --catalog examples/offline_inference/beam_search/interactive_constraint_triples.json \
+    --prompt tests/resources/single_one_rec_prompt.txt \
+    --constraint-backend npu --execution graph \
+    --batch-size "$B" --beam-width 128 --input-len 128 \
+    --generated-steps 3 --print-beams 5 \
+    --warmup-runs 3 --repeat 20 \
+    --output-json "$BENCH_RUN/graph_b${B}_w128.json" \
+    2>&1 | tee "$BENCH_RUN/graph_b${B}_w128.log" || exit 1
+done
+```
+
+Keep the model, prompt, generation budget, memory setting and device identical
+across B values. Request throughput is `B * repeat / total_timed_seconds`; batch
+latency divided by B is only amortized cost, not individual request latency.
+NPU graph counters saved in the report include both warmup and measured runs;
+check the captured shape and `fallbacks` when comparing graph performance.
+
+### Profile inference
+
+Add `--profile-dir /path/to/traces` to enable the vLLM Worker profiler. Collection
+starts after engine initialization and unprofiled warmup, and stops before graph
+statistics and Beam output printing. Without this option, no profiler is
+configured or started; use `--repeat` for separate latency measurements.
+
+- `--profile-warmup-runs` defaults to 1; use 0 to include the first inference.
+- `--profile-runs` defaults to 1 and collects complete batches, each with one
+  Prefill and `generated-steps - 1` Decode stages. Only the last result is printed.
+- Prefix caching stays enabled, but separate cache salts for every row and run
+  prevent warmup or previous runs from skipping Prefill.
+- Stack, shape and memory recording are disabled to reduce profiling overhead.
+  Traces cover the Worker rather than the frontend, and are not gzip compressed.
+
+For NPU B=2/W=128, run from the repository root:
+
+```bash
+set -o pipefail
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+PROFILE_RUN="$PWD/test-results/bs2_bw128_profile_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$PROFILE_RUN/logs"
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model /path/to/OneRec_Qwen3_1.7B \
+  --catalog examples/offline_inference/beam_search/interactive_constraint_triples.json \
+  --prompt tests/resources/single_one_rec_prompt.txt \
+  --constraint-backend npu --execution graph \
+  --batch-size 2 --beam-width 128 --input-len 128 \
+  --generated-steps 3 --print-beams 128 \
+  --profile-dir "$PROFILE_RUN/profile/graph" \
+  --profile-warmup-runs 1 --profile-runs 5 \
+  2>&1 | tee "$PROFILE_RUN/logs/graph.log"
+```
+
+Do not combine this with `msprof` collection. Graph statistics include warmup and
+profile runs; their cumulative dispatch count need not be 2. Confirm the trace
+contains Worker model operations and actual graph replay, not just frontend
+events. Use separate unprofiled repeated runs for latency/throughput measurements.

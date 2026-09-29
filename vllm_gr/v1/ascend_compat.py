@@ -143,12 +143,12 @@ def patch_npu_worker_init_device() -> int:
         re_apply_patches()
         # Mount set_gr_constraint_resources so the driver can inject constraint
         # tables via EngineCore.collective_rpc after init_device returns.
-        from vllm_gr.constraints.worker_inject import (
-            install_worker_resource_hook,
-            load_constraint_tables_on_worker,
+        from vllm_gr.constraints.worker_inject import load_constraint_tables_on_worker
+        from vllm_gr.v1.worker.model_runner_patch import (
+            install_worker_utility_hooks,
         )
 
-        install_worker_resource_hook(type(self))
+        install_worker_utility_hooks(type(self))
         result = original_init_device(self)
         # Preload constraint tables onto the device at weight-load time so the
         # runtime never does a lazy build/H2D on the first constrained step.

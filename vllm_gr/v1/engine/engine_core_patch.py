@@ -24,6 +24,7 @@ _PIS_PATCH_MARKER = "_vllm_gr_process_input_sockets"
 _GR_FINALIZING_IDS_ATTR = "_gr_v1_finalizing_request_ids"
 _GR_NATIVE_UPDATE_IDS_ATTR = "_gr_v1_native_update_request_ids"
 _GR_RESET_PREFIX_CACHE_PATCH_MARKER = "_vllm_gr_v1_reset_prefix_cache"
+_GR_SCHEDULE_PATCH_DEPTH_ATTR = "_vllm_gr_schedule_patch_depth"
 
 # Upstream EngineCoreProc.process_input_sockets captured before the adapter
 # is installed.  Parity tests inspect this object against the pinned vLLM.
@@ -583,6 +584,16 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
+        # Some platform plugins replace Scheduler with a subclass whose
+        # schedule() delegates to super().schedule(). If both implementations
+        # were patched, that produces nested GR wrappers around one native
+        # scheduling pass. Only the outermost wrapper may apply admission and
+        # annotate the SchedulerOutput; the inner wrapper must preserve the
+        # subclass' normal super() chain without processing the output twice.
+        schedule_patch_depth = getattr(self, _GR_SCHEDULE_PATCH_DEPTH_ATTR, 0)
+        if schedule_patch_depth:
+            return _original_schedule(self)
+
         # The two cache-manager wrappers depend only on constants resolved at
         # patch-install time (original bound methods + block_size), so they
         # are built ONCE and stashed on the scheduler instance; rebuilding
@@ -659,6 +670,7 @@ def apply_scheduler_patch():
             gr_admission,
         )
 
+        setattr(self, _GR_SCHEDULE_PATCH_DEPTH_ATTR, schedule_patch_depth + 1)
         try:
             with gr_admission(self):
                 output = _original_schedule(self)
@@ -708,8 +720,14 @@ def apply_scheduler_patch():
             attach_gr_retirement(self, output)
             return output
         finally:
-            self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
-            self.kv_cache_manager.coordinator.cache_blocks = _original_cache_blocks
+            try:
+                self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
+                self.kv_cache_manager.coordinator.cache_blocks = _original_cache_blocks
+            finally:
+                if schedule_patch_depth:
+                    setattr(self, _GR_SCHEDULE_PATCH_DEPTH_ATTR, schedule_patch_depth)
+                else:
+                    delattr(self, _GR_SCHEDULE_PATCH_DEPTH_ATTR)
 
     Scheduler.schedule = patched_schedule
     setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)

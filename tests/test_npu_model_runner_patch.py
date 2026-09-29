@@ -729,12 +729,13 @@ def test_npu_determine_cascade_mode_downgrades_full() -> None:
 def test_npu_determine_pure_beam_batch_grants_full() -> None:
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
 
-    session = SimpleNamespace(is_active=True, slot=0)
+    session = SimpleNamespace(is_active=True, slot=0, batch_size=1, request_width=4)
     beam_info = _make_beam_info(session, ["beam-1"], ["beam-1"])
     native = (CUDAGraphMode.NONE, BatchDescriptor(num_tokens=4))
     runner = SimpleNamespace(
         _current_beam_info=beam_info,
         _beam_graph_keys={4},
+        _gr_npu_beam_graph_shapes={(1, 4)},
     )
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
@@ -747,6 +748,49 @@ def test_npu_determine_pure_beam_batch_grants_full() -> None:
         assert result[0] == CUDAGraphMode.FULL
         assert result[1].num_tokens == 4
         assert result[1].uniform is True
+        assert runner._beam_graph_full_dispatch_count == 1
+    finally:
+        npu_patch._npu_xllm_decode_mode_active = orig_xllm
+        npu_patch._beam_graph_enabled_for_run = orig_enabled
+
+
+@pytest.mark.parametrize("native_mode", ["NONE", "PIECEWISE", "FULL"])  # type: ignore[misc]
+def test_npu_determine_same_token_count_wrong_shape_falls_back(native_mode: str) -> None:
+    """B*W equality alone must not replay a graph captured for another shape."""
+
+    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
+
+    session = SimpleNamespace(
+        is_active=True,
+        slot=0,
+        batch_size=4,
+        request_width=2,
+    )
+    request_ids = [f"beam-{index}" for index in range(4)]
+    beam_info = _make_beam_info(session, request_ids, request_ids)
+    native = (getattr(CUDAGraphMode, native_mode), BatchDescriptor(num_tokens=8), "native-extra")
+    runner = SimpleNamespace(
+        _current_beam_info=beam_info,
+        _beam_graph_keys={8},
+        _gr_npu_beam_graph_shapes={(2, 4)},
+    )
+
+    orig_xllm = npu_patch._npu_xllm_decode_mode_active
+    orig_enabled = npu_patch._beam_graph_enabled_for_run
+    npu_patch._npu_xllm_decode_mode_active = lambda: True
+    npu_patch._beam_graph_enabled_for_run = lambda r: True
+    try:
+        wrapped = _make_determine_wrapper(native)
+        result = wrapped(runner, num_tokens=8)
+        expected_mode = (
+            CUDAGraphMode.PIECEWISE if native_mode == "PIECEWISE" else CUDAGraphMode.NONE
+        )
+        assert result[0] == expected_mode
+        assert result[1].num_tokens == 8 and result[2:] == native[2:]
+        if native_mode != "FULL":
+            assert result is native
+        assert runner._beam_graph_fallback_count == 1
+        assert runner._beam_graph_fallback_reasons == {"shape_miss": 1}
     finally:
         npu_patch._npu_xllm_decode_mode_active = orig_xllm
         npu_patch._beam_graph_enabled_for_run = orig_enabled
@@ -806,12 +850,13 @@ def test_npu_determine_graph_disabled_no_full() -> None:
 def test_npu_determine_width_mismatch_no_full() -> None:
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
 
-    session = SimpleNamespace(is_active=True, slot=0)
+    session = SimpleNamespace(is_active=True, slot=0, batch_size=1, request_width=4)
     beam_info = _make_beam_info(session, ["beam-1"], ["beam-1"])
     native = (CUDAGraphMode.NONE, BatchDescriptor(num_tokens=8))
     runner = SimpleNamespace(
         _current_beam_info=beam_info,
         _beam_graph_keys={4},  # captured at 4, batch is 8 tokens
+        _gr_npu_beam_graph_shapes={(1, 4)},
     )
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
@@ -893,6 +938,7 @@ def test_npu_capture_reentry_returns_true(monkeypatch: pytest.MonkeyPatch) -> No
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False),
         _beam_graph_keys={4},
+        _gr_npu_beam_graph_shapes={(1, 4)},
     )
     assert npu_patch.capture_beam_decode_graph(runner) is True
 
@@ -914,7 +960,12 @@ def test_npu_capture_forwards_run_under_inference_mode(
 
     _stub_gr_config(
         monkeypatch,
-        SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
+        SimpleNamespace(
+            beam_graph_active=True,
+            beam_graph_batch_size=2,
+            beam_max_width=4,
+            beam_max_decode_steps=3,
+        ),
     )
     monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
     monkeypatch.setattr(monitor, "set_cudagraph_capturing_enabled", lambda *_: None)
@@ -928,11 +979,21 @@ def test_npu_capture_forwards_run_under_inference_mode(
     )
     monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
 
-    session = SimpleNamespace(end_session=lambda: None)
+    dummy_sessions = tuple(SimpleNamespace(session_id=f"dummy-{index}") for index in range(2))
+    attention_batch = SimpleNamespace(
+        sessions=dummy_sessions,
+        end_session=lambda: None,
+    )
+    create_args: list[tuple[Any, ...]] = []
+
+    def fake_create(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        create_args.append(args)
+        return object(), attention_batch, object(), object()
+
     monkeypatch.setattr(
         npu_patch,
         "_capture_create_dummy_context_npu",
-        lambda *args, **kwargs: (object(), session, object(), object()),
+        fake_create,
     )
 
     inference_flags: list[bool] = []
@@ -941,7 +1002,9 @@ def test_npu_capture_forwards_run_under_inference_mode(
         inference_flags.append(torch.is_inference_mode_enabled())
 
     monkeypatch.setattr(npu_patch, "_dummy_beam_forward_npu", fake_forward)
-    monkeypatch.setattr(npu_patch, "_verify_and_record_captured_graph_npu", lambda r, width: True)
+    monkeypatch.setattr(
+        npu_patch, "_verify_and_record_captured_graph_npu", lambda r, width: width == 8
+    )
 
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False),
@@ -949,6 +1012,8 @@ def test_npu_capture_forwards_run_under_inference_mode(
         _current_beam_info=None,
     )
     assert npu_patch.capture_beam_decode_graph(runner) is True
+    assert create_args[0][2] == 2
+    assert runner._gr_npu_beam_graph_shapes == {(2, 4)}
     assert len(inference_flags) == npu_patch._BEAM_CAPTURE_NUM_WARMUPS + 1
     assert all(inference_flags), f"capture forwards ran outside inference_mode: {inference_flags}"
 
@@ -1078,7 +1143,7 @@ def test_npu_eager_attention_layout_keeps_request_ownership() -> None:
     assert layout.pool_slots == (4, 7)
 
 
-def test_npu_eager_capability_gate_is_npu_only_and_eager_only() -> None:
+def test_npu_capability_gate_allows_graph_mode_and_remains_npu_only() -> None:
     worker = SimpleNamespace(
         device="npu",
         model_config=SimpleNamespace(enforce_eager=True, dtype=torch.bfloat16),
@@ -1092,10 +1157,7 @@ def test_npu_eager_capability_gate_is_npu_only_and_eager_only() -> None:
     )
     validate_npu_eager_capabilities(worker)
     worker.model_config.enforce_eager = False
-    with pytest.raises(ValueError, match="eager mode"):
-        validate_npu_eager_capabilities(worker)
-
-    worker.model_config.enforce_eager = True
+    validate_npu_eager_capabilities(worker)
 
     worker.device = "cuda"
     with pytest.raises(ValueError, match="NPU worker"):
@@ -1183,6 +1245,64 @@ def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, d
             cuda.assert_not_called()
 
 
+def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+    from vllm_gr.v1.worker import model_runner_common as common
+
+    def context(batch_size: int) -> BeamAttentionContext:
+        return BeamAttentionContext(batch_size, 4, 1, 3, 2, 1, torch.device("cpu"), torch.float16)
+
+    graph_context = context(2)
+
+    def pointers() -> tuple[int, ...]:
+        return tuple(
+            tensor.data_ptr()
+            for tensor in (
+                graph_context.pools[0].unshared_key,
+                graph_context.pools[0].unshared_value,
+                graph_context.decision.sequence,
+                graph_context.decision.beam_scores,
+                graph_context.decode_step_buf,
+                graph_context.decode_step_1based_buf,
+                graph_context.xllm_block_table_buf,
+            )
+        )
+
+    captured_pointers = pointers()
+    worker = SimpleNamespace(
+        _gr_npu_graph_context=graph_context, _gr_npu_beam_graph_shapes={(2, 4)}
+    )
+    created: list[int] = []
+
+    def create(worker: Any, config: Any, *, max_batch: int) -> BeamAttentionContext:
+        created.append(max_batch)
+        return context(max_batch)
+
+    monkeypatch.setattr(common, "_create_beam_context", create)
+    monkeypatch.setattr(common, "_get_gr_config", lambda worker: object())
+    for batch_size in (2, 1, 2):
+        scheduled = _eager_stage_output(kind="decode", batch_size=batch_size, beam_width=4)
+        next(iter(scheduled.gr_stage_metadata.values())).beam_params.max_tokens = 3
+        worker._current_scheduler_output = scheduled
+        stage = object.__new__(NPUEagerBeamStageRunner)
+        stage.worker, stage.attention_batch = worker, None
+        stage.prefill_candidates = ConstraintOutput(
+            token_ids=torch.arange(batch_size * 4, dtype=torch.int32).view(batch_size, 4),
+            logprobs=torch.zeros(batch_size, 4),
+            valid_mask=torch.ones(batch_size, 4, dtype=torch.bool),
+        )
+        stage._ensure_attention_batch(NPUEagerStagePlan.from_scheduler_output(scheduled))
+        assert stage.attention_batch is not None
+        expected = graph_context if batch_size == 2 else worker._gr_npu_eager_context
+        assert stage.attention_batch.context is expected
+        assert worker._gr_npu_graph_context is graph_context
+        assert pointers() == captured_pointers
+        assert expected.registry.num_active_sessions == batch_size
+        stage._release()
+        assert expected.registry.num_active_sessions == 0 and not worker._beam_sessions
+    assert created == [1]
+
+
 def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1198,6 +1318,12 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     metadata.beam_params.max_tokens = 3
     prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
     winners = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
+    with torch.inference_mode():
+        context = SimpleNamespace(
+            decode_step_buf=torch.zeros(1, dtype=torch.int32),
+            decode_step_1based_buf=torch.zeros(1, dtype=torch.int32),
+            xllm_block_table_buf=torch.zeros(2, dtype=torch.int32),
+        )
     worker = SimpleNamespace(
         device="npu",
         input_ids=SimpleNamespace(gpu=torch.zeros(6, dtype=torch.int32)),
@@ -1219,11 +1345,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
         sessions=tuple(
             SimpleNamespace(_state=SimpleNamespace(is_last_step=False)) for _ in winners
         ),
-        context=SimpleNamespace(
-            decode_step_buf=torch.zeros(1, dtype=torch.int32),
-            decode_step_1based_buf=torch.zeros(1, dtype=torch.int32),
-            xllm_block_table_buf=torch.zeros(2, dtype=torch.int32),
-        ),
+        context=context,
     )
     monkeypatch.setattr(npu_beam_stage_runner, "get_npu_stage_runner", lambda *args: stage)
     arange = torch.arange
@@ -1259,6 +1381,7 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     ).__get__(worker)
 
     def native(self: Any, runtime: Any) -> Any:
+        assert torch.is_inference_mode_enabled()
         # Native execute reads this scalar before updating request state.
         assert runtime.total_num_scheduled_tokens == 6
         self._update_states(runtime)
@@ -1350,6 +1473,7 @@ def test_npu_stage_runner_receipt_preserves_owner_generation() -> None:
     plan = NPUEagerStagePlan.from_scheduler_output(scheduler_output)
 
     def select(logits: torch.Tensor, constraint: ConstraintMetadata) -> ConstraintOutput:
+        assert torch.is_inference_mode_enabled()
         assert logits.shape[0] == 1
         assert constraint.top_k == 2
         return ConstraintOutput(

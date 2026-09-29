@@ -282,7 +282,11 @@ class NPUEagerFirstDecodeHandoff:
 
 
 def validate_npu_eager_capabilities(worker: object) -> None:
-    """Fail before mutation when the initial NPU adapter is unsupported."""
+    """Fail before mutation when the NPU eager-or-graph adapter is unsupported.
+
+    Graph misses intentionally execute through the same eager data path, so
+    enforce_eager=False is valid once the NPU graph adapter is enabled.
+    """
 
     device_type = str(getattr(worker, "device", "cpu")).split(":", 1)[0].lower()
     parallel = getattr(worker, "parallel_config", None)
@@ -294,8 +298,6 @@ def validate_npu_eager_capabilities(worker: object) -> None:
     model = getattr(worker, "model_config", None)
     if device_type != "npu":
         raise ValueError("NPU eager Beam execution requires an NPU worker")
-    if not bool(getattr(model, "enforce_eager", False)):
-        raise ValueError("initial NPU Multi-Batch execution requires eager mode")
     if not bool(getattr(worker, "use_async_scheduling", False)):
         raise ValueError("fixed Batch Session execution requires async scheduling")
     context_parallel = (

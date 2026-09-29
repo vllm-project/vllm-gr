@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # pytest decorators are untyped in the mypy-only pre-commit environments.
-# mypy: disable-error-code="misc"
+# mypy: disable-error-code="misc,no-untyped-def,var-annotated,no-untyped-call"
 import asyncio
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +47,7 @@ from vllm_gr.v1.engine.engine_core_patch import (
     _patch_scheduler_reset_prefix_cache,
     _patch_scheduler_update_from_output,
     _sync_gr_sessions_after_native_finish,
+    apply_scheduler_patch,
 )
 from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
@@ -139,6 +140,79 @@ def _scheduler() -> SimpleNamespace:
 
 def _scheduler_output() -> SimpleNamespace:
     return SimpleNamespace(num_scheduled_tokens={"session-0": 1})
+
+
+def test_scheduler_patch_processes_subclass_super_chain_once(monkeypatch) -> None:
+    """A platform Scheduler subclass may delegate to an already-patched base."""
+
+    from vllm.v1.core.sched import scheduler as scheduler_module
+
+    from vllm_gr.v1.engine import gr_async_scheduler
+
+    native_calls: list[str] = []
+    retirement_calls: list[object] = []
+
+    class BaseScheduler:
+        def __init__(self) -> None:
+            coordinator = SimpleNamespace(cache_blocks=lambda *_args, **_kwargs: None)
+            self.kv_cache_manager = SimpleNamespace(
+                coordinator=coordinator,
+                get_computed_blocks=lambda _request: (SimpleNamespace(blocks=()), 0),
+                create_kv_cache_blocks=lambda blocks: SimpleNamespace(blocks=blocks),
+            )
+            self.cache_config = SimpleNamespace(block_size=16)
+            self.requests = {}
+
+        def has_requests(self):
+            return False
+
+        def add_request(self, request):
+            self.requests[request.request_id] = request
+
+        def finish_requests(self, request_ids, finished_status):
+            return None
+
+        def reset_prefix_cache(self, *args, **kwargs):
+            return True
+
+        def update_from_output(self, *args, **kwargs):
+            return {}
+
+        def schedule(self):
+            native_calls.append("base")
+            return SimpleNamespace(
+                num_scheduled_tokens={},
+                total_num_scheduled_tokens=0,
+                finished_req_ids=set(),
+            )
+
+    monkeypatch.setattr(
+        gr_async_scheduler,
+        "attach_gr_retirement",
+        lambda _scheduler, output: retirement_calls.append(output),
+    )
+    monkeypatch.setattr(scheduler_module, "Scheduler", BaseScheduler)
+    apply_scheduler_patch()
+
+    class BalanceScheduler(BaseScheduler):
+        def schedule(self):
+            native_calls.append("balance")
+            return super().schedule()
+
+    monkeypatch.setattr(scheduler_module, "Scheduler", BalanceScheduler)
+    apply_scheduler_patch()
+
+    scheduler = BalanceScheduler()
+    original_get_computed_blocks = scheduler.kv_cache_manager.get_computed_blocks
+    original_cache_blocks = scheduler.kv_cache_manager.coordinator.cache_blocks
+    output = scheduler.schedule()
+
+    assert native_calls == ["balance", "base"]
+    assert retirement_calls == [output]
+    assert output.gr_stage_metadata == {}
+    assert not hasattr(scheduler, "_vllm_gr_schedule_patch_depth")
+    assert scheduler.kv_cache_manager.get_computed_blocks is original_get_computed_blocks
+    assert scheduler.kv_cache_manager.coordinator.cache_blocks is original_cache_blocks
 
 
 def test_caller_formed_batch_is_one_ordered_scheduler_session() -> None:

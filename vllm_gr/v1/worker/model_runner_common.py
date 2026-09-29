@@ -1272,6 +1272,19 @@ def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
         stats["prefill_graph_full_dispatches"] = counts["FULL"]
         stats["prefill_graph_piecewise_dispatches"] = counts["PIECEWISE"]
         stats["prefill_graph_none_dispatches"] = counts["NONE"]
+    device_type = str(getattr(runner, "device", "")).split(":", 1)[0].lower()
+    if device_type == "npu" or hasattr(runner, "_gr_npu_beam_graph_shapes"):
+        stats.update(
+            {
+                "beam_graph_batch_size": int(getattr(config, "beam_graph_batch_size", 1)),
+                "captured_shapes": sorted(
+                    tuple(int(value) for value in shape)
+                    for shape in getattr(runner, "_gr_npu_beam_graph_shapes", ())
+                ),
+                "fallbacks": int(getattr(runner, "_beam_graph_fallback_count", 0)),
+                "fallback_reasons": dict(getattr(runner, "_beam_graph_fallback_reasons", {})),
+            }
+        )
     return stats
 
 

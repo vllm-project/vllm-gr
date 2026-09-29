@@ -245,6 +245,14 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     assert worker_class().init_device() == "ready"
     assert events == ["re_apply", "original"]
 
+    from vllm_gr.v1.worker.model_runner_common import (
+        freeze_gc_after_warmup,
+        get_beam_graph_runtime_stats,
+    )
+
+    assert worker_class.__dict__["get_gr_beam_graph_runtime_stats"] is get_beam_graph_runtime_stats
+    assert worker_class.__dict__["gr_freeze_gc_after_warmup"] is freeze_gc_after_warmup
+
     events.clear()
     raise_from_original = True
     with pytest.raises(RuntimeError, match="init failed"):

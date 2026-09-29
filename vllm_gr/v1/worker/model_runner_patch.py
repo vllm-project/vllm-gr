@@ -240,6 +240,19 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
     return _get_active_platform_module().discover_worker_runners()
 
 
+def install_worker_utility_hooks(worker_cls: type) -> None:
+    """Install named utility RPCs shared by CUDA and NPU Worker classes."""
+    from vllm_gr.constraints.worker_inject import install_worker_resource_hook
+
+    install_worker_resource_hook(worker_cls)
+    if not getattr(worker_cls, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
+        # Utility RPC dispatch resolves named Worker methods. Keep these
+        # importable functions instead of relying on callable serialization.
+        worker_cls.get_gr_beam_graph_runtime_stats = get_beam_graph_runtime_stats  # type: ignore[attr-defined]
+        worker_cls.gr_freeze_gc_after_warmup = freeze_gc_after_warmup  # type: ignore[attr-defined]
+        setattr(worker_cls, _BEAM_GRAPH_STATS_HOOK_MARKER, True)
+
+
 def _install_active_worker_resource_hook() -> None:
     """Mount named vllm-gr utility RPCs on the active CUDA Worker class."""
 
@@ -249,17 +262,7 @@ def _install_active_worker_resource_hook() -> None:
         return
     from vllm.v1.worker.gpu_worker import Worker
 
-    from vllm_gr.constraints.worker_inject import install_worker_resource_hook
-
-    install_worker_resource_hook(Worker)
-    if not getattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, False):
-        # A named method is required here: vLLM's safe msgpack utility channel
-        # intentionally rejects callable serialization unless insecure pickle
-        # fallback is enabled.  The profiling contract must work under spawn
-        # without weakening that policy.
-        Worker.get_gr_beam_graph_runtime_stats = get_beam_graph_runtime_stats  # type: ignore[attr-defined]
-        Worker.gr_freeze_gc_after_warmup = freeze_gc_after_warmup  # type: ignore[attr-defined]
-        setattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, True)
+    install_worker_utility_hooks(Worker)
 
 
 def apply_worker_patches() -> None:

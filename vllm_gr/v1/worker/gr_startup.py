@@ -50,12 +50,16 @@ def capture_async_forward(
         or not cfg.constraint_table.enabled
     ):
         raise ValueError("Beam V1 requires worker decisions, fixed width and a canonical table")
-    if (
-        str(worker.device).split(":")[0] != "cuda"
-        or worker.model_config.enforce_eager
-        or not cfg.beam_graph_enabled
-    ):
+    device_type = str(worker.device).split(":")[0]
+    if worker.model_config.enforce_eager or not cfg.beam_graph_enabled:
         return False
+    if device_type == "npu":
+        from vllm_gr.v1.worker.npu_model_runner_patch import capture_beam_decode_graph
+
+        return capture_beam_decode_graph(worker)
+    if device_type != "cuda":
+        return False
+
     existing = getattr(worker, "_gr_gpu_stage_runner", None)
     if existing is not None:
         if (

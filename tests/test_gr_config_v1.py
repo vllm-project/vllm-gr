@@ -64,6 +64,18 @@ def test_canonical_mapping_round_trip_is_exact(tmp_path: Path) -> None:
     assert gr_config_to_mapping(config) == raw
 
 
+def test_canonical_graph_batch_shape_round_trip(tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    beam = raw["beam"]
+    assert isinstance(beam, dict)
+    beam["graph_batch_size"] = 2
+
+    config = gr_config_from_mapping(raw)
+
+    assert config.beam_graph_batch_size == 2
+    assert gr_config_to_mapping(config) == raw
+
+
 def test_canonical_write_invalidates_cached_defaults_for_uniproc(tmp_path: Path) -> None:
     host = SimpleNamespace(additional_config={})
     assert GRConfig.from_vllm_config(host).beam_max_width is None
@@ -248,6 +260,23 @@ def test_constraint_max_top_k_has_no_npu_upper_bound(tmp_path: Path) -> None:
         max_top_k=257,
     )
     assert config.max_top_k == 257
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])  # type: ignore[misc]
+def test_engine_creation_preserves_flat_graph_batch_size(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int
+) -> None:
+    from vllm_gr.engine import arg_utils_gr
+
+    config = SimpleNamespace(additional_config={"vllm_gr_beam_graph_batch_size": batch_size})
+    assert GRConfig.from_vllm_config(config).beam_graph_batch_size == batch_size
+    monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: config)
+    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: False)
+    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: False)
+
+    assert arg_utils_gr.create_engine_config(SimpleNamespace()) is config
+    assert GRConfig.from_vllm_config(config).beam_graph_batch_size == batch_size
+    assert config.additional_config.get("vllm_gr_beam_graph_batch_size", 1) == batch_size
 
 
 def test_engine_creation_writes_enabled_canonical_config(
