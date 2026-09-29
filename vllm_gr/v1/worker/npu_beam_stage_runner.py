@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Initial eager NPU runtime for a fixed Beam Batch Session.
+"""Persistent eager NPU runtime for a fixed Beam Batch Session.
 
-Part 1 intentionally stops after the first Decode forward. It establishes the
-real Prefill -> device winner handoff -> B*W Decode execution path. Beam state
-advance, KV reorder, terminal materialization, and retirement belong to the
-following device-state PR.
+Prefill stays logical B; Decode executes physical B*W rows. Candidate state,
+request-local KV reorder, terminal materialization, and retirement stay owned
+by this runner for the complete session.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from copy import copy
 from typing import Any
@@ -17,11 +17,27 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_gr.constraints.backend import ConstraintMetadata
+from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
+from vllm_gr.v1.beam.batch_contracts import (
+    BEAM_BATCH_PROTOCOL_VERSION,
+    BeamBatchFailure,
+    BeamBatchOutput,
+    BeamBatchRequest,
+    BeamBatchResult,
+    BeamOutputSequence,
+    BeamRequestOutput,
+)
+from vllm_gr.v1.beam.beam_decision import run_beam_decision_candidates
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch
-from vllm_gr.v1.engine.beam_search_v1 import GRWorkerResult
+from vllm_gr.v1.engine.beam_search_v1 import (
+    GRRetireMetadata,
+    GRRetireResult,
+    GRWorkerResult,
+)
 from vllm_gr.v1.engine.gr_async_scheduler import (
+    GR_RETIRE_OUTPUT_ATTR,
+    GR_RETIRE_RESULT_ATTR,
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
@@ -33,7 +49,7 @@ from vllm_gr.v1.worker.npu_beam_stage_adapter import (
 
 
 class NPUEagerBeamStageRunner:
-    """Own the initial NPU Prefill and first-Decode execution contract."""
+    """Own persistent eager NPU Beam execution for one fixed batch."""
 
     def __init__(self, worker: Any) -> None:
         validate_npu_eager_capabilities(worker)
@@ -43,6 +59,10 @@ class NPUEagerBeamStageRunner:
         self.execution_error: Exception | None = None
         self.logical_scheduler_output: Any = None
         self.handoff: NPUEagerFirstDecodeHandoff | None = None
+        self.prefill_candidates: Any = None
+        self.latest_token_ids: torch.Tensor | None = None
+        self.parent_history: torch.Tensor | None = None
+        self.session_request: BeamBatchRequest | None = None
         self.decode_candidates: Any = None
         self.logits: torch.Tensor | None = None
         self.attention_batch: NPUBeamExecutionBatch | None = None
@@ -61,13 +81,13 @@ class NPUEagerBeamStageRunner:
         self.previous.assert_same_logical_batch(current)
         if current.dispatch_id != self.previous.dispatch_id + 1:
             raise ValueError("NPU Batch Session dispatch IDs must be contiguous")
-        if current.kind != "decode" or current.decode_step != 0:
-            raise NotImplementedError(
-                "NPU Part 1 supports Prefill and Decode step zero only; "
-                "Beam state advance is implemented in Part 2"
-            )
-        if self.previous.kind != "prefill" or self.handoff is None:
-            raise RuntimeError("Decode step zero requires the Prefill winner handoff")
+        if current.kind != "decode":
+            raise ValueError("NPU Batch Session may Prefill only once")
+        expected_step = 0 if self.previous.kind == "prefill" else int(self.previous.decode_step) + 1
+        if current.decode_step != expected_step:
+            raise ValueError("NPU Batch Session Decode steps must be contiguous")
+        if self.latest_token_ids is None:
+            raise RuntimeError("Decode requires a device-resident previous winner")
 
     def _ensure_attention_batch(self, plan: NPUEagerStagePlan) -> None:
         if self.attention_batch is not None:
@@ -79,11 +99,18 @@ class NPUEagerBeamStageRunner:
         )
 
         execution = plan.execution
+        if self.prefill_candidates is None:
+            raise RuntimeError("Decode state requires Prefill candidates")
         context = _create_beam_context(
             self.worker,
             _get_gr_config(self.worker),
             max_batch=execution.batch_size,
         )
+        required_steps = self._metadata(
+            self.worker._current_scheduler_output
+        ).beam_params.max_tokens
+        if required_steps > context.decision.sequence.shape[2]:
+            raise ValueError("NPU Beam history exceeds the configured Decode capacity")
         sessions = []
         for request_id, prompt_len in zip(
             execution.request_ids,
@@ -98,12 +125,20 @@ class NPUEagerBeamStageRunner:
             session.begin_session(execution.beam_width, prompt_len)
             sessions.append(session)
         self.attention_batch = NPUBeamExecutionBatch(execution, sessions)
+        width = execution.beam_width
+        candidates = self.prefill_candidates
+        initial_scores = candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf"))
+        context.decision.sequence[: execution.batch_size, :width, 0].copy_(candidates.token_ids)
+        context.decision.beam_scores[: execution.batch_size, :width].copy_(initial_scores)
+        context.decision.worker_decode_steps = 1
+        self.parent_history = torch.zeros_like(context.decision.sequence)
         self.worker._beam_context = context
         self.worker._beam_sessions = {session.session_id: session for session in sessions}
 
     def _beam_data(self, plan: NPUEagerStagePlan, metadata: Any) -> dict[str, dict[str, Any]]:
         execution = plan.execution
-        assert execution.decode_step == 0
+        step = execution.decode_step
+        assert step is not None
         return {
             request_id: {
                 "prefix_len": prompt_len,
@@ -111,9 +146,9 @@ class NPUEagerBeamStageRunner:
                 "max_decode_steps": metadata.beam_params.max_tokens,
                 "is_beam_decode": True,
                 "beam_width": execution.beam_width,
-                "beam_decode_steps": 1,
+                "beam_decode_steps": step + 1,
                 "parent_beam_ids": [0] * execution.beam_width,
-                "decode_step": 0,
+                "decode_step": step,
             }
             for request_id, prompt_len in zip(
                 execution.request_ids,
@@ -152,11 +187,11 @@ class NPUEagerBeamStageRunner:
         plan = NPUEagerStagePlan.from_scheduler_output(scheduler_output)
         self._validate_sequence(plan)
         metadata = self._metadata(scheduler_output)
-        if metadata.is_last_stage:
-            raise NotImplementedError(
-                "NPU Part 1 does not publish terminal Beam results; use a non-terminal "
-                "Prefill/Decode-step-zero validation and add Part 2 before serving"
-            )
+        session_init = getattr(metadata, "session_init", None)
+        if session_init is not None:
+            if plan.execution.kind != "prefill" or self.session_request is not None:
+                raise ValueError("NPU session_init must appear once on Prefill")
+            self.session_request = session_init
 
         self.pending_plan = plan
         self.logical_scheduler_output = scheduler_output
@@ -169,6 +204,8 @@ class NPUEagerBeamStageRunner:
         if plan.execution.kind == "decode":
             self._ensure_attention_batch(plan)
             assert self.attention_batch is not None
+            for session in self.attention_batch.sessions:
+                session._state.is_last_step = bool(metadata.is_last_stage)
             beam_data = self._beam_data(plan, metadata)
             beam_info = {
                 "beam_data": beam_data,
@@ -178,8 +215,10 @@ class NPUEagerBeamStageRunner:
             self.worker._current_beam_data = beam_data
             self.worker._current_beam_info = beam_info
             context = self.attention_batch.context
-            context.decode_step_buf.fill_(0)
-            context.decode_step_1based_buf.fill_(1)
+            step = plan.execution.decode_step
+            assert step is not None
+            context.decode_step_buf.fill_(step)
+            context.decode_step_1based_buf.fill_(step + 1)
             context.xllm_block_table_buf.copy_(
                 torch.arange(
                     plan.execution.batch_size,
@@ -257,13 +296,13 @@ class NPUEagerBeamStageRunner:
         )
 
         if execution.kind == "decode":
-            if self.handoff is None:
-                raise RuntimeError("Decode preparation has no Prefill winner handoff")
+            if self.latest_token_ids is None:
+                raise RuntimeError("Decode preparation has no previous Beam winners")
             input_ids = self.worker.input_ids.gpu
             positions, _ = _get_positions_buffers(self.worker)
             if positions is None:
                 raise RuntimeError("NPU runner has no device position buffer")
-            self.handoff.bind_first_decode(plan, input_ids, positions)
+            plan.prepare_decode_inputs(input_ids, positions, self.latest_token_ids)
             original_batch = self.worker.input_batch
             self.worker.input_batch = InputBatchProxy(
                 original_batch,
@@ -292,27 +331,65 @@ class NPUEagerBeamStageRunner:
                 dtype=torch.float32,
                 device=self.logits.device,
             ),
-            current_step=0 if plan.execution.kind == "prefill" else 1,
+            current_step=plan.execution.stage_index,
             top_k=plan.execution.beam_width,
         )
         backend = getattr(self.worker, "constraint_backend", None)
         if backend is None or not callable(getattr(backend, "select", None)):
             raise RuntimeError("NPU GR requires a loaded canonical constraint backend")
-        candidates = backend.select(self.logits.contiguous(), metadata)
+        candidates = self._select_constraint_candidates(backend, self.logits.contiguous(), metadata)
         expected = (
             plan.execution.num_execution_rows,
             plan.execution.beam_width,
         )
         if tuple(candidates.token_ids.shape) != expected:
             raise RuntimeError("NPU constraint backend returned an invalid candidate shape")
-        if plan.execution.kind == "prefill":
+        stage_metadata = self._metadata(self.worker._current_scheduler_output)
+        is_last = bool(stage_metadata.is_last_stage)
+        terminal_result = None
+        execution = plan.execution
+        if execution.kind == "prefill":
+            self.prefill_candidates = candidates
             self.handoff = NPUEagerFirstDecodeHandoff.from_prefill(plan, candidates.token_ids)
+            self.latest_token_ids = candidates.token_ids
+            if is_last:
+                terminal_result = self._build_terminal_result(
+                    candidates.token_ids.unsqueeze(2),
+                    candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf")),
+                    torch.zeros(
+                        (*candidates.token_ids.shape, 1),
+                        dtype=torch.int32,
+                        device=candidates.token_ids.device,
+                    ),
+                )
         else:
             self.decode_candidates = candidates
+            if self.attention_batch is None:
+                raise RuntimeError("Decode decision has no persistent attention batch")
+            decision = run_beam_decision_candidates(
+                self.worker,
+                self.attention_batch,
+                candidates.token_ids,
+                candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf")),
+                is_last_step=is_last,
+                result_width=execution.beam_width,
+            )
+            self.latest_token_ids = decision["out_token_ids"]
+            self._advance_parent_history(decision, execution.stage_index)
+            if is_last:
+                assert self.parent_history is not None
+                terminal_result = self._build_terminal_result(
+                    decision["out_sequence"],
+                    decision["out_log_probs"],
+                    self.parent_history[:, : decision["out_sequence"].shape[1]],
+                )
+        if is_last:
+            if terminal_result is None:
+                raise RuntimeError("terminal NPU Beam stage produced no result")
+            self._release()
 
         from vllm.v1.outputs import ModelRunnerOutput
 
-        execution = plan.execution
         request_ids = list(execution.request_ids)
         output = ModelRunnerOutput(
             req_ids=request_ids,
@@ -325,7 +402,9 @@ class NPUEagerBeamStageRunner:
             stage_index=execution.stage_index,
             produced_token_count=1,
             device_state=self._metadata(self.worker._current_scheduler_output).output_device_state,
-            finished=False,
+            finished=is_last,
+            terminal_result=terminal_result,
+            resources_released=is_last,
             owner_generation=execution.owner_generation,
         )
         setattr(output, GR_WORKER_RESULT_ATTR, {execution.session_id: worker_result})
@@ -337,18 +416,212 @@ class NPUEagerBeamStageRunner:
         self.worker.kv_connector_output = None
         return output
 
+    def _select_constraint_candidates(
+        self,
+        backend: Any,
+        logits: torch.Tensor,
+        metadata: ConstraintMetadata,
+    ) -> ConstraintOutput:
+        """Select candidates within one Backend call's row capacity.
+
+        The canonical Backend is intentionally sized for one request's beam
+        rows. A multi-request Decode stage submits contiguous row chunks and
+        restores the request-major result with concatenation.
+        """
+        max_rows = int(backend.info.max_rows)
+        if max_rows < 1:
+            raise RuntimeError(f"NPU constraint backend has invalid max_rows={max_rows}")
+        if logits.shape[0] <= max_rows:
+            return backend.select(logits, metadata)
+
+        outputs: list[ConstraintOutput] = []
+        for start in range(0, logits.shape[0], max_rows):
+            stop = min(start + max_rows, logits.shape[0])
+            temperatures = metadata.temperatures
+            if temperatures.numel() != 1:
+                temperatures = temperatures[start:stop]
+            chunk_metadata = ConstraintMetadata(
+                prefix_token_ids=metadata.prefix_token_ids[start:stop],
+                temperatures=temperatures,
+                current_step=metadata.current_step,
+                top_k=metadata.top_k,
+            )
+            outputs.append(backend.select(logits[start:stop].contiguous(), chunk_metadata))
+
+        return ConstraintOutput(
+            token_ids=torch.cat([output.token_ids for output in outputs], dim=0),
+            logprobs=torch.cat([output.logprobs for output in outputs], dim=0),
+            valid_mask=torch.cat([output.valid_mask for output in outputs], dim=0),
+        )
+
+    def _advance_parent_history(self, decision: dict[str, torch.Tensor], stage_index: int) -> None:
+        if self.parent_history is None or self.attention_batch is None:
+            raise RuntimeError("NPU Beam parent history is not initialized")
+        width = self.attention_batch.beam_width
+        batch = self.attention_batch.batch_size
+        parents = decision["out_token_index"][:, :width].to(torch.int64)
+        offsets = torch.arange(batch, dtype=torch.int64, device=parents.device).unsqueeze(1) * width
+        local_parents = parents - offsets
+        gather_index = local_parents.unsqueeze(2).expand_as(self.parent_history)
+        history = self.parent_history.gather(1, gather_index)
+        history[:, :, stage_index].copy_(local_parents.to(torch.int32))
+        self.parent_history = history
+
+    def _build_terminal_result(
+        self,
+        sequences: torch.Tensor,
+        scores: torch.Tensor,
+        parents: torch.Tensor,
+    ) -> BeamBatchResult:
+        request = self.session_request
+        if request is None:
+            raise RuntimeError("terminal NPU Beam output is missing session_init")
+        if tuple(item.request.request_id for item in request.items) != tuple(
+            self.pending_plan.execution.request_ids
+        ):
+            raise RuntimeError("terminal NPU Beam request order changed")
+
+        batch, width, steps = sequences.shape
+        if tuple(scores.shape) != (batch, width) or tuple(parents.shape[:2]) != (
+            batch,
+            width,
+        ):
+            raise RuntimeError("terminal NPU Beam tensors have inconsistent shapes")
+        history_words = batch * width * steps
+        score_words = batch * width
+        packed = torch.cat(
+            (
+                sequences.to(torch.int32).contiguous().reshape(-1),
+                parents[:, :, :steps].to(torch.int32).contiguous().reshape(-1),
+                scores.to(torch.float32).contiguous().reshape(-1).view(torch.int32),
+            )
+        ).to("cpu")
+        sequence_rows = packed[:history_words].view(batch, width, steps).tolist()
+        parent_rows = packed[history_words : 2 * history_words].view(batch, width, steps).tolist()
+        score_rows = (
+            packed[2 * history_words : 2 * history_words + score_words]
+            .view(torch.float32)
+            .view(batch, width)
+            .tolist()
+        )
+        params = request.beam_params
+        options = request.output_options
+        outputs = []
+        stop_ids = set(params.stop_token_ids) if not params.ignore_stop_tokens else set()
+        for row, item in enumerate(request.items):
+            ranked = []
+            prompt_length = len(item.request.prompt_token_ids or ())
+            for beam, raw_score in enumerate(score_rows[row]):
+                score = float(raw_score)
+                if not math.isfinite(score):
+                    continue
+                token_ids = tuple(int(token) for token in sequence_rows[row][beam])
+                parent_ids = tuple(int(parent) for parent in parent_rows[row][beam])
+                stop_index = next(
+                    (index for index, token in enumerate(token_ids) if token in stop_ids),
+                    None,
+                )
+                if stop_index is None:
+                    finish_reason = "length"
+                    stop_token_id = None
+                    length = len(token_ids)
+                else:
+                    finish_reason = "stop"
+                    stop_token_id = token_ids[stop_index]
+                    length = stop_index + 1
+                normalization = (
+                    float(prompt_length + length) ** params.length_penalty
+                    if params.length_penalty != 0
+                    else 1.0
+                )
+                ranked.append(
+                    (
+                        score / normalization,
+                        score,
+                        beam,
+                        token_ids,
+                        parent_ids,
+                        finish_reason,
+                        stop_token_id,
+                        length,
+                    )
+                )
+            ranked.sort(key=lambda value: (value[0], value[1], -value[2]), reverse=True)
+            selected = []
+            for (
+                _,
+                score,
+                _,
+                token_ids,
+                parent_ids,
+                finish_reason,
+                stop_token_id,
+                length,
+            ) in ranked[: options.num_return_sequences]:
+                token_count = length
+                if finish_reason == "stop" and not options.include_stop_token:
+                    token_count -= 1
+                selected.append(
+                    BeamOutputSequence(
+                        token_ids[:token_count],
+                        score if options.include_cumulative_logprob else None,
+                        parent_ids[:token_count] if options.include_parent_beam_indices else (),
+                        finish_reason,
+                        stop_token_id,
+                    )
+                )
+            if not selected:
+                return BeamBatchResult(
+                    BEAM_BATCH_PROTOCOL_VERSION,
+                    request.batch_id,
+                    None,
+                    BeamBatchFailure(
+                        "no_valid_beams",
+                        "No valid final Beam candidates",
+                        item.item_index,
+                    ),
+                )
+            outputs.append(
+                BeamRequestOutput(
+                    item.item_index,
+                    item.request.request_id,
+                    tuple(selected),
+                )
+            )
+        return BeamBatchResult(
+            BEAM_BATCH_PROTOCOL_VERSION,
+            request.batch_id,
+            BeamBatchOutput(tuple(outputs)),
+            None,
+        )
+
+    def _release(self) -> None:
+        if self.attention_batch is not None:
+            request_ids = tuple(session.session_id for session in self.attention_batch.sessions)
+            self.attention_batch.end_session()
+            sessions = getattr(self.worker, "_beam_sessions", {})
+            for request_id in request_ids:
+                sessions.pop(request_id, None)
+        self.closed = True
+        self.logical_scheduler_output = None
+        self.execution_error = None
+
     def _constraint_prefixes(self, plan: NPUEagerStagePlan) -> torch.Tensor:
         rows = plan.execution.num_execution_rows
         prefixes = torch.zeros((rows, 3), dtype=torch.int32, device=self.logits.device)
         if plan.execution.kind == "decode":
-            if self.handoff is None:
-                raise RuntimeError("Decode constraint selection has no winner handoff")
-            prefixes[:, 0].copy_(self.handoff.winner_token_ids.reshape(-1))
+            if self.attention_batch is None:
+                raise RuntimeError("Decode constraint selection has no Beam state")
+            steps = plan.execution.stage_index
+            sequence = self.attention_batch.context.decision.sequence[
+                : plan.execution.batch_size, : plan.execution.beam_width, :steps
+            ]
+            prefixes[:, :steps].copy_(sequence.reshape(rows, steps))
         return prefixes
 
 
 def get_npu_stage_runner(worker: Any, scheduler_output: Any) -> NPUEagerBeamStageRunner:
-    """Return the exclusive local NPU Part 1 execution owner."""
+    """Return the exclusive local NPU persistent execution owner."""
 
     from vllm_gr.config import BeamExecutionMode
     from vllm_gr.config.execution import require_beam_execution_mode
@@ -362,4 +635,57 @@ def get_npu_stage_runner(worker: Any, scheduler_output: Any) -> NPUEagerBeamStag
     return runner
 
 
-__all__ = ["NPUEagerBeamStageRunner", "get_npu_stage_runner"]
+def execute_npu_gr_retirement(worker: Any, scheduler_output: Any) -> Any:
+    """Release a drained eager NPU owner without another model invocation."""
+    metadata = getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR)
+    if (
+        not isinstance(metadata, GRRetireMetadata)
+        or scheduler_output.total_num_scheduled_tokens
+        or scheduler_output.num_scheduled_tokens
+        or getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
+        or metadata.session_id not in scheduler_output.finished_req_ids
+    ):
+        raise ValueError("invalid Asynchronous scheduling retirement control frame")
+    previous_metadata = getattr(worker, "_gr_npu_retirement_metadata", None)
+    previous_output = getattr(worker, "_gr_npu_retirement_output", None)
+    if previous_metadata == metadata and previous_output is not None:
+        return previous_output
+    owner = getattr(worker, "_gr_npu_stage_runner", None)
+    if (
+        owner is None
+        or owner.closed
+        or owner.pending_plan is not None
+        or owner.previous is None
+        or owner.previous.session_id != metadata.session_id
+        or owner.previous.owner_generation != metadata.owner_generation
+    ):
+        raise RuntimeError("Asynchronous scheduling retirement has no matching live NPU owner")
+    owner._release()
+    event = worker.prepare_inputs_event
+    if event is not None:
+        event.synchronize()
+    worker._update_states(scheduler_output)
+
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    output = ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
+    setattr(
+        output,
+        GR_RETIRE_RESULT_ATTR,
+        GRRetireResult(
+            metadata.session_id,
+            metadata.owner_generation,
+            metadata.retire_id,
+            True,
+        ),
+    )
+    worker._gr_npu_retirement_metadata = metadata
+    worker._gr_npu_retirement_output = output
+    return output
+
+
+__all__ = [
+    "NPUEagerBeamStageRunner",
+    "execute_npu_gr_retirement",
+    "get_npu_stage_runner",
+]

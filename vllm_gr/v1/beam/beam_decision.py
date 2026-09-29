@@ -1261,6 +1261,8 @@ def _reorder_kv_same_step(
                     block_table = torch.tensor(
                         [session.slot], dtype=torch.int32, device=beam_index.device
                     )
+                else:
+                    block_table = block_table[session.slot : session.slot + 1]
                 beam_ops.select_unshared_kv(
                     beam_index.contiguous(),
                     [p.unshared_key for p in pools],
@@ -1282,6 +1284,66 @@ def _reorder_kv_same_step(
     # and validated together with this persistent context.  Avoid rescanning
     # every K/V layer between BeamSearchGroup and SelectUnsharedKV.
     session.step_complete(beam_index, layout_prevalidated=True)
+
+
+def _reorder_kv_batch_same_step(
+    session: Any,
+    sessions: tuple[Any, ...],
+    beam_index: torch.Tensor,
+    group_token_num: torch.Tensor,
+) -> None:
+    """Apply one request-major B*W KV reorder for an NPU Beam batch."""
+
+    context = session.context
+    pools = context.pools
+    batch = len(sessions)
+    beam_width = session.beam_width
+    steps = {item._state.decode_step for item in sessions}
+    if len(steps) != 1:
+        raise RuntimeError("NPU Beam batch sessions left the same KV reorder step")
+    step = steps.pop()
+    expected = (batch, beam_width)
+    if tuple(beam_index.shape) != expected or tuple(group_token_num.shape) != expected:
+        raise RuntimeError("NPU Beam batch reorder tensors have an invalid shape")
+
+    if str(beam_index.device.type) == "npu":
+        try:
+            from vllm_gr.ops.npu import beam_ops
+
+            if beam_ops.is_available():
+                block_table = getattr(context, "xllm_block_table_buf", None)
+                if block_table is None:
+                    block_table = torch.tensor(
+                        [item.slot for item in sessions],
+                        dtype=torch.int32,
+                        device=beam_index.device,
+                    )
+                else:
+                    block_table = block_table[:batch]
+                # xllm consumes all B*W local parents and B pool slots in one
+                # call. Per-request calls do not preserve its batch geometry
+                # for a non-zero pool slot.
+                beam_ops.select_unshared_kv(
+                    beam_index.reshape(-1).contiguous(),
+                    [pool.unshared_key for pool in pools],
+                    [pool.unshared_value for pool in pools],
+                    block_table,
+                    group_token_num.reshape(-1).contiguous(),
+                    step + 1,
+                    beam_width,
+                    len(pools),
+                )
+                for item in sessions:
+                    item._state.decode_step += 1
+                return
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning(
+                "vllm-gr fused batch same-step KV reorder failed: %s; fallback",
+                exc,
+            )
+
+    for row, item in enumerate(sessions):
+        _reorder_kv_same_step(item, beam_index[row], group_token_num[row])
 
 
 def _finalize_decision(
@@ -1326,13 +1388,17 @@ def _finalize_decision(
     local_prefix = prefix[:batch, :beam_width].to(torch.int32) - request_offset
     bufs.group_token_num[:batch, :beam_width].copy_(local_prefix)
 
-    state = session._state
-    if not state.is_last_step:
-        # The shared beam context serves a single active session (max_batch=1
-        # design): its operator row is batch row 0.  Only that row's mapping
-        # may feed the pool reorder — flattening every batch row would push a
-        # [B*W] parent mapping into a [W]-wide pool.
-        _reorder_kv_same_step(session, local_idx[0], local_prefix[0])
+    sessions = getattr(session, "sessions", (session,))
+    if len(sessions) != batch:
+        raise RuntimeError("Beam decision batch does not match its request sessions")
+    if not all(item._state.is_last_step for item in sessions):
+        # NPU B>1 keeps the complete request-major geometry in one operator call.
+        # Other devices and B=1 retain the established per-session path.
+        if batch > 1 and local_idx.device.type == "npu":
+            _reorder_kv_batch_same_step(session, sessions, local_idx, local_prefix)
+        else:
+            for row, item in enumerate(sessions):
+                _reorder_kv_same_step(item, local_idx[row], local_prefix[row])
         # The applied mapping is NOT materialized here: reading
         # ``local_idx[0].tolist()`` is a device→host sync that stalls the
         # pipeline every step (~30ms on NPU, profiling bw128_1k_t3).  The
@@ -1360,7 +1426,10 @@ def _run_npu_decision(
     step = width  # worker-side token count == next sequence slot to write
 
     log_probs = bufs.beam_scores[:batch, :beam_width].reshape(batch * beam_width, 1)
-    seq = bufs.sequence[:batch, :beam_width, :].contiguous()
+    # xllm derives the history stride from the physical last dimension and
+    # requires exactly current_step + 1 slots. Passing the runtime N=3
+    # capacity to an N=2 terminal group step misreads the second SID token.
+    seq = bufs.sequence[:batch, :beam_width, : step + 1].contiguous()
 
     prefix: torch.Tensor | None = None
     if is_last_step and result_width % _FINAL_SELECT_ALIGNMENT == 0:
@@ -1567,7 +1636,7 @@ def _run_torch_decision(
     step = width
 
     log_probs = bufs.beam_scores[:batch, :beam_width].reshape(batch * beam_width, 1)
-    seq = bufs.sequence[:batch, :beam_width, :].contiguous()
+    seq = bufs.sequence[:batch, :beam_width, : step + 1].contiguous()
 
     prefix: torch.Tensor | None = None
     if is_last_step and (
@@ -1688,6 +1757,56 @@ def run_beam_decision(
     decision = _run_torch_decision(session, top_tokens, top_probs, is_last_step, result_width)
     if decision is not None:
         decision["probs"] = session.context.decision.beam_scores[:1, :width].clone()
+    return decision
+
+
+def run_beam_decision_candidates(
+    runner: Any,
+    session: Any,
+    top_tokens: torch.Tensor,
+    top_probs: torch.Tensor,
+    *,
+    is_last_step: bool,
+    result_width: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Run a worker decision from canonical fixed-width candidates.
+
+    The NPU eager GR runner already owns ``ConstraintOutput`` tensors, so
+    routing them through vLLM's sampler container would only reconstruct an
+    object that the constrained backend has just deconstructed. This narrow
+    entry point shares the persistent decision and KV-reorder machinery while
+    keeping the canonical candidate ABI explicit.
+    """
+    width = session.beam_width
+    if (
+        top_tokens.ndim != 2
+        or top_probs.shape != top_tokens.shape
+        or top_tokens.shape[1] != width
+        or top_tokens.shape[0] == 0
+        or top_tokens.shape[0] % width
+    ):
+        raise ValueError("Beam candidates must have shape [B*W, W]")
+    if top_tokens.dtype is not torch.int32 or top_probs.dtype is not torch.float32:
+        raise ValueError("Beam candidates must use int32 token IDs and float32 scores")
+    if session.context.decision.worker_decode_steps == 0:
+        raise RuntimeError("Beam decision state must be initialized from Prefill")
+
+    result_width = result_width or width
+    if not 1 <= result_width <= width:
+        raise ValueError("result_width must be in [1, beam_width]")
+    device_type = str(getattr(getattr(runner, "device", None), "type", ""))
+    if device_type.startswith("npu"):
+        from vllm_gr.ops.npu import beam_ops
+
+        if not beam_ops.is_available():
+            raise RuntimeError("NPU Beam decision operators are unavailable")
+        decision = _run_npu_decision(session, top_tokens, top_probs, is_last_step, result_width)
+    else:
+        decision = _run_torch_decision(session, top_tokens, top_probs, is_last_step, result_width)
+    if decision is None:
+        raise RuntimeError("Beam decision did not produce a result")
+    batch = top_tokens.shape[0] // width
+    decision["probs"] = session.context.decision.beam_scores[:batch, :width].clone()
     return decision
 
 
@@ -1846,6 +1965,7 @@ __all__ = [
     "init_beam_decision_state",
     "maybe_run_worker_beam_decision",
     "run_beam_decision",
+    "run_beam_decision_candidates",
     "unpack_beam_result_buffer",
     "worker_decision_enabled",
 ]

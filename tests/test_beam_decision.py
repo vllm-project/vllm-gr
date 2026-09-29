@@ -512,8 +512,11 @@ def test_prefix_sums_converted_to_request_local() -> None:
 def test_kv_reorder_record_matches_global_index_minus_offset() -> None:
     """Multi-request offset arithmetic: recorded[i] = global_idx[i] - i*W."""
     context = _make_context(max_batch=2, max_beams=4, max_decode_steps=4)
-    session = _make_session(context)
-    session.begin_session(beam_width=4, prefix_len=8)
+    first = _make_session(context, "first")
+    second = _make_session(context, "second")
+    first.begin_session(beam_width=4, prefix_len=8)
+    second.begin_session(beam_width=4, prefix_len=8)
+    session = SimpleNamespace(sessions=(first, second), context=context, beam_width=4)
 
     beam_width = 4
     # batch=2 synthetic operator output exercising the offset conversion.
@@ -542,11 +545,13 @@ def test_kv_reorder_record_matches_global_index_minus_offset() -> None:
         [1, 2, 2, 2],
     ]
     # The decision no longer materializes kv_reorder (no device→host sync);
-    # the return channel derives it from out_token_index's host copy, and
-    # only the single active session (request 0 slice) is recorded.  Row 0's
+    # each request row is applied to its own pool slot without a host-side
+    # kv_reorder record. Row 0's
     # global offset is 0, so row 0 already equals the request-local mapping;
     # row 1 must shed its 1*beam_width offset to match.
-    assert session._state.kv_reorder is None
+    assert first._state.kv_reorder is None
+    assert second._state.kv_reorder is None
+    assert (first.decode_step, second.decode_step) == (1, 1)
     assert out_idx[0].tolist() == [0, 1, 0, 1]
     assert (out_idx[1] - beam_width).tolist() == [0, 1, 0, 1]
 

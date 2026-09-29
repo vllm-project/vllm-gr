@@ -79,11 +79,6 @@ def worker_input(scheduled: Any) -> Any:
     return local
 
 
-def _require_device(worker: Any) -> None:
-    if str(worker.device).split(":")[0] != "cuda":
-        raise ValueError("beam_search_v1 has no execution adapter for this device")
-
-
 def execute_gr_stage(
     worker: Any,
     scheduled: Any,
@@ -121,7 +116,17 @@ def execute_gr_stage(
 
 
 def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
-    _require_device(worker)
-    from vllm_gr.v1.worker.gpu_beam_stage_runner import execute_gr_retirement as retire
+    local = worker_input(scheduled)
+    device_type = str(worker.device).split(":")[0]
+    if device_type == "cuda":
+        from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+            execute_gr_retirement as retire,
+        )
+    elif device_type == "npu":
+        from vllm_gr.v1.worker.npu_beam_stage_runner import (
+            execute_npu_gr_retirement as retire,
+        )
+    else:
+        raise ValueError("beam_search_v1 has no retirement adapter for this device")
 
-    return retire(worker, worker_input(scheduled))
+    return retire(worker, local)
