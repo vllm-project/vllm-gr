@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Run one offline Beam Search V1 request with a CUDA Constraint Table."""
+"""Run one offline Beam Search V1 request with a canonical Constraint Table."""
 
 from __future__ import annotations
 
@@ -28,10 +28,17 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Constraint triples JSON produced by tools/build_constraint_triples.py",
     )
+    parser.add_argument(
+        "--constraint-backend",
+        choices=("cuda", "npu"),
+        default="cuda",
+        help="Constraint Table device backend; NPU uses the eager V1 runtime",
+    )
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--generated-steps", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--beam-width", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
@@ -94,6 +101,8 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
 
+    is_npu = args.constraint_backend == "npu"
+
     artifact_digest, tokenizer_digest = build_artifact(
         args.model.resolve(),
         args.catalog.resolve(),
@@ -104,14 +113,14 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         "attention_backend": "CUSTOM",
         "beam": {
             "execution_mode": "v1",
-            "graph_enabled": True,
+            "graph_enabled": not is_npu,
             "worker_decision": True,
             "max_width": args.beam_width,
             "max_decode_steps": args.generated_steps,
         },
         "constraint_table": {
             "enabled": True,
-            "backend": "cuda",
+            "backend": args.constraint_backend,
             "max_top_k": args.beam_width,
             "path": str(artifact_path),
             "format": "constraint_table_v1",
@@ -139,37 +148,39 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         enable_prefix_caching=True,
         enable_chunked_prefill=False,
         max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.max_model_len,
-        max_num_seqs=args.beam_width,
+        max_num_batched_tokens=max(args.max_model_len, args.batch_size * args.input_len),
+        max_num_seqs=max(args.beam_width, args.batch_size),
         max_logprobs=args.beam_width,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=False,
+        enforce_eager=is_npu,
     ) as llm:
         tokenizer = llm.get_tokenizer()
         prompt_token_ids = make_prompt(tokenizer, args.prompt.resolve(), args.input_len)
         outputs = llm.beam_search_v1(
-            [{"prompt_token_ids": prompt_token_ids}],
+            [{"prompt_token_ids": list(prompt_token_ids)} for _ in range(args.batch_size)],
             params,
         )
 
-        sequences = outputs[0].sequences
-        print(f"returned_beams={len(sequences)}")
-        for rank, sequence in enumerate(sequences[: args.print_beams]):
-            token_ids = [int(token) for token in sequence.tokens]
-            sid_token_ids = token_ids[-(args.generated_steps + 2) :]
-            print(
-                json.dumps(
-                    {
-                        "rank": rank,
-                        "cumulative_logprob": float(sequence.cum_logprob),
-                        "finish_reason": sequence.finish_reason,
-                        "stop_reason": sequence.stop_reason,
-                        "sid_token_ids": sid_token_ids,
-                        "sid_tokens": tokenizer.convert_ids_to_tokens(sid_token_ids),
-                    },
-                    ensure_ascii=False,
+        for request_index, output in enumerate(outputs):
+            sequences = output.sequences
+            print(f"request={request_index} returned_beams={len(sequences)}")
+            for rank, sequence in enumerate(sequences[: args.print_beams]):
+                token_ids = [int(token) for token in sequence.tokens]
+                sid_token_ids = token_ids[-(args.generated_steps + 2) :]
+                print(
+                    json.dumps(
+                        {
+                            "request": request_index,
+                            "rank": rank,
+                            "cumulative_logprob": float(sequence.cum_logprob),
+                            "finish_reason": sequence.finish_reason,
+                            "stop_reason": sequence.stop_reason,
+                            "sid_token_ids": sid_token_ids,
+                            "sid_tokens": tokenizer.convert_ids_to_tokens(sid_token_ids),
+                        },
+                        ensure_ascii=False,
+                    )
                 )
-            )
 
 
 def main() -> None:
@@ -179,6 +190,8 @@ def main() -> None:
             raise FileNotFoundError(path)
     if args.input_len + args.generated_steps + 1 > args.max_model_len:
         raise ValueError("prompt and generated tokens exceed --max-model-len")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
     if args.print_beams <= 0:
         raise ValueError("--print-beams must be positive")
 

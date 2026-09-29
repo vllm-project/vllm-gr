@@ -52,6 +52,8 @@ def test_v1_requires_native_async() -> None:
         validate_gr_execution_config(config)
     config.scheduler_config.async_scheduling = True
     validate_gr_execution_config(config)
+    config.device_config = SimpleNamespace(device="npu")
+    validate_gr_execution_config(config)
     with pytest.raises(ValueError, match="execution_mode='legacy'"):
         require_beam_execution_mode(config, BeamExecutionMode.LEGACY)
 

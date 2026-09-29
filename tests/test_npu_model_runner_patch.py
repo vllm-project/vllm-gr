@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
 from vllm_gr.v1.beam.npu_execution_batch import (
     NPUBeamExecutionBatch,
     restore_npu_cache_pool_layout,
@@ -23,16 +24,22 @@ from vllm_gr.v1.worker.npu_beam_stage_adapter import (
 from vllm_gr.v1.worker.npu_beam_stage_runner import NPUEagerBeamStageRunner
 
 
-def _eager_stage_output(*, kind: str, batch_size: int = 2, beam_width: int = 3) -> SimpleNamespace:
+def _eager_stage_output(
+    *,
+    kind: str,
+    batch_size: int = 2,
+    beam_width: int = 3,
+    decode_step: int = 0,
+) -> SimpleNamespace:
     request_ids = tuple(f"request-{index}" for index in range(batch_size))
     prompt_lengths = tuple(range(2, batch_size + 2))
-    stage_index = 0 if kind == "prefill" else 1
+    stage_index = 0 if kind == "prefill" else decode_step + 1
     metadata = SimpleNamespace(
         session_id="batch-0",
         dispatch_id=stage_index,
         stage_index=stage_index,
         kind=kind,
-        decode_step=None if kind == "prefill" else 0,
+        decode_step=None if kind == "prefill" else decode_step,
         owner_generation=1,
         request_ids=request_ids,
         num_prompt_tokens_by_request=prompt_lengths,
@@ -66,6 +73,12 @@ def test_npu_eager_plan_keeps_logical_prefill_and_expands_decode_rows() -> None:
     assert decode.logits_indices == tuple(range(6))
     assert decode.sampling_row_indices == (0, 0, 0, 1, 1, 1)
     assert decode.decode_positions == (2, 2, 2, 3, 3, 3)
+    next_decode = NPUEagerStagePlan.from_scheduler_output(
+        _eager_stage_output(kind="decode", decode_step=1)
+    )
+    assert next_decode.decode_positions == (3, 3, 3, 4, 4, 4)
+    assert next_decode.execution.stage_index == 2
+    assert next_decode.execution.decode_step == 1
 
 
 def test_npu_prepare_unproxies_and_preserves_four_item_contract(
@@ -1114,6 +1127,7 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> 
     def original(self: Any, physical_output: Any, counts: Any) -> tuple[Any, ...]:
         assert self is worker
         assert physical_output is runtime_output
+        assert physical_output is not scheduler_output
         assert physical_output.num_scheduled_tokens == {
             "request-0": 3,
             "request-1": 3,
@@ -1311,6 +1325,65 @@ def test_npu_failed_execute_reaches_sample_without_native_fallback(
         stage.execute(scheduled, fail)
 
 
+def test_npu_retirement_clears_failed_dispatch_state() -> None:
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.attention_batch = None
+    stage.closed = False
+    stage.logical_scheduler_output = object()
+    stage.execution_error = ValueError("failed dispatch")
+    stage._release()
+    assert stage.closed
+    assert stage.logical_scheduler_output is None
+    assert stage.execution_error is None
+
+
+def test_npu_stage_runner_receipt_preserves_owner_generation() -> None:
+    scheduler_output = _eager_stage_output(
+        kind="prefill",
+        batch_size=1,
+        beam_width=2,
+    )
+    metadata = next(iter(scheduler_output.gr_stage_metadata.values()))
+    metadata.beam_params.temperature = 0.0
+    metadata.is_last_stage = False
+    metadata.output_device_state = object()
+    plan = NPUEagerStagePlan.from_scheduler_output(scheduler_output)
+
+    def select(logits: torch.Tensor, constraint: ConstraintMetadata) -> ConstraintOutput:
+        assert logits.shape[0] == 1
+        assert constraint.top_k == 2
+        return ConstraintOutput(
+            token_ids=torch.tensor([[11, 12]], dtype=torch.int32),
+            logprobs=torch.tensor([[-0.1, -0.2]], dtype=torch.float32),
+            valid_mask=torch.ones((1, 2), dtype=torch.bool),
+        )
+
+    worker = SimpleNamespace(
+        _current_scheduler_output=scheduler_output,
+        constraint_backend=SimpleNamespace(
+            info=SimpleNamespace(max_rows=1),
+            select=select,
+        ),
+        execute_model_state=object(),
+        kv_connector_output=object(),
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.worker = worker
+    stage.execution_error = None
+    stage.pending_plan = plan
+    stage.logits = torch.zeros((1, 16), dtype=torch.float32)
+    stage.prefill_candidates = None
+    stage.handoff = None
+    stage.latest_token_ids = None
+    stage.attention_batch = None
+    stage.closed = False
+
+    output = stage.sample()
+
+    result = output.gr_worker_results[plan.execution.session_id]
+    assert result.owner_generation == plan.execution.owner_generation == 1
+
+
 def test_npu_execution_batch_flattens_only_the_xllm_attention_view() -> None:
     execution = NPUEagerStagePlan.from_scheduler_output(
         _eager_stage_output(kind="decode")
@@ -1349,3 +1422,74 @@ def test_npu_execution_batch_flattens_only_the_xllm_attention_view() -> None:
     restored = restore_npu_cache_pool_layout(flat, request_width=3)
     assert restored.shape == (2, 3, 1)
     assert restored.data_ptr() == source.unshared_key.data_ptr()
+
+
+def test_npu_terminal_result_keeps_batch_identity_and_output_options() -> None:
+    request_ids = ("request-0", "request-1")
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.pending_plan = SimpleNamespace(execution=SimpleNamespace(request_ids=request_ids))
+    stage.session_request = SimpleNamespace(
+        batch_id="batch-0",
+        items=tuple(
+            SimpleNamespace(
+                item_index=index,
+                request=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+            )
+            for index, request_id in enumerate(request_ids)
+        ),
+        beam_params=SimpleNamespace(
+            stop_token_ids=(99,), ignore_stop_tokens=False, length_penalty=1.0
+        ),
+        output_options=SimpleNamespace(
+            num_return_sequences=1,
+            include_stop_token=False,
+            include_cumulative_logprob=True,
+            include_parent_beam_indices=True,
+        ),
+    )
+    result = stage._build_terminal_result(
+        torch.tensor([[[10, 99], [20, 21]], [[30, 31], [40, 41]]], dtype=torch.int32),
+        torch.tensor([[-0.1, -1.0], [-0.2, -2.0]], dtype=torch.float32),
+        torch.tensor([[[0, 0], [0, 1]], [[0, 0], [0, 1]]], dtype=torch.int32),
+    )
+
+    assert result.failure is None and result.output is not None
+    assert tuple(item.request_id for item in result.output.items) == request_ids
+    first = result.output.items[0].sequences[0]
+    assert (first.token_ids, first.parent_beam_indices) == ((10,), (0,))
+    assert (first.finish_reason, first.stop_token_id) == ("stop", 99)
+
+
+def test_npu_constraint_candidates_chunk_multi_batch_rows() -> None:
+    calls: list[ConstraintMetadata] = []
+
+    def select(logits: torch.Tensor, metadata: ConstraintMetadata) -> ConstraintOutput:
+        calls.append(metadata)
+        row_ids = logits[:, 0].to(torch.int32)
+        return ConstraintOutput(
+            token_ids=row_ids[:, None].expand(-1, metadata.top_k).contiguous(),
+            logprobs=logits[:, : metadata.top_k].contiguous(),
+            valid_mask=torch.ones((logits.shape[0], metadata.top_k), dtype=torch.bool),
+        )
+
+    prefixes = torch.arange(18, dtype=torch.int32).view(6, 3)
+    temperatures = torch.arange(6, dtype=torch.float32)
+    metadata = ConstraintMetadata(
+        prefix_token_ids=prefixes,
+        temperatures=temperatures,
+        current_step=1,
+        top_k=2,
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    result = stage._select_constraint_candidates(
+        SimpleNamespace(info=SimpleNamespace(max_rows=3), select=select),
+        torch.arange(6, dtype=torch.float32)[:, None].expand(-1, 4),
+        metadata,
+    )
+
+    assert [item.prefix_token_ids.shape[0] for item in calls] == [3, 3]
+    torch.testing.assert_close(torch.cat([item.prefix_token_ids for item in calls]), prefixes)
+    torch.testing.assert_close(torch.cat([item.temperatures for item in calls]), temperatures)
+    assert all(item.current_step == 1 and item.top_k == 2 for item in calls)
+    torch.testing.assert_close(result.token_ids[:, 0], torch.arange(6, dtype=torch.int32))
+    assert result.logprobs.is_contiguous() and result.valid_mask.all()

@@ -42,6 +42,7 @@ from vllm_gr.v1.engine.core_client import (
 from vllm_gr.v1.engine.core_client_patch import sync_mp_submit_gr_session
 from vllm_gr.v1.engine.engine_core_patch import (
     _GR_FINALIZING_IDS_ATTR,
+    _expand_gr_abort_request_ids,
     _finalize_ready_gr_session,
     _patch_scheduler_reset_prefix_cache,
     _patch_scheduler_update_from_output,
@@ -265,6 +266,7 @@ def test_prefill_decode_lookahead_uses_device_dependency_without_cpu_update() ->
 
     assert prefill is not None
     assert prefill.kind == GRStageKind.PREFILL
+    assert prefill.session_init is session.request
     assert prefill.input_device_state is None
     assert can_issue_gr_stage(scheduler, session)
 
@@ -277,6 +279,7 @@ def test_prefill_decode_lookahead_uses_device_dependency_without_cpu_update() ->
 
     assert decode is not None
     assert decode.kind == GRStageKind.DECODE
+    assert decode.session_init is None
     assert decode.input_device_state == prefill.output_device_state
     assert session.in_flight_stages == 2
     assert not can_issue_gr_stage(scheduler, session)
@@ -643,6 +646,18 @@ def test_native_abort_all_result_cleans_unscheduled_gr_session() -> None:
     assert session.status == GRSessionStatus.ABORTED
     assert session.resource_status is GRResourceStatus.CLOSED
     assert session.session_id not in scheduler._gr_v1_sessions
+
+
+def test_native_shutdown_preserves_none_abort_selector() -> None:
+    scheduler = _scheduler()
+
+    request_ids = _expand_gr_abort_request_ids(
+        scheduler,
+        None,
+        SimpleNamespace(name="FINISHED_ABORTED"),
+    )
+
+    assert request_ids is None
 
 
 def test_native_abort_overrides_a_pending_gr_terminal_result() -> None:

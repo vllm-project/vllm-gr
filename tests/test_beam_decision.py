@@ -23,6 +23,7 @@ All tests run on CPU against the PyTorch reference decision path
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -305,6 +306,35 @@ def test_result_width_falls_back_to_beam_width() -> None:
     assert decision is not None
     # beam_search_group output width == beam_width, NOT 32.
     assert decision["out_token_ids"].shape == (1, beam_width)
+
+
+def test_npu_n2_group_receives_two_slot_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The N=2 terminal group must not receive the runtime N=3 capacity."""
+    from vllm_gr.ops.npu import beam_ops
+
+    width = 8
+    context = _make_context(max_beams=width, max_decode_steps=3)
+    session = _make_session(context)
+    session.begin_session(beam_width=width, prefix_len=8)
+    context.decision.worker_decode_steps = 1
+    seen_shape: tuple[int, ...] | None = None
+
+    def capture_group(*args: Any) -> None:
+        nonlocal seen_shape
+        seen_shape = tuple(args[3].shape)
+        raise RuntimeError("captured group input")
+
+    monkeypatch.setattr(beam_ops, "beam_search_group", capture_group)
+    candidates = torch.arange(width * width, dtype=torch.int32).reshape(width, width)
+    with pytest.raises(RuntimeError, match="captured group input"):
+        beam_decision._run_npu_decision(
+            session,
+            candidates,
+            torch.zeros_like(candidates, dtype=torch.float32),
+            is_last_step=True,
+            result_width=width,
+        )
+    assert seen_shape == (1, width, 2)
 
 
 def test_result_width_decouples_from_max_decode_steps() -> None:
