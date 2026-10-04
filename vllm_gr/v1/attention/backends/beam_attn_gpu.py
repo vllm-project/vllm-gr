@@ -150,12 +150,15 @@ def cascade_attention(
     vllm_flash_attn_version: int,
     s_aux: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
+    use_direct_output: bool = False,
 ) -> None:
     if attn_metadata.std_indices is not None:
         if attn_metadata.prefix_indices is None:
             std_query = query[: attn_metadata.num_std_indices]
+            std_output = output[: attn_metadata.num_std_indices] if use_direct_output else None
         else:
             std_query = query[attn_metadata.std_indices]
+            std_output = None
         std_out = flash_attn_varlen_func(
             q=std_query,
             k=key_cache,
@@ -170,12 +173,13 @@ def cascade_attention(
             window_size=sliding_window_size,
             block_table=attn_metadata.std_block_table,
             softcap=logits_soft_cap,
+            out=std_output,
             fa_version=vllm_flash_attn_version,
         )
-        if attn_metadata.prefix_indices is None:
-            output[: attn_metadata.num_std_indices] = std_out
-        else:
+        if attn_metadata.prefix_indices is not None:
             output[attn_metadata.std_indices] = std_out
+        elif not use_direct_output:
+            output[: attn_metadata.num_std_indices] = std_out
 
     if attn_metadata.prefix_indices is not None:
         if attn_metadata.std_indices is None:
@@ -246,10 +250,12 @@ def cascade_attention(
                 .view(attn_metadata.num_heads, -1)
             )
 
-        out = torch.empty_like(beam_query)
-        merge_attn_states(out, prefix_out, prefix_lse, suffix_out, suffix_lse)
-
-        if attn_metadata.std_indices is None:
-            output[: attn_metadata.num_prefix_indices] = out
+        if attn_metadata.std_indices is None and use_direct_output:
+            out = output[: attn_metadata.num_prefix_indices]
         else:
+            out = torch.empty_like(beam_query)
+        merge_attn_states(out, prefix_out, prefix_lse, suffix_out, suffix_lse)
+        if attn_metadata.std_indices is not None:
             output[attn_metadata.prefix_indices] = out
+        elif not use_direct_output:
+            output[: attn_metadata.num_prefix_indices] = out

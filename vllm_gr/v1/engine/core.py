@@ -31,6 +31,7 @@ logger = init_logger(__name__)
 
 _BEAMPROC_MSG_ABORT = b"ABORT"
 _BEAMPROC_MSG_BEAM_PLAN = b"BEAM_PLAN"
+_BEAMPROC_MSG_BEAM_FINISHED = b"BEAM_FINISHED"
 _BEAMPROC_MSG_ENGINE_OUTPUT_BATCH = b"ENGINE_OUTPUT_BATCH"
 _BEAMPROC_MSG_BEAM_STATE_UPDATE = b"BEAM_STATE_UPDATE"
 _BEAMPROC_ENABLED_ENV = "VLLM_GR_BEAM_PROC_ENABLED"
@@ -724,8 +725,8 @@ def _create_beam_fork_children(
     if enqueue_child_batch and created_requests:
         pb_queue = getattr(self, "pb_queue", None)
         if pb_queue is not None:
-            _beamproc_queue_put(
-                pb_queue,
+            _publish_beamproc_item(
+                self,
                 (
                     _BEAMPROC_CHILD_BATCH_REQUEST,
                     created_requests,
@@ -1219,8 +1220,8 @@ def _apply_beamproc_grouped_plan(self, plan: dict[str, Any]) -> bool:
         self.beam_cache[grouped_request_id] = (req, len(req.block_hashes))
     pb_queue = getattr(self, "pb_queue", None)
     if pb_queue is not None:
-        _beamproc_queue_put(
-            pb_queue,
+        _publish_beamproc_item(
+            self,
             (_BEAMPROC_CHILD_BATCH_REQUEST, [req], getattr(source_request, "current_wave", 0)),
             "plan queue",
         )
@@ -1368,8 +1369,6 @@ def _start_beamproc_io_thread(self) -> None:
     if not beam_proc_tx_addr:
         self.beamproc_outbound_queue = None
         self.pb_queue = None
-        self.beamproc_io_wake_r = None
-        self.beamproc_io_wake_w = None
         self.beamproc_wake_lock = None
         self.beamproc_wake_pending = False
         self.beamproc_io_thread = None
@@ -1380,15 +1379,20 @@ def _start_beamproc_io_thread(self) -> None:
         beam_proc_rx_addr = beam_proc_tx_addr
 
     queue_capacity = _positive_env_int("VLLM_GR_BEAMPROC_QUEUE_CAPACITY", 64)
-    self.beamproc_outbound_queue = queue.Queue(maxsize=queue_capacity)
+    self.beamproc_outbound_queue = None
     self.pb_queue = queue.Queue(maxsize=queue_capacity)
-    self.beamproc_io_wake_r = None
-    self.beamproc_io_wake_w = None
     self.beamproc_wake_lock = threading.Lock()
     self.beamproc_wake_pending = False
     self.beamproc_correlation_id = 0
     self.beamproc_pending_plan_count = 0
     self.scheduler._gr_beamproc_pending_plans = 0
+    ce_to_bp = os.environ.get("VLLM_GR_CE_BP_TRANSPORT", "zmq")
+    if ce_to_bp not in ("zmq", "sharedmem"):
+        raise ValueError("VLLM_GR_CE_BP_TRANSPORT must be zmq or sharedmem")
+    if ce_to_bp == "sharedmem":
+        _start_beamproc_native_io(self, beam_proc_tx_addr, beam_proc_rx_addr, queue_capacity)
+        return
+    self.beamproc_outbound_queue = queue.Queue(maxsize=queue_capacity)
     self.beamproc_io_bp_tx_thread = threading.Thread(
         target=_beamproc_io_bp_tx_run,
         args=(self, beam_proc_tx_addr),
@@ -1402,28 +1406,134 @@ def _start_beamproc_io_thread(self) -> None:
         name="beamproc-io-bp-rx",
     )
     self.beamproc_io_thread = self.beamproc_io_bp_tx_thread
-    logger.warning(
-        "[vllm-gr CE diagnostic] Starting BeamProc threads pid=%s tx_addr=%s rx_addr=%s",
-        os.getpid(),
-        beam_proc_tx_addr,
-        beam_proc_rx_addr,
-    )
     self.beamproc_io_bp_rx_thread.start()
     self.beamproc_io_bp_tx_thread.start()
-    logger.warning(
-        "[vllm-gr CE diagnostic] BeamProc threads started "
-        "pid=%s tx_alive=%s rx_alive=%s tx_addr=%s rx_addr=%s",
-        os.getpid(),
-        self.beamproc_io_bp_tx_thread.is_alive(),
-        self.beamproc_io_bp_rx_thread.is_alive(),
-        beam_proc_tx_addr,
-        beam_proc_rx_addr,
-    )
     logger.info(
         "Started EngineCore BeamProc I/O threads tx_addr=%s rx_addr=%s",
         beam_proc_tx_addr,
         beam_proc_rx_addr,
     )
+
+
+def _start_beamproc_native_io(self, tx_addr: str, rx_addr: str, capacity: int) -> None:
+    from vllm_gr.v1.engine.native_ce_transport import NativeBridge
+
+    self.beamproc_native_stop = threading.Event()
+    self.beamproc_native_error = None
+    self.beamproc_io_bp_tx_thread = None
+    self.beamproc_io_bp_rx_thread = None
+    self.beamproc_io_thread = None
+    self.beamproc_native_bridge = NativeBridge(
+        tx_addr,
+        rx_addr,
+        capacity,
+        _positive_env_int("VLLM_GR_BEAMPROC_ZMQ_HWM", 64),
+    )
+    try:
+        # Pull delivery stays entirely native until the scheduler drains it.
+        self.beamproc_native_bridge.start_receive()
+    except BaseException:
+        _stop_beamproc_native_io(self)
+        raise
+    logger.info(
+        "Started native Rust CE %s RX/TX with direct TX and scheduler-owned RX decoding",
+        os.environ.get("VLLM_GR_CE_BP_TRANSPORT", "zmq"),
+    )
+
+
+def _start_beamproc_python_shm_io(self, tx_addr: str, rx_addr: str, capacity: int) -> None:
+    from vllm_gr.v1.engine.native_ce_transport import NativeBridge
+
+    self.beamproc_native_stop = threading.Event()
+    self.beamproc_native_error = None
+    self.beamproc_python_bridge = NativeBridge(
+        tx_addr,
+        rx_addr,
+        capacity,
+        _positive_env_int("VLLM_GR_BEAMPROC_ZMQ_HWM", 64),
+        caller_owned=True,
+    )
+    self.beamproc_io_bp_tx_thread = threading.Thread(
+        target=_beamproc_python_shm_run,
+        args=(self, True),
+        daemon=True,
+        name="beamproc-io-bp-tx",
+    )
+    self.beamproc_io_bp_rx_thread = threading.Thread(
+        target=_beamproc_python_shm_run,
+        args=(self, False),
+        daemon=True,
+        name="beamproc-io-bp-rx",
+    )
+    self.beamproc_io_thread = self.beamproc_io_bp_tx_thread
+    try:
+        self.beamproc_io_bp_rx_thread.start()
+        self.beamproc_io_bp_tx_thread.start()
+    except BaseException:
+        _stop_beamproc_native_io(self)
+        raise
+    logger.info("Started Python CE TX/RX threads with synchronous iceoryx2 ports")
+
+
+def _beamproc_python_shm_run(self, transmit: bool) -> None:
+    bridge = self.beamproc_python_bridge
+    stop = self.beamproc_native_stop
+    pending = deque()
+    output_buffer_pool: list[dict[str, Any]] = []
+    try:
+        while not stop.is_set():
+            if transmit:
+                try:
+                    message = self.beamproc_outbound_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                _send_beamproc_outbound_message(
+                    self,
+                    bridge,
+                    message,
+                    pending,
+                    output_buffer_pool,
+                )
+            else:
+                frames = bridge.receive(100)
+                if frames is not None:
+                    _process_beamproc_plan_frames(self, frames)
+    except Exception as exc:
+        if not stop.is_set():
+            self.beamproc_native_error = exc
+            stop.set()
+            logger.exception(
+                "EngineCore Python shared-memory %s failed", "TX" if transmit else "RX"
+            )
+
+
+def _stop_beamproc_native_io(self) -> None:
+    python_bridge = getattr(self, "beamproc_python_bridge", None)
+    if python_bridge is not None:
+        self.beamproc_native_stop.set()
+        python_bridge.close()
+        for worker in (self.beamproc_io_bp_tx_thread, self.beamproc_io_bp_rx_thread):
+            if worker is not None and worker.ident is not None:
+                worker.join()
+        self.beamproc_python_bridge = None
+    bridge = getattr(self, "beamproc_native_bridge", None)
+    if bridge is None:
+        return
+    self.beamproc_native_stop.set()
+    # Native close wakes blocked callers and joins socket owners without the GIL.
+    bridge.close()
+    self.beamproc_native_bridge = None
+
+
+def _check_beamproc_native_io(self) -> None:
+    bridge = getattr(self, "beamproc_native_bridge", None) or getattr(
+        self, "beamproc_python_bridge", None
+    )
+    if bridge is not None:
+        error = getattr(self, "beamproc_native_error", None)
+        if error is not None:
+            raise RuntimeError("CE transport adapter failed") from error
+        bridge.check()
 
 
 def _beamproc_io_bp_tx_run(self, beam_proc_tx_addr: str) -> None:
@@ -1502,31 +1612,6 @@ def _beamproc_io_bp_rx_run(self, beam_proc_rx_addr: str) -> None:
             pass
         socket.close(linger=0)
         context.term()
-
-
-def _drain_beamproc_io_wake_fd(wake_fd: int | None) -> None:
-    if wake_fd is None:
-        return
-    while True:
-        try:
-            if not os.read(wake_fd, 4096):
-                return
-        except BlockingIOError:
-            return
-        except OSError:
-            return
-
-
-def _wake_beamproc_io_thread(self) -> None:
-    wake_w = getattr(self, "beamproc_io_wake_w", None)
-    if wake_w is None:
-        return
-    try:
-        os.write(wake_w, b"\0")
-    except BlockingIOError:
-        pass
-    except OSError:
-        pass
 
 
 def _release_beamproc_tx_buffer(refs, output_buffer_pool) -> None:
@@ -1646,6 +1731,15 @@ def _send_beamproc_frames(
     import zmq
 
     zmq_frames = [_as_zmq_frame(frame) for frame in frames]
+    # Rust copies all submitted buffers before returning; pooled Python arrays
+    # are immediately reusable, independently of ZMQ's asynchronous completion.
+    if not isinstance(socket, zmq.Socket):
+        from vllm_gr.v1.engine.native_ce_transport import NativeBridge
+
+        if isinstance(socket, NativeBridge):
+            socket.send(zmq_frames)
+            _release_beamproc_tx_buffer(refs, output_buffer_pool)
+            return
     while True:
         try:
             tracker = socket.send_multipart(
@@ -1920,6 +2014,21 @@ def _process_beamproc_plan_frames(self, frames) -> None:
         for index, frame in enumerate(frames)
     ]
     message_type = frame_bytes[0] if frame_bytes else b"<missing>"
+    if message_type == _BEAMPROC_MSG_BEAM_FINISHED and len(frame_bytes) == 2:
+        try:
+            payload = msgspec.msgpack.decode(frame_bytes[1])
+        except Exception:
+            logger.exception(
+                "Failed to decode BeamProc BEAM_FINISHED payload bytes=%s",
+                len(frame_bytes[1]),
+            )
+            return
+        if payload.get("version") != 1 or not payload.get("root_request_id"):
+            logger.warning("Dropping invalid BeamProc BEAM_FINISHED payload: %s", payload)
+            return
+        payload["action"] = "beamproc_finished"
+        _publish_beamproc_item(self, payload, "finished queue")
+        return
     if message_type == _BEAMPROC_MSG_BEAM_PLAN and len(frame_bytes) >= 2:
         try:
             payload = msgspec.msgpack.decode(frame_bytes[1])
@@ -1980,7 +2089,7 @@ def _process_beamproc_plan_frames(self, frames) -> None:
                 next(iter(payload.get("token_ids", ()) or ()), None),
             )
             return
-        _beamproc_queue_put(pb_queue, payload, "plan queue")
+        _publish_beamproc_item(self, payload, "plan queue")
         logger.debug(
             "Received BeamProc BEAM_PLAN correlation_id=%s request_id=%s action=%s "
             "parents=%s children=%s tokens=%s aborts=%s completed=%s finished=%s "
@@ -1999,8 +2108,8 @@ def _process_beamproc_plan_frames(self, frames) -> None:
         )
         return
 
-    _beamproc_queue_put(
-        pb_queue,
+    _publish_beamproc_item(
+        self,
         {"message_type": message_type, "frames": frame_bytes},
         "plan queue",
     )
@@ -2033,10 +2142,53 @@ def _clear_beamproc_engine_wake(self) -> None:
         self.beamproc_wake_pending = False
 
 
+def _publish_beamproc_item(self, item, queue_name: str) -> None:
+    # While pulling native replies, decoding and admission share the scheduler
+    # thread. Deliver immediately rather than enqueueing work for that same thread.
+    delivery = getattr(self, "beamproc_scheduler_delivery", None)
+    if delivery is not None:
+        delivery(item)
+    elif getattr(self, "beamproc_python_bridge", None) is not None:
+        # The RX owner must be able to stop even if the scheduler has exited
+        # while its admission queue is full.
+        deadline = time.monotonic() + _BEAMPROC_QUEUE_PUT_TIMEOUT_S
+        while not self.beamproc_native_stop.is_set():
+            try:
+                self.pb_queue.put(item, timeout=0.1)
+                break
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"BeamProc {queue_name} remained full") from None
+    else:
+        _beamproc_queue_put(self.pb_queue, item, queue_name)
+
+
+def _consume_beamproc_item(self, item) -> int:
+    admitted = 0
+    if isinstance(item, tuple) and len(item) == 3 and item[0] is _BEAMPROC_CHILD_BATCH_REQUEST:
+        _, requests, current_wave = item
+        for req in requests or ():
+            self.add_request(req, current_wave)
+            admitted += 1
+    elif isinstance(item, tuple) and len(item) == 2 and item[0] is _BEAMPROC_CHILD_BATCH_REQUEST:
+        _, request_batch = item
+        for req, current_wave in request_batch or ():
+            self.add_request(req, current_wave)
+            admitted += 1
+    elif isinstance(item, tuple) and len(item) == 2:
+        req, current_wave = item
+        self.add_request(req, current_wave)
+        admitted += 1
+    else:
+        _handle_beamproc_plan(self, item)
+    return admitted
+
+
 def _drain_pb_queue(self) -> int:
-    """Drain all PB RX work before returning to the AS input queue."""
+    """Decode/admit native replies on the scheduler before newer AS input."""
+    _check_beamproc_native_io(self)
     pb_queue = getattr(self, "pb_queue", None)
-    if pb_queue is None:
+    if pb_queue is None or getattr(self, "beamproc_scheduler_delivery", None) is not None:
         return 0
 
     admitted = 0
@@ -2045,29 +2197,39 @@ def _drain_pb_queue(self) -> int:
             item = pb_queue.get_nowait()
         except queue.Empty:
             break
-        if isinstance(item, tuple) and len(item) == 3 and item[0] is _BEAMPROC_CHILD_BATCH_REQUEST:
-            _, requests, current_wave = item
-            if requests:
-                for req in requests:
-                    self.add_request(req, current_wave)
-                    admitted += 1
-            continue
-        if isinstance(item, tuple) and len(item) == 2 and item[0] is _BEAMPROC_CHILD_BATCH_REQUEST:
-            _, request_batch = item
-            for req, current_wave in request_batch or ():
-                self.add_request(req, current_wave)
-                admitted += 1
-            continue
-        if isinstance(item, tuple) and len(item) == 2:
-            req, current_wave = item
-            self.add_request(req, current_wave)
-            admitted += 1
-            continue
-        _handle_beamproc_plan(self, item)
+        admitted += _consume_beamproc_item(self, item)
+
+    bridge = getattr(self, "beamproc_native_bridge", None)
+    if bridge is None:
+        return admitted
+
+    def deliver(item):
+        nonlocal admitted
+        admitted += _consume_beamproc_item(self, item)
+
+    self.beamproc_scheduler_delivery = deliver
+    try:
+        while (frames := bridge.receive(0)) is not None:
+            _process_beamproc_plan_frames(self, frames)
+    finally:
+        # Do not retain the engine through the local function, including on errors.
+        self.beamproc_scheduler_delivery = None
     return admitted
 
 
 def _enqueue_beamproc_message(self, message_type, payload=None) -> None:
+    bridge = getattr(self, "beamproc_native_bridge", None)
+    if bridge is not None:
+        _check_beamproc_native_io(self)
+        if message_type == _BEAMPROC_MSG_ENGINE_OUTPUT_BATCH and payload.get("batches") is None:
+            from vllm_gr.v1.engine.native_ce_batch import send_engine_outputs
+
+            send_engine_outputs(self, bridge, payload)
+        else:
+            # Controls and already prepared frames share the same native FIFO as
+            # raw batches, preserving state-update/output/abort ordering.
+            _send_beamproc_message(self, bridge, (message_type, payload), deque())
+        return
     outbound_queue = getattr(self, "beamproc_outbound_queue", None)
     if outbound_queue is not None:
         _beamproc_queue_put(
@@ -2108,6 +2270,13 @@ def _enqueue_beamproc_abort(self, request_ids) -> None:
     )
 
 
+def _beamproc_has_transport(self) -> bool:
+    return (
+        getattr(self, "beamproc_native_bridge", None) is not None
+        or getattr(self, "beamproc_outbound_queue", None) is not None
+    )
+
+
 def _enqueue_beamproc_state_update_values(
     self,
     *,
@@ -2116,7 +2285,7 @@ def _enqueue_beamproc_state_update_values(
     child_valid_token_ids,
     beam_width: int,
 ) -> None:
-    if getattr(self, "beamproc_outbound_queue", None) is None:
+    if not _beamproc_has_transport(self):
         return
     if not child_ids:
         return
@@ -2152,7 +2321,7 @@ def _enqueue_beamproc_state_update(self, fork_req) -> None:
 
 
 def _enqueue_beamproc_engine_outputs(self, outputs) -> None:
-    if not outputs or getattr(self, "beamproc_outbound_queue", None) is None:
+    if not outputs or not _beamproc_has_transport(self):
         return
 
     correlation_base = getattr(self, "beamproc_correlation_id", 0)
@@ -2699,7 +2868,14 @@ def _beamproc_value(value):
 
 
 def _handle_beamproc_plan(self, plan: dict[str, Any]) -> str | None:
-    if isinstance(plan, dict) and plan.get("action") == "observed_full":
+    if isinstance(plan, dict) and plan.get("action") == "beamproc_finished":
+        _cleanup_beamproc_root_state(
+            self,
+            plan["root_request_id"],
+            plan.get("request_id"),
+            *(plan.get("request_ids") or ()),
+        )
+    elif isinstance(plan, dict) and plan.get("action") == "observed_full":
         root_request_id = plan.get("root_request_id") or _beamproc_parent_root(
             plan.get("request_id")
         )
@@ -2789,12 +2965,14 @@ def _cleanup_beamproc_root_state(
 
 def make_patched_process_input_queue(original_process_input_queue):
     def patched_process_input_queue(self, *args, **kwargs):
-        # AS RX publishes to input_queue; PB RX publishes only to pb_queue.
+        # AS RX publishes to input_queue; native PB RX publishes to its Rust inbox.
         # Always drain PB work first so ready children precede newer AS input.
         if getattr(self, "pb_queue", None) is None:
             return original_process_input_queue(self, *args, **kwargs)
 
         while True:
+            if not getattr(self, "is_running", lambda: True)():
+                return None
             _drain_pb_queue(self)
             if (
                 self.engines_running
@@ -2803,7 +2981,10 @@ def make_patched_process_input_queue(original_process_input_queue):
                 or not self.input_queue.empty()
             ):
                 return original_process_input_queue(self, *args, **kwargs)
-            time.sleep(_BEAMPROC_DUAL_QUEUE_POLL_SLEEP_S)
+            if getattr(self, "beamproc_native_bridge", None) is not None:
+                os.sched_yield()
+            else:
+                time.sleep(_BEAMPROC_DUAL_QUEUE_POLL_SLEEP_S)
 
     return patched_process_input_queue
 
@@ -2822,8 +3003,6 @@ def make_patched_process_engine_step(original_process_engine_step):
                 self.output_queue.put_nowait((client_index, visible_outputs))
 
         self.post_step(model_executed)
-        if not model_executed and self.scheduler.has_unfinished_requests():
-            time.sleep(0.001)
         return model_executed
 
     return patched_process_engine_step

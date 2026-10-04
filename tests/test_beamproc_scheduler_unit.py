@@ -722,6 +722,42 @@ def test_finished_full_plan_releases_enginecore_root_state() -> None:
     assert engine.beamproc_grouped_output_states == {}
 
 
+def test_compact_finished_frame_releases_enginecore_root_state() -> None:
+    engine = _beamproc_plan_engine()
+    engine.beam_cache.update({"group": object(), "child": object()})
+    engine.beamproc_grouped_request_by_root = {"p0": "group"}
+    engine.beamproc_grouped_active_ids_by_root = {"p0": {"child"}}
+    engine.beamproc_grouped_response_prefix_by_root = {"p0": 1}
+    engine.beamproc_grouped_parent_states = {"p0": object()}
+    engine.beamproc_grouped_output_states = {
+        "group": {"root_request_id": "p0", "is_final_step": False}
+    }
+    metadata = msgspec.msgpack.encode(
+        {
+            "version": 1,
+            "root_request_id": "p0",
+            "request_id": "group",
+            "request_ids": ["child"],
+        }
+    )
+
+    def frame(value: bytes) -> SimpleNamespace:
+        return SimpleNamespace(buffer=memoryview(value))
+
+    _process_beamproc_plan_frames(
+        engine,
+        [frame(b"BEAM_FINISHED"), frame(metadata)],
+    )
+    _drain_pb_queue(engine)
+
+    assert engine.beam_cache == {}
+    assert engine.beamproc_grouped_request_by_root == {}
+    assert engine.beamproc_grouped_active_ids_by_root == {}
+    assert engine.beamproc_grouped_response_prefix_by_root == {}
+    assert engine.beamproc_grouped_parent_states == {}
+    assert engine.beamproc_grouped_output_states == {}
+
+
 def test_finished_rust_plan_frame_releases_state_before_final_decode_step(
     monkeypatch: Any,
 ) -> None:

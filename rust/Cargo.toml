@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 
+[lib]
+name = "ce_transport"
+path = "ce-transport/src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
 [[bin]]
 name = "beam-proc"
 path = "beam-proc/src/main.rs"
 
 [dependencies]
+iceoryx2 = { version = "=0.9.3", optional = true }
 anyhow = "1"
 crossbeam-channel = "0.5"
 libc = "0.2"
@@ -19,3 +25,11 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zmq = "0.10"
+
+[features]
+iceoryx = ["dep:iceoryx2"]
+
+[[example]]
+name = "iceoryx-peer"
+path = "examples/iceoryx_peer.rs"
+required-features = ["iceoryx"]

@@ -58,6 +58,8 @@ jobs:
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
 
       - name: Fetch target branch benchmark policy
         id: benchmark-policy

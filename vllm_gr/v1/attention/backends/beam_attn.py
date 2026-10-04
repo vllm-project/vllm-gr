@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
+from vllm_gr.utils.env import is_truthy_env
 from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
@@ -137,6 +138,7 @@ class BeamAttentionImpl(AttentionImpl):
         kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
     ) -> None:
+        self.use_direct_output = is_truthy_env("VLLM_GR_BEAM_PROC_ENABLED")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -240,6 +242,7 @@ class BeamAttentionImpl(AttentionImpl):
         vllm_flash_attn_version: int,
         s_aux: torch.Tensor | None = None,
         alibi_slopes: torch.Tensor | None = None,
+        use_direct_output: bool = False,
     ) -> None:
         platform_execution = _get_platform_execution_module()
         platform_execution.cascade_attention(
@@ -254,6 +257,7 @@ class BeamAttentionImpl(AttentionImpl):
             vllm_flash_attn_version=vllm_flash_attn_version,
             s_aux=s_aux,
             alibi_slopes=alibi_slopes,
+            **({"use_direct_output": use_direct_output} if CUDA_DEVICE else {}),
         )
 
     def forward(
@@ -337,6 +341,7 @@ class BeamAttentionImpl(AttentionImpl):
             vllm_flash_attn_version=self.vllm_flash_attn_version,
             s_aux=self.sinks,
             alibi_slopes=self.alibi_slopes,
+            **({"use_direct_output": self.use_direct_output} if CUDA_DEVICE else {}),
         )
 
         return output

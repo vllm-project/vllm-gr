@@ -1,6 +1,6 @@
 use crate::catalog::Catalog;
 use crate::runtime::manager::{Manager, ManagerMessage};
-use crossbeam_channel::{SendError, Sender};
+use crossbeam_channel::Sender;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::thread;
@@ -151,8 +151,36 @@ pub struct BeamContext {
     pub priority: i64,
 }
 
+// CLOCK_MONOTONIC shares the OS clock used by CPython perf_counter on Linux.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct BeamTiming {
+    pub clock: &'static str,
+    pub prefill_end: f64,
+    pub prefill_only: bool,
+}
+
+fn beam_timing(prefill_only: bool) -> Option<BeamTiming> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+            return Some(BeamTiming {
+                clock: "CLOCK_MONOTONIC",
+                prefill_end: ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9,
+                prefill_only,
+            });
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct BeamWorkerPlan {
+    pub timing: Option<BeamTiming>,
+    pub num_processed_tokens: u64,
     pub engine_index: usize,
     pub client_index: usize,
     pub request_id: String,
@@ -170,6 +198,9 @@ pub struct BeamWorkerPlan {
     pub abort_ids: Vec<String>,
     pub completed_count: usize,
     pub finished: bool,
+    /// EngineCore already cleans up roots whose scheduled final step ran.
+    /// A finished plan with this false needs an explicit early-finish notice.
+    pub scheduled_final: bool,
     pub final_token_ids_include_prompt: bool,
     pub final_token_ids: Vec<Vec<i32>>,
     pub final_scores: Vec<f32>,
@@ -301,8 +332,10 @@ impl BeamWorker {
         self.manager.is_finished()
     }
 
-    pub fn shutdown(&self) -> Result<(), SendError<BeamWorkerMsg>> {
-        self.manager.shutdown()
+    pub fn shutdown(&self) -> anyhow::Result<()> {
+        self.manager
+            .shutdown()
+            .map_err(|_| anyhow::anyhow!("beam worker shutdown channel disconnected"))
     }
 
     pub fn join(&mut self) -> thread::Result<()> {
@@ -344,6 +377,7 @@ struct BeamWorkerState {
     cancelled_epoch_order: VecDeque<(Instant, String)>,
     plan_tx: Sender<BeamWorkerPlan>,
     catalog: Option<Arc<Catalog>>,
+    candidate_scratch: Vec<ObservedCandidate>,
 }
 
 const CANCELLED_EPOCH_TTL: Duration = Duration::from_secs(10 * 60);
@@ -356,12 +390,28 @@ struct ObservedCandidate {
     continuation_score: f32,
     completed_score: f32,
     flat_index: usize,
-    explicit_rejected: bool,
-    catalog_rejected: bool,
-    eos_rejected: bool,
-    is_invalid: bool,
-    include_stop_token: bool,
-    eos_token_id: Option<i32>,
+    flags: u8,
+}
+
+const CANDIDATE_EXPLICIT_REJECTED: u8 = 1 << 0;
+const CANDIDATE_CATALOG_REJECTED: u8 = 1 << 1;
+const CANDIDATE_EOS_REJECTED: u8 = 1 << 2;
+const CANDIDATE_INVALID: u8 = 1 << 3;
+const CANDIDATE_INCLUDE_STOP_TOKEN: u8 = 1 << 4;
+
+impl ObservedCandidate {
+    #[inline]
+    fn has_flag(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    #[inline]
+    fn stop_token_id(&self) -> Option<i32> {
+        // EOS_REJECTED is set only when matching_stop_token returned this
+        // candidate's token and ignore_eos was false. No separate ID is needed.
+        self.has_flag(CANDIDATE_EOS_REJECTED)
+            .then_some(self.token_id)
+    }
 }
 
 impl BeamWorkerState {
@@ -379,6 +429,7 @@ impl BeamWorkerState {
             cancelled_epoch_order: VecDeque::new(),
             plan_tx,
             catalog,
+            candidate_scratch: Vec::new(),
         }
     }
 
@@ -713,6 +764,26 @@ impl BeamWorkerState {
             return None;
         }
 
+        // Grouped EngineCore outputs normally arrive complete and in the
+        // active-parent order. Keep their pooled candidate buffers in place
+        // instead of copying through pending and ordered batches.
+        if !self.pending_engine_outputs.contains_key(&request_id)
+            && batch.outputs.len() == family.active_parent_ids.len()
+            && batch
+                .outputs
+                .iter()
+                .zip(&family.active_parent_ids)
+                .all(|(output, parent_id)| output.request_id == *parent_id)
+        {
+            return Some(self.build_full_observed_plan(
+                engine_index,
+                client_index,
+                request_id,
+                correlation_id,
+                batch,
+            ));
+        }
+
         let expected_parent_ids = family.active_parent_ids.clone();
         let expected_count = expected_parent_ids.len();
         let pending = self
@@ -760,10 +831,10 @@ impl BeamWorkerState {
             .expect("pending output buffer exists after completion check");
         let mut ordered_batch = BeamEngineOutputBatch::with_capacity(expected_count);
         for parent_id in expected_parent_ids.iter() {
-            if let Some(output_index) = pending.outputs_by_parent.get(parent_id) {
-                if let Some(output) = pending.batch.outputs.get(*output_index).cloned() {
-                    ordered_batch.append_output(output, &pending.batch);
-                }
+            if let Some(output_index) = pending.outputs_by_parent.get(parent_id)
+                && let Some(output) = pending.batch.outputs.get(*output_index).cloned()
+            {
+                ordered_batch.append_output(output, &pending.batch);
             }
         }
         debug!(
@@ -861,7 +932,11 @@ impl BeamWorkerState {
             Vec::new()
         };
         let candidate_capacity = outputs.len().saturating_mul(beam_width);
-        let mut candidates = Vec::with_capacity(candidate_capacity);
+        // Each worker handles one message at a time. Retain its allocation
+        // across steps and requests; outgoing plans own their selected data.
+        let candidates = &mut self.candidate_scratch;
+        candidates.clear();
+        candidates.reserve(candidate_capacity);
         for (parent_index, output) in outputs.iter().enumerate() {
             let parent_cum_logprob = family
                 .and_then(|family| family.parent_cum_logprobs.get(&output.request_id))
@@ -954,7 +1029,7 @@ impl BeamWorkerState {
                     ) = apply_catalog_strategy(
                         token_id,
                         logprob,
-                        valid_token_ids.as_deref(),
+                        valid_token_ids,
                         fill_catalog,
                         &mut fill_used,
                     );
@@ -978,41 +1053,49 @@ impl BeamWorkerState {
                     } else {
                         logprob
                     };
+                    let flags = (u8::from(explicit_rejected) * CANDIDATE_EXPLICIT_REJECTED)
+                        | (u8::from(catalog_rejected) * CANDIDATE_CATALOG_REJECTED)
+                        | (u8::from(eos_rejected) * CANDIDATE_EOS_REJECTED)
+                        | (u8::from(is_invalid) * CANDIDATE_INVALID)
+                        | (u8::from(include_stop_token) * CANDIDATE_INCLUDE_STOP_TOKEN);
                     candidates.push(ObservedCandidate {
                         parent_index,
                         token_id,
                         continuation_score: parent_cum_logprob + continuation_logprob,
                         completed_score: parent_cum_logprob + completed_logprob,
                         flat_index: parent_index * beam_width + candidate_index,
-                        explicit_rejected,
-                        catalog_rejected,
-                        eos_rejected,
-                        is_invalid,
-                        include_stop_token,
-                        eos_token_id: stop_token_id,
+                        flags,
                     });
                 }
             }
         }
-        let invalid_candidate_count = candidates
-            .iter()
-            .filter(|candidate| candidate.is_invalid)
-            .count();
+        // Match Python's candidate count before EOS/finite-score filtering and
+        // beam selection. Include masked candidates, not just selected children.
+        let processed_candidates = candidates.len() as u64;
+        let diagnostics_enabled =
+            tracing::enabled!(tracing::Level::WARN) || tracing::enabled!(tracing::Level::DEBUG);
+        let invalid_candidate_count = if diagnostics_enabled {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.has_flag(CANDIDATE_INVALID))
+                .count()
+        } else {
+            0
+        };
         for candidate in candidates.iter() {
-            if candidate.eos_rejected
-                && candidate.eos_token_id.is_some()
-                && !candidate.catalog_rejected
+            if candidate.has_flag(CANDIDATE_EOS_REJECTED)
+                && !candidate.has_flag(CANDIDATE_CATALOG_REJECTED)
             {
                 let mut completed_token_ids =
                     materialize_candidate_tokens(batch, family, candidate);
-                if !candidate.include_stop_token {
+                if !candidate.has_flag(CANDIDATE_INCLUDE_STOP_TOKEN) {
                     completed_token_ids.pop();
                 }
                 completed_candidates.push(ObservedFinalBeam {
                     token_ids: completed_token_ids,
                     score: candidate.completed_score,
                     finish_reason: BeamFinishReason::Stop,
-                    stop_token_id: candidate.eos_token_id,
+                    stop_token_id: candidate.stop_token_id(),
                     order: candidate.flat_index,
                     logprob_steps: if return_logprobs {
                         materialize_candidate_logprob_steps(
@@ -1034,7 +1117,7 @@ impl BeamWorkerState {
                 .extend(completed_candidates);
         }
         let candidate_count_before_retain = candidates.len();
-        candidates.retain(|candidate| !candidate.is_invalid);
+        candidates.retain(|candidate| !candidate.has_flag(CANDIDATE_INVALID));
         let candidate_count_after_retain = candidates.len();
         let reached_final_step = outputs.iter().any(|output| {
             output
@@ -1050,7 +1133,7 @@ impl BeamWorkerState {
         // continuation. Finish immediately even when the model-level sampled
         // token was a custom end token rather than the tokenizer EOS.
         let finished = reached_final_step || candidates.is_empty();
-        rank_top_candidates(&mut candidates, beam_width);
+        rank_top_candidates(candidates, beam_width);
         let mut final_context_count = 0usize;
         let mut max_step_index: Option<usize> = None;
         let mut total_decode_steps: Option<usize> = None;
@@ -1058,13 +1141,13 @@ impl BeamWorkerState {
             let Some(context) = output.beam_context.as_ref() else {
                 continue;
             };
-            if context.is_final_step {
+            if diagnostics_enabled && context.is_final_step {
                 final_context_count += 1;
             }
             if let Some(step_index) = context.step_index {
                 max_step_index = Some(max_step_index.map_or(step_index, |max| max.max(step_index)));
             }
-            if total_decode_steps.is_none() {
+            if diagnostics_enabled && total_decode_steps.is_none() {
                 total_decode_steps = context.total_decode_steps;
             }
         }
@@ -1103,22 +1186,38 @@ impl BeamWorkerState {
                     .collect::<Vec<_>>(),
             )
         };
-        let selected_explicit_rejected = candidates
-            .iter()
-            .filter(|candidate| candidate.explicit_rejected)
-            .count();
-        let selected_catalog_rejected = candidates
-            .iter()
-            .filter(|candidate| candidate.catalog_rejected)
-            .count();
-        let selected_eos_rejected = candidates
-            .iter()
-            .filter(|candidate| candidate.eos_rejected)
-            .count();
-        let selected_invalid = candidates
-            .iter()
-            .filter(|candidate| candidate.is_invalid)
-            .count();
+        let selected_explicit_rejected = if diagnostics_enabled {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.has_flag(CANDIDATE_EXPLICIT_REJECTED))
+                .count()
+        } else {
+            0
+        };
+        let selected_catalog_rejected = if diagnostics_enabled {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.has_flag(CANDIDATE_CATALOG_REJECTED))
+                .count()
+        } else {
+            0
+        };
+        let selected_eos_rejected = if diagnostics_enabled {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.has_flag(CANDIDATE_EOS_REJECTED))
+                .count()
+        } else {
+            0
+        };
+        let selected_invalid = if diagnostics_enabled {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.has_flag(CANDIDATE_INVALID))
+                .count()
+        } else {
+            0
+        };
         let mut final_beams = Vec::new();
         if finished {
             final_beams.extend(
@@ -1231,11 +1330,14 @@ impl BeamWorkerState {
                 vec![0; final_beams.len() + 1],
             )
         };
-        let observed_completed_count = self
-            .observed_completed
-            .get(&root_request_id)
-            .map(Vec::len)
-            .unwrap_or(0);
+        let observed_completed_count = if diagnostics_enabled {
+            self.observed_completed
+                .get(&root_request_id)
+                .map(Vec::len)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if finished {
             warn!(
                 worker_id = self.worker_id,
@@ -1330,7 +1432,10 @@ impl BeamWorkerState {
         } else {
             child_ids.len()
         };
-        BeamWorkerPlan {
+        candidates.clear();
+        let mut plan = BeamWorkerPlan {
+            timing: None,
+            num_processed_tokens: processed_candidates,
             engine_index,
             client_index,
             request_id: root_request_id.clone(),
@@ -1348,6 +1453,7 @@ impl BeamWorkerState {
             abort_ids: Vec::new(),
             completed_count,
             finished,
+            scheduled_final: reached_final_step,
             final_token_ids_include_prompt,
             final_token_ids,
             final_scores,
@@ -1357,7 +1463,17 @@ impl BeamWorkerState {
             final_logprob_values,
             final_logprob_step_offsets,
             final_logprob_beam_offsets,
+        };
+        if let Some(family) = self.shadow_families.get_mut(&plan.root_request_id) {
+            family.num_processed_tokens += processed_candidates;
+            plan.num_processed_tokens = family.num_processed_tokens;
+            if !family.timing_recorded {
+                family.timing_recorded = true;
+                family.timing = beam_timing(plan.finished);
+            }
+            plan.timing = family.timing;
         }
+        plan
     }
 }
 
@@ -1381,6 +1497,9 @@ impl BeamFinishReason {
 }
 
 struct ShadowBeamFamily {
+    timing_recorded: bool,
+    timing: Option<BeamTiming>,
+    num_processed_tokens: u64,
     beam_width: usize,
     active_parent_ids: Vec<String>,
     parent_cum_logprobs: HashMap<String, f32>,
@@ -1426,6 +1545,9 @@ impl PendingEngineOutputs {
 impl ShadowBeamFamily {
     fn new(_root_request_id: String) -> Self {
         Self {
+            timing_recorded: false,
+            timing: None,
+            num_processed_tokens: 0,
             beam_width: 0,
             active_parent_ids: Vec::new(),
             parent_cum_logprobs: HashMap::new(),
@@ -1699,6 +1821,7 @@ fn rank_top_candidates(candidates: &mut Vec<ObservedCandidate>, beam_width: usiz
 
 #[cfg(test)]
 impl RequestState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         request_id: String,
         beam_width: usize,
@@ -2054,6 +2177,118 @@ mod tests {
         assert_eq!(matching_stop_token(7, Some(2), Some(99)), None);
     }
 
+    fn grouped_fixture(width: usize) -> (BeamWorkerState, BeamEngineOutputBatch) {
+        let (tx, _) = crossbeam_channel::unbounded();
+        let mut state = BeamWorkerState::new(0, tx, None);
+        let ids: Vec<String> = (0..width).map(|i| format!("parent-{i}")).collect();
+        let mut family = ShadowBeamFamily::new("root".into());
+        family.update(width, ids.clone(), vec![0.0; width], Vec::new());
+        family.return_logprobs = Some(false);
+        state.shadow_families.insert("root".into(), family);
+        let mut batch = BeamEngineOutputBatch::with_capacity(width);
+        for (i, id) in ids.into_iter().enumerate() {
+            batch
+                .candidate_token_ids
+                .extend((0..width).map(|j| j as i32 + 10));
+            batch
+                .candidate_logprobs
+                .extend((0..width).map(|j| -(j as f32)));
+            batch.outputs.push(BeamEngineOutput {
+                request_id: id,
+                new_token_ids: vec![],
+                finish_reason: None,
+                stop_reason: None,
+                num_cached_tokens: None,
+                candidate_token_start: i * width,
+                candidate_token_end: (i + 1) * width,
+                candidate_logprob_start: i * width,
+                candidate_logprob_end: (i + 1) * width,
+                candidate_rows: 1,
+                candidate_cols: width,
+                sampled_rank_start: 0,
+                sampled_rank_end: 0,
+                beam_context: None,
+            });
+        }
+        (state, batch)
+    }
+
+    #[test]
+    fn complete_grouped_batch_matches_reordered_and_partial_delivery() {
+        let (mut direct, mut batch) = grouped_fixture(4);
+        let plan = direct
+            .buffer_or_build_full_observed_plan(0, 0, "root".into(), "c".into(), &mut batch)
+            .unwrap();
+        assert_eq!(batch.outputs.len(), 4); // The complete path retains pooled storage.
+        assert_eq!(plan.num_processed_tokens, 16);
+        for partial in [false, true] {
+            let (mut state, mut other) = grouped_fixture(4);
+            other.outputs.reverse();
+            if partial {
+                let remaining = other.outputs.split_off(2);
+                let mut first = BeamEngineOutputBatch::with_capacity(2);
+                for output in remaining {
+                    first.append_output(output, &other);
+                }
+                assert!(
+                    state
+                        .buffer_or_build_full_observed_plan(
+                            0,
+                            0,
+                            "root".into(),
+                            "a".into(),
+                            &mut first
+                        )
+                        .is_none()
+                );
+            }
+            let result = state
+                .buffer_or_build_full_observed_plan(0, 0, "root".into(), "c".into(), &mut other)
+                .unwrap();
+            assert_eq!(result.parent_ids, plan.parent_ids);
+            assert_eq!(result.num_processed_tokens, 16);
+            assert_eq!(result.child_ids, plan.child_ids);
+            assert_eq!(result.token_ids, plan.token_ids);
+            assert_eq!(result.scores, plan.scores);
+            assert_eq!(result.flat_indices, plan.flat_indices);
+            assert_eq!(result.beam_tokens, plan.beam_tokens);
+            assert!(state.pending_engine_outputs.is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU microbenchmark; run explicitly with --ignored --nocapture"]
+    fn benchmark_complete_grouped_batch() {
+        for buffered in [true, false, false, true] {
+            let (mut state, batch) = grouped_fixture(128);
+            let mut elapsed = std::time::Duration::ZERO;
+            for i in 0..1100 {
+                let mut input = BeamEngineOutputBatch::with_capacity(128);
+                for output in &batch.outputs {
+                    input.append_output(output.clone(), &batch);
+                }
+                if buffered {
+                    state.pending_engine_outputs.insert(
+                        "root".into(),
+                        PendingEngineOutputs::new(0, 0, "root".into(), "c".into()),
+                    );
+                }
+                let start = std::time::Instant::now();
+                let result = state
+                    .buffer_or_build_full_observed_plan(0, 0, "root".into(), "c".into(), &mut input)
+                    .unwrap();
+                std::hint::black_box(result);
+                if i >= 100 {
+                    elapsed += start.elapsed();
+                }
+            }
+            println!(
+                "BW128 complete batch buffered={buffered}: {:.2} us/step (100 warmups, 1000 measured)",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
     #[test]
     fn catalog_fill_replaces_invalid_candidates_like_python() {
         let mut fill_used = 0;
@@ -2090,7 +2325,7 @@ mod tests {
             .shadow_families
             .insert(root_request_id.clone(), family);
 
-        let batch = BeamEngineOutputBatch {
+        let mut batch = BeamEngineOutputBatch {
             candidate_token_ids: vec![2],
             candidate_logprobs: vec![-0.1],
             sampled_token_ranks: vec![0],
@@ -2140,8 +2375,72 @@ mod tests {
         );
 
         assert!(!plan.finished);
+        assert_eq!(plan.num_processed_tokens, 1);
+        let initial_timing = plan.timing.unwrap();
+        assert_eq!(initial_timing.clock, "CLOCK_MONOTONIC");
+        assert!(!initial_timing.prefill_only);
+        assert!(initial_timing.prefill_end > 0.0);
+        assert!(initial_timing.prefill_end <= beam_timing(false).unwrap().prefill_end);
         assert_eq!(plan.token_ids, vec![2]);
         assert!(!state.observed_completed.contains_key(&root_request_id));
+
+        // Reuse the worker across requests with growing and shrinking widths.
+        // Old plans must own their data, and smaller steps must not reallocate.
+        for width in [1, 32, 2, 32] {
+            let previous_capacity = state.candidate_scratch.capacity();
+            let previous_ptr = state.candidate_scratch.as_ptr();
+            batch.candidate_token_ids = (1000..1000 + width as i32).collect();
+            batch.candidate_logprobs = (0..width).map(|i| -(i as f32)).collect();
+            let output = &mut batch.outputs[0];
+            output.candidate_token_end = width;
+            output.candidate_logprob_end = width;
+            output.candidate_cols = width;
+            output.beam_context.as_mut().unwrap().beam_width = Some(width);
+            let next_plan = state.build_full_observed_plan(
+                0,
+                0,
+                format!("other-root-{width}"),
+                "reuse".to_string(),
+                &batch,
+            );
+            assert!(next_plan.timing.unwrap().prefill_end >= initial_timing.prefill_end);
+            assert_eq!(
+                state.shadow_families["root"].timing.unwrap().prefill_end,
+                initial_timing.prefill_end
+            );
+            assert_eq!(next_plan.token_ids, batch.candidate_token_ids);
+            assert!(state.candidate_scratch.is_empty());
+            assert!(state.candidate_scratch.capacity() >= width);
+            if width <= previous_capacity {
+                assert_eq!(state.candidate_scratch.capacity(), previous_capacity);
+                assert_eq!(state.candidate_scratch.as_ptr(), previous_ptr);
+            }
+            assert_eq!(plan.token_ids, vec![2]);
+        }
+        // A later final plan retains the first boundary, even after other roots run.
+        batch.outputs[0]
+            .beam_context
+            .as_mut()
+            .unwrap()
+            .is_final_step = true;
+        let final_plan =
+            state.build_full_observed_plan(0, 0, "root".into(), "final".into(), &batch);
+        assert!(final_plan.finished);
+        // Other roots and scratch-buffer reuse must not contaminate this total.
+        assert_eq!(final_plan.num_processed_tokens, 2);
+        assert!(final_plan.scheduled_final);
+        assert_eq!(
+            final_plan.timing.unwrap().prefill_end,
+            initial_timing.prefill_end
+        );
+        assert!(!final_plan.timing.unwrap().prefill_only);
+        let immediate =
+            state.build_full_observed_plan(0, 0, "early".into(), "final".into(), &batch);
+        assert!(immediate.timing.unwrap().prefill_only);
+        assert_eq!(immediate.num_processed_tokens, 32);
+        // The normal completion handler owns removal of the entire timing-bearing family.
+        state.handle_engine_output_batch(0, 0, "root".into(), "done".into(), batch);
+        assert!(!state.shadow_families.contains_key("root"));
     }
 
     #[test]
@@ -2205,6 +2504,7 @@ mod tests {
         );
 
         assert!(!first_plan.finished);
+        assert_eq!(first_plan.num_processed_tokens, 2); // Includes the completed EOS candidate.
         assert_eq!(first_plan.beam_width, 1);
         assert_eq!(first_plan.token_ids, vec![10]);
         assert_eq!(first_plan.beam_tokens, vec![vec![100, 10]]);
@@ -2266,7 +2566,9 @@ mod tests {
         );
 
         assert!(final_plan.finished);
+        assert!(final_plan.scheduled_final);
         assert!(!final_plan.final_token_ids_include_prompt);
+        assert_eq!(final_plan.num_processed_tokens, 3);
         assert_eq!(final_plan.final_token_ids, vec![vec![], vec![10, 11]]);
         assert!(final_plan.parent_ids.is_empty());
         assert!(final_plan.child_ids.is_empty());
@@ -2410,6 +2712,11 @@ mod tests {
             root_request_id.clone(),
             PendingEngineOutputs::new(0, 0, root_request_id.clone(), "corr".to_string()),
         );
+
+        let family = state.shadow_families.get_mut(&root_request_id).unwrap();
+        family.timing_recorded = true;
+        family.timing = beam_timing(false);
+        assert!(family.timing.is_some());
 
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         state.handle(BeamWorkerMsg::Abort {

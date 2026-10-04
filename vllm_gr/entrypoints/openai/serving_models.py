@@ -50,6 +50,12 @@ def init_gr(
             catalog_path=catalog_path,
         )
         ensure_beam_proc_started()
+        from vllm_gr.entrypoints.openai.serving_engine import (
+            _ensure_beamproc_apiserver_output,
+        )
+
+        # init_gr runs on the API event loop before requests are accepted.
+        _ensure_beamproc_apiserver_output(engine_client, "startup")
 
 
 def patch_OpenAIServingModels_init():
