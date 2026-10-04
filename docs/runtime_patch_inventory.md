@@ -55,6 +55,7 @@ aligned with it.
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
 | GR-PATCH-016 | `vllm/utils/system_utils.py` | `npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
+| GR-PATCH-017 | `vllm_gr/tokenizer_fast.py` | `tokenizer_patch.patch_fast_sid_encode` | prompt contains added SIDs and satisfies fast SID shape | `_validate_fast_sid_encode_patch`; `test_tokenizer_fast_sid_encode.py` | API server |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -330,6 +331,20 @@ aligned with it.
   in the process that is about to create worker subprocesses.
 - Removal condition: upstream `_maybe_force_spawn()` covers NPU (or delegates the
   decision to the platform interface).
+
+### GR-PATCH-017 — Fast SID Prompt Tokenization
+
+- Source: `vllm_gr/tokenizer_fast.py`
+- Installer: `vllm_gr/entrypoints/openai/tokenizer_patch.py`
+- Orchestration: `vllm_gr/patch.py`
+- Targets:
+    - `vllm.renderers.base.BaseRenderer._tokenize_prompt`
+    - `vllm.renderers.base.BaseRenderer._tokenize_prompt_async`
+- Risk: Low
+- Activation: installed during frontend initialization; active when a chat/completion
+  prompt contains added SID tokens (`<s_a_N>`, `<s_b_N>`, `<s_c_N>`) and satisfies
+  the fast-path verification probe, falling back to plain `tokenizer.encode` otherwise.
+- Removal condition: vLLM provides a native added-token fast path.
 
 ## Benchmark-only Runtime Mutations
 

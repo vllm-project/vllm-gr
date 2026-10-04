@@ -243,3 +243,18 @@ patches:
     risk: medium
     contract: npu-spawn-start-method
     removal_condition: upstream _maybe_force_spawn() covers NPU (or delegates to the platform interface)
+
+  - id: GR-PATCH-017
+    owner: vllm_gr/tokenizer_fast.py
+    installer: vllm_gr.entrypoints.openai.tokenizer_patch.patch_fast_sid_encode
+    activation: prompt contains added SIDs and satisfies fast SID shape
+    validator_or_test:
+      - vllm_gr.patch._validate_fast_sid_encode_patch
+      - tests/test_tokenizer_fast_sid_encode.py
+    process_roles: [api_server]
+    target:
+      - vllm.renderers.base.BaseRenderer._tokenize_prompt
+      - vllm.renderers.base.BaseRenderer._tokenize_prompt_async
+    risk: low
+    contract: null
+    removal_condition: vLLM provides native added-token fast path

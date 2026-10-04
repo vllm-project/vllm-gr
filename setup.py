@@ -14,8 +14,12 @@ import sys
 import warnings
 from pathlib import Path
 
-from setuptools import setup
-from setuptools_scm import get_version
+from setuptools import Extension, setup
+
+try:
+    from setuptools_scm import get_version
+except ImportError:
+    get_version = None
 
 logger = logging.getLogger("vllm_gr.setup")
 
@@ -135,7 +139,8 @@ def get_vllm_gr_version() -> str:
             raise RuntimeError(f"Unknown target device: {device}")
 
     os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = version
-    get_version(write_to="vllm_gr/_version.py")
+    if get_version is not None:
+        get_version(write_to="vllm_gr/_version.py")
     logger.info("Generated version: %s", version)
     return version
 
@@ -183,7 +188,19 @@ def get_install_requires() -> list[str]:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    ext_modules = []
+    if not os.environ.get("READTHEDOCS"):
+        # Optional: a machine without a C compiler still installs and the
+        # Python regex fallback in tokenizer_fast.py handles the encode.
+        ext_modules.append(
+            Extension(
+                "vllm_gr._fast_sid_c",
+                ["vllm_gr/_fast_sid_c.c"],
+                optional=True,
+            )
+        )
     setup(
         version=get_vllm_gr_version(),
         install_requires=get_install_requires(),
+        ext_modules=ext_modules,
     )
