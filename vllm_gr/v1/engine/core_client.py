@@ -4,6 +4,7 @@
 import asyncio
 import contextlib
 import os
+import threading
 import time
 
 import msgspec
@@ -346,19 +347,6 @@ def ensure_beamproc_output_task(self, output_addr: str | None = None) -> None:
     )
 
 
-def make_patched_ensure_output_queue_task(original_ensure_output_queue_task):
-    def patched_ensure_output_queue_task(self):
-        original_ensure_output_queue_task(self)
-        logger.debug(
-            "Ensuring BeamProc APIServer output task from AsyncMPClient output "
-            "queue lifecycle client=%s",
-            type(self).__name__,
-        )
-        ensure_beamproc_output_task(self)
-
-    return patched_ensure_output_queue_task
-
-
 def make_patched_background_resources_call(original_call):
     def patched_call(self):
         beamproc_task = getattr(self, "beamproc_output_task", None)
@@ -369,7 +357,106 @@ def make_patched_background_resources_call(original_call):
         if beamproc_socket is not None:
             with contextlib.suppress(Exception):
                 beamproc_socket.close(linger=0)
-
         return original_call(self)
 
     return patched_call
+
+
+class SyncBeamProcReceiver:
+    """Synchronous BEAM_FINAL receiver for offline (in-process) BeamProc use.
+
+    The online APIServer path reads final replies through an asyncio task
+    (``ensure_beamproc_output_task``). The offline GRLLM/LLM path is
+    synchronous, so this class binds the same ``PULL`` socket on a plain
+    background thread and exposes a blocking ``await_plan``.
+    """
+
+    def __init__(self, output_addr: str):
+        self.output_addr = output_addr
+        self._plans: dict[str, list[dict]] = {}
+        self._cond = threading.Condition()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="beamproc-offline-output",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        context = zmq.Context()
+        socket = context.socket(zmq.PULL)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVHWM, 64)
+        socket.bind(self.output_addr)
+        try:
+            while not self._stop.is_set():
+                if socket.poll(50) == 0:
+                    continue
+                frames = socket.recv_multipart(copy=False)
+                message_type = frames[0].buffer if frames else b"<missing>"
+                if message_type == b"BEAM_FINAL" and len(frames) >= 2:
+                    try:
+                        payload = _decode_beamproc_final_frames(frames)
+                    except Exception:
+                        logger.exception(
+                            "Failed to decode offline BeamProc BEAM_FINAL bytes=%s",
+                            sum(len(frame.buffer) for frame in frames[1:]),
+                        )
+                        continue
+                    self._dispatch(payload)
+        finally:
+            with contextlib.suppress(Exception):
+                socket.close(linger=0)
+            context.term()
+
+    def _dispatch(self, payload: dict) -> None:
+        root_request_id = str(payload.get("root_request_id") or payload.get("request_id") or "")
+        if not root_request_id:
+            return
+        with self._cond:
+            self._plans.setdefault(root_request_id, []).append(payload)
+            self._cond.notify_all()
+
+    def await_plan(
+        self,
+        root_request_id: str,
+        beam_width: int,
+        timeout_s: float,
+    ) -> dict | None:
+        """Block until a final plan for ``root_request_id`` is observed."""
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+        with self._cond:
+            while True:
+                plan = self._pop(root_request_id, beam_width)
+                if plan is not None:
+                    return plan
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(remaining)
+
+    def _pop(self, root_request_id: str, beam_width: int) -> dict | None:
+        entries = self._plans.get(root_request_id)
+        if not entries:
+            return None
+        for index, plan in enumerate(entries):
+            if int(plan.get("beam_width") or 0) == beam_width:
+                entries.pop(index)
+                if not entries:
+                    self._plans.pop(root_request_id, None)
+                return plan
+        return None
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        self._thread = None

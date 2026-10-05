@@ -300,3 +300,69 @@ class TestInitializeMetrics:
             128,
             float("inf"),
         ]
+
+
+def test_rust_timing_uses_existing_benchmark_display(monkeypatch, capsys):
+    from benchmarks.open_one_rec import one_rec_patch
+    from vllm_gr.entrypoints.openai import serving_engine
+
+    monkeypatch.setattr(serving_engine, "_BEAMPROC_SHARED_CLOCK", True)
+    metrics = serving_engine._beamproc_timing_metrics(
+        {
+            "num_processed_tokens": 32768,
+            "beam_timing": {
+                "clock": "CLOCK_MONOTONIC",
+                "prefill_end": 10.05,
+                "prefill_only": False,
+            },
+        },
+        10.0,
+        10.15,
+        128,
+        4,
+    )
+    serving_engine._record_beam_metrics(
+        SimpleNamespace(models=SimpleNamespace(model_name="test")), metrics
+    )
+    monkeypatch.setattr(
+        one_rec_patch.requests,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status_code=200, text=get_beam_search_metrics_text()
+        ),
+    )
+    after = one_rec_patch._fetch_prometheus_metrics("http://test")
+    assert after["requests"] == 1
+    assert after["processed_tokens"] == 32768
+    assert "processed_tokens" in after["_seen"]
+    one_rec_patch._print_beam_search_delta({"requests": 0}, after)
+    output = capsys.readouterr().out
+    assert "Avg Prefill Time (ms):                   50.00" in output
+    assert "Avg Decode Time (ms):                    100.00" in output
+    assert "Processed Tokens (total):                32768" in output
+
+
+def test_unreported_processed_tokens_are_unavailable_not_zero(capsys, caplog):
+    from benchmarks.open_one_rec import one_rec_patch
+
+    one_rec_patch._print_beam_search_delta(
+        {"requests": 0},
+        {"requests": 1, "_seen": {"requests"}},
+    )
+    output = capsys.readouterr().out
+    assert "Processed Tokens (total):                N/A" in output
+    assert "Processed Tokens (avg per request):      N/A" in output
+    assert "unavailable" in caplog.text
+    assert "older vllm_gr" not in caplog.text
+    assert "Restart" not in caplog.text
+
+
+def test_exported_zero_processed_tokens_remain_zero(capsys, caplog):
+    from benchmarks.open_one_rec import one_rec_patch
+
+    one_rec_patch._print_beam_search_delta(
+        {"requests": 0},
+        {"requests": 1, "processed_tokens": 0, "_seen": {"requests", "processed_tokens"}},
+    )
+    assert "Processed Tokens (total):                0" in capsys.readouterr().out
+    assert "unavailable" not in caplog.text

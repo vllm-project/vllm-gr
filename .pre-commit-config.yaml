@@ -112,6 +112,14 @@ repos:
       types: [shell]
       require_serial: true
 
+    - id: rust-check
+      name: Format and lint Rust crates
+      entry: tools/pre_commit/rust-check.sh
+      language: script
+      files: ^(rust/.*\.(rs|toml)|rust/Cargo\.lock)$
+      pass_filenames: false
+      require_serial: true
+
     - id: png-lint
       name: Lint PNG exports from excalidraw
       entry: tools/pre_commit/png-lint.sh

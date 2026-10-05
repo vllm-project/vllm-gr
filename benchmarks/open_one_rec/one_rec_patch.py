@@ -76,9 +76,8 @@ def _fetch_prometheus_metrics(metrics_url: str) -> dict:
             "processed_tokens": "vllm_gr_beam_search_processed_tokens_total",
         }
 
-        # Track which metrics were actually exported by the server so we can
-        # detect servers running an older vllm_gr without the processed-tokens
-        # counter (in that case the field would silently report 0).
+        # An absent value is not zero: a server may define the counter without
+        # recording it on the active execution path.
         seen: set[str] = set()
 
         # Parse exposition format line-by-line
@@ -125,11 +124,12 @@ def _print_beam_search_delta(before: dict, after: dict):
     avg_sort = (after.get("sort_time", 0) - before.get("sort_time", 0)) / num
     processed_tokens = after.get("processed_tokens", 0) - before.get("processed_tokens", 0)
     seen_after = after.get("_seen", set())
-    if "requests" in seen_after and "processed_tokens" not in seen_after:
+    processed_available = "processed_tokens" in seen_after
+    if "requests" in seen_after and not processed_available:
         logger.warning(
-            "Server /metrics does not export vllm_gr_beam_search_processed_tokens_total; "
-            "the server is running an older vllm_gr version. Restart the server to report "
-            "processed tokens."
+            "Processed-token metric unavailable: /metrics has no value for "
+            "vllm_gr_beam_search_processed_tokens_total. The active server path "
+            "may not report it; this does not establish a server version mismatch."
         )
     total = avg_prefill + avg_decode + avg_sort
     print("---------------Beam Search Metrics----------------")
@@ -138,8 +138,10 @@ def _print_beam_search_delta(before: dict, after: dict):
     print(f"Avg Sort Time (ms):                      {avg_sort * 1000:.3f}")
     print(f"Total Beam Time (ms):                    {total * 1000:.2f}")
     print(f"Beam Search Requests:                    {int(num)}")
-    print(f"Processed Tokens (total):                {int(processed_tokens)}")
-    print(f"Processed Tokens (avg per request):      {processed_tokens / num:.2f}")
+    processed_total = str(int(processed_tokens)) if processed_available else "N/A"
+    processed_average = f"{processed_tokens / num:.2f}" if processed_available else "N/A"
+    print(f"Processed Tokens (total):                {processed_total}")
+    print(f"Processed Tokens (avg per request):      {processed_average}")
     print("=" * 50)
 
 

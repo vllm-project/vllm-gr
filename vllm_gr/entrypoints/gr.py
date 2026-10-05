@@ -17,6 +17,8 @@ LLM path.
 
 import copy
 import gc
+import json
+import os
 import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -32,6 +34,7 @@ from vllm.entrypoints.llm import LLM
 from vllm.inputs import TokensPrompt
 from vllm.logprobs import FlatLogprobs
 from vllm.sampling_params import SamplingParams
+from vllm.utils import random_uuid
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.beam_search_decision_utils import (
@@ -51,8 +54,13 @@ from vllm_gr.logprobs import (
 )
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
 from vllm_gr.utils.catalog import Catalog, complete_catalog_beam, fill_catalog_beams
+from vllm_gr.utils.env import is_truthy_env
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+
+_BEAMPROC_ENABLED_ENV = "VLLM_GR_BEAM_PROC_ENABLED"
+_BEAMPROC_FINAL_TIMEOUT_S_ENV = "VLLM_GR_BEAM_PROC_FINAL_TIMEOUT_S"
+_BEAMPROC_CONTEXT_TRACE_HEADER = "x-vllm-gr-beam-context"
 
 if TYPE_CHECKING:
     from vllm.inputs import TextPrompt, TokensPrompt
@@ -619,9 +627,56 @@ class GRLLM(LLM):
         )
 
         self.catalog = None
+        self.catalog_path = catalog_path
         if catalog_path is not None:
             self.catalog = Catalog(self.get_tokenizer())
             self.catalog.load(catalog_path)
+
+        self._beamproc_enabled = False
+        self._beamproc_receiver = None
+        if is_truthy_env(_BEAMPROC_ENABLED_ENV):
+            self._init_beamproc_offline()
+
+    def _init_beamproc_offline(self) -> None:
+        """Start the Rust BeamProc sidecar for the offline path.
+
+        The ZMQ EngineCore addresses are already exported into the environment
+        at plugin load time (``patch_engine_core_process_entrypoint`` calls
+        ``ensure_beam_proc_config``), so the multi-process EngineCore
+        (``SyncMPClient``) inherits them and starts its BeamProc I/O threads on
+        its own. Here we only export the catalog, bind the final-output receiver
+        and spawn the Rust sidecar.
+        """
+        from vllm_gr.entrypoints.openai.beam_proc_manager import (
+            ensure_beam_proc_started,
+            prepare_beam_proc_catalog,
+        )
+        from vllm_gr.v1.engine.core_client import SyncBeamProcReceiver
+
+        tokenizer = self.get_tokenizer()
+        prepare_beam_proc_catalog(
+            None,
+            tokenizer,
+            catalog_path=self.catalog_path,
+        )
+
+        output_addr = os.environ.get("VLLM_GR_BEAM_PROC_APISERVER_OUTPUT_ADDR")
+        if not output_addr:
+            raise RuntimeError(
+                "BeamProc is enabled but VLLM_GR_BEAM_PROC_APISERVER_OUTPUT_ADDR is unset"
+            )
+
+        # Bind the receiver before spawning the sidecar so its PUSH connect
+        # always finds a live PULL endpoint.
+        self._beamproc_receiver = SyncBeamProcReceiver(output_addr)
+        self._beamproc_receiver.start()
+
+        handle = ensure_beam_proc_started()
+        if handle is None:
+            raise RuntimeError("BeamProc sidecar did not start")
+
+        self._beamproc_enabled = True
+        logger.info("GRLLM offline BeamProc enabled output_addr=%s", output_addr)
 
     def beam_search(
         self,
@@ -774,6 +829,36 @@ class GRLLM(LLM):
             "CUSTOM" in str(attention_backend).upper()
             or getattr(attention_backend, "name", "").upper() == "CUSTOM"
         )
+
+        if self._beamproc_enabled:
+            if beam_star:
+                raise NotImplementedError(
+                    "beam_star is not supported by the Rust BeamProc offline path"
+                )
+            if not use_custom_attn:
+                raise RuntimeError(
+                    "Rust BeamProc offline requires the CUSTOM attention backend"
+                )
+            return self._beam_search_rust(
+                instances=instances,
+                cached_prompts=cached_prompts,
+                instance_lora_requests=instance_lora_requests,
+                tokenizer=tokenizer,
+                beam_width=beam_width,
+                max_tokens=max_tokens,
+                ignore_eos=ignore_eos,
+                temperature=temperature,
+                sid_begin_token_id=sid_begin_token_id,
+                sid_end_token_id=sid_end_token_id,
+                pre_calc=pre_calc,
+                include_stop_str_in_output=bool(
+                    getattr(params, "include_stop_str_in_output", False)
+                ),
+                return_logprobs=bool(getattr(params, "return_logprobs", True)),
+                catalog_strategy=getattr(params, "catalog_strategy", "fill"),
+                concurrency_limit=concurrency_limit,
+            )
+
         processed_by_global_idx: dict[int, int] = {}
         for prompt_start in range(0, len(prompts), concurrency_limit):
             instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
@@ -961,10 +1046,299 @@ class GRLLM(LLM):
 
         return outputs
 
+    def _beamproc_final_timeout_s(self) -> float:
+        raw = os.getenv(_BEAMPROC_FINAL_TIMEOUT_S_ENV)
+        if raw is None:
+            return 600.0
+        try:
+            return max(float(raw), 0.0)
+        except ValueError:
+            logger.warning(
+                "Invalid %s=%r; using default 600s",
+                _BEAMPROC_FINAL_TIMEOUT_S_ENV,
+                raw,
+            )
+            return 600.0
+
+    def _beam_search_rust(
+        self,
+        *,
+        instances,
+        cached_prompts,
+        instance_lora_requests,
+        tokenizer,
+        beam_width: int,
+        max_tokens: int,
+        ignore_eos: bool,
+        temperature: float,
+        sid_begin_token_id: int | None,
+        sid_end_token_id: int | None,
+        pre_calc: int,
+        include_stop_str_in_output: bool,
+        return_logprobs: bool,
+        catalog_strategy: str,
+        concurrency_limit: int,
+    ) -> list["BeamSearchOutput"]:
+        """Run offline beam search through the Rust BeamProc sidecar.
+
+        Prompts are submitted in batches of ``concurrency_limit``; the
+        multi-process EngineCore and Rust worker pool process them
+        concurrently, and finals are collected from the receiver as they
+        arrive.
+        """
+        from vllm_gr.entrypoints.openai.beam_proc_manager import beam_proc_exit_code
+
+        total_decode_steps = max_tokens - pre_calc
+        outputs: list[Any] = [None] * len(instances)
+        timeout_s = self._beamproc_final_timeout_s()
+        deadline = time.monotonic() + timeout_s
+
+        for batch_start in range(0, len(instances), concurrency_limit):
+            batch_indices = list(
+                range(batch_start, min(batch_start + concurrency_limit, len(instances)))
+            )
+            pending: dict[str, int] = {}
+            for global_idx in batch_indices:
+                instance = instances[global_idx]
+                root_request_id = random_uuid()
+                self._submit_beamproc_prefill(
+                    instance=instance,
+                    prompt_len=instance.prompt_len,
+                    root_request_id=root_request_id,
+                    beam_width=beam_width,
+                    total_decode_steps=total_decode_steps,
+                    max_tokens=max_tokens,
+                    ignore_eos=ignore_eos,
+                    temperature=temperature,
+                    sid_begin_token_id=sid_begin_token_id,
+                    sid_end_token_id=sid_end_token_id,
+                    pre_calc=pre_calc,
+                    include_stop_str_in_output=include_stop_str_in_output,
+                    return_logprobs=return_logprobs,
+                    catalog_strategy=catalog_strategy,
+                    lora_request=instance_lora_requests[global_idx],
+                )
+                pending[root_request_id] = global_idx
+
+            while pending:
+                for root_request_id in list(pending.keys()):
+                    plan = self._beamproc_receiver.await_plan(
+                        root_request_id, beam_width, 0.0
+                    )
+                    if plan is None:
+                        continue
+                    global_idx = pending.pop(root_request_id)
+                    instance = instances[global_idx]
+                    outputs[global_idx] = self._build_beam_output_from_plan(
+                        final_plan=plan,
+                        orig_prompt=instance.beams[0].orig_prompt,
+                        prompt_cache=cached_prompts[global_idx],
+                        prompt_len=instance.prompt_len,
+                        tokenizer=tokenizer,
+                        beam_width=beam_width,
+                        sid_begin_token_id=sid_begin_token_id,
+                        sid_end_token_id=sid_end_token_id,
+                        ignore_eos=ignore_eos,
+                        include_stop_str_in_output=include_stop_str_in_output,
+                        return_logprobs=return_logprobs,
+                        lora_request=instance_lora_requests[global_idx],
+                    )
+                if not pending:
+                    break
+                exit_code = beam_proc_exit_code()
+                if exit_code is not None:
+                    raise RuntimeError(
+                        "BeamProc sidecar exited while awaiting final output "
+                        f"with status {exit_code}"
+                    )
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "BeamProc offline did not produce final plans for "
+                        f"{len(pending)} prompt(s) within the timeout"
+                    )
+                time.sleep(0.0005)
+
+        return outputs  # type: ignore[return-value]
+
+    def _submit_beamproc_prefill(
+        self,
+        *,
+        instance,
+        prompt_len: int,
+        root_request_id: str,
+        beam_width: int,
+        total_decode_steps: int,
+        max_tokens: int,
+        ignore_eos: bool,
+        temperature: float,
+        sid_begin_token_id: int | None,
+        sid_end_token_id: int | None,
+        pre_calc: int,
+        include_stop_str_in_output: bool,
+        return_logprobs: bool,
+        catalog_strategy: str,
+        lora_request,
+    ) -> None:
+        llm_engine = self.llm_engine
+
+        beam_context = {
+            "global_max_tokens": max_tokens,
+            "total_decode_steps": total_decode_steps,
+            "step_index": 0,
+            "is_final_step": total_decode_steps == 1,
+            "ignore_eos": ignore_eos,
+            "include_stop_token": include_stop_str_in_output,
+            "beam_width": beam_width,
+            "catalog_strategy": catalog_strategy,
+            "return_logprobs": return_logprobs,
+            "end_token_id": sid_end_token_id,
+            "pre_calc_tokens": pre_calc,
+            "prompt_token_count": prompt_len,
+            "root_request_id": root_request_id,
+        }
+        trace_headers = {
+            _BEAMPROC_CONTEXT_TRACE_HEADER: json.dumps(
+                beam_context,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        }
+
+        beam_search_params = SamplingParams(
+            logprobs=beam_width,
+            max_tokens=1,
+            temperature=temperature,
+            skip_clone=True,
+            detokenize=False,
+            flat_logprobs=True,
+        )
+        tokens_prompt = _create_tokens_prompt_from_beam(instance.beams[0])
+        ec_req = llm_engine.input_processor.process_inputs(
+            request_id=f"{root_request_id}-beam-0",
+            prompt=tokens_prompt,
+            params=beam_search_params,
+            supported_tasks=llm_engine.get_supported_tasks(),
+            arrival_time=time.time(),
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=int(time.perf_counter() * 1_000_000),
+        )
+        llm_engine.input_processor.assign_request_id(ec_req)
+        # ADD_BATCH caches the beam request (grouped parent state) on the
+        # EngineCoreProc side so Rust plans can be applied against it.
+        llm_engine.engine_core.add_requests([ec_req], force_batch=True)
+
+    def _build_beam_output_from_plan(
+        self,
+        *,
+        final_plan: dict,
+        orig_prompt,
+        prompt_cache,
+        prompt_len: int,
+        tokenizer,
+        beam_width: int,
+        sid_begin_token_id: int | None,
+        sid_end_token_id: int | None,
+        ignore_eos: bool,
+        include_stop_str_in_output: bool,
+        return_logprobs: bool,
+        lora_request,
+    ) -> "BeamSearchOutput":
+        from vllm_gr.entrypoints.openai.serving_engine import (
+            _materialize_beamproc_final_logprobs,
+        )
+
+        final_token_ids = final_plan.get("final_token_ids") or []
+        final_scores = final_plan.get("final_scores") or final_plan.get("scores") or []
+        final_finish_reasons = final_plan.get("final_finish_reasons") or []
+        final_stop_token_ids = final_plan.get("final_stop_token_ids") or []
+        final_token_ids_include_prompt = final_plan.get("final_token_ids_include_prompt", True)
+        version = final_plan.get("version")
+        eos_token_id = tokenizer.eos_token_id
+
+        prompt_prefix = list(prompt_cache["tokens"])[:prompt_len]
+        prompt_text = prompt_cache["text"]
+
+        sequences: list["BeamSearchSequence"] = []
+        decode_token_ids: list[list[int]] = []
+        for index, tokens_value in enumerate(final_token_ids[:beam_width]):
+            tokens = (
+                list(tokens_value)
+                if version in (2, 3)
+                else [int(token_id) for token_id in tokens_value]
+            )
+            finish_reason = (
+                str(final_finish_reasons[index])
+                if index < len(final_finish_reasons)
+                else "length"
+            )
+            if finish_reason not in ("stop", "length"):
+                finish_reason = "length"
+            if finish_reason != "stop" and sid_end_token_id is not None:
+                tokens.append(sid_end_token_id)
+
+            text_tokens = tokens[prompt_len:] if final_token_ids_include_prompt else tokens
+            full_tokens = prompt_prefix + list(text_tokens)
+
+            completion_tokens = list(text_tokens)
+            if sid_begin_token_id is not None and completion_tokens:
+                completion_tokens = completion_tokens[1:]
+            decode_tokens = completion_tokens
+            if (
+                finish_reason == "stop"
+                and not ignore_eos
+                and not include_stop_str_in_output
+                and decode_tokens
+                and decode_tokens[-1] == eos_token_id
+            ):
+                decode_tokens = decode_tokens[:-1]
+
+            score = float(final_scores[index]) if index < len(final_scores) else None
+            stop_reason = (
+                int(final_stop_token_ids[index])
+                if finish_reason == "stop"
+                and index < len(final_stop_token_ids)
+                and final_stop_token_ids[index] is not None
+                else None
+            )
+            beam_logprobs = None
+            if return_logprobs:
+                beam_logprobs = _materialize_beamproc_final_logprobs(
+                    final_plan,
+                    index,
+                    sid_begin_token_id=sid_begin_token_id,
+                    sid_end_token_id=(sid_end_token_id if finish_reason != "stop" else None),
+                )
+            sequences.append(
+                BeamSearchSequence(
+                    orig_prompt=orig_prompt,
+                    tokens=full_tokens,
+                    logprobs=beam_logprobs if beam_logprobs is not None else FlatLogprobs(),
+                    lora_request=lora_request,
+                    cum_logprob=score if score is not None else 0.0,
+                    finish_reason=finish_reason,
+                    stop_reason=stop_reason,
+                )
+            )
+            decode_token_ids.append(decode_tokens)
+
+        if decode_token_ids:
+            decoded_texts = tokenizer.batch_decode(decode_token_ids)
+            for sequence, decoded_text in zip(sequences, decoded_texts, strict=True):
+                sequence.text = prompt_text + decoded_text
+
+        output = BeamSearchOutput(sequences=sequences)
+        output.processed_tokens = int(final_plan.get("num_processed_tokens", 0) or 0)
+        return output
+
     def shutdown(self) -> None:
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
+
+        if getattr(self, "_beamproc_receiver", None) is not None:
+            self._beamproc_receiver.shutdown()
+            self._beamproc_receiver = None
 
         from vllm_gr.utils.engine_lifecycle import shutdown_sync_engine
 

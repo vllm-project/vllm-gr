@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 const MSG_ENGINE_OUTPUT_BATCH: &str = "ENGINE_OUTPUT_BATCH";
 const MSG_BEAM_PLAN: &str = "BEAM_PLAN";
+const MSG_BEAM_FINISHED: &str = "BEAM_FINISHED";
 const MSG_BEAM_FINAL: &str = "BEAM_FINAL";
 const MSG_BEAM_STATE_UPDATE: &str = "BEAM_STATE_UPDATE";
 const MSG_ABORT: &str = "ABORT";
@@ -73,6 +74,7 @@ pub struct IoWorker {
 }
 
 impl IoWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         enginecore_beamproc_addr: String,
         enginecore_beamproc_tx_addr: String,
@@ -169,6 +171,8 @@ impl IoWorker {
 }
 
 struct IoRxState {
+    #[cfg(feature = "iceoryx")]
+    iceoryx_rx: Option<ce_transport::iceoryx::FrameReceiver>,
     enginecore_beamproc_addr: String,
     enginecore_beamproc_tx_addr: String,
     zmq_context: Option<zmq::Context>,
@@ -183,11 +187,36 @@ struct IoTxState {
     enginecore_beamproc_rx_addr: String,
     apiserver_output_addr: String,
     zmq_context: Option<zmq::Context>,
-    enginecore_tx_socket: Option<zmq::Socket>,
+    enginecore_tx_socket: Option<CeSender>,
     apiserver_output_socket: Option<zmq::Socket>,
     monitor_threads: Vec<JoinHandle<()>>,
     plan_rxs: Vec<Receiver<BeamWorkerPlan>>,
     zmq_hwm: i32,
+}
+
+enum CeSender {
+    Zmq(zmq::Socket),
+    #[cfg(feature = "iceoryx")]
+    Iceoryx(Box<ce_transport::iceoryx::FrameSender>),
+}
+
+impl CeSender {
+    fn send_multipart<const N: usize>(&self, frames: [&[u8]; N], flags: i32) -> Result<(), String> {
+        match self {
+            Self::Zmq(socket) => socket
+                .send_multipart(frames, flags)
+                .map_err(|e| e.to_string()),
+            #[cfg(feature = "iceoryx")]
+            Self::Iceoryx(sender) => sender.send(
+                &frames
+                    .iter()
+                    .map(|frame| frame.to_vec())
+                    .collect::<Vec<_>>(),
+                Duration::from_millis(TX_SEND_TIMEOUT_MS as u64),
+                || crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 struct BeamOutputPool {
@@ -273,6 +302,8 @@ impl IoRxState {
         Self {
             enginecore_beamproc_addr,
             enginecore_beamproc_tx_addr,
+            #[cfg(feature = "iceoryx")]
+            iceoryx_rx: None,
             zmq_context: None,
             enginecore_rx_socket: None,
             monitor_threads: Vec::new(),
@@ -293,6 +324,20 @@ impl IoRxState {
     }
 
     fn ensure_connected(&mut self) -> anyhow::Result<()> {
+        if ce_transport::ce_bp_iceoryx_enabled().map_err(anyhow::Error::msg)? {
+            #[cfg(feature = "iceoryx")]
+            if self.iceoryx_rx.is_none() {
+                self.iceoryx_rx = Some(
+                    ce_transport::iceoryx::FrameReceiver::new(
+                        &self.enginecore_beamproc_tx_addr,
+                        self.zmq_hwm as usize,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                );
+                warn!("CE-to-BP RX initialized iceoryx2 shared-memory transport");
+            }
+            return Ok(());
+        }
         if self.zmq_context.is_some() {
             return Ok(());
         }
@@ -333,6 +378,16 @@ impl IoRxState {
     }
 
     fn poll_zmq(&mut self) {
+        #[cfg(feature = "iceoryx")]
+        if let Some(receiver) = self.iceoryx_rx.as_ref() {
+            match receiver.receive_wait(ce_transport::iceoryx::RECEIVE_WAIT) {
+                Ok(Some(frames)) => self.handle_enginecore_frames(frames),
+                Ok(None) => {}
+                // A dead RX worker is detected by the existing process supervisor.
+                Err(error) => panic!("CE-to-BP iceoryx RX failed: {error}"),
+            }
+            return;
+        }
         let Some(rx_readable) = self.poll_enginecore_socket() else {
             thread::yield_now();
             return;
@@ -491,8 +546,8 @@ impl IoRxState {
                 let group = self.claim_engine_output_group(&request_id, correlation_id);
                 by_request.insert(request_id.clone(), group);
             }
-            if let Some(group) = by_request.get_mut(&request_id) {
-                if output
+            if let Some(group) = by_request.get_mut(&request_id)
+                && output
                     .append_routed_output(
                         batch.correlation_base,
                         &batch.contexts,
@@ -502,10 +557,9 @@ impl IoRxState {
                         &mut group.batch,
                     )
                     .is_err()
-                {
-                    warn!("I/O worker rejected malformed ENGINE_OUTPUT_BATCH binary ranges");
-                    return;
-                }
+            {
+                warn!("I/O worker rejected malformed ENGINE_OUTPUT_BATCH binary ranges");
+                return;
             }
         }
 
@@ -566,8 +620,8 @@ impl IoRxState {
         let request_count = decoded.by_request.len();
         let output_count = decoded
             .by_request
-            .iter()
-            .map(|(_, group)| group.batch.output_count())
+            .values()
+            .map(|group| group.batch.output_count())
             .sum::<usize>();
         for (request_id, group) in decoded.by_request {
             self.route_engine_output_batch(
@@ -844,30 +898,15 @@ impl IoTxState {
         }
 
         let zmq_context = zmq::Context::new();
-        let enginecore_tx_socket = zmq_context
-            .socket(zmq::PUSH)
-            .map_err(|err| anyhow::anyhow!("failed to create EngineCore TX PUSH socket: {err}"))?;
+        let use_iceoryx = ce_transport::ce_bp_iceoryx_enabled().map_err(anyhow::Error::msg)?;
         let apiserver_output_socket = zmq_context.socket(zmq::PUSH).map_err(|err| {
             anyhow::anyhow!("failed to create APIServer output PUSH socket: {err}")
         })?;
-
-        enginecore_tx_socket
-            .set_linger(0)
-            .map_err(|err| anyhow::anyhow!("failed to set EngineCore TX PUSH linger: {err}"))?;
-        configure_enginecore_push_socket(&enginecore_tx_socket, self.zmq_hwm)?;
         apiserver_output_socket
             .set_linger(0)
             .map_err(|err| anyhow::anyhow!("failed to set APIServer output PUSH linger: {err}"))?;
         configure_apiserver_output_socket(&apiserver_output_socket, self.zmq_hwm)?;
 
-        enginecore_tx_socket
-            .bind(&self.enginecore_beamproc_rx_addr)
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to bind EngineCore TX PUSH socket at {}: {err}",
-                    self.enginecore_beamproc_rx_addr
-                )
-            })?;
         apiserver_output_socket
             .connect(&self.apiserver_output_addr)
             .map_err(|err| {
@@ -877,11 +916,40 @@ impl IoTxState {
                 )
             })?;
 
-        if let Some(handle) =
-            start_zmq_monitor(&zmq_context, &enginecore_tx_socket, "enginecore-tx")
-        {
-            self.monitor_threads.push(handle);
-        }
+        let sender = if use_iceoryx {
+            #[cfg(feature = "iceoryx")]
+            {
+                CeSender::Iceoryx(Box::new(
+                    ce_transport::iceoryx::FrameSender::new(
+                        &self.enginecore_beamproc_rx_addr,
+                        self.zmq_hwm as usize,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                ))
+            }
+            #[cfg(not(feature = "iceoryx"))]
+            anyhow::bail!("rebuild BeamProc with --features iceoryx");
+        } else {
+            let socket = zmq_context.socket(zmq::PUSH).map_err(|err| {
+                anyhow::anyhow!("failed to create EngineCore TX PUSH socket: {err}")
+            })?;
+            socket
+                .set_linger(0)
+                .map_err(|err| anyhow::anyhow!("failed to set EngineCore TX PUSH linger: {err}"))?;
+            configure_enginecore_push_socket(&socket, self.zmq_hwm)?;
+            socket
+                .bind(&self.enginecore_beamproc_rx_addr)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to bind EngineCore TX PUSH socket at {}: {err}",
+                        self.enginecore_beamproc_rx_addr
+                    )
+                })?;
+            if let Some(handle) = start_zmq_monitor(&zmq_context, &socket, "enginecore-tx") {
+                self.monitor_threads.push(handle);
+            }
+            CeSender::Zmq(socket)
+        };
 
         if let Some(handle) =
             start_zmq_monitor(&zmq_context, &apiserver_output_socket, "apiserver-output")
@@ -893,10 +961,11 @@ impl IoTxState {
             enginecore_beamproc_rx_addr = %self.enginecore_beamproc_rx_addr,
             apiserver_output_addr = %self.apiserver_output_addr,
             plan_receiver = true,
-            "TX I/O worker initialized ZMQ sockets"
+            ce_transport = if use_iceoryx { "iceoryx2" } else { "zmq" },
+            "TX I/O worker initialized CE transport and APIServer ZMQ socket"
         );
 
-        self.enginecore_tx_socket = Some(enginecore_tx_socket);
+        self.enginecore_tx_socket = Some(sender);
         self.apiserver_output_socket = Some(apiserver_output_socket);
         self.zmq_context = Some(zmq_context);
         Ok(())
@@ -974,10 +1043,11 @@ impl IoTxState {
             return;
         }
 
-        // EngineCore owns the grouped-request and beam-cache state. Send the
-        // finished plan there as a cleanup signal as well as returning the
-        // final beam payload to the API server.
-        self.send_beam_plan_v3(&plan);
+        // EngineCore cleans scheduled final steps before forwarding their
+        // outputs. Only an early EOS/catalog finish needs a cleanup notice.
+        if !plan.scheduled_final {
+            self.send_beam_finished(&plan);
+        }
 
         let mut final_token_offsets = Vec::with_capacity(plan.final_token_ids.len() + 1);
         let final_token_count = plan.final_token_ids.iter().map(Vec::len).sum::<usize>();
@@ -989,6 +1059,8 @@ impl IoTxState {
         }
 
         let plan_meta = BeamFinalPayloadV3 {
+            beam_timing: plan.timing,
+            num_processed_tokens: plan.num_processed_tokens,
             version: 3,
             engine_index: plan.engine_index,
             client_index: plan.client_index,
@@ -1124,6 +1196,39 @@ impl IoTxState {
                 "failed to deliver BEAM_PLAN for request {} within {}ms: {}",
                 plan.request_id, TX_SEND_TIMEOUT_MS, err
             ),
+        }
+    }
+
+    fn send_beam_finished(&mut self, plan: &BeamWorkerPlan) {
+        let Some(socket) = self.enginecore_tx_socket.as_ref() else {
+            return;
+        };
+        let metadata = BeamFinishedPayloadV1 {
+            version: 1,
+            engine_index: plan.engine_index,
+            client_index: plan.client_index,
+            correlation_id: &plan.correlation_id,
+            request_id: &plan.request_id,
+            root_request_id: &plan.root_request_id,
+            request_ids: &plan.scored_parent_ids,
+        };
+        let payload = match rmp_serde::to_vec_named(&metadata) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    root_request_id = %plan.root_request_id,
+                    "TX I/O worker failed to encode BEAM_FINISHED"
+                );
+                return;
+            }
+        };
+        let frames = [MSG_BEAM_FINISHED.as_bytes(), payload.as_slice()];
+        if let Err(err) = socket.send_multipart(frames, 0) {
+            panic!(
+                "failed to deliver BEAM_FINISHED for request {} within {}ms: {}",
+                plan.request_id, TX_SEND_TIMEOUT_MS, err
+            );
         }
     }
 
@@ -1506,6 +1611,7 @@ impl<'a> MsgpackDecoder<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_v3_outputs(
         &mut self,
         worker: &mut IoRxState,
@@ -1956,6 +2062,17 @@ struct BeamPlanPayloadV3<'a> {
 }
 
 #[derive(Serialize)]
+struct BeamFinishedPayloadV1<'a> {
+    version: u32,
+    engine_index: usize,
+    client_index: usize,
+    correlation_id: &'a str,
+    request_id: &'a str,
+    root_request_id: &'a str,
+    request_ids: &'a [String],
+}
+
+#[derive(Serialize)]
 struct BeamPlanPayloadV4<'a> {
     version: u32,
     engine_index: usize,
@@ -2000,6 +2117,9 @@ struct BeamPlanPayloadV5<'a> {
 
 #[derive(Serialize)]
 struct BeamFinalPayloadV3<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beam_timing: Option<super::beam_worker::BeamTiming>,
+    num_processed_tokens: u64,
     version: u32,
     engine_index: usize,
     client_index: usize,
@@ -2399,7 +2519,7 @@ impl ScalarValue {
 }
 
 fn validate_binary_frame<T>(bytes: &[u8], field: &str) -> bool {
-    if bytes.len() % mem::size_of::<T>() != 0 {
+    if !bytes.len().is_multiple_of(mem::size_of::<T>()) {
         warn!(
             field,
             bytes = bytes.len(),
@@ -2438,6 +2558,7 @@ fn append_frame_range<T: Copy>(
     Ok((out_start, target.len()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_output_binary_ranges(
     token_id_bytes: &[u8],
     logprob_bytes: &[u8],
