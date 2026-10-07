@@ -8,7 +8,7 @@ import gc
 import threading
 import time
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -266,6 +266,17 @@ class BeamReqIdsProxy(list):
     def __init__(self, original_list, req_id_map):
         super().__init__(original_list)
         self.req_id_map = req_id_map
+
+    def __len__(self):
+        # The proxy's logical length is the mapped row count, not the copied
+        # base storage: index-guarded callers (e.g. `i < len(req_ids)`) must
+        # never observe a length the map cannot serve.
+        return len(self.req_id_map)
+
+    def __iter__(self):
+        # list.__iter__ would walk the copied base storage; iterate the map so
+        # `list(proxy)` / `for r in proxy` observe the mapped request rows.
+        return iter(self.req_id_map)
 
     def __getitem__(self, index):
         try:
@@ -2030,3 +2041,169 @@ def is_worker_runner_patched(runner_class) -> bool:
             )
         )
     )
+
+
+def _build_p2d_bookkeeping_result(
+    runner: Any,
+    final_tokens: torch.Tensor,
+    final_cum_lps: torch.Tensor,
+    valid_beam_counts: torch.Tensor | list[int] | None,
+    sampler_output: Any,
+    step_scores: torch.Tensor | None = None,
+) -> tuple[Any, list[list[int]], list[str], dict[str, int], list[int]]:
+    """Shared P2D bookkeeping: converts the in-graph beam tree into engine outputs.
+
+    Runs on every platform (GPU and NPU) after a P2D graph replay. Returns
+    ``(logprobs_lists, valid_sampled_token_ids, req_ids_output_copy,
+    req_id_to_index_output_copy, invalid_req_indices)``; the platform
+    bookkeeping wrapper prepends/appends its own tuple items.
+
+    ``valid_beam_counts`` bounds the number of real beams per request (a
+    constrained catalog may complete fewer than ``w2`` legal triples). Beam
+    blocks past the valid count are overwritten with ``-1`` token markers so
+    the serving engine never materializes dead beams; ``None`` keeps the
+    legacy all-beams-valid behavior.
+
+    ``step_scores`` carries the true per-token local scores (one per decode
+    token per beam). When provided, the logprob values exposed to the serving
+    engine are those per-token scores; otherwise the legacy fallback repeats
+    the final cumulative score across the tokens.
+    """
+    import numpy as np
+    from vllm.v1.outputs import LogprobsLists
+
+    from vllm_gr.v1.worker.prefill_graph_common import P2D_SENTINEL_RANK
+
+    tokens_cpu = final_tokens.detach().cpu().numpy()
+    cum_lps_cpu = final_cum_lps.detach().cpu().numpy()
+    step_scores_cpu = step_scores.detach().cpu().numpy() if step_scores is not None else None
+
+    if valid_beam_counts is not None:
+        if isinstance(valid_beam_counts, torch.Tensor):
+            valid_cpu = valid_beam_counts.detach().cpu().numpy()
+        else:
+            valid_cpu = np.asarray(list(valid_beam_counts))
+    else:
+        valid_cpu = None
+
+    num_reqs = tokens_cpu.shape[0]
+    num_decode_steps_plus_one = tokens_cpu.shape[2]
+
+    total_toks_per_req = final_tokens.shape[1] * num_decode_steps_plus_one
+    logprob_token_ids = np.zeros((num_reqs, total_toks_per_req), dtype=np.int64)
+    logprob_values = np.zeros((num_reqs, total_toks_per_req), dtype=np.float32)
+    sampled_token_ranks = np.full((num_reqs, total_toks_per_req), P2D_SENTINEL_RANK, dtype=np.int64)
+
+    for i in range(num_reqs):
+        valid_n = int(valid_cpu[i]) if valid_cpu is not None else int(tokens_cpu.shape[1])
+        valid_n = max(0, min(valid_n, int(tokens_cpu.shape[1])))
+        row = tokens_cpu[i].reshape(-1).copy()
+        if valid_n < int(tokens_cpu.shape[1]):
+            row[valid_n * num_decode_steps_plus_one :] = -1
+        logprob_token_ids[i] = row
+        if step_scores_cpu is not None:
+            logprob_values[i] = step_scores_cpu[i].reshape(-1)
+        else:
+            logprob_values[i] = np.repeat(cum_lps_cpu[i], num_decode_steps_plus_one)
+        if valid_n < int(tokens_cpu.shape[1]):
+            # Defense in depth: dead beams carry -inf scores as well as the -1
+            # token marker, so no downstream consumer can leak their scores.
+            logprob_values[i][valid_n * num_decode_steps_plus_one :] = -np.inf
+
+    p2d_logprobs_lists = LogprobsLists(
+        logprob_token_ids=logprob_token_ids,
+        logprobs=logprob_values,
+        sampled_token_ranks=sampled_token_ranks,
+        cu_num_generated_tokens=None,
+    )
+
+    valid_sampled_token_ids: list[list[int]] = []
+    token_ids_cpu = runner.input_batch.token_ids_cpu
+    is_token_ids = runner.input_batch.is_token_ids
+    for i in range(num_reqs):
+        valid_n = int(valid_cpu[i]) if valid_cpu is not None else int(tokens_cpu.shape[1])
+        first_tok = int(tokens_cpu[i, 0, 0]) if valid_n > 0 else -1
+        if first_tok < 0:
+            first_tok = int(getattr(getattr(runner, "model_config", None), "eos_token_id", 0) or 0)
+        valid_sampled_token_ids.append([first_tok])
+
+        if i < len(runner.input_batch.req_ids):
+            req_id = runner.input_batch.req_ids[i]
+            start_idx = runner.input_batch.num_tokens_no_spec[i]
+            end_idx = start_idx + 1
+            if isinstance(token_ids_cpu, torch.Tensor):
+                token_ids_cpu[i, start_idx:end_idx] = torch.tensor(
+                    [first_tok], dtype=token_ids_cpu.dtype, device=token_ids_cpu.device
+                )
+                is_token_ids[i, start_idx:end_idx] = torch.tensor(
+                    [True], dtype=is_token_ids.dtype, device=is_token_ids.device
+                )
+            else:
+                token_ids_cpu[i, start_idx:end_idx] = [first_tok]
+                is_token_ids[i, start_idx:end_idx] = True
+            runner.input_batch.num_tokens_no_spec[i] = end_idx
+            if req_id in runner.requests:
+                runner.requests[req_id].output_token_ids.append(first_tok)
+
+    if getattr(runner, "use_async_scheduling", False):
+        if (
+            sampler_output is not None
+            and getattr(runner.input_batch, "prev_sampled_token_ids", None) is None
+        ):
+            runner.input_batch.prev_sampled_token_ids = sampler_output.sampled_token_ids
+        runner.input_batch.prev_req_id_to_index = {
+            req_id: i for i, req_id in enumerate(runner.input_batch.req_ids)
+        }
+
+    req_ids_output_copy = runner.input_batch.req_ids.copy()
+    req_id_to_index_output_copy = runner.input_batch.req_id_to_index.copy()
+    invalid_req_indices: list[int] = []
+
+    return (
+        p2d_logprobs_lists,
+        valid_sampled_token_ids,
+        req_ids_output_copy,
+        req_id_to_index_output_copy,
+        invalid_req_indices,
+    )
+
+
+def build_p2d_sampler_output(final_tokens: torch.Tensor) -> Any:
+    """Shared P2D sampler bypass: first tokens per request without a real sample."""
+    from vllm.v1.outputs import SamplerOutput
+
+    return SamplerOutput(
+        sampled_token_ids=final_tokens[:, 0, 0:1],
+        logprobs_tensors=None,
+    )
+
+
+def patch_p2d_compute_logits_bypass(runner: Any) -> None:
+    """Patches ``runner.model.compute_logits`` to skip the LM-head GEMM while a
+    P2D result is active (all decode logits were already computed in-graph).
+    Idempotent; shared by the GPU and NPU model-forward wrappers.
+    """
+    model = getattr(runner, "model", None)
+    if model is None or not hasattr(model, "compute_logits"):
+        return
+    if getattr(model.compute_logits, "_p2d_patched", False):
+        return
+    _orig_compute_logits = model.compute_logits
+
+    @wraps(_orig_compute_logits)
+    def patched_compute_logits(hidden_states: torch.Tensor) -> torch.Tensor:
+        if getattr(runner, "_current_p2d_result", None) is not None:
+            dtype = (
+                runner.model_config.dtype
+                if hasattr(runner, "model_config")
+                else hidden_states.dtype
+            )
+            return torch.empty(
+                (hidden_states.shape[0], 1),
+                device=hidden_states.device,
+                dtype=dtype,
+            )
+        return cast(torch.Tensor, _orig_compute_logits(hidden_states))
+
+    patched_compute_logits._p2d_patched = True  # type: ignore[attr-defined]
+    model.compute_logits = patched_compute_logits

@@ -574,3 +574,724 @@ def update_graph_params(
             )
             torch.npu.graph_task_update_end(update_stream)
     return True
+
+
+def p2d_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: Any,
+    layer_idx: int,
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    vllm_flash_attn_version: int = 2,
+    key_cache: torch.Tensor | None = None,
+    value_cache: torch.Tensor | None = None,
+    use_manual_suffix: bool = True,
+    kv_cache_dtype: str = "auto",
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """NPU execution for the P2D (Prefill + 2 Decodes) graph passes.
+
+    Pass 0 (monolithic graph only): writes the scheduled chunk into the paged
+    KV cache (reshape_and_cache with the staged slot mapping) and runs FIA
+    full-context attention over the paged cache with the per-request chunk
+    qlens and full-prompt kvlens (computed + scheduled), so cached prefixes
+    are attended correctly.
+
+    Passes 1 & 2: prefix attention over the paged KV cache (block-table FIA)
+    plus suffix attention over the beam's own history (1 or 2 chronological
+    tokens); the query is always the trailing history token, so the causal
+    window is fully open.
+
+    ``use_manual_suffix`` selects the suffix implementation:
+      True  — plain torch ops (no mask; capturable without a task group);
+      False — FIA-v2 in a task group with the causal tile (cascade parity).
+    """
+    if attn_metadata.p2d_pass == 0:
+        _p2d_prefill_pass0(
+            output=output,
+            query=query,
+            key=key,
+            value=value,
+            attn_metadata=attn_metadata,
+            scale=scale,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return
+
+    pool = attn_metadata.p2d_pool
+    num_beams_total = query.shape[0]
+    group_size = num_heads // num_kv_heads
+
+    if key_cache is None or value_cache is None:
+        raise RuntimeError("NPU P2D prefix attention requires the paged KV cache tensors.")
+
+    # Write this pass's suffix KV into the static pool slot (slot 0 for
+    # pass 1, slot 1 for pass 2), mirroring the GPU pool layout.
+    step = 0 if attn_metadata.p2d_pass == 1 else 1
+    pool.suffix_kv[layer_idx, 0, :num_beams_total, step].copy_(key, non_blocking=True)
+    pool.suffix_kv[layer_idx, 1, :num_beams_total, step].copy_(value, non_blocking=True)
+
+    capturing = _GRAPH_CAPTURE_STATE["capturing"]
+    prefix_qlen_list = list(range(1, num_beams_total + 1))
+    prefix_kvlen_list = attn_metadata.prefix_kvlen_list
+
+    # ----------------------------------------------------------------
+    # Prefix attention over the paged KV cache (non-causal, lse).
+    # ----------------------------------------------------------------
+    prefix_kw = {
+        "query": query,
+        "key": key_cache.view(*key_cache.shape[:-2], -1),
+        "value": value_cache.view(*value_cache.shape[:-2], -1),
+        "atten_mask": None,
+        "block_table": attn_metadata.block_table,
+        "input_layout": "TND",
+        "block_size": attn_metadata.block_size,
+        "actual_seq_qlen": prefix_qlen_list,
+        "actual_seq_kvlen": prefix_kvlen_list,
+        "num_key_value_heads": num_kv_heads,
+        "num_query_heads": num_heads,
+        "softmax_scale": scale,
+        "sparse_mode": 0,
+    }
+    if capturing:
+        entry = _GRAPH_CAPTURE_STATE["entry"]
+        tasks = _p2d_task_list(entry, attn_metadata.p2d_pass)
+        prefix_out = torch.empty(
+            (num_beams_total, num_heads, head_size),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        prefix_lse = torch.empty(
+            (num_beams_total, num_heads, 1),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        workspace = _get_p2d_task_workspace(entry, prefix_kw, kind="prefix")
+        stream = torch.npu.current_stream()
+        torch.npu.graph_task_group_begin(stream)
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            **prefix_kw, workspace=workspace, out=[prefix_out, prefix_lse]
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        tasks.append(
+            NPUDecodeLayerTask(
+                handle=handle,
+                kind="prefix",
+                p2d_pass=attn_metadata.p2d_pass,
+                output=_make_weak_graph_tensor(prefix_out),
+                query=_make_weak_graph_tensor(query),
+                key=_make_weak_graph_tensor(prefix_kw["key"]),
+                value=_make_weak_graph_tensor(prefix_kw["value"]),
+                mask=None,
+                lse=_make_weak_graph_tensor(prefix_lse),
+                workspace=workspace,
+                block_size=attn_metadata.block_size,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                scale=scale,
+                sparse_mode=0,
+                qlen_list=prefix_qlen_list,
+                kvlen_list=list(prefix_kvlen_list),
+            )
+        )
+    else:
+        prefix_out, prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
+            **prefix_kw,
+            return_softmax_lse=True,
+        )
+
+    # ----------------------------------------------------------------
+    # Suffix attention over the beam's own history (open causal window).
+    # ----------------------------------------------------------------
+    if use_manual_suffix:
+        suffix_out, suffix_lse = _p2d_suffix_manual(
+            pool=pool,
+            layer_idx=layer_idx,
+            query=query,
+            scale=scale,
+            p2d_pass=attn_metadata.p2d_pass,
+            num_beams_total=num_beams_total,
+            group_size=group_size,
+        )
+    else:
+        suffix_out, suffix_lse = _p2d_suffix_fia(
+            attn_metadata=attn_metadata,
+            pool=pool,
+            layer_idx=layer_idx,
+            query=query,
+            scale=scale,
+            p2d_pass=attn_metadata.p2d_pass,
+            num_beams_total=num_beams_total,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            capturing=capturing,
+        )
+
+    merged, _ = merge_tnd_attention_outputs(prefix_out, prefix_lse, suffix_out, suffix_lse)
+    output[:num_beams_total] = merged
+
+
+def _p2d_prefill_pass0(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: Any,
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    key_cache: torch.Tensor | None,
+    value_cache: torch.Tensor | None,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    """Monolithic pass 0: chunk KV write + paged full-context prefill attention.
+
+    Writes the scheduled chunk into the paged KV cache (staged slot mapping)
+    and runs FIA causal attention over the paged cache with per-request chunk
+    qlens and full-prompt kvlens (computed + scheduled), so cached prefixes
+    are attended correctly. In graph mode the FIA call is task-grouped with
+    kind "prefill_pass0" so ``update_monolithic_graph_params`` can rebind the
+    host lists + block table per replay.
+    """
+    if key_cache is None or value_cache is None:
+        raise RuntimeError("NPU P2D pass 0 requires the paged KV cache tensors.")
+    if attn_metadata.slot_mapping is not None:
+        reshape_and_cache(
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=attn_metadata.slot_mapping,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+    pass0_qlen_list = attn_metadata.pass0_qlen_list
+    pass0_kvlen_list = attn_metadata.pass0_kvlen_list
+    if not pass0_qlen_list or not pass0_kvlen_list:
+        raise RuntimeError("NPU P2D pass 0 requires the host qlen/kvlen lists.")
+
+    kw = {
+        "query": query,
+        "key": key_cache.view(*key_cache.shape[:-2], -1),
+        "value": value_cache.view(*value_cache.shape[:-2], -1),
+        "atten_mask": attn_metadata.npu_causal_atten_mask,
+        "block_table": attn_metadata.block_table,
+        "input_layout": "TND",
+        "block_size": attn_metadata.block_size,
+        "actual_seq_qlen": pass0_qlen_list,
+        "actual_seq_kvlen": pass0_kvlen_list,
+        "num_key_value_heads": num_kv_heads,
+        "num_query_heads": num_heads,
+        "softmax_scale": scale,
+        "sparse_mode": 3,
+    }
+    num_tokens = query.shape[0]
+
+    if _GRAPH_CAPTURE_STATE["capturing"]:
+        entry = _GRAPH_CAPTURE_STATE["entry"]
+        tasks = _p2d_task_list(entry, 0)
+        lse = torch.empty(
+            (num_tokens, num_heads, 1),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        workspace = _get_p2d_task_workspace(entry, kw, kind="prefill_pass0")
+        stream = torch.npu.current_stream()
+        torch.npu.graph_task_group_begin(stream)
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            **kw, workspace=workspace, out=[output, lse]
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        causal_mask = attn_metadata.npu_causal_atten_mask
+        tasks.append(
+            NPUDecodeLayerTask(
+                handle=handle,
+                kind="prefill_pass0",
+                p2d_pass=0,
+                output=_make_weak_graph_tensor(output),
+                query=_make_weak_graph_tensor(query),
+                key=_make_weak_graph_tensor(kw["key"]),
+                value=_make_weak_graph_tensor(kw["value"]),
+                mask=_make_weak_graph_tensor(causal_mask) if causal_mask is not None else None,
+                lse=_make_weak_graph_tensor(lse),
+                workspace=workspace,
+                block_size=attn_metadata.block_size,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                scale=scale,
+                sparse_mode=3,
+                qlen_list=list(pass0_qlen_list),
+                kvlen_list=list(pass0_kvlen_list),
+            )
+        )
+        return
+
+    std_out, _ = torch_npu.npu_fused_infer_attention_score_v2(**kw)
+    output[: std_out.shape[0]] = std_out
+
+
+def _p2d_task_list(entry: Any, p2d_pass: int) -> list:
+    """Returns the task registry list for a P2D pass under the active capture."""
+    if isinstance(entry, NPUMonolithicGraphEntry):
+        return entry.prefill_tasks if p2d_pass == 0 else entry.decode_tasks
+    if isinstance(entry, NPUDecodeGraphEntry):
+        assert p2d_pass != 0, "P2D pass 0 requires a monolithic graph entry"
+        return entry.tasks
+    raise AssertionError("NPU P2D graph capture requires an active decode/monolithic entry")
+
+
+def _p2d_suffix_manual(
+    pool: Any,
+    layer_idx: int,
+    query: torch.Tensor,
+    scale: float,
+    p2d_pass: int,
+    num_beams_total: int,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Manual suffix attention with plain torch ops (no mask, fully open).
+
+    The suffix query is always the trailing token of the beam history and the
+    keys are the history in chronological order, so the causal window covers
+    every suffix token: a mask would be a no-op (equivalent to the GPU
+    ``causal=True`` call under the end-aligned varlen convention).
+    """
+    if p2d_pass == 1:
+        # Single key per beam: attention output is the value itself and the
+        # lse is the (scaled) score — no softmax needed.
+        k1 = pool.suffix_kv[layer_idx, 0, :num_beams_total, 0]
+        v1 = pool.suffix_kv[layer_idx, 1, :num_beams_total, 0]
+        if group_size > 1:
+            k1 = k1.repeat_interleave(group_size, dim=-2)
+            v1 = v1.repeat_interleave(group_size, dim=-2)
+        scores = (query.float() * k1.float()).sum(-1, keepdim=True) * scale
+        return v1, scores
+
+    # Pass 2: two chronological keys per beam [t0, t1]; query is t1.
+    k2 = pool.suffix_kv[layer_idx, 0, :num_beams_total, 0:2]
+    v2 = pool.suffix_kv[layer_idx, 1, :num_beams_total, 0:2]
+    if group_size > 1:
+        k2 = k2.repeat_interleave(group_size, dim=-2)
+        v2 = v2.repeat_interleave(group_size, dim=-2)
+    scores = torch.einsum("whd,wshd->whs", query.float(), k2.float()) * scale
+    weights = torch.softmax(scores, dim=-1)
+    suffix_out = torch.einsum("whs,wshd->whd", weights, v2.float()).to(query.dtype)
+    suffix_lse = torch.logsumexp(scores, dim=-1, keepdim=True)
+    return suffix_out, suffix_lse
+
+
+def _p2d_suffix_fia(
+    attn_metadata: Any,
+    pool: Any,
+    layer_idx: int,
+    query: torch.Tensor,
+    scale: float,
+    p2d_pass: int,
+    num_beams_total: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    capturing: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Suffix attention via FIA-v2 (cascade parity; used when the manual
+    implementation is disabled via ``use_manual_p2d_suffix``)."""
+    if p2d_pass == 1:
+        k = pool.suffix_kv[layer_idx, 0, :num_beams_total, 0]
+        v = pool.suffix_kv[layer_idx, 1, :num_beams_total, 0]
+        kvlen_list = list(range(1, num_beams_total + 1))
+    else:
+        k = pool.suffix_kv[layer_idx, 0, :num_beams_total, 0:2].reshape(-1, num_kv_heads, head_size)
+        v = pool.suffix_kv[layer_idx, 1, :num_beams_total, 0:2].reshape(-1, num_kv_heads, head_size)
+        kvlen_list = list(range(2, 2 * num_beams_total + 1, 2))
+    qlen_list = list(range(1, num_beams_total + 1))
+
+    kw = {
+        "query": query,
+        "key": k,
+        "value": v,
+        "atten_mask": attn_metadata.npu_causal_atten_mask,
+        "block_table": None,
+        "block_size": 0,
+        "input_layout": "TND",
+        "actual_seq_qlen": qlen_list,
+        "actual_seq_kvlen": kvlen_list,
+        "num_key_value_heads": num_kv_heads,
+        "num_query_heads": num_heads,
+        "softmax_scale": scale,
+        "sparse_mode": 3,
+        "inner_precise": 0,
+    }
+    if capturing:
+        entry = _GRAPH_CAPTURE_STATE["entry"]
+        tasks = _p2d_task_list(entry, p2d_pass)
+        suffix_out = torch.empty(
+            (num_beams_total, num_heads, head_size),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        suffix_lse = torch.empty(
+            (num_beams_total, num_heads, 1),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        workspace = _get_p2d_task_workspace(entry, kw, kind="suffix")
+        stream = torch.npu.current_stream()
+        torch.npu.graph_task_group_begin(stream)
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            **kw, workspace=workspace, out=[suffix_out, suffix_lse]
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        causal_mask = attn_metadata.npu_causal_atten_mask
+        tasks.append(
+            NPUDecodeLayerTask(
+                handle=handle,
+                kind="suffix_fia",
+                p2d_pass=p2d_pass,
+                output=_make_weak_graph_tensor(suffix_out),
+                query=_make_weak_graph_tensor(query),
+                key=_make_weak_graph_tensor(k),
+                value=_make_weak_graph_tensor(v),
+                mask=_make_weak_graph_tensor(causal_mask) if causal_mask is not None else None,
+                lse=_make_weak_graph_tensor(suffix_lse),
+                workspace=workspace,
+                block_size=0,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                scale=scale,
+                sparse_mode=3,
+                qlen_list=qlen_list,
+                kvlen_list=kvlen_list,
+            )
+        )
+        return suffix_out, suffix_lse
+    return torch_npu.npu_fused_infer_attention_score_v2(
+        **kw,
+        return_softmax_lse=True,
+    )
+
+
+def _get_p2d_task_workspace(
+    entry: Any,
+    fia_kw: dict,
+    kind: str,
+) -> Any:
+    """Returns (sizing on first use) the per-kind FIA workspace for the P2D graph.
+
+    The monolithic entry keeps separate workspaces for the pass-0 prefill
+    shape (bucket queries x max_kvlen) and the decode-prefix shape (W queries
+    x max_kvlen); the plain decode entry keeps prefix/suffix workspaces.
+    """
+    if isinstance(entry, NPUMonolithicGraphEntry):
+        if kind == "prefill_pass0":
+            if entry.prefill_workspace is None:
+                entry.prefill_workspace = _size_fia_workspace(entry, fia_kw, kind="prefill_pass0")
+            return entry.prefill_workspace
+        if kind == "prefix":
+            if entry.decode_prefix_workspace is None:
+                entry.decode_prefix_workspace = _size_fia_workspace(entry, fia_kw, kind="prefix")
+            return entry.decode_prefix_workspace
+        if entry.suffix_workspace is None:
+            entry.suffix_workspace = _size_fia_workspace(entry, fia_kw, kind="suffix")
+        return entry.suffix_workspace
+    if isinstance(entry, NPUDecodeGraphEntry):
+        if kind == "prefix":
+            if entry.prefix_workspace is None:
+                entry.prefix_workspace = _size_fia_workspace(entry, fia_kw, kind="prefix")
+            return entry.prefix_workspace
+        if entry.suffix_workspace is None:
+            entry.suffix_workspace = _size_fia_workspace(entry, fia_kw, kind="suffix")
+        return entry.suffix_workspace
+    raise AssertionError("NPU P2D graph capture requires an active decode/monolithic entry")
+
+
+def _size_fia_workspace(
+    entry: Any,
+    fia_kw: dict,
+    kind: str,
+) -> Any:
+    """Sizes the FIA workspace for the given task kind.
+
+    Prefix/prefill workspaces are sized for the maximum supported per-request
+    KV length (the model's max context): replays rebind the per-row kvlens and
+    cached/chunked contexts can exceed the capture-time dummy lengths.
+    """
+    ws_kw = dict(fia_kw)
+    max_kvlen = entry.max_kvlen or max(ws_kw["actual_seq_kvlen"])
+    if kind == "prefix":
+        num_rows = ws_kw["query"].shape[0]
+        ws_kw["actual_seq_qlen"] = list(range(1, num_rows + 1))
+        ws_kw["actual_seq_kvlen"] = [max_kvlen] * num_rows
+    elif kind == "prefill_pass0":
+        num_rows = len(ws_kw["actual_seq_qlen"])
+        ws_kw["actual_seq_kvlen"] = [max_kvlen] * num_rows
+    workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(**ws_kw)
+    if workspace is None:
+        raise RuntimeError(f"FIA-v2 workspace sizing failed during P2D {kind} capture")
+    return workspace
+
+
+@dataclass
+class NPUDecodeLayerTask:
+    """Per-layer FIA task-group state captured inside an NPU P2D decode graph.
+
+    ``kind`` is "prefix" (rebindable block table + prompt kvlens) or
+    "suffix_fia" (static lists, no block table). The update dispatches the
+    right parameter set per task.
+    """
+
+    handle: Any
+    kind: str
+    p2d_pass: int
+    output: Any
+    query: Any
+    key: Any
+    value: Any
+    mask: Any
+    lse: Any
+    workspace: Any
+    block_size: int
+    num_heads: int
+    num_kv_heads: int
+    scale: float
+    sparse_mode: int
+    qlen_list: list
+    kvlen_list: list
+
+
+@dataclass
+class NPUDecodeGraphEntry:
+    """Registry entry for one captured P2D decode graph (one per (num_reqs, beam_width))."""
+
+    max_kvlen: int = 0
+    prefix_workspace: Any = None
+    suffix_workspace: Any = None
+    tasks: list[NPUDecodeLayerTask] = field(default_factory=list)
+
+
+@contextmanager
+def decode_graph_capture(entry: NPUDecodeGraphEntry):
+    """Marks the P2D decode fast path as graph-capturing and registers layer tasks."""
+    assert not _GRAPH_CAPTURE_STATE["capturing"], "nested NPU graph capture"
+    prev = (_GRAPH_CAPTURE_STATE["capturing"], _GRAPH_CAPTURE_STATE["entry"])
+    _GRAPH_CAPTURE_STATE["capturing"] = True
+    _GRAPH_CAPTURE_STATE["entry"] = entry
+    try:
+        yield
+    finally:
+        _GRAPH_CAPTURE_STATE["capturing"], _GRAPH_CAPTURE_STATE["entry"] = prev
+
+
+def _update_p2d_task(
+    update_stream: Any,
+    task: NPUDecodeLayerTask,
+    qlen_list: list,
+    kvlen_list: list,
+    task_block_table: torch.Tensor | None,
+    atten_mask: Any,
+    block_size: int,
+    sparse_mode: int,
+    extra_kw: dict[str, Any] | None = None,
+) -> bool:
+    """Rebinds one P2D FIA task group with fresh params. False on missing tensors."""
+    output = task.output
+    query = task.query
+    key = task.key
+    value = task.value
+    lse = task.lse
+    if output is None or query is None or key is None or value is None or lse is None:
+        logger.warning(
+            "NPU P2D graph update: layer tensors are missing; "
+            "aborting the update (the replay would execute with stale params)."
+        )
+        return False
+    torch.npu.graph_task_update_begin(update_stream, task.handle)
+    torch_npu.npu_fused_infer_attention_score_v2.out(
+        query=query,
+        key=key,
+        value=value,
+        atten_mask=atten_mask,
+        block_table=task_block_table,
+        input_layout="TND",
+        block_size=block_size,
+        actual_seq_qlen=qlen_list,
+        actual_seq_kvlen=kvlen_list,
+        num_key_value_heads=task.num_kv_heads,
+        num_query_heads=task.num_heads,
+        softmax_scale=task.scale,
+        sparse_mode=sparse_mode,
+        workspace=task.workspace,
+        out=[output, lse],
+        **(extra_kw or {}),
+    )
+    torch.npu.graph_task_update_end(update_stream)
+    return True
+
+
+def update_decode_graph_params(
+    update_stream: Any,
+    entry: NPUDecodeGraphEntry,
+    prefix_qlen_list: list,
+    prefix_kvlen_list: list,
+    block_table: torch.Tensor,
+) -> bool:
+    """Rewrites the decode graph's FIA task-group params before a replay.
+
+    Prefix tasks are rebound with the fresh per-beam qlen/kvlen host lists and
+    the current (beam-replicated) block table; suffix FIA tasks are re-sent
+    with their capture-time static lists. Tasks in manual-suffix graphs are
+    prefix-only, so the update stays single-kind there.
+
+    Returns True on success; the caller MUST NOT replay on False.
+    """
+    if not isinstance(entry, NPUDecodeGraphEntry):
+        logger.debug("update_decode_graph_params: non-decode-graph entry; skipping.")
+        return False
+    serving_stream = torch.npu.current_stream()
+    with torch.npu.stream(update_stream):
+        update_stream.wait_stream(serving_stream)
+        for task in entry.tasks:
+            if task.kind == "prefix":
+                ok = _update_p2d_task(
+                    update_stream,
+                    task,
+                    prefix_qlen_list,
+                    prefix_kvlen_list,
+                    block_table,
+                    None,
+                    task.block_size,
+                    0,
+                )
+            else:
+                ok = _update_p2d_task(
+                    update_stream,
+                    task,
+                    task.qlen_list,
+                    task.kvlen_list,
+                    None,
+                    task.mask,
+                    0,
+                    3,
+                    extra_kw={"inner_precise": 0},
+                )
+            if not ok:
+                return False
+    return True
+
+
+@dataclass
+class NPUMonolithicGraphEntry:
+    """Registry entry for one captured monolithic P2D graph
+    (one per (bucket, num_reqs, beam_width)).
+
+    Pass 0 tasks live in ``prefill_tasks`` (kind "prefill_pass0"); passes 1/2
+    tasks live in ``decode_tasks`` (kinds "prefix"/"suffix_fia"). Three FIA
+    workspaces: the pass-0 prefill shape (bucket queries x max_kvlen), the
+    decode-prefix shape (W queries x max_kvlen), and the suffix shape.
+    """
+
+    bucket: int = 0
+    num_reqs: int = 1
+    beam_width: int = 128
+    max_kvlen: int = 0
+    prefill_workspace: Any = None
+    decode_prefix_workspace: Any = None
+    suffix_workspace: Any = None
+    prefill_tasks: list[NPUDecodeLayerTask] = field(default_factory=list)
+    decode_tasks: list[NPUDecodeLayerTask] = field(default_factory=list)
+
+
+@contextmanager
+def monolithic_graph_capture(entry: NPUMonolithicGraphEntry):
+    """Marks the P2D monolithic fast path as graph-capturing and registers tasks."""
+    assert not _GRAPH_CAPTURE_STATE["capturing"], "nested NPU graph capture"
+    prev = (_GRAPH_CAPTURE_STATE["capturing"], _GRAPH_CAPTURE_STATE["entry"])
+    _GRAPH_CAPTURE_STATE["capturing"] = True
+    _GRAPH_CAPTURE_STATE["entry"] = entry
+    try:
+        yield
+    finally:
+        _GRAPH_CAPTURE_STATE["capturing"], _GRAPH_CAPTURE_STATE["entry"] = prev
+
+
+def update_monolithic_graph_params(
+    update_stream: Any,
+    entry: NPUMonolithicGraphEntry,
+    pass0_qlen_list: list,
+    pass0_kvlen_list: list,
+    prefix_qlen_list: list,
+    prefix_kvlen_list: list,
+    pass0_block_table: torch.Tensor,
+    prefix_block_table: torch.Tensor,
+) -> bool:
+    """Rewrites the monolithic graph's FIA task-group params before a replay.
+
+    Pass-0 tasks are rebound with the per-request chunk qlens and full-prompt
+    kvlens (computed + scheduled) plus the request-row staged block table;
+    decode-prefix tasks with the per-beam qlen/kvlen lists plus the
+    beam-replicated staged block table; suffix FIA tasks are re-sent with
+    their capture-time static lists.
+
+    Returns True on success; the caller MUST NOT replay on False.
+    """
+    if not isinstance(entry, NPUMonolithicGraphEntry):
+        logger.debug("update_monolithic_graph_params: non-monolithic entry; skipping.")
+        return False
+    serving_stream = torch.npu.current_stream()
+    with torch.npu.stream(update_stream):
+        update_stream.wait_stream(serving_stream)
+        for task in list(entry.prefill_tasks) + list(entry.decode_tasks):
+            if task.kind == "prefill_pass0":
+                ok = _update_p2d_task(
+                    update_stream,
+                    task,
+                    pass0_qlen_list,
+                    pass0_kvlen_list,
+                    pass0_block_table,
+                    task.mask,
+                    task.block_size,
+                    3,
+                )
+            elif task.kind == "prefix":
+                ok = _update_p2d_task(
+                    update_stream,
+                    task,
+                    prefix_qlen_list,
+                    prefix_kvlen_list,
+                    prefix_block_table,
+                    None,
+                    task.block_size,
+                    0,
+                )
+            else:
+                ok = _update_p2d_task(
+                    update_stream,
+                    task,
+                    task.qlen_list,
+                    task.kvlen_list,
+                    None,
+                    task.mask,
+                    0,
+                    3,
+                    extra_kw={"inner_precise": 0},
+                )
+            if not ok:
+                return False
+    return True

@@ -7,6 +7,7 @@ from __future__ import annotations
 from functools import wraps
 from importlib import import_module
 from types import ModuleType
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -28,6 +29,11 @@ _NPU_PATCH_MODULE = "vllm_gr.v1.worker.npu_model_runner_patch"
 _CONSTRAINT_LOAD_PATCH_MARKER = "_vllm_gr_constraint_load_patched"
 _CONSTRAINT_SHUTDOWN_PATCH_MARKER = "_vllm_gr_constraint_shutdown_patched"
 _BEAM_GRAPH_STATS_HOOK_MARKER = "_vllm_gr_beam_graph_stats_hook_installed"
+
+# Kernel-wide candidate cap for the constrained Top-K operator (shared by the
+# CUDA and NPU kernels). The startup catalog promotion has no user-facing
+# max_top_k config, so it uses the full kernel capacity.
+MAX_CONSTRAINT_TOP_K = 256
 
 
 def close_constraint_backend(runner: object) -> None:
@@ -83,6 +89,114 @@ def _runner_vocab_size(runner: object) -> int:
     return vocab_size
 
 
+def _runner_constraint_max_rows(gr_config: Any) -> int:
+    """Row capacity shared by the canonical and promoted backend paths."""
+    max_rows = gr_config.beam_max_width
+    if max_rows is None:
+        raise ValueError("constraint_table backend requires beam_max_width to be configured")
+    max_rows = int(max_rows)
+    # P2D step 0 batches every scheduled request in one constrained launch
+    # (rows = num_reqs), so the row-capacity bound must also cover the
+    # configured P2D batch sizes on top of beam_max_width.
+    try:
+        from vllm_gr.v1.worker.prefill_graph_common import get_p2d_supported_num_reqs
+
+        max_rows = max(max_rows, max(get_p2d_supported_num_reqs()))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Could not widen constraint max_rows for P2D batch sizes: %r", e)
+    return max_rows
+
+
+def _install_constraint_vocab_window(runner: Any, backend: Any) -> None:
+    """Bind the LogitsProcessor slice window to the backend's catalog window.
+
+    Shared by the canonical artifact path and the startup catalog promotion.
+    TP>1 keeps the full-logits collective path (window None); a window equal
+    to the full vocabulary is also dropped (no benefit from slicing).
+    """
+    if getattr(backend.info, "backend", None) is not ConstraintTableBackendEnum.CUDA:
+        return
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    parallel = getattr(getattr(runner, "vllm_config", None), "parallel_config", None)
+    window = backend.vocab_slice
+    if getattr(parallel, "tensor_parallel_size", 1) != 1:
+        # All ranks must retain the original full-logits collective path.
+        window = None
+        backend.vocab_slice = None
+        logger.info(
+            "vllm-gr: canonical CUDA vocabulary slicing disabled for TP>1; "
+            "using full-vocabulary projection"
+        )
+    if window == (0, _runner_vocab_size(runner)):
+        window = None  # No benefit from cloning the entire LM head.
+    processors = tuple(
+        module for module in runner.model.modules() if isinstance(module, LogitsProcessor)
+    )
+    for processor in processors:
+        # Explicit None also overrides unrelated legacy global settings.
+        processor._gr_vocab_slice = window
+    runner._gr_vocab_slice_processors = processors
+
+
+def _promote_catalog_backend(
+    runner: Any, gr_config: Any, max_rows: int | None = None
+) -> Any | None:
+    """Build a ready CUDA backend from the server-wide triples catalog.
+
+    Applies only when the legacy CLI selects ``constraint_backend=constraint_table``
+    with a triples ``--catalog-path`` on a CUDA device (the offline catalog the
+    server consumes). Returns ``None`` when the promotion does not apply
+    (Trie, no catalog, non-CUDA, or a non-triples document), keeping the
+    legacy per-request injection path untouched. Compile/upload failures raise:
+    the catalog is server configuration, so startup must fail loudly.
+    """
+    from vllm_gr.config import ConstraintBackend
+
+    if gr_config.constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE:
+        return None
+    catalog_path = gr_config.catalog_path
+    if not catalog_path:
+        return None
+    device = getattr(runner, "device", None)
+    if device is None or device.type != "cuda":
+        return None
+    model_config = getattr(runner, "model_config", None)
+    if model_config is None:
+        return None
+    tokenizer_name = getattr(model_config, "tokenizer", None)
+    if not tokenizer_name:
+        return None
+    from vllm.tokenizers import get_tokenizer
+
+    tokenizer = get_tokenizer(
+        tokenizer_name, trust_remote_code=bool(getattr(model_config, "trust_remote_code", False))
+    )
+    vocab_size = _runner_vocab_size(runner)
+    dtype = getattr(model_config, "dtype", None)
+
+    from vllm_gr.constraints.artifact_compiler import constraint_table_from_resource
+    from vllm_gr.constraints.loader import load_cuda_backend_from_table
+    from vllm_gr.constraints.startup import compile_constraint_table_resource
+    from vllm_gr.constraints.worker_inject import get_worker_manager
+
+    resource = compile_constraint_table_resource(catalog_path, tokenizer, vocab_size)
+    # Register the resource so the worker's digest cache matches the published
+    # backend: the API server's first-request broadcast then reuses the same
+    # digest and stays an instant no-op.
+    get_worker_manager().ensure(resource)
+    table = constraint_table_from_resource(resource)
+    if max_rows is None:
+        max_rows = _runner_constraint_max_rows(gr_config)
+    return load_cuda_backend_from_table(
+        table,
+        device=device,
+        dtype=dtype,
+        max_top_k=MAX_CONSTRAINT_TOP_K,
+        max_rows=max_rows,
+    )
+
+
 def make_load_model_with_constraint_backend(original):
     """Load weights first, then atomically publish a ready canonical Backend."""
 
@@ -99,41 +213,51 @@ def make_load_model_with_constraint_backend(original):
         close_constraint_backend(self)
         gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
         table_config = gr_config.constraint_table
-        parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
         result = original(self, *args, **kwargs)
 
         backend = None
         try:
             if table_config is None or not table_config.enabled:
-                return result
+                # Server-wide catalog promotion: the legacy CLI configures the
+                # constraint tables through --catalog-path (offline triples)
+                # instead of the canonical artifact config. Load them now so
+                # the P2D warmup capture bakes the constrained kernels in.
+                backend = _promote_catalog_backend(self, gr_config)
+                if backend is None:
+                    return result
+                max_rows = _runner_constraint_max_rows(gr_config)
+            else:
+                max_rows = _runner_constraint_max_rows(gr_config)
+                if gr_config.beam_max_width > table_config.max_top_k:
+                    raise ValueError(
+                        "beam_max_width must be <= constraint_table.max_top_k "
+                        f"for canonical constraint sampling, got "
+                        f"{gr_config.beam_max_width} > {table_config.max_top_k}"
+                    )
+                if max_rows > table_config.max_top_k:
+                    logger.warning(
+                        "constraint row capacity %d (beam_max_width + P2D batch) exceeds "
+                        "max_top_k %d; P2D step 0 may be capacity-gated.",
+                        max_rows,
+                        table_config.max_top_k,
+                    )
 
-            max_rows = gr_config.beam_max_width
-            if max_rows is None:
-                raise ValueError(
-                    "canonical constraint_table.enabled=true requires "
-                    "beam_max_width to be configured"
+                from vllm_gr.constraints.loader import load_constraint_backend
+
+                backend = load_constraint_backend(
+                    config=table_config,
+                    device=getattr(self, "device", None),
+                    vocab_size=_runner_vocab_size(self),
+                    dtype=getattr(getattr(self, "model_config", None), "dtype", None),
+                    # One Backend call is made per request. Decode requests carry
+                    # exactly beam_width logits rows, so beam_max_width is the
+                    # canonical row-capacity bound.
+                    max_rows=max_rows,
                 )
-            if max_rows > table_config.max_top_k:
-                raise ValueError(
-                    "beam_max_width must be <= constraint_table.max_top_k "
-                    f"for canonical constraint sampling, got {max_rows} > "
-                    f"{table_config.max_top_k}"
-                )
-
-            from vllm_gr.constraints.loader import load_constraint_backend
-
-            backend = load_constraint_backend(
-                config=table_config,
-                device=getattr(self, "device", None),
-                vocab_size=_runner_vocab_size(self),
-                dtype=getattr(getattr(self, "model_config", None), "dtype", None),
-                # One Backend call is made per request. Decode requests carry
-                # exactly beam_width logits rows, so beam_max_width is the
-                # canonical row-capacity bound.
-                max_rows=max_rows,
-            )
-            if backend is None:
-                raise RuntimeError("enabled canonical constraint table loader returned no Backend")
+                if backend is None:
+                    raise RuntimeError(
+                        "enabled canonical constraint table loader returned no Backend"
+                    )
 
             model_memory_usage = int(getattr(self, "model_memory_usage", 0))
             self.model_memory_usage = model_memory_usage + backend.info.device_memory_bytes
@@ -142,28 +266,7 @@ def make_load_model_with_constraint_backend(original):
             # Backend only after readiness and returns an immediately usable CPU
             # Backend, so requests never observe a partially initialized object.
             self.constraint_backend = backend
-            if getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.CUDA:
-                # Import GPU layers only after selecting the CUDA backend.
-                from vllm.model_executor.layers.logits_processor import LogitsProcessor
-
-                window = backend.vocab_slice
-                if getattr(parallel, "tensor_parallel_size", 1) != 1:
-                    # All ranks must retain the original full-logits collective path.
-                    window = None
-                    backend.vocab_slice = None
-                    logger.info(
-                        "vllm-gr: canonical CUDA vocabulary slicing disabled for TP>1; "
-                        "using full-vocabulary projection"
-                    )
-                if window == (0, _runner_vocab_size(self)):
-                    window = None  # No benefit from cloning the entire LM head.
-                processors = tuple(
-                    module for module in self.model.modules() if isinstance(module, LogitsProcessor)
-                )
-                for processor in processors:
-                    # Explicit None also overrides unrelated legacy global settings.
-                    processor._gr_vocab_slice = window
-                self._gr_vocab_slice_processors = processors
+            _install_constraint_vocab_window(self, backend)
             return result
         except BaseException:
             if backend is not None:
@@ -286,6 +389,9 @@ def apply_worker_patches() -> None:
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )
+        p2d_prepare_check = getattr(platform_module, "p2d_will_handle_batch", None)
+        if p2d_prepare_check is not None:
+            runner_class._gr_prepare_will_run_p2d = p2d_prepare_check
         runner_class._bookkeeping_sync = platform_module.make_patched_bookkeeping_sync(
             runner_class._bookkeeping_sync
         )
@@ -360,6 +466,15 @@ def apply_worker_patches() -> None:
             patched = make_patched_capture_model(_orig_capture_model, beam_capture, prefill_capture)
             setattr(patched, _WORKER_CAPTURE_PATCH_MARKER, True)
             runner_class.capture_model = patched
+
+        # P2D startup capture: patch _capture_cudagraphs so NPU/GPU prefill+P2D
+        # graphs are captured after the native cudagraph capture.
+        if hasattr(runner_class, "_capture_cudagraphs") and hasattr(
+            platform_module, "make_patched_capture_cudagraphs"
+        ):
+            runner_class._capture_cudagraphs = platform_module.make_patched_capture_cudagraphs(
+                runner_class._capture_cudagraphs
+            )
 
         # Patch _determine_batch_execution_and_padding to force FULL CUDA Graph
         # for beam decode steps (if the platform module provides it).

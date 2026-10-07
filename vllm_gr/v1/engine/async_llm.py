@@ -122,6 +122,15 @@ def make_patched_process_outputs(original_process_outputs):
                     )
                 buffer.append(ec_output)
                 continue
+            if req_id not in self.request_states:
+                # Abnormal path: an output whose request state is gone and its
+                # session is untracked would be dropped upstream, hanging the
+                # beam collector. Log loudly so such drops never go silent.
+                logger.warning(
+                    "vllm-gr: [DIAGNOSTIC] output for untracked/pruned req_id=%s "
+                    "(not in session_ids); upstream output_processor may drop it",
+                    req_id,
+                )
             remaining.append(ec_output)
         self._gr_beam_pending_overflows = overflow
         if remaining:

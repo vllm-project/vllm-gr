@@ -62,6 +62,25 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
   --n 128
 ```
 
+### 3. Variadic Beam Width (P2D Fast Path)
+
+Benchmark serving throughput with per-step candidate widths $(W_0, W_1, W_2)$:
+
+```bash
+python -m benchmarks.open_one_rec.one_rec_main bench serve \
+  --endpoint /v1/chat/completions \
+  --backend openai-chat \
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-name onerec \
+  --dataset-path ./data \
+  --task-types video \
+  --num-prompts 100 \
+  --use-beam-search \
+  --step-beam-widths 128,64,32
+```
+
+See [Variadic Beam Width Guide](../variadic_beam_width.md) for architectural details.
+
 ## Usage
 
 ### Command Line Arguments
@@ -92,10 +111,11 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 
 #### Beam Search Parameters (Optional)
 
-| Argument            | Type | Default | Description                          |
-|---------------------|------|---------|--------------------------------------|
-| `--use-beam-search` | flag | `False` | Enable beam search during generation |
-| `--n`               | int  | -       | Number of beams for beam search      |
+| Argument             | Type | Default | Description                                                                |
+|----------------------|------|---------|----------------------------------------------------------------------------|
+| `--use-beam-search`  | flag | `False` | Enable beam search during generation                                       |
+| `--n`                | int  | -       | Number of beams for beam search                                            |
+| `--step-beam-widths` | str  | -       | Comma-separated per-step beam widths (W0,W1,W2) for P2D (e.g. `128,64,32`) |
 
 #### Arguments for Online benchmark
 

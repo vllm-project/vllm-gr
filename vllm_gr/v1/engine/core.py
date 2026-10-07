@@ -118,9 +118,11 @@ def _cache_beam_request(self, request) -> None:
             "partial_block_hash": partial_block_hash,
             "block_hashes": list(request.block_hashes),
             "num_pad_tokens": pad_len,
-            "eos_token_id": request.sampling_params.eos_token_id
-            if request.sampling_params is not None
-            else None,
+            "eos_token_id": (
+                request.sampling_params.eos_token_id
+                if request.sampling_params is not None
+                else None
+            ),
             "lora_request": request.lora_request,
             "cache_salt": request.cache_salt,
             "mm_features": request.mm_features,
@@ -439,6 +441,8 @@ def _apply_beam_step(self, update) -> bool:
     )
     # Store max decode steps for KV pool pre-allocation
     req.max_decode_steps = update.max_decode_steps
+    # P2D final-step teardown signal (engine pops the session cache inline).
+    req.is_last_step = getattr(update, "is_last_step", False)
 
     # Parent beam token sequences ride along for every beam decode request:
     # the Worker seeds its beam-decision state from them when a session is
@@ -457,6 +461,9 @@ def _apply_beam_step(self, update) -> bool:
         req.constraint_step = update.constraint_step if update.constraint_step > 0 else decode_steps
         req.is_constraint_prefill = False
 
+    if getattr(update, "is_last_step", False):
+        with self.beam_cache_lock:
+            self.beam_cache.pop(session_id, None)
     _add_preprocessed_request(self, (req, update.current_wave))
 
     for abort_id in update.pruned_ids:

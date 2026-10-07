@@ -3,6 +3,7 @@
 """Beam-Consecutive Suffix Gather Attention Backend."""
 
 from types import ModuleType
+from typing import Any, ClassVar
 
 import torch
 from vllm import envs
@@ -112,6 +113,13 @@ def _get_platform_execution_module() -> ModuleType:
 
 class BeamAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+    # Suffix-attention implementation switch for the P2D decode passes.
+    # True: plain torch ops (no mask — the suffix query is the trailing
+    # beam-history token, so the causal window over the chronological
+    # suffix keys is fully open). False: FIA-v2 task groups with the
+    # causal tile (GPU ignores this flag; it has a single implementation).
+    # Set before startup: the captured decode graph bakes the chosen path.
+    use_manual_p2d_suffix: ClassVar[bool] = True
 
     @staticmethod
     def update_graph_params(
@@ -256,6 +264,17 @@ class BeamAttentionImpl(AttentionImpl):
             )
         if attn_metadata is None:
             return output.fill_(0)
+
+        if getattr(attn_metadata, "is_p2d_graph_exec", False):
+            return self.p2d_forward(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                attn_metadata=attn_metadata,
+                output=output,
+                kv_cache=kv_cache,
+            )
 
         if getattr(attn_metadata, "is_prefill_graph_exec", False):
             return self.prefill_forward(
@@ -404,6 +423,7 @@ class BeamAttentionImpl(AttentionImpl):
 
         sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
 
+        # Cascade attention (prefill & eager beam decode)
         platform_execution.cascade_attention(
             output=output,
             query=query,
@@ -513,11 +533,103 @@ class BeamAttentionImpl(AttentionImpl):
 
         return output
 
+    @staticmethod
+    def p2d_attention(
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: Any,
+        layer_idx: int,
+        scale: float,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        vllm_flash_attn_version: int,
+        key_cache: torch.Tensor | None = None,
+        value_cache: torch.Tensor | None = None,
+        use_manual_suffix: bool = True,
+        kv_cache_dtype: str = "auto",
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ) -> None:
+        platform_execution = _get_platform_execution_module()
+        platform_execution.p2d_attention(
+            output=output,
+            query=query,
+            key=key,
+            value=value,
+            attn_metadata=attn_metadata,
+            layer_idx=layer_idx,
+            scale=scale,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            vllm_flash_attn_version=vllm_flash_attn_version,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            use_manual_suffix=use_manual_suffix,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    def p2d_forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: Any,
+        output: torch.Tensor,
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Prefill + 2 Decodes attention execution (GPU: paged KV or static pool; NPU: paged cache)."""
+        layer_idx = getattr(self, "layer_idx", None)
+        if layer_idx is None:
+            layer_name = getattr(layer, "layer_name", None)
+            if layer_name is not None:
+                layer_idx = extract_layer_index(layer_name)
+            else:
+                layer_idx = getattr(layer, "layer_idx", 0)
+            self.layer_idx = layer_idx
+
+        key_cache = value_cache = None
+        if kv_cache is not None:
+            if isinstance(kv_cache, tuple):
+                key_cache, value_cache = kv_cache[0], kv_cache[1]
+            else:
+                key_cache, value_cache = kv_cache.unbind(0)
+
+        k_scale = None if NPU_DEVICE else getattr(layer, "_k_scale", None)
+        v_scale = None if NPU_DEVICE else getattr(layer, "_v_scale", None)
+
+        self.p2d_attention(
+            output=output,
+            query=query,
+            key=key,
+            value=value,
+            attn_metadata=attn_metadata,
+            layer_idx=layer_idx,
+            scale=self.scale,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            vllm_flash_attn_version=self.vllm_flash_attn_version,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            use_manual_suffix=self.use_manual_p2d_suffix,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return output
+
 
 @register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
     accept_output_buffer = True
-    supported_dtypes = [torch.float16, torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:

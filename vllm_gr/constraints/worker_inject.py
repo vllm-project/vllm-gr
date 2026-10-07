@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import torch
+
 from vllm_gr.constraints.resource_manager import ConstraintResourceManager
 
 logger = logging.getLogger(__name__)
@@ -44,16 +46,66 @@ def get_worker_manager() -> ConstraintResourceManager:
     return _WORKER_MANAGER
 
 
+def _publish_canonical_backend_from_resource(runner: Any, resource: Any) -> bool:
+    """Build a ready CUDA backend from a cached resource and publish it.
+
+    Used when constraint tables arrive on a CUDA worker before the canonical
+    backend exists (e.g. an injection that precedes ``load_model`` promotion
+    or standalone runners). Publishes ``runner.constraint_backend`` and binds
+    the LogitsProcessor catalog window so both the engine-driven hook and the
+    P2D gate/capture see one canonical owner. Returns ``False`` for non-CUDA
+    devices (the platform adapter path stays in charge there).
+    """
+    device = getattr(runner, "device", None)
+    if device is None or device.type != "cuda":
+        return False
+    from vllm_gr.config import GRConfig
+    from vllm_gr.constraints.artifact_compiler import constraint_table_from_resource
+    from vllm_gr.constraints.loader import load_cuda_backend_from_table
+    from vllm_gr.v1.worker.model_runner_patch import (
+        MAX_CONSTRAINT_TOP_K,
+        _install_constraint_vocab_window,
+        _runner_constraint_max_rows,
+    )
+
+    gr_config = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
+    max_rows = _runner_constraint_max_rows(gr_config)
+    dtype = getattr(getattr(runner, "model_config", None), "dtype", None)
+    if not isinstance(dtype, torch.dtype):
+        raise RuntimeError(
+            f"canonical constraint backend requires model_config.dtype, got {dtype!r}"
+        )
+    backend = load_cuda_backend_from_table(
+        constraint_table_from_resource(resource),
+        device=device,
+        dtype=dtype,
+        max_top_k=MAX_CONSTRAINT_TOP_K,
+        max_rows=max_rows,
+    )
+    runner.constraint_backend = backend
+    _install_constraint_vocab_window(runner, backend)
+    logger.info(
+        "vllm-gr: worker published canonical constraint backend "
+        "digest=%s from the injected resource",
+        resource.digest,
+    )
+    return True
+
+
 def load_constraint_tables_on_worker(worker: Any) -> bool:
     """Preload the injected constraint tables onto the runner device.
 
-    Idempotent: a runner that already owns a loaded adapter (``_gr_constraint_execution``)
-    is left untouched.  When the worker has injected tables (the driver
-    broadcast them via ``EngineCore.collective_rpc``) and a runner is
-    available, the platform adapter is created and ``load_tables`` moves the
-    resource to the device — at weight-load time (``init_device``) or as soon
-    as the injection arrives (``set_gr_constraint_resources``), so the runtime
-    never pays a lazy build / H2D on the first constrained step.
+    Idempotent: a runner that already owns a canonical backend
+    (``constraint_backend``, published by the startup catalog promotion or a
+    previous injection) or a loaded adapter (``_gr_constraint_execution``) is
+    left untouched — the tables are never uploaded twice.  When the worker has
+    injected tables (the driver broadcast them via
+    ``EngineCore.collective_rpc``) and a runner is available, the platform
+    adapter is created and ``load_tables`` moves the resource to the device —
+    at weight-load time (``init_device``) or as soon as the injection arrives
+    (``set_gr_constraint_resources``), so the runtime never pays a lazy build
+    / H2D on the first constrained step.  On CUDA workers the canonical
+    backend is preferred over the legacy adapter.
 
     ``worker`` may be the worker object (with ``model_runner``) or the runner
     itself (which owns ``device`` / ``_gr_constraint_execution`` directly).
@@ -69,6 +121,8 @@ def load_constraint_tables_on_worker(worker: Any) -> bool:
         runner = worker
     if runner is None:
         return False
+    if getattr(runner, "constraint_backend", None) is not None:
+        return True
     if getattr(runner, "_gr_constraint_execution", None) is not None:
         return True
     if getattr(runner, "device", None) is None:
@@ -82,10 +136,16 @@ def load_constraint_tables_on_worker(worker: Any) -> bool:
     if digest is None:
         return False
 
+    resource = manager.require(digest)
+    if getattr(
+        getattr(runner, "device", None), "type", ""
+    ) == "cuda" and _publish_canonical_backend_from_resource(runner, resource):
+        return True
+
     from vllm_gr.constraints.startup import create_constraint_execution
 
     adapter = create_constraint_execution(device=getattr(runner, "device", None))
-    adapter.load_tables(manager.require(digest))
+    adapter.load_tables(resource)
     runner._gr_constraint_execution = adapter
     logger.info(
         "vllm-gr: worker preloaded constraint tables digest=%s onto %s",

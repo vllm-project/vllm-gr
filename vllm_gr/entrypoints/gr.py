@@ -72,6 +72,10 @@ from vllm_gr.tokenizer_fast import fast_decode
 from vllm_gr.utils.engine_lifecycle import frontend_request_scope
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from vllm_gr.v1.worker.prefill_graph_runner import (
+    DEFAULT_DECODE_STEPS,
+    P2D_TOTAL_STEPS_HEADER,
+)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
@@ -384,6 +388,14 @@ def _prepare_beam_step_requests(
                 lora_request=instance.beams[0].lora_request,
             )
             llm_engine.input_processor.assign_request_id(ec_req)
+            # Stamp the session's total step budget so the Worker's P2D
+            # eligibility check (is_p2d_eligible -> _requested_total_steps)
+            # never intercepts an offline batch whose budget differs from the
+            # fixed 1 + DEFAULT_DECODE_STEPS tokens the P2D graph generates.
+            # The serving engine stamps the same header on its requests.
+            p2d_headers = dict(getattr(ec_req, "trace_headers", None) or {})
+            p2d_headers[P2D_TOTAL_STEPS_HEADER] = str(max_decode_steps)
+            ec_req.trace_headers = p2d_headers
             llm_engine.output_processor.add_request(ec_req, None, None, 0)
             engine_core_requests.append(ec_req)
 
@@ -559,6 +571,81 @@ def _parse_step_logprobs(
     )
 
 
+def _materialize_p2d_final_beams(
+    *,
+    flat: Any,
+    root: "BeamSearchSequence",
+    beam_width: int,
+    num_steps: int,
+    ignore_eos: bool,
+    eos_token_id: int | None,
+    sid_end_token_id: int | None,
+) -> list["BeamSearchSequence"]:
+    """Build the finished beam list from a Worker P2D sentinel flat.
+
+    The Worker's P2D fast path generated every decode step in one graph
+    replay; the flat carries ``beam_width * num_steps`` entries (per-token
+    local scores) and dead beams are marked with a -1 first token.  Mirrors
+    the serving-engine ``_build_p2d_request_output`` unwrap for the offline
+    shared-prefix beam ABI: beams land in ``instance.completed`` with the
+    session-end token already appended, so the standard final assembly
+    (which appends it to active beams only) stays untouched.
+    """
+    from types import SimpleNamespace
+
+    from vllm_gr.entrypoints.openai.serving_engine import _p2d_eos_boundary
+
+    raw_token_ids = flat.token_ids
+    raw_logprobs = flat.logprobs
+    if len(raw_token_ids) > 0 and isinstance(raw_token_ids[0], (list, tuple)):
+        raw_token_ids = raw_token_ids[0]
+        raw_logprobs = raw_logprobs[0]
+    total_captured_beams = len(raw_token_ids) // num_steps
+
+    beams: list[BeamSearchSequence] = []
+    for beam_index in range(min(beam_width, total_captured_beams)):
+        offset = beam_index * num_steps
+        if int(raw_token_ids[offset]) < 0:
+            # Dead beam (fewer legal triples than the captured width).
+            continue
+        b_toks = [int(token_id) for token_id in raw_token_ids[offset : offset + num_steps]]
+        b_lps = [float(value) for value in raw_logprobs[offset : offset + num_steps]]
+        finish_reason = None
+        stop_reason = None
+        if eos_token_id is not None:
+            b_toks, finish_reason, stop_reason = _p2d_eos_boundary(b_toks, eos_token_id, ignore_eos)
+        gen_len = len(b_toks)
+        if sid_end_token_id is not None and stop_reason is None:
+            b_toks.append(sid_end_token_id)
+        beam = BeamSearchSequence(
+            orig_prompt=root.orig_prompt,
+            tokens=b_toks,
+            logprobs=root.logprobs,
+            lora_request=root.lora_request,
+            cum_logprob=sum(b_lps[:gen_len]),
+            finish_reason=finish_reason,
+            stop_reason=stop_reason,
+        )
+        beam._prompt_token_ids = root._prompt_token_ids
+        # Parent-pointer chain mirroring the per-step fork segments so the
+        # lazy logprob reconstruction replays the same step structure.
+        anchor = SimpleNamespace(_lp_step_data=None)
+        for step in range(gen_len):
+            anchor = SimpleNamespace(
+                _lp_step_data=(
+                    b_toks[step : step + 1],
+                    b_lps[step : step + 1],
+                    [1],
+                    [None],
+                ),
+                _lp_parent=anchor,
+            )
+        beam._lp_step_data = anchor._lp_step_data
+        beam._lp_parent = anchor._lp_parent
+        beams.append(beam)
+    return beams
+
+
 def _custom_beam_search_batch(
     llm_engine,
     instances_batch: list[BeamSearchInstance],
@@ -600,6 +687,11 @@ def _custom_beam_search_batch(
     _is_constrained = constraint_coordinator is not None and isinstance(
         constraint_coordinator.strategy, ConstraintTableStrategy
     )
+
+    # The Worker's P2D fast path generates exactly 1 + DEFAULT_DECODE_STEPS
+    # tokens per beam; the prefill output of such a batch arrives with the
+    # P2D sentinel rank and is consumed in one shot below.
+    p2d_num_steps = 1 + DEFAULT_DECODE_STEPS
 
     for token in token_iter:
         # Check if all instances are done
@@ -657,6 +749,43 @@ def _custom_beam_search_batch(
             result = outputs_map.get(search_id)
 
             if result is None:
+                continue
+
+            # P2D fast path: the Worker generated every decode step in a
+            # single graph replay and the flat logprobs carry the final beam
+            # tree keyed by the P2D sentinel rank.  Consume it directly and
+            # finish the instance — the per-step fork loop never runs for
+            # this session.
+            from vllm_gr.entrypoints.openai.serving_engine import _is_p2d_sentinel
+
+            p2d_flat = getattr(result.outputs[0], "logprobs", None)
+            if (
+                token == 0
+                and max_decode_steps == p2d_num_steps
+                and _is_p2d_sentinel(getattr(p2d_flat, "ranks", None))
+            ):
+                instance.completed.extend(
+                    _materialize_p2d_final_beams(
+                        flat=p2d_flat,
+                        root=instance.beams[0],
+                        beam_width=beam_width,
+                        num_steps=p2d_num_steps,
+                        ignore_eos=ignore_eos,
+                        eos_token_id=(
+                            sid_end_token_id
+                            if sid_end_token_id is not None
+                            else tokenizer.eos_token_id
+                        ),
+                        sid_end_token_id=sid_end_token_id,
+                    )
+                )
+                instance.beams = []
+                _beam_request_cleanup(
+                    llm_engine,
+                    session_id,
+                    instance_prev_beam_internal_ids[j],
+                )
+                instance_completed_sessions.add(j)
                 continue
 
             # Worker-side beam decision: when the accelerator
@@ -750,7 +879,7 @@ def _custom_beam_search_batch(
             # order used by its device-resident KV state. Keep that order.
             topn_idx = (
                 np.arange(all_beams_token_id.size, dtype=np.intp)
-                if worker_candidates is not None and not eos_beams
+                if worker_candidates is not None
                 else select_top_indices(
                     all_beams_logprob,
                     beam_width,

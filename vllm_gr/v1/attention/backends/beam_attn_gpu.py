@@ -68,31 +68,6 @@ def supports_sinks() -> bool:
     return bool(is_available() and flash_attn_supports_sinks())
 
 
-def cache_unshared_kv(
-    unshared_key: Any,
-    unshared_value: Any,
-    curr_key: Any,
-    curr_value: Any,
-    slot: int,
-    decode_step: int,
-    beam_session: object = None,  # unused on GPU; xllm-only contract
-) -> None:
-    """Cascade-mode pool write: slot/0-based semantics, unchanged behavior."""
-    from vllm_gr.v1.attention.backends.beam_kernels import (
-        cache_unshared_kv as _cache_unshared_kv,
-    )
-
-    del beam_session
-    _cache_unshared_kv(
-        unshared_key,
-        unshared_value,
-        curr_key,
-        curr_value,
-        slot,
-        decode_step,
-    )
-
-
 def reshape_and_cache(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -373,3 +348,221 @@ def cascade_attention(
             output[: attn_metadata.num_prefix_indices] = out
         else:
             output[attn_metadata.prefix_indices] = out
+
+
+def p2d_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: Any,
+    layer_idx: int,
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    vllm_flash_attn_version: int,
+    key_cache: torch.Tensor | None = None,
+    value_cache: torch.Tensor | None = None,
+    use_manual_suffix: bool = True,
+    kv_cache_dtype: str = "auto",
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """GPU execution for Prefill + 2 Decodes attention with paged KV cache (or static pool fallback)."""
+    del use_manual_suffix
+    pool = attn_metadata.p2d_pool
+    p2d_pass = attn_metadata.p2d_pass
+
+    if p2d_pass == 0:
+        # Pass 0: Prefill (works for both captured bucket and eager prefill)
+        num_tokens = query.shape[0]
+        slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+        if slot_mapping is not None and key_cache is not None and value_cache is not None:
+            reshape_and_cache(
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                slot_mapping=slot_mapping,
+                kv_cache_dtype=kv_cache_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        elif pool.prompt_kv is not None:
+            pool.prompt_kv[layer_idx, 0, :num_tokens].copy_(key, non_blocking=True)
+            pool.prompt_kv[layer_idx, 1, :num_tokens].copy_(value, non_blocking=True)
+
+        block_table = getattr(attn_metadata, "block_table", None)
+        seqused_k = getattr(attn_metadata, "seqused_k", None)
+        max_seqlen = getattr(attn_metadata, "bucket", None) or num_tokens
+        if (
+            block_table is not None
+            and key_cache is not None
+            and value_cache is not None
+            and seqused_k is not None
+        ):
+            max_seqlen_k = getattr(pool, "max_bucket", max_seqlen)
+            std_out = flash_attn_varlen_func(
+                q=query,
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q_0,
+                seqused_k=seqused_k,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=scale,
+                causal=True,
+                block_table=block_table,
+                fa_version=vllm_flash_attn_version,
+            )
+        else:
+            std_out = flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q_0,
+                cu_seqlens_k=attn_metadata.cu_seqlens_q_0,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=scale,
+                causal=True,
+                fa_version=vllm_flash_attn_version,
+            )
+        output[: std_out.shape[0]].copy_(std_out, non_blocking=True)
+
+    elif p2d_pass == 1:
+        # Pass 1: Decode 1
+        num_beams_total = query.shape[0]
+        pool.suffix_kv[layer_idx, 0, :num_beams_total, 0].copy_(key, non_blocking=True)
+        pool.suffix_kv[layer_idx, 1, :num_beams_total, 0].copy_(value, non_blocking=True)
+
+        block_table = getattr(attn_metadata, "block_table", None)
+        if (
+            block_table is not None
+            and key_cache is not None
+            and value_cache is not None
+            and getattr(attn_metadata, "seqused_k", None) is not None
+        ):
+            prefix_out, prefix_lse = flash_attn_varlen_func(
+                q=query,
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q_prefix,
+                seqused_k=attn_metadata.seqused_k,
+                max_seqlen_q=attn_metadata.beam_width,
+                max_seqlen_k=getattr(pool, "max_bucket", attn_metadata.bucket),
+                softmax_scale=scale,
+                causal=False,
+                block_table=block_table,
+                return_softmax_lse=True,
+                fa_version=vllm_flash_attn_version,
+            )
+        else:
+            assert pool.prompt_kv is not None, "Neither block_table nor prompt_kv is available"
+            prefix_out, prefix_lse = flash_attn_varlen_func(
+                q=query,
+                k=pool.prompt_kv[layer_idx, 0, : attn_metadata.total_prompt_tokens],
+                v=pool.prompt_kv[layer_idx, 1, : attn_metadata.total_prompt_tokens],
+                cu_seqlens_q=attn_metadata.cu_seqlens_q_prefix,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k_prompt,
+                max_seqlen_q=attn_metadata.beam_width,
+                max_seqlen_k=attn_metadata.bucket,
+                softmax_scale=scale,
+                causal=False,
+                return_softmax_lse=True,
+                fa_version=vllm_flash_attn_version,
+            )
+        suffix_out, suffix_lse = flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q_suffix,
+            cu_seqlens_k=attn_metadata.cu_seqlens_k_suffix_1,
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            softmax_scale=scale,
+            causal=True,
+            return_softmax_lse=True,
+            fa_version=vllm_flash_attn_version,
+        )
+        group_size = num_heads // num_kv_heads
+        if group_size > 1 and vllm_flash_attn_version != 3:
+            suffix_lse = (
+                suffix_lse.view(num_kv_heads, group_size, -1)
+                .transpose(1, 2)
+                .contiguous()
+                .view(num_heads, -1)
+            )
+        merge_attn_states(output, prefix_out, prefix_lse, suffix_out, suffix_lse)
+
+    elif p2d_pass == 2:
+        # Pass 2: Decode 2
+        num_beams_total = query.shape[0]
+        pool.suffix_kv[layer_idx, 0, :num_beams_total, 1].copy_(key, non_blocking=True)
+        pool.suffix_kv[layer_idx, 1, :num_beams_total, 1].copy_(value, non_blocking=True)
+
+        block_table = getattr(attn_metadata, "block_table", None)
+        if (
+            block_table is not None
+            and key_cache is not None
+            and value_cache is not None
+            and getattr(attn_metadata, "seqused_k", None) is not None
+        ):
+            prefix_out, prefix_lse = flash_attn_varlen_func(
+                q=query,
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q_prefix,
+                seqused_k=attn_metadata.seqused_k,
+                max_seqlen_q=attn_metadata.beam_width,
+                max_seqlen_k=getattr(pool, "max_bucket", attn_metadata.bucket),
+                softmax_scale=scale,
+                causal=False,
+                block_table=block_table,
+                return_softmax_lse=True,
+                fa_version=vllm_flash_attn_version,
+            )
+        else:
+            assert pool.prompt_kv is not None, "Neither block_table nor prompt_kv is available"
+            prefix_out, prefix_lse = flash_attn_varlen_func(
+                q=query,
+                k=pool.prompt_kv[layer_idx, 0, : attn_metadata.total_prompt_tokens],
+                v=pool.prompt_kv[layer_idx, 1, : attn_metadata.total_prompt_tokens],
+                cu_seqlens_q=attn_metadata.cu_seqlens_q_prefix,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k_prompt,
+                max_seqlen_q=attn_metadata.beam_width,
+                max_seqlen_k=attn_metadata.bucket,
+                softmax_scale=scale,
+                causal=False,
+                return_softmax_lse=True,
+                fa_version=vllm_flash_attn_version,
+            )
+        s_k = pool.suffix_kv[layer_idx, 0, :num_beams_total, 0:2].reshape(
+            -1, num_kv_heads, head_size
+        )
+        s_v = pool.suffix_kv[layer_idx, 1, :num_beams_total, 0:2].reshape(
+            -1, num_kv_heads, head_size
+        )
+        suffix_out, suffix_lse = flash_attn_varlen_func(
+            q=query,
+            k=s_k,
+            v=s_v,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q_suffix,
+            cu_seqlens_k=attn_metadata.cu_seqlens_k_suffix_2,
+            max_seqlen_q=1,
+            max_seqlen_k=2,
+            softmax_scale=scale,
+            causal=True,
+            return_softmax_lse=True,
+            fa_version=vllm_flash_attn_version,
+        )
+        group_size = num_heads // num_kv_heads
+        if group_size > 1 and vllm_flash_attn_version != 3:
+            suffix_lse = (
+                suffix_lse.view(num_kv_heads, group_size, -1)
+                .transpose(1, 2)
+                .contiguous()
+                .view(num_heads, -1)
+            )
+        merge_attn_states(output, prefix_out, prefix_lse, suffix_out, suffix_lse)

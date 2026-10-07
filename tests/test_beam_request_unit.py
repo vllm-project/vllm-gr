@@ -2134,3 +2134,30 @@ class TestWorkerDecisionFlatten:
             "out_log_probs": ["float32", [1, 2], 2],
         }
         assert _worker_decision_flatten(decision, 2, self._parents()) is None
+
+
+def test_beam_search_params_step_beam_widths_validation() -> None:
+    # Valid list and tuple; None stays None.
+    assert BeamSearchParams(
+        beam_width=32, max_tokens=1, step_beam_widths=[32, 64, 128]
+    ).step_beam_widths == [32, 64, 128]
+    assert BeamSearchParams(
+        beam_width=32, max_tokens=1, step_beam_widths=(32, 64, 128)
+    ).step_beam_widths == [32, 64, 128]
+    assert (
+        BeamSearchParams(beam_width=32, max_tokens=1, step_beam_widths=None).step_beam_widths
+        is None
+    )
+
+    for invalid in (
+        [32, 64],  # wrong length (2)
+        [32, 64, 128, 256],  # wrong length (4)
+        [32, -1, 128],  # negative
+        [32, 0, 128],  # zero
+        [32, 64, 257],  # exceeds MAX_BEAM_WIDTH
+        [32, True, 128],  # boolean
+        [32, "64", 128],  # string
+        "32,64,128",  # not a sequence
+    ):
+        with pytest.raises(VLLMValidationError, match="step_beam_widths"):
+            BeamSearchParams(beam_width=32, max_tokens=1, step_beam_widths=invalid)

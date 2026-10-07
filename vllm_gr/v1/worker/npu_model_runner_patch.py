@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from functools import wraps
 
 import torch
@@ -16,7 +17,6 @@ from vllm_gr.v1.worker.constraint_hook import (
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
-    _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
@@ -25,15 +25,19 @@ from vllm_gr.v1.worker.model_runner_common import (
     _beam_full_graph_ready,
     _beam_graph_enabled_for_run,
     _beam_remap_inputs,
+    _build_p2d_bookkeeping_result,
     _create_beam_context,
     _materialize_logits_indices,
     _reduce_sampler_output_for_worker_decision,
+    build_p2d_sampler_output,
+    patch_p2d_compute_logits_bypass,
 )
 from vllm_gr.v1.worker.prefill_graph_runner import (
-    SUPPORTED_NUM_REQS,
+    MONOLITHIC_MAX_PAD_RATIO,
+    MONOLITHIC_SUPPORTED_BUCKETS,
     get_prefill_graph_runner,
-    is_prefill_graph_enabled,
-    is_prefill_phase_batch,
+    is_p2d_eligible,
+    match_p2d_step_beam_widths,
 )
 
 logger = init_logger(__name__)
@@ -117,6 +121,10 @@ def make_patched_sample_npu(_orig_sample):
 
     @wraps(_orig_sample)
     def patched_sample(self, *args, **kwargs):
+        p2d_result = getattr(self, "_current_p2d_result", None)
+        if p2d_result is not None:
+            final_tokens = p2d_result[0]
+            return build_p2d_sampler_output(final_tokens)
         logits = args[0] if args else kwargs.get("logits")
         spec_decode_metadata = args[1] if len(args) > 1 else kwargs.get("spec_decode_metadata")
         sampler_output = try_sample_with_constraint_backend(
@@ -231,10 +239,45 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
     @wraps(_orig_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
-        if hasattr(self, "_beam_logprobs_cache") and self._beam_logprobs_cache:
-            if hasattr(scheduler_output, "finished_req_ids"):
-                for req_id in scheduler_output.finished_req_ids:
-                    self._beam_logprobs_cache.pop(req_id, None)
+        if (
+            hasattr(self, "_beam_logprobs_cache")
+            and self._beam_logprobs_cache
+            and hasattr(scheduler_output, "finished_req_ids")
+        ):
+            for req_id in scheduler_output.finished_req_ids:
+                self._beam_logprobs_cache.pop(req_id, None)
+
+        p2d_result = getattr(self, "_current_p2d_result", None)
+        if p2d_result is not None:
+            self._current_p2d_result = None
+            logger.debug("P2D: processing p2d_result in NPU bookkeeping sync")
+            final_tokens = p2d_result[0]
+            final_cum_lps = p2d_result[1]
+            valid_beam_counts = p2d_result[2] if len(p2d_result) > 2 else None
+            step_scores = p2d_result[3] if len(p2d_result) > 3 else None
+            sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+            (
+                p2d_logprobs_lists,
+                valid_sampled_token_ids,
+                req_ids_output_copy,
+                req_id_to_index_output_copy,
+                invalid_req_indices,
+            ) = _build_p2d_bookkeeping_result(
+                self,
+                final_tokens,
+                final_cum_lps,
+                valid_beam_counts,
+                sampler_output,
+                step_scores,
+            )
+            return (
+                p2d_logprobs_lists,
+                valid_sampled_token_ids,
+                {},
+                req_ids_output_copy,
+                req_id_to_index_output_copy,
+                invalid_req_indices,
+            )
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
@@ -782,9 +825,7 @@ make_patched_determine_batch_execution_and_padding = (
 
 
 def make_patched_model_forward_npu(_orig_model_forward):
-    """Wrap _model_forward to intercept and replay pure prefill NPU graphs."""
-    if getattr(_orig_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, False):
-        return _orig_model_forward
+    """Wrap _model_forward to intercept P2D and pure-prefill NPU graphs."""
 
     @wraps(_orig_model_forward)
     def patched_model_forward(
@@ -796,8 +837,17 @@ def make_patched_model_forward_npu(_orig_model_forward):
         inputs_embeds=None,
         **model_kwargs,
     ):
+        self._current_p2d_result = None
+        patch_p2d_compute_logits_bypass(self)
+
         scheduler_output = getattr(self, "_current_scheduler_output", None)
         if scheduler_output is not None:
+            from vllm_gr.v1.worker.prefill_graph_runner import (
+                SUPPORTED_NUM_REQS,
+                is_prefill_graph_enabled,
+                is_prefill_phase_batch,
+            )
+
             if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
                 p_runner = get_prefill_graph_runner(self)
 
@@ -815,22 +865,223 @@ def make_patched_model_forward_npu(_orig_model_forward):
                     )
 
                 if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
+                    # Current-batch attention metadata (built by
+                    # _prepare_inputs, published via the forward context) is
+                    # the source for the live slot mapping and block table.
+                    live_meta = None
+                    try:
+                        from vllm.forward_context import get_forward_context
+
+                        attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
+                        if isinstance(attn_metadata, dict) and attn_metadata:
+                            live_meta = next(iter(attn_metadata.values()))
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("Could not get attention metadata: %r", e)
+
+                    # 1. First priority: P2D (3-tier: monolithic / stepwise / eager-on-device)
+                    step_bws = match_p2d_step_beam_widths(self, scheduler_output)
+                    if (
+                        step_bws is not None
+                        and live_meta is not None
+                        and is_p2d_eligible(
+                            self,
+                            scheduler_output,
+                            num_reqs,
+                            total_tokens,
+                            None,
+                            step_bws=step_bws,
+                        )
+                    ):
+                        w0, w1, w2 = step_bws
+                        block_table = getattr(live_meta, "block_table", None)
+                        slot_mapping = getattr(live_meta, "slot_mapping", None)
+
+                        computed_tokens: list[int] = []
+                        input_batch = getattr(self, "input_batch", None)
+                        if input_batch is not None:
+                            comp = getattr(input_batch, "num_computed_tokens_cpu", None)
+                            if comp is not None:
+                                req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+                                if (
+                                    isinstance(raw_scheduled_tokens, dict)
+                                    and req_id_to_index is not None
+                                ):
+                                    for req_id in raw_scheduled_tokens:
+                                        row = req_id_to_index.get(req_id, 0)
+                                        computed_tokens.append(int(comp[row]))
+                                else:
+                                    for r in range(num_reqs):
+                                        computed_tokens.append(int(comp[r]))
+
+                        p2d_mode = os.environ.get("VLLM_GR_P2D_MODE", "auto").lower()
+                        if p2d_mode == "auto":
+                            scheduled_new_reqs = getattr(
+                                scheduler_output, "scheduled_new_reqs", None
+                            )
+                            if scheduled_new_reqs:
+                                for req in scheduled_new_reqs:
+                                    sp = getattr(req, "sampling_params", None)
+                                    eb = getattr(sp, "extra_body", None)
+                                    if isinstance(eb, dict) and "p2d_mode" in eb:
+                                        p2d_mode = str(eb["p2d_mode"]).lower()
+                                        break
+
+                        # --- Tier 1: monolithic graph (uniform widths only) ---
+                        p2d_bucket = (
+                            p_runner.match_p2d_bucket(total_tokens)
+                            if hasattr(p_runner, "match_p2d_bucket")
+                            else None
+                        )
+                        use_monolithic = False
+                        if step_bws.is_uniform:
+                            has_mono = (
+                                p2d_bucket is not None
+                                and hasattr(p_runner, "has_monolithic_graph")
+                                and p_runner.has_monolithic_graph(p2d_bucket, num_reqs, w0)
+                            )
+                            if p2d_mode == "monolithic":
+                                use_monolithic = bool(has_mono)
+                            elif (
+                                p2d_mode != "eager_p2d"
+                                and p2d_bucket is not None
+                                and p2d_bucket in MONOLITHIC_SUPPORTED_BUCKETS
+                                and has_mono
+                            ):
+                                pad_tokens = p2d_bucket - total_tokens
+                                pad_ratio = pad_tokens / float(total_tokens)
+                                if pad_ratio <= MONOLITHIC_MAX_PAD_RATIO:
+                                    use_monolithic = True
+
+                        if use_monolithic and p2d_bucket is not None:
+                            p2d_res = p_runner.execute_p2d(
+                                bucket=p2d_bucket,
+                                input_ids=input_ids,
+                                positions=positions,
+                                num_scheduled_tokens=raw_scheduled_tokens,
+                                beam_width=w0,
+                                block_table=block_table,
+                                slot_mapping=slot_mapping,
+                                computed_tokens=computed_tokens,
+                            )
+                            if p2d_res is not None:
+                                self._current_p2d_result = p2d_res
+                                logger.debug(
+                                    "P2D NPU Replay: monolithic graph "
+                                    "(bucket=%d, reqs=%d, bw=%d, %d actual tokens).",
+                                    p2d_bucket,
+                                    num_reqs,
+                                    w0,
+                                    total_tokens,
+                                )
+                                if hasattr(p_runner, "get_output_buf"):
+                                    return p_runner.get_output_buf(total_tokens, self.model_config)
+                                return torch.zeros(
+                                    (total_tokens, self.model_config.get_hidden_size()),
+                                    dtype=self.model_config.dtype,
+                                    device=self.device,
+                                )
+
+                        # Tiers 2/3: prefill stage (prefill graph replay first,
+                        # eager fallback) + stepwise or eager-on-device chain.
+                        if p2d_mode != "monolithic":
+                            bucket = p_runner.match_bucket(total_tokens)
+                            hidden = None
+                            if (
+                                bucket is not None
+                                and p_runner.has_captured_graph(bucket, num_reqs)
+                                and slot_mapping is not None
+                            ):
+                                hidden = p_runner.execute_model_prefill(
+                                    bucket=bucket,
+                                    input_ids=input_ids,
+                                    positions=positions,
+                                    slot_mapping=slot_mapping,
+                                    num_scheduled_tokens=raw_scheduled_tokens,
+                                )
+                            if hidden is None:
+                                hidden = _orig_model_forward(
+                                    self,
+                                    num_tokens_padded,
+                                    input_ids,
+                                    positions,
+                                    intermediate_tensors,
+                                    inputs_embeds,
+                                    **model_kwargs,
+                                )
+                            sample_indices = p_runner.get_prefill_logit_indices(
+                                raw_scheduled_tokens
+                            )
+
+                            # Legacy uniform Eager-P + 2D graph path.
+                            if (
+                                step_bws.is_uniform
+                                and hasattr(p_runner, "has_2d_graph")
+                                and p_runner.has_2d_graph(num_reqs, w0)
+                            ):
+                                p2d_res = p_runner.execute_decode_p2d(
+                                    runner=self,
+                                    hidden=hidden,
+                                    block_table=block_table,
+                                    num_scheduled_tokens=raw_scheduled_tokens,
+                                    beam_width=w0,
+                                    computed_tokens=computed_tokens,
+                                )
+                                tier_name = "2D"
+                            elif (
+                                hasattr(p_runner, "has_decode_step_graph")
+                                and p_runner.has_decode_step_graph(1, num_reqs, w0)
+                                and p_runner.has_decode_step_graph(2, num_reqs, w1)
+                            ):
+                                # Tier 2: decoupled decode-step graphs.
+                                p2d_res = p_runner.execute_stepwise_p2d(
+                                    runner=self,
+                                    hidden=hidden,
+                                    sample_indices=sample_indices,
+                                    num_scheduled_tokens=raw_scheduled_tokens,
+                                    computed_tokens=computed_tokens,
+                                    step_bws=step_bws,
+                                    block_table=block_table,
+                                    slot_mapping=slot_mapping,
+                                )
+                                tier_name = "Stepwise"
+                            else:
+                                # Tier 3: on-device eager P2D (exact widths).
+                                p2d_res = p_runner.execute_eager_p2d_stepped(
+                                    runner=self,
+                                    hidden=hidden,
+                                    sample_indices=sample_indices,
+                                    num_scheduled_tokens=raw_scheduled_tokens,
+                                    computed_tokens=computed_tokens,
+                                    step_bws=step_bws,
+                                    block_table=block_table,
+                                    slot_mapping=slot_mapping,
+                                )
+                                tier_name = "Eager-on-device"
+                            if p2d_res is not None:
+                                self._current_p2d_result = p2d_res
+                                logger.debug(
+                                    "P2D NPU Replay: %s (reqs=%d, w=(%d, %d, %d), %d actual tokens).",
+                                    tier_name,
+                                    num_reqs,
+                                    w0,
+                                    w1,
+                                    w2,
+                                    total_tokens,
+                                )
+                                if hasattr(p_runner, "get_output_buf"):
+                                    return p_runner.get_output_buf(total_tokens, self.model_config)
+                                return torch.zeros(
+                                    (total_tokens, self.model_config.get_hidden_size()),
+                                    dtype=self.model_config.dtype,
+                                    device=self.device,
+                                )
+
+                    # 2. Standard prefill graph fallback
                     bucket = p_runner.match_bucket(total_tokens)
                     if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
-                        # Extract the current batch's slot mapping from the
-                        # attention metadata built by _prepare_inputs. The
-                        # metadata is published in the forward context by
-                        # execute_model; NPUModelRunner does not store it as
-                        # a runner attribute.
-                        slot_mapping = None
-                        try:
-                            from vllm.forward_context import get_forward_context
-
-                            attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
-                            if isinstance(attn_metadata, dict) and attn_metadata:
-                                slot_mapping = next(iter(attn_metadata.values())).slot_mapping
-                        except Exception as e:  # noqa: BLE001
-                            logger.debug("Could not get slot_mapping: %r", e)
+                        slot_mapping = (
+                            getattr(live_meta, "slot_mapping", None) if live_meta else None
+                        )
 
                         output_buf = p_runner.execute_model_prefill(
                             bucket=bucket,
@@ -860,37 +1111,43 @@ def make_patched_model_forward_npu(_orig_model_forward):
             **model_kwargs,
         )
 
-    setattr(patched_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, True)
     return patched_model_forward
 
 
-def capture_prefill_graphs(runner) -> None:
-    """Startup capture of the pure-prefill NPU graphs (one per bucket).
+make_patched_prepare_inputs = make_patched_prepare_inputs_npu
+make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_npu
 
-    Chained after the beam decode-graph capture in ``capture_model``; runs
-    only when the prefill graph env gate is enabled. Every failure falls back
-    to eager prefill (the interception simply never matches a bucket).
-    """
-    if not is_prefill_graph_enabled():
-        return
-    if getattr(runner, "_prefill_graphs_captured", False):
-        return
-    try:
-        # Mirror the beam decode-graph capture: run the prefill capture on a
-        # dedicated side stream ordered against the default stream (the
-        # native capture_stream context is gone once capture_model returns).
-        side = torch.npu.Stream(device=runner.device)
-        side.wait_stream(torch.npu.current_stream())
-        with torch.npu.stream(side):
-            p_runner = get_prefill_graph_runner(runner)
-            p_runner.capture_graphs(runner)
-        torch.npu.current_stream().wait_stream(side)
-        torch.npu.synchronize()
-        runner._prefill_graphs_captured = True
-    except Exception:
-        logger.exception(
-            "vllm-gr: prefill NPU graph capture failed; prefill will fall back to eager"
+
+def make_patched_capture_cudagraphs_npu(_orig_capture_cudagraphs):
+    """Wrap _capture_cudagraphs to capture prefill graphs during warmup (GPU parity)."""
+
+    @wraps(_orig_capture_cudagraphs)
+    def patched_capture_cudagraphs(
+        self, batch_descriptors, cudagraph_runtime_mode, *args, **kwargs
+    ):
+        res = _orig_capture_cudagraphs(
+            self, batch_descriptors, cudagraph_runtime_mode, *args, **kwargs
         )
 
+        # Trigger prefill graph capture once when FULL decode graphs are being captured
+        from vllm.config import CUDAGraphMode
 
+        from vllm_gr.v1.worker.prefill_graph_runner import is_prefill_graph_enabled
+
+        if (
+            is_prefill_graph_enabled()
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not getattr(self, "_prefill_graphs_captured", False)
+        ):
+            self._prefill_graphs_captured = True
+            p_runner = get_prefill_graph_runner(self)
+            p_runner.capture_graphs(self)
+
+        return res
+
+    return patched_capture_cudagraphs
+
+
+make_patched_capture_cudagraphs = make_patched_capture_cudagraphs_npu
 make_patched_model_forward = make_patched_model_forward_npu
+make_patched_sample = make_patched_sample_npu

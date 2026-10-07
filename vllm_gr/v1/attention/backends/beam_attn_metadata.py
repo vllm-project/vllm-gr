@@ -136,6 +136,7 @@ class BeamAttentionMetadata:
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
+    _fixed_buffers: bool = False
 
     @staticmethod
     def build_async_layout(

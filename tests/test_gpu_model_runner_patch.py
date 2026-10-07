@@ -5,12 +5,14 @@
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
 from vllm_gr.v1.worker import model_runner_common as common
+from vllm_gr.v1.worker import prefill_graph_common
 
 
 def test_async_scheduling_decode_bypasses_prefill_graph_dispatch(
@@ -410,6 +412,8 @@ def test_gpu_bookkeeping_reuses_host_ready_prefill_views(
 ) -> None:
     from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 
+    from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch_mod
+
     width = 4
     original_batch = SimpleNamespace()
     host_ids = torch.tensor([[31, 32, 33, 34]], dtype=torch.int32)
@@ -459,6 +463,7 @@ def test_gpu_bookkeeping_reuses_host_ready_prefill_views(
             [],
         )
 
+    monkeypatch.setattr(gpu_patch_mod, "is_prefill_graph_enabled", lambda: True)
     monkeypatch.setattr(
         gpu_patch,
         "_beam_collapse_bookkeeping",
@@ -1058,167 +1063,722 @@ def test_create_beam_context_uses_grconfig_params() -> None:
         assert call_kwargs["max_batch"] == 1
 
 
-def test_create_beam_context_dtype_from_model_config() -> None:
-    """dtype must come from model_config.dtype, not hardcoded."""
-    from unittest.mock import MagicMock, patch
+def test_gpu_sample_bypasses_sampler_when_p2d_active() -> None:
+    original_calls = []
 
-    gr_cfg = SimpleNamespace(beam_max_width=32, beam_max_decode_steps=5)
+    def original_sample(self: Any, logits: Any, spec_decode_metadata: Any) -> Any:
+        original_calls.append((logits, spec_decode_metadata))
+        return "orig_sample_out"
+
+    wrapped = gpu_patch.make_patched_sample(original_sample)
+    assert gpu_patch.make_patched_sample(wrapped) is wrapped
+
+    # 1. When _current_p2d_result is None -> calls original sampler
+    runner = SimpleNamespace(_current_p2d_result=None)
+    res = wrapped(runner, "dummy_logits", "spec_meta")
+    assert res == "orig_sample_out"
+    assert len(original_calls) == 1
+
+    # 2. When _current_p2d_result is set -> bypasses original sampler
+    final_tokens = torch.tensor([[[42, 100, 200]], [[43, 101, 201]]], dtype=torch.int64)
+    final_cum_lps = torch.tensor([[-0.5], [-0.8]], dtype=torch.float32)
+    runner._current_p2d_result = (final_tokens, final_cum_lps)
+
+    p2d_res = wrapped(runner, "dummy_logits", "spec_meta")
+    assert len(original_calls) == 1  # Not called!
+    assert p2d_res.sampled_token_ids.tolist() == [[42], [43]]
+    assert p2d_res.logprobs_tensors is None
+
+
+def test_gpu_compute_logits_bypasses_gemm_when_p2d_active() -> None:
+    original_calls = []
+
+    class FakeModel:
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            original_calls.append(hidden_states)
+            return torch.full((hidden_states.shape[0], 1000), 1.0)
+
+    model = FakeModel()
     runner = SimpleNamespace(
-        model_config=SimpleNamespace(
-            get_num_kv_heads=lambda pc: 4,
-            get_head_size=lambda: 96,
-            get_num_layers=lambda pc: 1,
-            dtype=torch.bfloat16,
+        model=model,
+        model_config=SimpleNamespace(dtype=torch.float32),
+        _current_scheduler_output=None,
+    )
+
+    def dummy_forward(
+        self: Any, input_ids: Any = None, positions: Any = None, *args: Any, **kwargs: Any
+    ) -> Any:
+        return "forward_out"
+
+    wrapped_forward = gpu_patch.make_patched_model_forward_gpu(dummy_forward)
+    wrapped_forward(runner)
+
+    # When _current_p2d_result is None -> calls original compute_logits
+    runner._current_p2d_result = None
+    hidden = torch.randn(2, 64)
+    logits = runner.model.compute_logits(hidden)
+    assert logits.shape == (2, 1000)
+    assert len(original_calls) == 1
+
+    # When _current_p2d_result is set -> skips GEMM, returns (batch, 1)
+    runner._current_p2d_result = ("fake_tokens", "fake_lps")
+    fast_logits = runner.model.compute_logits(hidden)
+    assert fast_logits.shape == (2, 1)
+    assert len(original_calls) == 1  # GEMM was skipped!
+
+    # Stale _current_p2d_result must be cleared at start of next forward
+    runner._current_p2d_result = ("stale_tokens", "stale_lps")
+    wrapped_forward(runner)
+    assert runner._current_p2d_result is None
+    normal_logits = runner.model.compute_logits(hidden)
+    assert normal_logits.shape == (2, 1000)
+    assert len(original_calls) == 2
+
+
+def test_gpu_model_forward_returns_output_buf_on_p2d(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_buf = torch.zeros((512, 64), dtype=torch.bfloat16)
+
+    class DummyGraphRunner:
+        def match_p2d_bucket(self, total_tokens: int) -> int:
+            return 512
+
+        def execute_p2d(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                torch.zeros((1, 32, 3), dtype=torch.int64),
+                torch.zeros((1, 32), dtype=torch.float32),
+            )
+
+        def __init__(self) -> None:
+            self.buffers: dict[int, Any] = {
+                512: SimpleNamespace(
+                    has_captured_graph=lambda num_reqs, bw: True,
+                    output_buf=expected_buf,
+                )
+            }
+
+    p_runner = DummyGraphRunner()
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_GR_P2D_MODE", "monolithic")
+    monkeypatch.setattr(
+        gpu_patch,
+        "is_prefill_phase_batch",
+        lambda self, scheduler_output: scheduler_output.pure,
+    )
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda runner: p_runner)
+    from vllm_gr.v1.worker.prefill_graph_common import StepBeamWidths
+
+    monkeypatch.setattr(
+        gpu_patch, "match_p2d_step_beam_widths", lambda r, s: StepBeamWidths(32, 32, 32)
+    )
+    monkeypatch.setattr(gpu_patch, "is_p2d_eligible", lambda *args, **kwargs: True)
+
+    def dummy_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return "orig_out"
+
+    wrapped = gpu_patch.make_patched_model_forward_gpu(dummy_forward)
+    runner = SimpleNamespace(
+        _current_scheduler_output=SimpleNamespace(
+            pure=True,
+            total_num_scheduled_tokens=500,
+            num_scheduled_tokens={"r1": 500},
         ),
-        parallel_config=SimpleNamespace(),
+        input_batch=SimpleNamespace(req_ids=["r1"]),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
         device=torch.device("cpu"),
     )
 
-    with patch("vllm_gr.v1.beam.beam_attention_context.BeamAttentionContext") as MockCtx:
-        MockCtx.return_value = MagicMock()
-        gpu_patch._create_beam_context(runner, gr_cfg)
-        call_kwargs = MockCtx.call_args[1]
-        assert call_kwargs["dtype"] is torch.bfloat16
+    out = wrapped(runner, input_ids=torch.zeros(500), positions=torch.zeros(500))
+    assert out is expected_buf
+    assert runner._current_p2d_result is not None
 
 
-# ---------------------------------------------------------------------------
-# _capture_create_dummy_context — dummy session setup
-# ---------------------------------------------------------------------------
-
-
-def test_capture_create_dummy_context_creates_session_and_beam_info() -> None:
-    """_capture_create_dummy_context must create a session with correct width/prefix."""
-    from unittest.mock import MagicMock, patch
-
-    gr_cfg = SimpleNamespace(beam_max_width=128, beam_max_decode_steps=5)
-
-    with patch("vllm_gr.v1.worker.gpu_model_runner_patch._create_beam_context") as mock_create:
-        mock_context = MagicMock()
-        mock_context.registry.allocate.return_value = 0
-        mock_create.return_value = mock_context
-
-        with patch("vllm_gr.v1.beam.beam_search_session.BeamSearchSession") as MockSession:
-            mock_session = MagicMock()
-            MockSession.return_value = mock_session
-
-            runner = SimpleNamespace(
-                model_config=SimpleNamespace(),
-                parallel_config=SimpleNamespace(),
-                device=torch.device("cpu"),
-            )
-
-            _context, _session, beam_info, batch_descriptor = (
-                gpu_patch._capture_create_dummy_context(
-                    runner, gr_cfg, width=4, steps_upper=5, prefix_len=1024
-                )
-            )
-
-            # Session created with correct params
-            MockSession.assert_called_once_with(
-                session_id=gpu_patch._BEAM_DUMMY_REQ_ID, slot=0, context=mock_context
-            )
-            mock_session.begin_session.assert_called_once_with(4, 1024)
-
-            # beam_info contains the dummy request
-            assert gpu_patch._BEAM_DUMMY_REQ_ID in beam_info["beam_data"]
-            dummy_mdata = beam_info["beam_data"][gpu_patch._BEAM_DUMMY_REQ_ID]
-            assert dummy_mdata["beam_width"] == 4
-            assert dummy_mdata["prefix_len"] == 1024
-            assert dummy_mdata["is_beam_decode"] is True
-
-            # beam_session linked
-            assert beam_info["beam_session"] is mock_session
-
-            # batch_descriptor matches width
-            from vllm.v1.cudagraph_dispatcher import BatchDescriptor
-
-            assert batch_descriptor == BatchDescriptor(num_tokens=4, uniform=True)
-
-
-# ---------------------------------------------------------------------------
-# Beam graph readiness uses the current Worker's registry.
-# ---------------------------------------------------------------------------
-
-
-def test_beam_full_graph_ready_uses_worker_registry() -> None:
-    runner = SimpleNamespace(_beam_decode_graph=SimpleNamespace(width=4, ready=True))
-    assert common._beam_full_graph_ready(runner, 4)
-    assert not common._beam_full_graph_ready(runner, 8)
-    runner._beam_decode_graph.ready = False
-    assert not common._beam_full_graph_ready(runner, 4)
-
-
-def test_beam_full_graph_ready_ignores_other_native_graphs() -> None:
-    from unittest.mock import MagicMock, patch
-
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
-
-    wrapper = SimpleNamespace(
-        runtime_mode=CUDAGraphMode.FULL,
-        concrete_cudagraph_entries={BatchDescriptor(num_tokens=4, uniform=True): MagicMock()},
-    )
-    with patch("vllm.compilation.cuda_graph.CUDAGraphWrapper._all_instances", [wrapper]):
-        assert not common._beam_full_graph_ready(SimpleNamespace(), 4)
-
-
-# ---------------------------------------------------------------------------
-# Persistent postprocess workspace load hook
-# ---------------------------------------------------------------------------
-
-
-def test_postprocess_workspace_load_wrapper_initializes_after_model_load(
+def test_gpu_model_forward_routes_excessive_padding_to_eager_p2d(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, object]] = []
+    calls = []
 
-    def original(runner: Any, marker: Any) -> str:
-        calls.append(("load", marker))
-        return "loaded"
+    class MockGraphRunner:
+        def match_p2d_bucket(self, total_tokens: int) -> int:
+            # 2500 tokens matched to 4096 bucket (pad ratio = 1596 / 2500 = 63.8% > 2% threshold)
+            return 4096
 
-    def initialize(runner: Any) -> None:
-        calls.append(("workspace", runner))
+        def has_captured_graph(self, bucket: int, num_reqs: int, bw: int) -> bool:
+            return True
 
-    monkeypatch.setattr(gpu_patch, "initialize_beam_postprocess_workspaces", initialize)
-    wrapped = gpu_patch.make_load_model_with_beam_postprocess_workspace(original)
-    runner = SimpleNamespace()
+        def has_2d_graph(self, num_reqs: int, bw: int) -> bool:
+            return True
 
-    assert wrapped(runner, "weights") == "loaded"
-    assert calls == [("load", "weights"), ("workspace", runner)]
-    assert gpu_patch.make_load_model_with_beam_postprocess_workspace(wrapped) is wrapped
+        def execute_p2d(self, **kwargs: Any) -> Any:
+            calls.append("execute_p2d")
+            return None
+
+        def execute_eager_p2d(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append("execute_eager_p2d")
+            return (
+                torch.zeros((1, 32, 3), dtype=torch.int64),
+                torch.zeros((1, 32), dtype=torch.float32),
+            )
+
+        def get_output_buf(self, total_tokens: int, model_config: Any) -> torch.Tensor:
+            return torch.zeros((total_tokens, 64), dtype=torch.bfloat16)
+
+    p_runner = MockGraphRunner()
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_GR_P2D_MODE", "eager_p2d")
+    monkeypatch.setattr(
+        gpu_patch,
+        "is_prefill_phase_batch",
+        lambda self, scheduler_output: scheduler_output.pure,
+    )
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda runner: p_runner)
+    from vllm_gr.v1.worker.prefill_graph_common import StepBeamWidths
+
+    monkeypatch.setattr(
+        gpu_patch, "match_p2d_step_beam_widths", lambda r, s: StepBeamWidths(32, 32, 32)
+    )
+    monkeypatch.setattr(gpu_patch, "is_p2d_eligible", lambda *args, **kwargs: True)
+
+    def dummy_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return "orig_out"
+
+    wrapped = gpu_patch.make_patched_model_forward_gpu(dummy_forward)
+    runner = SimpleNamespace(
+        _current_scheduler_output=SimpleNamespace(
+            pure=True,
+            total_num_scheduled_tokens=2500,
+            num_scheduled_tokens={"r1": 2500},
+        ),
+        input_batch=SimpleNamespace(req_ids=["r1"]),
+        model_config=SimpleNamespace(dtype=torch.bfloat16, get_hidden_size=lambda: 64),
+        device=torch.device("cpu"),
+    )
+
+    out = wrapped(runner, input_ids=torch.zeros(2500), positions=torch.zeros(2500))
+    # Must NOT have called execute_p2d because padding (1596 tokens, 63.8%) exceeds dynamic threshold
+    assert "execute_p2d" not in calls
+    # Must have called execute_eager_p2d
+    assert "execute_eager_p2d" in calls
+    assert out.shape[0] >= 2500
+    assert runner._current_p2d_result is not None
 
 
-def test_postprocess_workspace_load_wrapper_accounts_device_memory(
+def test_gpu_model_forward_routes_prefix_cached_to_eager_p2d(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workspace_pool = SimpleNamespace(device_memory_bytes=37)
+    calls = []
+    received_kwargs = {}
 
-    def original(runner: Any) -> str:
-        # Native load_model recomputes this value on every model load.
-        runner.model_memory_usage = 100
-        return "loaded"
+    class MockGraphRunner:
+        def match_p2d_bucket(self, total_tokens: int) -> int:
+            return 512
 
+        def has_captured_graph(self, bucket: int, num_reqs: int, bw: int) -> bool:
+            return True
+
+        def has_2d_graph(self, num_reqs: int, bw: int) -> bool:
+            return True
+
+        def execute_p2d(self, **kwargs: Any) -> Any:
+            calls.append("execute_p2d")
+            return None
+
+        def execute_eager_p2d(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append("execute_eager_p2d")
+            received_kwargs.update(kwargs)
+            return (
+                torch.zeros((1, 32, 3), dtype=torch.int64),
+                torch.zeros((1, 32), dtype=torch.float32),
+            )
+
+        def get_output_buf(self, total_tokens: int, model_config: Any) -> torch.Tensor:
+            return torch.zeros((total_tokens, 64), dtype=torch.bfloat16)
+
+    p_runner = MockGraphRunner()
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_GR_P2D_MODE", "eager_p2d")
     monkeypatch.setattr(
         gpu_patch,
-        "initialize_beam_postprocess_workspaces",
-        lambda runner: workspace_pool,
+        "is_prefill_phase_batch",
+        lambda self, scheduler_output: scheduler_output.pure,
     )
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda runner: p_runner)
+    from vllm_gr.v1.worker.prefill_graph_common import StepBeamWidths
+
+    monkeypatch.setattr(
+        gpu_patch, "match_p2d_step_beam_widths", lambda r, s: StepBeamWidths(32, 32, 32)
+    )
+    monkeypatch.setattr(gpu_patch, "is_p2d_eligible", lambda *args, **kwargs: True)
+
+    def dummy_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return "orig_out"
+
+    wrapped = gpu_patch.make_patched_model_forward_gpu(dummy_forward)
+
+    mock_block_table = torch.zeros((1, 10), dtype=torch.int32)
+    mock_slot_mapping = torch.zeros((400,), dtype=torch.int64)
+
+    class MockBlockTableItem:
+        def get_device_tensor(self, num_reqs: int) -> torch.Tensor:
+            return mock_block_table
+
+        slot_mapping = SimpleNamespace(gpu=mock_slot_mapping)
+
+    # total scheduled = 400 with bucket = 512 -> pad = 112 (28% > 5% max pad ratio) -> eager_p2d
+    runner = SimpleNamespace(
+        _current_scheduler_output=SimpleNamespace(
+            pure=True,
+            total_num_scheduled_tokens=400,
+            num_scheduled_tokens={"r1": 400},
+        ),
+        input_batch=SimpleNamespace(
+            req_ids=["r1"],
+            req_id_to_index={"r1": 0},
+            num_computed_tokens_cpu=np.array([128], dtype=np.int32),
+            block_table=[MockBlockTableItem()],
+        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16, get_hidden_size=lambda: 64),
+        device=torch.device("cpu"),
+    )
+
+    out = wrapped(runner, input_ids=torch.zeros(400), positions=torch.zeros(400))
+    assert out is not None
+    # Must NOT have called monolithic execute_p2d because padding exceeds 5%
+    assert "execute_p2d" not in calls
+    # Must have called execute_eager_p2d
+    assert "execute_eager_p2d" in calls
+    assert received_kwargs.get("computed_tokens") == [128]
+    assert received_kwargs.get("block_table") is mock_block_table
+    rec_slot = received_kwargs.get("slot_mapping")
+    assert isinstance(rec_slot, torch.Tensor)
+    assert torch.equal(rec_slot, mock_slot_mapping)
+    assert runner._current_p2d_result is not None
+
+
+def test_gpu_model_forward_routes_prefix_cached_to_monolithic_p2d(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    received_kwargs = {}
+
+    class MockGraphRunner:
+        def match_p2d_bucket(self, total_tokens: int) -> int:
+            return 512
+
+        def has_captured_graph(self, bucket: int, num_reqs: int, bw: int) -> bool:
+            return True
+
+        def has_2d_graph(self, num_reqs: int, bw: int) -> bool:
+            return True
+
+        def execute_p2d(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append("execute_p2d")
+            received_kwargs.update(kwargs)
+            return (
+                torch.zeros((1, 32, 3), dtype=torch.int64),
+                torch.zeros((1, 32), dtype=torch.float32),
+            )
+
+        def execute_eager_p2d(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append("execute_eager_p2d")
+            return (
+                torch.zeros((1, 32, 3), dtype=torch.int64),
+                torch.zeros((1, 32), dtype=torch.float32),
+            )
+
+        def get_output_buf(self, total_tokens: int, model_config: Any) -> torch.Tensor:
+            return torch.zeros((total_tokens, 64), dtype=torch.bfloat16)
+
+    p_runner = MockGraphRunner()
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_GR_P2D_MODE", "monolithic")
     monkeypatch.setattr(
         gpu_patch,
-        "_install_cuda_prefill_compute_logits_hook",
-        lambda runner: False,
+        "is_prefill_phase_batch",
+        lambda self, scheduler_output: scheduler_output.pure,
     )
-    wrapped = gpu_patch.make_load_model_with_beam_postprocess_workspace(original)
-    runner = SimpleNamespace()
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda runner: p_runner)
+    from vllm_gr.v1.worker.prefill_graph_common import StepBeamWidths
 
-    assert wrapped(runner) == "loaded"
-    assert runner.model_memory_usage == 137
-    # Reusing an existing pool after reload must be accounted once relative
-    # to the freshly measured model memory, rather than accumulated twice.
-    assert wrapped(runner) == "loaded"
-    assert runner.model_memory_usage == 137
+    monkeypatch.setattr(
+        gpu_patch, "match_p2d_step_beam_widths", lambda r, s: StepBeamWidths(32, 32, 32)
+    )
+    monkeypatch.setattr(gpu_patch, "is_p2d_eligible", lambda *args, **kwargs: True)
+
+    def dummy_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return "orig_out"
+
+    wrapped = gpu_patch.make_patched_model_forward_gpu(dummy_forward)
+
+    mock_block_table = torch.zeros((1, 10), dtype=torch.int32)
+    mock_slot_mapping = torch.zeros((500,), dtype=torch.int64)
+
+    class MockBlockTableItem:
+        def get_device_tensor(self, num_reqs: int) -> torch.Tensor:
+            return mock_block_table
+
+        slot_mapping = SimpleNamespace(gpu=mock_slot_mapping)
+
+    # total scheduled = 500 with bucket = 512 -> pad = 12 (2.4% <= 5% max pad ratio) -> monolithic
+    runner = SimpleNamespace(
+        _current_scheduler_output=SimpleNamespace(
+            pure=True,
+            total_num_scheduled_tokens=500,
+            num_scheduled_tokens={"r1": 500},
+        ),
+        input_batch=SimpleNamespace(
+            req_ids=["r1"],
+            req_id_to_index={"r1": 0},
+            num_computed_tokens_cpu=np.array([128], dtype=np.int32),
+            block_table=[MockBlockTableItem()],
+        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16, get_hidden_size=lambda: 64),
+        device=torch.device("cpu"),
+    )
+
+    out = wrapped(runner, input_ids=torch.zeros(500), positions=torch.zeros(500))
+    assert out is not None
+    assert "execute_p2d" in calls
+    assert "execute_eager_p2d" not in calls
+    assert received_kwargs.get("computed_tokens") == [128]
+    assert received_kwargs.get("block_table") is mock_block_table
+    rec_slot = received_kwargs.get("slot_mapping")
+    assert isinstance(rec_slot, torch.Tensor)
+    assert torch.equal(rec_slot, mock_slot_mapping)
+    assert runner._current_p2d_result is not None
 
 
-def test_postprocess_workspace_initializer_is_noop_off_cuda() -> None:
-    runner = SimpleNamespace(device=torch.device("cpu"))
-    assert gpu_patch.initialize_beam_postprocess_workspaces(runner) is None
-    assert not hasattr(runner, "_beam_postprocess_workspaces")
+@pytest.mark.skipif(  # type: ignore[misc]
+    prefill_graph_common.is_npu_platform(),
+    reason="P2D is gated off on NPU (is_p2d_enabled); this test asserts the GPU P2D fast path",
+)
+def test_gpu_model_forward_with_real_eligibility_and_cached_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    received_kwargs = {}
+
+    class MockGraphRunner:
+        max_bucket = 2048
+
+        def match_p2d_bucket(self, total_tokens: int) -> int:
+            return 512
+
+        def has_captured_graph(self, bucket: int, num_reqs: int, bw: int) -> bool:
+            return True
+
+        def has_2d_graph(self, num_reqs: int, bw: int) -> bool:
+            return True
+
+        def execute_p2d(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append("execute_p2d")
+            received_kwargs.update(kwargs)
+            return (
+                torch.zeros((1, 32, 3), dtype=torch.int64),
+                torch.zeros((1, 32), dtype=torch.float32),
+            )
+
+        def execute_eager_p2d(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append("execute_eager_p2d")
+            return (
+                torch.zeros((1, 32, 3), dtype=torch.int64),
+                torch.zeros((1, 32), dtype=torch.float32),
+            )
+
+        def get_output_buf(self, total_tokens: int, model_config: Any) -> torch.Tensor:
+            return torch.zeros((total_tokens, 64), dtype=torch.bfloat16)
+
+    p_runner = MockGraphRunner()
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_GR_P2D_MODE", "monolithic")
+    monkeypatch.setattr(
+        gpu_patch,
+        "is_prefill_phase_batch",
+        lambda self, scheduler_output: scheduler_output.pure,
+    )
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda runner: p_runner)
+    from vllm_gr.v1.worker.prefill_graph_common import StepBeamWidths
+
+    monkeypatch.setattr(
+        gpu_patch, "match_p2d_step_beam_widths", lambda r, s: StepBeamWidths(32, 32, 32)
+    )
+    # Note: real is_p2d_eligible is NOT mocked!
+
+    def dummy_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return "orig_out"
+
+    wrapped = gpu_patch.make_patched_model_forward_gpu(dummy_forward)
+
+    mock_block_table = torch.zeros((1, 10), dtype=torch.int32)
+    mock_slot_mapping = torch.zeros((500,), dtype=torch.int64)
+
+    class MockBlockTableItem:
+        def get_device_tensor(self, num_reqs: int) -> torch.Tensor:
+            return mock_block_table
+
+        slot_mapping = SimpleNamespace(gpu=mock_slot_mapping)
+
+    # Prompt has 628 tokens: 128 computed, 500 scheduled. Prompt completes at this step (128 + 500 == 628).
+    # Pad ratio = (512 - 500) / 500 = 2.4% <= 5% -> monolithic execute_p2d
+    runner = SimpleNamespace(
+        _current_scheduler_output=SimpleNamespace(
+            pure=True,
+            total_num_scheduled_tokens=500,
+            num_scheduled_tokens={"r1": 500},
+            scheduled_new_reqs=[SimpleNamespace(sampling_params=SimpleNamespace(beam_width=32))],
+            scheduled_spec_decode_tokens=[],
+            scheduled_encoder_inputs=[],
+        ),
+        input_batch=SimpleNamespace(
+            req_ids=["r1"],
+            req_id_to_index={"r1": 0},
+            num_computed_tokens_cpu=np.array([128], dtype=np.int32),
+            num_prompt_tokens=np.array([628], dtype=np.int32),
+            block_table=[MockBlockTableItem()],
+        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16, get_hidden_size=lambda: 64),
+        device=torch.device("cpu"),
+        vllm_config=SimpleNamespace(additional_config={}),
+        _prefill_graph_runner=p_runner,
+    )
+
+    out = wrapped(runner, input_ids=torch.zeros(500), positions=torch.zeros(500))
+    assert out is not None
+    assert "execute_p2d" in calls
+    assert received_kwargs.get("computed_tokens") == [128]
+    assert runner._current_p2d_result is not None
+
+
+def test_gpu_model_forward_restores_constraint_prepare_when_p2d_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All P2D tiers returning None re-stages the skipped constraint prepare."""
+    prepare_calls: list[Any] = []
+
+    class MockGraphRunner:
+        def match_p2d_bucket(self, total_tokens: int) -> int:
+            return 512
+
+        def match_bucket(self, total_tokens: int) -> int | None:
+            return None
+
+        def has_captured_graph(self, *args: Any, **kwargs: Any) -> bool:
+            return False
+
+        def has_2d_graph(self, num_reqs: int, bw: int) -> bool:
+            return False
+
+        def execute_eager_p2d(self, **kwargs: Any) -> Any:
+            return None
+
+        def execute_stepwise_p2d(self, **kwargs: Any) -> Any:
+            return None
+
+        def execute_eager_p2d_stepped(self, **kwargs: Any) -> Any:
+            return None
+
+        def get_prefill_logit_indices(self, num_scheduled_tokens: Any) -> list[int]:
+            return [0]
+
+    p_runner = MockGraphRunner()
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_GR_P2D_MODE", "auto")
+    monkeypatch.setattr(
+        gpu_patch,
+        "is_prefill_phase_batch",
+        lambda self, scheduler_output: scheduler_output.pure,
+    )
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda runner: p_runner)
+    from vllm_gr.v1.worker.prefill_graph_common import StepBeamWidths
+
+    monkeypatch.setattr(
+        gpu_patch, "match_p2d_step_beam_widths", lambda r, s: StepBeamWidths(32, 32, 32)
+    )
+    monkeypatch.setattr(gpu_patch, "is_p2d_eligible", lambda *args, **kwargs: True)
+
+    def fake_prepare(self: Any, scheduler_output: Any) -> bool:
+        prepare_calls.append(scheduler_output)
+        self._gr_prepared_cuda_prefill_constraint = None
+        return False
+
+    monkeypatch.setattr(gpu_patch, "prepare_cuda_prefill_constraint", fake_prepare)
+
+    def dummy_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return "orig_out"
+
+    wrapped = gpu_patch.make_patched_model_forward_gpu(dummy_forward)
+    sched = SimpleNamespace(
+        pure=True,
+        total_num_scheduled_tokens=100,
+        num_scheduled_tokens={"r1": 100},
+    )
+    runner = SimpleNamespace(
+        _current_scheduler_output=sched,
+        input_batch=SimpleNamespace(req_ids=["r1"]),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        device=torch.device("cpu"),
+        _gr_skipped_constraint_prepare=True,
+    )
+
+    out = wrapped(runner, input_ids=torch.zeros(100), positions=torch.zeros(100))
+    assert out == "orig_out"
+    assert runner._current_p2d_result is None
+    assert prepare_calls == [sched]
+
+
+def test_gpu_model_forward_no_prepare_fallback_without_skip_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batches whose prepare was NOT skipped never re-stage it."""
+    prepare_calls: list[Any] = []
+
+    class MockGraphRunner:
+        def match_p2d_bucket(self, total_tokens: int) -> int:
+            return 512
+
+        def match_bucket(self, total_tokens: int) -> int | None:
+            return None
+
+        def has_captured_graph(self, *args: Any, **kwargs: Any) -> bool:
+            return False
+
+        def has_2d_graph(self, num_reqs: int, bw: int) -> bool:
+            return False
+
+        def execute_eager_p2d_stepped(self, **kwargs: Any) -> Any:
+            return None
+
+        def get_prefill_logit_indices(self, num_scheduled_tokens: Any) -> list[int]:
+            return [0]
+
+    p_runner = MockGraphRunner()
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_GR_P2D_MODE", "auto")
+    monkeypatch.setattr(
+        gpu_patch,
+        "is_prefill_phase_batch",
+        lambda self, scheduler_output: scheduler_output.pure,
+    )
+    monkeypatch.setattr(gpu_patch, "get_prefill_graph_runner", lambda runner: p_runner)
+    from vllm_gr.v1.worker.prefill_graph_common import StepBeamWidths
+
+    monkeypatch.setattr(
+        gpu_patch, "match_p2d_step_beam_widths", lambda r, s: StepBeamWidths(32, 32, 32)
+    )
+    monkeypatch.setattr(gpu_patch, "is_p2d_eligible", lambda *args, **kwargs: True)
+
+    def _mock_prepare(self: Any, scheduler_output: Any) -> bool:
+        prepare_calls.append(scheduler_output)
+        return False
+
+    monkeypatch.setattr(gpu_patch, "prepare_cuda_prefill_constraint", _mock_prepare)
+
+    def dummy_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return "orig_out"
+
+    wrapped = gpu_patch.make_patched_model_forward_gpu(dummy_forward)
+    sched = SimpleNamespace(
+        pure=True,
+        total_num_scheduled_tokens=100,
+        num_scheduled_tokens={"r1": 100},
+    )
+    runner = SimpleNamespace(
+        _current_scheduler_output=sched,
+        input_batch=SimpleNamespace(req_ids=["r1"]),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        device=torch.device("cpu"),
+    )
+
+    out = wrapped(runner, input_ids=torch.zeros(100), positions=torch.zeros(100))
+    assert out == "orig_out"
+    assert prepare_calls == []
+
+
+def test_gpu_bookkeeping_p2d_branch_restores_input_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The P2D bookkeeping early return unwraps the remap proxy."""
+    from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
+
+    original_batch = SimpleNamespace(
+        req_ids=["r1"],
+        req_id_to_index={"r1": 0},
+        num_tokens_no_spec=[0],
+        token_ids_cpu=np.zeros((1, 12), dtype=np.int64),
+        is_token_ids=np.zeros((1, 12), dtype=np.bool_),
+    )
+    proxy = InputBatchProxy(original_batch, ["r1"], [0], [0])
+    runner = SimpleNamespace(
+        input_batch=proxy,
+        requests={"r1": SimpleNamespace(output_token_ids=[])},
+        use_async_scheduling=False,
+        model_config=SimpleNamespace(eos_token_id=2),
+    )
+    runner._current_p2d_result = (
+        torch.zeros((1, 1, 3), dtype=torch.int64),
+        torch.zeros((1, 1), dtype=torch.float32),
+        torch.ones((1,), dtype=torch.int32),
+    )
+
+    def original(self: Any, scheduler_output: Any, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    wrapped = gpu_patch.make_patched_bookkeeping_sync(original)
+    wrapped(runner, SimpleNamespace(beam_data={}), None)
+    assert runner.input_batch is original_batch
+    assert runner._current_p2d_result is None
+
+
+def test_p2d_will_handle_batch_honors_capture_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prepare-side P2D preflight applies the same capture bound as dispatch."""
+    from vllm_gr.v1.worker import prefill_graph_runner as pgr_mod
+    from vllm_gr.v1.worker.prefill_graph_common import StepBeamWidths
+
+    monkeypatch.setattr(gpu_patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(
+        pgr_mod,
+        "is_prefill_phase_batch",
+        lambda runner, scheduler_output: True,
+    )
+    monkeypatch.setattr(
+        pgr_mod,
+        "match_p2d_step_beam_widths",
+        lambda r, s: StepBeamWidths(128, 128, 128),
+    )
+    monkeypatch.setattr(pgr_mod, "is_p2d_eligible", lambda *a, **k: True)
+
+    def make_runner() -> SimpleNamespace:
+        return SimpleNamespace(
+            _prefill_graph_runner=SimpleNamespace(p2d_pool=SimpleNamespace(max_bucket=1024)),
+            input_batch=SimpleNamespace(
+                num_computed_tokens_cpu=[0],
+                req_id_to_index={"r1": 0},
+            ),
+        )
+
+    sched = SimpleNamespace(
+        num_scheduled_tokens={"r1": 100},
+        total_num_scheduled_tokens=100,
+    )
+    assert gpu_patch.p2d_will_handle_batch(make_runner(), sched, [100]) is True
+    # KV beyond the capture bound must fall back (prepare not skipped).
+    long_sched = SimpleNamespace(
+        num_scheduled_tokens={"r1": 1500},
+        total_num_scheduled_tokens=1500,
+    )
+    assert gpu_patch.p2d_will_handle_batch(make_runner(), long_sched, [1500]) is False
+
+    # Sequence-form num_scheduled_tokens applies the same bound.
+    seq_sched = SimpleNamespace(
+        num_scheduled_tokens=[100],
+        total_num_scheduled_tokens=100,
+    )
+    assert gpu_patch.p2d_will_handle_batch(make_runner(), seq_sched, [100]) is True
+    seq_long_sched = SimpleNamespace(
+        num_scheduled_tokens=[1500],
+        total_num_scheduled_tokens=1500,
+    )
+    assert gpu_patch.p2d_will_handle_batch(make_runner(), seq_long_sched, [1500]) is False

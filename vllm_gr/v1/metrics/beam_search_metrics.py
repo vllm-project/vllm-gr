@@ -29,11 +29,14 @@ except ImportError:
 _metrics_initialized = False
 _beam_prefill_time_total = None
 _beam_decode_time_total = None
+_beam_execution_time_total = None
 _beam_sort_time_total = None
 _beam_requests_total = None
 _total_beams_generated = None
+_beam_p2d_requests_total = None
 _beam_prefill_time_histogram = None
 _beam_decode_time_histogram = None
+_beam_execution_time_histogram = None
 _beam_sort_time_histogram = None
 _beams_per_request_histogram = None
 
@@ -41,9 +44,12 @@ _beams_per_request_histogram = None
 def _initialize_metrics() -> None:
     """Initialize all Prometheus metrics. Called once per process via lazy initialization."""
     global _metrics_initialized
-    global _beam_prefill_time_total, _beam_decode_time_total, _beam_sort_time_total
+    global _beam_prefill_time_total, _beam_decode_time_total, _beam_execution_time_total
+    global _beam_sort_time_total
     global _beam_requests_total, _total_beams_generated
+    global _beam_p2d_requests_total
     global _beam_prefill_time_histogram, _beam_decode_time_histogram
+    global _beam_execution_time_histogram
     global _beam_sort_time_histogram, _beams_per_request_histogram
 
     if _metrics_initialized or not PROMETHEUS_AVAILABLE:
@@ -61,6 +67,11 @@ def _initialize_metrics() -> None:
             "Cumulative decode time for beam search requests",
             labelnames=["engine", "model_name"],
         )
+        _beam_execution_time_total = Counter(
+            "vllm_gr_beam_search_execution_time_seconds_total",
+            "Cumulative P2D execution time for beam search requests",
+            labelnames=["engine", "model_name"],
+        )
         _beam_sort_time_total = Counter(
             "vllm_gr_beam_search_sort_time_seconds_total",
             "Cumulative beam sort operation time",
@@ -76,6 +87,11 @@ def _initialize_metrics() -> None:
             "Total number of beams generated across all requests",
             labelnames=["engine", "model_name"],
         )
+        _beam_p2d_requests_total = Counter(
+            "vllm_gr_beam_search_p2d_requests_total",
+            "Total number of P2D beam search requests processed",
+            labelnames=["engine", "model_name"],
+        )
 
         # Histograms for distributions
         _beam_prefill_time_histogram = Histogram(
@@ -87,6 +103,12 @@ def _initialize_metrics() -> None:
         _beam_decode_time_histogram = Histogram(
             "vllm_gr_beam_search_decode_duration_seconds",
             "Decode time distribution for beam search requests",
+            labelnames=["engine", "model_name"],
+            buckets=(0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0),
+        )
+        _beam_execution_time_histogram = Histogram(
+            "vllm_gr_beam_search_execution_duration_seconds",
+            "P2D execution time distribution for beam search requests",
             labelnames=["engine", "model_name"],
             buckets=(0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0),
         )
@@ -123,7 +145,6 @@ def record_beam_search_metrics(
         model_name: Model name for Prometheus label
     """
     # Lazy initialization: ensure metrics are created in THIS process
-    global _metrics_initialized
     if not _metrics_initialized:
         _initialize_metrics()
 
@@ -149,6 +170,16 @@ def record_beam_search_metrics(
             if _beam_decode_time_histogram is not None:
                 _beam_decode_time_histogram.labels(**labels).observe(decode_time)
 
+        execution_time = getattr(metrics, "beam_search_execution_time", 0.0)
+        if execution_time > 0 and _beam_execution_time_total is not None:
+            _beam_execution_time_total.labels(**labels).inc(execution_time)
+            if _beam_execution_time_histogram is not None:
+                _beam_execution_time_histogram.labels(**labels).observe(execution_time)
+
+        is_p2d = getattr(metrics, "is_p2d", False) or execution_time > 0
+        if is_p2d and _beam_p2d_requests_total is not None:
+            _beam_p2d_requests_total.labels(**labels).inc()
+
         sort_time = getattr(metrics, "beam_search_sort_time", 0.0)
         if sort_time > 0 and _beam_sort_time_total is not None:
             _beam_sort_time_total.labels(**labels).inc(sort_time)
@@ -164,7 +195,7 @@ def record_beam_search_metrics(
                 _total_beams_generated.labels(**labels).inc(num_beams)
             if _beams_per_request_histogram is not None:
                 _beams_per_request_histogram.labels(**labels).observe(num_beams)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         # Silently ignore errors - don't break main flow
         pass
 
@@ -186,5 +217,5 @@ def get_beam_search_metrics_text() -> str:
     try:
         metrics_text = generate_latest(REGISTRY).decode("utf-8")
         return metrics_text
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
