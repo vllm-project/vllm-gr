@@ -53,10 +53,39 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
   --task-type interactive \
   --num-prompts 1000 \
   --result-dir results/acc_test_results
-
 ```
 
-optionally, one can modify the beam width from the default dataset definition. See [Benchmark related parameters](#benchmark-related-parameters) below.
+### 3. Variadic Beam Width (P2D Fast Path)
+
+For 3-step recommendation tasks (`video`, `interactive`), you can benchmark per-step candidate widths $(W_0, W_1, W_2)$ using `--step-beam-widths`.
+
+#### Terminal 1 — Start the server with `--beam-max-width`
+
+```bash
+vllm-gr serve OpenOneRec/OneRec-1.7B \
+  --beam-max-width 128 \
+  --max-logprobs 512 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 32768 \
+  --scheduling-policy priority \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
+```
+
+#### Terminal 2 — Run accuracy test with variable beam widths
+
+```bash
+python -m benchmarks.open_one_rec.one_rec_acc_test \
+  --endpoint /v1/chat/completions \
+  --backend openai-chat \
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-path ./data \
+  --task-type video \
+  --num-prompts 1000 \
+  --step-beam-widths 128,64,32 \
+  --result-dir results/acc_test_results
+```
+
+See [Variadic Beam Width Guide](../variadic_beam_width.md) for architectural details.
 
 ## Usage
 
@@ -70,17 +99,18 @@ optionally, one can modify the beam width from the default dataset definition. S
 
 #### Benchmark related parameters
 
-| Argument            | Type  | Default          | Description                                                               |
-|---------------------|-------|------------------|---------------------------------------------------------------------------|
-| `--dataset-name`    | str   | onerec           | Must be `onerec` for OneRec benchmark                                     |
-| `--dataset-path`    | str   | ./data           | Path to benchmark data directory                                          |
-| `--num-prompts`     | int   | 1000             | Number of prompts to sample                                               |
-| `--task-type`       | str   | -                | Task to run (ad, product, label_cond, video, interactive, label_pred)     |
-| `--result-dir`      | str   | -                | Directory to save debug evaluation files                                  |
-| `--debug`           | -     | -                | Enable debug mode for evaluators                                          |
-| `--use-beam-search` | flag  | -                | Enable beam search during generation                                      |
-| `--n`               | int   | dataset-specific | Override the dataset default beam width (number of beams) for beam search |
-| `--temperature`     | float | dataset-specific | Override the dataset default temperature                                  |
+| Argument             | Type  | Default          | Description                                                                |
+|----------------------|-------|------------------|----------------------------------------------------------------------------|
+| `--dataset-name`     | str   | onerec           | Must be `onerec` for OneRec benchmark                                      |
+| `--dataset-path`     | str   | ./data           | Path to benchmark data directory                                           |
+| `--num-prompts`      | int   | 1000             | Number of prompts to sample                                                |
+| `--task-type`        | str   | -                | Task to run (ad, product, label_cond, video, interactive, label_pred)      |
+| `--result-dir`       | str   | -                | Directory to save debug evaluation files                                   |
+| `--debug`            | -     | -                | Enable debug mode for evaluators                                           |
+| `--use-beam-search`  | flag  | -                | Enable beam search during generation                                       |
+| `--n`                | int   | dataset-specific | Override the dataset default beam width (number of beams) for beam search  |
+| `--step-beam-widths` | str   | -                | Comma-separated per-step beam widths (W0,W1,W2) for P2D (e.g. `128,64,32`) |
+| `--temperature`      | float | dataset-specific | Override the dataset default temperature                                   |
 
 #### Arguments for Online benchmark
 

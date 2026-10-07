@@ -19,7 +19,6 @@ from vllm_gr.config import (
     GRConfigInput,
     write_canonical_gr_config,
 )
-from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
 from vllm_gr.config.parser import (
     GR_CONFIG_KEY,
     KNOWN_GR_CONFIG_KEYS,
@@ -123,7 +122,7 @@ def _init_engine_args(
     self.catalog_path = catalog_path
     self.constraint_backend = constraint_backend
     self._vllm_gr_config_input = vllm_gr_config
-    setattr(self, "beam_execution_mode", beam_execution_mode)
+    self.beam_execution_mode = beam_execution_mode
 
 
 def _nested_attention_backend_is_explicit(value: object) -> bool:
@@ -320,9 +319,11 @@ def _explicit_gr_attention_backend(
     if nested_backend_is_explicit or configured_backend is not None:
         return (
             True,
-            GRAttentionBackend.CUSTOM
-            if configured_backend == AttentionBackendEnum.CUSTOM
-            else None,
+            (
+                GRAttentionBackend.CUSTOM
+                if configured_backend == AttentionBackendEnum.CUSTOM
+                else None
+            ),
         )
     return False, None
 
@@ -337,7 +338,7 @@ def _apply_npu_default_block_size(config) -> None:
     """
     try:
         from vllm.platforms import current_platform
-    except Exception:
+    except (ImportError, AttributeError):
         return
     if getattr(current_platform, "device_type", None) != "npu":
         return
@@ -365,7 +366,7 @@ def _is_npu_platform() -> bool:
     """Return whether the active platform is an Ascend NPU."""
     try:
         from vllm.platforms import current_platform
-    except Exception:
+    except (ImportError, AttributeError):
         return False
     return getattr(current_platform, "device_type", None) == "npu"
 
@@ -374,7 +375,7 @@ def _is_cuda_platform() -> bool:
     """Return whether the active platform is CUDA."""
     try:
         from vllm.platforms import current_platform
-    except Exception:
+    except (ImportError, AttributeError):
         return False
     return getattr(current_platform, "device_type", None) == "cuda"
 
@@ -528,9 +529,9 @@ def create_engine_config(self, usage_context=None, headless=False):
             (_is_npu_platform() or _is_cuda_platform())
             and beam_width_configured
             and not worker_decision_explicit
+            and effective_beam_worker_decision is None
         ):
-            if effective_beam_worker_decision is None:
-                effective_beam_worker_decision = True
+            effective_beam_worker_decision = True
         # Unified engine-driven sessions: accelerator beam default with
         # worker decisions, NO async-scheduling and NO constraint-backend
         # condition.  The advance runs in the busy-loop iteration that
@@ -555,36 +556,40 @@ def create_engine_config(self, usage_context=None, headless=False):
                 "'vllm_gr_beam_worker_decision')"
             )
         offset, slice_size = None, None
-        # CUDA Constraint Tables support sliced logits while keeping global
-        # table token ids (CUDAConstrainedTopKExecution._vocab_window).  The
-        # slice helper accepts both Trie lists and triples documents, so keep
-        # the old lm_head fast path on CUDA. NPU retains its full-vocabulary
-        # ABI and validate_constraint_table_platform rejects slicing there.
+        # Slicing is derived purely from the tokenizer's SID token definitions
+        # (<|sid_a_*|>, <|sid_b_*|>, <|sid_c_*|>), completely decoupled from the
+        # catalog. Slicing is supported on CUDA (unconstrained and constraint_table)
+        # and NPU (unconstrained / trie; NPU constraint_table requires full-vocab ABI).
         constraint_slice_supported = (
             effective_constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
             or _is_cuda_platform()
         )
-        if (
-            effective_catalog_path is not None
-            and effective_catalog_path != AUTO_CONSTRAINT_TABLE_PATH
-            and constraint_slice_supported
-        ):
+        if (_is_cuda_platform() or _is_npu_platform()) and constraint_slice_supported:
             model_name = getattr(self, "model", None)
             if model_name is not None:
-                from vllm_gr.utils.catalog import (
-                    compute_catalog_slice_config,
-                )
+                try:
+                    from vllm.tokenizers import get_tokenizer
 
-                trust_remote_code = bool(getattr(self, "trust_remote_code", False))
-                offset, slice_size = compute_catalog_slice_config(
-                    effective_catalog_path,
-                    model_name,
-                    trust_remote_code=trust_remote_code,
-                )
-                if offset is not None and slice_size is not None:
-                    from vllm_gr.ops.sliced_logits import set_vocab_slice_config
+                    from vllm_gr.v1.worker.prefill_graph_common import (
+                        compute_sid_slices_from_tokenizer,
+                    )
 
-                    set_vocab_slice_config(offset, slice_size)
+                    trust_remote_code = bool(getattr(self, "trust_remote_code", False))
+                    tokenizer = get_tokenizer(model_name, trust_remote_code=trust_remote_code)
+                    slices = compute_sid_slices_from_tokenizer(tokenizer)
+                    if slices is not None:
+                        offset = slices.sid_a[0]
+                        slice_size = slices.sid_c[0] + slices.sid_c[1] - offset
+                        from vllm_gr.ops.sliced_logits import set_vocab_slice_config
+
+                        set_vocab_slice_config(offset, slice_size)
+                        logger.info(
+                            "vllm-gr: SID vocabulary slicing enabled: offset=%d, size=%d",
+                            offset,
+                            slice_size,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Could not compute SID slices for vocab slicing: %s", e)
 
         effective_gr_config = GRConfig(
             catalog_path=effective_catalog_path,

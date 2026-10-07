@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import os
 from functools import wraps
+from typing import Any
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 
@@ -26,13 +29,13 @@ from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
-    _WORKER_MODEL_FORWARD_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
     _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
+    InputBatchProxy,
     _beam_collapse_bookkeeping,
 )
-from vllm_gr.v1.worker.model_runner_common import (  # noqa: E402,F401
+from vllm_gr.v1.worker.model_runner_common import (
     _beam_full_graph_ready as _common_beam_full_graph_ready,
 )
 from vllm_gr.v1.worker.model_runner_common import (
@@ -40,6 +43,7 @@ from vllm_gr.v1.worker.model_runner_common import (
 )
 from vllm_gr.v1.worker.model_runner_common import (
     _beam_remap_inputs,
+    _build_p2d_bookkeeping_result,
 )
 from vllm_gr.v1.worker.model_runner_common import (
     _create_beam_context as _common_create_beam_context,
@@ -47,12 +51,19 @@ from vllm_gr.v1.worker.model_runner_common import (
 from vllm_gr.v1.worker.model_runner_common import (
     _materialize_logits_indices,
     _reduce_sampler_output_for_worker_decision,
+    build_p2d_sampler_output,
+    patch_p2d_compute_logits_bypass,
 )
 from vllm_gr.v1.worker.prefill_graph_runner import (
+    MONOLITHIC_MAX_PAD_RATIO,
+    MONOLITHIC_SUPPORTED_BUCKETS,
+    P2D_SENTINEL_RANK,
     SUPPORTED_NUM_REQS,
     get_prefill_graph_runner,
+    is_p2d_eligible,
     is_prefill_graph_enabled,
     is_prefill_phase_batch,
+    match_p2d_step_beam_widths,
 )
 
 logger = init_logger(__name__)
@@ -192,6 +203,84 @@ def make_load_model_with_beam_postprocess_workspace(original):
     return load_model_with_beam_postprocess_workspace
 
 
+def p2d_will_handle_batch(runner: Any, scheduler_output: Any, num_scheduled_tokens: Any) -> bool:
+    """True when the scheduled batch will be executed by a P2D tier.
+
+    Mirrors the eligibility computation of the ``_model_forward`` dispatch
+    (same scheduler output, same InputBatch state after ``_prepare_inputs``)
+    so the constraint-prepare skip can never diverge from the actual dispatch.
+    Falls back to False on any resolution error (the staged prepare then runs
+    as usual and the fallback sampling path stays fully correct).
+    """
+    del num_scheduled_tokens
+    try:
+        from vllm_gr.v1.worker.prefill_graph_runner import (
+            is_p2d_eligible,
+            is_prefill_phase_batch,
+            match_p2d_step_beam_widths,
+        )
+
+        if scheduler_output is None or not is_prefill_graph_enabled():
+            return False
+        if not is_prefill_phase_batch(runner, scheduler_output):
+            return False
+        raw_scheduled = getattr(scheduler_output, "num_scheduled_tokens", [])
+        if not raw_scheduled:
+            return False
+        num_reqs = len(raw_scheduled)
+        total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
+        if not total_tokens and raw_scheduled:
+            total_tokens = (
+                sum(raw_scheduled.values())
+                if isinstance(raw_scheduled, dict)
+                else sum(raw_scheduled)
+            )
+        step_bws = match_p2d_step_beam_widths(runner, scheduler_output)
+        if step_bws is None:
+            return False
+        if not is_p2d_eligible(
+            runner,
+            scheduler_output,
+            num_reqs,
+            total_tokens,
+            bucket=None,
+            step_bws=step_bws,
+        ):
+            return False
+        # The forward dispatch only runs tiers 2/3 within the pool's capture
+        # extent (beyond it the batch falls back to the engine path), so the
+        # prepare-side decision must apply the same bound or the staged
+        # constraint prepare would be skipped for a batch that falls back.
+        captured_bound = getattr(
+            getattr(getattr(runner, "_prefill_graph_runner", None), "p2d_pool", None),
+            "max_bucket",
+            None,
+        )
+        if captured_bound is not None:
+            input_batch = getattr(runner, "input_batch", None)
+            computed = getattr(input_batch, "num_computed_tokens_cpu", None)
+            req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+            max_kv = 0
+            if isinstance(raw_scheduled, dict):
+                for req_id, sched_cnt in raw_scheduled.items():
+                    c = 0
+                    if computed is not None and req_id_to_index is not None:
+                        row = req_id_to_index.get(req_id)
+                        if row is not None and row < len(computed):
+                            c = int(computed[row])
+                    max_kv = max(max_kv, c + int(sched_cnt))
+            else:
+                for i, sched_cnt in enumerate(raw_scheduled):
+                    c = int(computed[i]) if (computed is not None and i < len(computed)) else 0
+                    max_kv = max(max_kv, c + int(sched_cnt))
+            if max_kv > int(captured_bound):
+                return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug("P2D preflight check failed; keeping constraint prepare: %r", e)
+        return False
+
+
 def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
     """Wrap the GPU two-item ``_prepare_inputs`` contract."""
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
@@ -203,6 +292,10 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
         # interception can classify the batch and extract token counts.
         self._current_scheduler_output = scheduler_output
 
+        # A P2D step can leave a proxy behind when bookkeeping is skipped;
+        # unwrap before any read so the next batch never sees a stale map.
+        if isinstance(self.input_batch, InputBatchProxy):
+            self.input_batch = object.__getattribute__(self.input_batch, "_obj")
         logits_indices = try_prepare_gr_prefill_inputs(self, scheduler_output, num_scheduled_tokens)
         if logits_indices is None:
             logits_indices, spec_decode_metadata = _orig_prepare_inputs(
@@ -210,7 +303,6 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
             )
         else:
             spec_decode_metadata = None
-
         # GPU attention metadata is built after _prepare_inputs returns.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
@@ -220,8 +312,19 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
             return logits_indices, spec_decode_metadata
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
-        with torch.autograd.profiler.record_function("prefill_constraint_prepare"):
-            prepare_cuda_prefill_constraint(self, scheduler_output)
+        # When P2D will handle this batch, the worker-side constrained kernels
+        # own the catalog selection — the staged CUDA prefill constraint chain
+        # would only be discarded after launch. Cache the eligibility decision
+        # so prepare and the forward-path dispatch can never diverge.
+        will_run_p2d = getattr(
+            self, "_gr_prepare_will_run_p2d", None
+        ) is not None and self._gr_prepare_will_run_p2d(scheduler_output, num_scheduled_tokens)
+        self._gr_skipped_constraint_prepare = will_run_p2d
+        if not will_run_p2d:
+            with torch.autograd.profiler.record_function("prefill_constraint_prepare"):
+                prepare_cuda_prefill_constraint(self, scheduler_output)
+        else:
+            self._gr_prepared_cuda_prefill_constraint = None
         return (
             _materialize_logits_indices(self, new_logits_indices),
             spec_decode_metadata,
@@ -238,6 +341,10 @@ def make_patched_sample_gpu(_orig_sample):
 
     @wraps(_orig_sample)
     def patched_sample(self, logits, spec_decode_metadata=None):
+        p2d_result = getattr(self, "_current_p2d_result", None)
+        if p2d_result is not None:
+            final_tokens = p2d_result[0]
+            return build_p2d_sampler_output(final_tokens)
         sampler_output = consume_prelaunched_cuda_prefill(self, logits, spec_decode_metadata)
         if sampler_output is None:
             sampler_output = try_sample_with_constraint_backend(
@@ -286,6 +393,51 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
             if hasattr(scheduler_output, "finished_req_ids"):
                 for req_id in scheduler_output.finished_req_ids:
                     self._beam_logprobs_cache.pop(req_id, None)
+
+        p2d_result = getattr(self, "_current_p2d_result", None)
+        if p2d_result is not None:
+            self._current_p2d_result = None
+            # The P2D branch returns without the remap unwind; restore the
+            # original batch even when bookkeeping raises, so the next step
+            # never operates through this step's proxy.
+            orig_input_batch = (
+                object.__getattribute__(self.input_batch, "_obj")
+                if isinstance(self.input_batch, InputBatchProxy)
+                else self.input_batch
+            )
+            try:
+                final_tokens = p2d_result[0]
+                final_cum_lps = p2d_result[1]
+                valid_beam_counts = p2d_result[2] if len(p2d_result) > 2 else None
+                step_scores = p2d_result[3] if len(p2d_result) > 3 else None
+
+                sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+                (
+                    p2d_logprobs_lists,
+                    valid_sampled_token_ids,
+                    req_ids_output_copy,
+                    req_id_to_index_output_copy,
+                    invalid_req_indices,
+                ) = _build_p2d_bookkeeping_result(
+                    self,
+                    final_tokens,
+                    final_cum_lps,
+                    valid_beam_counts,
+                    sampler_output,
+                    step_scores,
+                )
+
+                return (
+                    {},
+                    p2d_logprobs_lists,
+                    valid_sampled_token_ids,
+                    {},
+                    req_ids_output_copy,
+                    req_id_to_index_output_copy,
+                    invalid_req_indices,
+                )
+            finally:
+                self.input_batch = orig_input_batch
 
         beam_data = getattr(scheduler_output, "beam_data", {})
         if not beam_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
@@ -863,13 +1015,15 @@ make_patched_determine_batch_execution_and_padding = (
 
 def make_patched_model_forward_gpu(_orig_model_forward):
     """Wrap _model_forward to intercept and replay pure prefill CUDA graphs."""
-    if getattr(_orig_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, False):
-        return _orig_model_forward
 
     @wraps(_orig_model_forward)
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
+        self._current_p2d_result = None
+        patch_p2d_compute_logits_bypass(self)
+
         scheduler_output = getattr(self, "_current_scheduler_output", None)
         gr_stages = getattr(scheduler_output, "gr_stage_metadata", None)
+        async_prefill = bool(gr_stages)
         if gr_stages:
             # Decode uses its independent startup graph. Only pure asynchronous Prefill
             # may enter the existing Prefill graph dispatch below.
@@ -890,86 +1044,390 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                 return _orig_model_forward(
                     self, input_ids=input_ids, positions=positions, *args, **kwargs
                 )
-        if scheduler_output is not None:
-            if is_prefill_graph_enabled() and is_prefill_phase_batch(self, scheduler_output):
-                p_runner = get_prefill_graph_runner(self)
+        if (
+            scheduler_output is not None
+            and is_prefill_graph_enabled()
+            and is_prefill_phase_batch(self, scheduler_output)
+        ):
+            p_runner = get_prefill_graph_runner(self)
 
-                raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
-                # The scheduler already computed the batch's token total; only
-                # the request count is derived here (the runner re-derives the
-                # per-request counts it needs from the dict itself).
-                num_reqs = len(raw_scheduled_tokens)
-                total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
-                if not total_tokens and raw_scheduled_tokens:
-                    total_tokens = (
-                        sum(raw_scheduled_tokens.values())
-                        if isinstance(raw_scheduled_tokens, dict)
-                        else sum(raw_scheduled_tokens)
-                    )
+            raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
+            # The scheduler already computed the batch's token total; only
+            # the request count is derived here (the runner re-derives the
+            # per-request counts it needs from the dict itself).
+            num_reqs = len(raw_scheduled_tokens)
+            total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
+            if not total_tokens and raw_scheduled_tokens:
+                total_tokens = (
+                    sum(raw_scheduled_tokens.values())
+                    if isinstance(raw_scheduled_tokens, dict)
+                    else sum(raw_scheduled_tokens)
+                )
 
-                if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
-                    bucket = p_runner.match_bucket(total_tokens)
-                    reason = "no_matching_bucket" if bucket is None else "graph_not_captured"
-                    if gr_stages:
-                        # Reuse the same padded geometry and static buffers as
-                        # legacy Prefill. The runner keeps the real Attention
-                        # lengths and masks padded KV slots. Async scheduling
-                        # adds no exact-bucket requirement; adapters and invalid
-                        # live input shapes still fall back to the original path.
-                        if (
-                            input_ids is None
-                            or tuple(input_ids.shape) != (total_tokens,)
-                            or positions is None
-                            or tuple(positions.shape) != (total_tokens,)
-                            or kwargs.get("inputs_embeds") is not None
-                            or kwargs.get("intermediate_tensors") is not None
+            # Reuse the same padded geometry and static buffers as legacy
+            # Prefill. Async scheduling adds no exact-bucket requirement;
+            # adapters and invalid live input shapes still fall back to
+            # the original path.
+            if async_prefill and (
+                input_ids is None
+                or tuple(input_ids.shape) != (total_tokens,)
+                or positions is None
+                or tuple(positions.shape) != (total_tokens,)
+                or kwargs.get("inputs_embeds") is not None
+                or kwargs.get("intermediate_tensors") is not None
+            ):
+                return _orig_model_forward(
+                    self, input_ids=input_ids, positions=positions, *args, **kwargs
+                )
+
+            if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
+                # Extract block_table and slot_mapping from input_batch early for both P2D and standard prefill
+                block_table = None
+                slot_mapping = None
+                input_batch = getattr(self, "input_batch", None)
+                if (
+                    input_batch is not None
+                    and getattr(input_batch, "block_table", None) is not None
+                ):
+                    try:
+                        blk_table = input_batch.block_table[0]
+                        if hasattr(blk_table, "get_device_tensor"):
+                            block_table = blk_table.get_device_tensor(num_reqs)
+                        if hasattr(blk_table, "slot_mapping") and hasattr(
+                            blk_table.slot_mapping, "gpu"
                         ):
-                            reason = "unsupported_inputs"
-                            bucket = None
-                    if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
-                        # Extract slot mapping from active block table
-                        slot_mapping = None
-                        if (
-                            hasattr(self, "input_batch")
-                            and getattr(self.input_batch, "block_table", None) is not None
+                            slot_mapping = blk_table.slot_mapping.gpu[:total_tokens]
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Could not get block_table or slot_mapping: %r", e)
+
+                # 1. First priority: P2D (3-tier: monolithic / stepwise / eager-on-device)
+                p2d_bucket = (
+                    p_runner.match_p2d_bucket(total_tokens)
+                    if not async_prefill and hasattr(p_runner, "match_p2d_bucket")
+                    else None
+                )
+                step_bws = (
+                    match_p2d_step_beam_widths(self, scheduler_output)
+                    if not async_prefill
+                    else None
+                )
+                if step_bws is not None and is_p2d_eligible(
+                    self,
+                    scheduler_output,
+                    num_reqs,
+                    total_tokens,
+                    bucket=None,
+                    step_bws=step_bws,
+                ):
+                    w0, w1, w2 = step_bws
+
+                    # The engine per-step path applies the request
+                    # temperature through the constraint Backend at every
+                    # step; the P2D sampling kernels read the same value
+                    # from the pool's broadcast buffer (a device input baked
+                    # into the captured graphs), so stage it before any tier
+                    # executes to keep P2D samples identical to the
+                    # engine-driven loop.
+                    scheduled_new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None) or []
+                    for staged_req in scheduled_new_reqs:
+                        staged_temp = getattr(
+                            getattr(staged_req, "sampling_params", None),
+                            "temperature",
+                            None,
+                        )
+                        if isinstance(staged_temp, (int, float)):
+                            break
+                    else:
+                        staged_temp = None
+                    if staged_temp is not None:
+                        p2d_pool = getattr(p_runner, "p2d_pool", None)
+                        if p2d_pool is not None and hasattr(p2d_pool, "temperatures"):
+                            p2d_pool.temperatures[0] = float(staged_temp)
+
+                    # Extract computed tokens for KV-cache and position alignment
+                    computed_tokens: list[int] = []
+                    if input_batch is not None:
+                        comp = getattr(input_batch, "num_computed_tokens_cpu", None)
+                        if comp is not None:
+                            req_id_to_index = getattr(input_batch, "req_id_to_index", None)
+                            if (
+                                isinstance(raw_scheduled_tokens, dict)
+                                and req_id_to_index is not None
+                            ):
+                                for req_id in raw_scheduled_tokens:
+                                    row = req_id_to_index.get(req_id, 0)
+                                    val = int(comp[row])
+                                    computed_tokens.append(val)
+                            else:
+                                for r in range(num_reqs):
+                                    val = int(comp[r])
+                                    computed_tokens.append(val)
+
+                    p2d_mode = os.environ.get("VLLM_GR_P2D_MODE", "auto").lower()
+                    if p2d_mode == "auto":
+                        scheduled_new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None)
+                        if scheduled_new_reqs:
+                            for req in scheduled_new_reqs:
+                                sp = getattr(req, "sampling_params", None)
+                                eb = getattr(sp, "extra_body", None)
+                                if isinstance(eb, dict) and "p2d_mode" in eb:
+                                    p2d_mode = str(eb["p2d_mode"]).lower()
+                                    break
+
+                    # --- Tier 1: monolithic graph (uniform widths only) ---
+                    use_monolithic = False
+                    has_monolithic_graph = False
+                    if step_bws.is_uniform:
+                        if p2d_bucket is not None:
+                            if hasattr(p_runner, "has_captured_graph"):
+                                has_monolithic_graph = p_runner.has_captured_graph(
+                                    p2d_bucket, num_reqs, w0
+                                )
+                            elif hasattr(p_runner, "buffers") and p_runner.buffers.get(p2d_bucket):
+                                buf = p_runner.buffers[p2d_bucket]
+                                if hasattr(buf, "has_captured_graph"):
+                                    has_monolithic_graph = buf.has_captured_graph(num_reqs, w0)
+                        if p2d_mode == "monolithic":
+                            use_monolithic = bool(has_monolithic_graph)
+                        elif (
+                            p2d_mode != "eager_p2d"
+                            and p2d_bucket is not None
+                            and p2d_bucket in MONOLITHIC_SUPPORTED_BUCKETS
+                            and has_monolithic_graph
                         ):
-                            try:
-                                blk_table = self.input_batch.block_table[0]
-                                if hasattr(blk_table, "slot_mapping") and hasattr(
-                                    blk_table.slot_mapping, "gpu"
-                                ):
-                                    slot_mapping = blk_table.slot_mapping.gpu
-                            except Exception as e:
-                                logger.warning("Could not get slot_mapping: %r", e)
-                        output_buf = p_runner.execute_model_prefill(
-                            bucket=bucket,
+                            pad_tokens = p2d_bucket - total_tokens
+                            pad_ratio = pad_tokens / float(total_tokens)
+                            if pad_ratio <= MONOLITHIC_MAX_PAD_RATIO:
+                                use_monolithic = True
+
+                    p2d_res = None
+                    if use_monolithic and p2d_bucket is not None:
+                        p2d_res = p_runner.execute_p2d(
+                            bucket=p2d_bucket,
                             input_ids=input_ids,
                             positions=positions,
-                            slot_mapping=slot_mapping,
                             num_scheduled_tokens=raw_scheduled_tokens,
+                            beam_width=w0,
+                            block_table=block_table,
+                            slot_mapping=slot_mapping,
+                            computed_tokens=computed_tokens,
                         )
-
-                        if output_buf is not None:
+                        if p2d_res is not None:
+                            self._current_p2d_result = p2d_res
                             logger.debug(
-                                "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
-                                "bucket=%s outcome=replay",
+                                "P2D Graph Replay: Executed captured CUDA Graph for "
+                                "bucket %d (reqs=%d, bw=%d, %d actual tokens).",
+                                p2d_bucket,
+                                num_reqs,
+                                w0,
+                                total_tokens,
+                            )
+                            buf = (
+                                p_runner.buffers.get(p2d_bucket)
+                                if hasattr(p_runner, "buffers")
+                                and isinstance(p_runner.buffers, dict)
+                                else None
+                            )
+                            if buf is not None:
+                                if buf.output_buf is None:
+                                    hidden_size = (
+                                        self.model_config.get_hidden_size()
+                                        if hasattr(self.model_config, "get_hidden_size")
+                                        else getattr(self.model_config, "hidden_size", 2048)
+                                    )
+                                    buf.output_buf = torch.zeros(
+                                        (p2d_bucket, hidden_size),
+                                        dtype=self.model_config.dtype,
+                                        device=self.device,
+                                    )
+                                return buf.output_buf
+                            if hasattr(p_runner, "get_output_buf"):
+                                return p_runner.get_output_buf(total_tokens, self.model_config)
+                    elif (
+                        step_bws.is_uniform
+                        and p2d_mode != "monolithic"
+                        and hasattr(p_runner, "has_2d_graph")
+                        and p_runner.has_2d_graph(num_reqs, w0)
+                    ):
+                        # Legacy uniform Eager-P + 2D graph path.
+                        p2d_res = p_runner.execute_eager_p2d(
+                            runner=self,
+                            input_ids=input_ids,
+                            positions=positions,
+                            num_scheduled_tokens=raw_scheduled_tokens,
+                            beam_width=w0,
+                            block_table=block_table,
+                            slot_mapping=slot_mapping,
+                            computed_tokens=computed_tokens,
+                        )
+                        if p2d_res is not None:
+                            self._current_p2d_result = p2d_res
+                            logger.debug(
+                                "Eager-P + 2D Graph Replay: Executed eager prefill (%d tokens) + "
+                                "captured 2D Graph (reqs=%d, bw=%d).",
                                 total_tokens,
                                 num_reqs,
-                                bucket,
+                                w0,
                             )
-                            return output_buf
-                        reason = getattr(p_runner, "last_replay_reason", "runner_rejected")
-                    logger.debug(
-                        "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
-                        "bucket=%s outcome=%s",
-                        total_tokens,
-                        num_reqs,
-                        bucket,
-                        reason,
-                    )
-        return _orig_model_forward(self, input_ids=input_ids, positions=positions, *args, **kwargs)
+                            if hasattr(p_runner, "get_output_buf"):
+                                return p_runner.get_output_buf(total_tokens, self.model_config)
+                            hidden_size = (
+                                self.model_config.get_hidden_size()
+                                if hasattr(self.model_config, "get_hidden_size")
+                                else getattr(self.model_config, "hidden_size", 2048)
+                            )
+                            return torch.zeros(
+                                (total_tokens, hidden_size),
+                                dtype=self.model_config.dtype,
+                                device=self.device,
+                            )
 
-    setattr(patched_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, True)
+                    # Tiers 2/3 are only usable within the pool's capture
+                    # extent (their decode graphs bake it; the fully eager
+                    # tier is too slow beyond it). Longer KV falls back to
+                    # the engine-driven constrained path, which is the
+                    # proven flow for such prompts.
+                    sched_vals = (
+                        list(raw_scheduled_tokens.values())
+                        if isinstance(raw_scheduled_tokens, dict)
+                        else list(raw_scheduled_tokens)
+                    )
+                    max_kv = max(
+                        (computed_tokens[i] if i < len(computed_tokens) else 0)
+                        + (sched_vals[i] if i < len(sched_vals) else 0)
+                        for i in range(num_reqs)
+                    )
+                    captured_bound = getattr(
+                        getattr(p_runner, "p2d_pool", None), "max_bucket", None
+                    )
+                    if (
+                        p2d_res is None
+                        and p2d_mode != "monolithic"
+                        and (captured_bound is None or max_kv <= int(captured_bound))
+                    ):
+                        bucket = p_runner.match_bucket(total_tokens)
+                        hidden = None
+                        if (
+                            bucket is not None
+                            and p_runner.has_captured_graph(bucket, num_reqs)
+                            and slot_mapping is not None
+                        ):
+                            hidden = p_runner.execute_model_prefill(
+                                bucket=bucket,
+                                input_ids=input_ids,
+                                positions=positions,
+                                slot_mapping=slot_mapping,
+                                num_scheduled_tokens=raw_scheduled_tokens,
+                            )
+                        if hidden is None:
+                            hidden = _orig_model_forward(
+                                self, input_ids, positions, *args, **kwargs
+                            )
+                        sample_indices = p_runner.get_prefill_logit_indices(raw_scheduled_tokens)
+                        if (
+                            hasattr(p_runner, "has_decode_step_graph")
+                            and p_runner.has_decode_step_graph(1, num_reqs, w0)
+                            and p_runner.has_decode_step_graph(2, num_reqs, w1)
+                        ):
+                            # Tier 2: decoupled decode-step graphs.
+                            p2d_res = p_runner.execute_stepwise_p2d(
+                                runner=self,
+                                hidden=hidden,
+                                sample_indices=sample_indices,
+                                num_scheduled_tokens=raw_scheduled_tokens,
+                                computed_tokens=computed_tokens,
+                                step_bws=step_bws,
+                                block_table=block_table,
+                                slot_mapping=slot_mapping,
+                            )
+                            tier_name = "Stepwise"
+                        else:
+                            # Tier 3: on-device eager P2D (exact widths).
+                            p2d_res = p_runner.execute_eager_p2d_stepped(
+                                runner=self,
+                                hidden=hidden,
+                                sample_indices=sample_indices,
+                                num_scheduled_tokens=raw_scheduled_tokens,
+                                computed_tokens=computed_tokens,
+                                step_bws=step_bws,
+                                block_table=block_table,
+                                slot_mapping=slot_mapping,
+                            )
+                            tier_name = "Eager-on-device"
+                        if p2d_res is not None:
+                            self._current_p2d_result = p2d_res
+                            logger.debug(
+                                "P2D %s Replay: reqs=%d, w=(%d, %d, %d), %d actual tokens.",
+                                tier_name,
+                                num_reqs,
+                                w0,
+                                w1,
+                                w2,
+                                total_tokens,
+                            )
+                            if hasattr(p_runner, "get_output_buf"):
+                                return p_runner.get_output_buf(total_tokens, self.model_config)
+                            hidden_size = (
+                                self.model_config.get_hidden_size()
+                                if hasattr(self.model_config, "get_hidden_size")
+                                else getattr(self.model_config, "hidden_size", 2048)
+                            )
+                            return torch.zeros(
+                                (total_tokens, hidden_size),
+                                dtype=self.model_config.dtype,
+                                device=self.device,
+                            )
+
+                    # Every P2D tier failed for an eligible batch whose staged
+                    # constraint prepare was skipped: restore it so the engine
+                    # fallback keeps the prelaunch fast path (correctness is
+                    # already guaranteed by the full constrained hook).
+                    if p2d_res is None and getattr(self, "_gr_skipped_constraint_prepare", False):
+                        with torch.autograd.profiler.record_function(
+                            "prefill_constraint_prepare_fallback"
+                        ):
+                            prepare_cuda_prefill_constraint(self, scheduler_output)
+                    if p2d_res is None:
+                        logger.debug(
+                            "vllm-gr: P2D dispatch produced no result (reqs=%d, "
+                            "tokens=%d, w=(%s)); falling back to the engine path.",
+                            num_reqs,
+                            total_tokens,
+                            (w0, w1, w2),
+                        )
+
+                bucket = (
+                    p_runner.match_bucket(total_tokens)
+                    if hasattr(p_runner, "match_bucket")
+                    else None
+                )
+                if (
+                    bucket is not None
+                    and hasattr(p_runner, "has_captured_graph")
+                    and p_runner.has_captured_graph(bucket, num_reqs)
+                ):
+                    # 2. Standard Prefill Graph fallback
+                    if slot_mapping is None:
+                        logger.debug("Could not get slot_mapping: extraction unavailable.")
+
+                    output_buf = p_runner.execute_model_prefill(
+                        bucket=bucket,
+                        input_ids=input_ids,
+                        positions=positions,
+                        slot_mapping=slot_mapping,
+                        num_scheduled_tokens=raw_scheduled_tokens,
+                    )
+
+                    if output_buf is not None:
+                        logger.debug(
+                            "Prefill Graph Replay: Executed captured CUDA Graph for bucket %d (reqs=%d, %d actual tokens).",
+                            bucket,
+                            num_reqs,
+                            total_tokens,
+                        )
+                        return output_buf
+        return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
+
     return patched_model_forward
 
 
@@ -1004,3 +1462,79 @@ def capture_prefill_graphs(runner) -> None:
 
 
 make_patched_model_forward = make_patched_model_forward_gpu
+
+
+def make_patched_capture_cudagraphs_gpu(_orig_capture_cudagraphs):
+    """Wrap _capture_cudagraphs to capture prefill graphs during warmup."""
+
+    @wraps(_orig_capture_cudagraphs)
+    def patched_capture_cudagraphs(
+        self, batch_descriptors, cudagraph_runtime_mode, *args, **kwargs
+    ):
+        res = _orig_capture_cudagraphs(
+            self, batch_descriptors, cudagraph_runtime_mode, *args, **kwargs
+        )
+
+        # Trigger prefill graph capture once when FULL decode graphs are being captured
+        from vllm.config import CUDAGraphMode
+
+        from vllm_gr.v1.worker.prefill_graph_runner import is_prefill_graph_enabled
+
+        if (
+            is_prefill_graph_enabled()
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not getattr(self, "_prefill_graphs_captured", False)
+        ):
+            self._prefill_graphs_captured = True
+            p_runner = get_prefill_graph_runner(self)
+            p_runner.capture_graphs(self)
+
+        return res
+
+    return patched_capture_cudagraphs
+
+
+make_patched_capture_cudagraphs = make_patched_capture_cudagraphs_gpu
+
+make_patched_prepare_inputs = make_patched_prepare_inputs_gpu
+make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_gpu
+
+
+def patch_async_gpu_model_runner_output() -> None:
+    """Patch AsyncGPUModelRunnerOutput.get_output to preserve P2D results."""
+    try:
+        from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
+
+        if getattr(AsyncGPUModelRunnerOutput.get_output, "_p2d_patched", False):
+            return
+
+        _orig_get_output = AsyncGPUModelRunnerOutput.get_output
+
+        @wraps(_orig_get_output)
+        def patched_get_output(self):
+            output = self._model_runner_output
+            logprobs = getattr(output, "logprobs", None)
+            sampled_ranks = getattr(logprobs, "sampled_token_ranks", None) if logprobs else None
+            if (
+                sampled_ranks is not None
+                and isinstance(sampled_ranks, np.ndarray)
+                and (sampled_ranks == P2D_SENTINEL_RANK).any()
+            ):
+                self.async_copy_ready_event.synchronize()
+                if hasattr(self, "_logprobs_tensors"):
+                    del self._logprobs_tensors
+                if hasattr(self, "_sampled_token_ids"):
+                    del self._sampled_token_ids
+                if self._routed_experts_cpu is not None:
+                    output.routed_experts = self._routed_experts_cpu.tolists()
+                del self._routed_experts
+                return output
+            return _orig_get_output(self)
+
+        patched_get_output._p2d_patched = True
+        AsyncGPUModelRunnerOutput.get_output = patched_get_output
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to patch AsyncGPUModelRunnerOutput.get_output: %r", exc)
+
+
+patch_async_gpu_model_runner_output()

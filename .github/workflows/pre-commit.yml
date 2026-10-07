@@ -234,9 +234,11 @@ jobs:
       - name: Set up virtual environment
         run: |
           echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
-          echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311" >> "$GITHUB_ENV"
+          {
+            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
+            echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+            echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311"
+          } >> "$GITHUB_ENV"
 
       - name: Check for single commit
         if: >-
@@ -260,11 +262,13 @@ jobs:
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
+          python setup.py build_ext --inplace
 
       - name: Verify vLLM compatibility
         run: |
           python -c 'import importlib.metadata as m; version = m.version("vllm").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM 0.22.1, found {version}"'
           python -c 'import importlib.metadata as m; version = m.version("vllm-gr").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM-GR 0.22.1, found {version}"'
+          python -c 'import vllm_gr._fast_sid_c'
 
       - name: Verify CUDA device mapping before cleanup
         id: cuda-mapping
@@ -350,6 +354,7 @@ jobs:
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
+          python setup.py build_ext --inplace
 
       - name: Verify CUDA device mapping before cleanup
         id: cuda-mapping
@@ -452,6 +457,7 @@ jobs:
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
+          python setup.py build_ext --inplace
 
       - name: Verify CUDA device mapping before cleanup
         id: cuda-mapping
@@ -529,6 +535,7 @@ jobs:
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
+          python setup.py build_ext --inplace
 
       - name: Verify CUDA device mapping before cleanup
         id: cuda-mapping

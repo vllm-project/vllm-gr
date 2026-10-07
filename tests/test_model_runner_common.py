@@ -1332,3 +1332,17 @@ def test_execute_wrapper_releases_depth_on_exception() -> None:
     with pytest.raises(ExpectedError):
         wrapped(runner, scheduler_output)
     assert common._WORKER_EXECUTE_DEPTH == 0
+
+
+def test_beam_req_ids_proxy_len_matches_map() -> None:
+    """The proxy's logical length is the mapped row count."""
+    from vllm_gr.v1.worker.model_runner_common import BeamReqIdsProxy
+
+    proxy = BeamReqIdsProxy(["a", "b", "c"], ["a", "b"])
+    assert len(proxy) == 2
+    assert proxy[0] == "a"
+    assert proxy[1] == "b"
+    assert proxy.copy() == ["a", "b"]
+    # Iteration must follow the mapped rows, not the copied base storage.
+    assert list(proxy) == ["a", "b"]
+    assert [r for r in proxy] == ["a", "b"]

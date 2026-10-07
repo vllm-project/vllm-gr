@@ -89,13 +89,24 @@ def _validate_flat_logprobs_patch() -> str | None:
 
 
 def _validate_openai_beam_search_patch() -> str | None:
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
     from vllm.entrypoints.openai.engine.serving import OpenAIServing
 
     from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
     return _verified(
-        OpenAIServing.beam_search is beam_search,
-        "OpenAIServing.beam_search does not reference the GR implementation",
+        OpenAIServing.beam_search is beam_search
+        and getattr(OpenAIServingChat, "_vllm_gr_beam_stream_fast_path", False) is True,
+        "OpenAIServing.beam_search or stream fast path does not reference the GR implementation",
+    )
+
+
+def _validate_fast_sid_encode_patch() -> str | None:
+    from vllm.renderers.base import BaseRenderer
+
+    return _verified(
+        getattr(BaseRenderer, "_vllm_gr_sid_encode_patch", False) is True,
+        "BaseRenderer sid encode fast path is not installed",
     )
 
 
@@ -339,6 +350,12 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
             "vllm_gr.entrypoints.openai.beam_search_patch",
             "patch_beam_search",
             _validate_openai_beam_search_patch,
+        ),
+        patch(
+            "fast_sid_encode",
+            "vllm_gr.entrypoints.openai.tokenizer_patch",
+            "patch_fast_sid_encode",
+            _validate_fast_sid_encode_patch,
         ),
         patch(
             "chat_sampling_conversion",

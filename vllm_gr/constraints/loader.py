@@ -502,6 +502,54 @@ def _run_npu_readiness(
     )
 
 
+def load_cuda_backend_from_table(
+    table: ConstraintTable,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_top_k: int,
+    max_rows: int,
+) -> CUDAConstraintBackend:
+    """Upload an already-compiled host table and return a ready CUDA backend.
+
+    Shared by the canonical artifact loader and the startup catalog promotion
+    (offline triples compiled at model load). Runs the same capacity
+    validation, upload, readiness, and ready-marking sequence as
+    ``load_constraint_backend``'s CUDA branch.
+    """
+    if max_top_k > MAX_TOP_K:
+        raise ValueError(f"CUDA constraint max_top_k must be <= {MAX_TOP_K}, got {max_top_k}")
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"CUDA constraint logits must be fp16/bf16, got {dtype}")
+    if device.type != "cuda":
+        raise RuntimeError(f"CUDA constraint backend requires a CUDA device, got {device}")
+    _validate_loader_inputs(
+        device=device,
+        vocab_size=table.metadata.vocab_size,
+        dtype=dtype,
+        max_rows=max_rows,
+    )
+    backend, cases = _upload_cuda_backend(
+        table,
+        device=device,
+        max_top_k=max_top_k,
+        max_rows=max_rows,
+    )
+    try:
+        _run_cuda_readiness(
+            backend,
+            cases=cases,
+            device=device,
+            dtype=dtype,
+            max_rows=max_rows,
+        )
+        backend._mark_ready()  # noqa: SLF001
+        return backend
+    except BaseException:
+        backend.close()
+        raise
+
+
 def load_constraint_backend(
     config: ConstraintTableConfig,
     *,
@@ -560,26 +608,15 @@ def load_constraint_backend(
         )
         return CPUConstraintBackend(table, info)
     if config.backend is ConstraintTableBackendEnum.CUDA:
-        backend, cases = _upload_cuda_backend(
+        backend = load_cuda_backend_from_table(
             table,
             device=device,
+            dtype=dtype,
             max_top_k=config.max_top_k,
             max_rows=max_rows,
         )
         del table
-        try:
-            _run_cuda_readiness(
-                backend,
-                cases=cases,
-                device=device,
-                dtype=dtype,
-                max_rows=max_rows,
-            )
-            backend._mark_ready()  # noqa: SLF001
-            return backend
-        except BaseException:
-            backend.close()
-            raise
+        return backend
     if config.backend is not ConstraintTableBackendEnum.NPU or op is None:
         raise RuntimeError(f"unsupported constraint table backend {config.backend!r}")
 
@@ -609,4 +646,4 @@ def load_constraint_backend(
         raise
 
 
-__all__ = ["load_constraint_backend"]
+__all__ = ["load_constraint_backend", "load_cuda_backend_from_table"]

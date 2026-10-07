@@ -436,3 +436,97 @@ def test_inject_verifies_all_worker_acks(tokenizer: MagicMock) -> None:
         _verify_injected(resource, [{"digest": "deadbeef"}])
     with pytest.raises(RuntimeError, match="expected"):
         _verify_injected(resource, [{"cached": True}])  # missing digest
+
+
+def test_load_constraint_tables_skips_when_canonical_backend_present(
+    tokenizer: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner with a canonical backend never builds the legacy adapter."""
+    from vllm_gr.constraints import worker_inject
+    from vllm_gr.constraints.worker_inject import load_constraint_tables_on_worker
+
+    resource = _build_resource(tokenizer)
+    manager = ConstraintResourceManager()
+    manager.ensure(resource)
+    monkeypatch.setattr(worker_inject, "get_worker_manager", lambda: manager)
+
+    def fail_create(**kw: Any) -> None:
+        pytest.fail("adapter must not be created when a canonical backend exists")
+
+    monkeypatch.setattr(
+        "vllm_gr.constraints.startup.create_constraint_execution",
+        fail_create,
+    )
+
+    class FakeRunner:
+        device = torch.device("cuda")
+        constraint_backend = object()
+
+    assert load_constraint_tables_on_worker(FakeRunner()) is True
+
+
+def test_load_constraint_tables_publishes_canonical_backend_on_cuda(
+    tokenizer: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An injected resource on CUDA becomes the canonical backend."""
+    from types import SimpleNamespace
+
+    from vllm_gr.config import ConstraintBackend, ConstraintTableBackendEnum
+    from vllm_gr.constraints import worker_inject
+    from vllm_gr.constraints.worker_inject import load_constraint_tables_on_worker
+
+    resource = _build_resource(tokenizer)
+    manager = ConstraintResourceManager()
+    manager.ensure(resource)
+    monkeypatch.setattr(worker_inject, "get_worker_manager", lambda: manager)
+    monkeypatch.setattr(
+        "vllm_gr.config.GRConfig.from_vllm_config",
+        lambda vllm_config: SimpleNamespace(
+            constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+            catalog_path="triples.json",
+            beam_max_width=128,
+            constraint_table=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_gr.constraints.artifact_compiler.constraint_table_from_resource",
+        lambda resource: object(),
+    )
+    fake_backend = SimpleNamespace(
+        info=SimpleNamespace(backend=ConstraintTableBackendEnum.CUDA),
+        vocab_slice=(151669, 24576),
+    )
+    monkeypatch.setattr(
+        "vllm_gr.constraints.loader.load_cuda_backend_from_table",
+        lambda table, *, device, dtype, max_top_k, max_rows: fake_backend,
+    )
+
+    class FakeRunner:
+        device = torch.device("cuda")
+        vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1))
+        model_config = SimpleNamespace(
+            dtype=torch.bfloat16,
+            get_vocab_size=lambda: 176256,
+        )
+        model = SimpleNamespace(modules=lambda: [])
+        constraint_backend = None
+        _gr_constraint_execution = None
+        _gr_vocab_slice_processors = ()
+
+    runner = FakeRunner()
+    assert load_constraint_tables_on_worker(runner) is True
+    assert runner.constraint_backend is fake_backend
+    assert runner._gr_constraint_execution is None
+
+
+def test_constraint_table_from_resource_digest_prefix(tokenizer: MagicMock) -> None:
+    """The real resource digest gains the sha256: prefix the ABI requires."""
+    from vllm_gr.constraints.artifact_compiler import constraint_table_from_resource
+
+    resource = _build_resource(tokenizer)
+    table = constraint_table_from_resource(resource)
+    assert table.metadata.tokenizer_digest.startswith("sha256:")
+    assert len(table.metadata.tokenizer_digest) == len("sha256:") + 64
+    assert table.metadata.tokenizer_digest[7:] == resource.digest

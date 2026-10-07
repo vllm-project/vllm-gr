@@ -5,7 +5,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Dict, List
 
 import regex as re
 import requests
@@ -114,28 +114,55 @@ def _messages_for_prompt(prompt: str) -> list[dict[str, str]]:
     return [{"role": "user", "content": prompt}]
 
 
+def _parse_step_beam_widths(value: str | None) -> list[int] | None:
+    """Validates a --step-beam-widths string: 3 positive integers, else None."""
+    if value is None:
+        return None
+    try:
+        widths = [int(x.strip()) for x in value.split(",") if x.strip()]
+    except (TypeError, ValueError) as exc:
+        logger.warning("Invalid --step-beam-widths=%r: %r; ignoring.", value, exc)
+        return None
+    if len(widths) != 3 or any(w <= 0 for w in widths):
+        logger.warning(
+            "Invalid --step-beam-widths=%r: expected 3 positive integers; ignoring.",
+            value,
+        )
+        return None
+    return widths
+
+
 def run_api_inference(
     prompts: list[str],
     model: str,
     api_url: str,
     api_key: str,
-    gen_config: dict[str, Any],
+    gen_config: Dict[str, Any],
     max_concurrency: int | None = None,
-) -> list[MockRequestOutput]:
+    step_beam_widths: list[int] | None = None,
+) -> List[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
 
+    vllm_xargs = {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"}
+    if step_beam_widths:
+        vllm_xargs["step_beam_widths"] = [int(w) for w in step_beam_widths]
+
     # Map generation config to API parameters
     api_params = {
         "model": model,
-        "use_beam_search": True if (gen_config.get("num_beams", 1) > 1) else False,
+        "use_beam_search": bool(gen_config.get("num_beams", 1) > 1 or step_beam_widths is not None),
         "max_tokens": gen_config.get("max_new_tokens", 1024),
         "temperature": gen_config.get("temperature", 0.0),
         "top_p": gen_config.get("top_p", 1.0),
-        "n": gen_config.get("num_return_sequences", 1),
-        "vllm_xargs": {"begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>"},
+        "n": (
+            gen_config.get("num_return_sequences", 1)
+            if gen_config.get("num_return_sequences") is not None
+            else (step_beam_widths[-1] if step_beam_widths else 1)
+        ),
+        "vllm_xargs": vllm_xargs,
     }
 
     def _send_request(prompt):
@@ -170,12 +197,17 @@ def run_api_inference(
             logger.error(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
 
-    # Run in parallel. The BeamAttentionPool is max_batch=1: only one beam
-    # session may be active at a time, so cap workers at max_concurrency
-    # (callers running beam-search accuracy tests pass --max-concurrency 1).
-    worker_limit = max_concurrency if max_concurrency is not None else 16
-    logger.info(f"Sending {len(prompts)} requests to {api_url}...")
-    with ThreadPoolExecutor(max_workers=min(len(prompts), worker_limit)) as executor:
+    # Run with concurrency limit if specified
+    if max_concurrency is not None and max_concurrency > 0:
+        max_workers = max_concurrency
+    elif gen_config.get("num_beams", 1) > 1 or api_params.get("use_beam_search", False):
+        # Beam search in vLLM-GR currently supports only a single concurrent session (max_batch=1)
+        max_workers = 1
+    else:
+        max_workers = min(len(prompts), 16)
+
+    logger.info(f"Sending {len(prompts)} requests to {api_url} with max_workers={max_workers}...")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(_send_request, prompts))
 
     return results
@@ -208,6 +240,12 @@ def main():
         "--use-beam-search", action="store_true", help="Whether to use beam search for generation."
     )
     parser.add_argument("--n", type=int, help="Beam width to use if beam search is enabled.")
+    parser.add_argument(
+        "--step-beam-widths",
+        type=str,
+        default=None,
+        help="Comma-separated per-step beam widths (W0,W1,W2) for P2D.",
+    )
     parser.add_argument("--gr", action="store_true", help="Whether to use vllm-gr.")
 
     parser.add_argument(
@@ -272,6 +310,10 @@ def main():
         logger.info(
             f"Using beam search according to the config with beam width: {gen_config.get('num_beams', 1)}"
         )
+
+    step_beam_widths = _parse_step_beam_widths(args.step_beam_widths)
+    if step_beam_widths:
+        logger.info(f"Using per-step beam widths (W0,W1,W2): {step_beam_widths}")
 
     # 2. Initialize Engine
     llm = None
@@ -343,6 +385,7 @@ def main():
             args.api_key,
             gen_config,
             max_concurrency=args.max_concurrency,
+            step_beam_widths=step_beam_widths,
         )
         gen_end = time.perf_counter()
     else:
@@ -355,6 +398,8 @@ def main():
         if hasattr(BeamSearchParams, "begin_token"):
             params.begin_token = "<|sid_begin|>"
             params.end_token = "<|sid_end|>"
+        if step_beam_widths and hasattr(BeamSearchParams, "step_beam_widths"):
+            params.step_beam_widths = step_beam_widths
         prompts_dict = [{"prompt": prompt} for prompt in prompts]
         gen_start = time.perf_counter()
         raw_offline_outputs = llm.beam_search(

@@ -32,9 +32,7 @@ def _reset_prometheus_state(monkeypatch):
         return
 
     # Unregister any previously-registered metrics so tests don't collide.
-    collectors_to_remove = []
-    for collector in list(prometheus_client.REGISTRY._collector_to_names.keys()):
-        collectors_to_remove.append(collector)
+    collectors_to_remove = list(prometheus_client.REGISTRY._collector_to_names.keys())
     for collector in collectors_to_remove:
         try:
             prometheus_client.REGISTRY.unregister(collector)
@@ -47,11 +45,13 @@ def _reset_prometheus_state(monkeypatch):
     _mod._metrics_initialized = False
     _mod._beam_prefill_time_total = None
     _mod._beam_decode_time_total = None
+    _mod._beam_execution_time_total = None
     _mod._beam_sort_time_total = None
     _mod._beam_requests_total = None
     _mod._total_beams_generated = None
     _mod._beam_prefill_time_histogram = None
     _mod._beam_decode_time_histogram = None
+    _mod._beam_execution_time_histogram = None
     _mod._beam_sort_time_histogram = None
     _mod._beams_per_request_histogram = None
 
@@ -67,6 +67,7 @@ class TestRecordBeamSearchMetrics:
         stats = RequestStateStats()
         stats.beam_search_prefill_time = 0.1
         stats.beam_search_decode_time = 0.5
+        stats.beam_search_execution_time = 0.25
         stats.beam_search_sort_time = 0.01
         stats.num_beams = 4
 
@@ -75,12 +76,32 @@ class TestRecordBeamSearchMetrics:
         text = get_beam_search_metrics_text()
         assert "vllm_gr_beam_search_prefill_time_seconds_total" in text
         assert "vllm_gr_beam_search_decode_time_seconds_total" in text
+        assert "vllm_gr_beam_search_execution_time_seconds_total" in text
         assert "vllm_gr_beam_search_sort_time_seconds_total" in text
         assert "vllm_gr_beam_search_requests_total" in text
         assert "vllm_gr_beam_search_total_beams_generated_total" in text
         # Counters should contain the recorded values.
         assert 'engine="0"' in text
         assert 'model_name="test_model"' in text
+
+    def test_record_metrics_p2d(self):
+        """P2D request counter is recorded correctly."""
+        if not PROMETHEUS_AVAILABLE:
+            pytest.skip("prometheus_client not installed")
+
+        stats_p2d = RequestStateStats(
+            beam_search_execution_time=0.1,
+            num_beams=4,
+            is_p2d=True,
+        )
+
+        record_beam_search_metrics(stats_p2d, engine="0", model_name="test_model")
+
+        text = get_beam_search_metrics_text()
+        assert "vllm_gr_beam_search_p2d_requests_total" in text
+        assert "vllm_gr_beam_search_p2d_tier1_requests_total" not in text
+        assert "vllm_gr_beam_search_p2d_tier2_requests_total" not in text
+        assert "vllm_gr_beam_search_p2d_tier3_requests_total" not in text
 
     def test_record_metrics_with_plain_namespace(self):
         """record_beam_search_metrics works with arbitrary objects bearing the right attrs."""

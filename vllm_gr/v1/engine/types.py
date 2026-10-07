@@ -53,3 +53,5 @@ class BeamRequestStepUpdate(
     # Appended after all existing fields to preserve msgspec's positional
     # array wire compatibility with older EngineCore processes.
     parent_cumulative_logprobs: list[float] | None = None
+    # True if this is the final decode step, so worker/engine teardown can happen inline.
+    is_last_step: bool = False

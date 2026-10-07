@@ -5,12 +5,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from vllm_gr.config import MAX_BEAM_WIDTH
 
 
-def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional[Dict[str, Any]]:
+def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> dict[str, Any] | None:
     """Build scheduler metadata for a grouped beam-decode request.
 
     ``beam_width`` is execution metadata carried by ``BeamRequestStepUpdate``;
@@ -96,6 +96,7 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
         # independent of the decode step count, defaults to beam_width when
         # the request does not carry one).
         "result_width": getattr(req, "result_width", None),
+        "is_last_step": getattr(req, "is_last_step", False),
     }
     parent_scores = getattr(req, "parent_cumulative_logprobs", None)
     if parent_scores is not None:

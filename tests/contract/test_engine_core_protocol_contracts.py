@@ -85,6 +85,7 @@ BEAM_STEP_UPDATE_FIELDS = (
     "max_decode_steps",
     "constraint_step",
     "parent_cumulative_logprobs",
+    "is_last_step",
 )
 
 
@@ -177,7 +178,7 @@ def test_beam_step_update_full_raw_wire_shape() -> None:
     assert raw_payload[8:13] == [2, 3, 4, 5, 6]
     assert raw_payload[13] is None
     assert raw_payload[14:16] == ["cache-salt", {"traceparent": "trace-0"}]
-    assert raw_payload[16:] == [[0, 0], 4, 2, [-1.0, -2.0]]
+    assert raw_payload[16:] == [[0, 0], 4, 2, [-1.0, -2.0], False]
 
 
 def test_scheduler_beam_metadata_shape() -> None:
@@ -207,6 +208,7 @@ def test_scheduler_beam_metadata_shape() -> None:
         # Final-step output width for the worker beam decision; falls back
         # to beam_width on the worker when the request does not carry one.
         "result_width": None,
+        "is_last_step": False,
     }
 
 

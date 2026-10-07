@@ -301,16 +301,20 @@ def run_cascade_beam_attention(
     vllm_flash_attn_version: int,
     logits_soft_cap: float | None = None,
     npu_causal_atten_mask: torch.Tensor | None = None,
+    attn_metadata: Any | None = None,
 ) -> torch.Tensor:
     """Runs the real BeamAttentionImpl.cascade_attention backend under test.
 
     Shared by both device tests; only ``vllm_flash_attn_version``,
     ``logits_soft_cap`` and (NPU-only) ``npu_causal_atten_mask`` differ.
+    ``attn_metadata`` may be supplied pre-built to amortize metadata
+    construction over multiple layer calls.
     """
     output = torch.zeros_like(inputs.query)
-    attn_metadata = build_beam_attn_metadata(
-        inputs, device, npu_causal_atten_mask=npu_causal_atten_mask
-    )
+    if attn_metadata is None:
+        attn_metadata = build_beam_attn_metadata(
+            inputs, device, npu_causal_atten_mask=npu_causal_atten_mask
+        )
 
     impl = BeamAttentionImpl(
         num_heads=inputs.query.shape[1],

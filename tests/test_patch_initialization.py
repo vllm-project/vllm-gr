@@ -27,6 +27,7 @@ def test_patch_plans_preserve_process_responsibilities() -> None:
     assert frontend_patches == [
         "flat_logprobs",
         "openai_beam_search",
+        "fast_sid_encode",
         "chat_sampling_conversion",
         "engine_args",
         "serving_models",

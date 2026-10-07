@@ -5,8 +5,8 @@ import json
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from vllm_gr.beam_search_decision_utils import (
     extract_and_dedup_flat_logprobs,
@@ -15,7 +15,6 @@ from vllm_gr.beam_search_decision_utils import (
 from vllm_gr.ops.sliced_logits import (
     compute_sliced_logits,
     get_rank_vocab_bounds,
-    get_vocab_slice_config,
     is_vocab_slice_enabled,
     set_vocab_slice_config,
 )
@@ -135,7 +134,7 @@ def test_token_id_remapping() -> None:
     assert not is_vocab_slice_enabled()
 
 
-def test_catalog_slice_config(tmp_path: Any) -> None:
+def test_catalog_load_does_not_mutate_vocab_slice(tmp_path: Any) -> None:
     set_vocab_slice_config(None, None)
     assert not is_vocab_slice_enabled()
 
@@ -159,42 +158,9 @@ def test_catalog_slice_config(tmp_path: Any) -> None:
     cat = Catalog(DummyTokenizer())
     cat.load(str(catalog_file))
 
-    assert is_vocab_slice_enabled()
-    assert cat.vocab_offset == 1000
-    assert cat.vocab_slice_size == 1500  # 2499 - 1000 + 1
-    offset, slice_size, _ = get_vocab_slice_config()
-    assert offset == 1000
-    assert slice_size == 1500
-
-    set_vocab_slice_config(None, None)
+    # Catalog is disconnected from vocab slice: it should not enable vocab slicing
     assert not is_vocab_slice_enabled()
-
-
-def test_constraint_triples_slice_config(tmp_path: Any) -> None:
-    from vllm_gr.utils.catalog import compute_catalog_slice_config
-
-    class DummyTokenizer:
-        def convert_tokens_to_ids(self, tokens: Any) -> Any:
-            mapping = {
-                "<s_a_100>": 1000,
-                "<s_b_200>": 1200,
-                "<s_c_500>": 2499,
-            }
-            return [mapping.get(token) for token in tokens]
-
-    triples_file = tmp_path / "constraint_triples.json"
-    triples_file.write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "triples": [{"a": "<s_a_100>", "b": "<s_b_200>", "c": "<s_c_500>"}],
-                "sentinels": {"begin": "<|sid_begin|>", "end": "<|sid_end|>"},
-                "relations": {},
-            }
-        )
-    )
-
-    assert compute_catalog_slice_config(str(triples_file), DummyTokenizer()) == (1000, 1500)
+    assert cat.is_terminal([1, 1000, 1200, 2499, 2])
 
 
 class MockTPHead(nn.Module):  # type: ignore[misc]

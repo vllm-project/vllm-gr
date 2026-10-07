@@ -672,10 +672,6 @@ def test_npu_catalog_path_without_backend_promotes_to_constraint_table(
             "vllm_gr.engine.arg_utils_gr._catalog_is_triples_document",
             return_value=True,
         ),
-        mock.patch(
-            "vllm_gr.utils.catalog.compute_catalog_slice_config",
-            side_effect=AssertionError("vocab slice computation must not run"),
-        ),
     ):
         result = create_engine_config(engine_args)
 
@@ -777,10 +773,6 @@ def test_non_cuda_constraint_table_backend_skips_vocab_slice_computation(
             "vllm_gr.engine.arg_utils_gr._is_cuda_platform",
             return_value=False,
         ),
-        mock.patch(
-            "vllm_gr.utils.catalog.compute_catalog_slice_config",
-            side_effect=AssertionError("vocab slice computation must not run"),
-        ) as slice_spy,
         mock.patch("vllm_gr.ops.sliced_logits.set_vocab_slice_config") as set_slice,
     ):
         result = create_engine_config(engine_args)
@@ -790,7 +782,6 @@ def test_non_cuda_constraint_table_backend_skips_vocab_slice_computation(
     assert config.catalog_path == effective_path
     assert config.vocab_offset is None
     assert config.vocab_slice_size is None
-    slice_spy.assert_not_called()
     set_slice.assert_not_called()
 
 
@@ -805,6 +796,7 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
 ) -> None:
     """CUDA triples use the sliced lm_head path supported by the CUDA backend."""
     from vllm_gr.engine.arg_utils_gr import create_engine_config
+    from vllm_gr.v1.worker.prefill_graph_common import SIDSlices
 
     engine_args = SimpleNamespace(
         catalog_path="triples.json",
@@ -820,6 +812,7 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
         no_beam_graph=False,
         _vllm_gr_config_input=None,
     )
+    mock_slices = SIDSlices(sid_a=(151669, 8192), sid_b=(159861, 8192), sid_c=(168053, 8192))
     with (
         mock.patch(
             "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
@@ -827,9 +820,10 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
         ),
         mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=False),
         mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=True),
+        mock.patch("vllm.tokenizers.get_tokenizer", return_value=mock.MagicMock()),
         mock.patch(
-            "vllm_gr.utils.catalog.compute_catalog_slice_config",
-            return_value=(151669, 24576),
+            "vllm_gr.v1.worker.prefill_graph_common.compute_sid_slices_from_tokenizer",
+            return_value=mock_slices,
         ) as slice_spy,
         mock.patch("vllm_gr.ops.sliced_logits.set_vocab_slice_config") as set_slice,
     ):
@@ -842,6 +836,84 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
     assert config.beam_engine_driven is expected_engine_driven
     slice_spy.assert_called_once()
     set_slice.assert_called_once_with(151669, 24576)
+
+
+def test_npu_unconstrained_configures_vocab_slice_from_tokenizer() -> None:
+    """NPU without constraint_table configures vocabulary slicing from tokenizer SID slices."""
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+    from vllm_gr.v1.worker.prefill_graph_common import SIDSlices
+
+    engine_args = SimpleNamespace(
+        catalog_path=None,
+        constraint_backend=None,
+        attention_backend=None,
+        attention_config=None,
+        model="test-model",
+        trust_remote_code=False,
+        beam_max_width=32,
+        beam_worker_decision=None,
+        beam_engine_driven=None,
+        async_scheduling=False,
+        no_beam_graph=False,
+        _vllm_gr_config_input=None,
+    )
+    mock_slices = SIDSlices(sid_a=(151669, 8192), sid_b=(159861, 8192), sid_c=(168053, 8192))
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=_vllm_config(),
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=True),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
+        mock.patch("vllm.tokenizers.get_tokenizer", return_value=mock.MagicMock()),
+        mock.patch(
+            "vllm_gr.v1.worker.prefill_graph_common.compute_sid_slices_from_tokenizer",
+            return_value=mock_slices,
+        ) as slice_spy,
+        mock.patch("vllm_gr.ops.sliced_logits.set_vocab_slice_config") as set_slice,
+    ):
+        result = create_engine_config(engine_args)
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.vocab_offset == 151669
+    assert config.vocab_slice_size == 24576
+    slice_spy.assert_called_once()
+    set_slice.assert_called_once_with(151669, 24576)
+
+
+def test_npu_constraint_table_skips_vocab_slice_computation() -> None:
+    """NPU with constraint_table skips vocab slice computation to maintain full-vocab ABI."""
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    engine_args = SimpleNamespace(
+        catalog_path="triples.json",
+        constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+        attention_backend=None,
+        attention_config=None,
+        model="test-model",
+        trust_remote_code=False,
+        beam_max_width=32,
+        beam_worker_decision=None,
+        beam_engine_driven=None,
+        async_scheduling=False,
+        no_beam_graph=False,
+        _vllm_gr_config_input=None,
+    )
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=_vllm_config(),
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=True),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
+        mock.patch("vllm_gr.ops.sliced_logits.set_vocab_slice_config") as set_slice,
+    ):
+        result = create_engine_config(engine_args)
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.vocab_offset is None
+    assert config.vocab_slice_size is None
+    set_slice.assert_not_called()
 
 
 def test_from_vllm_config_caches_on_the_config_object() -> None:
@@ -857,7 +929,7 @@ def test_from_vllm_config_caches_on_the_config_object() -> None:
     assert first is second
     assert first.beam_max_width == 128
     # The cache travels on the host object.
-    assert getattr(vllm_config, "_vllm_gr_parsed_config") is first
+    assert vllm_config._vllm_gr_parsed_config is first
 
 
 def test_write_to_vllm_config_invalidates_parse_cache() -> None:
