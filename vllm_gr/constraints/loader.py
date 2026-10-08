@@ -33,6 +33,7 @@ from vllm_gr.ops.cuda.rec_constrained_topk import validate_cuda_sort_capacity
 from vllm_gr.ops.npu.rec_constrained_topk import (
     MAX_TOP_K,
     NPUConstraintOp,
+    rec_constrained_topk_npu,
     resolve_rec_constrained_topk_npu,
 )
 
@@ -380,7 +381,6 @@ def _run_device_readiness(
     dtype: torch.dtype,
     max_rows: int,
     synchronize: Callable[[torch.device], None],
-    normalize_over_candidates: bool,
 ) -> None:
     rows = min(max_rows, 2)
     vocab_size = backend.info.table_metadata.vocab_size
@@ -417,9 +417,12 @@ def _run_device_readiness(
                     _expected_ready_logprobs(
                         selected,
                         host_values,
-                        normalization_size=(
-                            case.candidate_count if normalize_over_candidates else vocab_size
-                        ),
+                        # The shared full-window domain is the only readiness
+                        # expectation: both the CUDA and NPU paths score over
+                        # the complete logits window, and there is deliberately
+                        # no knob to revert to the legacy candidate-set
+                        # normalization.
+                        normalization_size=vocab_size,
                         background_logit=background_logit,
                         temperature=temperature_values[row],
                     )
@@ -476,7 +479,6 @@ def _run_cuda_readiness(
         dtype=dtype,
         max_rows=max_rows,
         synchronize=_synchronize_current_cuda_stream,
-        normalize_over_candidates=False,
     )
 
 
@@ -488,9 +490,10 @@ def _run_npu_readiness(
     dtype: torch.dtype,
     max_rows: int,
 ) -> None:
-    # NPU readiness keeps the established candidate-set normalization domain:
-    # the shared full-window scoring contract is adopted by the CPU and CUDA
-    # Backends only; the fused NPU operator path is intentionally unchanged.
+    # NPU readiness validates the same shared full-window scoring contract as
+    # CUDA: the NPU wrapper re-scores the fused operator's selection with
+    # score_selected_tokens, so the expected logprobs normalize over the
+    # complete logits window, not the legacy candidate-set domain.
     _run_device_readiness(
         backend,
         cases=cases,
@@ -498,7 +501,6 @@ def _run_npu_readiness(
         dtype=dtype,
         max_rows=max_rows,
         synchronize=_synchronize_current_npu_stream,
-        normalize_over_candidates=True,
     )
 
 
@@ -540,7 +542,12 @@ def load_constraint_backend(
             )
         if device.type != "npu":
             raise RuntimeError(f"NPU constraint backend requires an NPU device, got {device}")
-        op = resolve_rec_constrained_topk_npu()
+        # Fail fast with the resolver's explicit unavailability message, then
+        # inject the wrapper (not the raw op): it widens bf16 logits, re-scores
+        # the operator's selection over the shared full-window domain, and
+        # restores the deterministic oracle tie order.
+        resolve_rec_constrained_topk_npu()
+        op = rec_constrained_topk_npu
 
     table = load_constraint_table_artifact(
         config.path,

@@ -120,6 +120,8 @@ def _build_case(
     candidate_width: int = 8,
     top_k: int = 4,
     per_row_temperature: bool = False,
+    background_logit: float = -20.0,
+    candidate_logit_step: float = 1.0,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], int]:
     tables = _constraint_tables(vocab_size, candidate_width)
     (
@@ -149,9 +151,12 @@ def _build_case(
     # CPU reference and NPU fused kernels may disagree on a few boundary tokens
     # due to different rounding/order stability. The precision guard should check
     # the operator contract, not accidental near-ties in random test data.
+    # The two knobs below deliberately break that isolation for the domain and
+    # tie-order guards: a hot background separates the full-window and
+    # candidate-set domains, a zero step makes every candidate tie exactly.
     logits = torch.full(
         (rows, vocab_size),
-        -20.0,
+        background_logit,
         dtype=torch.float32,
     )
 
@@ -174,7 +179,9 @@ def _build_case(
         # Make candidate ranking deterministic and well separated even after bf16
         # conversion. Higher-ranked candidates get larger logits.
         for rank, token_id in enumerate(candidate_ids.tolist()):
-            logits[row, token_id] = 10.0 + float(candidate_ids.numel() - rank)
+            logits[row, token_id] = 10.0 + candidate_logit_step * float(
+                candidate_ids.numel() - rank
+            )
 
     logits = logits.to(dtype)
 
@@ -233,6 +240,103 @@ def test_rec_constrained_topk_npu_matches_torch_reference(
     )
     # The reference accumulates in fp32 just like the NPU contract, but the
     # input logits may be fp16/bf16 and can differ by a few ulps after gather.
+    torch.testing.assert_close(
+        actual_logprobs.cpu(),
+        expected_logprobs,
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+@pytest.mark.parametrize("step", [0, 1, 2])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_rec_constrained_topk_npu_scores_full_window_on_hot_background(
+    step: int,
+    dtype: torch.dtype,
+) -> None:
+    """Fail if the NPU wrapper ever returns the fused op's candidate-set scores.
+
+    The wrapper must discard the fused operator's internal candidate-set
+    log-probs and re-score the selection over the shared full-window domain.
+    With a background logit close to the candidates the two domains differ by
+    O(0.2) log-prob units — far beyond the precision tolerance below — so a
+    wrapper that passes the candidate-set scores through cannot pass this
+    guard, unlike the cold-background ``matches_torch_reference`` test where
+    the domains numerically coincide.
+    """
+    cpu_inputs, npu_inputs, top_k = _build_case(
+        step=step,
+        dtype=dtype,
+        background_logit=8.0,
+    )
+
+    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
+        *cpu_inputs,
+        current_step=step,
+        top_k=top_k,
+    )
+    actual_tokens, actual_logprobs = rec_constrained_topk_npu(
+        *npu_inputs,
+        current_step=step,
+        top_k=top_k,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(
+        actual_tokens.cpu().to(expected_tokens.dtype),
+        expected_tokens,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        actual_logprobs.cpu(),
+        expected_logprobs,
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+@pytest.mark.parametrize("step", [0, 1, 2])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_rec_constrained_topk_npu_restores_oracle_order_on_exact_ties(
+    step: int,
+    dtype: torch.dtype,
+) -> None:
+    """Pin the shared tie oracle (score desc, table offset asc) on real NPU.
+
+    The fused operator's heap makes no ordering promise for equal scores, so
+    every candidate shares one logit and ``top_k`` covers the full degree:
+    the selected set is unambiguous and only the emitted order can vary. The
+    wrapper must restore the shared oracle order, which for equal scores is
+    exactly the table enumeration order the Torch reference produces. The
+    default candidates are strictly rank-separated, so the cold-background
+    tests never exercise this path on hardware.
+    """
+    cpu_inputs, npu_inputs, top_k = _build_case(
+        step=step,
+        dtype=dtype,
+        candidate_logit_step=0.0,
+        top_k=8,
+    )
+
+    expected_tokens, expected_logprobs = rec_constrained_topk_torch(
+        *cpu_inputs,
+        current_step=step,
+        top_k=top_k,
+    )
+    actual_tokens, actual_logprobs = rec_constrained_topk_npu(
+        *npu_inputs,
+        current_step=step,
+        top_k=top_k,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(
+        actual_tokens.cpu().to(expected_tokens.dtype),
+        expected_tokens,
+        rtol=0,
+        atol=0,
+    )
     torch.testing.assert_close(
         actual_logprobs.cpu(),
         expected_logprobs,

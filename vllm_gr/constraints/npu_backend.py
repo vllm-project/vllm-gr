@@ -101,14 +101,13 @@ class NPUConstraintBackend:
 
         # The fused operator consumes [B, W, max_steps]. A singleton W is a
         # zero-copy view of the public flat [rows, 3] Backend metadata.
+        # ``self._op`` is the full wrapper (bf16->fp32 widening, full-window
+        # re-scoring via score_selected_tokens, deterministic oracle tie
+        # order), so the returned scores already sit on the shared
+        # full-window domain — no re-scoring here.
         sequence_group = metadata.prefix_token_ids.unsqueeze(1)
-        # The fused kernel's bf16 load path reads stale unified-buffer data on
-        # ascend910b and produces garbage logprobs, while its fp32 path is
-        # correct; bf16 -> fp32 is a lossless bit extension, so widen first.
-        # (Same normalization as vllm_gr.ops.npu.rec_constrained_topk.)
-        op_logits = logits.to(torch.float32) if logits.dtype == torch.bfloat16 else logits
         token_ids, logprobs = self._op(
-            op_logits,
+            logits,
             sequence_group,
             *tables,
             metadata.temperatures,

@@ -36,9 +36,11 @@ class ConstraintMetadata:
     ``temperatures`` is a caller-validated tensor of finite, non-negative
     values.  Zero has the established constrained-operator meaning of one:
     logits are left unscaled, rather than divided by zero. Positive values
-    scale logits before normalization. The CPU and CUDA Backends normalize
-    over the complete shared logits window so candidate scores are
-    comparable across parent rows.
+    scale logits before normalization. The CPU, CUDA, and NPU Backends all
+    normalize over the complete shared logits window so candidate scores are
+    comparable across parent rows; the NPU wrapper re-scores the fused
+    operator's selection with the same shared-domain helper and restores the
+    deterministic oracle tie order.
 
     Value-domain validation intentionally remains at the request boundary.
     Inspecting a device tensor here would synchronize every NPU ``select``;
