@@ -99,6 +99,15 @@ def _validate_openai_beam_search_patch() -> str | None:
     )
 
 
+def _validate_fast_sid_encode_patch() -> str | None:
+    from vllm.renderers.base import BaseRenderer
+
+    return _verified(
+        getattr(BaseRenderer, "_vllm_gr_sid_encode_patch", False) is True,
+        "BaseRenderer sid encode fast path is not installed",
+    )
+
+
 def _validate_chat_sampling_patch() -> str | None:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 
@@ -339,6 +348,12 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
             "vllm_gr.entrypoints.openai.beam_search_patch",
             "patch_beam_search",
             _validate_openai_beam_search_patch,
+        ),
+        patch(
+            "fast_sid_encode",
+            "vllm_gr.entrypoints.openai.tokenizer_patch",
+            "patch_fast_sid_encode",
+            _validate_fast_sid_encode_patch,
         ),
         patch(
             "chat_sampling_conversion",
