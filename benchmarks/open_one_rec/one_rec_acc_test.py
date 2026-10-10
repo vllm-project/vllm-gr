@@ -23,6 +23,10 @@ except ImportError:
 # Must be imported before any vllm.benchmarks module usage.
 import benchmarks.open_one_rec.one_rec_patch  # noqa: F401
 from benchmarks.open_one_rec.open_one_rec_loader import TASK_REGISTRY, DataLoaderWrapper
+from benchmarks.open_one_rec.regression import (
+    RECOMMENDATION_TASKS,
+    validate_generations,
+)
 
 try:
     from vllm_gr.sampling_params import BeamSearchParams
@@ -158,6 +162,7 @@ def run_api_inference(
     api_key: str,
     gen_config: dict[str, Any],
     max_concurrency: int | None = None,
+    request_timeout: float = 600.0,
 ) -> list[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
@@ -177,35 +182,65 @@ def run_api_inference(
 
     def _send_request(prompt):
         response = None
-        payload = {"messages": _messages_for_prompt(prompt), **api_params}
+        # Rendered dataset transcripts sent to the Completion API must pass
+        # through verbatim: wrapping them in a chat message would apply the
+        # model's chat template a second time. Chat-API calls keep structured
+        # messages so the server-side template is applied exactly once.
+        if api_url.rstrip("/").endswith("/v1/completions"):
+            payload = {"prompt": prompt, **api_params}
+        else:
+            payload = {"messages": _messages_for_prompt(prompt), **api_params}
         try:
-            response = requests.post(api_url, headers=headers, json=payload)
+            response = requests.post(
+                api_url,
+                headers=headers,
+                json=payload,
+                timeout=request_timeout,
+            )
             response.raise_for_status()
             data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("API response JSON must be an object")
 
-            # Extract content
-            if data.get("choices"):
-                mock_outputs = []
-                for choice in data["choices"]:
-                    message = choice.get("message", {})
+            choices = data.get("choices")
+            expected_choices = int(api_params["n"])
+            if not isinstance(choices, list):
+                raise ValueError("API response 'choices' must be a list")
+            if len(choices) != expected_choices:
+                raise ValueError(
+                    f"API response returned {len(choices)} choices, expected {expected_choices}"
+                )
+
+            mock_outputs = []
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    raise ValueError("API response choices must be objects")
+                if api_url.rstrip("/").endswith("/v1/completions"):
+                    full_text = choice.get("text")
+                    if not isinstance(full_text, str):
+                        raise ValueError("Completion choice 'text' must be a string")
+                else:
+                    message = choice.get("message")
+                    if not isinstance(message, dict):
+                        raise ValueError("Chat choice 'message' must be an object")
                     content = message.get("content", "")
                     reasoning = message.get("reasoning_content", "")  # Support for reasoning models
-
-                    full_text = ""
-                    if reasoning:
-                        full_text += reasoning
-                    if content:
-                        full_text += content
-                    mock_outputs.append(MockCompletionOutput(full_text))
-                return MockRequestOutput(prompt, mock_outputs)
-            return MockRequestOutput(prompt, [MockCompletionOutput("")])
-        except Exception as e:
-            status_code = response.status_code if response is not None else "N/A"
-            response_text = response.text if response is not None else "N/A"
+                    if content is None:
+                        content = ""
+                    if reasoning is None:
+                        reasoning = ""
+                    if not isinstance(content, str) or not isinstance(reasoning, str):
+                        raise ValueError("Chat choice content fields must be strings")
+                    full_text = reasoning + content
+                mock_outputs.append(MockCompletionOutput(full_text))
+            return MockRequestOutput(prompt, mock_outputs), None
+        except Exception as e:  # noqa: BLE001 - record per-sample failures, keep the run going
+            status_code = getattr(response, "status_code", "N/A")
+            response_text = getattr(response, "text", "N/A")
             logger.error(f"Request failed. Status code: {status_code}")
             logger.error(f"[DEBUG] Response text: {response_text}")
             logger.error(f"Request failed for prompt: {prompt[:50]}... Error: {e}")
-            return MockRequestOutput(prompt, [MockCompletionOutput("")])
+            return None, f"status={status_code}: {e}"
 
     # Run in parallel. The BeamAttentionPool is max_batch=1: only one beam
     # session may be active at a time, so cap workers at max_concurrency
@@ -213,9 +248,50 @@ def run_api_inference(
     worker_limit = max_concurrency if max_concurrency is not None else 16
     logger.info(f"Sending {len(prompts)} requests to {api_url}...")
     with ThreadPoolExecutor(max_workers=min(len(prompts), worker_limit)) as executor:
-        results = list(executor.map(_send_request, prompts))
+        request_results = list(executor.map(_send_request, prompts))
 
-    return results
+    outputs: list[MockRequestOutput] = []
+    failures: list[str] = []
+    for output, failure in request_results:
+        if failure is not None:
+            failures.append(failure)
+        elif output is not None:
+            outputs.append(output)
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} of {len(prompts)} API requests failed; first failure: {failures[0]}"
+        )
+
+    return outputs
+
+
+def _validate_recommendation_outputs(
+    outputs: list[MockRequestOutput],
+    *,
+    expected_requests: int,
+    beam_width: int,
+) -> None:
+    """Reject incomplete or structurally invalid OneRec recommendation output."""
+    if len(outputs) != expected_requests:
+        raise RuntimeError(
+            f"inference returned {len(outputs)} requests, expected {expected_requests}"
+        )
+
+    invalid: list[tuple[int, dict[str, Any]]] = []
+    for index, output in enumerate(outputs):
+        contract = validate_generations([choice.text for choice in output.outputs], beam_width)
+        if (
+            not contract["beam_count_ok"]
+            or contract["empty_count"] > 0
+            or contract["invalid_sid_count"] > 0
+        ):
+            invalid.append((index, contract))
+    if invalid:
+        first_index, first_contract = invalid[0]
+        raise RuntimeError(
+            f"{len(invalid)} of {expected_requests} requests violated the OneRec output "
+            f"contract; first invalid request index={first_index}: {first_contract}"
+        )
 
 
 def main():
@@ -425,6 +501,17 @@ def main():
             gen_start = time.perf_counter()
             outputs = run_offline_v1_inference(llm, prompts, params, args.batch_size)
             gen_end = time.perf_counter()
+
+    # Enforce the standalone-SID output contract only for the five SID
+    # recommendation tasks; the other registered tasks (label_pred,
+    # item_understand, rec_reason) emit yes/no, captions or explanations and
+    # must keep their own output contracts.
+    if args.task_type in RECOMMENDATION_TASKS:
+        _validate_recommendation_outputs(
+            outputs,
+            expected_requests=len(prompts),
+            beam_width=gen_config["num_beams"],
+        )
 
     # Print a sample output
     if outputs:

@@ -183,6 +183,7 @@ class DataLoaderWrapper:
         split: str = "test",
         sample_size: Optional[Any] = None,
         sample_ids: Optional[list[int | str]] = None,
+        cache_sample: bool = True,
     ):
         """Load data using new loader system"""
         if task_name not in self._loader_cache:
@@ -195,7 +196,12 @@ class DataLoaderWrapper:
             )
 
         loader = self._loader_cache[task_name]
-        return loader.load_data(split=split, sample_size=sample_size, sample_ids=sample_ids)
+        return loader.load_data(
+            split=split,
+            sample_size=sample_size,
+            sample_ids=sample_ids,
+            cache_sample=cache_sample,
+        )
 
 
 class BaseLoader(ABC):
@@ -235,6 +241,7 @@ class BaseLoader(ABC):
         split: str = "test",
         sample_size: Optional[Any] = None,
         sample_ids: Optional[list[int | str]] = None,
+        cache_sample: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Load data for the task in messages-based format
@@ -242,8 +249,11 @@ class BaseLoader(ABC):
         Args:
             split: Dataset split (default "test")
             sample_size: Override sample size (can be int, "full", or None to use task config)
-            sample_ids: Exact source parquet row indices, preserving input order.
-                Mutually exclusive with sample_size.
+            sample_ids: Exact dataframe row indices to load, preserving the
+                supplied order. Mutually exclusive with sample_size.
+            cache_sample: Whether a size-based random sample may be loaded
+                from or written to the dataset directory. Explicit-ID loads
+                never use this cache.
 
         Returns:
             Dictionary mapping sample_id to sample data:
@@ -299,7 +309,8 @@ class BaseLoader(ABC):
         # Try to load cached sample dataframe
         df = None
         if (
-            effective_sample_size is not None
+            cache_sample
+            and effective_sample_size is not None
             and full_size is not None
             and effective_sample_size < full_size
         ):
@@ -314,7 +325,7 @@ class BaseLoader(ABC):
                 df = self._sample_data(df, effective_sample_size)
 
                 # Save sampled data
-                if full_size is not None and effective_sample_size < full_size:
+                if cache_sample and full_size is not None and effective_sample_size < full_size:
                     self._save_sample_data(df, split, effective_sample_size)
 
         if "messages" not in df.columns:

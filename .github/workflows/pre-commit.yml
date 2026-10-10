@@ -565,6 +565,36 @@ jobs:
           TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
         run: ./tests/system/run_benchmark_and_verify.sh
 
+      - name: Run official-protocol five-task precision differential
+        if: >-
+          github.ref_name == 'decode_graph' ||
+          github.event.pull_request.base.ref == 'decode_graph'
+        run: |
+          ./tests/system/run_onerec_precision_diff.sh \
+            --model OpenOneRec/OneRec-1.7B \
+            --revision cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b \
+            --dataset-path "${{ github.workspace }}/OpenOneRec/benchmark_data" \
+            --prepared-dir "${{ github.workspace }}/generated_full" \
+            --output-dir "${{ github.workspace }}/onerec_precision_results" \
+            --decode-execution offline \
+            --constrained-golden \
+              "${{ github.workspace }}/benchmarks/open_one_rec/manifests/ci_precision_v1_constrained_golden_offline.json" \
+            --beam-width 32 \
+            --temperature 0 \
+            --overwrite
+
+      - name: Upload five-task precision diagnostics
+        if: >-
+          always() &&
+          (github.ref_name == 'decode_graph' ||
+           github.event.pull_request.base.ref == 'decode_graph')
+        uses: actions/upload-artifact@v4
+        with:
+          name: onerec-precision-${{ github.run_id }}
+          path: onerec_precision_results
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
