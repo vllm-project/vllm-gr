@@ -96,16 +96,15 @@ def initialize_beam_postprocess_workspaces(
 ):
     """Prewarm the configured CUDA Beam postprocess bucket on ``runner``.
 
-    The production Worker currently owns a one-slot Beam context.  ``max_batch``
-    remains an explicit construction input so operator tests and a future
-    multi-request Worker can reserve more than one batch row without changing
-    the workspace layout.
+    V1 reserves the largest supported logical batch so B=1/2/4 reuse the same
+    fixed-address state and selection storage.
     """
 
     device = torch.device(getattr(runner, "device", "cpu"))
     if device.type != "cuda":
         return None
 
+    from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.beam.beam_decision import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
@@ -119,8 +118,11 @@ def initialize_beam_postprocess_workspaces(
         return None
 
     context = getattr(runner, "_beam_context", None)
+    default_max_batch = 4 if gr_cfg.beam_execution_mode is BeamExecutionMode.V1 else 1
     resolved_max_batch = (
-        int(max_batch) if max_batch is not None else int(getattr(context, "max_batch", 1))
+        int(max_batch)
+        if max_batch is not None
+        else int(getattr(context, "max_batch", default_max_batch))
     )
     dtype = getattr(getattr(runner, "model_config", None), "dtype", None)
     if not isinstance(dtype, torch.dtype):

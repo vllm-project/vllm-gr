@@ -310,6 +310,26 @@ def test_offline_inputs_preserve_caller_formed_batch_order() -> None:
     assert request.items[1].request.request_id != request.batch_id
 
 
+def test_offline_inputs_reject_unsupported_batch_size_before_admission() -> None:
+    engine = _make_engine()
+    engine.get_supported_tasks = lambda: ("generate",)
+    tokenizer = SimpleNamespace(eos_token_id=2, convert_tokens_to_ids=lambda token: None)
+    llm = SimpleNamespace(
+        get_tokenizer=lambda: tokenizer,
+        _preprocess_cmpl=lambda prompts: prompts,
+        _lora_request_to_seq=lambda lora, size: [lora] * size,
+    )
+
+    with pytest.raises(BeamSearchRequestError, match="supports batch sizes"):
+        BeamSearchInputProcessor(engine).process_offline_inputs(
+            llm,
+            OfflineBeamSearchRequest(
+                prompts=[[10], [20], [30]],
+                params=BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+            ),
+        )
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     "additional_config",
     [

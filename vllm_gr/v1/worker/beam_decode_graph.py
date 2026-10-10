@@ -81,6 +81,13 @@ class BeamDecodeGraph:
         self.descriptor = BatchDescriptor(num_tokens=signature.num_model_rows, uniform=True)
         return self
 
+    def discard_selected(self) -> None:
+        """Drop a capture whose fixed input addresses cannot be reused."""
+        self.wrapper.concrete_cudagraph_entries.pop(self.descriptor, None)
+        self._bindings.pop(self.signature, None)
+        self.capture_inputs = self.capture_attention = None
+        self.worker._beam_graph_keys = {signature.num_model_rows for signature in self._bindings}
+
     def _check_context(self) -> None:
         if self.context is not self.worker._beam_context:
             raise RuntimeError("Beam graph context changed after capture")

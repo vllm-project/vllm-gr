@@ -147,10 +147,10 @@ def test_planned_state_mismatch_is_a_device_error_with_no_generated_successor(dt
     owner.admit(dispatch(metadata()))
     owner.logits = torch.zeros((1, 6), device="cuda", dtype=dtype)
     first = owner.sample()
-    owner.beam.state.num_decode_steps[2:3].fill_(1)  # Planned Decode is zero.
+    owner.beam.state.num_decode_steps[0:1].fill_(1)  # Planned Decode is zero.
     execution = owner.admit(dispatch(metadata(1)))
     prepare_binding(owner, execution.entries[0])
-    assert owner.beam.state.error_code[2].item() == ERROR_DISPATCH_STATE
+    assert owner.beam.state.error_code[0].item() == ERROR_DISPATCH_STATE
     assert owner.input_ids.tolist() == [0] * 4
     assert owner.positions.tolist() == [0] * 4
     assert not owner.execution_mask.any().item()
@@ -215,8 +215,8 @@ def test_legal_eos_is_an_ordinary_candidate_with_delayed_receipts(dtype):
         owner.logits = torch.zeros((1 if step == 0 else 4, 6), device="cuda", dtype=dtype)
         receipts.append(owner.sample())
         if step == 0:
-            assert owner.beam.state.active_mask[2].sum().item() == 2
-            assert owner.beam.state.num_completed[2].item() == 0
+            assert owner.beam.state.active_mask[0].sum().item() == 2
+            assert owner.beam.state.num_completed[0].item() == 0
     for step, receipt in enumerate(receipts):
         result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
         assert result.produced_token_count == 1
@@ -227,10 +227,10 @@ def test_legal_eos_is_an_ordinary_candidate_with_delayed_receipts(dtype):
             assert result.terminal_result is not None
             assert result.terminal_result.failure is None
             assert result.resources_released
-    count = owner.beam.state.num_completed[2].item()
-    lengths = owner.beam.state.completed_lengths[2, :count].tolist()
+    count = owner.beam.state.num_completed[0].item()
+    lengths = owner.beam.state.completed_lengths[0, :count].tolist()
     assert lengths and all(length == 3 for length in lengths)
-    assert 1 in owner.beam.state.history_token_ids[2, 0].tolist()
+    assert 1 in owner.beam.state.history_token_ids[0, 0].tolist()
     assert owner.closed
 
 
@@ -241,12 +241,23 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         install_decode_model,
     )
     from vllm_gr.v1.worker import model_runner_common
+    from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
     from vllm_gr.v1.worker.gpu_beam_stage_runner import (
         GPUBeamStageRunner,
         get_stage_runner,
     )
     from vllm_gr.v1.worker.gr_startup import capture_async_forward
 
+    captures: list[tuple[int, int, int]] = []
+    original_capture = BeamDecodeGraph.capture
+
+    def record_capture(self, *args, **kwargs):
+        if not self.ready:
+            signature = self.signature
+            captures.append((signature.batch_size, signature.beam_width, signature.num_model_rows))
+        return original_capture(self, *args, **kwargs)
+
+    monkeypatch.setattr(BeamDecodeGraph, "capture", record_capture)
     worker = admission_worker()
     freezes: list[str] = []
     monkeypatch.setattr(
@@ -273,6 +284,10 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
     owner = worker._gr_gpu_stage_runner
     graph = owner.graph
     assert owner.closed and graph is not None
+    assert captures == [(1, 4, 4)]
+    fixed_inputs = (owner.input_ids, owner.positions, owner.slots, owner.execution_mask)
+    input_buffers = owner.inputs
+    previous_state = owner.beam.state
 
     def unexpected_forward(self):
         raise AssertionError(
@@ -280,13 +295,25 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         )
 
     monkeypatch.setattr(GPUBeamStageRunner, "_forward", unexpected_forward)
-    for prompt, budget in [(7, 1), (21, 3), (11, 1)]:
+    for prompt, budget in [(7, 1), (13, 2), (21, 3), (11, 1)]:
         first = replace(
             metadata(n=budget),
             num_prompt_tokens=prompt,
             num_prompt_tokens_by_request=(prompt,),
         )
         assert get_stage_runner(worker, dispatch(first)) is owner
+        assert owner.beam.state.max_new_tokens == budget
+        if budget != previous_state.max_new_tokens:
+            assert owner.beam.state is not previous_state
+        previous_state = owner.beam.state
+        assert owner.inputs is input_buffers
+        assert all(
+            current is fixed
+            for current, fixed in zip(
+                (owner.input_ids, owner.positions, owner.slots, owner.execution_mask),
+                fixed_inputs,
+            )
+        )
         worker.requests["session-0"] = SimpleNamespace(block_ids=[[1, 2]])
 
         def prefill(worker, output):
@@ -304,6 +331,8 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
                 num_prompt_tokens_by_request=(prompt,),
             )
             owner.execute(dispatch(m), prefill)
+            assert worker._beam_decode_graph is graph
+            assert captures == [(1, 4, 4)]
             if step == 0:
                 final = owner.final_output
                 assert final.layout.width == owner.beam.state.beam_width
@@ -314,7 +343,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
                     1,
                     owner.beam.state.completed_capacity,
                 )
-                assert final.prompt_length == prompt
+                assert final.prompt_lengths == (prompt,)
             receipts.append(owner.sample())
         terminal = None
         for receipt in receipts:
@@ -325,4 +354,4 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
             assert len(sequence.token_ids) == budget
             assert sequence.cumulative_logprob is not None
         assert owner.closed
-        assert owner.graph is graph
+        assert worker._beam_decode_graph is graph

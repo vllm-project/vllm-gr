@@ -253,5 +253,8 @@ def test_running_cancel_drains_queued_stage_without_changing_beam_state(dtype, n
     state.reset(owner.binding.state_row)
     assert not state.is_finished[owner.binding.state_row]
     assert not state.is_initialized[owner.binding.state_row]
+    state_row = owner.binding.state_row
     for name, value in snapshot.items():
-        torch.testing.assert_close(getattr(state, name)[:2], value[:2], rtol=0, atol=0)
+        current = getattr(state, name)
+        torch.testing.assert_close(current[:state_row], value[:state_row], rtol=0, atol=0)
+        torch.testing.assert_close(current[state_row + 1 :], value[state_row + 1 :], rtol=0, atol=0)

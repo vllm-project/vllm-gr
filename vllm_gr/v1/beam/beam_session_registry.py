@@ -102,6 +102,8 @@ class BeamSessionRegistry:
         if slot is not None:
             del self._slots[slot]
             self._free_slots.append(slot)
+            # Keep request-major batch admission deterministic across reuse.
+            self._free_slots.sort()
 
     def get_slot(self, session_id: str) -> int:
         """Get the slot index for a session. Raises KeyError if not found."""

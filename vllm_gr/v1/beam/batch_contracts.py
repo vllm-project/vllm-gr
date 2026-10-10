@@ -22,6 +22,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm_gr.config import MAX_BEAM_WIDTH
 
 BEAM_BATCH_PROTOCOL_VERSION = 1
+SUPPORTED_BEAM_BATCH_SIZES = (1, 2, 4)
 DEFAULT_CONSTRAINT_RESOURCE_ID = "default"
 # Terminal failure code for a request the engine refused before the session
 # started. It is the one code the frontend reports as a client error; every
@@ -710,6 +711,7 @@ def validate_beam_batch_result(
 __all__ = [
     "BEAM_BATCH_PROTOCOL_VERSION",
     "DEFAULT_CONSTRAINT_RESOURCE_ID",
+    "SUPPORTED_BEAM_BATCH_SIZES",
     "BeamBatchFailure",
     "BeamBatchItem",
     "BeamBatchLimits",

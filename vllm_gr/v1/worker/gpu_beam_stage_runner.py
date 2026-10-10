@@ -22,12 +22,14 @@ from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
+    SUPPORTED_BEAM_BATCH_SIZES,
     BeamBatchFailure,
     BeamBatchResult,
 )
 from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRExecutionCapacity,
     GRRetireMetadata,
@@ -44,7 +46,11 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_WORKER_RESULT_ATTR,
 )
 from vllm_gr.v1.worker.beam_final_output import GPUBeamFinalOutput
-from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
+from vllm_gr.v1.worker.beam_search_runner import (
+    BeamBatchSearchRunner,
+    BeamCandidateBatch,
+    BeamSearchRunner,
+)
 from vllm_gr.v1.worker.gr_inputs import (
     GRInputBuffers,
     PreparedGRInputs,
@@ -53,6 +59,12 @@ from vllm_gr.v1.worker.gr_inputs import (
 
 METADATA_ABI = 1
 CONTROL_CAPACITY = 2
+SUPPORTED_BATCH_SIZES = SUPPORTED_BEAM_BATCH_SIZES
+
+
+def _batch_finished(is_finished: torch.Tensor, error_code: torch.Tensor) -> torch.Tensor:
+    """Finish a logical batch only when all members finish or any member errors."""
+    return is_finished.all() | (error_code != 0).any()
 
 
 @dataclass(frozen=True)
@@ -135,9 +147,6 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         results = {}
         for entry in self.execution.entries:
             m = entry.metadata
-            out.req_id_to_index[m.session_id] = len(out.req_ids)
-            out.req_ids.append(m.session_id)
-            out.sampled_token_ids.append([])
             failure = BeamBatchResult(
                 BEAM_BATCH_PROTOCOL_VERSION,
                 m.session_id,
@@ -155,6 +164,9 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                 terminal,
                 owner_generation=m.owner_generation,
             )
+        out.req_ids = [binding.native_request_id for binding in self.owner.bindings]
+        out.req_id_to_index = {request_id: i for i, request_id in enumerate(out.req_ids)}
+        out.sampled_token_ids = [[] for _ in out.req_ids]
         setattr(out, GR_WORKER_RESULT_ATTR, results)
         return out
 
@@ -193,10 +205,8 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                         ),
                     )
                     terminal = final_output.failure(self.owner, failure)
-            req_ids.append(entry.binding.native_request_id)
             # These are scheduler placeholders. They must never be used as
             # model inputs or published as generated Beam sequences.
-            sampled.append([0] if produced else [])
             results[m.session_id] = GRWorkerResult(
                 m.session_id,
                 m.dispatch_id,
@@ -207,6 +217,8 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                 terminal,
                 owner_generation=m.owner_generation,
             )
+        req_ids = [binding.native_request_id for binding in self.owner.bindings]
+        sampled = [([0] if produced else []) for _ in req_ids]
         out = ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={r: i for i, r in enumerate(req_ids)},
@@ -318,17 +330,19 @@ class GPUBeamStageRunner:
     def __init__(
         self,
         worker: Any,
-        beam: BeamSearchRunner,
-        binding: BeamRequestBinding,
+        beam: BeamBatchSearchRunner,
+        bindings: tuple[BeamRequestBinding, ...],
         backend: CUDAConstraintBackend,
         hooks: _StageExecutionHooks | None = None,
     ):
-        if (
-            binding.session_id != beam.session.session_id
-            or binding.kv_slot != beam.session.slot
-            or binding.state_row != beam.state_index
-            or binding.workspace_row != beam.workspace_index
-            or binding.item_index != 0
+        expected = tuple(range(len(bindings)))
+        if not bindings or (
+            tuple(binding.item_index for binding in bindings) != expected
+            or tuple(binding.kv_slot for binding in bindings) != expected
+            or tuple(binding.state_row for binding in bindings) != expected
+            or tuple(binding.workspace_row for binding in bindings) != expected
+            or tuple(binding.native_request_id for binding in bindings) != beam.layout.request_ids
+            or any(binding.session_id != beam.layout.session_id for binding in bindings)
         ):
             raise ValueError("GR binding disagrees with existing session resources")
         context = beam.session.context
@@ -337,11 +351,15 @@ class GPUBeamStageRunner:
             or beam.workspace.execution_owner is not None
         ):
             raise RuntimeError("Beam context already has an execution owner")
-        self.worker, self.beam, self.binding, self.backend = worker, beam, binding, backend
+        self.worker, self.beam, self.bindings, self.backend = worker, beam, bindings, backend
+        self.binding = bindings[0]
+        self.batch_view = beam.layout
         # Device indexing is part of Decode binding and must not upload a CPU
         # index tensor while a CUDA graph is being captured.
         self.state_rows = torch.tensor(
-            (binding.state_row,), dtype=torch.long, device=beam.state.device
+            tuple(binding.state_row for binding in bindings),
+            dtype=torch.long,
+            device=beam.state.device,
         )
         self.hooks = hooks if hooks is not None else _StageExecutionHooks(worker)
         self.previous: GRStageMetadata | None = None
@@ -371,22 +389,20 @@ class GPUBeamStageRunner:
         self.metadata: Any = None
         self.graph: Any = None
         self.logits: torch.Tensor | None = None
-        self.input_ids = torch.empty(
-            beam.state.beam_width, device=beam.state.device, dtype=torch.int32
-        )
+        batch_size = len(bindings)
+        rows = batch_size * beam.state.beam_width
+        self.input_ids = torch.empty(rows, device=beam.state.device, dtype=torch.int32)
         self.positions = torch.empty_like(self.input_ids, dtype=torch.int64)
         self.slots = torch.full_like(self.positions, -1)
         self.execution_mask = torch.empty_like(self.input_ids, dtype=torch.bool)
-        self.constraint_steps = beam.state.num_generated_tokens[
-            binding.state_row : binding.state_row + 1
-        ]
+        self.constraint_steps = beam.state.num_generated_tokens[:batch_size]
         w = beam.workspace
-        self.prefixes = w.prefix_token_ids[binding.workspace_row]
-        self.temperatures = w.temperatures[binding.workspace_row]
-        self.tokens = w.topk_token_ids[binding.workspace_row]
-        self.scores = w.topk_scores[binding.workspace_row]
-        self.valid = w.topk_valid_mask[binding.workspace_row]
-        self.counts = w.topk_valid_counts[binding.workspace_row]
+        self.prefixes = w.prefix_token_ids[:batch_size].reshape(rows, -1)
+        self.temperatures = w.temperatures[:batch_size].reshape(rows)
+        self.tokens = w.topk_token_ids[:batch_size].reshape(rows, beam.state.beam_width)
+        self.scores = w.topk_scores[:batch_size].reshape(rows, beam.state.beam_width)
+        self.valid = w.topk_valid_mask[:batch_size].reshape(rows, beam.state.beam_width)
+        self.counts = w.topk_valid_counts[:batch_size].reshape(rows)
         context._gr_execution_owner = self
         beam.workspace.execution_owner = self
 
@@ -409,7 +425,7 @@ class GPUBeamStageRunner:
             stages = validate_dispatch(
                 scheduler_output,
                 previous=self.previous,
-                binding=self.binding,
+                bindings=self.bindings,
             )
         for m in stages:
             state, params = self.beam.state, m.beam_params
@@ -423,23 +439,22 @@ class GPUBeamStageRunner:
         if not hasattr(self, "final_output"):
             first = stages[0]
             self.final_output = GPUBeamFinalOutput(
-                self, self.binding, first.beam_params, first.output_options
+                self, self.bindings, first.beam_params, first.output_options
             )
-        elif self.previous is None or self.final_output.binding != self.binding:
+        elif self.previous is None or self.final_output.bindings != self.bindings:
             first = stages[0]
             if self.final_output.is_compatible(self):
-                self.final_output.reset(self, self.binding, first.beam_params, first.output_options)
+                self.final_output.reset(
+                    self, self.bindings, first.beam_params, first.output_options
+                )
             else:
                 self.final_output = GPUBeamFinalOutput(
-                    self, self.binding, first.beam_params, first.output_options
+                    self, self.bindings, first.beam_params, first.output_options
                 )
         entries, offset = [], 0
         for m in stages:
-            count = (
-                m.beam_params.beam_width
-                if m.kind is GRStageKind.DECODE
-                else scheduler_output.num_scheduled_tokens[m.session_id]
-            )
+            view = BeamBatchExecutionView.from_stage_metadata(m)
+            count = view.num_execution_rows if m.kind is GRStageKind.DECODE else view.batch_size
             entries.append(BeamDispatchEntry(self.binding, m, offset, count))
             offset += count
         with self.control_lock:
@@ -449,12 +464,10 @@ class GPUBeamStageRunner:
             self.control_busy[slot] = True
         execution = BeamDispatchExecution(tuple(entries), offset)
         self.pending = execution, slot
-        self.previous = stages[0]  # B=1 admission bridge, not a model/state row.
+        self.previous = stages[0]
         torch.cuda.current_stream(self.beam.state.device).wait_event(self.last_work)
         self.device_control[slot, 0, :1].copy_(
-            self.beam.state.num_generated_tokens[
-                self.binding.state_row : self.binding.state_row + 1
-            ]
+            self.beam.state.num_generated_tokens[: len(self.bindings)].amax().reshape(1)
         )
         return execution
 
@@ -469,15 +482,23 @@ class GPUBeamStageRunner:
                 worker.model_config.max_model_len,
                 groups[0].kv_cache_spec.block_size,
                 self.beam.state.device,
+                max_batch=len(self.bindings),
             )
         block_ids = (
-            [list(group) for group in m.kv_blocks]
-            if getattr(m, "kv_blocks", None) is not None
-            else self.hooks.decode_block_ids(self.binding.native_request_id)
+            tuple([list(row)] for row in m.kv_blocks)
+            if m.kv_blocks is not None
+            else tuple(
+                self.hooks.decode_block_ids(binding.native_request_id) for binding in self.bindings
+            )
         )
-        return self.inputs.prepare_cpu(m, self.binding, block_ids=block_ids, slot=slot)
+        return self.inputs.prepare_cpu_batch(
+            m, self.bindings, block_ids_by_request=block_ids, slot=slot
+        )
 
     def _bind_attention(self, m: GRStageMetadata) -> None:
+        from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+            GPUBeamAttentionBatch,
+        )
         from vllm_gr.v1.attention.backends.beam_attn_metadata import (
             BeamAttentionMetadataBuilder,
         )
@@ -492,7 +513,7 @@ class GPUBeamStageRunner:
         self.metadata = BeamAttentionMetadataBuilder.build_async(
             layout=self.prepared.layout,
             views=views,
-            session=self.beam.session,
+            session=GPUBeamAttentionBatch(self.beam.sessions),
             mask=self.execution_mask,
             slots=self.slots,
             block_size=self.inputs.block_size,
@@ -516,8 +537,7 @@ class GPUBeamStageRunner:
         prepared_bindings = (
             prepared.binding if isinstance(prepared.binding, tuple) else (prepared.binding,)
         )
-        entry_bindings = entry.binding if isinstance(entry.binding, tuple) else (entry.binding,)
-        if prepared.metadata != entry.metadata or prepared_bindings != entry_bindings:
+        if prepared.metadata != entry.metadata or prepared_bindings != self.bindings:
             raise RuntimeError(
                 "Asynchronous scheduling device binding does not match the prepared dispatch"
             )
@@ -527,7 +547,11 @@ class GPUBeamStageRunner:
         """Return a captured candidate; startup publishes it after cleanup."""
         from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
 
-        graph = get_beam_decode_graph(self.worker)
+        graph = get_beam_decode_graph(
+            self.worker,
+            batch_size=len(self.bindings),
+            beam_width=self.beam.state.beam_width,
+        )
         graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
         return graph
 
@@ -569,6 +593,29 @@ class GPUBeamStageRunner:
                 self.hooks.consume_native_state(scheduler_output)
                 self._bind_attention(m)
                 self.prepare_decode(entry)
+                from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+                graph_enabled = (
+                    not worker.model_config.enforce_eager
+                    and _get_gr_config(worker).beam_graph_enabled
+                    and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+                )
+                if graph_enabled:
+                    from vllm_gr.v1.worker.beam_decode_graph import (
+                        get_beam_decode_graph,
+                    )
+
+                    graph = get_beam_decode_graph(
+                        worker,
+                        batch_size=len(self.bindings),
+                        beam_width=self.beam.state.beam_width,
+                    )
+                    if not graph.ready:
+                        graph.capture(
+                            self._forward_hidden,
+                            persistent_install=self.hooks.persistent_graph_install,
+                        )
+                    self.graph = graph
                 if should_replay_decode_graph(worker, self.graph):
                     self.logits = worker.model.compute_logits(self.graph.replay())
                 else:
@@ -591,7 +638,8 @@ class GPUBeamStageRunner:
             if m.produces_output and not self.cancelled:
                 if self.logits is None:
                     raise RuntimeError("GR output stage has no native model logits")
-                rows = 1 if m.kind is GRStageKind.PREFILL else entry.row_count
+                layout = BeamBatchExecutionView.from_stage_metadata(m)
+                rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
                 candidates = self.tokens[:rows], self.scores[:rows], self.valid[:rows]
                 self.backend.select_out_unchecked(
                     self.logits,
@@ -604,17 +652,23 @@ class GPUBeamStageRunner:
                     out_valid_counts=self.counts[:rows],
                     device_step=self.constraint_steps,
                 )
+                candidate_batch = BeamCandidateBatch(layout, *candidates)
                 if m.kind is GRStageKind.PREFILL:
-                    self.beam.initialize_from_prefill(*candidates)
+                    self.beam.initialize_from_prefill(candidate_batch)
                 else:
-                    self.beam.advance(*candidates)
-            row = slice(entry.binding.state_row, entry.binding.state_row + 1)
+                    self.beam.advance(candidate_batch)
+            state_rows = slice(0, len(self.bindings))
             control = self.device_control[slot, 0]
-            control[:1].copy_(self.beam.state.num_generated_tokens[row] - control[:1])
-            control[1:2].copy_(
-                self.beam.state.is_finished[row] | (self.beam.state.error_code[row] != 0)
+            control[:1].copy_(
+                self.beam.state.num_generated_tokens[state_rows].amax().reshape(1) - control[:1]
             )
-            control[2:3].copy_(self.beam.state.error_code[row])
+            control[1:2].copy_(
+                _batch_finished(
+                    self.beam.state.is_finished[state_rows],
+                    self.beam.state.error_code[state_rows],
+                ).reshape(1)
+            )
+            control[2:3].copy_(self.beam.state.error_code[state_rows].amax().reshape(1))
             # The fixed-length terminal stage returns one packed payload whose
             # header replaces the separate per-stage control D2H.
             if m.is_last_stage:
@@ -633,7 +687,7 @@ class GPUBeamStageRunner:
         return AsyncGPUBeamOutput(self, execution, slot, terminal_payload)
 
     def completion_view(self, binding: BeamRequestBinding) -> dict[str, torch.Tensor]:
-        if self.closed or binding != self.binding:
+        if self.closed or binding not in self.bindings:
             raise RuntimeError("completion view requires a live matching binding")
         if self.pending is not None:
             raise RuntimeError("completion view requires the current dispatch to be sampled")
@@ -693,13 +747,13 @@ class GPUBeamStageRunner:
         # follow-up control dispatch, so retire the Worker's cached request
         # locally after all GPU and output consumers have drained.
         cleanup = SchedulerOutput.make_empty()
-        cleanup.finished_req_ids.add(self.binding.native_request_id)
+        cleanup.finished_req_ids.update(binding.native_request_id for binding in self.bindings)
         self.hooks.consume_native_state(cleanup)
         return True
 
     @torch.inference_mode()
     def cancel(self, binding: BeamRequestBinding) -> None:
-        if binding != self.binding:
+        if binding not in self.bindings:
             raise ValueError("cancel binding mismatch")
         if self.closed or self.cancelled:
             return
@@ -707,14 +761,14 @@ class GPUBeamStageRunner:
             raise RuntimeError("sample the dispatched work before cancellation")
         stream = torch.cuda.current_stream(self.beam.state.device)
         stream.wait_event(self.last_work)
-        row = binding.state_row
-        self.beam.state.is_finished[row : row + 1].fill_(True)
-        self.beam.state.active_mask[row : row + 1].zero_()
+        rows = slice(0, len(self.bindings))
+        self.beam.state.is_finished[rows].fill_(True)
+        self.beam.state.active_mask[rows].zero_()
         self.last_work.record(stream)
         self.cancelled = True
 
     def release(self, binding: BeamRequestBinding, *, consumer_done: torch.Event) -> None:
-        if binding != self.binding:
+        if binding not in self.bindings:
             raise ValueError("release binding mismatch")
         if self.closed:
             return
@@ -727,7 +781,8 @@ class GPUBeamStageRunner:
         self.closed = True
         self.beam.session.context._gr_execution_owner = None
         self.beam.workspace.execution_owner = None
-        self.worker._beam_sessions.pop(binding.session_id, None)
+        for member in self.bindings:
+            self.worker._beam_sessions.pop(member.native_request_id, None)
 
 
 class AsyncGRRetireOutput(AsyncModelRunnerOutput):
@@ -904,9 +959,10 @@ def get_stage_runner(
             cfg.beam_max_width, cfg.beam_max_width, worker.model_config.dtype
         )
     )
+    view = BeamBatchExecutionView.from_stage_metadata(m)
     context = getattr(worker, "_beam_context", None)
     if context is None:
-        context = _create_beam_context(worker, cfg)
+        context = _create_beam_context(worker, cfg, max_batch=max(SUPPORTED_BATCH_SIZES))
         worker._beam_context = context
     if (
         context.registry.num_active_sessions
@@ -918,54 +974,33 @@ def get_stage_runner(
         context.max_batch != workspace.max_batch
         or context.max_beams < m.beam_params.beam_width
         or context.max_decode_steps < m.beam_params.max_tokens
+        or context.max_batch < view.batch_size
     ):
         raise ValueError("existing Beam context and workspace capacity are incompatible")
-    next_slot = context.registry.next_free_slot
-    resource_key = BeamSearchRunner.validate_resources(
-        context,
-        workspace,
-        beam_width=m.beam_params.beam_width,
-        max_new_tokens=m.beam_params.max_tokens,
-        kv_slot=next_slot,
-    )
-    reuse = (
+    # The graph captures the adapter's fixed Forward and attention buffers,
+    # not the request-local Beam state or its effective token budget.
+    reuse_adapter = (
         existing is not None
         and existing.closed
         and existing.beam.state.beam_width == m.beam_params.beam_width
         and existing.beam.session.context is context
         and existing.beam.workspace is workspace
-    )
-    reuse_state = (
-        existing is not None
-        and reuse
         and existing.beam.state.decision is context.decision
-        and existing.beam._resource_key == resource_key
+        and len(getattr(existing.beam, "runners", ())) == view.batch_size
+        and all(
+            runner._scratch_owner is workspace.state_scratch for runner in existing.beam.runners
+        )
+    )
+    reuse_beam = (
+        reuse_adapter
         and existing.beam.state.max_new_tokens == m.beam_params.max_tokens
         and existing.beam.state.stop_token_ids_config == m.beam_params.stop_token_ids
         and existing.beam.state.ignore_stop_tokens_config == m.beam_params.ignore_stop_tokens
-        and existing.beam.state_index == 0
-        and existing.beam.workspace_index == 0
     )
-    reuse_beam = (
-        existing is not None
-        and reuse_state
-        and existing.beam._scratch_owner is workspace.state_scratch
-    )
-    if (
-        existing is not None
-        and reuse
-        and existing.graph is not None
-        and existing.beam._resource_key != resource_key
-    ):
-        raise ValueError("GR captured resource addresses or layouts changed before reuse")
     if reuse_beam:
         assert existing is not None
         existing.beam.reset_for_session()
         state = existing.beam.state
-    elif reuse_state:
-        assert existing is not None
-        state = existing.beam.state
-        state.reset(existing.binding.state_row)
     else:
         state = BeamSearchState(
             context.decision,
@@ -974,35 +1009,62 @@ def get_stage_runner(
             stop_token_ids=m.beam_params.stop_token_ids,
             ignore_stop_tokens=m.beam_params.ignore_stop_tokens,
         )
-    slot = context.registry.allocate(m.session_id, m.beam_params.beam_width, m.num_prompt_tokens)
-    session = BeamSearchSession(m.session_id, slot, context)
-    if not reuse_beam:
-        session.begin_session(m.beam_params.beam_width, m.num_prompt_tokens, decision_index=0)
-    binding = BeamRequestBinding(m.session_id, 0, m.session_id, 0, slot, 0)
+    sessions = []
+    bindings = []
+    for item_index, (request_id, prompt_tokens) in enumerate(
+        zip(view.request_ids, view.num_prompt_tokens_by_request)
+    ):
+        slot = context.registry.allocate(request_id, m.beam_params.beam_width, prompt_tokens)
+        if slot != item_index:
+            raise RuntimeError("GR batch requires contiguous request-major KV slots")
+        session = BeamSearchSession(request_id, slot, context)
+        session.begin_session(m.beam_params.beam_width, prompt_tokens, decision_index=item_index)
+        sessions.append(session)
+        bindings.append(
+            BeamRequestBinding(m.session_id, item_index, request_id, item_index, slot, item_index)
+        )
+    session_tuple = tuple(sessions)
+    binding_tuple = tuple(bindings)
     if reuse_beam:
         assert existing is not None
+        for runner, session in zip(existing.beam.runners, session_tuple):
+            runner.rebind_session(session)
         beam = existing.beam
-        beam.rebind_session(session)
+        beam.layout = view
     else:
-        beam = BeamSearchRunner(session, state, workspace)
-    if reuse:
+        runners = tuple(
+            BeamSearchRunner(
+                session,
+                state,
+                workspace,
+                state_index=index,
+                workspace_index=index,
+            )
+            for index, session in enumerate(session_tuple)
+        )
+        beam = BeamBatchSearchRunner(runners, view)
+    if reuse_adapter:
         assert existing is not None
         adapter = existing
-        adapter.beam, adapter.binding, adapter.backend = beam, binding, backend
+        adapter.beam, adapter.bindings, adapter.backend = beam, binding_tuple, backend
+        adapter.binding, adapter.batch_view = binding_tuple[0], view
         adapter.previous, adapter.pending = None, None
         adapter.closed, adapter.cancelled = False, False
         adapter.terminal_release_requested = False
         adapter.terminal_release_claimed = False
         adapter.execution_error = None
         adapter.prepared = None
-        adapter.constraint_steps = beam._state["num_generated_tokens"]
+        adapter.constraint_steps = beam.state.num_generated_tokens[: view.batch_size]
         context._gr_execution_owner = adapter
         workspace.execution_owner = adapter
     else:
-        adapter = GPUBeamStageRunner(worker, beam, binding, backend, hooks=hooks_type(worker))
-    sessions = getattr(worker, "_beam_sessions", {})
-    sessions[m.session_id] = session
-    worker._beam_sessions = sessions
+        graph = getattr(worker, "_beam_decode_graph", None)
+        if graph is not None:
+            graph.select(view.batch_size, view.beam_width).discard_selected()
+        adapter = GPUBeamStageRunner(worker, beam, binding_tuple, backend, hooks=hooks_type(worker))
+    worker._beam_sessions = {
+        binding.native_request_id: session for binding, session in zip(binding_tuple, session_tuple)
+    }
     worker._gr_gpu_stage_runner = adapter
     adapter._validated_dispatch = (scheduler_output, stages)
     return cast(GPUBeamStageRunner, adapter)

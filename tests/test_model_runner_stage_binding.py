@@ -132,8 +132,10 @@ def test_stage_capture_passes_bound_model_install_policy(
     owner = object.__new__(stages.GPUBeamStageRunner)
     owner.worker = worker
     owner.hooks = hooks_type(worker)
+    owner.bindings = (object(),)
+    owner.beam = SimpleNamespace(state=SimpleNamespace(beam_width=4))
     graph = Mock()
-    monkeypatch.setattr(beam_decode_graph, "get_beam_decode_graph", lambda _: graph)
+    monkeypatch.setattr(beam_decode_graph, "get_beam_decode_graph", lambda *args, **kwargs: graph)
     owner.graph = None
     assert owner.capture_forward() is graph
     graph.capture.assert_called_once_with(

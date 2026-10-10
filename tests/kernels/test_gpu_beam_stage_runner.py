@@ -26,6 +26,7 @@ from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspace
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
     GRStageKind,
@@ -35,10 +36,11 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_STAGE_OUTPUT_ATTR,
     GR_WORKER_RESULT_ATTR,
 )
-from vllm_gr.v1.worker.beam_search_runner import BeamSearchRunner
+from vllm_gr.v1.worker.beam_search_runner import BeamBatchSearchRunner, BeamSearchRunner
 from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
+    _batch_finished,
     get_stage_runner,
     validate_dispatch,
 )
@@ -46,6 +48,12 @@ from vllm_gr.v1.worker.gr_inputs import GRInputBuffers, bind_device_inputs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
+
+
+def test_batch_finishes_only_when_all_members_finish_or_any_member_errors():
+    assert not _batch_finished(torch.tensor([True, False]), torch.tensor([0, 0])).item()
+    assert _batch_finished(torch.tensor([True, True]), torch.tensor([0, 0])).item()
+    assert _batch_finished(torch.tensor([False, False]), torch.tensor([0, 1])).item()
 
 
 def metadata(stage=0, dispatch=None, output=True, n=3):
@@ -75,7 +83,7 @@ def dispatch(m):
 
 
 def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
-    context = BeamAttentionContext(3, 6, 1, 5, 8, 2, torch.device("cuda"), dtype)
+    context = BeamAttentionContext(3, 4, 1, 5, 8, 2, torch.device("cuda"), dtype)
     state = BeamSearchState(
         context.decision,
         beam_width=4,
@@ -83,14 +91,15 @@ def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
         stop_token_ids=stop_token_ids,
         ignore_stop_tokens=True,
     )
-    # State row 2, workspace row 1 and KV slot 0 are intentionally distinct.
+    # A one-request batch owns request-major state, workspace, and KV row 0.
     slot = context.registry.allocate("session-0", 4, 7)
     session = BeamSearchSession("session-0", slot, context)
-    session.begin_session(4, 7, decision_index=2)
+    session.begin_session(4, 7, decision_index=0)
     workspace = BeamPostprocessWorkspace.allocate(
         max_batch=3, beam_width=4, top_k=4, max_decode_steps=5, device="cuda", logits_dtype=dtype
     )
-    beam = BeamSearchRunner(session, state, workspace, state_index=2, workspace_index=1)
+    runner = BeamSearchRunner(session, state, workspace)
+    beam = BeamBatchSearchRunner((runner,), BeamBatchExecutionView.from_stage_metadata(metadata(n)))
     backend, _ = _upload_cuda_backend(
         make_table(), device=torch.device("cuda"), max_top_k=4, max_rows=4
     )
@@ -101,7 +110,7 @@ def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
         _update_states=Mock(),
     )
     owner = GPUBeamStageRunner(
-        worker, beam, BeamRequestBinding("session-0", 0, "session-0", 2, 0, 1), backend
+        worker, beam, (BeamRequestBinding("session-0", 0, "session-0", 0, 0, 0),), backend
     )
     owner.metadata = SimpleNamespace(
         suffix_cu_seqlens_q_device=torch.arange(5, device="cuda", dtype=torch.int32),
@@ -132,7 +141,7 @@ def admission_worker(
     backend, _ = _upload_cuda_backend(make_table(), device=device, max_top_k=4, max_rows=4)
     backend._mark_ready()
     workspace = BeamPostprocessWorkspace.allocate(
-        max_batch=1, beam_width=4, top_k=4, max_decode_steps=3, device=device, logits_dtype=dtype
+        max_batch=4, beam_width=4, top_k=4, max_decode_steps=3, device=device, logits_dtype=dtype
     )
     layers = {
         f"layer.{i}": SimpleNamespace(
@@ -273,9 +282,9 @@ def test_admission_rejects_sliding_window_before_reuse_reset(monkeypatch):
 def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
     owner = runtime(dtype, n)
     state, ws = owner.beam.state, owner.beam.workspace
-    protected = {k: v[:2].clone() for k, v in vars(state).items() if isinstance(v, torch.Tensor)}
-    ws.selected_token_ids[0].fill_(987)
-    ws.prefix_token_ids[0].fill_(789)
+    protected = {k: v[1:].clone() for k, v in vars(state).items() if isinstance(v, torch.Tensor)}
+    ws.selected_token_ids[1].fill_(987)
+    ws.prefix_token_ids[1].fill_(789)
     ws.prefix_token_ids[2].fill_(789)
     for pool in owner.beam.session.pools:
         pool.unshared_key[1:].fill_(123)
@@ -313,22 +322,22 @@ def test_continuous_dispatch_snapshots_and_resource_isolation(dtype, n):
         assert result.resources_released == (stage == n - 1)
         if result.terminal_result is not None:
             assert result.terminal_result.output is not None
-    assert state.num_generated_tokens.tolist() == [0, 0, n]
-    assert state.num_decode_steps.tolist() == [0, 0, n - 1]
+    assert state.num_generated_tokens.tolist() == [n, 0, 0]
+    assert state.num_decode_steps.tolist() == [n - 1, 0, 0]
     for name, value in protected.items():
-        torch.testing.assert_close(getattr(state, name)[:2], value)
-    assert ws.selected_token_ids[0].tolist() == [987] * 4
-    assert state.num_completed[2] > 0
+        torch.testing.assert_close(getattr(state, name)[1:], value)
+    assert ws.selected_token_ids[1].tolist() == [987] * 4
+    assert state.num_completed[0] > 0
     assert owner.final_output.final_d2h_count == 1
     assert owner.closed
     assert not owner.beam.session.context.registry.has_session("session-0")
     cleanup = owner.worker._update_states.call_args.args[0]
     assert cleanup.total_num_scheduled_tokens == 0
     assert cleanup.finished_req_ids == {"session-0"}
-    state.reset(2)
+    state.reset(0)
     for name, value in protected.items():
-        torch.testing.assert_close(getattr(state, name)[:2], value)
-    assert ws.prefix_token_ids[0].eq(789).all()
+        torch.testing.assert_close(getattr(state, name)[1:], value)
+    assert ws.prefix_token_ids[1].eq(789).all()
     assert ws.prefix_token_ids[2].eq(789).all()
     for pool in owner.beam.session.pools:
         assert pool.unshared_key[1:].eq(123).all()
@@ -379,7 +388,7 @@ def test_terminal_successor_preserves_all_layer_kv(graph):
         with torch.cuda.graph(g):
             step()
         replay = g.replay
-    state.is_finished[2] = True
+    state.is_finished[0] = True
     before = [(p.unshared_key.clone(), p.unshared_value.clone()) for p in owner.beam.session.pools]
     replay()
     for pool, (key, value) in zip(owner.beam.session.pools, before):
@@ -403,17 +412,18 @@ def test_partial_prefill_and_dispatch_identity_rejected_before_writes():
     before = owner.beam.state.sequence.clone()
     with pytest.raises(ValueError, match="dispatch order"):
         owner.admit(dispatch(metadata(stage=1, dispatch=99)))
-    with pytest.raises(ValueError, match="second active"):
+    with pytest.raises(ValueError, match="shared execution binding"):
         other = replace(
             metadata(stage=1, dispatch=1),
             session_id="other",
+            request_ids=("other",),
             output_device_state=GRDeviceStateRef("other", 1),
             input_device_state=GRDeviceStateRef("other", 0),
         )
         owner.admit(dispatch(other))
     mixed = dispatch(metadata(1, dispatch=1))
     mixed.num_scheduled_tokens["ordinary"] = 1
-    with pytest.raises(ValueError, match="mix"):
+    with pytest.raises(ValueError, match="immutable logical batch"):
         owner.admit(mixed)
     torch.testing.assert_close(owner.beam.state.sequence, before)
 
@@ -457,12 +467,12 @@ def test_session_init_binding_rejected_before_writes(fault):
 def test_device_binding_preserves_surrounding_storage_and_strided_prefix():
     owner = runtime()
     s = owner.beam.state
-    s.is_initialized[2] = True
-    s.num_generated_tokens[2] = 2
-    s.num_decode_steps[2] = 1
-    s.active_mask[2] = torch.tensor([True, False, True, False], device="cuda")
-    s.input_ids[2] = torch.tensor([3, 4, 5, 6], device="cuda")
-    s.sequence[2, :, :2] = torch.tensor([[1, 2]] * 4, device="cuda")
+    s.is_initialized[0] = True
+    s.num_generated_tokens[0] = 2
+    s.num_decode_steps[0] = 1
+    s.active_mask[0] = torch.tensor([True, False, True, False], device="cuda")
+    s.input_ids[0] = torch.tensor([3, 4, 5, 6], device="cuda")
+    s.sequence[0, :, :2] = torch.tensor([[1, 2]] * 4, device="cuda")
     prefix = torch.full((3, 4, 7), 99, device="cuda", dtype=torch.int32)[:, :, :3]
     tokens = torch.full((9,), 77, device="cuda", dtype=torch.int32)
     positions = tokens.clone()
@@ -486,7 +496,28 @@ def test_multiple_entries_rejected_even_with_storage_capacity():
     output = dispatch(m)
     getattr(output, GR_STAGE_OUTPUT_ATTR)["other"] = replace(m, session_id="other")
     output.num_scheduled_tokens["other"] = 7
-    with pytest.raises(ValueError, match="B=1"):
+    with pytest.raises(ValueError, match="cannot mix ordinary"):
+        validate_dispatch(output)
+
+
+def test_multi_request_dispatch_keeps_member_token_extents_separate():
+    m = replace(
+        metadata(),
+        num_prompt_tokens=12,
+        request_ids=("session-0", "session-0:1"),
+        num_prompt_tokens_by_request=(7, 5),
+        kv_blocks=((11,), (21,)),
+    )
+    output = dispatch(m)
+    output.num_scheduled_tokens["session-0:1"] = 5
+    assert validate_dispatch(output) == (m,)
+
+    output.num_scheduled_tokens["session-0:1"] = 4
+    output.scheduled_new_reqs = (
+        SimpleNamespace(req_id="session-0", prompt_token_ids=[1] * 7, num_computed_tokens=0),
+        SimpleNamespace(req_id="session-0:1", prompt_token_ids=[1] * 5, num_computed_tokens=0),
+    )
+    with pytest.raises(ValueError, match="partial Prefill"):
         validate_dispatch(output)
 
 
@@ -578,7 +609,7 @@ def test_release_requires_control_and_completion_consumer_drain():
         owner.release(owner.binding, consumer_done=done)
     receipt.get_output()
     completion = owner.completion_view(owner.binding)
-    assert completion["sequence"].data_ptr() == owner.beam.state.sequence[2].data_ptr()
+    assert completion["sequence"].data_ptr() == owner.beam.state.sequence[0].data_ptr()
     with pytest.raises(ValueError, match="binding mismatch"):
         owner.release(replace(owner.binding, state_row=1), consumer_done=done)
     owner.cancel(owner.binding)

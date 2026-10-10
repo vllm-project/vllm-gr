@@ -22,6 +22,7 @@ from vllm_gr.ops.cuda.beam_selection import (
 from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspace
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 
 try:
     from torch._C._dynamo.guards import TensorGuards as _TensorGuards
@@ -436,7 +437,12 @@ class BeamSearchRunner:
             getattr(self.session.context, "_gr_execution_owner", None),
             self.workspace.execution_owner,
         ):
-            if owner is not None and getattr(owner, "beam", None) is not self:
+            owner_beam = getattr(owner, "beam", None)
+            if (
+                owner is not None
+                and owner_beam is not self
+                and self not in getattr(owner_beam, "runners", ())
+            ):
                 raise RuntimeError("another runner owns the shared Beam execution scratch")
         width = self.state.beam_width
         rows = 1 if prefill else width
@@ -596,3 +602,116 @@ class BeamSearchRunner:
             BLOCK=block,
             PREFILL=prefill,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class BeamCandidateBatch:
+    """Device candidate tensors with immutable request-major row ownership."""
+
+    layout: BeamBatchExecutionView
+    token_ids: torch.Tensor
+    logprobs: torch.Tensor
+    valid_mask: torch.Tensor
+
+    def validate(self, *, prefill: bool, device: torch.device) -> None:
+        rows = self.layout.batch_size if prefill else self.layout.num_execution_rows
+        width = self.layout.beam_width
+        if prefill != (self.layout.kind == "prefill"):
+            raise ValueError("candidate stage does not match its batch layout")
+        for name, tensor, dtype in (
+            ("token_ids", self.token_ids, torch.int32),
+            ("logprobs", self.logprobs, torch.float32),
+            ("valid_mask", self.valid_mask, torch.bool),
+        ):
+            if (
+                tensor.shape != (rows, width)
+                or tensor.dtype != dtype
+                or tensor.device != device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(f"{name} must be contiguous {dtype} [{rows}, {width}] on {device}")
+
+
+class BeamBatchSearchRunner:
+    """Atomic request-major adapter over existing request-local GPU runners."""
+
+    def __init__(
+        self,
+        runners: tuple[BeamSearchRunner, ...],
+        layout: BeamBatchExecutionView,
+    ) -> None:
+        if not runners or len(runners) != layout.batch_size:
+            raise ValueError("Beam batch runner count must match the execution layout")
+        first = runners[0]
+        if (
+            tuple(runner.state_index for runner in runners) != tuple(range(layout.batch_size))
+            or tuple(runner.workspace_index for runner in runners)
+            != tuple(range(layout.batch_size))
+            or tuple(runner.session.slot for runner in runners) != tuple(range(layout.batch_size))
+            or any(runner.state is not first.state for runner in runners)
+            or any(runner.workspace is not first.workspace for runner in runners)
+            or any(runner.session.context is not first.session.context for runner in runners)
+            or first.state.beam_width != layout.beam_width
+        ):
+            raise ValueError("Beam batch resources do not match request-major row ownership")
+        self.runners = runners
+        self.layout = layout
+        self.state = first.state
+        self.workspace = first.workspace
+        self.session = first.session
+        self.state_index = 0
+        self.workspace_index = 0
+
+    @property
+    def sessions(self) -> tuple[BeamSearchSession, ...]:
+        return tuple(runner.session for runner in self.runners)
+
+    @property
+    def closed(self) -> bool:
+        return all(runner._closed for runner in self.runners)
+
+    def assert_layout(self, layout: BeamBatchExecutionView) -> None:
+        self.layout.assert_same_logical_batch(layout)
+        if layout.batch_size != len(self.runners):
+            raise ValueError("Beam batch size changed after resource binding")
+
+    def reset_for_session(self) -> None:
+        for runner in self.runners:
+            runner.reset_for_session()
+
+    def initialize_from_prefill(self, candidates: BeamCandidateBatch) -> None:
+        candidates.validate(prefill=True, device=self.state.device)
+        self.assert_layout(candidates.layout)
+        for index, runner in enumerate(self.runners):
+            row = slice(index, index + 1)
+            runner.initialize_from_prefill(
+                candidates.token_ids[row],
+                candidates.logprobs[row],
+                candidates.valid_mask[row],
+            )
+
+    def advance(self, candidates: BeamCandidateBatch) -> None:
+        candidates.validate(prefill=False, device=self.state.device)
+        self.assert_layout(candidates.layout)
+        width = self.state.beam_width
+        for index, runner in enumerate(self.runners):
+            rows = slice(index * width, (index + 1) * width)
+            runner.advance(
+                candidates.token_ids[rows],
+                candidates.logprobs[rows],
+                candidates.valid_mask[rows],
+            )
+
+    def end_session(self, consumer_done: torch.Event | None = None) -> None:
+        if self.closed:
+            return
+        stream = torch.cuda.current_stream(self.state.device)
+        if consumer_done is not None:
+            stream.wait_event(consumer_done)
+        done = torch.Event()
+        done.record(stream)
+        done.synchronize()
+        for runner in self.runners:
+            if not runner._closed:
+                runner.session.end_session()
+                runner._closed = True

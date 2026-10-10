@@ -18,12 +18,14 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
+    SUPPORTED_BEAM_BATCH_SIZES,
     BeamBatchParams,
     BeamBatchRequest,
     BeamBatchResult,
     BeamOutputOptions,
     validate_beam_batch_request,
 )
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 
 
 class GRStageKind(str, Enum):
@@ -166,6 +168,11 @@ def validate_gr_device_config(config: Any) -> None:
 def validate_gr_request(request: BeamBatchRequest) -> None:
     """Validate shared V1 semantics before native ADD or Worker allocation."""
     validate_beam_batch_request(request)
+    if len(request.items) not in SUPPORTED_BEAM_BATCH_SIZES:
+        raise ValueError(
+            "beam_search_v1 supports batch sizes "
+            f"{SUPPORTED_BEAM_BATCH_SIZES}, got {len(request.items)}"
+        )
     if request.items[0].request.request_id != request.batch_id:
         raise ValueError("batch_id and the first native request_id must match")
     for item in request.items:
@@ -441,13 +448,14 @@ def validate_dispatch(
     *,
     previous: GRStageMetadata | None = None,
     binding: Any = None,
+    bindings: tuple[Any, ...] | None = None,
 ) -> tuple[GRStageMetadata, ...]:
     """Validate the whole metadata map before any Worker resource mutation."""
     mapping = getattr(scheduler_output, "gr_stage_metadata", None)
     if not isinstance(mapping, Mapping) or not mapping:
         raise ValueError("GR dispatch requires a nonempty metadata mapping")
     scheduled = scheduler_output.num_scheduled_tokens
-    if set(mapping) != set(scheduled) or getattr(scheduler_output, "beam_data", {}):
+    if len(mapping) != 1 or getattr(scheduler_output, "beam_data", {}):
         raise ValueError("GR dispatch cannot mix ordinary or legacy Beam requests")
     if any(type(count) is not int or count <= 0 for count in scheduled.values()):
         raise ValueError("GR scheduled counts must be positive integers")
@@ -455,13 +463,15 @@ def validate_dispatch(
         scheduled.values()
     ):
         raise ValueError("GR dispatch total disagrees with native scheduled counts")
-    # Central admission boundary. Other code operates on explicit bindings.
-    if len(mapping) != 1:
-        raise ValueError("persistent GPU Beam currently requires B=1")
     stages = tuple(mapping.values())
     for key, m in mapping.items():
         if not isinstance(m, GRStageMetadata) or key != m.session_id:
             raise ValueError("invalid GR metadata identity")
+        view = BeamBatchExecutionView.from_stage_metadata(m)
+        if view.batch_size not in SUPPORTED_BEAM_BATCH_SIZES or set(scheduled) != set(
+            view.request_ids
+        ):
+            raise ValueError("GR requires one immutable logical batch with B=1,2,4")
         for number in (m.dispatch_id, m.stage_index, m.num_prompt_tokens, m.owner_generation):
             if isinstance(number, bool) or not isinstance(number, int) or number < 0:
                 raise ValueError(
@@ -471,37 +481,35 @@ def validate_dispatch(
             raise ValueError("GR requires a nonempty prompt and complete, output-producing Prefill")
         new_requests = {r.req_id: r for r in getattr(scheduler_output, "scheduled_new_reqs", ())}
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-        computed = None
-        if key in new_requests:
-            native = new_requests[key]
-            if (
-                m.kind is GRStageKind.DECODE
-                or len(native.prompt_token_ids or ()) != m.num_prompt_tokens
-            ):
-                raise ValueError("GR native request identity or prompt geometry changed")
-            computed = native.num_computed_tokens
-        elif cached is not None and key in cached.req_ids:
-            if key in cached.resumed_req_ids and m.stage_index > 0:
-                raise ValueError("GR rejects recompute after generation")
-            computed = cached.num_computed_tokens[cached.req_ids.index(key)]
-        if computed is None and (new_requests or cached is not None):
-            raise ValueError("GR metadata has no matching native request")
-        if computed is not None:
-            if type(computed) is not int or computed < 0:
-                raise ValueError("invalid native computed token count")
-            if computed + scheduled[key] != m.num_prompt_tokens + m.stage_index:
-                raise ValueError(
-                    "GR stage disagrees with native token extent; partial Prefill/recompute"
-                )
-            if m.kind is GRStageKind.PREFILL and computed >= m.num_prompt_tokens:
-                raise ValueError("GR Prefill requires remaining prompt tokens")
-        if (
-            not isinstance(m.is_last_stage, bool)
-            or (m.decode_step is not None and type(m.decode_step) is not int)
-            or type(scheduled[key]) is not int
-            or scheduled[key] <= 0
+        for request_id, prompt_tokens in zip(view.request_ids, view.num_prompt_tokens_by_request):
+            computed = None
+            if request_id in new_requests:
+                native = new_requests[request_id]
+                if (
+                    m.kind is GRStageKind.DECODE
+                    or len(native.prompt_token_ids or ()) != prompt_tokens
+                ):
+                    raise ValueError("GR native request identity or prompt geometry changed")
+                computed = native.num_computed_tokens
+            elif cached is not None and request_id in cached.req_ids:
+                if request_id in cached.resumed_req_ids and m.stage_index > 0:
+                    raise ValueError("GR rejects recompute after generation")
+                computed = cached.num_computed_tokens[cached.req_ids.index(request_id)]
+            if computed is None and (new_requests or cached is not None):
+                raise ValueError("GR metadata has no matching native request")
+            if computed is not None:
+                if type(computed) is not int or computed < 0:
+                    raise ValueError("invalid native computed token count")
+                if computed + scheduled[request_id] != prompt_tokens + m.stage_index:
+                    raise ValueError(
+                        "GR stage disagrees with native token extent; partial Prefill/recompute"
+                    )
+                if m.kind is GRStageKind.PREFILL and computed >= prompt_tokens:
+                    raise ValueError("GR Prefill requires remaining prompt tokens")
+        if not isinstance(m.is_last_stage, bool) or (
+            m.decode_step is not None and type(m.decode_step) is not int
         ):
-            raise ValueError("GR dispatch flags, step and scheduled count have invalid types")
+            raise ValueError("GR dispatch flags and step have invalid types")
         params = m.beam_params
         capacity = m.execution_capacity or GRExecutionCapacity(params.beam_width)
         capacity.validate(params)
@@ -527,7 +535,7 @@ def validate_dispatch(
                 not m.produces_output
                 or m.decode_step != m.stage_index - 1
                 or m.input_device_state != GRDeviceStateRef(key, m.stage_index - 1)
-                or scheduled[key] != 1
+                or any(scheduled[request_id] != 1 for request_id in view.request_ids)
             ):
                 raise ValueError("invalid GR Decode dependency or logical token count")
         else:
@@ -540,18 +548,23 @@ def validate_dispatch(
             if (
                 m.kind is not GRStageKind.PREFILL
                 or request.protocol_version != BEAM_BATCH_PROTOCOL_VERSION
-                or len(request.items) != 1
+                or len(request.items) != view.batch_size
                 or request.batch_id != key
-                or type(request.items[0].item_index) is not int
-                or request.items[0].item_index != 0
-                or request.items[0].request.request_id != key
-                or len(request.items[0].request.prompt_token_ids or ()) != m.num_prompt_tokens
+                or tuple(item.item_index for item in request.items) != tuple(range(view.batch_size))
+                or tuple(item.request.request_id for item in request.items) != view.request_ids
+                or tuple(len(item.request.prompt_token_ids or ()) for item in request.items)
+                != view.num_prompt_tokens_by_request
                 or request.beam_params != params
                 or request.output_options != m.output_options
             ):
                 raise ValueError("GR session_init disagrees with dispatch metadata")
         if binding is not None and key != binding.session_id:
             raise ValueError("a second active GR session cannot use shared execution scratch")
+        if bindings is not None and (
+            tuple(bound.native_request_id for bound in bindings) != view.request_ids
+            or any(bound.session_id != key for bound in bindings)
+        ):
+            raise ValueError("GR batch changed the shared execution binding")
         if previous is None:
             if m.dispatch_id != 0 or m.kind is not GRStageKind.PREFILL:
                 raise ValueError("GR session must start with dispatch 0 Prefill")
@@ -564,6 +577,8 @@ def validate_dispatch(
             or m.num_prompt_tokens != previous.num_prompt_tokens
         ):
             raise ValueError("GR dispatch order, configuration or prompt binding changed")
+        if previous is not None:
+            BeamBatchExecutionView.from_stage_metadata(previous).assert_same_logical_batch(view)
     return stages
 
 
