@@ -70,30 +70,29 @@ def test_apply_v2_runner_patches_stamps_markers(
         def add_requests(self, scheduler_output: Any) -> None:
             return None
 
-    native_methods = {
-        name: getattr(Runner, name)
-        for name in ("sample", "prepare_inputs", "finish_requests", "add_requests")
-    }
+    native_methods = {name: getattr(Runner, name) for name in ("sample", "finish_requests")}
     monkeypatch.setattr(v2, "discover_worker_runners", lambda: (("GPUModelRunnerV2", Runner),))
     v2._apply_v2_runner_patches()
 
-    # The slim V2 install set: execute_model, sample_tokens, load, shutdown.
-    # Native sample plus prepare_inputs / finish_requests / add_requests are
-    # NOT patched under V2.
+    # Input preparation/registration have guarded GR specializations; native
+    # sampling and request retirement remain unchanged.
     assert getattr(Runner.execute_model, common._WORKER_EXECUTE_PATCH_MARKER, False)
     assert all(getattr(Runner, name) is method for name, method in native_methods.items())
     assert getattr(Runner.sample_tokens, common._WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False)
     assert getattr(Runner.load_model, common._CONSTRAINT_LOAD_PATCH_MARKER, False)
     assert getattr(Runner.shutdown, common._CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
-    assert not getattr(Runner.prepare_inputs, common._WORKER_V2_PREPARE_PATCH_MARKER, False)
+    assert getattr(Runner.prepare_inputs, common._WORKER_V2_PREPARE_PATCH_MARKER, False)
+    assert getattr(Runner.add_requests, common._WORKER_V2_ADD_REQUESTS_PATCH_MARKER, False)
     assert common.is_worker_runner_v2_patched(Runner)
     assert common.is_worker_runner_patched(Runner)
 
     # Idempotent: a second apply leaves every wrapper unchanged.
-    execute, sample, sample_tokens, load, shutdown = (
+    execute, sample, sample_tokens, prepare, add, load, shutdown = (
         Runner.execute_model,
         Runner.sample,
         Runner.sample_tokens,
+        Runner.prepare_inputs,
+        Runner.add_requests,
         Runner.load_model,
         Runner.shutdown,
     )
@@ -104,6 +103,8 @@ def test_apply_v2_runner_patches_stamps_markers(
         sample_tokens,
     )
     assert (Runner.load_model, Runner.shutdown) == (load, shutdown)
+    assert Runner.prepare_inputs is prepare
+    assert Runner.add_requests is add
 
 
 def test_sample_tokens_v2_plain_fallback_is_pure_native() -> None:

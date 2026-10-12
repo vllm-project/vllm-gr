@@ -36,7 +36,7 @@ _WORKER_MODEL_FORWARD_PATCH_MARKER = "_vllm_gr_prefill_model_forward_patch"
 # marker) with V1.
 _WORKER_V2_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_v2_patch"
 _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER = "_vllm_gr_beam_sample_tokens_v2_patch"
-# P0 beam steady-state state-machine bypass (V2 only): finish/add wrappers.
+# Retained finish marker and optional GR Prefill registration specialization.
 _WORKER_V2_FINISH_REQUESTS_PATCH_MARKER = "_vllm_gr_beam_finish_requests_v2_patch"
 _WORKER_V2_ADD_REQUESTS_PATCH_MARKER = "_vllm_gr_beam_add_requests_v2_patch"
 
@@ -2169,9 +2169,11 @@ def is_worker_runner_v2_patched(runner_class) -> bool:
     required V2 method set is the slim ``execute_model`` and ``sample_tokens``
     stage bypass plus the canonical Constraint Backend load/shutdown markers.
     Native ``sample`` remains untouched: V2 supports only beam_search_v1,
-    whose stage runner owns constrained sampling. ``prepare_inputs`` /
-    ``finish_requests`` / ``add_requests`` are NOT patched under V2 — the
-    stage path drives the native state machine directly (``consume_native_state``).
+    whose stage runner owns constrained sampling. The optional ``prepare_inputs``
+    specialization preserves the native InputBatch contract. ``add_requests``
+    optionally skips unused sampler state for admitted GR Prefill;
+    ``finish_requests`` remains native. The stage path also drives this state
+    machine directly (``consume_native_state``).
     """
     return bool(
         getattr(runner_class.execute_model, _WORKER_EXECUTE_PATCH_MARKER, False)

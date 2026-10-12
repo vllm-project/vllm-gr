@@ -15,6 +15,10 @@ been removed, so this module installs only the slim hook set:
 - ``sample_tokens``: stage bypass (``stage_runner.pending`` → the stage
   runner's own constraint sampling); ordinary frames fall through to the
   native sampler.
+- ``prepare_inputs``: guarded single-request GR Prefill specialization;
+  unsupported inputs fall through to the native V2 InputBatch builder.
+- ``add_requests``: guarded GR Prefill registration without unused native
+  sampler initialization/refresh; other dispatches retain native behavior.
 - ``load_model``/``shutdown``: canonical Constraint Backend + postprocess
   workspace wiring (reusing the V1 wrappers, which only read V2-present attrs).
 
@@ -32,9 +36,12 @@ from vllm_gr.v1.worker.gpu_model_runner_patch import (
     _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
     make_load_model_with_beam_postprocess_workspace,
 )
+from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs_v2
 from vllm_gr.v1.worker.model_runner_common import (
     _CONSTRAINT_LOAD_PATCH_MARKER,
     _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
+    _WORKER_V2_ADD_REQUESTS_PATCH_MARKER,
+    _WORKER_V2_PREPARE_PATCH_MARKER,
     _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
     is_worker_runner_v2_patched,
     make_patched_execute_model_v2,
@@ -85,6 +92,39 @@ def make_patched_sample_tokens_v2(_orig_sample_tokens):
     return patched_sample_tokens
 
 
+def make_patched_prepare_inputs_v2(_orig_prepare_inputs):
+    """Preserve native V2 input preparation outside the supported GR Prefill."""
+    if getattr(_orig_prepare_inputs, _WORKER_V2_PREPARE_PATCH_MARKER, False):
+        return _orig_prepare_inputs
+
+    @wraps(_orig_prepare_inputs)
+    def patched_prepare_inputs(self, scheduler_output, batch_desc):
+        batch = try_prepare_gr_prefill_inputs_v2(self, scheduler_output, batch_desc)
+        if batch is not None:
+            return batch
+        return _orig_prepare_inputs(self, scheduler_output, batch_desc)
+
+    setattr(patched_prepare_inputs, _WORKER_V2_PREPARE_PATCH_MARKER, True)
+    return patched_prepare_inputs
+
+
+def make_patched_add_requests_v2(_orig_add_requests):
+    """Keep native registration outside an admitted, supported GR Prefill."""
+    if getattr(_orig_add_requests, _WORKER_V2_ADD_REQUESTS_PATCH_MARKER, False):
+        return _orig_add_requests
+
+    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import try_add_gr_prefill_request
+
+    @wraps(_orig_add_requests)
+    def patched_add_requests(self, scheduler_output):
+        if try_add_gr_prefill_request(self, scheduler_output):
+            return None
+        return _orig_add_requests(self, scheduler_output)
+
+    setattr(patched_add_requests, _WORKER_V2_ADD_REQUESTS_PATCH_MARKER, True)
+    return patched_add_requests
+
+
 def _apply_v2_runner_patches() -> None:
     """Install grouped-Beam hooks on the V2 GPU ModelRunner class.
 
@@ -119,6 +159,8 @@ def _apply_v2_runner_patches() -> None:
 
         runner_class.execute_model = make_patched_execute_model_v2(runner_class.execute_model)
         runner_class.sample_tokens = make_patched_sample_tokens_v2(runner_class.sample_tokens)
+        runner_class.prepare_inputs = make_patched_prepare_inputs_v2(runner_class.prepare_inputs)
+        runner_class.add_requests = make_patched_add_requests_v2(runner_class.add_requests)
 
         # Native Prefill plan capture + async-forward decode graph capture.
         # These optional graph hooks are NOT part of
@@ -137,5 +179,7 @@ def _apply_v2_runner_patches() -> None:
 __all__ = [
     "_apply_v2_runner_patches",
     "discover_worker_runners",
+    "make_patched_add_requests_v2",
+    "make_patched_prepare_inputs_v2",
     "make_patched_sample_tokens_v2",
 ]
