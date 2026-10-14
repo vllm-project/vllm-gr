@@ -58,12 +58,6 @@ PR 的 GPU 测试使用 V1 Beam、异步调度和 CUDA Graph。上述数值是�
 
 PR #433 使用 OneRec-1.7B、输入长度 1024、Beam 宽度 128、生成 3 个 SID token、CUDA Graph；预热 2 次，测量 5 次。串行列表示把同样的 B 个请求逐个按 B=1 执行，Batch 列表示一次提交 B 个请求。
 
-| B | 串行 B=1 总耗时 | Batch 总耗时 | Batch 总耗时 / B | 吞吐 | 相对串行加速 |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 55.10 ms | 54.97 ms | 54.97 ms | 18.19 req/s | 1.002× |
-| 2 | 109.83 ms | 94.31 ms | 47.15 ms | 21.21 req/s | 1.165× |
-| 4 | 221.83 ms | 177.62 ms | 44.40 ms | 22.52 req/s | 1.249× |
-
 B=4 的平均每请求分摊耗时比单独执行 B=1 低约 19%，吞吐从 18.19 提升到 22.52 req/s。表中的“总耗时 / B”是分摊成本；如果业务关心一次 Batch 中单个请求何时拿到结果，还应直接看 **Batch 总耗时** 和实际等待时间。
 
 <img width="1113" height="752" alt="d9702c9aaba4847bcbaf86b83ed2a0cb" src="https://github.com/user-attachments/assets/07501dba-9fa8-4d60-bb31-f2392ecd50ff" />
