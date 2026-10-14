@@ -6,13 +6,14 @@
 
 - **上层共用**：GPU 和 NPU 在 EngineCore 及以上复用请求接入、Batch 调度和结果返回流程；Worker 侧分别实现各自的设备执行逻辑，保持对外功能一致。PR #433 的性能数据只针对 GPU。
 - **固定成员**：调用方一次提交 B 个请求，它们组成一个 Batch Session。运行中不会动态加入、移走或重新配对请求；结果按提交顺序返回。即使某个请求先结束，Batch 中未完成的请求仍继续执行。
+- **没有自动组 Batch**：当前系统不负责把分散到达的请求攒成一批，也不会跨多次调用合并请求。调用方需要在调用前确定成员和 B。
 - **请求隔离**：Decode 时按 `B × Beam 宽度` 组织计算，但每个请求保有自己的 Beam 状态和 KV。取消、异常、结束后的清理以整个 Batch 为单位处理，避免留下未释放的状态。
 
 目前离线单进程场景下，框架自身开销已降至约 **4 ms**，这部分优化已比较充分。这个数字描述框架开销，与下文包含模型计算的完整请求耗时不是同一个统计口径。
 
 ## Batch 大小如何配置
 
-离线 `GRLLM.beam_search_v1(prompts, params)` 中，**一次调用传入的 prompt 数量就是 B**；当前不是由运行时自动决定 Batch 大小。同一 Batch 使用同一组 Beam 参数。调用方可以按自己的工况将请求分成 B=1、2 或 4 的组，剩余请求再用受支持的大小提交；不支持的大小会在接入阶段被拒绝。
+离线 `GRLLM.beam_search_v1(prompts, params)` 中，**一次调用传入的 prompt 数量就是 B**。同一 Batch 使用同一组 Beam 参数。调用方需要自行将请求分成 B=1、2 或 4 的组，剩余请求再用受支持的大小提交；不支持的大小会在接入阶段被拒绝。
 
 ```python
 B = 2
@@ -26,11 +27,30 @@ outputs = llm.beam_search_v1(batch_prompts, params)
 | 配置 | 需要关注的关系 |
 | --- | --- |
 | `max_num_seqs` | 至少为 B；它限制一次可接入的请求数。 |
-| `max_num_batched_tokens` | 对不使用 chunked prefill 的场景，需覆盖该 Batch 的输入 Token 总量；可参考 `max(max_model_len, B × input_len)` 设置。 |
+| `max_num_batched_tokens` | 当前多请求 Prefill 要整批调度，需覆盖该 Batch 的实际输入 Token 总量；可参考 `max(max_model_len, B × input_len)` 设置。预算不足时会拒绝该 Batch。 |
+| `long_prefill_token_threshold` | 不要设置成会触发 Batch 内请求切块的值；当前路径会拒绝这种情况。 |
 | `beam.max_width` 与 `BeamSearchParams.beam_width` | 前者至少覆盖实际 Beam 宽度 W；设备执行规模随 `B × W` 增加。 |
 | `max_model_len`、显存预算 | 覆盖输入和生成长度，并检查目标 B 下的峰值显存。 |
 
 PR 的 GPU 测试使用 V1 Beam、异步调度和 CUDA Graph。上述数值是容量条件，**不是推荐所有业务固定使用 B=4**：prompt 长度、Beam 宽度、生成步数、约束表、设备和延迟目标都会影响合适的 B。
+
+## 为什么暂不采用 CB
+
+这里的 CB 指 Continuous Batching，即运行中按请求到达和完成情况动态调整执行批次。当前主要面向离线单进程、由调用方一次给出请求集合的工况，因此选择固定成员的 Batch：调度和结果归属更明确，Worker 可以按确定的 `B × Beam 宽度` 形状执行。动态加入、替换或独立退出成员需要另一套状态管理，当前没有实现，也没有自动组 Batch 的入口。若后续转向请求持续到达的在线场景，再根据收益评估 CB 和组批能力。
+
+## 为什么当前不切 Prefill chunk
+
+[Issue #5](https://github.com/ZhiYunpenghuawei/vllm-gr/issues/5) 比较了相同的 4 个 4095-token 请求：同步 `generate` 端到端计时，不含引擎初始化和 CUDA Graph 捕获，每组汇总 30 次采样。
+
+| Prefill 方式 | 中位延迟 | 相对整批执行 |
+| --- | ---: | ---: |
+| 4 个请求一次进入 16K batch-4 图 | 578.74 ms | 基准 |
+| 每轮 4×1K，使用 4K batch-4 图，共 4 轮 | 584.45 ms | +5.71 ms（+0.99%） |
+| 逐请求执行，使用 4K batch-1 图，共 4 轮 | 586.52 ms | +7.78 ms（+1.34%） |
+
+在这组请求和计算量相同的测试中，整批 Prefill 最快；切 chunk 会多出几轮执行，而没有带来延迟收益。因此当前固定 Batch 路径优先一次完成 Prefill，并尽量选择刚好覆盖实际 Token 数的图 bucket，减少 padding。当前多请求 Beam Prefill 也尚未支持切 chunk，触发 Token 预算或长请求切块条件时会在接入阶段拒绝。
+
+这不是对所有场景都禁用 chunk 的结论。显存不足、需要公平调度或避免长请求阻塞时，切 chunk 仍可能必要；那时需要补齐对应实现，并重新比较延迟与资源收益。
 
 ## 已有测试数据
 
