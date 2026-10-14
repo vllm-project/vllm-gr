@@ -1263,12 +1263,20 @@ def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
     counts = getattr(manager, "dispatch_counts", None)
     if counts is not None:
         stats["prefill_graph_captured_buckets"] = sorted(
-            desc.num_tokens for desc in manager._successful if desc.cg_mode.name == "FULL"
+            {desc.num_tokens for desc in manager._successful if desc.cg_mode.name == "FULL"}
+        )
+        stats["prefill_graph_captured_shapes"] = sorted(
+            (desc.num_reqs, desc.num_tokens)
+            for desc in manager._successful
+            if desc.cg_mode.name == "FULL"
         )
         stats["prefill_graph_piecewise_buckets"] = sorted(
             desc.num_tokens for desc in manager._successful if desc.cg_mode.name == "PIECEWISE"
         )
-        stats["prefill_graph_full_capture_failures"] = dict(manager.full_capture_failures)
+        stats["prefill_graph_full_capture_failures"] = {
+            f"{desc.cg_mode.name}:T={desc.num_tokens}:B={desc.num_reqs}": reason
+            for desc, reason in manager.full_capture_failures.items()
+        }
         stats["prefill_graph_full_dispatches"] = counts["FULL"]
         stats["prefill_graph_piecewise_dispatches"] = counts["PIECEWISE"]
         stats["prefill_graph_none_dispatches"] = counts["NONE"]

@@ -272,7 +272,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
-    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True)
+    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=1)
     worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec = SimpleNamespace(block_size=16)
     worker._update_states = lambda _: None
     install_decode_model(

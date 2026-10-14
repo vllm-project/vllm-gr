@@ -247,12 +247,13 @@ def get_beam_decode_graph(
     *,
     batch_size: int = 1,
     beam_width: int | None = None,
+    graph_type: type[BeamDecodeGraph] = BeamDecodeGraph,
 ) -> BeamDecodeGraph:
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
     graph = getattr(worker, "_beam_decode_graph", None)
     if graph is None:
-        graph = BeamDecodeGraph(worker, int(_get_gr_config(worker).beam_max_width))
+        graph = graph_type(worker, int(_get_gr_config(worker).beam_max_width))
         worker._beam_decode_graph = graph
     width = int(_get_gr_config(worker).beam_max_width) if beam_width is None else beam_width
     return graph.select(batch_size, width)

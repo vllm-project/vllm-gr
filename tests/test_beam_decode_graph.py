@@ -44,6 +44,42 @@ def test_context_replacement_fails_before_graph_launch() -> None:
         graph.replay()
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "installed,replacement,message",
+    [
+        (False, None, None),
+        (True, None, None),
+        (False, "_gr_input_buffers", "input storage changed"),
+        (False, "model", "model changed"),
+    ],
+)
+def test_replay_checks_captured_storage_and_model_before_launch(
+    installed: bool, replacement: str | None, message: str | None
+) -> None:
+    from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2BeamDecodeGraph
+
+    graph = object.__new__(V2BeamDecodeGraph)
+    graph.context, graph.input_buffers, graph.original_model = object(), object(), object()
+    graph.signature = shared.BeamDecodeGraphSignature(2, 4, 8)
+    graph.descriptor = object()
+    graph._bindings = {graph.signature: (graph.context, None, None)}
+    entry = SimpleNamespace(cudagraph=Mock(), output=object())
+    graph.wrapper = SimpleNamespace(concrete_cudagraph_entries={graph.descriptor: entry})
+    graph.worker = SimpleNamespace(
+        _beam_context=graph.context,
+        _gr_input_buffers=graph.input_buffers,
+        model=graph.wrapper if installed else graph.original_model,
+    )
+    if replacement is not None:
+        setattr(graph.worker, replacement, object())
+        with pytest.raises(RuntimeError, match=message):
+            graph.replay()
+        entry.cudagraph.replay.assert_not_called()
+    else:
+        assert graph.replay() is entry.output
+        entry.cudagraph.replay.assert_called_once_with()
+
+
 def test_native_model_discovery_unwraps_beam_wrapper() -> None:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 

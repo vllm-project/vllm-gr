@@ -56,7 +56,9 @@ def test_batch_finishes_only_when_all_members_finish_or_any_member_errors():
     assert _batch_finished(torch.tensor([False, False]), torch.tensor([0, 1])).item()
 
 
-def metadata(stage=0, dispatch=None, output=True, n=3):
+def metadata(
+    stage: int = 0, dispatch: int | None = None, output: bool = True, n: int = 3
+) -> GRStageMetadata:
     request = _batch_request(n)
     return GRStageMetadata(
         session_id=request.batch_id,
@@ -76,7 +78,7 @@ def metadata(stage=0, dispatch=None, output=True, n=3):
     )
 
 
-def dispatch(m):
+def dispatch(m: GRStageMetadata) -> SimpleNamespace:
     result = SimpleNamespace(num_scheduled_tokens={m.session_id: 7 if m.stage_index == 0 else 1})
     setattr(result, GR_STAGE_OUTPUT_ATTR, {m.session_id: m})
     return result
@@ -106,6 +108,10 @@ def runtime(dtype=torch.float16, n=3, stop_token_ids=()):
     backend._mark_ready()
     worker = SimpleNamespace(
         _beam_sessions={"session-0": session},
+        model_config=SimpleNamespace(max_model_len=64),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+        ),
         execute_model_state=None,
         _update_states=Mock(),
     )
@@ -135,10 +141,13 @@ def prepare_binding(owner, entry):
 
 
 def admission_worker(
-    sliding_windows: tuple[int | None, ...] = (None, None), dtype: torch.dtype = torch.float16
+    sliding_windows: tuple[int | None, ...] = (None, None),
+    dtype: torch.dtype = torch.float16,
+    *,
+    max_rows: int = 4,
 ) -> SimpleNamespace:
     device = torch.device("cuda", torch.accelerator.current_device_index())
-    backend, _ = _upload_cuda_backend(make_table(), device=device, max_top_k=4, max_rows=4)
+    backend, _ = _upload_cuda_backend(make_table(), device=device, max_top_k=4, max_rows=max_rows)
     backend._mark_ready()
     workspace = BeamPostprocessWorkspace.allocate(
         max_batch=4, beam_width=4, top_k=4, max_decode_steps=3, device=device, logits_dtype=dtype
@@ -166,6 +175,7 @@ def admission_worker(
         ),
         model_config=SimpleNamespace(
             dtype=dtype,
+            max_model_len=64,
             is_encoder_decoder=False,
             is_hybrid=False,
             get_vocab_size=lambda: backend.info.table_metadata.vocab_size,
@@ -187,7 +197,11 @@ def admission_worker(
         ),
         constraint_backend=backend,
         kv_cache_config=SimpleNamespace(
-            kv_cache_groups=[SimpleNamespace(layer_names=list(layers))]
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=list(layers), kv_cache_spec=SimpleNamespace(block_size=16)
+                )
+            ]
         ),
         compilation_config=SimpleNamespace(static_forward_context=layers),
         _beam_postprocess_workspaces=SimpleNamespace(require=Mock(return_value=workspace)),

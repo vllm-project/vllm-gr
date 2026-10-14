@@ -165,8 +165,6 @@ def test_capture_order_and_failure_propagation(
 ) -> None:
     from vllm_gr.v1.worker import gpu_model_runner_v2_graph as graphs
     from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as prefill
-    from vllm_gr.v1.worker import gr_startup
-    from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
 
     worker = SimpleNamespace(
         _vllm_gr_config=SimpleNamespace(beam_max_width=4 if beam_enabled else None)
@@ -174,14 +172,12 @@ def test_capture_order_and_failure_propagation(
     events = Mock()
     events.native.return_value = 17
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", events.plan)
-    monkeypatch.setattr(gr_startup, "capture_async_forward", events.decode)
+    monkeypatch.setattr(graphs, "capture_multibatch_forward", events.decode)
     monkeypatch.setattr(common, "freeze_gc_after_graph_capture", events.freeze)
     expected = [call.native(worker)]
     if beam_enabled:
         expected.insert(0, call.plan(worker))
-        expected.append(
-            call.decode(worker, hooks_type=V2StageExecutionHooks, allow_eager_fallback=True)
-        )
+        expected.append(call.decode(worker))
 
     def native(runner: Any) -> int:
         return cast(int, events.native(runner))

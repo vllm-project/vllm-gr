@@ -87,8 +87,10 @@ def test_runner_vocab_size_prefers_upstream_api() -> None:
     assert _runner_vocab_size(runner) == 32000
 
 
+@pytest.mark.parametrize("max_batch", [1, 4])  # type: ignore[misc]
 def test_weights_then_readiness_then_publication_and_memory(
     monkeypatch: pytest.MonkeyPatch,
+    max_batch: int,
 ) -> None:
     runner = _runner()
     backend = _Backend(device_memory_bytes=37)
@@ -103,7 +105,7 @@ def test_weights_then_readiness_then_publication_and_memory(
     def load_backend(**kwargs: Any) -> _Backend:
         events.append("readiness")
         assert runner.constraint_backend is None
-        assert kwargs["max_rows"] == 4
+        assert kwargs["max_rows"] == 4 * max_batch
         assert kwargs["vocab_size"] == 32000
         assert kwargs["dtype"] is torch.float16
         return backend
@@ -113,7 +115,11 @@ def test_weights_then_readiness_then_publication_and_memory(
         load_backend,
     )
 
-    wrapped = make_load_model_with_constraint_backend(original)
+    wrapped = (
+        make_load_model_with_constraint_backend(original)
+        if max_batch == 1
+        else make_load_model_with_constraint_backend(original, max_batch=max_batch)
+    )
     assert wrapped(runner) == "loaded"
     assert events == ["weights", "readiness"]
     assert runner.constraint_backend is backend
@@ -374,8 +380,8 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
 
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-    import vllm_gr.constraints.loader as loader
     from vllm_gr.config import ConstraintTableBackendEnum
+    from vllm_gr.constraints import loader
     from vllm_gr.ops.sliced_logits import get_vocab_slice_config, set_vocab_slice_config
     from vllm_gr.ops.sliced_logits_patch import apply_sliced_logits_patch
 
@@ -452,3 +458,49 @@ assert 'vllm_gr.constraints.cuda_backend' not in sys.modules
 assert 'vllm_gr.ops.cuda.rec_constrained_topk' not in sys.modules
 """
     subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
+
+
+@pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("operation", ["reload", "shutdown"])  # type: ignore[misc]
+def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
+    v2: bool, operation: str
+) -> None:
+    from unittest.mock import Mock
+
+    from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+
+    runner = _runner()
+    backend = runner.constraint_backend = _Backend()
+    graph = runner._beam_decode_graph = SimpleNamespace(uninstall=Mock(), clear=Mock())
+    runtime = {
+        "_gr_input_buffers": object(),
+        "_gr_gpu_stage_runner": object(),
+        "_gr_decode_capture_failures": {2: "refused"},
+        "_gr_async_decode_graph_capture_failed": True,
+        "_gr_async_decode_graph_capture_error": "refused",
+    }
+    for name, value in runtime.items():
+        setattr(runner, name, value)
+
+    def native(self: Any) -> None:
+        assert self.constraint_backend is None
+        assert backend.close_calls == 1
+        assert (self._beam_decode_graph is None) is v2
+        raise RuntimeError("native failure")
+
+    options = {"close_runtime": close_v2_runtime} if v2 else {}
+    wrapped = (
+        make_load_model_with_constraint_backend(native, **options)
+        if operation == "reload"
+        else make_shutdown_with_constraint_backend(native, **options)
+    )
+    with pytest.raises(RuntimeError, match="native failure"):
+        wrapped(runner)
+    if v2:
+        graph.uninstall.assert_called_once()
+        graph.clear.assert_called_once()
+        assert all(not hasattr(runner, name) for name in runtime)
+    else:
+        graph.uninstall.assert_not_called()
+        graph.clear.assert_not_called()
+        assert all(getattr(runner, name) is value for name, value in runtime.items())

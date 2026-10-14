@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -300,6 +300,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
+        from vllm_gr.config import GRConfig
+
+        self._v2_gr_prefill_capture = (
+            self._is_cuda
+            and envs.VLLM_USE_V2_MODEL_RUNNER
+            and GRConfig.from_vllm_config(vllm_config).beam_worker_decision
+        )
 
         self.num_heads_q = self.model_config.get_num_attention_heads(self.parallel_config)
         self.num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
@@ -1725,6 +1732,21 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         During replay, buffer contents are refreshed via fill_()/copy_()
         in patched_execute_model before the graph is replayed.
         """
+        beam_info = BEAM_DATA_VAR.get()
+        beam_data = beam_info.get("beam_data", {}) if beam_info else {}
+        if getattr(self, "_v2_gr_prefill_capture", False) and not any(
+            row and row.get("is_beam_decode", False) for row in beam_data.values()
+        ):
+            # Native dummy requests split T nearly evenly. Real Prefills can
+            # put nearly all T tokens in one member and can reuse long cached
+            # prefixes. Set bounds before build creates dependent metadata.
+            common_attn_metadata = replace(
+                common_attn_metadata,
+                max_query_len=min(
+                    common_attn_metadata.num_actual_tokens, self.model_config.max_model_len
+                ),
+                max_seq_len=self.model_config.max_model_len,
+            )
         return self.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,

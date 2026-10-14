@@ -32,10 +32,12 @@ from functools import wraps
 
 from vllm.logger import init_logger
 
+from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.v1.worker.gpu_model_runner_patch import (
     _BEAM_POSTPROCESS_LOAD_PATCH_MARKER,
     make_load_model_with_beam_postprocess_workspace,
 )
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
 from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs_v2
 from vllm_gr.v1.worker.model_runner_common import (
     _CONSTRAINT_LOAD_PATCH_MARKER,
@@ -149,12 +151,16 @@ def _apply_v2_runner_patches() -> None:
 
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
-            runner_class.load_model = make_load_model_with_constraint_backend(load_model)
+            runner_class.load_model = make_load_model_with_constraint_backend(
+                load_model,
+                max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
+                close_runtime=close_v2_runtime,
+            )
 
         shutdown = getattr(runner_class, "shutdown", None)
         if not getattr(shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
             runner_class.shutdown = make_shutdown_with_constraint_backend(
-                shutdown if callable(shutdown) else None
+                shutdown if callable(shutdown) else None, close_runtime=close_v2_runtime
             )
 
         runner_class.execute_model = make_patched_execute_model_v2(runner_class.execute_model)

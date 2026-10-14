@@ -30,7 +30,7 @@ def test_decode_capture_and_clean_fallback(failure: str | None) -> None:
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True
     worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
-    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True)
+    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=1)
     for group in worker.kv_cache_config.kv_cache_groups:
         group.kv_cache_spec = SimpleNamespace(block_size=16)
     invalidations = []

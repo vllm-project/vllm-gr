@@ -26,12 +26,19 @@ that surface onto the V2 ModelRunner
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import torch
 
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
-from vllm_gr.v1.worker.gpu_beam_stage_runner import _StageExecutionHooks
+from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+    BeamRequestBinding,
+    GPUBeamStageRunner,
+    _StageExecutionHooks,
+    should_replay_decode_graph,
+)
 
 
 def _can_fuse_prefill_state_writes(worker: Any, scheduler_output: Any, request: Any) -> bool:
@@ -203,6 +210,82 @@ class V2StageExecutionHooks(_StageExecutionHooks):
 
     persistent_graph_install = False
 
+    def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
+        from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2InputBuffers
+
+        worker, beam = self.worker, owner.beam
+        block_size = worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        inputs = getattr(worker, "_gr_input_buffers", None)
+        if inputs is None:
+            inputs = V2InputBuffers(
+                beam.state.beam_width,
+                worker.model_config.max_model_len,
+                block_size,
+                beam.state.device,
+                max_batch=beam.workspace.max_batch,
+            )
+            worker._gr_input_buffers = inputs
+        if (
+            inputs.width != beam.state.beam_width
+            or inputs.max_batch != beam.workspace.max_batch
+            or inputs.max_model_len != worker.model_config.max_model_len
+            or inputs.block_size != block_size
+        ):
+            raise RuntimeError("GR fixed input capacity changed during the worker lifetime")
+        owner.inputs = inputs
+        owner.input_ids = inputs.input_ids[:rows]
+        owner.positions = inputs.positions[:rows]
+        owner.slots = inputs.slots[:rows]
+        owner.execution_mask = inputs.execution_mask[:rows]
+
+    @staticmethod
+    def required_constraint_rows(batch_size: int, beam_width: int) -> int:
+        return batch_size * beam_width
+
+    def prepare_new_adapter(self, view: BeamBatchExecutionView) -> None:
+        # Every V2 adapter uses the same Worker storage. Keep captured graphs.
+        pass
+
+    def decode_graph(self, batch_size: int, beam_width: int) -> Any:
+        from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
+        from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2BeamDecodeGraph
+
+        return get_beam_decode_graph(
+            self.worker,
+            batch_size=batch_size,
+            beam_width=beam_width,
+            graph_type=V2BeamDecodeGraph,
+        )
+
+    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor:
+        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+        worker = self.worker
+        batch_size = len(owner.bindings)
+        enabled = (
+            not worker.model_config.enforce_eager
+            and _get_gr_config(worker).beam_graph_enabled
+            and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+            and batch_size not in getattr(worker, "_gr_decode_capture_failures", {})
+        )
+        owner.graph = (
+            self.decode_graph(batch_size, owner.beam.state.beam_width) if enabled else None
+        )
+        if should_replay_decode_graph_v2(worker, owner.graph, batch_size=batch_size):
+            return worker.model.compute_logits(owner.graph.replay())
+        return owner._forward()
+
+    def consume_retirement_state(
+        self, scheduler_output: Any, bindings: tuple[BeamRequestBinding, ...]
+    ) -> None:
+        self.consume_native_state(
+            replace(
+                scheduler_output,
+                finished_req_ids=scheduler_output.finished_req_ids
+                | {binding.native_request_id for binding in bindings},
+            )
+        )
+
     def forward_hidden(
         self,
         input_ids: torch.Tensor,
@@ -265,7 +348,33 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         # unconditional).  A Host-side bounds check on ``logits_indices`` would
         # force a device->host sync right after the Prefill forward — the
         # sampler's own indexing is the authoritative contract and needs none.
-        sample_hidden = state.hidden_states[state.input_batch.logits_indices]
+        batch = state.input_batch
+        stages = getattr(scheduler_output, "gr_stage_metadata", None)
+        if not stages or len(stages) != 1:
+            raise ValueError("GR Prefill requires one logical batch's metadata")
+        request_ids = next(iter(stages.values())).request_ids
+        native_ids = batch.req_ids
+        if (
+            len(set(request_ids)) != len(request_ids)
+            or len(set(native_ids)) != len(native_ids)
+            or set(request_ids) != set(native_ids)
+            or len(batch.cu_num_logits_np) != len(request_ids) + 1
+            or any(b - a != 1 for a, b in zip(batch.cu_num_logits_np, batch.cu_num_logits_np[1:]))
+        ):
+            raise ValueError("GR Prefill requires exactly one logit row per batch member")
+        indices = batch.logits_indices
+        if tuple(native_ids) != tuple(request_ids):
+            from vllm.utils.torch_utils import async_tensor_h2d
+
+            native_rows = {request_id: row for row, request_id in enumerate(native_ids)}
+            order = async_tensor_h2d(
+                [native_rows[request_id] for request_id in request_ids],
+                torch.long,
+                worker.device,
+            )
+            indices = indices[order]
+        # Restore only the sampled rows. Native request/KV order remains intact.
+        sample_hidden = state.hidden_states[indices]
         logits = worker.model.compute_logits(sample_hidden)
         # GR bypasses native sample_tokens/postprocess, which normally advances
         # this GPU counter. update_requests only updates its CPU mirror; without
@@ -311,3 +420,15 @@ class V2StageExecutionHooks(_StageExecutionHooks):
 def make_v2_stage_hooks(worker: Any) -> V2StageExecutionHooks:
     """Construct the V2 execution hooks for one worker."""
     return V2StageExecutionHooks(worker)
+
+
+def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -> bool:
+    """A refused V2 shape falls back without disabling other captured B values."""
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    requested = not worker.model_config.enforce_eager and _get_gr_config(worker).beam_graph_enabled
+    if requested and batch_size in getattr(worker, "_gr_decode_capture_failures", {}):
+        if graph is not None:
+            raise RuntimeError("Decode capture failed but a graph is still published")
+        return False
+    return should_replay_decode_graph(worker, graph)

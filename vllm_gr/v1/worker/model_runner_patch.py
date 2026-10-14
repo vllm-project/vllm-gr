@@ -37,7 +37,7 @@ def close_constraint_backend(runner: object) -> None:
     backend = getattr(runner, "constraint_backend", None)
     # Detach first so no concurrent observer can discover a Backend while it is
     # being closed, and so repeated shutdown/load calls are naturally idempotent.
-    setattr(runner, "constraint_backend", None)
+    runner.constraint_backend = None
     for processor in getattr(runner, "_gr_vocab_slice_processors", ()):
         processor._gr_vocab_slice = None
     runner._gr_vocab_slice_processors = ()
@@ -84,7 +84,7 @@ def _runner_vocab_size(runner: object) -> int:
     return vocab_size
 
 
-def make_load_model_with_constraint_backend(original):
+def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, close_runtime=None):
     """Load weights first, then atomically publish a ready canonical Backend."""
 
     if getattr(original, _CONSTRAINT_LOAD_PATCH_MARKER, False):
@@ -97,6 +97,8 @@ def make_load_model_with_constraint_backend(original):
         # A complete load replaces the model runtime. Release the previous
         # Backend before loading weights so a failed reload cannot leave stale
         # canonical tables reachable from this runner.
+        if close_runtime is not None:
+            close_runtime(self)
         close_constraint_backend(self)
         gr_config = GRConfig.from_vllm_config(getattr(self, "vllm_config", None))
         table_config = gr_config.constraint_table
@@ -128,10 +130,8 @@ def make_load_model_with_constraint_backend(original):
                 device=getattr(self, "device", None),
                 vocab_size=_runner_vocab_size(self),
                 dtype=getattr(getattr(self, "model_config", None), "dtype", None),
-                # One Backend call is made per request. Decode requests carry
-                # exactly beam_width logits rows, so beam_max_width is the
-                # canonical row-capacity bound.
-                max_rows=max_rows,
+                # V1 retains its row bound; V2 opts into batched sampling.
+                max_rows=max_batch * max_rows,
             )
             if backend is None:
                 raise RuntimeError("enabled canonical constraint table loader returned no Backend")
@@ -176,7 +176,7 @@ def make_load_model_with_constraint_backend(original):
     return load_model_with_constraint_backend
 
 
-def make_shutdown_with_constraint_backend(original=None):
+def make_shutdown_with_constraint_backend(original=None, *, close_runtime=None):
     """Release model callbacks and Backend before native runner shutdown."""
 
     if original is not None and getattr(original, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
@@ -187,6 +187,8 @@ def make_shutdown_with_constraint_backend(original=None):
         def shutdown_with_constraint_backend(self, *args, **kwargs):
             del args, kwargs
             _remove_model_bytecode_hooks(self)
+            if close_runtime is not None:
+                close_runtime(self)
             close_constraint_backend(self)
 
     else:
@@ -194,6 +196,8 @@ def make_shutdown_with_constraint_backend(original=None):
         @wraps(original)
         def shutdown_with_constraint_backend(self, *args, **kwargs):
             _remove_model_bytecode_hooks(self)
+            if close_runtime is not None:
+                close_runtime(self)
             close_constraint_backend(self)
             return original(self, *args, **kwargs)
 

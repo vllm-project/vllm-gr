@@ -10,14 +10,23 @@ import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode as Mode
 from vllm.v1.worker.gpu import cudagraph_utils as native
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as pg2
+from vllm_gr.v1.worker import prefill_graph_common as common
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+from vllm_gr.v1.worker.model_runner_patch import (
+    make_load_model_with_constraint_backend,
+    make_shutdown_with_constraint_backend,
+)
 from vllm_gr.v1.worker.prefill_graph_common import PrefillGraphEnv
 
 
 @pytest.fixture  # type: ignore[misc]
 def runner(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(PrefillGraphEnv, "enabled", True)
+    for name in (common.ENV_PREFILL_GRAPH_BUCKET_STEP, common.ENV_PREFILL_GRAPH_MAX_BUCKET):
+        monkeypatch.delenv(name, raising=False)
     parallel = SimpleNamespace(
         tensor_parallel_size=1,
         data_parallel_size=1,
@@ -45,6 +54,7 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     manager = native.ModelCudaGraphManager(config, torch.device("cpu"), Mode.FULL_AND_PIECEWISE, 1)
     return SimpleNamespace(
         cudagraph_manager=manager,
+        vllm_config=config,
         scheduler_config=config.scheduler_config,
         model_config=SimpleNamespace(max_model_len=2048, enforce_eager=False),
         parallel_config=parallel,
@@ -99,19 +109,110 @@ def fake_capture(
     return observed
 
 
-def test_plan_union_covers_native_gr_and_short_tail(
+def test_plan_preserves_native_capture_budget(
     runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(pg2, "get_default_buckets", lambda: [128, 256, 1024])
+    monkeypatch.setattr(common, "get_default_buckets", lambda: [128, 256, 1024])
+    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_KV_BOUND, "2048")
     runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = [1, 2, 384, 2048]
     plan = pg2.PrefillCapturePlan.for_runner(runner)
-    assert plan.buckets == (1, 2, 16, 128, 256, 384, 512)
+    assert plan.buckets == (1, 2, 384)
     descs = plan.descriptors()
-    assert [d.num_tokens for d in descs[Mode.FULL]] == list(reversed(plan.buckets))
-    assert all(d.num_reqs == 1 and d.uniform_token_count is None for d in descs[Mode.FULL])
+    assert descs[Mode.FULL][0].num_tokens == descs[Mode.PIECEWISE][0].num_tokens == 384
+    assert [d.num_tokens for d in descs[Mode.FULL] if d.num_reqs == 1] == list(
+        reversed(plan.buckets)
+    )
+    assert {d.num_reqs for d in descs[Mode.FULL]} == {1, 2, 4}
+    assert all(
+        d.num_tokens >= d.num_reqs and d.uniform_token_count is None for d in descs[Mode.FULL]
+    )
     assert all(d.num_reqs is None for d in descs[Mode.PIECEWISE])
     runner.model_config.max_model_len = 200
-    assert pg2.PrefillCapturePlan.for_runner(runner).buckets[-1] == 200
+    plan = pg2.PrefillCapturePlan.for_runner(runner)
+    assert plan.buckets[-1] == 384
+    assert max(d.num_tokens for d in plan.descriptors()[Mode.FULL] if d.num_reqs == 1) == 2
+    assert native.BatchExecutionDescriptor(Mode.FULL, 384, 2) in plan.descriptors()[Mode.FULL]
+
+
+@pytest.mark.parametrize("piecewise", [False, True])  # type: ignore[misc]
+def test_full_capture_admits_native_dummy_lengths_and_preserves_fallback(
+    runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, piecewise: bool
+) -> None:
+    sizes = [8187, 8189, 8190, 8191, 8192]
+    runner.scheduler_config.max_num_batched_tokens = 8192
+    runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = sizes
+    runner.cudagraph_manager.cudagraph_mode = Mode.FULL_AND_PIECEWISE if piecewise else Mode.FULL
+    plan = pg2.PrefillCapturePlan.for_runner(runner)
+    assert plan.buckets == tuple(sizes)
+    buffers = InputBuffers(4, 8192, torch.device("cpu"))
+    full = plan.descriptors()[Mode.FULL]
+    assert {(desc.num_reqs, desc.num_tokens) for desc in full} == {(4, 8189), (4, 8192)}
+    # Use upstream's actual split as the oracle instead of copying its formula.
+    for size in sizes:
+        dummy = InputBatch.make_dummy(4, size, buffers)
+        fits = int(dummy.num_scheduled_tokens.max()) <= runner.model_config.max_model_len
+        assert (native.BatchExecutionDescriptor(Mode.FULL, size, 4) in full) is fits
+
+    observed = fake_capture(monkeypatch)
+    pg2.install_prefill_graph_manager_v2(runner)
+    manager = runner.cudagraph_manager
+    manager.capture()
+    assert [size for mode, size in observed if mode == Mode.FULL] == [8192, 8189]
+    assert not manager.full_capture_failures
+    runner.req_states.req_id_to_index = {f"r{i}": i for i in range(4)}
+    runner.req_states.num_computed_tokens_np = [0] * 4
+    runner.req_states.prompt_len.np = [2048] * 4
+    for size in sizes:
+        # Real requests can distribute the remainder without exceeding 2048.
+        counts = {f"r{i}": size // 4 + int(i < size % 4) for i in range(4)}
+        with manager.prefill_scope(SimpleNamespace(num_scheduled_tokens=counts)):
+            desc = manager.dispatch(4, size, None)
+            expected = (
+                Mode.FULL if size in (8189, 8192) else Mode.PIECEWISE if piecewise else Mode.NONE
+            )
+            assert desc.cg_mode == expected
+            # Preserve same-bucket fallback; do not silently select FULL/8192.
+            assert desc.num_tokens == size
+
+
+@pytest.mark.parametrize("sizes", [[], [1, 2, 16, 128, 1024, 2048, 4096]])  # type: ignore[misc]
+def test_v2_native_capture_sizes_do_not_change_v1_grid(
+    runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, sizes: list[int]
+) -> None:
+    from vllm_gr.config import BeamExecutionMode, GRConfig
+    from vllm_gr.v1.worker.prefill_graph_runner import get_prefill_graph_runner
+
+    monkeypatch.setattr(
+        GRConfig,
+        "from_vllm_config",
+        lambda _: SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1),
+    )
+    runner.device = torch.device("cpu")
+    runner.model_config.max_model_len = 1000
+    runner.scheduler_config.max_num_batched_tokens = 4096
+    monkeypatch.delenv(common.ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
+    runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = sizes
+    v1 = get_prefill_graph_runner(runner)
+    v2 = pg2.PrefillCapturePlan.for_runner(runner)
+    assert v1.buckets == [128, 256, 384, 512, 640, 768, 896, 1000]
+    assert v1.match_bucket(900) == 1000
+    assert v1.match_bucket(1001) is None
+    assert v2.buckets == tuple(t for t in sizes if t <= 4000)
+    shapes = {(d.num_reqs, d.num_tokens) for d in v2.descriptors().get(Mode.FULL, [])}
+    assert (1, 1024) not in shapes
+    assert (2, 2048) not in shapes
+    assert ((2, 1024) in shapes) == (1024 in sizes)
+    assert ((4, 2048) in shapes) == (2048 in sizes)
+
+
+def test_legacy_grid_overrides_native_without_adding_capacity_endpoints(
+    runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_BUCKET_STEP, "128")
+    monkeypatch.setenv(common.ENV_PREFILL_GRAPH_MAX_BUCKET, "256")
+    monkeypatch.delenv(common.ENV_PREFILL_GRAPH_KV_BOUND, raising=False)
+    runner.cudagraph_manager.compilation_config.cudagraph_capture_sizes = [1, 2, 512]
+    assert pg2.PrefillCapturePlan.for_runner(runner).buckets == (128, 256)
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -177,6 +278,60 @@ def test_replacing_bound_manager_is_error(runner: SimpleNamespace) -> None:
         pg2.install_prefill_graph_manager_v2(runner)
 
 
+@pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("operation", ["reload", "shutdown"])  # type: ignore[misc]
+def test_prefill_cleanup_precedes_failed_native_lifecycle(
+    runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, v2: bool, operation: str
+) -> None:
+    def fail(desc: native.BatchExecutionDescriptor) -> None:
+        if desc.cg_mode == Mode.FULL and desc.num_tokens == 128:
+            raise RuntimeError("operation not supported when stream is capturing")
+
+    fake_capture(monkeypatch, fail=fail)
+    manager = runner.cudagraph_manager = make_manager(runner)
+    manager.capture()
+    storage = manager.hidden_states = torch.empty(512, 4)
+    manager.aux_hidden_states = [storage]
+    manager.intermediate_tensors = SimpleNamespace(tensors={"hidden": storage})
+    manager.use_aux_hidden_state_outputs = True
+    manager._prefill_scope = scheduled()
+    assert manager.dispatch(1, 128, None).cg_mode == Mode.PIECEWISE
+
+    def native_operation(self: Any) -> None:
+        # Invalidation must happen before native loading/shutdown can fail.
+        assert (self.cudagraph_manager is manager) is not v2
+        assert manager._capture_finished is not v2
+        raise RuntimeError("native failure")
+
+    options = {"close_runtime": close_v2_runtime} if v2 else {}
+    wrapped = (
+        make_load_model_with_constraint_backend(native_operation, **options)
+        if operation == "reload"
+        else make_shutdown_with_constraint_backend(native_operation, **options)
+    )
+    with pytest.raises(RuntimeError, match="native failure"):
+        wrapped(runner)
+    if not v2:
+        assert manager.hidden_states is storage
+        assert manager.graphs and manager._graphs_captured and manager._successful
+        assert manager.full_capture_failures and manager.dispatch_counts["PIECEWISE"] == 1
+        return
+
+    assert not manager.graphs and manager.hidden_states is None
+    assert not manager.aux_hidden_states and manager.intermediate_tensors is None
+    assert not manager.use_aux_hidden_state_outputs
+    assert not manager._graphs_captured and not manager.needs_capture()
+    assert not manager._successful and not manager.full_capture_failures
+    assert manager._prefill_scope is None and not any(manager.dispatch_counts.values())
+    assert manager.dispatch(1, 128, None).cg_mode == Mode.NONE
+    replacement = runner.cudagraph_manager
+    assert type(replacement) is native.ModelCudaGraphManager
+    assert not replacement.graphs and replacement.hidden_states is None
+    assert not replacement._graphs_captured
+    close_v2_runtime(runner)
+    assert runner.cudagraph_manager is replacement
+
+
 def test_capture_order_publication_registry_and_instance_scope(
     runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -217,7 +372,9 @@ def test_full_capture_unsupported_without_piecewise_falls_back_to_none(
     manager = make_manager(runner, piecewise=False)
     manager.capture()
     assert manager._graphs_captured
-    assert set(manager.full_capture_failures) == {128}
+    assert set(manager.full_capture_failures) == {
+        native.BatchExecutionDescriptor(Mode.FULL, 128, 1)
+    }
     with manager.prefill_scope(scheduled()):
         assert manager.dispatch(1, 128, None).cg_mode == Mode.NONE
         assert manager.dispatch(1, 16, None).cg_mode == Mode.FULL
@@ -254,6 +411,34 @@ def test_piecewise_failure_is_not_published(
     with pytest.raises(RuntimeError, match="PW failed"):
         manager.capture()
     assert not manager._successful and not manager._graphs_captured
+
+
+def test_full_capture_failure_and_dispatch_use_exact_request_count(
+    runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(desc: native.BatchExecutionDescriptor) -> None:
+        if desc == native.BatchExecutionDescriptor(Mode.FULL, 128, 2):
+            raise RuntimeError("operation not supported when stream is capturing")
+
+    fake_capture(monkeypatch, fail=fail)
+    manager = pg2.GRPrefillCudaGraphManager(
+        runner, pg2.PrefillCapturePlan((16, 128, 512), True, True, (1, 2, 4), 2048)
+    )
+    runner.req_states.req_id_to_index = {f"r{i}": i for i in range(4)}
+    runner.req_states.num_computed_tokens_np = [0] * 4
+    runner.req_states.prompt_len.np = [128] * 4
+    manager.capture()
+    assert set(manager.full_capture_failures) == {
+        native.BatchExecutionDescriptor(Mode.FULL, 128, 2)
+    }
+    for b in (1, 2, 4):
+        with manager.prefill_scope(
+            SimpleNamespace(num_scheduled_tokens={f"r{i}": 32 for i in range(b)})
+        ):
+            desc = manager.dispatch(b, 128, None)
+            assert desc.cg_mode == (Mode.PIECEWISE if b == 2 else Mode.FULL)
+            if b != 2:
+                assert desc.num_reqs == b
 
 
 def test_capture_error_chain_rejects_fatal_context() -> None:

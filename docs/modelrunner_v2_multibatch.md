@@ -1,0 +1,154 @@
+# ModelRunner V2 multi-batch execution
+
+ModelRunner V2 supports one Beam Search V1 call containing B=1, 2, or 4 logical
+requests. Each member has its own prompt, candidates, scores and KV history.
+Beam width W is fixed by the engine configuration; Decode processes B * W
+physical rows. B is not the beam width or the asynchronous dispatch depth.
+
+## Reuse of native vLLM
+
+The implementation keeps native request registration, input preparation,
+Prefix Cache, KV block tables and Prefill execution. Native preparation may
+reorder requests. The V2 adapter selects the last-token logit rows in the
+original logical member order before Beam sampling; it does not reorder
+native request or KV state.
+
+After Prefill, both runners use the existing GR stage runner, Beam state,
+Constraint Table and Decode graph primitives. V2 alone uses a worker-owned
+input allocation with room for 4 * W rows; each batch uses a view of that
+storage. V2 startup captures the admitted B=1/2/4 Decode shapes. Switching B updates buffer
+contents and selects an existing graph without request-time capture. V2 can
+fall back to eager execution for an individually unsupported capture after
+checking cleanup and device health; other captured shapes remain usable.
+
+V2 retirement passes all logical member IDs back through native request cleanup.
+V2 model replacement and shutdown invalidate both Prefill and Decode captures
+before the native lifecycle operation, including when loading fails. Prefill
+cleanup releases graph/output bindings and clears readiness, capture results
+and counters, then restores an uncaptured native manager. The next capture
+installs a fresh GR plan and allocates output storage for the new model.
+Decode replay also checks the captured model, context and input storage before
+launching.
+
+### V1 compatibility boundary
+
+ModelRunner V1 retains the behavior of the rebased parent `7ee1d95`: the GR
+Prefill grid and per-request capacity clamp, exact native-input admission for
+async Prefill, B=1 startup Decode capture, and lazy capture against stage-owned
+buffers when a new batch needs a graph. Its Backend row bound, retirement and
+shutdown semantics remain unchanged. Upstream V1/NPU fixes in that parent,
+including B=2 Prefill capture, are retained.
+
+The default stage hooks implement that V1 policy. `V2StageExecutionHooks`
+selects fixed storage, startup-only graph replay, batched Backend admission
+and full-member retirement. The V2 installer alone supplies the extended
+Backend capacity and runtime cleanup callback. Shared graph construction has
+an optional graph class; V2 uses a subclass for storage/model validation.
+There is no new environment switch or duplicated Beam state machine.
+
+## Configuration and scope
+
+Use the Beam configuration and Constraint Table artifact described in the
+[asynchronous quickstart](onerec_v1_async_quickstart.md). Set
+`VLLM_USE_V2_MODEL_RUNNER=1` before importing vLLM, and submit the complete
+batch through `GRLLM.beam_search_v1()`. `beam.execution_mode="v1"` selects the
+Beam protocol; it does not select ModelRunner V1.
+
+For B=4, set `max_num_seqs` to at least 4 and make
+`max_num_batched_tokens` large enough for the sum of all remaining prompt
+tokens. `max_model_len` remains a per-member limit. The native request capacity
+does not need to equal B * W; GR allocates the expanded Decode rows separately.
+Keep request beam width equal to `beam.max_width`, with sufficient Constraint
+Table top-k capacity.
+
+The implemented scope is CUDA, one executing logical batch, fixed beam width,
+N=1/2/3 generation steps, asynchronous scheduling, and TP/PP/DP/DCP/PCP=1.
+Keep `ignore_eos=True` and Chunked Prefill disabled. This scope does not include
+arbitrary B, concurrent batch owners, distributed execution, LoRA, multimodal
+inputs or speculative decoding. The validation below exercises offline calls;
+it does not establish automatic batching through an HTTP service.
+
+V2 consumes the native Prefill token capture list; V1 retains its GR grid.
+Configure V2's list explicitly for large prompts and compare actual
+`(B, total_tokens)` shapes when evaluating the runners.
+See [GPU Prefill capture configuration](prefill_graph_capture.md) for capacity
+bounds, Prefix Cache attention bounds and legacy environment overrides.
+
+## Regression coverage
+
+Keep tests at the layer that owns the contract. The fast tests and CUDA tests
+are complementary: mocks check admission and error handling, while native
+state and actual CUDA replay check request order and storage reuse.
+
+| Contract | Tests |
+| --- | --- |
+| V1/V2 startup selection, lazy capture, per-B fallback and cleanup failure | `tests/test_gr_startup.py` |
+| Native token budget and `(B,T)` admission, V1 grid isolation | `tests/test_gpu_prefill_graph_runner_v2.py` |
+| Logical member order, retirement and Backend capacity policy | `tests/test_v2_multibatch.py` |
+| Native row/slot reuse and unchanged request state | `tests/kernels/test_gpu_beam_stage_v2_state.py` |
+| Actual B-switch replay, fixed storage, B=2 eager fallback with B=1/4 preserved | `tests/kernels/test_v2_multibatch_graphs.py` |
+| Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
+| Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |
+| Existing public protocol, generation steps and scheduler integration | `tests/st/test_onerec_v1_scheduler_st.py`, `tests/st/test_modelrunner_v2_stage_parity_st.py` |
+| Real-model multi-batch execution and V1 baseline comparison | `tests/st/model_runner_policy_isolation.py` (manual CLI) |
+| Real video business accuracy and cross-B comparison | `tests/st/onerec_multibatch_accuracy.py` (manual CLI) |
+
+The two manual CLIs are explicit experiments, not pytest-collected tests.
+Profiling, synthetic latency sweeps and intermediate-tensor diagnostics are
+not maintained as additional regression entrypoints.
+
+## Reproduce the execution regression
+
+Set `VLLM_GR_TEST_MODEL` to the local OneRec model and run each combination in
+a fresh process and output directory. For example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
+python -m tests.st.model_runner_policy_isolation \
+  --runner v2 --mode graph --output /tmp/v2-multibatch-graph
+```
+
+Repeat with `--runner v2 --mode eager` and `--runner v1 --mode graph`.
+The probe uses distinct prompts with unsorted lengths. It checks the
+B=1→2→4→1→4→2 sequence with cold/warm Prefix Cache, an N=1 B=4 case and a
+mixed-cache B=4 case. Assertions cover actual Decode replay/eager calls,
+V2 FULL Prefill replay, fixed input addresses, absence of V2 request-time
+capture, candidate structure and resource release. Repeated matching
+shapes must produce identical outputs after batch switches.
+
+To verify V1 baseline behavior, copy this single probe into a checkout of
+`7ee1d95`, run `--runner v1 --mode graph`, then run the current checkout with
+`--reference /path/to/baseline/results.json`. This requires exact ordered
+candidates and scores for every matching case. `--expected-source` can
+additionally assert the Worker imports the intended checkout.
+
+Cross-B or Graph/Eager equality is a separate numerical investigation; it is
+not a required identity in this probe. Different shapes can change BF16
+scores and candidate order. Use the real-data evaluator below to enforce the
+benchmark's business thresholds and record cross-B differences separately.
+
+## Reproduce the real-data accuracy run
+
+Set `VLLM_GR_TEST_MODEL`, `DATASET_PATH` and `CATALOG_PATH` as in the system
+benchmark. Prepare catalog triples using the quickstart. Load the benchmark
+policy's `PASS_AT_1_THRESHOLD`, `PASS_AT_32_THRESHOLD` and
+`RECALL_AT_32_THRESHOLD` environment variables; the script does not lower
+thresholds when changing runners. Point `ONEREC_TRIPLES` to the triples file
+and `ONEREC_ARTIFACT` to a reusable Constraint Table artifact path.
+
+Run each runner in a fresh process, with a new output directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
+python -m tests.st.onerec_multibatch_accuracy \
+  --runner v2 --batches 1 2 4 --num-prompts 100 \
+  --triples "$ONEREC_TRIPLES" --artifact "$ONEREC_ARTIFACT" \
+  --output /tmp/onerec-v2-multibatch
+```
+
+Repeat with `--runner v1` and a different output directory for the controlled
+comparison. The script preserves original prompts, uses the system benchmark
+loader and evaluator, and records source fingerprints, configuration, raw
+candidates, per-sample metrics and graph counters. Exit code zero means that
+the structural checks and business thresholds passed; inspect the recorded
+cross-batch comparisons separately.

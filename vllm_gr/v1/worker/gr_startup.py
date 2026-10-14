@@ -55,24 +55,9 @@ def capture_async_forward(
     hooks_type: type[_StageExecutionHooks] | None = None,
     allow_eager_fallback: bool = False,
 ) -> bool:
-    from vllm_gr.v1.worker.gpu_beam_stage_runner import (
-        _StageExecutionHooks,
-        get_stage_runner,
-    )
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
-
-    cfg = _get_gr_config(worker)
-    validate_gr_execution_runtime(worker.vllm_config)
-    if (
-        not cfg.beam_worker_decision
-        or cfg.beam_max_width is None
-        or cfg.constraint_table is None
-        or not cfg.constraint_table.enabled
-    ):
-        raise ValueError("Beam V1 requires worker decisions, fixed width and a canonical table")
-    device_type = str(worker.device).split(":")[0]
-    if worker.model_config.enforce_eager or not cfg.beam_graph_enabled:
+    if not _capture_enabled(worker):
         return False
+    device_type = str(worker.device).split(":")[0]
     if device_type == "npu":
         from vllm_gr.v1.worker.npu_model_runner_patch import capture_beam_decode_graph
 
@@ -92,6 +77,49 @@ def capture_async_forward(
                 "Asynchronous scheduling startup encountered an incomplete capture state"
             )
         return True
+    error = _capture_batch(
+        worker,
+        _startup_capture_batch_size(),
+        hooks_type=hooks_type,
+        allow_eager_fallback=allow_eager_fallback,
+    )
+    if error is not None:
+        worker._gr_async_decode_graph_capture_failed = True
+        worker._gr_async_decode_graph_capture_error = error
+        return False
+    return True
+
+
+def _capture_enabled(worker: Any) -> bool:
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    cfg = _get_gr_config(worker)
+    validate_gr_execution_runtime(worker.vllm_config)
+    if (
+        not cfg.beam_worker_decision
+        or cfg.beam_max_width is None
+        or cfg.constraint_table is None
+        or not cfg.constraint_table.enabled
+    ):
+        raise ValueError("Beam V1 requires worker decisions, fixed width and a canonical table")
+    return not worker.model_config.enforce_eager and cfg.beam_graph_enabled
+
+
+def _capture_batch(
+    worker: Any,
+    batch_size: int,
+    *,
+    hooks_type: type[_StageExecutionHooks] | None,
+    allow_eager_fallback: bool,
+) -> str | None:
+    """Capture the explicit batch selected by the V1 or V2 entry point."""
+    from vllm_gr.v1.worker.gpu_beam_stage_runner import (
+        _StageExecutionHooks,
+        get_stage_runner,
+    )
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    cfg = _get_gr_config(worker)
     width = cfg.beam_max_width
     GRExecutionCapacity(width)
     sessions = getattr(worker, "_beam_sessions", {})
@@ -99,7 +127,6 @@ def capture_async_forward(
         raise RuntimeError("Asynchronous scheduling startup capture requires drained Beam sessions")
     worker._beam_sessions = sessions
     name = "__async_scheduling_startup_capture__"
-    batch_size = _startup_capture_batch_size()
     request_ids = (
         (name,) if batch_size == 1 else tuple(f"{name}_{index}" for index in range(batch_size))
     )
@@ -169,17 +196,16 @@ def capture_async_forward(
         raise
 
     if fallback_error is not None:
-        worker._gr_async_decode_graph_capture_failed = True
-        worker._gr_async_decode_graph_capture_error = str(fallback_error)
         logger.warning(
             "GR Decode capture unsupported; cleanup and device checks succeeded. "
-            "Using eager Decode: %s",
+            "Using eager Decode for B=%d: %s",
+            batch_size,
             fallback_error,
         )
-        return False
+        return str(fallback_error)
     if graph is None:
         raise RuntimeError("Decode capture completed without a graph candidate")
     # Publishing is the final step: no serving path can see this graph before
     # the startup owner has been released and its GPU work has completed.
     owner.graph = graph
-    return True
+    return None

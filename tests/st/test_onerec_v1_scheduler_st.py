@@ -226,6 +226,11 @@ def _engine_kwargs(model: str, config: dict[str, Any]) -> dict[str, Any]:
         enable_prefix_caching=True,
         gpu_memory_utilization=0.5,
         enforce_eager=_EAGER,
+        # These STs assert Prefill replay for full prompts and cached tails.
+        # Native defaults depend on max_num_seqs and need not cover either.
+        compilation_config={
+            "cudagraph_capture_sizes": [1, 2, 16, *range(128, 2049, 128)],
+        },
         worker_extension_cls="tests.st.test_onerec_v1_scheduler_st.OneRecV1STWorkerExtension",
     )
 

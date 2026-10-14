@@ -23,13 +23,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unav
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
 
 
-def _native_worker(prompt, computed=0):
+def _native_worker(prompt, computed=0, capacity=2):
     worker: Any = GPUModelRunner.__new__(GPUModelRunner)
     worker.device = torch.device("cuda", torch.accelerator.current_device_index())
-    worker.max_num_reqs = 2
+    worker.max_num_reqs = capacity
     worker.use_dcp = False
-    worker.input_buffers = InputBuffers(2, 16, worker.device)
-    worker.req_states = RequestState(2, 16, 16, 0, 32, worker.device)
+    worker.input_buffers = InputBuffers(capacity, 64, worker.device)
+    worker.req_states = RequestState(capacity, 16, 64, 0, 512, worker.device)
     worker.req_states.add_request("session-0", len(prompt), prompt, computed)
     worker.req_states.apply_staged_writes()
     worker.block_tables = SimpleNamespace(apply_staged_writes=Mock())
@@ -73,6 +73,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(monkeypatch
 
     count = len(prompt) - cached
     scheduled = SchedulerOutput.make_empty()
+    scheduled.gr_stage_metadata = {"session-0": metadata()}
     scheduled.num_scheduled_tokens = {"session-0": count}
     scheduled.total_num_scheduled_tokens = count
     scheduled.scheduled_cached_reqs.req_ids = ["session-0"]
@@ -110,3 +111,45 @@ def test_terminal_output_retires_native_v2_request():
     # The request row can be admitted again after the fused terminal cleanup.
     worker.req_states.add_request("next-session", 1, [1], 0)
     assert worker.req_states.num_reqs == 1
+
+
+def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
+    from dataclasses import replace
+
+    worker = _native_worker([1], capacity=7)
+    states = worker.req_states
+    prompts = {"a": [101] * 9, "b": [202] * 2, "c": [303] * 7, "d": [404] * 5}
+    for request_id in ("unused-x", "a", "unused-y", "b", "c"):
+        tokens = prompts.get(request_id, [1])
+        states.add_request(request_id, len(tokens), tokens, 0)
+    worker._remove_request("unused-x")
+    worker._remove_request("unused-y")
+    states.add_request("d", 5, prompts["d"], 0)
+    states.apply_staged_writes()
+    scheduled = SchedulerOutput.make_empty()
+    scheduled.num_scheduled_tokens = {r: len(tokens) for r, tokens in prompts.items()}
+    scheduled.total_num_scheduled_tokens = 23
+    scheduled.gr_stage_metadata = {
+        "a": replace(
+            metadata(),
+            request_ids=tuple(prompts),
+            num_prompt_tokens=23,
+            num_prompt_tokens_by_request=(9, 2, 7, 5),
+        )
+    }
+
+    def native_prefill(runner, scheduled):
+        batch = runner.prepare_inputs(
+            scheduled, BatchExecutionDescriptor(CUDAGraphMode.FULL, 24, 4)
+        )
+        assert batch.req_ids == ["b", "d", "c", "a"]
+        runner.execute_model_state = SimpleNamespace(
+            input_batch=batch, hidden_states=batch.input_ids.float()[:, None]
+        )
+
+    result = make_v2_stage_hooks(worker).prefill_logits(native_prefill, scheduled)
+    assert result[:, 0].tolist() == [101, 202, 303, 404]
+    for request_id, tokens in prompts.items():
+        row = states.req_id_to_index[request_id]
+        assert states.num_computed_tokens.gpu[row].item() == len(tokens)
+    assert states.num_computed_tokens.gpu[states.req_id_to_index["session-0"]].item() == 0

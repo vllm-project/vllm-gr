@@ -156,7 +156,9 @@ python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py
 
 ## Further reading
 
+- [ModelRunner V2 multi-batch execution](modelrunner_v2_multibatch.md): native integration, B=1/2/4 configuration, validation and remaining accuracy work.
 - [Asynchronous scheduling execution contract](async_scheduling.md): scheduling, Prefill/Decode overlap, and retirement.
+- [GPU Prefill capture configuration](prefill_graph_capture.md): V1 grid compatibility, V2 native capture sizes, and multi-request capacity.
 - [Offline Beam Search V1 reference](../examples/offline_inference/beam_search/README.md#beam-search-v1): full configuration fields and script arguments.
 - [Asynchronous scheduling validation](async_scheduling_validation.md): historical precision and graph-replay results.
 - [OneRec benchmark](benchmarks/README.md): dataset, online benchmarks, and accuracy evaluation.

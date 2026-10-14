@@ -305,6 +305,55 @@ class _StageExecutionHooks:
         native = self.worker.requests[session_id]
         return native.block_ids
 
+    def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
+        """V1 model inputs belong to the stage; upload storage stays lazy."""
+        owner.input_ids = torch.empty(rows, device=owner.beam.state.device, dtype=torch.int32)
+        owner.positions = torch.empty_like(owner.input_ids, dtype=torch.int64)
+        owner.slots = torch.full_like(owner.positions, -1)
+        owner.execution_mask = torch.empty_like(owner.input_ids, dtype=torch.bool)
+
+    @staticmethod
+    def required_constraint_rows(batch_size: int, beam_width: int) -> int:
+        return beam_width
+
+    def prepare_new_adapter(self, view: BeamBatchExecutionView) -> None:
+        graph = getattr(self.worker, "_beam_decode_graph", None)
+        if graph is not None:
+            graph.select(view.batch_size, view.beam_width).discard_selected()
+
+    def decode_graph(self, batch_size: int, beam_width: int) -> Any:
+        from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
+
+        return get_beam_decode_graph(self.worker, batch_size=batch_size, beam_width=beam_width)
+
+    def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor:
+        """V1 can capture a missing graph against a new stage's buffers."""
+        worker = self.worker
+        from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+        graph_enabled = (
+            not worker.model_config.enforce_eager
+            and _get_gr_config(worker).beam_graph_enabled
+            and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
+        )
+        if graph_enabled:
+            graph = self.decode_graph(len(owner.bindings), owner.beam.state.beam_width)
+            if not graph.ready:
+                graph.capture(
+                    owner._forward_hidden,
+                    persistent_install=self.persistent_graph_install,
+                )
+            owner.graph = graph
+        if should_replay_decode_graph(worker, owner.graph):
+            return worker.model.compute_logits(owner.graph.replay())
+        else:
+            return owner._forward()
+
+    def consume_retirement_state(
+        self, scheduler_output: Any, bindings: tuple[BeamRequestBinding, ...]
+    ) -> None:
+        self.consume_native_state(scheduler_output)
+
 
 def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
     """Resolve decode graph replay, preserving unexpected-missing invariants."""
@@ -391,10 +440,11 @@ class GPUBeamStageRunner:
         self.logits: torch.Tensor | None = None
         batch_size = len(bindings)
         rows = batch_size * beam.state.beam_width
-        self.input_ids = torch.empty(rows, device=beam.state.device, dtype=torch.int32)
-        self.positions = torch.empty_like(self.input_ids, dtype=torch.int64)
-        self.slots = torch.full_like(self.positions, -1)
-        self.execution_mask = torch.empty_like(self.input_ids, dtype=torch.bool)
+        self.input_ids: torch.Tensor
+        self.positions: torch.Tensor
+        self.slots: torch.Tensor
+        self.execution_mask: torch.Tensor
+        self.hooks.initialize_inputs(self, rows)
         self.constraint_steps = beam.state.num_generated_tokens[:batch_size]
         w = beam.workspace
         self.prefixes = w.prefix_token_ids[:batch_size].reshape(rows, -1)
@@ -545,13 +595,7 @@ class GPUBeamStageRunner:
 
     def capture_forward(self) -> Any:
         """Return a captured candidate; startup publishes it after cleanup."""
-        from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
-
-        graph = get_beam_decode_graph(
-            self.worker,
-            batch_size=len(self.bindings),
-            beam_width=self.beam.state.beam_width,
-        )
+        graph = self.hooks.decode_graph(len(self.bindings), self.beam.state.beam_width)
         graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
         return graph
 
@@ -593,33 +637,7 @@ class GPUBeamStageRunner:
                 self.hooks.consume_native_state(scheduler_output)
                 self._bind_attention(m)
                 self.prepare_decode(entry)
-                from vllm_gr.v1.worker.model_runner_common import _get_gr_config
-
-                graph_enabled = (
-                    not worker.model_config.enforce_eager
-                    and _get_gr_config(worker).beam_graph_enabled
-                    and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
-                )
-                if graph_enabled:
-                    from vllm_gr.v1.worker.beam_decode_graph import (
-                        get_beam_decode_graph,
-                    )
-
-                    graph = get_beam_decode_graph(
-                        worker,
-                        batch_size=len(self.bindings),
-                        beam_width=self.beam.state.beam_width,
-                    )
-                    if not graph.ready:
-                        graph.capture(
-                            self._forward_hidden,
-                            persistent_install=self.hooks.persistent_graph_install,
-                        )
-                    self.graph = graph
-                if should_replay_decode_graph(worker, self.graph):
-                    self.logits = worker.model.compute_logits(self.graph.replay())
-                else:
-                    self.logits = self._forward()
+                self.logits = self.hooks.decode_logits(self)
         return None
 
     def sample(self, grammar_output: Any = None) -> AsyncGPUBeamOutput:
@@ -846,7 +864,7 @@ def execute_gr_retirement(worker, scheduler_output):
     result = owner.request_release(metadata)
     # Preserve the native finished_req_ids cleanup entry, without Forward or sampling.
     owner.hooks.prefill_stage_fence()
-    owner.hooks.consume_native_state(scheduler_output)
+    owner.hooks.consume_retirement_state(scheduler_output, owner.bindings)
     worker._gr_retirement_output = result
     return result
 
@@ -912,7 +930,11 @@ def get_stage_runner(
         or any(table.device != worker.device for table in backend._tables())
     ):
         raise ValueError("constraint backend is not ready or its model/device binding differs")
-    if backend.info.max_rows < cfg.beam_max_width or backend.info.max_top_k < cfg.beam_max_width:
+    if (
+        backend.info.max_rows
+        < hooks_type.required_constraint_rows(len(m.request_ids), cfg.beam_max_width)
+        or backend.info.max_top_k < cfg.beam_max_width
+    ):
         raise ValueError("constraint backend capacity is smaller than fixed Beam width")
     if (
         worker.model_config.is_encoder_decoder
@@ -1058,10 +1080,9 @@ def get_stage_runner(
         context._gr_execution_owner = adapter
         workspace.execution_owner = adapter
     else:
-        graph = getattr(worker, "_beam_decode_graph", None)
-        if graph is not None:
-            graph.select(view.batch_size, view.beam_width).discard_selected()
-        adapter = GPUBeamStageRunner(worker, beam, binding_tuple, backend, hooks=hooks_type(worker))
+        hooks = hooks_type(worker)
+        hooks.prepare_new_adapter(view)
+        adapter = GPUBeamStageRunner(worker, beam, binding_tuple, backend, hooks=hooks)
     worker._beam_sessions = {
         binding.native_request_id: session for binding, session in zip(binding_tuple, session_tuple)
     }
