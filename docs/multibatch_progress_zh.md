@@ -66,6 +66,9 @@ PR #433 使用 OneRec-1.7B、输入长度 1024、Beam 宽度 128、生成 3 个 
 
 B=4 的平均每请求分摊耗时比单独执行 B=1 低约 19%，吞吐从 18.19 提升到 22.52 req/s。表中的“总耗时 / B”是分摊成本；如果业务关心一次 Batch 中单个请求何时拿到结果，还应直接看 **Batch 总耗时** 和实际等待时间。
 
+<img width="1113" height="752" alt="d9702c9aaba4847bcbaf86b83ed2a0cb" src="https://github.com/user-attachments/assets/07501dba-9fa8-4d60-bb31-f2392ecd50ff" />
+
+
 ### Review A/B 复测（NVIDIA L20X）
 
 [这条 review](https://github.com/JiusiServe/vllm-gr/pull/433#pullrequestreview-5479329092) 明确标注硬件为 **NVIDIA L20X**。它使用 OneRec-1.7B BF16、Beam 宽度 128、3 个 SID token、4 条不同的 1024-token prompt（加上 `sid_begin` 后模型输入为 1025 token），以及合成的 2048 条约束目录。单卡、离线单进程，关闭 prefix caching 和 chunked prefill；两次进程重复采用 ABBA 顺序，每种模式每次测 20 组，预热组不计入结果。
