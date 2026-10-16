@@ -112,7 +112,7 @@ class GRInputBuffers:
         if (
             type(step) is not int
             or step < 0
-            or step > 1
+            or step >= metadata.beam_params.max_tokens - 1
             or any(
                 prompt + step >= self.max_model_len for prompt in view.num_prompt_tokens_by_request
             )

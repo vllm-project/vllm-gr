@@ -269,8 +269,8 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     if not scheduler.scheduler_config.async_scheduling:
         raise RuntimeError("beam_search_v1 requires vLLM async_scheduling")
     try:
-        validate_gr_request(request)
         config = getattr(scheduler, "vllm_config", None)
+        validate_gr_request(request, config=config)
         if config is not None:
             validate_gr_execution_config(config)
             validate_gr_device_config(config)

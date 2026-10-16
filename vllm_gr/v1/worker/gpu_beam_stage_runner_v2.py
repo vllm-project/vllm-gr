@@ -209,6 +209,7 @@ class V2StageExecutionHooks(_StageExecutionHooks):
     """_StageExecutionHooks bound to the V2 GPUModelRunner surface."""
 
     persistent_graph_install = False
+    supports_transposed_head = False
 
     def initialize_inputs(self, owner: GPUBeamStageRunner, rows: int) -> None:
         from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2InputBuffers

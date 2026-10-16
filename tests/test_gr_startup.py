@@ -29,6 +29,7 @@ def capture_runtime(monkeypatch: pytest.MonkeyPatch) -> CaptureRuntime:
         model_config=SimpleNamespace(enforce_eager=False),
         _vllm_gr_config=SimpleNamespace(
             beam_max_width=4,
+            beam_max_decode_steps=3,
             beam_worker_decision=True,
             beam_graph_enabled=True,
             beam_online_batch_sizes=(1, 2, 4),
@@ -92,6 +93,10 @@ def test_success_publishes_only_after_release_and_sync(
     assert cast(Mock, stages.get_stage_runner).call_args.kwargs == {"hooks_type": hooks_type}
     decode = owner.prepare_cpu.call_args.args[0]
     assert decode.kv_blocks == ((0,),)
+    assert decode.beam_params.max_tokens == 2
+    assert decode.is_last_stage
+    assert decode.input_device_state == startup.GRDeviceStateRef(decode.session_id, 0)
+    assert decode.output_device_state == startup.GRDeviceStateRef(decode.session_id, 1)
     owner._bind_attention.assert_called_once_with(decode)
     assert not hasattr(worker, "requests")
     assert owner.graph is graph
@@ -111,6 +116,7 @@ def test_opt_in_startup_capture_uses_requested_rows(
     scheduled = cast(Mock, stages.get_stage_runner).call_args.args[1]
     prefill = scheduled.gr_stage_metadata["__async_scheduling_startup_capture__"]
     decode = owner.prepare_cpu.call_args.args[0]
+    assert not prefill.is_last_stage
     assert len(prefill.request_ids) == batch_size
     assert prefill.num_prompt_tokens == batch_size
     assert prefill.num_prompt_tokens_by_request == (1,) * batch_size
@@ -149,6 +155,21 @@ def test_invalid_startup_capture_batch_size(monkeypatch: pytest.MonkeyPatch, raw
 def test_default_startup_capture_batch_size(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, raising=False)
     assert startup._startup_capture_batch_size() == 1
+
+
+@pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
+def test_single_step_skips_decode_capture(capture_runtime: CaptureRuntime, v2: bool) -> None:
+    worker, owner, _graph, _stream, _health = capture_runtime
+    worker._vllm_gr_config.beam_max_decode_steps = 1
+    entry = capture_multibatch_forward if v2 else startup.capture_async_forward
+
+    assert not entry(worker)
+    assert not entry(worker)
+    cast(Mock, stages.get_stage_runner).assert_not_called()
+    owner.capture_forward.assert_not_called()
+    owner.release.assert_not_called()
+    assert not hasattr(worker, "_gr_gpu_stage_runner")
+    assert not hasattr(worker, "_gr_decode_capture_failures")
 
 
 def test_recoverable_failure_records_reason_only_after_cleanup(
@@ -317,6 +338,7 @@ def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
         beam=SimpleNamespace(state=SimpleNamespace(beam_width=4)),
         graph=None,
         _forward_hidden=Mock(),
+        _decode_logits=Mock(return_value="logits"),
         _forward=Mock(),
     )
     hooks = (V2StageExecutionHooks if v2 else stages._StageExecutionHooks)(worker)
@@ -330,6 +352,7 @@ def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
         assert hooks.decode_logits(owner) == "logits"
         graph.capture.assert_called_once_with(owner._forward_hidden, persistent_install=True)
         graph.replay.assert_called_once()
+        owner._decode_logits.assert_called_once_with("hidden")
 
 
 @pytest.mark.parametrize("sizes", [(1, 2, 4), (1, 3, 7), (1, 6, 8)])  # type: ignore[misc]

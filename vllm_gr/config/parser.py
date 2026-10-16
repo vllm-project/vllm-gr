@@ -29,6 +29,7 @@ from vllm_gr.config.validation import (
     validate_beam_online_batch_sizes,
     validate_beam_worker_decision,
     validate_catalog_path,
+    validate_constrained_generation,
     validate_constraint_backend,
     validate_constraint_table_backend,
     validate_constraint_table_enabled,
@@ -60,6 +61,7 @@ NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
 BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
 BEAM_ENGINE_DRIVEN_KEY: Final = "vllm_gr_beam_engine_driven"
 BEAM_EXECUTION_MODE_KEY: Final = "vllm_gr_beam_execution_mode"
+CONSTRAINED_GENERATION_KEY: Final = "vllm_gr_constrained_generation"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -78,10 +80,11 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         BEAM_WORKER_DECISION_KEY,
         BEAM_ENGINE_DRIVEN_KEY,
         BEAM_EXECUTION_MODE_KEY,
+        CONSTRAINED_GENERATION_KEY,
     }
 )
 _TOP_LEVEL_KEYS: Final = frozenset(
-    {"schema_version", "beam", "constraint_table", "attention_backend"}
+    {"schema_version", "beam", "constraint_table", "attention_backend", "constrained_generation"}
 )
 _BEAM_KEYS: Final = frozenset(
     {
@@ -212,6 +215,9 @@ def gr_config_from_mapping(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
         constraint_table=table,
+        constrained_generation=validate_constrained_generation(
+            mapping.get("constrained_generation")
+        ),
     )
 
 
@@ -279,6 +285,11 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         },
         "attention_backend": (
             config.attention_backend.value if config.attention_backend is not None else None
+        ),
+        **(
+            {"constrained_generation": config.constrained_generation}
+            if config.constrained_generation is not None
+            else {}
         ),
     }
 
@@ -380,6 +391,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_execution_mode=validate_beam_execution_mode(
             additional_config.get(BEAM_EXECUTION_MODE_KEY, "legacy")
         ),
+        constrained_generation=validate_constrained_generation(
+            additional_config.get(CONSTRAINED_GENERATION_KEY)
+        ),
     )
 
 
@@ -404,6 +418,7 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     vocab_offset = validate_vocab_offset(gr_config.vocab_offset)
     vocab_slice_size = validate_vocab_slice_size(gr_config.vocab_slice_size)
     npu_decode_execution = validate_npu_decode_execution(gr_config.npu_decode_execution)
+    constrained_generation = validate_constrained_generation(gr_config.constrained_generation)
 
     if catalog_path is None:
         additional_config.pop(CATALOG_PATH_KEY, None)
@@ -434,6 +449,11 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config[SHORT_SUFFIX_ATTENTION_KEY] = True
     else:
         additional_config.pop(SHORT_SUFFIX_ATTENTION_KEY, None)
+
+    if constrained_generation is None:
+        additional_config.pop(CONSTRAINED_GENERATION_KEY, None)
+    else:
+        additional_config[CONSTRAINED_GENERATION_KEY] = constrained_generation
 
     if gr_config.beam_graph_enabled:
         additional_config.pop(BEAM_GRAPH_ENABLED_KEY, None)

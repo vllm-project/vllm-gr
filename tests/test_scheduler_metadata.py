@@ -35,6 +35,7 @@ def test_constraint_prefill_metadata_carries_step_zero() -> None:
     metadata = build_beam_request_metadata(
         _req(
             is_constraint_prefill=True,
+            is_constrained=True,
             beam_width=2,
             prefix_len=0,
             max_decode_steps=2,
@@ -48,6 +49,30 @@ def test_constraint_prefill_metadata_carries_step_zero() -> None:
     assert metadata["is_constrained"] is True
     assert metadata["constraint_step"] == 0
     assert metadata["beam_width"] == 2
+
+
+def test_unconstrained_prefill_metadata_carries_step_zero_without_constraint() -> None:
+    """A full-vocabulary prefill keeps step 0 but is not marked constrained.
+
+    ``is_constraint_prefill`` only says the EngineCore cache hook saw a beam
+    prefill; ``is_constrained`` is what selects the Constraint Table, so the
+    Worker never treats an unconstrained prefill as a constrained one.
+    """
+
+    metadata = build_beam_request_metadata(
+        _req(
+            is_constraint_prefill=True,
+            beam_width=2,
+            prefix_len=0,
+            max_decode_steps=2,
+        ),
+        num_scheduled_tokens=4,
+    )
+
+    assert metadata is not None
+    assert metadata["is_constraint_prefill"] is True
+    assert metadata["is_constrained"] is False
+    assert metadata["constraint_step"] == 0
 
 
 def test_constrained_decode_metadata_carries_step() -> None:

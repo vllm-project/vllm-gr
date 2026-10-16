@@ -113,8 +113,9 @@ def test_grllm_v1_entry_uses_new_frontend(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.parametrize("fail_shutdown", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("unconstrained", [False, True])  # type: ignore[misc]
 def test_v1_heap_is_prepared_before_serving_and_released_on_close(
-    monkeypatch: pytest.MonkeyPatch, fail_shutdown: bool
+    monkeypatch: pytest.MonkeyPatch, fail_shutdown: bool, unconstrained: bool
 ) -> None:
     from vllm.entrypoints.llm import LLM
 
@@ -129,8 +130,11 @@ def test_v1_heap_is_prepared_before_serving_and_released_on_close(
             raise RuntimeError("engine shutdown failed")
 
     def initialize(llm: Any, **kwargs: Any) -> None:
+        additional_config: dict[str, object] = {"vllm_gr_beam_execution_mode": "v1"}
+        if unconstrained:
+            additional_config["vllm_gr_constrained_generation"] = False
         llm.llm_engine = SimpleNamespace(
-            vllm_config=SimpleNamespace(additional_config={"vllm_gr_beam_execution_mode": "v1"}),
+            vllm_config=SimpleNamespace(additional_config=additional_config),
             shutdown=shutdown,
         )
         events.append("engine_ready")

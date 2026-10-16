@@ -41,7 +41,11 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
         return {
             "is_beam_decode": False,
             "is_constraint_prefill": True,
-            "is_constrained": True,
+            "is_constrained": bool(getattr(req, "is_constrained", False)),
+            # Prefill is always FSM step 0.  The key stays present for every
+            # beam prefill: the Worker's constrained paths
+            # (collect_constrained_rows / prepared prefill) require it, and
+            # ``is_constrained`` above is what tells the two modes apart.
             "constraint_step": 0,
             "beam_width": beam_width,
             "beam_suffix": [],

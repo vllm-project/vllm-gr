@@ -53,6 +53,8 @@ def init_gr(
     tokenizer = self.input_processor.tokenizer
     vllm_config = getattr(engine_client, "vllm_config", None)
     gr_config = GRConfig.from_vllm_config(vllm_config)
+    if gr_config.constrained_generation is False:
+        return
     canonical_table = gr_config.constraint_table
     if canonical_table is not None and canonical_table.enabled:
         self.constraint_strategy = ConstraintTableStrategy(canonical_table.path or "")

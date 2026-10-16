@@ -64,6 +64,14 @@ def validate_constraint_table_enabled(value: object) -> bool:
     return value
 
 
+def validate_constrained_generation(value: object) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError("vllm-gr constrained_generation must be a boolean or null")
+    return value
+
+
 def validate_constraint_table_backend(
     value: object,
 ) -> ConstraintTableBackendEnum:

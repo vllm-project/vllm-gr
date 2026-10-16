@@ -101,6 +101,7 @@ def _init_engine_args(
     *args: object,
     catalog_path: str | None = None,
     constraint_backend: ConstraintBackend | str | None = None,
+    constrained_generation: bool | None = None,
     vllm_gr_config: GRConfigInput | None = None,
     beam_execution_mode: str | None = None,
     **kwargs: object,
@@ -123,6 +124,7 @@ def _init_engine_args(
     origin_engine_args_init(self, *args, **kwargs)
     self.catalog_path = catalog_path
     self.constraint_backend = constraint_backend
+    self.constrained_generation = constrained_generation
     self._vllm_gr_config_input = vllm_gr_config
     setattr(self, "beam_execution_mode", beam_execution_mode)
 
@@ -181,6 +183,19 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         choices=[backend.value for backend in ConstraintBackend],
         default=None,
         help="Constraint implementation: trie (default) or constraint_table.",
+    )
+    model_group.add_argument(
+        "--constrained-generation",
+        action="store_true",
+        default=None,
+        help="Enable catalog-constrained Beam candidate generation.",
+    )
+    model_group.add_argument(
+        "--no-constrained-generation",
+        action="store_false",
+        dest="constrained_generation",
+        default=None,
+        help="Disable catalog constraints and use full-vocabulary Beam candidates.",
     )
     model_group.add_argument(
         "--vllm-gr-config",
@@ -276,6 +291,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.constraint_backend = None
     if hasattr(args, "constraint_backend"):
         engine_args.constraint_backend = args.constraint_backend
+    engine_args.constrained_generation = getattr(args, "constrained_generation", None)
     engine_args._vllm_gr_config_input = getattr(args, "vllm_gr_config", None)
     for attr in ("beam_max_width", "beam_max_decode_steps"):
         setattr(engine_args, attr, getattr(args, attr, None))
@@ -440,6 +456,7 @@ def create_engine_config(self, usage_context=None, headless=False):
     canonical_input = getattr(self, "_vllm_gr_config_input", None)
     catalog_path = getattr(self, "catalog_path", None)
     constraint_backend = getattr(self, "constraint_backend", None)
+    constrained_generation = getattr(self, "constrained_generation", None)
     backend_is_explicit, backend_override = _explicit_gr_attention_backend(self)
 
     # GRLLM historically forwards its default ConstraintBackend.TRIE value.
@@ -453,6 +470,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         or bool(getattr(self, "no_beam_graph", False))
         or getattr(self, "beam_worker_decision", None) is not None
         or getattr(self, "beam_engine_driven", None) is not None
+        or constrained_generation is not None
         or backend_is_explicit
     )
 
@@ -489,6 +507,11 @@ def create_engine_config(self, usage_context=None, headless=False):
             if constraint_backend is not None
             else existing_gr_config.constraint_backend
         )
+        effective_constrained_generation = (
+            constrained_generation
+            if constrained_generation is not None
+            else existing_gr_config.constrained_generation
+        )
         effective_beam_worker_decision = (
             getattr(self, "beam_worker_decision", None)
             if getattr(self, "beam_worker_decision", None) is not None
@@ -516,7 +539,8 @@ def create_engine_config(self, usage_context=None, headless=False):
             or existing_gr_config.beam_max_width is not None
         )
         if (
-            _is_npu_platform()
+            effective_constrained_generation is not False
+            and _is_npu_platform()
             and beam_width_configured
             and not _constraint_explicitly_configured(self, existing_gr_config)
             and effective_catalog_path is not None
@@ -550,7 +574,8 @@ def create_engine_config(self, usage_context=None, headless=False):
             or _is_cuda_platform()
         )
         if (
-            effective_catalog_path is not None
+            effective_constrained_generation is not False
+            and effective_catalog_path is not None
             and effective_catalog_path != AUTO_CONSTRAINT_TABLE_PATH
             and constraint_slice_supported
         ):
@@ -578,7 +603,7 @@ def create_engine_config(self, usage_context=None, headless=False):
             attention_backend=(
                 backend_override if backend_is_explicit else existing_gr_config.attention_backend
             ),
-            vocab_offset=(offset if offset is not None else existing_gr_config.vocab_offset),
+            vocab_offset=offset if offset is not None else existing_gr_config.vocab_offset,
             vocab_slice_size=(
                 slice_size if slice_size is not None else existing_gr_config.vocab_slice_size
             ),
@@ -597,6 +622,10 @@ def create_engine_config(self, usage_context=None, headless=False):
             ),
             beam_worker_decision=effective_beam_worker_decision,
             beam_engine_driven=effective_beam_engine_driven,
+            beam_execution_mode=existing_gr_config.beam_execution_mode,
+            schema_version=existing_gr_config.schema_version,
+            constraint_table=existing_gr_config.constraint_table,
+            constrained_generation=effective_constrained_generation,
         )
 
     if canonical_source:
@@ -610,6 +639,11 @@ def create_engine_config(self, usage_context=None, headless=False):
             beam_worker_decision=worker_decision,
             beam_engine_driven=engine_driven,
         )
+
+    if effective_gr_config.constrained_generation is False:
+        from vllm_gr.ops.sliced_logits import set_vocab_slice_config
+
+        set_vocab_slice_config(None, None)
 
     execution_mode = getattr(self, "beam_execution_mode", None)
     if execution_mode is not None:

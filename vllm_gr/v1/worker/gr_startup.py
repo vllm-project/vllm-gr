@@ -98,14 +98,26 @@ def _capture_enabled(worker: Any) -> bool:
 
     cfg = _get_gr_config(worker)
     validate_gr_execution_runtime(worker.vllm_config)
+    unconstrained = getattr(cfg, "constrained_generation", None) is False
     if (
         not cfg.beam_worker_decision
         or cfg.beam_max_width is None
-        or cfg.constraint_table is None
-        or not cfg.constraint_table.enabled
+        or (
+            not unconstrained and (cfg.constraint_table is None or not cfg.constraint_table.enabled)
+        )
     ):
-        raise ValueError("Beam V1 requires worker decisions, fixed width and a canonical table")
-    return not worker.model_config.enforce_eager and cfg.beam_graph_enabled
+        raise ValueError(
+            "Beam V1 requires worker decisions, fixed width and either an enabled "
+            "canonical table or constrained_generation=False"
+        )
+    if unconstrained and str(worker.device).split(":")[0] != "cuda":
+        raise ValueError("unconstrained Beam V1 requires CUDA")
+    # A one-token session completes in Prefill and never replays a Decode graph.
+    return (
+        not worker.model_config.enforce_eager
+        and cfg.beam_graph_enabled
+        and cfg.beam_max_decode_steps > 1
+    )
 
 
 def _capture_batch(
@@ -139,10 +151,11 @@ def _capture_batch(
         stage_index=0,
         kind=GRStageKind.PREFILL,
         decode_step=None,
-        is_last_stage=True,
+        is_last_stage=False,
         input_device_state=None,
         output_device_state=GRDeviceStateRef(name, 0),
-        beam_params=BeamBatchParams(width, 1, 0.0, (), True),
+        # The capture includes Decode step 0 after the first Prefill token.
+        beam_params=BeamBatchParams(width, 2, 0.0, (), True),
         output_options=BeamOutputOptions(width, True, True, True),
         num_prompt_tokens=batch_size,
         request_ids=request_ids,
@@ -165,6 +178,9 @@ def _capture_batch(
                 kind=GRStageKind.DECODE,
                 stage_index=1,
                 decode_step=0,
+                is_last_stage=True,
+                input_device_state=GRDeviceStateRef(name, 0),
+                output_device_state=GRDeviceStateRef(name, 1),
                 kv_blocks=((0,),) * batch_size,
             )
             owner.prepared = owner.prepare_cpu(decode, 0)

@@ -93,6 +93,43 @@ def test_constraint_table_requires_catalog_path() -> None:
         GRConfig(constraint_backend=ConstraintBackend.CONSTRAINT_TABLE)
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "existing",
+    [
+        GRConfig(
+            catalog_path="/tmp/catalog.json", constraint_backend=ConstraintBackend.CONSTRAINT_TABLE
+        ),
+        GRConfig(vocab_offset=10, vocab_slice_size=20),
+    ],
+)
+def test_unconstrained_legacy_merge_rejects_explicit_constraints(existing: GRConfig) -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    existing.write_to_vllm_config(vllm_config)
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config", return_value=vllm_config
+    ):
+        with pytest.raises(ValueError, match="constrained_generation=False"):
+            create_engine_config(SimpleNamespace(constrained_generation=False))
+
+
+def test_unconstrained_cli_rejects_explicit_constraint_backend() -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config", return_value=_vllm_config()
+    ):
+        with pytest.raises(ValueError, match="constrained_generation=False"):
+            create_engine_config(
+                SimpleNamespace(
+                    constrained_generation=False,
+                    catalog_path="/tmp/catalog.json",
+                    constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+                )
+            )
+
+
 def test_npu_decode_execution_defaults_to_unset() -> None:
     # Unset (None): the runtime resolves per platform (xllm on NPU with the
     # operator library, cascade otherwise).

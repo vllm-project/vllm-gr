@@ -99,22 +99,31 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     try:
         validate_gr_execution_config(vllm_config)
         validate_gr_device_config(vllm_config)
-        validate_gr_request(request)
+        validate_gr_request(request, config=vllm_config)
     except ValueError as error:
         raise BeamSearchRequestError(str(error)) from error
     # Shared validation above owns request/config semantics. Only frontend
     # limits and the configured Constraint Table remain to check here.
     gr_config = GRConfig.from_vllm_config(vllm_config)
     table = gr_config.constraint_table
+    unconstrained = gr_config.constrained_generation is False
     device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
     device_type = str(device).split(":")[0]
+    if unconstrained and device_type != "cuda":
+        raise BeamSearchRequestError("unconstrained beam_search_v1 requires CUDA")
     required_backend = (
         ConstraintTableBackendEnum.NPU if device_type == "npu" else ConstraintTableBackendEnum.CUDA
     )
-    if table is None or not table.enabled or table.backend is not required_backend:
+    if not unconstrained and (
+        table is None or not table.enabled or table.backend is not required_backend
+    ):
         raise BeamSearchRequestError(
             "beam_search_v1 requires an enabled canonical "
             f"{required_backend.value.upper()} constraint table"
+        )
+    if not unconstrained and request.beam_params.catalog_strategy is not None:
+        raise BeamSearchRequestError(
+            "catalog_strategy is not applicable to the constraint_table backend"
         )
     max_width = gr_config.beam_max_width
     if max_width is None:
@@ -124,11 +133,6 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     if request.beam_params.beam_width != max_width:
         raise BeamSearchRequestError(
             f"Asynchronous scheduling beam_width must equal the fixed runtime width {max_width}"
-        )
-    if request.beam_params.max_tokens > gr_config.beam_max_decode_steps:
-        raise BeamSearchRequestError(
-            f"Decode steps {request.beam_params.max_tokens} exceed runtime limit "
-            f"{gr_config.beam_max_decode_steps}"
         )
 
     model_config = vllm_config.model_config

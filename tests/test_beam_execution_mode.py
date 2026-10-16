@@ -80,6 +80,7 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
             beam_execution_mode=BeamExecutionMode.V1,
             beam_graph_enabled=True,
             beam_max_width=4,
+            beam_max_decode_steps=3,
             beam_worker_decision=True,
             constraint_table=SimpleNamespace(enabled=True),
         ),

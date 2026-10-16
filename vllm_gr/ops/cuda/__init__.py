@@ -21,6 +21,11 @@ from vllm_gr.ops.cuda.rec_constrained_topk import (
     rec_constrained_topk_cuda,
     rec_constrained_topk_cuda_out,
 )
+from vllm_gr.ops.cuda.unconstrained_topk import (
+    UnconstrainedTopKScratch,
+    allocate_unconstrained_topk_scratch,
+    unconstrained_topk_out,
+)
 
 __all__ = [
     "BeamSelectionScratch",
@@ -37,4 +42,7 @@ __all__ = [
     "rec_constrained_topk_cuda",
     "rec_constrained_topk_cuda_out",
     "prefill_beam_result_out",
+    "UnconstrainedTopKScratch",
+    "allocate_unconstrained_topk_scratch",
+    "unconstrained_topk_out",
 ]

@@ -34,6 +34,8 @@ def _engine_constraint_table_active(engine: Any) -> bool:
     from vllm_gr.config import ConstraintBackend, GRConfig
 
     gr_config = GRConfig.from_vllm_config(getattr(engine, "vllm_config", None))
+    if gr_config.constrained_generation is False:
+        return False
     canonical_table = gr_config.constraint_table
     return gr_config.constraint_backend == ConstraintBackend.CONSTRAINT_TABLE or (
         canonical_table is not None and canonical_table.enabled
@@ -131,7 +133,9 @@ def _cache_beam_request(self, request) -> None:
         if preserved_template is not None:
             self.beam_cache[request.request_id]["step_template"] = preserved_template
 
-    if _engine_constraint_table_active(self):
+    is_constraint_table = _engine_constraint_table_active(self)
+    is_beam_prefill = getattr(request, "gr_batch_request", None) is not None
+    if is_constraint_table or is_beam_prefill:
         # Constraint Tables generate the step-0 candidates in the Worker from
         # the raw prefill logits.  Only beam-session prefills reach this cache
         # (ADD_BATCH), so any such request is the session's constrained prefill.
@@ -140,6 +144,7 @@ def _cache_beam_request(self, request) -> None:
         params = getattr(request, "sampling_params", None)
         beam_width = getattr(params, "logprobs", None) if params is not None else None
         request.is_constraint_prefill = True
+        request.is_constrained = is_constraint_table
         request.beam_width = beam_width
 
 
@@ -269,7 +274,7 @@ def _handle_submit_gr_session(self, batch_request) -> None:
     try:
         from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
 
-        validate_gr_request(batch_request)
+        validate_gr_request(batch_request, config=getattr(self, "vllm_config", None))
     except ValueError as error:
         # A malformed batch is a request rejection, not a preprocessing fault.
         if getattr(self, "output_queue", None) is None:
@@ -303,7 +308,7 @@ def _admit_gr_session(self, batch_request) -> None:
             validate_gr_request,
         )
 
-        validate_gr_request(batch_request)
+        validate_gr_request(batch_request, config=getattr(self, "vllm_config", None))
     except ValueError as error:
         # The request is answerable, so it must not take the preprocessing
         # error path: that one logs a traceback and sends a bare

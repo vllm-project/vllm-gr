@@ -60,11 +60,9 @@ def _validate_gr_generation_params(params: BeamBatchParams) -> None:
         type(params.beam_width) is not int
         or not 1 <= params.beam_width <= 256
         or type(params.max_tokens) is not int
-        or params.max_tokens not in (1, 2, 3)
+        or params.max_tokens < 1
     ):
-        raise ValueError(
-            "Asynchronous scheduling requires the startup beam width and effective N=1/2/3"
-        )
+        raise ValueError("Asynchronous scheduling requires W in [1, 256] and N >= 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,9 +91,7 @@ class GRExecutionCapacity:
     def validate(self, params: BeamBatchParams) -> None:
         _validate_gr_generation_params(params)
         if params.beam_width != self.beam_width:
-            raise ValueError(
-                "Asynchronous scheduling requires the startup beam width and effective N=1/2/3"
-            )
+            raise ValueError("Asynchronous scheduling requires the startup beam width")
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +163,7 @@ def validate_gr_device_config(config: Any) -> None:
         )
 
 
-def validate_gr_request(request: BeamBatchRequest) -> None:
+def validate_gr_request(request: BeamBatchRequest, *, config: Any = None) -> None:
     """Validate shared V1 semantics before native ADD or Worker allocation."""
     validate_beam_batch_request(request)
     if len(request.items) not in SUPPORTED_BEAM_BATCH_SIZES:
@@ -189,6 +185,24 @@ def validate_gr_request(request: BeamBatchRequest) -> None:
         if params.max_tokens != request.beam_params.max_tokens or params.n != 1:
             raise ValueError("native and Beam generation budgets must match and n must be 1")
     _validate_gr_generation_params(request.beam_params)
+    if config is not None:
+        from vllm_gr.config import GRConfig
+        from vllm_gr.config.models import CONSTRAINT_TABLE_MAX_DECODE_STEPS
+
+        gr_config = GRConfig.from_vllm_config(config)
+        max_tokens = request.beam_params.max_tokens
+        if (
+            gr_config.constrained_generation is not False
+            and max_tokens > CONSTRAINT_TABLE_MAX_DECODE_STEPS
+        ):
+            raise ValueError(
+                "generation budget exceeds constraint_table_v1 depth "
+                f"({CONSTRAINT_TABLE_MAX_DECODE_STEPS})"
+            )
+        if max_tokens > gr_config.beam_max_decode_steps:
+            raise ValueError(
+                f"Decode steps {max_tokens} exceed runtime limit {gr_config.beam_max_decode_steps}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,12 +535,12 @@ def validate_dispatch(
             type(params.beam_width) is not int
             or not 1 <= params.beam_width <= 256
             or type(params.max_tokens) is not int
-            or params.max_tokens not in (1, 2, 3)
+            or params.max_tokens < 1
             or not math.isfinite(params.temperature)
             or params.temperature < 0
             or params.constraint_resource_id != DEFAULT_CONSTRAINT_RESOURCE_ID
         ):
-            raise ValueError("GR requires fixed W<=256, effective N=1/2/3 and Constraint Table")
+            raise ValueError("GR requires W in [1, 256], N >= 1 and valid generation params")
         if not 0 <= m.stage_index < params.max_tokens:
             raise ValueError("GR logical stage exceeds generation budget")
         if m.output_device_state != GRDeviceStateRef(key, m.stage_index):

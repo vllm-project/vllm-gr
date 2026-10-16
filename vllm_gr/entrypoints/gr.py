@@ -85,6 +85,7 @@ class GRLLM(LLM):
         *,
         catalog_path: str | None = None,
         constraint_backend: ConstraintBackend | str | None = None,
+        constrained_generation: bool | None = None,
         beam_graph_enabled: bool | None = None,
         beam_max_width: int | None = None,
         beam_max_decode_steps: int | None = None,
@@ -150,7 +151,8 @@ class GRLLM(LLM):
         )
 
         if (
-            constraint_backend is None
+            constrained_generation is not False
+            and constraint_backend is None
             and catalog_path is not None
             and _catalog_is_triples_document(catalog_path)
             and beam_max_width is not None
@@ -162,6 +164,7 @@ class GRLLM(LLM):
         if engine_args_accepts_gr_values():
             gr_engine_args["catalog_path"] = catalog_path
             gr_engine_args["constraint_backend"] = constraint_backend
+            gr_engine_args["constrained_generation"] = constrained_generation
         elif constraint_backend not in (None, ConstraintBackend.TRIE):
             raise RuntimeError(
                 "vllm-gr runtime patches are not active: EngineArgs cannot "
@@ -202,41 +205,42 @@ class GRLLM(LLM):
         # sentinel catalog_path when Constraint Tables are auto-selected).
         # Explicit user choices pass through unchanged.
         resolved_gr = GRConfig.from_vllm_config(getattr(self.llm_engine, "vllm_config", None))
-        effective_backend = resolved_gr.constraint_backend
-        effective_catalog_path = resolved_gr.catalog_path
-        canonical_table = resolved_gr.constraint_table
-        if canonical_table is not None and canonical_table.enabled:
-            # Canonical artifacts are loaded independently by every worker.
-            # The frontend strategy is only the request-routing marker that
-            # carries constraint_step/beam_suffix through the beam protocol.
-            self.constraint_strategy = ConstraintTableStrategy(canonical_table.path or "")
-            self.constraint_strategy.digest = canonical_table.artifact_digest
-            self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
-        elif effective_catalog_path is not None:
-            self.constraint_strategy = create_constraint_strategy(
-                backend=effective_backend,
-                tokenizer=self.get_tokenizer(),
-                catalog_path=effective_catalog_path,
-            )
-            self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
-            if isinstance(self.constraint_strategy, TrieConstraintStrategy):
-                self.catalog = self.constraint_strategy.catalog
-            elif isinstance(self.constraint_strategy, ConstraintTableStrategy):
-                # Constraint Tables compile on the driver and are broadcast to
-                # every worker before any beam-search step runs.  Failing here
-                # is a hard startup error — never a silent fall back to Trie.
-                model_config = self.llm_engine.model_config
-                get_vocab_size = getattr(model_config, "get_vocab_size", None)
-                vocab_size = (
-                    get_vocab_size() if callable(get_vocab_size) else model_config.vocab_size
-                )
-                resource = install_constraint_table(
-                    self.llm_engine,
-                    catalog_path=effective_catalog_path,
+        if resolved_gr.constrained_generation is not False:
+            effective_backend = resolved_gr.constraint_backend
+            effective_catalog_path = resolved_gr.catalog_path
+            canonical_table = resolved_gr.constraint_table
+            if canonical_table is not None and canonical_table.enabled:
+                # Canonical artifacts are loaded independently by every worker.
+                # The frontend strategy is only the request-routing marker that
+                # carries constraint_step/beam_suffix through the beam protocol.
+                self.constraint_strategy = ConstraintTableStrategy(canonical_table.path or "")
+                self.constraint_strategy.digest = canonical_table.artifact_digest
+                self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
+            elif effective_catalog_path is not None:
+                self.constraint_strategy = create_constraint_strategy(
+                    backend=effective_backend,
                     tokenizer=self.get_tokenizer(),
-                    vocab_size=vocab_size,
+                    catalog_path=effective_catalog_path,
                 )
-                self.constraint_strategy.digest = resource.digest
+                self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
+                if isinstance(self.constraint_strategy, TrieConstraintStrategy):
+                    self.catalog = self.constraint_strategy.catalog
+                elif isinstance(self.constraint_strategy, ConstraintTableStrategy):
+                    # Constraint Tables compile on the driver and are broadcast to
+                    # every worker before any beam-search step runs.  Failing here
+                    # is a hard startup error — never a silent fall back to Trie.
+                    model_config = self.llm_engine.model_config
+                    get_vocab_size = getattr(model_config, "get_vocab_size", None)
+                    vocab_size = (
+                        get_vocab_size() if callable(get_vocab_size) else model_config.vocab_size
+                    )
+                    resource = install_constraint_table(
+                        self.llm_engine,
+                        catalog_path=effective_catalog_path,
+                        tokenizer=self.get_tokenizer(),
+                        vocab_size=vocab_size,
+                    )
+                    self.constraint_strategy.digest = resource.digest
 
         if resolved_gr.beam_execution_mode is BeamExecutionMode.V1:
             from vllm_gr.utils.engine_lifecycle import acquire_frontend_startup_heap

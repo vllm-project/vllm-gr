@@ -162,6 +162,7 @@ class GRConfig:
     # chain consumes worker beam decisions).
     beam_engine_driven: bool | None = None
     beam_execution_mode: BeamExecutionMode = BeamExecutionMode.LEGACY
+    constrained_generation: bool | None = None
     # Exact logical B captured by the NPU Beam graph adapter. This is a graph
     # signature dimension, not a scheduler capacity: other B values do not use
     # the Beam FULL graph (native PIECEWISE/NONE dispatch remains available).
@@ -186,6 +187,7 @@ class GRConfig:
             validate_beam_online_batch_sizes,
             validate_beam_worker_decision,
             validate_catalog_path,
+            validate_constrained_generation,
             validate_constraint_backend,
             validate_enable_short_suffix_attention,
             validate_npu_decode_execution,
@@ -236,6 +238,11 @@ class GRConfig:
             validate_npu_decode_execution(self.npu_decode_execution),
         )
         object.__setattr__(self, "schema_version", validate_schema_version(self.schema_version))
+        object.__setattr__(
+            self,
+            "constrained_generation",
+            validate_constrained_generation(self.constrained_generation),
+        )
         if self.constraint_table is not None and not isinstance(
             self.constraint_table, ConstraintTableConfig
         ):
@@ -264,6 +271,16 @@ class GRConfig:
             and self.catalog_path is None
         ):
             raise ValueError("vllm-gr constraint_backend='constraint_table' requires catalog_path")
+        if self.constrained_generation is False and (
+            self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
+            or self.vocab_offset is not None
+            or self.vocab_slice_size is not None
+            or (self.constraint_table is not None and self.constraint_table.enabled)
+        ):
+            raise ValueError(
+                "constrained_generation=False cannot be combined with an enabled "
+                "constraint table or a configured vocabulary slice"
+            )
 
     @property
     def beam_graph_active(self) -> bool:
@@ -280,6 +297,7 @@ class GRConfig:
             or self.vocab_slice_size is not None
             or self.npu_decode_execution is not None
             or (self.constraint_table is not None and self.constraint_table.enabled)
+            or self.constrained_generation is not None
             or self.beam_worker_decision is not None
             or self.beam_engine_driven is not None
             or self.beam_execution_mode is not BeamExecutionMode.LEGACY

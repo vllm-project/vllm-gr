@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Any
 
 import regex as re
@@ -276,6 +277,11 @@ def main():
         ),
     )
     parser.add_argument(
+        "--no-constrained-generation",
+        action="store_true",
+        help="Run offline V1 over the full vocabulary; requires a compatible V1 config.",
+    )
+    parser.add_argument(
         "--beam-max-width",
         type=int,
         default=None,
@@ -347,10 +353,15 @@ def main():
             parser.error("Offline attention backend is selected by --vllm-gr-config")
         if args.max_concurrency is not None:
             parser.error("Use --batch-size 1/2/4 for offline V1 batching")
+        if args.no_constrained_generation:
+            try:
+                config = replace(config, constrained_generation=False)
+            except ValueError as exc:
+                parser.error(f"--no-constrained-generation conflicts with V1 config: {exc}")
         engine_kwargs = {
             "model": args.model,
             "trust_remote_code": True,
-            "vllm_gr_config": args.vllm_gr_config,
+            "vllm_gr_config": config,
             "async_scheduling": True,
             "enable_chunked_prefill": False,
             "max_model_len": 8192,

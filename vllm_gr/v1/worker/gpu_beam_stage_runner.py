@@ -9,6 +9,7 @@ so expanding storage capacity does not implicitly enable concurrent scratch use.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Condition, Lock
@@ -20,6 +21,11 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
+from vllm_gr.ops.cuda.unconstrained_topk import (
+    UnconstrainedTopKScratch,
+    allocate_unconstrained_topk_scratch,
+    unconstrained_topk_out,
+)
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     SUPPORTED_BEAM_BATCH_SIZES,
@@ -58,6 +64,7 @@ from vllm_gr.v1.worker.gr_inputs import (
 )
 
 METADATA_ABI = 1
+_UNCONSTRAINED_HEAD_LAYOUT_LOCK = Lock()
 CONTROL_CAPACITY = 2
 SUPPORTED_BATCH_SIZES = SUPPORTED_BEAM_BATCH_SIZES
 
@@ -241,6 +248,7 @@ class _StageExecutionHooks:
     """
 
     persistent_graph_install = True
+    supports_transposed_head = True
 
     def __init__(self, worker: Any):
         self.worker = worker
@@ -345,7 +353,7 @@ class _StageExecutionHooks:
                 )
             owner.graph = graph
         if should_replay_decode_graph(worker, owner.graph):
-            return worker.model.compute_logits(owner.graph.replay())
+            return owner._decode_logits(owner.graph.replay())
         else:
             return owner._forward()
 
@@ -373,6 +381,68 @@ def should_replay_decode_graph(worker: Any, graph: Any) -> bool:
     raise RuntimeError("Asynchronous scheduling graph mode requires successful startup capture")
 
 
+def _get_unconstrained_head_layout(
+    worker: Any,
+) -> tuple[torch.Tensor, torch.Event] | None:
+    """Cache a read-only, vocabulary-contiguous Qwen3 head for Decode."""
+    if os.environ.get("VLLM_GR_UNCONSTRAINED_HEAD_LAYOUT") != "transposed":
+        return None
+    if (
+        worker.parallel_config.tensor_parallel_size != 1
+        or worker.parallel_config.pipeline_parallel_size != 1
+        or getattr(worker, "lora_config", None) is not None
+        or getattr(worker.model_config, "quantization", None) is not None
+        or getattr(worker.model_config.hf_config, "architectures", None) != ["Qwen3ForCausalLM"]
+    ):
+        return None
+    from vllm import envs
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+        VocabParallelEmbedding,
+    )
+
+    model = worker.model
+    head = getattr(model, "lm_head", None)
+    processor = getattr(model, "logits_processor", None)
+    if (
+        envs.VLLM_BATCH_INVARIANT
+        or not isinstance(head, VocabParallelEmbedding)
+        or type(getattr(head, "quant_method", None)) is not UnquantizedEmbeddingMethod
+        or type(processor) is not LogitsProcessor
+        or processor.logits_as_input
+        or processor.soft_cap is not None
+        or processor.scale != 1.0
+        or getattr(head, "bias", None) is not None
+    ):
+        return None
+    weight = head.weight
+    if (
+        not weight.is_cuda
+        or not weight.is_contiguous()
+        or weight.ndim != 2
+        or weight.dtype not in (torch.bfloat16, torch.float16)
+        or weight.shape[0] != processor.org_vocab_size
+    ):
+        return None
+    source_key = (
+        id(weight),
+        weight.data_ptr(),
+        weight._version,
+        tuple(weight.shape),
+        weight.dtype,
+    )
+    with _UNCONSTRAINED_HEAD_LAYOUT_LOCK:
+        cached = getattr(worker, "_gr_unconstrained_head_layout", None)
+        if cached is not None and cached[0] == source_key:
+            return cached[1], cached[2]
+        transposed = weight.detach().T.contiguous()
+        ready = torch.Event()
+        ready.record(torch.cuda.current_stream(weight.device))
+        worker._gr_unconstrained_head_layout = (source_key, transposed, ready)
+        return transposed, ready
+
+
 class GPUBeamStageRunner:
     """One exclusive execution owner, using the existing session/state/workspace."""
 
@@ -381,7 +451,7 @@ class GPUBeamStageRunner:
         worker: Any,
         beam: BeamBatchSearchRunner,
         bindings: tuple[BeamRequestBinding, ...],
-        backend: CUDAConstraintBackend,
+        backend: CUDAConstraintBackend | None,
         hooks: _StageExecutionHooks | None = None,
     ):
         expected = tuple(range(len(bindings)))
@@ -432,6 +502,7 @@ class GPUBeamStageRunner:
         self.terminal_release_requested = False
         self.terminal_release_claimed = False
         self.execution_error: Exception | None = None
+        self.unconstrained_topk_scratch: UnconstrainedTopKScratch | None = None
         self.inputs: GRInputBuffers | None = None
         self.prepared: PreparedGRInputs | None = None
         self.final_output: GPUBeamFinalOutput
@@ -440,6 +511,20 @@ class GPUBeamStageRunner:
         self.logits: torch.Tensor | None = None
         batch_size = len(bindings)
         rows = batch_size * beam.state.beam_width
+        self._head_layout = (
+            _get_unconstrained_head_layout(worker)
+            if backend is None and self.hooks.supports_transposed_head
+            else None
+        )
+        self._head_logits = (
+            torch.empty(
+                (rows, self._head_layout[0].shape[1]),
+                dtype=self._head_layout[0].dtype,
+                device=beam.state.device,
+            )
+            if self._head_layout is not None
+            else None
+        )
         self.input_ids: torch.Tensor
         self.positions: torch.Tensor
         self.slots: torch.Tensor
@@ -460,7 +545,8 @@ class GPUBeamStageRunner:
         if self.closed:
             raise RuntimeError("GR session is closed")
         if (
-            not self.backend.is_ready
+            self.backend is not None
+            and not self.backend.is_ready
             or self.beam.workspace.execution_owner is not self
             or self.beam.session.context._gr_execution_owner is not self
         ):
@@ -600,7 +686,31 @@ class GPUBeamStageRunner:
         return graph
 
     def _forward(self) -> torch.Tensor:
-        return self.worker.model.compute_logits(self._forward_hidden(False))
+        return self._decode_logits(self._forward_hidden(False))
+
+    def _decode_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        logits = self._try_transposed_head_logits(hidden)
+        return logits if logits is not None else self.worker.model.compute_logits(hidden)
+
+    def _try_transposed_head_logits(self, hidden: torch.Tensor) -> torch.Tensor | None:
+        layout = self._head_layout
+        output = self._head_logits
+        if (
+            layout is None
+            or output is None
+            or hidden.ndim != 2
+            or not hidden.is_contiguous()
+            or hidden.device != output.device
+            or hidden.dtype != output.dtype
+            or hidden.shape[1] != layout[0].shape[0]
+            or hidden.shape[0] > output.shape[0]
+        ):
+            return None
+        transposed, ready = layout
+        torch.cuda.current_stream(hidden.device).wait_event(ready)
+        logits = output[: hidden.shape[0]]
+        torch.mm(hidden, transposed, out=logits)
+        return logits
 
     def _forward_hidden(self, capture: bool) -> torch.Tensor:
         return self.hooks.forward_hidden(
@@ -647,8 +757,6 @@ class GPUBeamStageRunner:
             ) from self.execution_error
         if grammar_output is not None or self.pending is None:
             raise RuntimeError("GR sample requires a pending dispatch and no grammar output")
-        if self.backend is None:
-            raise RuntimeError("GR sampling requires a bound constraint backend")
         execution, slot = self.pending
         terminal_payload = False
         for entry in execution.entries:
@@ -659,17 +767,40 @@ class GPUBeamStageRunner:
                 layout = BeamBatchExecutionView.from_stage_metadata(m)
                 rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
                 candidates = self.tokens[:rows], self.scores[:rows], self.valid[:rows]
-                self.backend.select_out_unchecked(
-                    self.logits,
-                    ConstraintMetadata(
-                        self.prefixes[:rows], self.temperatures[:rows], 0, m.beam_params.beam_width
-                    ),
-                    out_token_ids=candidates[0],
-                    out_logprobs=candidates[1],
-                    out_valid_mask=candidates[2],
-                    out_valid_counts=self.counts[:rows],
-                    device_step=self.constraint_steps,
-                )
+                if self.backend is not None:
+                    self.backend.select_out_unchecked(
+                        self.logits,
+                        ConstraintMetadata(
+                            self.prefixes[:rows],
+                            self.temperatures[:rows],
+                            0,
+                            m.beam_params.beam_width,
+                        ),
+                        out_token_ids=candidates[0],
+                        out_logprobs=candidates[1],
+                        out_valid_mask=candidates[2],
+                        out_valid_counts=self.counts[:rows],
+                        device_step=self.constraint_steps,
+                    )
+                else:
+                    logits = self.logits[:rows]
+                    if self.unconstrained_topk_scratch is None:
+                        self.unconstrained_topk_scratch = allocate_unconstrained_topk_scratch(
+                            batch_size=len(self.bindings) * self.beam.state.beam_width,
+                            vocab_size=int(logits.shape[-1]),
+                            top_k=m.beam_params.beam_width,
+                            device=logits.device,
+                        )
+                    unconstrained_topk_out(
+                        logits,
+                        self.temperatures[:rows],
+                        m.beam_params.beam_width,
+                        self.unconstrained_topk_scratch,
+                        candidates[0],
+                        candidates[1],
+                        candidates[2],
+                        self.counts[:rows],
+                    )
                 candidate_batch = BeamCandidateBatch(layout, *candidates)
                 if m.kind is GRStageKind.PREFILL:
                     self.beam.initialize_from_prefill(candidate_batch)
@@ -913,7 +1044,10 @@ def get_stage_runner(
             "persistent GR requires GPU V1 async, TP/PP/DP=1, FP16/BF16 and matching capacity"
         )
     backend = getattr(worker, "constraint_backend", None)
-    if not isinstance(backend, CUDAConstraintBackend):
+    # A GRConfig without the switch (or a partial config object) keeps the
+    # constrained default: only an explicit ``False`` selects full vocabulary.
+    unconstrained = getattr(cfg, "constrained_generation", None) is False
+    if not unconstrained and not isinstance(backend, CUDAConstraintBackend):
         raise ValueError("persistent GR requires a loaded canonical CUDA Constraint Table")
     if (
         existing is not None
@@ -924,13 +1058,13 @@ def get_stage_runner(
         raise ValueError(
             "Asynchronous scheduling captured constraint/model binding cannot change after startup"
         )
-    if (
+    if backend is not None and (
         not backend.is_ready
         or backend.info.table_metadata.vocab_size != worker.model_config.get_vocab_size()
         or any(table.device != worker.device for table in backend._tables())
     ):
         raise ValueError("constraint backend is not ready or its model/device binding differs")
-    if (
+    if backend is not None and (
         backend.info.max_rows
         < hooks_type.required_constraint_rows(len(m.request_ids), cfg.beam_max_width)
         or backend.info.max_top_k < cfg.beam_max_width

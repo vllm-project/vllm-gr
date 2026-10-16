@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unav
 
 
 @pytest.mark.parametrize("width", [1, 4, 128, 256])
-@pytest.mark.parametrize("n", [2, 3])
+@pytest.mark.parametrize("n", [2, 3, 4])
 def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, n):
     buffers = GRInputBuffers(width, 96, 16, "cuda")
     binding = SimpleNamespace(session_id="session-0", native_request_id="session-0")
@@ -61,12 +61,12 @@ def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, 
                 patch.setattr(BeamAttentionMetadataBuilder, name, forbidden)
             for name in ("item", "cpu", "tolist"):
                 patch.setattr(torch.Tensor, name, forbidden)
-            prepared = buffers.prepare_cpu(m, binding, block_ids=[[2 + step, 4]], slot=step)
+            prepared = buffers.prepare_cpu(m, binding, block_ids=[[2 + step, 4]], slot=step % 2)
             views = buffers.upload(prepared)
             built = BeamAttentionMetadataBuilder.build_async(
                 layout=prepared.layout,
                 views=views,
-                session=SimpleNamespace(context=SimpleNamespace(max_decode_steps=3)),
+                session=SimpleNamespace(context=SimpleNamespace(max_decode_steps=n)),
                 mask=torch.ones(width, device="cuda", dtype=torch.bool),
                 slots=torch.full((width,), -1, device="cuda", dtype=torch.int64),
                 block_size=16,
@@ -82,10 +82,11 @@ def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, 
             i * (step + 1) for i in range(width + 1)
         ]
         assert prepared.layout["positions"] == [17 + 2 * step] * width
+        assert built.prefix_seqlens_kv_cpu == [17 + step]
         if first is not None:
             assert built is not first
             assert built.prefix_block_table.data_ptr() == first.prefix_block_table.data_ptr()
-            assert first.prefix_seqlens_kv_cpu == [17]
+            assert first.prefix_seqlens_kv_cpu == [17 + step - 1]
         first = built
 
 

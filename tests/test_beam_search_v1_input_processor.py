@@ -379,6 +379,54 @@ def test_npu_request_accepts_matching_width_and_canonical_backend() -> None:
     assert request.beam_params.beam_width == 2
 
 
+def test_cuda_unconstrained_request_accepts_budget_beyond_table_depth() -> None:
+    canonical = _canonical_gr_config(enabled=False)
+    canonical["constrained_generation"] = False
+    canonical["beam"]["max_decode_steps"] = 4
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device="cuda")
+
+    request = _prepare_request(
+        engine, [1, 2], BeamSearchParams(beam_width=2, max_tokens=4, ignore_eos=True), online=True
+    )
+
+    assert request.beam_params.max_tokens == 4
+
+
+def test_cuda_constrained_request_rejects_budget_beyond_table_depth() -> None:
+    canonical = _canonical_gr_config()
+    canonical["beam"]["max_decode_steps"] = 4
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device="cuda")
+
+    with pytest.raises(BeamSearchRequestError, match="constraint_table_v1 depth"):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=4, ignore_eos=True),
+            online=True,
+        )
+
+    engine.submit_gr_session.assert_not_called()
+
+
+def test_npu_unconstrained_request_is_rejected_before_submission() -> None:
+    canonical = _canonical_gr_config(enabled=False, backend="npu")
+    canonical["constrained_generation"] = False
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.vllm_config.device_config = SimpleNamespace(device="npu")
+
+    with pytest.raises(BeamSearchRequestError, match="requires CUDA"):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+            online=True,
+        )
+
+    engine.submit_gr_session.assert_not_called()
+
+
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize(  # type: ignore[misc]
     "model_eos,end_token,ignore_eos,expected_stops",
