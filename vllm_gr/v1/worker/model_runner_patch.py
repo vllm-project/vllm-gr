@@ -84,6 +84,19 @@ def _runner_vocab_size(runner: object) -> int:
     return vocab_size
 
 
+def _bind_model_vocab_slice(runner: object, window: tuple[int, int] | None) -> None:
+    """Bind projection policy to this model, overriding legacy global slicing."""
+    model = getattr(runner, "model", None)
+    if model is None:
+        return
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    processors = tuple(module for module in model.modules() if isinstance(module, LogitsProcessor))
+    for processor in processors:
+        processor._gr_vocab_slice = window
+    runner._gr_vocab_slice_processors = processors
+
+
 def make_load_model_with_constraint_backend(original):
     """Load weights first, then atomically publish a ready canonical Backend."""
 
@@ -105,7 +118,14 @@ def make_load_model_with_constraint_backend(original):
 
         backend = None
         try:
-            if table_config is None or not table_config.enabled:
+            if table_config is None:
+                return result
+
+            # Every canonical model starts from full projection. Explicit None
+            # is essential: absence would fall back to process-global legacy
+            # slicing left by another engine. CUDA tables may override below.
+            _bind_model_vocab_slice(self, None)
+            if not table_config.enabled:
                 return result
 
             max_rows = gr_config.beam_max_width
@@ -114,7 +134,7 @@ def make_load_model_with_constraint_backend(original):
                     "canonical constraint_table.enabled=true requires "
                     "beam_max_width to be configured"
                 )
-            if max_rows > table_config.max_top_k:
+            if table_config.max_top_k is None or max_rows > table_config.max_top_k:
                 raise ValueError(
                     "beam_max_width must be <= constraint_table.max_top_k "
                     f"for canonical constraint sampling, got {max_rows} > "
@@ -144,9 +164,6 @@ def make_load_model_with_constraint_backend(original):
             # Backend, so requests never observe a partially initialized object.
             self.constraint_backend = backend
             if getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.CUDA:
-                # Import GPU layers only after selecting the CUDA backend.
-                from vllm.model_executor.layers.logits_processor import LogitsProcessor
-
                 window = backend.vocab_slice
                 if getattr(parallel, "tensor_parallel_size", 1) != 1:
                     # All ranks must retain the original full-logits collective path.
@@ -158,13 +175,7 @@ def make_load_model_with_constraint_backend(original):
                     )
                 if window == (0, _runner_vocab_size(self)):
                     window = None  # No benefit from cloning the entire LM head.
-                processors = tuple(
-                    module for module in self.model.modules() if isinstance(module, LogitsProcessor)
-                )
-                for processor in processors:
-                    # Explicit None also overrides unrelated legacy global settings.
-                    processor._gr_vocab_slice = window
-                self._gr_vocab_slice_processors = processors
+                _bind_model_vocab_slice(self, window)
             return result
         except BaseException:
             if backend is not None:

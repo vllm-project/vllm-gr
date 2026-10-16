@@ -58,8 +58,10 @@ def test_v1_requires_native_async() -> None:
         require_beam_execution_mode(config, BeamExecutionMode.LEGACY)
 
 
+@pytest.mark.parametrize("table_enabled", [True, False])
 def test_v1_npu_startup_routes_to_acl_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
+    table_enabled: bool,
 ) -> None:
     from vllm_gr.v1.worker import gr_startup, npu_model_runner_patch
 
@@ -81,7 +83,7 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
             beam_graph_enabled=True,
             beam_max_width=4,
             beam_worker_decision=True,
-            constraint_table=SimpleNamespace(enabled=True),
+            constraint_table=SimpleNamespace(enabled=table_enabled),
         ),
     )
 

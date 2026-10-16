@@ -2,6 +2,10 @@
 
 ## Status and scope
 
+The historical table contract below remains protocol 1. Full-vocabulary Beam
+requests extend it with protocol 2 and an explicit candidate source; see
+[Full-vocabulary Beam Search V1](unconstrained_beam_search.md#runtime-boundaries).
+
 This document defines protocol version 1 of the prospective Worker-owned Beam
 batch boundary and its pure NumPy CPU reference implementation. This change
 defines transport-safe data, validation, and the correct Beam selection result.

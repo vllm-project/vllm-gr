@@ -396,13 +396,14 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
 
     load = make_load_model_with_constraint_backend(weights)
     close = make_shutdown_with_constraint_backend()
-    a, b, full = _runner(), _runner(), _runner()
+    a, b, full, disabled = _runner(), _runner(), _runner(), _runner(enabled=False)
     old = get_vocab_slice_config()
     set_vocab_slice_config(99, 5)
     try:
         load(a)
         load(b)
         load(full)
+        load(disabled)  # No fourth Backend exists: disabled must not invoke the loader.
         head = torch.nn.Linear(8, 256, bias=False)
         head.quant_method = type(
             "UnquantizedEmbeddingMethod",
@@ -422,6 +423,8 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
         torch.testing.assert_close(a.model[0]._get_logits(hidden, head, None), expected[:, 3:8])
         torch.testing.assert_close(full.model[0]._get_logits(hidden, head, None), expected)
         assert full.model[0]._gr_vocab_slice is None
+        assert disabled.model[0]._gr_vocab_slice is None
+        torch.testing.assert_close(disabled.model[0]._get_logits(hidden, head, None), expected)
         assert get_vocab_slice_config()[:2] == (99, 5)
         close(a)
         assert backends[0].close_calls == backends[1].close_calls == 1
@@ -429,6 +432,7 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
         close(a)
         close(b)
         close(full)
+        close(disabled)
         set_vocab_slice_config(*old)
 
 

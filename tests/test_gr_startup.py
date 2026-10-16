@@ -80,13 +80,22 @@ def _capture(worker: SimpleNamespace, *, allow: bool = True) -> bool:
 
 
 @pytest.mark.parametrize("hooks_type", [stages._StageExecutionHooks, V2StageExecutionHooks])  # type: ignore[misc]
+@pytest.mark.parametrize("table_enabled", [True, False])
 def test_success_publishes_only_after_release_and_sync(
-    capture_runtime: CaptureRuntime, hooks_type: type[stages._StageExecutionHooks]
+    capture_runtime: CaptureRuntime,
+    hooks_type: type[stages._StageExecutionHooks],
+    table_enabled: bool,
 ) -> None:
     worker, owner, graph, stream, health = capture_runtime
+    worker._vllm_gr_config.constraint_table.enabled = table_enabled
     assert startup.capture_async_forward(worker, hooks_type=hooks_type)
     assert cast(Mock, stages.get_stage_runner).call_args.kwargs == {"hooks_type": hooks_type}
     decode = owner.prepare_cpu.call_args.args[0]
+    assert decode.beam_params.candidate_mode == (
+        "constraint_table" if table_enabled else "full_vocab"
+    )
+    assert decode.beam_params.constraint_resource_id == ("default" if table_enabled else None)
+    assert decode.beam_params.ignore_stop_tokens is table_enabled
     assert decode.kv_blocks == ((0,),)
     owner._bind_attention.assert_called_once_with(decode)
     assert not hasattr(worker, "requests")

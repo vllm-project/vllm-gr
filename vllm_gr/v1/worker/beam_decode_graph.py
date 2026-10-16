@@ -192,6 +192,11 @@ class BeamDecodeGraph:
         entry = self.wrapper.concrete_cudagraph_entries[self.descriptor]
         assert entry.cudagraph is not None
         entry.cudagraph.replay()
+        # Explicit V1/V2 stage replay bypasses the legacy execute-model
+        # dispatch counter. Keep the public graph diagnostic truthful here.
+        self.worker._beam_graph_full_dispatch_count = (
+            int(getattr(self.worker, "_beam_graph_full_dispatch_count", 0)) + 1
+        )
         return cast(torch.Tensor, entry.output)
 
     def model_forward(self, *args: Any, **kwargs: Any) -> Any:

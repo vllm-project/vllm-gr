@@ -281,6 +281,7 @@ def _request() -> BeamBatchRequest:
     return cast(
         BeamBatchRequest,
         SimpleNamespace(
+            protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
             batch_id="session-1",
             items=[SimpleNamespace(request=SimpleNamespace(data_parallel_rank=None))],
         ),

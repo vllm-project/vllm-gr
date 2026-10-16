@@ -151,7 +151,9 @@ def make_patched_handle_client_request(original):
                 request.batch_id,
                 error,
             )
-            send_gr_rejection(self, native_request, str(error))
+            send_gr_rejection(
+                self, native_request, str(error), protocol_version=request.protocol_version
+            )
             return None
         if request_type == EngineCoreRequestType.ADD:
             # Admission runs here, after the socket thread has queued ADD.

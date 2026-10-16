@@ -22,10 +22,13 @@ from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
     BeamBatchOutput,
+    BeamBatchParams,
     BeamBatchRequest,
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
+    beam_batch_protocol_version,
+    validate_beam_candidate_source,
 )
 from vllm_gr.v1.beam.beam_decision import run_beam_decision_candidates
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
@@ -46,6 +49,32 @@ from vllm_gr.v1.worker.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
+from vllm_gr.v1.worker.torch_beam_state import TorchBeamState, reorder_beam_kv
+
+
+def _validate_candidate_mode(worker: Any, metadata: Any) -> None:
+    params = metadata.beam_params
+    actual = getattr(params, "candidate_mode", "constraint_table")
+    if actual not in ("constraint_table", "full_vocab"):
+        raise ValueError(f"Unknown NPU Beam candidate_mode={actual!r}")
+    if isinstance(params, BeamBatchParams):
+        validate_beam_candidate_source(params)
+    session_init = getattr(metadata, "session_init", None)
+    if session_init is not None:
+        if session_init.beam_params != params:
+            raise ValueError("NPU session_init Beam parameters disagree with stage metadata")
+        if session_init.protocol_version != beam_batch_protocol_version(params):
+            raise ValueError("NPU session_init protocol version disagrees with candidate mode")
+    config = getattr(worker, "vllm_config", None)
+    if config is None:
+        return
+    from vllm_gr.config import GRConfig
+
+    expected = GRConfig.from_vllm_config(config).beam_candidate_mode
+    if actual != expected:
+        raise ValueError(
+            f"NPU Beam candidate_mode={actual!r} does not match engine candidate_mode={expected!r}"
+        )
 
 
 class NPUEagerBeamStageRunner:
@@ -66,6 +95,7 @@ class NPUEagerBeamStageRunner:
         self.decode_candidates: Any = None
         self.logits: torch.Tensor | None = None
         self.attention_batch: NPUBeamExecutionBatch | None = None
+        self.full_vocab_state: TorchBeamState | None = None
         self.closed = False
 
     def _metadata(self, scheduler_output: Any) -> Any:
@@ -153,8 +183,15 @@ class NPUEagerBeamStageRunner:
         self.attention_batch = NPUBeamExecutionBatch(execution, sessions)
         width = execution.beam_width
         candidates = self.prefill_candidates
-        initial_scores = candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf"))
-        context.decision.sequence[: execution.batch_size, :width, 0].copy_(candidates.token_ids)
+        full_vocab_state = getattr(self, "full_vocab_state", None)
+        if full_vocab_state is None:
+            initial_scores = candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf"))
+            context.decision.sequence[: execution.batch_size, :width, 0].copy_(candidates.token_ids)
+        else:
+            initial_scores = full_vocab_state.scores
+            context.decision.sequence[
+                : execution.batch_size, :width, : full_vocab_state.max_steps
+            ].copy_(full_vocab_state.sequences)
         context.decision.beam_scores[: execution.batch_size, :width].copy_(initial_scores)
         context.decision.worker_decode_steps = 1
         self.parent_history = torch.zeros_like(context.decision.sequence)
@@ -214,6 +251,12 @@ class NPUEagerBeamStageRunner:
         plan = NPUEagerStagePlan.from_scheduler_output(scheduler_output)
         self._validate_sequence(plan)
         metadata = self._metadata(scheduler_output)
+        _validate_candidate_mode(self.worker, metadata)
+        if (
+            getattr(self, "session_request", None) is not None
+            and self.session_request.beam_params != metadata.beam_params
+        ):
+            raise ValueError("NPU Beam parameters changed during a Batch Session")
         session_init = getattr(metadata, "session_init", None)
         if session_init is not None:
             if plan.execution.kind != "prefill" or self.session_request is not None:
@@ -349,6 +392,13 @@ class NPUEagerBeamStageRunner:
         plan = self.pending_plan
         if grammar_output is not None or plan is None or self.logits is None:
             raise RuntimeError("NPU GR sample requires one pending stage and no grammar")
+        stage_metadata = self._metadata(self.worker._current_scheduler_output)
+        if (
+            getattr(stage_metadata.beam_params, "candidate_mode", "constraint_table")
+            == "full_vocab"
+        ):
+            terminal_result = self._sample_full_vocab(plan, stage_metadata)
+            return self._publish_sample(plan, bool(stage_metadata.is_last_stage), terminal_result)
         metadata = ConstraintMetadata(
             prefix_token_ids=self._constraint_prefixes(plan),
             temperatures=torch.full(
@@ -372,7 +422,6 @@ class NPUEagerBeamStageRunner:
         )
         if tuple(candidates.token_ids.shape) != expected:
             raise RuntimeError("NPU constraint backend returned an invalid candidate shape")
-        stage_metadata = self._metadata(self.worker._current_scheduler_output)
         is_last = bool(stage_metadata.is_last_stage)
         terminal_result = None
         execution = plan.execution
@@ -411,6 +460,12 @@ class NPUEagerBeamStageRunner:
                     decision["out_log_probs"],
                     self.parent_history[:, : decision["out_sequence"].shape[1]],
                 )
+        return self._publish_sample(plan, is_last, terminal_result)
+
+    def _publish_sample(
+        self, plan: NPUEagerStagePlan, is_last: bool, terminal_result: BeamBatchResult | None
+    ) -> Any:
+        execution = plan.execution
         if is_last:
             if terminal_result is None:
                 raise RuntimeError("terminal NPU Beam stage produced no result")
@@ -443,6 +498,149 @@ class NPUEagerBeamStageRunner:
         self.worker.execute_model_state = None
         self.worker.kv_connector_output = None
         return output
+
+    def _sample_full_vocab(self, plan: NPUEagerStagePlan, metadata: Any) -> BeamBatchResult | None:
+        from vllm_gr.v1.worker.full_vocab import full_vocab_topk
+
+        execution = plan.execution
+        params = metadata.beam_params
+        assert self.logits is not None
+        model_config = self.worker.model_config
+        get_vocab_size = getattr(model_config, "get_vocab_size", None)
+        vocab_size = get_vocab_size() if callable(get_vocab_size) else model_config.vocab_size
+        if self.logits.shape[-1] != vocab_size:
+            raise RuntimeError(
+                "NPU full-vocabulary Beam requires complete model logits: "
+                f"received {self.logits.shape[-1]} columns, expected {vocab_size}"
+            )
+        candidates = full_vocab_topk(self.logits, 2 * execution.beam_width)
+        expected = (execution.num_execution_rows, 2 * execution.beam_width)
+        if tuple(candidates.token_ids.shape) != expected:
+            raise RuntimeError("NPU full-vocabulary selection returned an invalid candidate shape")
+        if execution.kind == "prefill":
+            if self.session_request is None:
+                raise RuntimeError("NPU full-vocabulary Prefill is missing session_init")
+            self.full_vocab_state = TorchBeamState(
+                beam_width=execution.beam_width,
+                max_steps=params.max_tokens,
+                prompt_lengths=execution.num_prompt_tokens_by_request,
+                stop_token_ids=params.stop_token_ids,
+                eos_token_id=params.stop_token_ids[0] if params.stop_token_ids else None,
+                length_penalty=params.length_penalty,
+                ignore_stop_tokens=params.ignore_stop_tokens,
+                device=self.logits.device,
+            )
+            self.prefill_candidates = candidates
+        state = self.full_vocab_state
+        if state is None:
+            raise RuntimeError("NPU full-vocabulary Decode is missing persistent Beam state")
+        state.advance(
+            candidates.token_ids,
+            candidates.logprobs,
+            candidates.valid_mask,
+            stage_index=execution.stage_index,
+        )
+        self.latest_token_ids = state.token_ids
+        if execution.kind == "prefill":
+            self.handoff = NPUEagerFirstDecodeHandoff.from_prefill(plan, state.token_ids)
+        else:
+            self.decode_candidates = candidates
+            if self.attention_batch is None:
+                raise RuntimeError("NPU full-vocabulary Decode has no attention batch")
+            context = self.attention_batch.context
+            context.decision.sequence[
+                : execution.batch_size, : execution.beam_width, : state.max_steps
+            ].copy_(state.sequences)
+            context.decision.beam_scores[: execution.batch_size, : execution.beam_width].copy_(
+                state.scores
+            )
+            context.decision.worker_decode_steps = execution.stage_index + 1
+            if not metadata.is_last_stage:
+                assert execution.decode_step is not None
+                reorder_beam_kv(
+                    context.pools, state.local_parents, decode_step=execution.decode_step
+                )
+                for session in self.attention_batch.sessions:
+                    session._state.decode_step += 1
+        if metadata.is_last_stage:
+            return self._build_full_vocab_terminal_result()
+        return None
+
+    def _build_full_vocab_terminal_result(self) -> BeamBatchResult:
+        request = self.session_request
+        state = self.full_vocab_state
+        if request is None or state is None or self.pending_plan is None:
+            raise RuntimeError("NPU full-vocabulary output is missing its session")
+        if (
+            tuple(item.request.request_id for item in request.items)
+            != self.pending_plan.execution.request_ids
+        ):
+            raise RuntimeError("terminal NPU Beam request order changed")
+        final = state.finalize()
+        batch, width, steps = final.sequences.shape
+        history_words, scalar_words = batch * width * steps, batch * width
+        packed = torch.cat(
+            (
+                final.sequences.reshape(-1),
+                final.parents.reshape(-1),
+                final.scores.contiguous().view(torch.int32).reshape(-1),
+                final.lengths.reshape(-1),
+                final.stopped.to(torch.int32).reshape(-1),
+                final.stop_token_ids.reshape(-1),
+            )
+        ).to("cpu")
+        sequences = packed[:history_words].view(batch, width, steps).tolist()
+        parents = packed[history_words : 2 * history_words].view(batch, width, steps).tolist()
+        offset = 2 * history_words
+        scores = (
+            packed[offset : offset + scalar_words].view(torch.float32).view(batch, width).tolist()
+        )
+        offset += scalar_words
+        lengths, stopped, stop_ids = (
+            packed[offset + index * scalar_words : offset + (index + 1) * scalar_words]
+            .view(batch, width)
+            .tolist()
+            for index in range(3)
+        )
+        options = request.output_options
+        outputs = []
+        for row, item in enumerate(request.items):
+            selected = []
+            for beam in range(width):
+                score = float(scores[row][beam])
+                if not math.isfinite(score):
+                    continue
+                is_stop = bool(stopped[row][beam])
+                length = int(lengths[row][beam])
+                count = length - int(is_stop and not options.include_stop_token)
+                selected.append(
+                    BeamOutputSequence(
+                        tuple(sequences[row][beam][:count]),
+                        score if options.include_cumulative_logprob else None,
+                        tuple(parents[row][beam][:length])
+                        if options.include_parent_beam_indices
+                        else (),
+                        "stop" if is_stop else "length",
+                        int(stop_ids[row][beam]) if is_stop else None,
+                    )
+                )
+                if len(selected) == options.num_return_sequences:
+                    break
+            if not selected:
+                return BeamBatchResult(
+                    request.protocol_version,
+                    request.batch_id,
+                    None,
+                    BeamBatchFailure(
+                        "no_valid_beams", "No valid final Beam candidates", item.item_index
+                    ),
+                )
+            outputs.append(
+                BeamRequestOutput(item.item_index, item.request.request_id, tuple(selected))
+            )
+        return BeamBatchResult(
+            request.protocol_version, request.batch_id, BeamBatchOutput(tuple(outputs)), None
+        )
 
     def _select_constraint_candidates(
         self,
@@ -600,7 +798,7 @@ class NPUEagerBeamStageRunner:
                 )
             if not selected:
                 return BeamBatchResult(
-                    BEAM_BATCH_PROTOCOL_VERSION,
+                    getattr(request, "protocol_version", BEAM_BATCH_PROTOCOL_VERSION),
                     request.batch_id,
                     None,
                     BeamBatchFailure(
@@ -617,7 +815,7 @@ class NPUEagerBeamStageRunner:
                 )
             )
         return BeamBatchResult(
-            BEAM_BATCH_PROTOCOL_VERSION,
+            getattr(request, "protocol_version", BEAM_BATCH_PROTOCOL_VERSION),
             request.batch_id,
             BeamBatchOutput(tuple(outputs)),
             None,
@@ -655,6 +853,8 @@ def get_npu_stage_runner(worker: Any, scheduler_output: Any) -> NPUEagerBeamStag
     from vllm_gr.config.execution import require_beam_execution_mode
 
     require_beam_execution_mode(worker.vllm_config, BeamExecutionMode.V1)
+    metadata = next(iter(getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR).values()))
+    _validate_candidate_mode(worker, metadata)
     existing = getattr(worker, "_gr_npu_stage_runner", None)
     if existing is not None and not existing.closed:
         return existing

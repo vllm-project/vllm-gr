@@ -32,6 +32,7 @@ from vllm_gr.ops.cuda.beam_state import (
     FINISH_LENGTH,
     FINISH_STOP,
     _pack_final_beams_kernel,
+    _rank_final_beams_kernel,
     _validate_step_kernel,
 )
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
@@ -61,6 +62,7 @@ def _runtime(
     batch=1,
     state_index=0,
     physical_steps=None,
+    candidate_width=None,
 ):
     context = BeamAttentionContext(
         batch, width, 1, physical_steps or steps, 8, 2, torch.device("cuda"), dtype
@@ -71,6 +73,7 @@ def _runtime(
         max_new_tokens=steps,
         stop_token_ids=stops,
         ignore_stop_tokens=ignore,
+        candidate_width=candidate_width,
     )
     slot = context.registry.allocate("s", width, 0)
     session = BeamSearchSession("s", slot, context)
@@ -79,7 +82,7 @@ def _runtime(
     workspace = BeamPostprocessWorkspace.allocate(
         max_batch=1,
         beam_width=width,
-        top_k=width,
+        top_k=width if candidate_width is None else candidate_width,
         max_decode_steps=physical_steps or steps,
         device="cuda",
         logits_dtype=dtype,
@@ -740,6 +743,99 @@ def test_width_boundaries_and_final_candidate_history(width):
         assert score == 0
         assert reason == FINISH_LENGTH
         assert tie == index
+
+
+@pytest.mark.parametrize("width", [1, 2, 128, 256])
+def test_full_vocab_candidate_width_boundaries_preserve_model_beam_width(width):
+    candidate_width = 2 * width
+    runner = _runtime(width=width, steps=3, candidate_width=candidate_width)
+    initial = _gpu(
+        np.arange(candidate_width, dtype=np.int32)[None] + 100,
+        np.zeros((1, candidate_width), dtype=np.float32),
+    )
+    tokens = np.arange(width * candidate_width, dtype=np.int32).reshape(width, candidate_width)
+    decode = _gpu(tokens + 1000, np.zeros(tokens.shape, dtype=np.float32))
+    runner.initialize_from_prefill(*initial)
+    runner.advance(*decode)
+    runner.advance(*decode)
+    state = runner.state
+    assert state.error_code.cpu().item() == 0
+    assert state.is_finished.cpu().item()
+    assert state.num_completed.cpu().item() == width * candidate_width
+    assert state.active_mask.shape == (1, width)
+    torch.testing.assert_close(
+        state.completed_token_ids[0, : width * candidate_width].cpu(),
+        torch.from_numpy((tokens + 1000).reshape(-1)),
+    )
+    torch.testing.assert_close(
+        state.completed_parent_ids[0, : width * candidate_width].cpu(),
+        torch.arange(width, dtype=torch.int32).repeat_interleave(candidate_width),
+    )
+
+
+@pytest.mark.parametrize("graph_mode", [False, True], ids=["eager", "graph"])
+def test_full_vocab_keeps_eos_outside_first_w_and_reorders_wide_candidate_parents(graph_mode):
+    runner = _runtime(width=2, steps=3, candidate_width=4, stops=(99,))
+    initial = _gpu([[10, 11, 99, 12]], [[-0.01, -0.02, -0.03, -0.04]])
+    decode = _gpu(
+        [[20, 99, 21, 22], [30, 31, 99, 32]], [[-2, -0.8, -3, -4], [-0.1, -0.2, -0.9, -0.3]]
+    )
+    final = _gpu([[40, 41, 42, 43], [50, 51, 52, 53]], [[-2, -3, -4, -5]] * 2)
+    runner.initialize_from_prefill(*initial)
+    if graph_mode:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            _write_kv(runner)
+            runner.advance(*decode)
+            runner.reset()
+            runner.initialize_from_prefill(*initial)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            _write_kv(runner)
+            runner.advance(*decode)
+        torch.cuda.current_stream().wait_stream(stream)
+        runner.reset()
+        runner.initialize_from_prefill(*initial)
+        graph.replay()
+    else:
+        _write_kv(runner)
+        runner.advance(*decode)
+    # Winners both came from parent one, whose flat candidate indices are 4/5.
+    # Dividing by W instead of K corrupts the parent/KV mapping here.
+    assert runner.state.parent_ids[0].cpu().tolist() == [1, 1]
+    assert runner.state.sequence[0, :, :2].cpu().tolist() == [[11, 30], [11, 31]]
+    for target, source in zip(decode, final):
+        target.copy_(source)
+    if graph_mode:
+        graph.replay()
+    else:
+        _write_kv(runner)
+        runner.advance(*decode)
+    state = runner.state
+    assert state.error_code.cpu().item() == 0
+    completed = _completed(state)
+    assert len(completed) == 11
+    assert [row[0] for row in completed[:3]] == [(99,), (10, 99), (11, 99)]
+    assert all(row[0][:2] in ((11, 30), (11, 31)) for row in completed[3:])
+    assert completed[0][1] == pytest.approx(-0.03)
+    # The saved prefill EOS can outrank every later continuation. Its length
+    # includes the prompt (which contains SID begin), but excludes EOS itself.
+    ranking = torch.empty_like(state.completed_scores[0])
+    _rank_final_beams_kernel[(triton.cdiv(state.completed_capacity, 256),)](
+        state.completed_scores[0],
+        state.completed_lengths[0],
+        state.completed_finish_reasons[0],
+        ranking,
+        CAPACITY=state.completed_capacity,
+        PROMPT_LENGTH=5,
+        MAX_TOKENS=3,
+        LENGTH_PENALTY=1.0,
+        BLOCK=256,
+    )
+    assert ranking.argmax().cpu().item() == 0
+    assert ranking[0].cpu().item() == pytest.approx(-0.03 * 8 / 5)
 
 
 def test_final_compaction_preserves_rank_and_parent_lineage():

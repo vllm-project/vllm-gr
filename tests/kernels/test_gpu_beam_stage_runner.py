@@ -15,7 +15,7 @@ import torch
 
 from tests.constraints.test_table import make_table
 from tests.test_gr_async_scheduler import _batch_request
-from vllm_gr.config import BeamExecutionMode
+from vllm_gr.config import BeamCandidateMode, BeamExecutionMode
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
@@ -213,6 +213,99 @@ def install_decode_model(
     worker._model_forward = lambda **kw: worker.model(
         input_ids=kw["input_ids"], positions=kw["positions"]
     )
+
+
+def full_vocab_metadata(stage=0, n=3, stop_token_ids=(4,)):
+    value = metadata(stage=stage, n=n)
+    return replace(
+        value,
+        beam_params=msgspec.structs.replace(
+            value.beam_params,
+            candidate_mode=BeamCandidateMode.FULL_VOCAB,
+            constraint_resource_id=None,
+            ignore_stop_tokens=False,
+            stop_token_ids=stop_token_ids,
+            temperature=0.0,
+        ),
+    )
+
+
+def full_vocab_admission_worker():
+    worker = admission_worker()
+    worker.constraint_backend.close()
+    worker.constraint_backend = None
+    worker._vllm_gr_config.beam_candidate_mode = BeamCandidateMode.FULL_VOCAB
+    worker.model_config.get_vocab_size = lambda: 8
+    workspace = BeamPostprocessWorkspace.allocate(
+        max_batch=4,
+        beam_width=4,
+        top_k=8,
+        max_decode_steps=3,
+        device=worker.device,
+        logits_dtype=torch.float16,
+    )
+    worker._beam_postprocess_workspaces = SimpleNamespace(require=Mock(return_value=workspace))
+    return worker
+
+
+def test_full_vocab_rebinds_startup_state_and_preserves_eos_completed_candidates():
+    worker = full_vocab_admission_worker()
+    dummy = full_vocab_metadata(n=1, stop_token_ids=())
+    owner = get_stage_runner(worker, dispatch(dummy))
+    old_state = owner.beam.state
+    addresses = owner.input_ids.data_ptr(), owner.execution_mask.data_ptr(), owner.tokens.data_ptr()
+    owner.previous = dummy
+    done = torch.Event()
+    done.record()
+    owner.release(owner.binding, consumer_done=done)
+
+    first = full_vocab_metadata()
+    rebound = get_stage_runner(worker, dispatch(first))
+    assert rebound is owner
+    assert owner.beam.state is not old_state
+    assert owner.beam.state.stop_token_ids_config == (4,)
+    assert owner.beam.state.candidate_width == 8
+    assert addresses == (
+        owner.input_ids.data_ptr(),
+        owner.execution_mask.data_ptr(),
+        owner.tokens.data_ptr(),
+    )
+    assert owner.input_ids.numel() == 4
+    owner.admit(dispatch(first))
+    owner.logits = torch.arange(8, 0, -1, dtype=torch.float16, device=worker.device).view(1, 8)
+    prefill = owner.sample().get_output()
+    assert not getattr(prefill, GR_WORKER_RESULT_ATTR)[first.session_id].finished
+    # EOS is rank W+1 in full vocabulary and must survive in the completed pool.
+    assert owner.beam.state.num_completed[0].item() == 1
+    assert owner.beam.state.completed_token_ids[0, 0].item() == 4
+    assert owner.beam.state.num_active_beams[0].item() == 4
+
+    owner.admit(dispatch(full_vocab_metadata(stage=1)))
+    owner.logits = torch.full((4, 8), float("-inf"), device=worker.device, dtype=torch.float16)
+    owner.logits[:, 4] = 0
+    output = owner.sample().get_output()
+    result = getattr(output, GR_WORKER_RESULT_ATTR)[first.session_id]
+    assert result.finished and result.terminal_result is not None
+    assert result.terminal_result.protocol_version == 2
+    assert owner.beam.state.num_completed[0].item() == 5
+    sequences = result.terminal_result.output.items[0].sequences
+    assert all(sequence.finish_reason == "stop" for sequence in sequences)
+    assert all(len(sequence.token_ids) <= 2 for sequence in sequences)
+    owner.release(owner.binding, consumer_done=owner.final_output.consumer_done(owner))
+
+
+def test_full_vocab_stage_rejects_sliced_logits_before_sampling():
+    worker = full_vocab_admission_worker()
+    stage = full_vocab_metadata(n=1)
+    owner = get_stage_runner(worker, dispatch(stage))
+    owner.admit(dispatch(stage))
+    owner.logits = torch.zeros((1, 6), dtype=torch.float16, device=worker.device)
+    with pytest.raises(ValueError, match="complete model logits"):
+        owner.sample()
+    assert owner.beam.state.num_generated_tokens[0].item() == 0
+    owner.logits = torch.zeros((1, 8), dtype=torch.float16, device=worker.device)
+    result = owner.sample().get_output()
+    assert getattr(result, GR_WORKER_RESULT_ATTR)[stage.session_id].finished
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

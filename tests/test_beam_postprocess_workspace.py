@@ -113,6 +113,27 @@ def test_workspace_pool_never_creates_a_bucket_on_require() -> None:
         pool.require(BeamPostprocessWorkspaceKey(8, 8, torch.float16))
 
 
+def test_full_vocab_workspace_has_512_candidates_but_256_model_rows() -> None:
+    workspace = BeamPostprocessWorkspace.allocate(
+        max_batch=2,
+        beam_width=256,
+        top_k=512,
+        max_decode_steps=3,
+        device="cpu",
+        logits_dtype=torch.float16,
+        pin_host=False,
+    )
+    from vllm_gr.ops.cuda.beam_state import BeamStateScratch
+
+    scratch = BeamStateScratch.allocate(2, 256, torch.device("cpu"), candidate_width=512)
+    assert scratch.selection_mask.shape == (2, 256, 512)
+    assert scratch.parent_scores.shape == (2, 256)
+    assert workspace.candidate_rows(workspace.topk_token_ids, 2).shape == (512, 512)
+    assert workspace.candidate_rows(workspace.topk_token_ids, 2, compact=True).shape == (2, 512)
+    assert workspace.selected_token_ids.shape == (2, 256)
+    assert workspace.topk_valid_counts.shape == (2, 256)
+
+
 @pytest.mark.parametrize(
     "kwargs,match",
     [

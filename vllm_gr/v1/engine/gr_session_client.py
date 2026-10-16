@@ -11,11 +11,13 @@ from typing import Any
 
 import msgspec
 
+from vllm_gr.config import BeamCandidateMode
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
     BeamBatchOutput,
     BeamBatchRequest,
     BeamBatchResult,
+    BeamContractError,
     BeamOutputSequence,
     BeamRequestOutput,
 )
@@ -69,10 +71,15 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
     # structs arrive as plain lists after a multiprocess round trip.
     # msgspec.convert trusts constructed Structs. Strip those wrappers before
     # typed conversion so inproc values receive the same nested validation.
-    if isinstance(result, BeamBatchResult):
-        result = _normalize_inproc_result(result)
-    elif isinstance(result, (list, tuple)):
-        result = msgspec.convert(result, type=BeamBatchResult)
+    try:
+        if isinstance(result, BeamBatchResult):
+            result = _normalize_inproc_result(result)
+        elif isinstance(result, (list, tuple)):
+            result = msgspec.convert(result, type=BeamBatchResult)
+    except msgspec.ValidationError as exc:
+        # Keep one public contract-error family across inproc and wire paths;
+        # msgspec.ValidationError itself is not a ValueError.
+        raise BeamContractError(f"malformed terminal Beam result: {exc}") from exc
     if isinstance(result, BeamBatchResult):
         # Typed conversion checks every nested field on both transports,
         # including nonnegative indices and finite cumulative scores.
@@ -83,7 +90,11 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
             raise ValueError("terminal Beam result requires exactly one output or failure")
         if result.batch_id != request.batch_id:
             raise ValueError("terminal Beam result belongs to a different session")
-        if result.failure is not None and result.failure.item_index not in (None, 0):
+        if (
+            result.failure is not None
+            and result.failure.item_index is not None
+            and result.failure.item_index not in {item.item_index for item in request.items}
+        ):
             raise ValueError("terminal Beam failure has an invalid item identity")
         if result.failure is not None and (
             not result.failure.code.strip() or not result.failure.message.strip()
@@ -97,6 +108,7 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
             width = request.beam_params.beam_width
             include_scores = options.include_cumulative_logprob
             include_parents = options.include_parent_beam_indices
+            full_vocab = request.beam_params.candidate_mode == BeamCandidateMode.FULL_VOCAB
             expected_sequence = (
                 "length",
                 budget,
@@ -114,6 +126,44 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
                     raise ValueError("terminal Beam result has an invalid sequence count")
                 for sequence in item.sequences:
                     parents = sequence.parent_beam_indices
+                    if full_vocab:
+                        generated_count = len(sequence.token_ids)
+                        if sequence.finish_reason == "stop":
+                            if request.beam_params.ignore_stop_tokens or (
+                                sequence.stop_token_id not in request.beam_params.stop_token_ids
+                            ):
+                                raise ValueError("terminal Beam result has an invalid stop token")
+                            if options.include_stop_token:
+                                if (
+                                    not sequence.token_ids
+                                    or sequence.token_ids[-1] != sequence.stop_token_id
+                                ):
+                                    raise ValueError(
+                                        "terminal Beam result must end with its included stop token"
+                                    )
+                            else:
+                                # Parent ancestry records generation steps,
+                                # including an EOS omitted from returned tokens.
+                                generated_count += 1
+                            if not 1 <= generated_count <= budget:
+                                raise ValueError(
+                                    "terminal Beam result violates the effective budget"
+                                )
+                        elif generated_count != budget or sequence.stop_token_id is not None:
+                            raise ValueError("terminal Beam result violates the effective budget")
+                        if include_scores != (sequence.cumulative_logprob is not None):
+                            raise ValueError(
+                                "terminal Beam score presence differs from requested options"
+                            )
+                        if not include_parents and parents:
+                            raise ValueError(
+                                "terminal Beam result contains unrequested parent indices"
+                            )
+                        if include_parents and (
+                            len(parents) != generated_count or max(parents) >= width
+                        ):
+                            raise ValueError("terminal Beam result has invalid parent indices")
+                        continue
                     # Compare the request-dependent shape together. Typed
                     # conversion above has already checked every field's type.
                     if (

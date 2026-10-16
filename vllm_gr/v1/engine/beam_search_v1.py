@@ -15,15 +15,16 @@ from typing import Any, Protocol, cast
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
+from vllm_gr.config import BeamCandidateMode, GRConfig
 from vllm_gr.v1.beam.batch_contracts import (
-    BEAM_BATCH_PROTOCOL_VERSION,
-    DEFAULT_CONSTRAINT_RESOURCE_ID,
     SUPPORTED_BEAM_BATCH_SIZES,
     BeamBatchParams,
     BeamBatchRequest,
     BeamBatchResult,
     BeamOutputOptions,
+    beam_batch_protocol_version,
     validate_beam_batch_request,
+    validate_beam_candidate_source,
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 
@@ -52,10 +53,23 @@ class GRResourceStatus(str, Enum):
 
 def _validate_gr_generation_params(params: BeamBatchParams) -> None:
     """Validate V1 generation semantics without constructing physical capacity."""
-    if params.ignore_stop_tokens is not True:
+    validate_beam_candidate_source(params)
+    if params.candidate_mode == BeamCandidateMode.FULL_VOCAB:
+        if (
+            params.temperature != 0
+            or params.ignore_stop_tokens is not False
+            or params.length_penalty != 1.0
+        ):
+            raise ValueError(
+                "full_vocab beam_search_v1 requires temperature=0, "
+                "ignore_eos=False and length_penalty=1"
+            )
+        if len(params.stop_token_ids) > 1:
+            raise ValueError("full_vocab supports only the tokenizer EOS stop token")
+    elif params.ignore_stop_tokens is not True:
         raise ValueError("beam_search_v1 requires ignore_eos=True")
     if params.catalog_strategy is not None:
-        raise ValueError("Constraint Table does not support catalog_strategy")
+        raise ValueError("beam_search_v1 does not support catalog_strategy")
     if (
         type(params.beam_width) is not int
         or not 1 <= params.beam_width <= 256
@@ -64,6 +78,17 @@ def _validate_gr_generation_params(params: BeamBatchParams) -> None:
     ):
         raise ValueError(
             "Asynchronous scheduling requires the startup beam width and effective N=1/2/3"
+        )
+
+
+def validate_gr_candidate_mode(params: BeamBatchParams, config: Any) -> None:
+    """Bind request/dispatch candidate semantics to the engine startup choice."""
+    validate_beam_candidate_source(params)
+    expected = GRConfig.from_vllm_config(config).beam_candidate_mode
+    if params.candidate_mode != expected:
+        raise ValueError(
+            f"Beam candidate_mode={params.candidate_mode!r} does not match "
+            f"engine candidate_mode={expected.value!r}"
         )
 
 
@@ -167,9 +192,11 @@ def validate_gr_device_config(config: Any) -> None:
         )
 
 
-def validate_gr_request(request: BeamBatchRequest) -> None:
+def validate_gr_request(request: BeamBatchRequest, config: Any = None) -> None:
     """Validate shared V1 semantics before native ADD or Worker allocation."""
     validate_beam_batch_request(request)
+    if config is not None:
+        validate_gr_candidate_mode(request.beam_params, config)
     if len(request.items) not in SUPPORTED_BEAM_BATCH_SIZES:
         raise ValueError(
             "beam_search_v1 supports batch sizes "
@@ -184,7 +211,17 @@ def validate_gr_request(request: BeamBatchRequest) -> None:
             raise ValueError("beam_search_v1 requires a nonempty token prompt")
         if native.mm_features or native.lora_request is not None:
             raise ValueError("beam_search_v1 does not support multimodal inputs or LoRA")
-        if params is None or params.ignore_eos is not True:
+        if params is None:
+            raise ValueError("beam_search_v1 requires sampling parameters")
+        if request.beam_params.candidate_mode == BeamCandidateMode.FULL_VOCAB:
+            if params.ignore_eos is not True or params.stop_token_ids:
+                raise ValueError(
+                    "full_vocab native accounting requires ignore_eos=True and no stop tokens; "
+                    "Worker Beam state owns EOS termination"
+                )
+            if params.temperature != request.beam_params.temperature:
+                raise ValueError("native and Beam temperature must match")
+        elif params.ignore_eos is not True:
             raise ValueError("beam_search_v1 requires ignore_eos=True")
         if params.max_tokens != request.beam_params.max_tokens or params.n != 1:
             raise ValueError("native and Beam generation budgets must match and n must be 1")
@@ -522,9 +559,8 @@ def validate_dispatch(
             or params.max_tokens not in (1, 2, 3)
             or not math.isfinite(params.temperature)
             or params.temperature < 0
-            or params.constraint_resource_id != DEFAULT_CONSTRAINT_RESOURCE_ID
         ):
-            raise ValueError("GR requires fixed W<=256, effective N=1/2/3 and Constraint Table")
+            raise ValueError("GR requires fixed W<=256 and effective N=1/2/3")
         if not 0 <= m.stage_index < params.max_tokens:
             raise ValueError("GR logical stage exceeds generation budget")
         if m.output_device_state != GRDeviceStateRef(key, m.stage_index):
@@ -549,7 +585,7 @@ def validate_dispatch(
             validate_gr_request(request)
             if (
                 m.kind is not GRStageKind.PREFILL
-                or request.protocol_version != BEAM_BATCH_PROTOCOL_VERSION
+                or request.protocol_version != beam_batch_protocol_version(params)
                 or len(request.items) != view.batch_size
                 or request.batch_id != key
                 or tuple(item.item_index for item in request.items) != tuple(range(view.batch_size))
@@ -600,6 +636,7 @@ __all__ = [
     "GRStageMetadata",
     "GRWorkerResult",
     "validate_dispatch",
+    "validate_gr_candidate_mode",
     "validate_gr_device_config",
     "validate_gr_execution_config",
     "validate_gr_execution_runtime",

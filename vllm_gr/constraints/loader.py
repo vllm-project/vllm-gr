@@ -520,7 +520,12 @@ def load_constraint_backend(
         dtype=dtype,
         max_rows=max_rows,
     )
-    if config.path is None or config.artifact_digest is None or config.tokenizer_digest is None:
+    if (
+        config.path is None
+        or config.artifact_digest is None
+        or config.tokenizer_digest is None
+        or config.max_top_k is None
+    ):
         raise ValueError("enabled constraint table configuration is incomplete")
 
     op: NPUConstraintOp | None = None

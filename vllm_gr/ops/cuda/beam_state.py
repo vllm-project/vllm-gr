@@ -59,11 +59,19 @@ class BeamStateScratch:
     next_completed: torch.Tensor
 
     @classmethod
-    def allocate(cls, batch: int, width: int, device: torch.device) -> BeamStateScratch:
+    def allocate(
+        cls,
+        batch: int,
+        width: int,
+        device: torch.device,
+        *,
+        candidate_width: int | None = None,
+    ) -> BeamStateScratch:
         def empty(shape: tuple[int, ...], dtype: torch.dtype = torch.int32) -> torch.Tensor:
             return torch.empty(shape, dtype=dtype, device=device)
 
-        rows, candidates = (batch, width), (batch, width, width)
+        candidate_width = width if candidate_width is None else candidate_width
+        rows, candidates = (batch, width), (batch, width, candidate_width)
         return cls(
             empty(rows, torch.float32),
             empty(candidates, torch.bool),

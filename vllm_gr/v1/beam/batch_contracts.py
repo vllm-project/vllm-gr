@@ -19,9 +19,12 @@ import msgspec
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_gr.config import MAX_BEAM_WIDTH
+from vllm_gr.config import MAX_BEAM_WIDTH, BeamCandidateMode
 
 BEAM_BATCH_PROTOCOL_VERSION = 1
+# Preserve the existing constrained wire contract. Full-vocabulary requests
+# opt into version 2 so an older process rejects their new generation semantics.
+FULL_VOCAB_BEAM_BATCH_PROTOCOL_VERSION = 2
 SUPPORTED_BEAM_BATCH_SIZES = (1, 2, 4)
 DEFAULT_CONSTRAINT_RESOURCE_ID = "default"
 # Terminal failure code for a request the engine refused before the session
@@ -62,9 +65,34 @@ class BeamBatchParams(
     temperature: float
     stop_token_ids: tuple[int, ...]
     ignore_stop_tokens: bool
-    constraint_resource_id: str = DEFAULT_CONSTRAINT_RESOURCE_ID
+    constraint_resource_id: str | None = DEFAULT_CONSTRAINT_RESOURCE_ID
     length_penalty: float = 1.0
     catalog_strategy: Literal["fill", "null"] | None = None
+    candidate_mode: BeamCandidateMode = BeamCandidateMode.CONSTRAINT_TABLE
+
+
+def beam_batch_protocol_version(params: BeamBatchParams) -> int:
+    """Return the wire version required by this engine-selected candidate source."""
+    if params.candidate_mode == BeamCandidateMode.FULL_VOCAB:
+        return FULL_VOCAB_BEAM_BATCH_PROTOCOL_VERSION
+    if params.candidate_mode == BeamCandidateMode.CONSTRAINT_TABLE:
+        return BEAM_BATCH_PROTOCOL_VERSION
+    raise BeamContractError(f"unsupported Beam candidate_mode {params.candidate_mode!r}")
+
+
+def validate_beam_candidate_source(params: BeamBatchParams) -> None:
+    """Reject ambiguous candidate mode/resource combinations at every boundary."""
+    beam_batch_protocol_version(params)
+    expected = (
+        None
+        if params.candidate_mode == BeamCandidateMode.FULL_VOCAB
+        else DEFAULT_CONSTRAINT_RESOURCE_ID
+    )
+    if params.constraint_resource_id != expected:
+        raise BeamContractError(
+            f"Beam candidate_mode={params.candidate_mode!r} requires "
+            f"constraint_resource_id={expected!r}"
+        )
 
 
 class BeamOutputOptions(
@@ -185,7 +213,9 @@ class BeamBatchResult(
     failure: BeamBatchFailure | None
 
 
-def admission_rejected(batch_id: str, message: str) -> BeamBatchResult:
+def admission_rejected(
+    batch_id: str, message: str, *, protocol_version: int = BEAM_BATCH_PROTOCOL_VERSION
+) -> BeamBatchResult:
     """The terminal result for a session the engine refused before starting.
 
     Admission rejects a request on its own contents -- the caller's answer to
@@ -194,7 +224,7 @@ def admission_rejected(batch_id: str, message: str) -> BeamBatchResult:
     apart at the frontend.
     """
     return BeamBatchResult(
-        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+        protocol_version=protocol_version,
         batch_id=batch_id,
         output=None,
         failure=BeamBatchFailure(ADMISSION_REJECTED_CODE, message, None),
@@ -242,7 +272,7 @@ class BeamBatchLimits:
     max_num_beam_rows: int
     max_num_batched_tokens: int
     max_model_len: int
-    supported_constraint_resource_ids: tuple[str, ...]
+    supported_constraint_resource_ids: tuple[str | None, ...]
 
 
 def _fail(message: str) -> NoReturn:
@@ -278,8 +308,20 @@ def _bool(name: str, value: object) -> bool:
 
 
 def _protocol_version(value: object) -> None:
-    if not _is_int(value) or value != BEAM_BATCH_PROTOCOL_VERSION:
-        _fail(f"protocol_version must equal {BEAM_BATCH_PROTOCOL_VERSION}, got {value!r}")
+    if not _is_int(value) or value not in (
+        BEAM_BATCH_PROTOCOL_VERSION,
+        FULL_VOCAB_BEAM_BATCH_PROTOCOL_VERSION,
+    ):
+        _fail(f"protocol_version must equal 1 or 2, got {value!r}")
+
+
+def _candidate_protocol_version(version: int, params: BeamBatchParams) -> None:
+    expected = beam_batch_protocol_version(params)
+    if version != expected:
+        _fail(
+            f"protocol_version must equal {expected} for "
+            f"candidate_mode={params.candidate_mode!r}, got {version!r}"
+        )
 
 
 def _validate_beam_params(params: BeamBatchParams) -> None:
@@ -314,11 +356,7 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
         if normalized in seen_stop_ids:
             _fail("beam_params.stop_token_ids must be unique")
         seen_stop_ids.add(normalized)
-    if params.constraint_resource_id != DEFAULT_CONSTRAINT_RESOURCE_ID:
-        _fail(
-            "Beam batch protocol version 1 only admits "
-            f"constraint_resource_id={DEFAULT_CONSTRAINT_RESOURCE_ID!r}"
-        )
+    validate_beam_candidate_source(params)
 
 
 def _validate_output_options(options: BeamOutputOptions, *, beam_width: int) -> None:
@@ -351,6 +389,7 @@ def validate_beam_batch_request(request: BeamBatchRequest) -> None:
     _protocol_version(request.protocol_version)
     _non_empty_string("batch_id", request.batch_id)
     _validate_beam_params(request.beam_params)
+    _candidate_protocol_version(request.protocol_version, request.beam_params)
     _validate_output_options(
         request.output_options,
         beam_width=request.beam_params.beam_width,
@@ -398,9 +437,13 @@ def validate_beam_batch_limits(limits: BeamBatchLimits) -> None:
         _fail(f"limits.max_beam_width must be <= {MAX_BEAM_WIDTH}, got {limits.max_beam_width}")
     if not limits.supported_constraint_resource_ids:
         _fail("limits.supported_constraint_resource_ids must not be empty")
-    resource_ids: set[str] = set()
+    resource_ids: set[str | None] = set()
     for resource_id in limits.supported_constraint_resource_ids:
-        normalized = _non_empty_string("supported_constraint_resource_id", resource_id)
+        normalized = (
+            None
+            if resource_id is None
+            else _non_empty_string("supported_constraint_resource_id", resource_id)
+        )
         if normalized in resource_ids:
             _fail("limits.supported_constraint_resource_ids must be unique")
         resource_ids.add(normalized)
@@ -464,6 +507,7 @@ def validate_beam_batch_plan(
     _protocol_version(plan.protocol_version)
     _non_empty_string("batch_id", plan.batch_id)
     _validate_beam_params(plan.beam_params)
+    _candidate_protocol_version(plan.protocol_version, plan.beam_params)
     _validate_output_options(
         plan.output_options,
         beam_width=plan.beam_params.beam_width,
@@ -710,6 +754,7 @@ def validate_beam_batch_result(
 
 __all__ = [
     "BEAM_BATCH_PROTOCOL_VERSION",
+    "FULL_VOCAB_BEAM_BATCH_PROTOCOL_VERSION",
     "DEFAULT_CONSTRAINT_RESOURCE_ID",
     "SUPPORTED_BEAM_BATCH_SIZES",
     "BeamBatchFailure",
@@ -725,6 +770,8 @@ __all__ = [
     "BeamOutputSequence",
     "BeamPrefillData",
     "BeamRequestOutput",
+    "beam_batch_protocol_version",
+    "validate_beam_candidate_source",
     "validate_beam_batch_limits",
     "validate_beam_batch_plan",
     "validate_beam_batch_plan_limits",

@@ -104,7 +104,7 @@ def initialize_beam_postprocess_workspaces(
     if device.type != "cuda":
         return None
 
-    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.config import BeamCandidateMode, BeamExecutionMode
     from vllm_gr.v1.beam.beam_decision import (
         BeamPostprocessWorkspace,
         BeamPostprocessWorkspaceKey,
@@ -130,7 +130,14 @@ def initialize_beam_postprocess_workspaces(
             f"CUDA Beam postprocess workspace requires model_config.dtype, got {dtype!r}"
         )
 
-    key = BeamPostprocessWorkspaceKey(int(width), int(width), dtype)
+    candidate_width = int(width) * (
+        2
+        if gr_cfg.beam_execution_mode is BeamExecutionMode.V1
+        and getattr(gr_cfg, "beam_candidate_mode", BeamCandidateMode.CONSTRAINT_TABLE)
+        == BeamCandidateMode.FULL_VOCAB
+        else 1
+    )
+    key = BeamPostprocessWorkspaceKey(int(width), candidate_width, dtype)
     existing = getattr(runner, "_beam_postprocess_workspaces", None)
     if existing is not None:
         workspace = existing.require(key)
@@ -146,7 +153,7 @@ def initialize_beam_postprocess_workspaces(
     workspace = BeamPostprocessWorkspace.allocate(
         max_batch=resolved_max_batch,
         beam_width=int(width),
-        top_k=int(width),
+        top_k=candidate_width,
         max_decode_steps=int(gr_cfg.beam_max_decode_steps),
         device=device,
         logits_dtype=dtype,
@@ -160,7 +167,7 @@ def initialize_beam_postprocess_workspaces(
         "(batch=%d, width=%d, top_k=%d, dtype=%s, device_bytes=%d, pinned_bytes=%d)",
         resolved_max_batch,
         width,
-        width,
+        candidate_width,
         dtype,
         workspace.device_memory_bytes,
         workspace.pinned_memory_bytes,

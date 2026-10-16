@@ -14,6 +14,7 @@ from vllm.v1.engine import EngineCoreRequest
 
 import vllm_gr.v1.beam as beam_package
 import vllm_gr.v1.beam.batch_contracts as contracts
+from vllm_gr.config import BeamCandidateMode
 from vllm_gr.v1.beam.batch_codec import BeamBatchCodec, BeamBatchCodecError
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
@@ -30,6 +31,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputSequence,
     BeamPrefillData,
     BeamRequestOutput,
+    beam_batch_protocol_version,
     validate_beam_batch_limits,
     validate_beam_batch_plan,
     validate_beam_batch_plan_limits,
@@ -207,6 +209,63 @@ def test_request_plan_and_result_validate_in_context() -> None:
     validate_beam_batch_result(result, expected_plan=plan)
 
 
+def test_full_vocab_wire_round_trip_preserves_mode_and_absent_resource() -> None:
+    params = _params(
+        temperature=0.0,
+        candidate_mode=BeamCandidateMode.FULL_VOCAB,
+        constraint_resource_id=None,
+    )
+    request = _request(protocol_version=beam_batch_protocol_version(params), beam_params=params)
+    codec = BeamBatchCodec()
+    decoded = codec.decode_request(codec.encode_request(request))
+    assert decoded.protocol_version == 2
+    assert decoded.beam_params == params
+    assert decoded.beam_params.candidate_mode is BeamCandidateMode.FULL_VOCAB
+    plan = _plan(decoded)
+    decoded_plan = codec.decode_plan(codec.encode_plan(plan))
+    validate_beam_batch_plan(decoded_plan, expected_request=decoded)
+    result = _success(plan)
+    validate_beam_batch_result(codec.decode_result(codec.encode_result(result)), expected_plan=plan)
+    validate_beam_batch_request_limits(
+        decoded, _limits(supported_constraint_resource_ids=(None,)), max_num_seqs=4
+    )
+    with pytest.raises(BeamContractError, match="not supported by this runtime"):
+        validate_beam_batch_request_limits(decoded, _limits(), max_num_seqs=4)
+
+
+def test_previous_beam_params_wire_defaults_to_constraint_table() -> None:
+    # v1 messages from before candidate_mode was appended have eight fields.
+    raw = msgspec.msgpack.encode([2, 3, 0.0, [2], True, "default", 1.0, None])
+    params = msgspec.msgpack.decode(raw, type=BeamBatchParams)
+    assert params.candidate_mode is BeamCandidateMode.CONSTRAINT_TABLE
+    assert params.constraint_resource_id == "default"
+    assert beam_batch_protocol_version(params) == BEAM_BATCH_PROTOCOL_VERSION
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "mode,resource_id",
+    [("full_vocab", "default"), ("constraint_table", None), ("unknown", None)],
+)
+def test_candidate_source_rejects_conflicting_mode_and_resource(
+    mode: str, resource_id: str | None
+) -> None:
+    params = _params(candidate_mode=mode, constraint_resource_id=resource_id)
+    with pytest.raises(BeamContractError, match="candidate_mode"):
+        validate_beam_batch_request(_request(beam_params=params))
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "mode,resource_id,version",
+    [("full_vocab", None, 1), ("constraint_table", "default", 2)],
+)
+def test_candidate_source_requires_its_wire_version(
+    mode: str, resource_id: str | None, version: int
+) -> None:
+    params = _params(candidate_mode=mode, constraint_resource_id=resource_id)
+    with pytest.raises(BeamContractError, match="protocol_version"):
+        validate_beam_batch_request(_request(protocol_version=version, beam_params=params))
+
+
 def test_request_uses_engine_request_identity_and_beam_params_authority() -> None:
     request = _request()
     assert request.items[0].request.sampling_params.max_tokens == 99
@@ -239,7 +298,7 @@ def test_request_positive_geometry_is_fail_closed(bad_value: object) -> None:
 def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() -> None:
     with pytest.raises(BeamContractError, match="unique"):
         validate_beam_batch_request(_request(beam_params=_params(stop_token_ids=(2, 2))))
-    with pytest.raises(BeamContractError, match="only admits"):
+    with pytest.raises(BeamContractError, match="constraint_resource_id"):
         validate_beam_batch_request(
             _request(beam_params=_params(constraint_resource_id="catalog-a"))
         )

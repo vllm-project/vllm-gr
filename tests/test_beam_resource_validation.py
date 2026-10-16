@@ -56,6 +56,18 @@ def _full(context: Any, workspace: Any) -> Any:
     )
 
 
+def test_explicit_candidate_width_preserves_active_beam_resource_geometry() -> None:
+    context, workspace = _resources()
+    workspace.key.top_k = 8
+    workspace.topk_token_ids = torch.empty(1, 4, 8, dtype=torch.int32)
+    Runner.validate_resources(
+        context, workspace, beam_width=4, max_new_tokens=3, kv_slot=0, candidate_width=8
+    )
+    # A mode change must not reuse the validation cache for the other geometry.
+    with pytest.raises(ValueError, match="geometry"):
+        _validate(context, workspace)
+
+
 PATHS = [
     "context.pools.0.unshared_key",
     "context.pools.0.unshared_value",

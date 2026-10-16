@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.config import BeamCandidateMode
 from vllm_gr.v1.beam.batch_contracts import BeamBatchParams, BeamOutputOptions
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
@@ -43,13 +44,10 @@ def capture_async_forward(
 
     cfg = _get_gr_config(worker)
     validate_gr_execution_runtime(worker.vllm_config)
-    if (
-        not cfg.beam_worker_decision
-        or cfg.beam_max_width is None
-        or cfg.constraint_table is None
-        or not cfg.constraint_table.enabled
-    ):
-        raise ValueError("Beam V1 requires worker decisions, fixed width and a canonical table")
+    if not cfg.beam_worker_decision or cfg.beam_max_width is None or cfg.constraint_table is None:
+        raise ValueError(
+            "Beam V1 requires worker decisions, fixed width and canonical configuration"
+        )
     device_type = str(worker.device).split(":")[0]
     if worker.model_config.enforce_eager or not cfg.beam_graph_enabled:
         return False
@@ -79,6 +77,7 @@ def capture_async_forward(
         raise RuntimeError("Asynchronous scheduling startup capture requires drained Beam sessions")
     worker._beam_sessions = sessions
     name = "__async_scheduling_startup_capture__"
+    full_vocab = not cfg.constraint_table.enabled
     m = GRStageMetadata(
         session_id=name,
         dispatch_id=0,
@@ -88,7 +87,17 @@ def capture_async_forward(
         is_last_stage=True,
         input_device_state=None,
         output_device_state=GRDeviceStateRef(name, 0),
-        beam_params=BeamBatchParams(width, 1, 0.0, (), True),
+        beam_params=BeamBatchParams(
+            width,
+            1,
+            0.0,
+            (),
+            not full_vocab,
+            constraint_resource_id=None if full_vocab else "default",
+            candidate_mode=(
+                BeamCandidateMode.FULL_VOCAB if full_vocab else BeamCandidateMode.CONSTRAINT_TABLE
+            ),
+        ),
         output_options=BeamOutputOptions(width, True, True, True),
         num_prompt_tokens=1,
         request_ids=(name,),

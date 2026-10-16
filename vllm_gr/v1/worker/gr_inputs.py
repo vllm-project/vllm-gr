@@ -193,9 +193,8 @@ def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
     owner.execution_mask.copy_(flat_mask)
     owner.input_ids.copy_(torch.where(flat_mask, state.input_ids[rows].reshape(-1), 0))
     owner.positions.copy_(torch.where(flat_mask, owner.device_positions, 0))
-    owner.beam.session.context.decode_step_buf.copy_(
-        torch.where(running.all(), step, -1).reshape(1)
-    )
+    has_running = running.any()
+    owner.beam.session.context.decode_step_buf.copy_(torch.where(has_running, step, -1).reshape(1))
     owner.prefixes.fill_(-1)
     columns = min(step + 1, owner.prefixes.shape[1], state.sequence.shape[2])
     owner.prefixes[:, :columns].copy_(
@@ -205,7 +204,12 @@ def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
             -1,
         )
     )
-    lengths = torch.where(running, step + 1, 1).repeat_interleave(state.beam_width)
+    # The shared suffix-copy kernel packs every physical row with one common
+    # extent (beam * extent + position). Finished members remain in that fixed
+    # layout and their execution mask writes zeros; shrinking only their FA
+    # lengths would shift all later members away from their actual KV rows.
+    # Only an entirely inactive batch uses the one-row zero suffix fallback.
+    lengths = torch.where(has_running, step + 1, 1).expand(flat_mask.numel())
     owner.metadata.suffix_seqlens_kv_device.copy_(lengths)
     owner.metadata.suffix_cu_seqlens_k_device[0].zero_()
     torch.cumsum(

@@ -17,7 +17,7 @@ from vllm_gr.config.models import MAX_BEAM_WIDTH
 
 
 LOCAL_TILE_SIZE = 256
-MAX_CANDIDATE_WIDTH = 256
+MAX_CANDIDATE_WIDTH = 512
 MAX_REQUESTS = 48
 
 
@@ -371,6 +371,7 @@ def _beam_result_pack_kernel(
 @triton.jit(
     do_not_specialize=[
         "beam_width",
+        "candidate_width",
         "scratch_stride",
     ]
 )
@@ -383,6 +384,7 @@ def _group_beam_outputs_kernel(
     out_scores,
     out_grouped_flat_indices,
     beam_width,
+    candidate_width,
     scratch_stride,
     WRITE_FLAT_INDICES: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -391,8 +393,8 @@ def _group_beam_outputs_kernel(
     rank = tl.arange(0, BLOCK)
     selected_offset = request * scratch_stride + rank
     flat = tl.load(selected_flat_indices + selected_offset, mask=rank < beam_width, other=-1)
-    valid = (rank < beam_width) & (flat >= 0) & (flat < beam_width * beam_width)
-    parent = flat // beam_width
+    valid = (rank < beam_width) & (flat >= 0) & (flat < beam_width * candidate_width)
+    parent = flat // candidate_width
 
     group_key = (parent.to(tl.int64) << 32) | rank.to(tl.int64)
     group_key = tl.where(valid, group_key, 0x7FFFFFFFFFFFFFFF)
@@ -406,14 +408,14 @@ def _group_beam_outputs_kernel(
         other=-1,
     )
     grouped_valid = grouped_valid & (grouped_flat >= 0)
-    grouped_parent = grouped_flat // beam_width
+    grouped_parent = grouped_flat // candidate_width
     grouped_score = tl.load(
         selected_scores + request * scratch_stride + safe_rank,
         mask=grouped_valid,
         other=-float("inf"),
     )
     token = tl.load(
-        top_tokens + request * beam_width * beam_width + grouped_flat,
+        top_tokens + request * beam_width * candidate_width + grouped_flat,
         mask=grouped_valid,
         other=0,
     )
@@ -1254,6 +1256,7 @@ def beam_search_group_cuda_out(
         out_scores,
         (out_grouped_flat_indices if out_grouped_flat_indices is not None else out_parent_indices),
         beam_width,
+        candidate_width,
         scratch_stride,
         WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
         BLOCK=block,

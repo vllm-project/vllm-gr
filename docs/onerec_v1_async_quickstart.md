@@ -5,6 +5,9 @@ with OneRec-1.7B. One offline request exercises Prefill, asynchronous Decode,
 GPU Beam decisions, and the CUDA Constraint Table. Keep the values in this
 guide unchanged for the first run.
 
+For the official full-vocabulary recommendation profile without a catalog or
+SID vocabulary mask, use [Full-vocabulary Beam Search V1](unconstrained_beam_search.md).
+
 > The V1 reproduction entry point is offline `GRLLM.beam_search_v1()`.
 > The `vllm-gr serve` and OpenAI Chat API examples are separate online and
 > compatibility paths. Do not add the V1 configuration from this guide to

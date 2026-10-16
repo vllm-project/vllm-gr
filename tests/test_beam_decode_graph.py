@@ -44,6 +44,25 @@ def test_context_replacement_fails_before_graph_launch() -> None:
         graph.replay()
 
 
+def test_explicit_stage_replay_updates_public_graph_counter() -> None:
+    graph = object.__new__(shared.BeamDecodeGraph)
+    graph.context = object()
+    graph.signature = shared.BeamDecodeGraphSignature(1, 1, 1)
+    graph._bindings = {graph.signature: (graph.context, None, None)}
+    graph.worker = SimpleNamespace(_beam_context=graph.context)
+    graph.descriptor = object()
+    entry = SimpleNamespace(cudagraph=Mock(), output=object())
+    graph.wrapper = SimpleNamespace(concrete_cudagraph_entries={graph.descriptor: entry})
+    assert graph.replay() is entry.output
+    assert graph.replay() is entry.output
+    assert graph.worker._beam_graph_full_dispatch_count == 2
+    assert entry.cudagraph.replay.call_count == 2
+    entry.cudagraph.replay.side_effect = RuntimeError("replay failed")
+    with pytest.raises(RuntimeError, match="replay failed"):
+        graph.replay()
+    assert graph.worker._beam_graph_full_dispatch_count == 2
+
+
 def test_native_model_discovery_unwraps_beam_wrapper() -> None:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 

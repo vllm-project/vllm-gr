@@ -1345,3 +1345,43 @@ def test_postprocess_workspace_initializer_is_noop_off_cuda() -> None:
     runner = SimpleNamespace(device=torch.device("cpu"))
     assert gpu_patch.initialize_beam_postprocess_workspaces(runner) is None
     assert not hasattr(runner, "_beam_postprocess_workspaces")
+
+
+@pytest.mark.parametrize("candidate_mode, expected_k", [("constraint_table", 4), ("full_vocab", 8)])
+def test_postprocess_workspace_initializes_exact_configured_candidate_bucket(
+    monkeypatch: pytest.MonkeyPatch, candidate_mode: str, expected_k: int
+) -> None:
+    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.v1.beam.beam_decision import (
+        BeamPostprocessWorkspace,
+        BeamPostprocessWorkspaceKey,
+    )
+
+    cfg = SimpleNamespace(
+        beam_max_width=4,
+        beam_max_decode_steps=3,
+        beam_worker_decision=True,
+        beam_execution_mode=BeamExecutionMode.V1,
+        beam_candidate_mode=candidate_mode,
+    )
+    runner = SimpleNamespace(
+        device=torch.device("cuda"), model_config=SimpleNamespace(dtype=torch.float16)
+    )
+    allocated: list[dict[str, Any]] = []
+    original_allocate = BeamPostprocessWorkspace.allocate
+
+    def allocate_on_cpu(**kwargs: Any) -> BeamPostprocessWorkspace:
+        allocated.append(kwargs.copy())
+        return original_allocate(**{**kwargs, "device": "cpu", "pin_host": False})
+
+    monkeypatch.setattr(common, "_get_gr_config", lambda _: cfg)
+    monkeypatch.setattr(BeamPostprocessWorkspace, "allocate", allocate_on_cpu)
+    pool = gpu_patch.initialize_beam_postprocess_workspaces(runner)
+    key = BeamPostprocessWorkspaceKey(4, expected_k, torch.float16)
+    assert pool.keys == (key,)
+    assert allocated[0]["device"].type == "cuda"
+    assert allocated[0]["pin_host"] is True
+    assert pool.require(key).topk_token_ids.shape == (4, 4, expected_k)
+    assert pool.require(key).selected_token_ids.shape == (4, 4)
+    assert gpu_patch.initialize_beam_postprocess_workspaces(runner) is pool
+    assert len(allocated) == 1

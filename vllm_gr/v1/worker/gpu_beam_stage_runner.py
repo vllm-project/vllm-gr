@@ -18,13 +18,14 @@ import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
+from vllm_gr.config import BeamCandidateMode
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.v1.beam.batch_contracts import (
-    BEAM_BATCH_PROTOCOL_VERSION,
     SUPPORTED_BEAM_BATCH_SIZES,
     BeamBatchFailure,
     BeamBatchResult,
+    beam_batch_protocol_version,
 )
 from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspaceKey
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
@@ -65,6 +66,12 @@ SUPPORTED_BATCH_SIZES = SUPPORTED_BEAM_BATCH_SIZES
 def _batch_finished(is_finished: torch.Tensor, error_code: torch.Tensor) -> torch.Tensor:
     """Finish a logical batch only when all members finish or any member errors."""
     return is_finished.all() | (error_code != 0).any()
+
+
+def _candidate_width(params: Any) -> int:
+    return int(params.beam_width) * (
+        2 if params.candidate_mode == BeamCandidateMode.FULL_VOCAB else 1
+    )
 
 
 @dataclass(frozen=True)
@@ -148,7 +155,7 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         for entry in self.execution.entries:
             m = entry.metadata
             failure = BeamBatchResult(
-                BEAM_BATCH_PROTOCOL_VERSION,
+                beam_batch_protocol_version(m.beam_params),
                 m.session_id,
                 None,
                 BeamBatchFailure("worker_output_error", str(error), entry.binding.item_index),
@@ -180,7 +187,7 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
             final_output = self.owner.final_output
             if error:
                 failure = BeamBatchResult(
-                    protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                    protocol_version=beam_batch_protocol_version(m.beam_params),
                     batch_id=m.session_id,
                     output=None,
                     failure=BeamBatchFailure(
@@ -195,7 +202,7 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                     terminal = final_output.consume(self.owner, ready=final_ready)
                 except (ValueError, TypeError, IndexError) as exc:
                     failure = BeamBatchResult(
-                        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                        protocol_version=beam_batch_protocol_version(m.beam_params),
                         batch_id=m.session_id,
                         output=None,
                         failure=BeamBatchFailure(
@@ -332,7 +339,7 @@ class GPUBeamStageRunner:
         worker: Any,
         beam: BeamBatchSearchRunner,
         bindings: tuple[BeamRequestBinding, ...],
-        backend: CUDAConstraintBackend,
+        backend: CUDAConstraintBackend | None,
         hooks: _StageExecutionHooks | None = None,
     ):
         expected = tuple(range(len(bindings)))
@@ -399,9 +406,9 @@ class GPUBeamStageRunner:
         w = beam.workspace
         self.prefixes = w.prefix_token_ids[:batch_size].reshape(rows, -1)
         self.temperatures = w.temperatures[:batch_size].reshape(rows)
-        self.tokens = w.topk_token_ids[:batch_size].reshape(rows, beam.state.beam_width)
-        self.scores = w.topk_scores[:batch_size].reshape(rows, beam.state.beam_width)
-        self.valid = w.topk_valid_mask[:batch_size].reshape(rows, beam.state.beam_width)
+        self.tokens = w.topk_token_ids[:batch_size].reshape(rows, beam.state.candidate_width)
+        self.scores = w.topk_scores[:batch_size].reshape(rows, beam.state.candidate_width)
+        self.valid = w.topk_valid_mask[:batch_size].reshape(rows, beam.state.candidate_width)
         self.counts = w.topk_valid_counts[:batch_size].reshape(rows)
         context._gr_execution_owner = self
         beam.workspace.execution_owner = self
@@ -410,7 +417,7 @@ class GPUBeamStageRunner:
         if self.closed:
             raise RuntimeError("GR session is closed")
         if (
-            not self.backend.is_ready
+            (self.backend is not None and not self.backend.is_ready)
             or self.beam.workspace.execution_owner is not self
             or self.beam.session.context._gr_execution_owner is not self
         ):
@@ -431,6 +438,7 @@ class GPUBeamStageRunner:
             state, params = self.beam.state, m.beam_params
             if (
                 state.beam_width != params.beam_width
+                or state.candidate_width != _candidate_width(params)
                 or state.max_new_tokens != params.max_tokens
                 or state.stop_token_ids_config != params.stop_token_ids
                 or state.ignore_stop_tokens_config != params.ignore_stop_tokens
@@ -629,8 +637,6 @@ class GPUBeamStageRunner:
             ) from self.execution_error
         if grammar_output is not None or self.pending is None:
             raise RuntimeError("GR sample requires a pending dispatch and no grammar output")
-        if self.backend is None:
-            raise RuntimeError("GR sampling requires a bound constraint backend")
         execution, slot = self.pending
         terminal_payload = False
         for entry in execution.entries:
@@ -641,17 +647,35 @@ class GPUBeamStageRunner:
                 layout = BeamBatchExecutionView.from_stage_metadata(m)
                 rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
                 candidates = self.tokens[:rows], self.scores[:rows], self.valid[:rows]
-                self.backend.select_out_unchecked(
-                    self.logits,
-                    ConstraintMetadata(
-                        self.prefixes[:rows], self.temperatures[:rows], 0, m.beam_params.beam_width
-                    ),
-                    out_token_ids=candidates[0],
-                    out_logprobs=candidates[1],
-                    out_valid_mask=candidates[2],
-                    out_valid_counts=self.counts[:rows],
-                    device_step=self.constraint_steps,
-                )
+                if m.beam_params.candidate_mode == BeamCandidateMode.FULL_VOCAB:
+                    from vllm_gr.v1.worker.full_vocab import full_vocab_topk
+
+                    # Sampling is outside the captured Forward. Preserve the
+                    # fixed candidate addresses consumed by Beam state/KV ops.
+                    if self.logits.shape[1] != self.worker.model_config.get_vocab_size():
+                        raise ValueError("full-vocabulary Beam requires complete model logits")
+                    selected = full_vocab_topk(self.logits, top_k=self.beam.state.candidate_width)
+                    candidates[0].copy_(selected.token_ids)
+                    candidates[1].copy_(selected.logprobs)
+                    candidates[2].copy_(selected.valid_mask)
+                    self.counts[:rows].copy_(selected.valid_counts)
+                else:
+                    if self.backend is None:
+                        raise RuntimeError("constrained GR sampling requires a bound backend")
+                    self.backend.select_out_unchecked(
+                        self.logits,
+                        ConstraintMetadata(
+                            self.prefixes[:rows],
+                            self.temperatures[:rows],
+                            0,
+                            m.beam_params.beam_width,
+                        ),
+                        out_token_ids=candidates[0],
+                        out_logprobs=candidates[1],
+                        out_valid_mask=candidates[2],
+                        out_valid_counts=self.counts[:rows],
+                        device_step=self.constraint_steps,
+                    )
                 candidate_batch = BeamCandidateBatch(layout, *candidates)
                 if m.kind is GRStageKind.PREFILL:
                     self.beam.initialize_from_prefill(candidate_batch)
@@ -873,6 +897,11 @@ def get_stage_runner(
     )
 
     cfg = _get_gr_config(worker)
+    if m.beam_params.candidate_mode != getattr(
+        cfg, "beam_candidate_mode", BeamCandidateMode.CONSTRAINT_TABLE
+    ):
+        raise ValueError("Scheduler and Worker Beam candidate modes differ")
+    candidate_width = _candidate_width(m.beam_params)
     capacity = GRExecutionCapacity(cfg.beam_max_width)
     capacity.validate(m.beam_params)
     if m.execution_capacity is not None and m.execution_capacity != capacity:
@@ -895,9 +924,12 @@ def get_stage_runner(
             "persistent GR requires GPU V1 async, TP/PP/DP=1, FP16/BF16 and matching capacity"
         )
     backend = getattr(worker, "constraint_backend", None)
-    if not isinstance(backend, CUDAConstraintBackend):
+    full_vocab = m.beam_params.candidate_mode == BeamCandidateMode.FULL_VOCAB
+    if full_vocab and backend is not None:
+        raise ValueError("full-vocabulary Beam must not bind a constraint backend")
+    if not full_vocab and not isinstance(backend, CUDAConstraintBackend):
         raise ValueError("persistent GR requires a loaded canonical CUDA Constraint Table")
-    if (
+    if backend is not None and (
         existing is not None
         and existing.graph is not None
         and existing.backend is not None
@@ -906,13 +938,15 @@ def get_stage_runner(
         raise ValueError(
             "Asynchronous scheduling captured constraint/model binding cannot change after startup"
         )
-    if (
+    if backend is not None and (
         not backend.is_ready
         or backend.info.table_metadata.vocab_size != worker.model_config.get_vocab_size()
         or any(table.device != worker.device for table in backend._tables())
     ):
         raise ValueError("constraint backend is not ready or its model/device binding differs")
-    if backend.info.max_rows < cfg.beam_max_width or backend.info.max_top_k < cfg.beam_max_width:
+    if backend is not None and (
+        backend.info.max_rows < cfg.beam_max_width or backend.info.max_top_k < cfg.beam_max_width
+    ):
         raise ValueError("constraint backend capacity is smaller than fixed Beam width")
     if (
         worker.model_config.is_encoder_decoder
@@ -955,9 +989,7 @@ def get_stage_runner(
     if getattr(worker, "_beam_sessions", {}):
         raise ValueError("another Beam session owns the Worker")
     workspace = worker._beam_postprocess_workspaces.require(
-        BeamPostprocessWorkspaceKey(
-            cfg.beam_max_width, cfg.beam_max_width, worker.model_config.dtype
-        )
+        BeamPostprocessWorkspaceKey(cfg.beam_max_width, candidate_width, worker.model_config.dtype)
     )
     view = BeamBatchExecutionView.from_stage_metadata(m)
     context = getattr(worker, "_beam_context", None)
@@ -983,6 +1015,7 @@ def get_stage_runner(
         existing is not None
         and existing.closed
         and existing.beam.state.beam_width == m.beam_params.beam_width
+        and existing.beam.state.candidate_width == candidate_width
         and existing.beam.session.context is context
         and existing.beam.workspace is workspace
         and existing.beam.state.decision is context.decision
@@ -1008,6 +1041,7 @@ def get_stage_runner(
             max_new_tokens=m.beam_params.max_tokens,
             stop_token_ids=m.beam_params.stop_token_ids,
             ignore_stop_tokens=m.beam_params.ignore_stop_tokens,
+            candidate_width=candidate_width,
         )
     sessions = []
     bindings = []

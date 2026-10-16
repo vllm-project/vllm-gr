@@ -28,6 +28,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputOptions,
     BeamOutputSequence,
     BeamRequestOutput,
+    beam_batch_protocol_version,
 )
 
 _CONTROL_WORDS = 3
@@ -74,6 +75,7 @@ def _build_result(
     request_id: str,
     item_index: int,
     options: BeamOutputOptions,
+    protocol_version: int = BEAM_BATCH_PROTOCOL_VERSION,
 ) -> BeamBatchResult:
     """Wrap the GPU-ranked compact payload in the existing transport ABI."""
 
@@ -104,7 +106,7 @@ def _build_result(
         )
 
     return BeamBatchResult(
-        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+        protocol_version=protocol_version,
         batch_id=session_id,
         output=(
             BeamBatchOutput((BeamRequestOutput(item_index, request_id, tuple(sequences)),))
@@ -126,6 +128,7 @@ def _build_batch_result(
     session_id: str,
     bindings: tuple[BeamRequestBinding, ...],
     options: BeamOutputOptions,
+    protocol_version: int = BEAM_BATCH_PROTOCOL_VERSION,
 ) -> BeamBatchResult:
     values = payload.numpy() if isinstance(payload, torch.Tensor) else payload
     outputs = []
@@ -151,7 +154,7 @@ def _build_batch_result(
             )
         if not sequences:
             return BeamBatchResult(
-                protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+                protocol_version=protocol_version,
                 batch_id=session_id,
                 output=None,
                 failure=BeamBatchFailure(
@@ -168,7 +171,7 @@ def _build_batch_result(
             )
         )
     return BeamBatchResult(
-        BEAM_BATCH_PROTOCOL_VERSION,
+        protocol_version,
         session_id,
         BeamBatchOutput(tuple(outputs)),
         None,
@@ -231,6 +234,7 @@ class GPUBeamFinalOutput:
             self.bindings = binding if isinstance(binding, tuple) else (binding,)
             self.binding = self.bindings[0]
             self.options = options
+            self.protocol_version = beam_batch_protocol_version(params)
             self.length_penalty = params.length_penalty
             self.prompt_lengths = tuple(
                 runner.session._state.prefix_len
@@ -391,6 +395,7 @@ class GPUBeamFinalOutput:
                 session_id=self.binding.session_id,
                 bindings=self.bindings,
                 options=self.options,
+                protocol_version=self.protocol_version,
             )
             self._delivered = True
             self._record_done(owner)

@@ -104,9 +104,15 @@ def _get_engine_method(owner: Any, name: str) -> Any:
     return method
 
 
-def _create_failure_result(batch_id: str, code: str, exc: Exception) -> BeamBatchResult:
+def _create_failure_result(
+    batch_id: str,
+    code: str,
+    exc: Exception,
+    *,
+    protocol_version: int = BEAM_BATCH_PROTOCOL_VERSION,
+) -> BeamBatchResult:
     return BeamBatchResult(
-        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
+        protocol_version=protocol_version,
         batch_id=batch_id,
         output=None,
         failure=BeamBatchFailure(code=code, message=str(exc), item_index=None),
@@ -157,6 +163,7 @@ class BeamSearchClient:
             session_id=request.batch_id,
             handle=handle,
             data_parallel_rank=request.items[0].request.data_parallel_rank,
+            protocol_version=request.protocol_version,
         )
 
     def wait_final(self, session: BeamSearchSession) -> BeamBatchResult:
@@ -173,7 +180,9 @@ class BeamSearchClient:
             raise
         except Exception as exc:  # noqa: BLE001 - EngineCore failure boundary
             session.failed = True
-            return _create_failure_result(session.batch_id, "execution_failed", exc)
+            return _create_failure_result(
+                session.batch_id, "execution_failed", exc, protocol_version=session.protocol_version
+            )
 
     def build_output(
         self,
@@ -250,6 +259,7 @@ class AsyncBeamSearchClient:
             session_id=request.batch_id,
             handle=handle,
             data_parallel_rank=request.items[0].request.data_parallel_rank,
+            protocol_version=request.protocol_version,
         )
 
     async def _rollback_submission(
@@ -293,7 +303,9 @@ class AsyncBeamSearchClient:
             raise
         except Exception as exc:  # noqa: BLE001 - EngineCore failure boundary
             session.failed = True
-            return _create_failure_result(session.batch_id, "execution_failed", exc)
+            return _create_failure_result(
+                session.batch_id, "execution_failed", exc, protocol_version=session.protocol_version
+            )
 
     def build_output(
         self,

@@ -9,7 +9,11 @@ from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest, BeamBatchResult
+from vllm_gr.v1.beam.batch_contracts import (
+    BEAM_BATCH_PROTOCOL_VERSION,
+    BeamBatchRequest,
+    BeamBatchResult,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +55,7 @@ class BeamSearchSession:
     terminal: bool = False
     failed: bool = False
     closed: bool = False
+    protocol_version: int = BEAM_BATCH_PROTOCOL_VERSION
 
 
 class BeamSearchFrontend(Protocol):

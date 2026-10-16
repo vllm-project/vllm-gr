@@ -35,6 +35,7 @@ class BeamSearchState:
         max_new_tokens: int,
         stop_token_ids: tuple[int, ...] = (),
         ignore_stop_tokens: bool = False,
+        candidate_width: int | None = None,
     ) -> None:
         for name, value in (("beam_width", beam_width), ("max_new_tokens", max_new_tokens)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -47,6 +48,16 @@ class BeamSearchState:
             raise ValueError("decision storage must contain at least one batch row")
         if not 1 <= beam_width <= min(beams, MAX_BEAM_WIDTH):
             raise ValueError("beam_width exceeds decision or CUDA selection capacity")
+        if candidate_width is None:
+            candidate_width = beam_width
+        if (
+            isinstance(candidate_width, bool)
+            or not isinstance(candidate_width, int)
+            or not beam_width <= candidate_width <= 2 * MAX_BEAM_WIDTH
+        ):
+            raise ValueError(
+                "candidate_width must cover beam_width and fit CUDA candidate capacity"
+            )
         if max_new_tokens > steps:
             raise ValueError("max_new_tokens exceeds decision sequence capacity")
         if (
@@ -64,13 +75,14 @@ class BeamSearchState:
             for token in stop_token_ids
         ) or len(set(stop_token_ids)) != len(stop_token_ids):
             raise ValueError("stop_token_ids must be unique non-negative int32 values")
-        capacity = beam_width + (max_new_tokens - 1) * beam_width**2
+        capacity = candidate_width + (max_new_tokens - 1) * beam_width * candidate_width
         if max(batch * capacity, batch * max_new_tokens * beam_width, sequence.numel()) >= 2**31:
             raise ValueError("Beam state exceeds int32 indexing capacity")
 
         self.decision = decision
         self.max_batch_size = batch
         self.beam_width = beam_width
+        self.candidate_width = candidate_width
         self.max_new_tokens = max_new_tokens
         self.stop_token_ids_config = stop_token_ids
         self.ignore_stop_tokens_config = ignore_stop_tokens

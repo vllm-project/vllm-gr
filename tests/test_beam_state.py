@@ -61,6 +61,19 @@ def test_reset_preserves_other_rows_configuration_and_addresses() -> None:
     assert state.max_new_tokens_tensor[0] == 8
 
 
+@pytest.mark.parametrize("width", [1, 2, 128, 256])
+def test_full_vocab_state_reserves_candidates_without_expanding_active_beams(width: int) -> None:
+    decision = BeamDecisionBuffers(1, width, 3, torch.device("cpu"), torch.float16)
+    state = BeamSearchState(decision, beam_width=width, candidate_width=2 * width, max_new_tokens=3)
+    assert state.sequence.shape == (1, width, 3)
+    assert state.active_mask.shape == (1, width)
+    # Every round may complete all K candidates from each live parent. Prefill
+    # has one parent; both subsequent rounds can have W parents.
+    assert state.completed_capacity == 2 * width + 4 * width**2
+    assert state.completed_scores.shape == (1, state.completed_capacity)
+    assert state.candidate_width == 2 * width
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -69,6 +82,10 @@ def test_reset_preserves_other_rows_configuration_and_addresses() -> None:
         {"beam_width": 5},
         {"max_new_tokens": 0},
         {"max_new_tokens": 9},
+        {"candidate_width": 0},
+        {"candidate_width": 3},
+        {"candidate_width": True},
+        {"candidate_width": 513},
         {"stop_token_ids": (-1,)},
         {"stop_token_ids": (1, 1)},
     ],

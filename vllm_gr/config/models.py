@@ -24,6 +24,13 @@ class ConstraintBackend(str, Enum):
     CONSTRAINT_TABLE = "constraint_table"
 
 
+class BeamCandidateMode(str, Enum):
+    """Engine-lifetime candidate source for persistent Beam execution."""
+
+    CONSTRAINT_TABLE = "constraint_table"
+    FULL_VOCAB = "full_vocab"
+
+
 class ConstraintTableBackendEnum(str, Enum):
     """Execution placement requested for a canonical constraint table."""
 
@@ -47,7 +54,7 @@ AUTO_CONSTRAINT_TABLE_PATH: str = "__vllm_gr_auto_constraint_table__"
 class ConstraintTableConfig:
     """Configuration for a prebuilt canonical constraint-table artifact."""
 
-    max_top_k: int
+    max_top_k: int | None = None
     enabled: bool = False
     backend: ConstraintTableBackendEnum = ConstraintTableBackendEnum.CUDA
     path: str | None = None
@@ -80,16 +87,18 @@ class ConstraintTableConfig:
             "tokenizer_digest",
             validate_tokenizer_digest(self.tokenizer_digest),
         )
-        object.__setattr__(
-            self,
-            "max_top_k",
-            validate_constraint_table_max_top_k(self.max_top_k),
-        )
+        if self.max_top_k is not None:
+            object.__setattr__(
+                self,
+                "max_top_k",
+                validate_constraint_table_max_top_k(self.max_top_k),
+            )
 
         if self.enabled:
             missing = [
                 name
                 for name, value in (
+                    ("max_top_k", self.max_top_k),
                     ("path", self.path),
                     ("format", self.format),
                     ("artifact_digest", self.artifact_digest),
@@ -247,6 +256,17 @@ class GRConfig:
             and self.catalog_path is None
         ):
             raise ValueError("vllm-gr constraint_backend='constraint_table' requires catalog_path")
+
+    @property
+    def beam_candidate_mode(self) -> BeamCandidateMode:
+        """Select full vocabulary only through an explicit canonical opt-out.
+
+        Missing canonical state retains the existing table admission checks;
+        legacy catalog-free engines do not opt into the persistent interface.
+        """
+        if self.constraint_table is not None and not self.constraint_table.enabled:
+            return BeamCandidateMode.FULL_VOCAB
+        return BeamCandidateMode.CONSTRAINT_TABLE
 
     @property
     def beam_graph_active(self) -> bool:

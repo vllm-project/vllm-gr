@@ -12,6 +12,7 @@ import pytest
 
 from vllm_gr.config import (
     CONSTRAINT_TABLE_FORMAT,
+    BeamCandidateMode,
     ConstraintBackend,
     ConstraintTableBackendEnum,
     ConstraintTableConfig,
@@ -22,11 +23,7 @@ from vllm_gr.config import (
     load_gr_config,
     write_canonical_gr_config,
 )
-from vllm_gr.config.parser import (
-    CATALOG_PATH_KEY,
-    GR_CONFIG_KEY,
-    parse_gr_config,
-)
+from vllm_gr.config.parser import CATALOG_PATH_KEY, GR_CONFIG_KEY, parse_gr_config
 
 _ARTIFACT_DIGEST = "sha256:" + "a" * 64
 _TOKENIZER_DIGEST = "sha256:" + "b" * 64
@@ -248,6 +245,44 @@ def test_canonical_mapping_requires_explicit_max_top_k(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match=r"constraint_table\.max_top_k"):
         gr_config_from_mapping(raw)
+
+
+@pytest.mark.parametrize("include_table", [False, True])  # type: ignore[misc]
+def test_full_vocab_canonical_config_needs_no_table_resources(include_table: bool) -> None:
+    raw = {
+        "schema_version": 1,
+        "beam": {"execution_mode": "v1", "max_width": 32, "max_decode_steps": 3},
+    }
+    if include_table:
+        raw["constraint_table"] = {"enabled": False}
+    config = gr_config_from_mapping(raw)
+    assert config.beam_candidate_mode is BeamCandidateMode.FULL_VOCAB
+    assert config.constraint_table is not None
+    assert config.constraint_table.max_top_k is None
+    assert config.constraint_table.path is None
+    encoded = gr_config_to_mapping(config)
+    assert "max_top_k" not in encoded["constraint_table"]
+    assert gr_config_from_mapping(encoded) == config
+
+
+def test_missing_canonical_state_does_not_enable_full_vocab_v1() -> None:
+    assert GRConfig().beam_candidate_mode is BeamCandidateMode.CONSTRAINT_TABLE
+    assert GRConfig(catalog_path="/legacy/catalog.json").beam_candidate_mode is (
+        BeamCandidateMode.CONSTRAINT_TABLE
+    )
+
+
+def test_enabled_constraint_config_requires_max_top_k() -> None:
+    with pytest.raises(ValueError, match="max_top_k"):
+        ConstraintTableConfig(enabled=True)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "32"])  # type: ignore[misc]
+def test_disabled_constraint_config_validates_explicit_max_top_k(value: object) -> None:
+    with pytest.raises(ValueError, match="max_top_k"):
+        gr_config_from_mapping(
+            {"schema_version": 1, "constraint_table": {"enabled": False, "max_top_k": value}}
+        )
 
 
 def test_constraint_max_top_k_has_no_npu_upper_bound(tmp_path: Path) -> None:

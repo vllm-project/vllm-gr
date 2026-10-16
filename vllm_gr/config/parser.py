@@ -164,7 +164,8 @@ def gr_config_from_mapping(
     _reject_unknown_mapping_keys(beam_raw, _BEAM_KEYS, "beam")
     table_raw = _as_string_mapping(mapping.get("constraint_table", {}), "constraint_table")
     _reject_unknown_mapping_keys(table_raw, _CONSTRAINT_TABLE_KEYS, "constraint_table")
-    if "max_top_k" not in table_raw:
+    table_enabled = validate_constraint_table_enabled(table_raw.get("enabled", False))
+    if table_enabled and "max_top_k" not in table_raw:
         raise ValueError("vllm-gr configuration requires constraint_table.max_top_k")
 
     graph_enabled = beam_raw.get("graph_enabled", True)
@@ -172,7 +173,7 @@ def gr_config_from_mapping(
         raise ValueError("vllm-gr beam.graph_enabled must be a boolean")
 
     table = ConstraintTableConfig(
-        enabled=validate_constraint_table_enabled(table_raw.get("enabled", False)),
+        enabled=table_enabled,
         backend=validate_constraint_table_backend(table_raw.get("backend", "cuda")),
         path=validate_constraint_table_path(
             _normalize_artifact_path(table_raw.get("path"), base_dir=base_dir)
@@ -180,7 +181,11 @@ def gr_config_from_mapping(
         format=validate_constraint_table_format(table_raw.get("format", CONSTRAINT_TABLE_FORMAT)),
         artifact_digest=validate_artifact_digest(table_raw.get("artifact_digest")),
         tokenizer_digest=validate_tokenizer_digest(table_raw.get("tokenizer_digest")),
-        max_top_k=validate_constraint_table_max_top_k(table_raw["max_top_k"]),
+        max_top_k=(
+            validate_constraint_table_max_top_k(table_raw["max_top_k"])
+            if "max_top_k" in table_raw
+            else None
+        ),
     )
     return GRConfig(
         attention_backend=validate_attention_backend(mapping.get("attention_backend")),
@@ -246,18 +251,20 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     if config.beam_execution_mode is not BeamExecutionMode.LEGACY:
         beam["execution_mode"] = config.beam_execution_mode.value
 
+    table_mapping: dict[str, object] = {
+        "enabled": table.enabled,
+        "backend": table.backend.value,
+        "path": table.path,
+        "format": table.format,
+        "artifact_digest": table.artifact_digest,
+        "tokenizer_digest": table.tokenizer_digest,
+    }
+    if table.max_top_k is not None:
+        table_mapping["max_top_k"] = table.max_top_k
     return {
         "schema_version": config.schema_version,
         "beam": beam,
-        "constraint_table": {
-            "enabled": table.enabled,
-            "backend": table.backend.value,
-            "path": table.path,
-            "format": table.format,
-            "artifact_digest": table.artifact_digest,
-            "tokenizer_digest": table.tokenizer_digest,
-            "max_top_k": table.max_top_k,
-        },
+        "constraint_table": table_mapping,
         "attention_backend": (
             config.attention_backend.value if config.attention_backend is not None else None
         ),

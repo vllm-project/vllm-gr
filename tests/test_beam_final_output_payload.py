@@ -3,6 +3,7 @@
 """Compact output ABI, optional fields and independence from reused storage."""
 
 from itertools import product
+from types import SimpleNamespace
 
 import numpy as np
 import numpy.typing as npt
@@ -11,7 +12,11 @@ import torch
 
 from vllm_gr.ops.cuda.beam_state import FINISH_LENGTH, FINISH_STOP
 from vllm_gr.v1.beam.batch_contracts import BeamOutputOptions
-from vllm_gr.v1.worker.beam_final_output import _build_result, _PayloadLayout
+from vllm_gr.v1.worker.beam_final_output import (
+    _build_batch_result,
+    _build_result,
+    _PayloadLayout,
+)
 
 
 @pytest.mark.parametrize("steps", [1, 2, 3])  # type: ignore[misc]
@@ -70,3 +75,32 @@ def test_empty_compact_payload_failure() -> None:
     assert result.failure is not None
     assert result.failure.code == "no_valid_beams"
     assert result.failure.item_index == 7
+
+
+@pytest.mark.parametrize("nonempty", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+def test_full_vocab_terminal_preserves_protocol(nonempty: bool, batched: bool) -> None:
+    layout = _PayloadLayout.create(1, 1)
+    values = np.zeros(layout.size, dtype=np.int32)
+    values[3] = int(nonempty)
+    if nonempty:
+        row = values[4:]
+        row[0] = 0  # EOS is retained, including the EOS=0 edge case.
+        row[3:] = [1, FINISH_STOP, 0]
+    kwargs = dict(
+        session_id="full", options=BeamOutputOptions(1, True, True, False), protocol_version=2
+    )
+    if batched:
+        result = _build_batch_result(
+            values,
+            layout,
+            bindings=(SimpleNamespace(item_index=0, native_request_id="full"),),
+            **kwargs,
+        )
+    else:
+        result = _build_result(values, layout, request_id="full", item_index=0, **kwargs)
+    assert result.protocol_version == 2
+    if nonempty:
+        assert result.output.items[0].sequences[0].token_ids == (0,)
+    else:
+        assert result.failure.code == "no_valid_beams"

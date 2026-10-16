@@ -242,18 +242,33 @@ def is_gr_session_retired(self: Any, session_id: str) -> bool:
     return session_id not in getattr(self.scheduler, "_gr_v1_sessions", {})
 
 
-def send_gr_rejection(engine: Any, engine_request: Any, message: str) -> None:
+def send_gr_rejection(
+    engine: Any, engine_request: Any, message: str, *, protocol_version: int | None = None
+) -> None:
     """Answer a refused GR session with the terminal payload it never produced.
 
     Upstream's error output carries no ``gr_batch_result``, and a frontend can
     only read that absence as a broken engine. Sending the failure the session
     would have reported keeps the reason, and its status class, intact.
     """
-    from vllm_gr.v1.beam.batch_contracts import admission_rejected
+    from vllm_gr.v1.beam.batch_contracts import (
+        BEAM_BATCH_PROTOCOL_VERSION,
+        admission_rejected,
+    )
 
+    if protocol_version is None:
+        protocol_version = getattr(
+            getattr(engine_request, "gr_batch_request", None),
+            "protocol_version",
+            BEAM_BATCH_PROTOCOL_VERSION,
+        )
     request_id = engine_request.request_id
     output = EngineCoreOutput(request_id, [], finish_reason=FinishReason.ERROR)
-    output.kv_transfer_params = {"gr_batch_result": admission_rejected(request_id, message)}
+    output.kv_transfer_params = {
+        "gr_batch_result": admission_rejected(
+            request_id, message, protocol_version=protocol_version
+        )
+    }
     engine.output_queue.put_nowait(
         (
             engine_request.client_index,
@@ -277,7 +292,12 @@ def _handle_submit_gr_session(self, batch_request) -> None:
             from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
 
             raise GRAdmissionError(str(error)) from error
-        send_gr_rejection(self, batch_request.items[0].request, str(error))
+        send_gr_rejection(
+            self,
+            batch_request.items[0].request,
+            str(error),
+            protocol_version=batch_request.protocol_version,
+        )
         return
     except Exception:
         handler = getattr(self, "_handle_request_preproc_error", None)
@@ -315,7 +335,9 @@ def _admit_gr_session(self, batch_request) -> None:
             from vllm_gr.v1.engine.gr_async_scheduler import GRAdmissionError
 
             raise GRAdmissionError(str(error)) from error
-        send_gr_rejection(self, engine_requests[0], str(error))
+        send_gr_rejection(
+            self, engine_requests[0], str(error), protocol_version=batch_request.protocol_version
+        )
         return
     try:
         # Deployment configuration stays on the preprocessing error path: an

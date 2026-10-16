@@ -15,6 +15,7 @@ from vllm.inputs import embeds_input, tokens_input
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 
+from vllm_gr.config import BeamCandidateMode
 from vllm_gr.entrypoints.beam_search_v1.client import (
     AsyncBeamSearchClient,
     BeamSearchClient,
@@ -334,10 +335,9 @@ def test_offline_inputs_reject_unsupported_batch_size_before_admission() -> None
     "additional_config",
     [
         {"vllm_gr_beam_execution_mode": "v1", "vllm_gr_beam_max_width": 2},
-        {"vllm_gr": _canonical_gr_config(enabled=False)},
         {"vllm_gr": _canonical_gr_config(backend="cpu")},
     ],
-    ids=["missing", "disabled", "non-cuda"],
+    ids=["missing", "non-cuda"],
 )
 def test_request_requires_enabled_canonical_cuda_constraint_table(
     additional_config: dict[str, Any],
@@ -353,6 +353,198 @@ def test_request_requires_enabled_canonical_cuda_constraint_table(
             BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
             online=True,
         )
+
+
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("max_tokens", [1, 2, 3])  # type: ignore[misc]
+def test_full_vocab_uses_new_token_budget_and_only_tokenizer_eos(
+    online: bool, max_tokens: int
+) -> None:
+    canonical = _canonical_gr_config(enabled=False)
+    canonical["constraint_table"] = {"enabled": False}
+    engine = _make_engine(additional_config={"vllm_gr": canonical})
+    engine.input_processor.generation_config_fields = {"eos_token_id": [8, 9]}
+    request = _prepare_request(
+        engine,
+        [10, 7],  # SID begin is already part of the official prompt.
+        BeamSearchParams(beam_width=2, max_tokens=max_tokens),
+        online=online,
+    )
+    assert request.protocol_version == 2
+    assert request.beam_params.candidate_mode is BeamCandidateMode.FULL_VOCAB
+    assert request.beam_params.constraint_resource_id is None
+    assert request.beam_params.max_tokens == max_tokens
+    assert request.beam_params.stop_token_ids == (2,)
+    assert request.beam_params.ignore_stop_tokens is False
+    assert request.output_options.include_stop_token is True
+    native = request.items[0].request
+    assert native.prompt_token_ids == [10, 7]
+    assert native.sampling_params.max_tokens == max_tokens
+    assert native.sampling_params.ignore_eos is True
+    assert native.sampling_params.eos_token_id is None
+    assert native.sampling_params.stop_token_ids == []
+    assert native.sampling_params.all_stop_token_ids == set()
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "overrides, message",
+    [
+        ({"temperature": 0.5}, "temperature=0"),
+        ({"ignore_eos": True}, "ignore_eos=False"),
+        ({"length_penalty": 0.0}, "length_penalty=1"),
+        ({"begin_token": "<begin>"}, "begin_token/end_token"),
+        ({"end_token": "<end>"}, "begin_token/end_token"),
+        ({"max_tokens": 4}, "effective N=1/2/3"),
+        ({"catalog_strategy": "null"}, "catalog_strategy"),
+    ],
+)
+def test_full_vocab_rejects_unsupported_generation_options(
+    overrides: dict[str, Any], message: str
+) -> None:
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(enabled=False)})
+    options = {"beam_width": 2, "max_tokens": 3, **overrides}
+    with pytest.raises(BeamSearchRequestError, match=message):
+        _prepare_request(engine, [1, 7], BeamSearchParams(**options), online=True)
+    engine.submit_gr_session.assert_not_called()
+
+
+def test_full_vocab_request_cannot_enter_a_constraint_table_engine() -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(enabled=False)})
+    request = _prepare_request(
+        engine, [1, 7], BeamSearchParams(beam_width=2, max_tokens=3), online=True
+    )
+    with pytest.raises(ValueError, match="does not match engine"):
+        validate_gr_request(request, _make_engine().vllm_config)
+
+
+def test_full_vocab_wire_cannot_add_extra_eos_tokens() -> None:
+    import msgspec
+
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(enabled=False)})
+    request = _prepare_request(
+        engine, [1, 7], BeamSearchParams(beam_width=2, max_tokens=3), online=True
+    )
+    malformed = msgspec.structs.replace(
+        request,
+        beam_params=msgspec.structs.replace(request.beam_params, stop_token_ids=(2, 9)),
+    )
+    with pytest.raises(ValueError, match="only the tokenizer EOS"):
+        validate_gr_request(malformed, engine.vllm_config)
+
+
+def test_full_vocab_dispatch_validates_v2_session_metadata() -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import (
+        GRDeviceStateRef,
+        GRStageKind,
+        GRStageMetadata,
+        validate_dispatch,
+    )
+
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(enabled=False)})
+    request = _prepare_request(
+        engine, [1, 7], BeamSearchParams(beam_width=2, max_tokens=3), online=True
+    )
+    metadata = GRStageMetadata(
+        session_id=request.batch_id,
+        dispatch_id=0,
+        stage_index=0,
+        kind=GRStageKind.PREFILL,
+        decode_step=None,
+        is_last_stage=False,
+        input_device_state=None,
+        output_device_state=GRDeviceStateRef(request.batch_id, 0),
+        beam_params=request.beam_params,
+        output_options=request.output_options,
+        num_prompt_tokens=2,
+        session_init=request,
+        request_ids=(request.batch_id,),
+        num_prompt_tokens_by_request=(2,),
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={request.batch_id: 2},
+        gr_stage_metadata={request.batch_id: metadata},
+    )
+    assert validate_dispatch(scheduler_output) == (metadata,)
+
+
+def test_full_vocab_eos_zero_cannot_stop_native_accounting_placeholders() -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(enabled=False)})
+    engine.input_processor.renderer.get_eos_token_id = lambda: 0
+    engine.input_processor.generation_config_fields = {"eos_token_id": [0, 9]}
+    serving = SimpleNamespace(
+        input_processor=SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=0))
+    )
+    request = asyncio.run(
+        BeamSearchInputProcessor(engine).process_online_inputs(
+            serving,
+            OnlineBeamSearchRequest(
+                [1, 7], "eos-zero", BeamSearchParams(beam_width=2, max_tokens=3)
+            ),
+        )
+    )
+    assert request.beam_params.stop_token_ids == (0,)
+    assert request.beam_params.ignore_stop_tokens is False
+    native_params = request.items[0].request.sampling_params
+    assert native_params.ignore_eos is True
+    assert native_params.stop_token_ids == []
+    assert native_params.all_stop_token_ids == set()
+    native_params.ignore_eos = False
+    with pytest.raises(ValueError, match="native accounting requires ignore_eos=True"):
+        validate_gr_request(request, engine.vllm_config)
+
+
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+def test_full_vocab_frontend_failure_retains_protocol_version(online: bool) -> None:
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(enabled=False)})
+    request = _prepare_request(
+        engine, [1, 7], BeamSearchParams(beam_width=2, max_tokens=3), online=True
+    )
+
+    def fail_wait(*args: object) -> None:
+        raise RuntimeError("terminal transport failed")
+
+    engine.wait_gr_session = fail_wait
+    engine.release_gr_session = AsyncMock()
+    if online:
+        client = AsyncBeamSearchClient(SimpleNamespace(engine_client=engine))
+
+        async def run() -> BeamBatchResult:
+            session = await client.submit_once(request)
+            assert session.protocol_version == request.protocol_version
+            return await client.wait_final(session)
+
+        result = asyncio.run(run())
+    else:
+        engine.submit_gr_session = lambda request: object()
+        engine.abort_gr_session = lambda *args: None
+        engine.release_gr_session = lambda *args: None
+        client = BeamSearchClient(SimpleNamespace(llm_engine=engine))
+        session = client.submit_once(request)
+        assert session.protocol_version == request.protocol_version
+        result = client.wait_final(session)
+    assert result.protocol_version == request.protocol_version == 2
+    assert result.failure is not None
+    assert result.failure.code == "execution_failed"
+
+
+def test_constraint_table_request_cannot_enter_a_full_vocab_engine() -> None:
+    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+
+    request = _prepare_request(
+        _make_engine(),
+        [1, 7],
+        BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+        online=True,
+    )
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(enabled=False)})
+    with pytest.raises(ValueError, match="does not match engine"):
+        validate_gr_request(request, engine.vllm_config)
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]

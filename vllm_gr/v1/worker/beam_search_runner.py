@@ -109,6 +109,7 @@ class BeamSearchRunner:
             beam_width=width,
             max_new_tokens=state.max_new_tokens,
             kv_slot=session.slot,
+            candidate_width=state.candidate_width,
         )
 
         self.session = session
@@ -130,9 +131,11 @@ class BeamSearchRunner:
         }
         if workspace.state_scratch is None:
             workspace.state_scratch = ops.BeamStateScratch.allocate(
-                workspace.max_batch, width, state.device
+                workspace.max_batch, width, state.device, candidate_width=state.candidate_width
             )
         scratch = workspace.state_scratch
+        if scratch.selection_mask.shape != (workspace.max_batch, width, state.candidate_width):
+            raise ValueError("Beam state scratch does not match the candidate width")
         self._scratch = {
             name: getattr(scratch, name)[workspace_index]
             if getattr(scratch, name).ndim > 1
@@ -264,6 +267,7 @@ class BeamSearchRunner:
         beam_width: int,
         max_new_tokens: int,
         kv_slot: int,
+        candidate_width: int | None = None,
     ) -> tuple[Any, ...]:
         """Check live layouts in C++ and live addresses before reusing a key.
 
@@ -271,6 +275,7 @@ class BeamSearchRunner:
         lack version counters, so neither identity nor versions can replace
         the explicit data_ptr checks. A miss runs the complete validator.
         """
+        candidate_width = beam_width if candidate_width is None else candidate_width
         if _TensorGuards is None:
             return BeamSearchRunner._validate_resources_full(
                 context,
@@ -278,11 +283,13 @@ class BeamSearchRunner:
                 beam_width=beam_width,
                 max_new_tokens=max_new_tokens,
                 kv_slot=kv_slot,
+                candidate_width=candidate_width,
             )
         parameters = (
             beam_width,
             max_new_tokens,
             kv_slot,
+            candidate_width,
             workspace.key.beam_width,
             workspace.key.top_k,
             workspace.max_batch,
@@ -304,6 +311,7 @@ class BeamSearchRunner:
             beam_width=beam_width,
             max_new_tokens=max_new_tokens,
             kv_slot=kv_slot,
+            candidate_width=candidate_width,
         )
         tensors = _live_resource_tensors(context, workspace)
         if all(type(t) is torch.Tensor for t in tensors):
@@ -331,6 +339,7 @@ class BeamSearchRunner:
         beam_width: int,
         max_new_tokens: int,
         kv_slot: int,
+        candidate_width: int | None = None,
     ) -> tuple[Any, ...]:
         """Validate live storage and return the binding key for cached views.
 
@@ -339,9 +348,10 @@ class BeamSearchRunner:
         certificate for captured addresses or tensor layouts.
         """
         width, device = beam_width, context.decision.sequence.device
+        candidate_width = width if candidate_width is None else candidate_width
         if (
             workspace.key.beam_width != width
-            or workspace.key.top_k != width
+            or workspace.key.top_k != candidate_width
             or workspace.max_batch < 1
             or workspace.topk_token_ids.device != device
             or workspace.max_decode_steps < context.decision.sequence.shape[2]
@@ -445,6 +455,7 @@ class BeamSearchRunner:
             ):
                 raise RuntimeError("another runner owns the shared Beam execution scratch")
         width = self.state.beam_width
+        candidate_width = self.state.candidate_width
         rows = 1 if prefill else width
         for name, tensor, dtype in (
             ("token_ids", token_ids, torch.int32),
@@ -452,12 +463,14 @@ class BeamSearchRunner:
             ("valid_mask", valid_mask, torch.bool),
         ):
             if (
-                tensor.shape != (rows, width)
+                tensor.shape != (rows, candidate_width)
                 or tensor.dtype != dtype
                 or tensor.device != self.state.device
                 or not tensor.is_contiguous()
             ):
-                raise ValueError(f"{name} must be contiguous CUDA {dtype} [{rows}, {width}]")
+                raise ValueError(
+                    f"{name} must be contiguous CUDA {dtype} [{rows}, {candidate_width}]"
+                )
         s, w = self._state, self._scratch
         block = triton.next_power_of_2(width)
         ops._prepare_candidates_kernel[(rows,)](
@@ -479,8 +492,8 @@ class BeamSearchRunner:
             w["row_counts"],
             w["row_errors"],
             w["row_valid_counts"],
-            WIDTH=width,
-            BLOCK=block,
+            WIDTH=candidate_width,
+            BLOCK=triton.next_power_of_2(candidate_width),
             PREFILL=prefill,
         )
         ops._validate_step_kernel[(1,)](
@@ -510,7 +523,7 @@ class BeamSearchRunner:
             w["selection_mask"],
             1,
             rows,
-            width,
+            candidate_width,
             width,
             self.workspace.selection_scratch,
             mask_invalid_indices=True,
@@ -524,6 +537,7 @@ class BeamSearchRunner:
             self._selected_scores,
             self._selected_flat,
             width,
+            candidate_width,
             stride,
             WRITE_FLAT_INDICES=True,
             BLOCK=block,
@@ -542,8 +556,8 @@ class BeamSearchRunner:
             s["completed_lengths"],
             s["completed_finish_reasons"],
             s["completed_tie_break_indices"],
-            WIDTH=width,
-            BLOCK=block,
+            WIDTH=candidate_width,
+            BLOCK=triton.next_power_of_2(candidate_width),
             PREFILL=prefill,
         )
         extent = self.state.sequence.shape[2]
@@ -613,9 +627,11 @@ class BeamCandidateBatch:
     logprobs: torch.Tensor
     valid_mask: torch.Tensor
 
-    def validate(self, *, prefill: bool, device: torch.device) -> None:
+    def validate(
+        self, *, prefill: bool, device: torch.device, candidate_width: int | None = None
+    ) -> None:
         rows = self.layout.batch_size if prefill else self.layout.num_execution_rows
-        width = self.layout.beam_width
+        width = self.layout.beam_width if candidate_width is None else candidate_width
         if prefill != (self.layout.kind == "prefill"):
             raise ValueError("candidate stage does not match its batch layout")
         for name, tensor, dtype in (
@@ -680,7 +696,9 @@ class BeamBatchSearchRunner:
             runner.reset_for_session()
 
     def initialize_from_prefill(self, candidates: BeamCandidateBatch) -> None:
-        candidates.validate(prefill=True, device=self.state.device)
+        candidates.validate(
+            prefill=True, device=self.state.device, candidate_width=self.state.candidate_width
+        )
         self.assert_layout(candidates.layout)
         for index, runner in enumerate(self.runners):
             row = slice(index, index + 1)
@@ -691,7 +709,9 @@ class BeamBatchSearchRunner:
             )
 
     def advance(self, candidates: BeamCandidateBatch) -> None:
-        candidates.validate(prefill=False, device=self.state.device)
+        candidates.validate(
+            prefill=False, device=self.state.device, candidate_width=self.state.candidate_width
+        )
         self.assert_layout(candidates.layout)
         width = self.state.beam_width
         for index, runner in enumerate(self.runners):
