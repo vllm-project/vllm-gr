@@ -1,0 +1,471 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disallow-untyped-decorators=False
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import torch
+
+from vllm_gr.config import GRConfig, gr_config_from_mapping, gr_config_to_mapping
+from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+    GPUBeamAttentionBatch,
+    validate_short_suffix_attention,
+)
+from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
+from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("capacity", [1, 3, 4, 8, 16, 32, 128])
+def test_config_roundtrip(enabled: bool, capacity: int) -> None:
+    raw = {
+        "schema_version": 1,
+        "beam": {
+            "max_width": 256,
+            "max_decode_steps": capacity,
+            "enable_short_suffix_attention": enabled,
+        },
+        "constraint_table": {"max_top_k": 256},
+    }
+    config = gr_config_from_mapping(raw)
+    assert config.enable_short_suffix_attention is enabled
+    assert gr_config_from_mapping(gr_config_to_mapping(config)) == config
+    worker = SimpleNamespace(additional_config={"vllm_gr": gr_config_to_mapping(config)})
+    assert GRConfig.from_vllm_config(worker).enable_short_suffix_attention is enabled
+    legacy = GRConfig(
+        beam_max_width=256,
+        beam_max_decode_steps=capacity,
+        enable_short_suffix_attention=enabled,
+    )
+    worker = SimpleNamespace(additional_config={})
+    legacy.write_to_vllm_config(worker)
+    assert GRConfig.from_vllm_config(worker) == legacy
+
+
+@pytest.mark.parametrize("value", [None, "1", 1])
+def test_config_requires_boolean(value: Any) -> None:
+    with pytest.raises(TypeError, match="must be a boolean"):
+        GRConfig(beam_max_width=128, enable_short_suffix_attention=value)
+
+
+def test_config_default_and_capacity() -> None:
+    assert GRConfig().enable_short_suffix_attention is False
+    with pytest.raises(ValueError, match="requires max_width"):
+        GRConfig(enable_short_suffix_attention=True)
+    assert GRConfig(beam_max_width=128, beam_max_decode_steps=32)
+
+
+@pytest.mark.parametrize("capacity", [0, -1])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_config_rejects_nonpositive_capacity(capacity: int, enabled: bool) -> None:
+    with pytest.raises(ValueError, match="beam_max_decode_steps"):
+        GRConfig(
+            beam_max_width=128,
+            beam_max_decode_steps=capacity,
+            enable_short_suffix_attention=enabled,
+        )
+
+
+@pytest.mark.parametrize("capacity", [0, -1])
+def test_context_rejects_nonpositive_capacity_before_allocating(capacity: int) -> None:
+    with pytest.raises(ValueError, match="positive pool capacity"):
+        BeamAttentionContext(
+            1,
+            3,
+            1,
+            capacity,
+            64,
+            1,
+            torch.device("cuda"),
+            torch.float32,
+            enable_short_suffix_attention=True,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("capacity", [4, 8, 16, 32, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_context_accepts_positive_capacity(capacity: int, dtype: torch.dtype) -> None:
+    context = BeamAttentionContext(
+        1,
+        3,
+        1,
+        capacity,
+        64,
+        1,
+        torch.device("cuda"),
+        dtype,
+        enable_short_suffix_attention=True,
+    )
+    assert context.enable_short_suffix_attention is True
+    assert context.max_decode_steps == capacity
+    assert context.pools[0].unshared_key.shape[3] == capacity
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"num_heads": 15},
+        {"head_size": 80},
+        {"fa_version": 3},
+        {"sliding_window": (32, 0)},
+        {"softcap": 10.0},
+        {"alibi_slopes": torch.zeros(16)},
+        {"sinks": torch.zeros(16)},
+    ],
+)
+def test_static_layer_rejections(changes: dict[str, Any]) -> None:
+    args: dict[str, Any] = {
+        "num_heads": 16,
+        "num_kv_heads": 8,
+        "head_size": 128,
+        "fa_version": 2,
+        "sliding_window": (-1, -1),
+        "softcap": 0.0,
+        "alibi_slopes": None,
+        "sinks": None,
+    }
+    validate_short_suffix_attention(**args)
+    with pytest.raises(ValueError, match="Short suffix attention"):
+        validate_short_suffix_attention(**(args | changes))
+
+
+def test_context_rejects_cpu_before_allocating() -> None:
+    with pytest.raises(ValueError, match="requires CUDA"):
+        BeamAttentionContext(
+            1,
+            128,
+            8,
+            3,
+            128,
+            1,
+            torch.device("cpu"),
+            torch.float32,
+            enable_short_suffix_attention=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"std_indices": torch.tensor([0])},
+        {"suffix_max_q_len": 2},
+        {"num_prefix_indices": 3},
+        {"num_actual_tokens": 5},
+        {"prefix_indices": None},
+    ],
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_metadata_allows_batches_that_need_generic_attention(
+    changes: dict[str, Any], enabled: bool
+) -> None:
+    args: dict[str, Any] = {
+        "num_actual_tokens": 4,
+        "max_query_len": 4,
+        "query_start_loc": torch.tensor([0, 4]),
+        "max_seq_len": 128,
+        "seq_lens": torch.tensor([128]),
+        "block_table": torch.zeros(1, 8),
+        "slot_mapping": torch.arange(4),
+        "is_beam_decode": True,
+        "prefix_indices": torch.arange(4),
+        "num_prefix_indices": 4,
+        "suffix_max_q_len": 1,
+        "beam_session": SimpleNamespace(
+            beam_width=4, context=SimpleNamespace(enable_short_suffix_attention=enabled)
+        ),
+    }
+    BeamAttentionMetadata(**args)
+    metadata = BeamAttentionMetadata(**(args | changes))
+    for name, value in changes.items():
+        actual = getattr(metadata, name)
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(actual, value)
+        else:
+            assert actual == value
+
+
+def _cascade_case(batch: int, enabled: bool, routing: str) -> SimpleNamespace:
+    """Use CPU storage to exercise the real request-major cascade routing."""
+    request_width, heads, kv_heads, dim, capacity, step = 4, 2, 1, 64, 3, 1
+    width = batch * request_width
+    physical = (
+        torch.arange(batch * request_width * kv_heads * capacity * dim)
+        .reshape(batch, request_width, kv_heads, capacity, dim)
+        .float()
+    )
+    source_pool = SimpleNamespace(
+        num_kv_heads=kv_heads,
+        head_dim=dim,
+        max_decode_steps=capacity,
+        unshared_key=physical,
+        unshared_value=physical + 1000,
+    )
+    context = SimpleNamespace(
+        enable_short_suffix_attention=enabled,
+        max_beams=request_width,
+        max_decode_steps=capacity,
+        decode_step_buf=torch.tensor(step, dtype=torch.int32),
+        pools=[source_pool],
+        suffix_k_buf=torch.full((width * capacity, kv_heads, dim), float("nan")),
+        suffix_v_buf=torch.full((width * capacity, kv_heads, dim), float("nan")),
+    )
+    sessions = tuple(
+        SimpleNamespace(
+            context=context,
+            slot=slot,
+            beam_width=request_width,
+            decode_step=step,
+            is_active=True,
+            session_id=slot,
+            pools=context.pools,
+            suffix_k_buf=context.suffix_k_buf[: request_width * capacity],
+            suffix_v_buf=context.suffix_v_buf[: request_width * capacity],
+        )
+        for slot in range(batch)
+    )
+    session = sessions[0] if batch == 1 else GPUBeamAttentionBatch(sessions)
+    pool = session.pools[0]
+
+    actual_rows = beam_rows = width
+    std_indices: torch.Tensor | None = None
+    prefix_indices: torch.Tensor | None = torch.arange(width)
+    suffix_max_q_len = 1
+    if routing == "mixed":
+        assert batch == 1
+        actual_rows = 6
+        std_indices = torch.tensor([0, 3])
+        prefix_indices = torch.tensor([1, 2, 4, 5])
+    elif routing == "many_queries":
+        actual_rows = beam_rows = 2 * width
+        prefix_indices = torch.arange(beam_rows)
+        suffix_max_q_len = 2
+    elif routing == "prefix_count":
+        beam_rows = width - 1
+        prefix_indices = torch.arange(beam_rows)
+    elif routing == "total_count":
+        actual_rows = width + 1
+    elif routing == "std_only":
+        std_indices = torch.arange(width)
+        prefix_indices = None
+        beam_rows = 0
+    else:
+        assert routing == "pure"
+    query = (
+        torch.arange((actual_rows + 2) * heads * dim).reshape(actual_rows + 2, heads, dim).float()
+    )
+    output = torch.full_like(query, -10000)
+    key_cache = torch.zeros(1, 16, kv_heads, dim)
+    value_cache = torch.ones_like(key_cache)
+    suffix_offsets = torch.arange(width + 1) * suffix_max_q_len
+    if routing == "prefix_count":
+        suffix_offsets[-1] = beam_rows
+    metadata = BeamAttentionMetadata(
+        num_actual_tokens=actual_rows,
+        max_query_len=actual_rows,
+        query_start_loc=torch.tensor([0, actual_rows]),
+        max_seq_len=16,
+        seq_lens=torch.tensor([16]),
+        block_table=torch.zeros(1, 1),
+        slot_mapping=torch.arange(actual_rows),
+        num_heads=heads,
+        num_kv_heads=kv_heads,
+        std_indices=std_indices,
+        num_std_indices=0 if std_indices is None else len(std_indices),
+        std_cu_seqlens_q_device=torch.tensor([0, 2]),
+        std_seqlens_kv_device=torch.tensor([16]),
+        std_max_q_len=2,
+        std_max_seq_len=16,
+        std_block_table=torch.zeros(1, 1),
+        prefix_indices=prefix_indices,
+        num_prefix_indices=beam_rows,
+        prefix_cu_seqlens_q_device=torch.tensor([0, beam_rows]),
+        prefix_seqlens_kv_device=torch.tensor([16]),
+        prefix_max_q_len=beam_rows,
+        prefix_max_seq_len=16,
+        prefix_block_table=torch.zeros(1, 1),
+        suffix_cu_seqlens_q_device=suffix_offsets,
+        suffix_cu_seqlens_k_device=torch.arange(width + 1) * (step + 1),
+        suffix_max_q_len=suffix_max_q_len,
+        suffix_max_seq_len=step + 1,
+        is_beam_decode=True,
+        beam_session=session,
+        beam_active_mask=torch.ones(width, dtype=torch.bool),
+    )
+    return SimpleNamespace(
+        metadata=metadata,
+        query=query,
+        output=output,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        session=session,
+        pool=pool,
+        beam_rows=beam_rows,
+        width=width,
+        step=step,
+    )
+
+
+def _run_cascade(monkeypatch: pytest.MonkeyPatch, case: SimpleNamespace) -> list[str]:
+    from vllm_gr.v1.attention.backends import beam_attn_gpu, beam_short_suffix
+
+    calls: list[str] = []
+
+    def flash_attention(**kwargs: Any) -> Any:
+        query = kwargs["q"]
+        if not kwargs.get("return_softmax_lse", False):
+            calls.append("std")
+            return query + 1000
+        prefix = kwargs["k"] is case.key_cache
+        calls.append("prefix" if prefix else "suffix")
+        if not prefix:
+            total = case.width * (case.step + 1)
+            for buffer, source in (
+                (kwargs["k"], case.pool.unshared_key),
+                (kwargs["v"], case.pool.unshared_value),
+            ):
+                expected = source[case.session.slot, : case.width, :, : case.step + 1, :]
+                expected = expected.permute(0, 2, 1, 3).reshape(total, 1, 64)
+                torch.testing.assert_close(buffer[:total], expected)
+        return query + (10 if prefix else 20), torch.zeros(query.shape[1], query.shape[0])
+
+    def merge(
+        output: torch.Tensor,
+        prefix: torch.Tensor,
+        prefix_lse: torch.Tensor,
+        suffix: torch.Tensor,
+        suffix_lse: torch.Tensor,
+    ) -> None:
+        calls.append("merge")
+        assert prefix_lse.shape == suffix_lse.shape
+        output.copy_((prefix + suffix) / 2)
+
+    def fused(
+        output: torch.Tensor,
+        query: torch.Tensor,
+        prefix: torch.Tensor,
+        prefix_lse: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        slot: int,
+        step: torch.Tensor,
+        scale: float,
+        active: torch.Tensor | None,
+    ) -> None:
+        calls.append("fused")
+        assert output.data_ptr() == case.output.data_ptr()
+        assert output.shape[0] == query.shape[0] == case.width
+        assert keys is case.pool.unshared_key and values is case.pool.unshared_value
+        assert slot == case.session.slot and step is case.session.context.decode_step_buf
+        assert active is case.metadata.beam_active_mask
+        assert scale == 64**-0.5
+        assert prefix_lse.shape == (query.shape[1], query.shape[0])
+        output.copy_(prefix + 50)
+
+    monkeypatch.setattr(beam_attn_gpu, "flash_attn_varlen_func", flash_attention)
+    monkeypatch.setattr(beam_attn_gpu, "merge_attn_states", merge)
+    monkeypatch.setattr(beam_short_suffix, "merge_short_suffix_attention", fused)
+    beam_attn_gpu.cascade_attention(
+        case.output,
+        case.query,
+        case.key_cache,
+        case.value_cache,
+        case.metadata,
+        None,
+        64**-0.5,
+        0.0,
+        2,
+        beam_pool=case.pool,
+    )
+    return calls
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cascade_routes_pure_request_major_beams(
+    monkeypatch: pytest.MonkeyPatch, batch: int, enabled: bool
+) -> None:
+    case = _cascade_case(batch, enabled, "pure")
+    calls = _run_cascade(monkeypatch, case)
+    assert calls == (["prefix", "fused"] if enabled else ["prefix", "suffix", "merge"])
+    torch.testing.assert_close(
+        case.output[: case.width], case.query[: case.width] + (60 if enabled else 15)
+    )
+    assert torch.all(case.output[case.width :] == -10000)
+    if enabled:
+        assert torch.isnan(case.session.suffix_k_buf).all()
+        assert torch.isnan(case.session.suffix_v_buf).all()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cascade_mixed_batch_preserves_standard_and_scattered_beam_outputs(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    case = _cascade_case(1, enabled, "mixed")
+    calls = _run_cascade(monkeypatch, case)
+    assert calls == ["std", "prefix", "suffix", "merge"]
+    expected = torch.full_like(case.output, -10000)
+    expected[case.metadata.std_indices] = case.query[case.metadata.std_indices] + 1000
+    expected[case.metadata.prefix_indices] = case.query[case.metadata.prefix_indices] + 15
+    torch.testing.assert_close(case.output, expected)
+
+
+@pytest.mark.parametrize("routing", ["many_queries", "prefix_count", "total_count", "std_only"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cascade_nonpure_batches_use_generic_attention_without_overwriting_other_rows(
+    monkeypatch: pytest.MonkeyPatch, routing: str, enabled: bool
+) -> None:
+    case = _cascade_case(1, enabled, routing)
+    calls = _run_cascade(monkeypatch, case)
+    expected = torch.full_like(case.output, -10000)
+    if routing == "std_only":
+        assert calls == ["std"]
+        expected[: case.width] = case.query[: case.width] + 1000
+    else:
+        assert calls == ["prefix", "suffix", "merge"]
+        expected[: case.beam_rows] = case.query[: case.beam_rows] + 15
+    torch.testing.assert_close(case.output, expected)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_layer_constructor_validates_before_execution(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    import vllm.config
+
+    from vllm_gr.v1.attention.backends import beam_attn
+
+    config = SimpleNamespace(
+        additional_config={
+            "vllm_gr_enable_short_suffix_attention": enabled,
+            "vllm_gr_beam_max_width": 128,
+        }
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
+    monkeypatch.setattr(
+        beam_attn,
+        "_get_platform_execution_module",
+        lambda: SimpleNamespace(get_flash_attn_version=lambda **kwargs: 2),
+    )
+    kwargs: dict[str, Any] = {
+        "num_heads": 16,
+        "head_size": 128,
+        "scale": 128**-0.5,
+        "num_kv_heads": 8,
+        "alibi_slopes": None,
+        "sliding_window": None,
+        "kv_cache_dtype": "auto",
+        "logits_soft_cap": 10.0,
+    }
+    if enabled:
+        with pytest.raises(ValueError, match="softcap"):
+            beam_attn.BeamAttentionImpl(**kwargs)
+    else:
+        beam_attn.BeamAttentionImpl(**kwargs)
+
+    kwargs["logits_soft_cap"] = 0.0
+    impl = beam_attn.BeamAttentionImpl(**kwargs)
+    assert impl.supports_quant_query_input is (not enabled)

@@ -183,6 +183,7 @@ def admission_worker(
             beam_max_width=4,
             beam_max_decode_steps=3,
             beam_execution_mode=BeamExecutionMode.V1,
+            enable_short_suffix_attention=False,
         ),
         constraint_backend=backend,
         kv_cache_config=SimpleNamespace(

@@ -165,6 +165,9 @@ class GRConfig:
     # the Beam FULL graph (native PIECEWISE/NONE dispatch remains available).
     beam_graph_batch_size: int = 1
 
+    enable_short_suffix_attention: bool = False
+    """Fuse CUDA suffix attention and prefix merging when explicitly enabled."""
+
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
@@ -177,6 +180,7 @@ class GRConfig:
             validate_beam_worker_decision,
             validate_catalog_path,
             validate_constraint_backend,
+            validate_enable_short_suffix_attention,
             validate_npu_decode_execution,
             validate_schema_version,
             validate_vocab_offset,
@@ -237,6 +241,9 @@ class GRConfig:
         object.__setattr__(
             self, "beam_execution_mode", validate_beam_execution_mode(self.beam_execution_mode)
         )
+        validate_enable_short_suffix_attention(self.enable_short_suffix_attention)
+        if self.enable_short_suffix_attention and self.beam_max_width is None:
+            raise ValueError("beam.enable_short_suffix_attention requires max_width")
         if self.beam_engine_driven and not self.beam_worker_decision:
             raise ValueError(
                 "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "

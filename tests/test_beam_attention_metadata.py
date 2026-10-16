@@ -272,6 +272,66 @@ def test_build_routes_standard_and_beam_metadata(
         ]
 
 
+@pytest.mark.parametrize("enabled", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "case", ["mixed", "cache-lost", "cache-partial", "prefix-only"]
+)
+def test_incremental_metadata_preserves_standard_segments(case: str, enabled: bool) -> None:
+    """Enabling suffix fusion must not reject scheduler-generated std rows."""
+
+    class Registry:
+        def get_slot(self, req_id: str) -> int:
+            return 0
+
+    prefix_len = 6 if case == "cache-partial" else 4
+    cache_len = 4 if case == "mixed" else (2 if case == "cache-partial" else 0)
+    beam_query_len = 4 if case == "prefix-only" else (2 if case == "mixed" else 6)
+    req_ids = ["ordinary", "beam"] if case == "mixed" else ["beam"]
+    query_starts = [0, 2, 4] if case == "mixed" else [0, beam_query_len]
+    seq_lens = [3, 6] if case == "mixed" else [cache_len + beam_query_len]
+    common = _common_metadata(query_starts, seq_lens, [[0, 1, 2, 3]] * len(req_ids))
+    session = SimpleNamespace(
+        is_active=True,
+        beam_width=2,
+        context=SimpleNamespace(enable_short_suffix_attention=enabled, registry=Registry()),
+    )
+    token = BEAM_DATA_VAR.set(
+        {
+            "req_ids": req_ids,
+            "beam_session": session,
+            "beam_data": {
+                "beam": {
+                    "is_beam_decode": True,
+                    "prefix_len": prefix_len,
+                    "cache_len": cache_len,
+                    "beam_width": 2,
+                    "beam_decode_steps": 1,
+                    "decode_step": 0,
+                }
+            },
+        }
+    )
+    try:
+        metadata = _make_builder().build(0, common)
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+    assert metadata.is_beam_decode
+    assert metadata.beam_session is session
+    assert metadata.std_indices is not None
+    expected_std = [0, 1] if case == "mixed" else [0, 1, 2, 3]
+    expected_prefix = [] if case == "prefix-only" else ([2, 3] if case == "mixed" else [4, 5])
+    assert metadata.std_indices.tolist() == expected_std
+    prefix_indices = metadata.prefix_indices
+    assert ([] if prefix_indices is None else prefix_indices.tolist()) == expected_prefix
+    assert sorted(expected_std + expected_prefix) == list(range(query_starts[-1]))
+    assert metadata.std_seqlens_kv_cpu == ([3] if case == "mixed" else [prefix_len])
+    if expected_prefix:
+        assert metadata.suffix_max_q_len == 1
+        assert metadata.suffix_seqlens_q_cpu == [1, 1]
+        assert metadata.prefix_seqlens_kv_cpu == [prefix_len]
+
+
 def test_update_block_table_returns_copy_and_refreshes_subtables() -> None:
     old_table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
     old_slots = torch.tensor([10, 11], dtype=torch.int64)

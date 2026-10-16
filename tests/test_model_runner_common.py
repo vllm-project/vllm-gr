@@ -804,7 +804,9 @@ def test_beam_context_pool_follows_model_activation_dtype(
         cache_config=SimpleNamespace(cache_dtype="fp8"),
         # Provide a GRConfig with beam_max_width set: beam decode requests
         # without a configured pool raise in _get_or_create_beam_session.
-        _vllm_gr_config=SimpleNamespace(beam_max_width=128, beam_max_decode_steps=3),
+        _vllm_gr_config=SimpleNamespace(
+            beam_max_width=128, beam_max_decode_steps=3, enable_short_suffix_attention=False
+        ),
     )
     beam_data = {
         "beam": {
@@ -871,7 +873,9 @@ def test_beam_session_rejects_concurrent_incremental_requests() -> None:
     concurrency error is the only safe outcome.
     """
     runner = SimpleNamespace(
-        _vllm_gr_config=SimpleNamespace(beam_max_width=128, beam_max_decode_steps=3),
+        _vllm_gr_config=SimpleNamespace(
+            beam_max_width=128, beam_max_decode_steps=3, enable_short_suffix_attention=False
+        ),
         model_config=SimpleNamespace(
             dtype=torch.float16,
             get_num_kv_heads=lambda config: 2,

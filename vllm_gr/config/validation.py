@@ -199,6 +199,12 @@ def validate_vocab_slice_size(value: object) -> int | None:
         ) from exc
 
 
+def validate_enable_short_suffix_attention(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError("beam.enable_short_suffix_attention must be a boolean")
+    return value
+
+
 def validate_beam_graph_enabled(value: object) -> bool:
     if value is None:
         return True

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_gr.config import GRConfig
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker import gpu_model_runner_patch as gpu_patch
 from vllm_gr.v1.worker import model_runner_common as common
@@ -1155,7 +1156,7 @@ def test_create_beam_context_uses_grconfig_params() -> None:
     """_create_beam_context must pass gr_cfg.max_width/max_decode_steps."""
     from unittest.mock import MagicMock, patch
 
-    gr_cfg = SimpleNamespace(beam_max_width=64, beam_max_decode_steps=10)
+    gr_cfg = GRConfig(beam_max_width=64, beam_max_decode_steps=10)
     runner = SimpleNamespace(
         model_config=SimpleNamespace(
             get_num_kv_heads=lambda pc: 8,
@@ -1178,13 +1179,14 @@ def test_create_beam_context_uses_grconfig_params() -> None:
         assert call_kwargs["max_decode_steps"] == 10
         assert call_kwargs["dtype"] is torch.float16
         assert call_kwargs["max_batch"] == 1
+        assert call_kwargs["enable_short_suffix_attention"] is False
 
 
 def test_create_beam_context_dtype_from_model_config() -> None:
     """dtype must come from model_config.dtype, not hardcoded."""
     from unittest.mock import MagicMock, patch
 
-    gr_cfg = SimpleNamespace(beam_max_width=32, beam_max_decode_steps=5)
+    gr_cfg = GRConfig(beam_max_width=32, beam_max_decode_steps=5)
     runner = SimpleNamespace(
         model_config=SimpleNamespace(
             get_num_kv_heads=lambda pc: 4,
@@ -1201,6 +1203,7 @@ def test_create_beam_context_dtype_from_model_config() -> None:
         gpu_patch._create_beam_context(runner, gr_cfg)
         call_kwargs = MockCtx.call_args[1]
         assert call_kwargs["dtype"] is torch.bfloat16
+        assert call_kwargs["enable_short_suffix_attention"] is False
 
 
 # ---------------------------------------------------------------------------

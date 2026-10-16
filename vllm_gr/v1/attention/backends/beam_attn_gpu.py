@@ -228,6 +228,51 @@ def prefill_attention(
     output[: std_out.shape[0]] = std_out
 
 
+def validate_short_suffix_attention(
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    fa_version: int,
+    sliding_window: list[int] | tuple[int, int] | None,
+    softcap: float,
+    alibi_slopes: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+) -> None:
+    """Validate static layer semantics once, before graph capture/execution."""
+    if num_kv_heads <= 0 or num_heads % num_kv_heads or head_size not in (64, 128, 256):
+        raise ValueError(
+            "Short suffix attention requires integral GQA groups and head size 64/128/256"
+        )
+    if fa_version != 2:
+        raise ValueError("Short suffix attention currently requires FlashAttention 2 prefix states")
+    if (
+        sliding_window not in (None, (-1, -1), [-1, -1])
+        or softcap
+        or alibi_slopes is not None
+        or sinks is not None
+    ):
+        raise ValueError(
+            "Short suffix attention does not support sliding window, softcap, ALiBi or sinks"
+        )
+
+
+def _is_pure_beam_decode(attn_metadata: BeamAttentionMetadata, beam_width: int) -> bool:
+    """Only fuse batches whose complete output is one query per beam.
+
+    For a fixed-membership multi-request batch, beam_width is the session's
+    flattened B*W width. Mixed standard/beam rows and prefix recomputation must
+    retain the generic path's indexed output writes.
+    """
+    return (
+        beam_width > 0
+        and attn_metadata.std_indices is None
+        and attn_metadata.prefix_indices is not None
+        and attn_metadata.suffix_max_q_len == 1
+        and attn_metadata.num_prefix_indices == beam_width
+        and attn_metadata.num_actual_tokens == beam_width
+    )
+
+
 def cascade_attention(
     output: torch.Tensor,
     query: torch.Tensor,
@@ -316,6 +361,30 @@ def cascade_attention(
             D = pool.head_dim
             W = beam_session.beam_width
             max_steps = pool.max_decode_steps
+            # Pure incremental short decode: consume the pool directly and
+            # merge into the final output, avoiding packed KV and suffix FA2.
+            decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
+            if getattr(
+                beam_session.context, "enable_short_suffix_attention", False
+            ) and _is_pure_beam_decode(attn_metadata, W):
+                from vllm_gr.v1.attention.backends.beam_short_suffix import (
+                    merge_short_suffix_attention,
+                )
+
+                merge_short_suffix_attention(
+                    output[:W],
+                    beam_query,
+                    prefix_out,
+                    prefix_lse,
+                    pool.unshared_key,
+                    pool.unshared_value,
+                    slot,
+                    decode_step_buf,
+                    scale,
+                    getattr(attn_metadata, "beam_active_mask", None),
+                )
+                return
+
             suffix_k_buf = beam_session.suffix_k_buf
             suffix_v_buf = beam_session.suffix_v_buf
 

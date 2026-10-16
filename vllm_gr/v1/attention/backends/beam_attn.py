@@ -200,7 +200,30 @@ class BeamAttentionImpl(AttentionImpl):
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of heads in the layer"
             )
-        self.supports_quant_query_input = True
+        from vllm.config import get_current_vllm_config_or_none
+
+        from vllm_gr.config import GRConfig
+
+        config = GRConfig.from_vllm_config(get_current_vllm_config_or_none())
+        if config.enable_short_suffix_attention:
+            if not CUDA_DEVICE:
+                raise ValueError("Short suffix attention requires CUDA")
+            from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+                validate_short_suffix_attention,
+            )
+
+            validate_short_suffix_attention(
+                num_heads,
+                num_kv_heads,
+                head_size,
+                self.vllm_flash_attn_version,
+                self.sliding_window,
+                self.logits_soft_cap,
+                self.alibi_slopes,
+                self.sinks,
+            )
+        # The fused suffix consumes model-dtype queries, not quantized Q.
+        self.supports_quant_query_input = not config.enable_short_suffix_attention
         self.use_cascade = True
 
     @staticmethod
