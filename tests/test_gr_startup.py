@@ -97,6 +97,29 @@ def test_success_publishes_only_after_release_and_sync(
     graph.clear.assert_not_called()
 
 
+def test_opt_in_b4_startup_capture_uses_four_request_rows(
+    capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, "4")
+    worker, owner, _graph, _stream, _health = capture_runtime
+    assert startup.capture_async_forward(worker)
+    scheduled = cast(Mock, stages.get_stage_runner).call_args.args[1]
+    prefill = scheduled.gr_stage_metadata["__async_scheduling_startup_capture__"]
+    decode = owner.prepare_cpu.call_args.args[0]
+    assert len(prefill.request_ids) == 4
+    assert prefill.num_prompt_tokens == 4
+    assert prefill.num_prompt_tokens_by_request == (1, 1, 1, 1)
+    assert scheduled.num_scheduled_tokens == dict.fromkeys(prefill.request_ids, 1)
+    assert decode.kv_blocks == ((0,),) * 4
+    owner.release.assert_called_once()
+
+
+def test_invalid_startup_capture_batch_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, "3")
+    with pytest.raises(ValueError, match="must be 1, 2, or 4"):
+        startup._startup_capture_batch_size()
+
+
 def test_recoverable_failure_records_reason_only_after_cleanup(
     capture_runtime: CaptureRuntime,
 ) -> None:

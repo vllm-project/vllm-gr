@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -11,7 +12,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.beam.batch_contracts import BeamBatchParams, BeamOutputOptions
+from vllm_gr.v1.beam.batch_contracts import (
+    SUPPORTED_BEAM_BATCH_SIZES,
+    BeamBatchParams,
+    BeamOutputOptions,
+)
 from vllm_gr.v1.engine.beam_search_v1 import (
     GRDeviceStateRef,
     GRExecutionCapacity,
@@ -23,6 +28,21 @@ from vllm_gr.v1.engine.gr_async_scheduler import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
 
 logger = init_logger(__name__)
+ENV_V1_STARTUP_CAPTURE_BATCH_SIZE = "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"
+
+
+def _startup_capture_batch_size() -> int:
+    raw = os.getenv(ENV_V1_STARTUP_CAPTURE_BATCH_SIZE)
+    if raw is None:
+        return 1
+    try:
+        batch_size = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{ENV_V1_STARTUP_CAPTURE_BATCH_SIZE} must be 1, 2, or 4") from exc
+    if batch_size not in SUPPORTED_BEAM_BATCH_SIZES:
+        raise ValueError(f"{ENV_V1_STARTUP_CAPTURE_BATCH_SIZE} must be 1, 2, or 4")
+    return batch_size
+
 
 if TYPE_CHECKING:
     from vllm_gr.v1.worker.gpu_beam_stage_runner import _StageExecutionHooks
@@ -75,6 +95,10 @@ def capture_async_forward(
         raise RuntimeError("Asynchronous scheduling startup capture requires drained Beam sessions")
     worker._beam_sessions = sessions
     name = "__async_scheduling_startup_capture__"
+    batch_size = _startup_capture_batch_size()
+    request_ids = (
+        (name,) if batch_size == 1 else tuple(f"{name}_{index}" for index in range(batch_size))
+    )
     m = GRStageMetadata(
         session_id=name,
         dispatch_id=0,
@@ -86,11 +110,11 @@ def capture_async_forward(
         output_device_state=GRDeviceStateRef(name, 0),
         beam_params=BeamBatchParams(width, 1, 0.0, (), True),
         output_options=BeamOutputOptions(width, True, True, True),
-        num_prompt_tokens=1,
-        request_ids=(name,),
-        num_prompt_tokens_by_request=(1,),
+        num_prompt_tokens=batch_size,
+        request_ids=request_ids,
+        num_prompt_tokens_by_request=(1,) * batch_size,
     )
-    scheduled = SimpleNamespace(num_scheduled_tokens={name: 1})
+    scheduled = SimpleNamespace(num_scheduled_tokens=dict.fromkeys(request_ids, 1))
     setattr(scheduled, GR_STAGE_OUTPUT_ATTR, {name: m})
     owner = get_stage_runner(worker, scheduled, hooks_type=hooks_type or _StageExecutionHooks)
     owner.previous = m
@@ -103,7 +127,11 @@ def capture_async_forward(
     try:
         try:
             decode = replace(
-                m, kind=GRStageKind.DECODE, stage_index=1, decode_step=0, kv_blocks=((0,),)
+                m,
+                kind=GRStageKind.DECODE,
+                stage_index=1,
+                decode_step=0,
+                kv_blocks=((0,),) * batch_size,
             )
             owner.prepared = owner.prepare_cpu(decode, 0)
             owner._bind_attention(decode)

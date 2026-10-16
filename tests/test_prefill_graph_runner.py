@@ -617,6 +617,47 @@ def test_prefill_bucket_config_validation(monkeypatch: pytest.MonkeyPatch) -> No
         get_default_buckets()
 
 
+def test_opt_in_graded_b4_prefill_graph_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr.v1.worker.prefill_graph_common import (
+        ENV_PREFILL_GRAPH_BUCKETS,
+        ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS,
+        PREFILL_GRAPH_CAPTURE_NUM_REQS,
+        get_default_buckets,
+        get_prefill_graph_capture_num_reqs,
+    )
+
+    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKETS, "256,512,1024,2048,4096,8192,12288,24576")
+    monkeypatch.setenv(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS, "4")
+    assert get_default_buckets() == [256, 512, 1024, 2048, 4096, 8192, 12288, 24576]
+    assert get_prefill_graph_capture_num_reqs() == (4,)
+
+    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKETS, "256,1024,512")
+    with pytest.raises(ValueError, match="strictly increasing"):
+        get_default_buckets()
+    # The target branch may capture additional widths (including 2); choose
+    # one beyond the supported capture widths in this version.
+    monkeypatch.setenv(
+        ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS,
+        str(max(PREFILL_GRAPH_CAPTURE_NUM_REQS) + 1),
+    )
+    with pytest.raises(ValueError, match="must contain only"):
+        get_prefill_graph_capture_num_reqs()
+
+
+def test_custom_b4_bucket_limit_uses_total_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_BUCKETS
+
+    runner = MockModelRunner()
+    setattr(runner, "scheduler_config", SimpleNamespace(max_num_batched_tokens=24))
+    setattr(runner, "model_config", SimpleNamespace(max_model_len=8))
+
+    assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8]
+    monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKETS, "4,8,12,24")
+    assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8, 12, 24]
+
+
 def test_npu_max_kvlen_from_model_config() -> None:
     from types import SimpleNamespace
 

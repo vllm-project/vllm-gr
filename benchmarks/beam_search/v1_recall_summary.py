@@ -1,0 +1,321 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Summarize repeated fixed-sample Beam V1 Recall gates without loading a model."""
+
+import argparse
+import json
+import math
+import os
+import statistics
+from pathlib import Path
+
+TASKS = ("video", "ad", "product", "label_cond", "interactive")
+IDENTITY_KEYS = (
+    "source_sha256",
+    "sample_ids",
+    "artifact_digest",
+    "tokenizer_digest",
+    "interactive_tailcut_count",
+    "engine_config",
+    "prefill_graph_buckets",
+    "prefill_graph_capture_num_reqs",
+    "v1_startup_capture_batch_size",
+)
+
+
+def _read_seconds(path):
+    value = int(path.read_text(encoding="utf-8"))
+    if value < 0:
+        raise ValueError(f"negative elapsed time in {path}")
+    return value
+
+
+def _task_result(run_dir, task):
+    files = list((run_dir / task).glob("*_bs4_1000.json"))
+    if len(files) != 1:
+        raise ValueError(f"{run_dir.name}/{task}: expected one B=4 1000-sample metrics file")
+    metrics = json.loads(files[0].read_text(encoding="utf-8"))
+    if (
+        metrics.get("task") != task
+        or metrics.get("total_samples") != 1000
+        or metrics.get("batch_size") != 4
+        or metrics.get("beam_width") != 128
+        or metrics.get("temperature") != 0.6
+        or len(metrics.get("sample_ids", [])) != 1000
+        or not all(
+            isinstance(metrics.get(key), (int, float))
+            and math.isfinite(metrics[key])
+            and 0 <= metrics[key] <= 1
+            for key in ("recall@32", "pid_recall@32")
+        )
+        or not isinstance(metrics.get("elapsed_time"), (int, float))
+        or not math.isfinite(metrics["elapsed_time"])
+        or metrics["elapsed_time"] < 0
+    ):
+        raise ValueError(f"{run_dir.name}/{task}: incomplete or invalid accuracy result")
+    identity = {key: metrics[key] for key in IDENTITY_KEYS if key != "engine_config"}
+    identity["engine_config"] = {
+        "max_model_len": metrics["engine_config"]["max_model_len"],
+        "max_num_batched_tokens": metrics["engine_config"]["max_num_batched_tokens"],
+    }
+    return {
+        "recall@32": metrics["recall@32"],
+        "pid_recall@32": metrics["pid_recall@32"],
+        "inference_seconds": metrics["elapsed_time"],
+        "task_work_seconds": _read_seconds(run_dir / task / "wall_seconds.txt"),
+        "identity": identity,
+    }
+
+
+def _stats(values, scale=1):
+    return {
+        "min": min(values) * scale,
+        "median": statistics.median(values) * scale,
+        "max": max(values) * scale,
+        "mean": statistics.mean(values) * scale,
+        "range": (max(values) - min(values)) * scale,
+        "sample_stddev": (statistics.stdev(values) if len(values) > 1 else 0.0) * scale,
+        "max_abs_deviation_from_median": max(
+            abs(value - statistics.median(values)) for value in values
+        )
+        * scale,
+    }
+
+
+def summarize(root, repeats, baseline_path=None):
+    if repeats <= 0:
+        raise ValueError("repeats must be positive")
+    candidate = {
+        "schema_version": 1,
+        "commit": (root / "commit.txt").read_text(encoding="utf-8").strip(),
+        "metric_scale": "fraction",
+        "sample_selection": "pandas sample(n=1000, random_state=42) on source row IDs",
+        "batch_size": 4,
+        "beam_width": 128,
+        "temperature": 0.6,
+        "sample_count_per_task": 1000,
+        "execution_groups": [["video", "ad", "label_cond", "interactive"], ["product"]],
+        "graph_profile": {
+            "prefill_bucket_grid": os.environ["VLLM_GR_PREFILL_GRAPH_BUCKETS"],
+            "prefill_capture_num_reqs": os.environ["VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS"],
+            "prefill_kv_bound": os.environ["VLLM_GR_PREFILL_GRAPH_KV_BOUND"],
+            "v1_startup_capture_batch_size": os.environ["VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"],
+        },
+        "tasks": {},
+    }
+    runs = []
+    for index in range(1, repeats + 1):
+        run_dir = root / "runs" / f"run-{index:02d}"
+        run = {
+            "number": index,
+            "wall_seconds": _read_seconds(run_dir / "total_wall_seconds.txt"),
+            "sid_group_wall_seconds": _read_seconds(
+                run_dir / "groups" / "sid2pid" / "wall_seconds.txt"
+            ),
+            "product_group_wall_seconds": _read_seconds(
+                run_dir / "groups" / "sid2iid" / "wall_seconds.txt"
+            ),
+            "tasks": {task: _task_result(run_dir, task) for task in TASKS},
+        }
+        if index == 1:
+            candidate["tasks"] = {
+                task: {
+                    "recall@32": run["tasks"][task]["recall@32"],
+                    "pid_recall@32": run["tasks"][task]["pid_recall@32"],
+                    **run["tasks"][task]["identity"],
+                }
+                for task in TASKS
+            }
+        else:
+            for task in TASKS:
+                for key in IDENTITY_KEYS:
+                    if run["tasks"][task]["identity"][key] != candidate["tasks"][task][key]:
+                        raise ValueError(f"run {index}/{task}: input differs from run 1: {key}")
+        runs.append(run)
+
+    variability = {
+        task: {
+            "sid_recall32_pp": _stats([run["tasks"][task]["recall@32"] for run in runs], scale=100),
+            "pid_recall32_pp": _stats(
+                [run["tasks"][task]["pid_recall@32"] for run in runs], scale=100
+            ),
+        }
+        for task in TASKS
+    }
+    total_times = _stats([run["wall_seconds"] for run in runs])
+    failures = []
+    baseline = None
+    floors = None
+    suspected_tasks = []
+    if baseline_path is not None:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        if (
+            baseline.get("schema_version") != 1
+            or baseline.get("batch_size") != 4
+            or baseline.get("beam_width") != 128
+            or baseline.get("temperature") != 0.6
+            or baseline.get("sample_count_per_task") != 1000
+            or baseline.get("execution_groups") != candidate["execution_groups"]
+            or baseline.get("graph_profile") != candidate["graph_profile"]
+            or set(baseline.get("tasks", {})) != set(TASKS)
+        ):
+            raise ValueError("invalid B=4 1000-sample Recall baseline")
+        calibration = baseline.get("calibration_sid_recall32")
+        if not isinstance(calibration, dict) or set(calibration) != set(TASKS):
+            raise ValueError("baseline must contain ten historical SID results per task")
+        floors = {}
+        for task in TASKS:
+            expected = baseline["tasks"][task]
+            for key in IDENTITY_KEYS:
+                if candidate["tasks"][task][key] != expected.get(key):
+                    raise ValueError(f"{task}: baseline input differs: {key}")
+            values = calibration[task]
+            if (
+                not isinstance(values, list)
+                or len(values) != 10
+                or any(
+                    not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or not 0 <= value <= 1
+                    for value in values
+                )
+                or values[0] != expected["recall@32"]
+            ):
+                raise ValueError(f"{task}: invalid historical SID calibration")
+            floors[task] = min(values)
+            if runs[0]["tasks"][task]["recall@32"] < floors[task]:
+                suspected_tasks.append(task)
+        if repeats >= 3:
+            for task in suspected_tasks:
+                if all(run["tasks"][task]["recall@32"] < floors[task] for run in runs[:3]):
+                    failures.append(
+                        f"{task}: SID Recall@32 below historical minimum "
+                        f"{floors[task]:.4%} in all first three runs"
+                    )
+    confirmation_required = bool(suspected_tasks) and repeats < 3
+    result = {
+        "schema_version": 1,
+        "repeat_count": repeats,
+        "first_run_baseline_candidate": "b4_baseline_candidate.json",
+        "runs": runs,
+        "total_wall_seconds": _read_seconds(root / "total_wall_seconds.txt"),
+        "per_run_wall_seconds": total_times,
+        "task_variability": variability,
+        "baseline_file": str(baseline_path) if baseline_path is not None else None,
+        "baseline_sid_recall32_floors": floors,
+        "suspected_tasks": suspected_tasks,
+        "confirmation_required": confirmation_required,
+        "confirmation_runs": 3 if baseline is not None else None,
+        "baseline_failures": failures,
+    }
+    lines = [
+        f"## Beam V1 B=4 OneRec Recall@32: {repeats} repeats × five tasks × 1000 samples",
+        "",
+        "Each repeat starts two fresh engines, runs the same fixed samples, and includes "
+        "model initialization, constraint artifact construction and graph capture in "
+        "its wall time. Model download and source-catalog generation happen outside "
+        "these timings.",
+        "",
+        (
+            "The baseline candidate is **run 1 only**. No Recall floor is configured."
+            if baseline_path is None
+            else "The committed fixed-sample baseline uses each task's minimum "
+            "SID Recall@32 from ten historical runs. If run 1 falls below it, "
+            "two fresh runs confirm the result. The gate fails only if the same "
+            "task is below its historical minimum in all first three runs."
+        ),
+        "",
+        "| Run | Five-task wall s | Shared SID group s | Product group s |",
+        "| ---: | ---: | ---: | ---: |",
+    ]
+    for run in runs:
+        lines.append(
+            f"| {run['number']} | {run['wall_seconds']} | "
+            f"{run['sid_group_wall_seconds']} | {run['product_group_wall_seconds']} |"
+        )
+    lines.extend(
+        (
+            "",
+            "| Task | SID min | SID median | SID max | SID range (pp) | "
+            "SID sample SD (pp) | PID range (pp) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        )
+    )
+    for task in TASKS:
+        sid = variability[task]["sid_recall32_pp"]
+        pid = variability[task]["pid_recall32_pp"]
+        lines.append(
+            f"| {task} | {sid['min']:.4f}% | {sid['median']:.4f}% | "
+            f"{sid['max']:.4f}% | {sid['range']:.4f} | "
+            f"{sid['sample_stddev']:.4f} | {pid['range']:.4f} |"
+        )
+    if baseline is not None:
+        lines.extend(
+            (
+                "",
+                "| Task | Historical run 1 | Historical minimum | Current run 1 |",
+                "| --- | ---: | ---: | ---: |",
+            )
+        )
+        for task in TASKS:
+            expected = baseline["tasks"][task]["recall@32"]
+            current = runs[0]["tasks"][task]["recall@32"]
+            lines.append(f"| {task} | {expected:.4%} | {floors[task]:.4%} | {current:.4%} |")
+    lines.extend(("", "| Task | Run | SID Recall@32 | PID Recall@32 | Inference s | Task work s |"))
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+    for task in TASKS:
+        for run in runs:
+            item = run["tasks"][task]
+            lines.append(
+                f"| {task} | {run['number']} | {item['recall@32']:.4%} | "
+                f"{item['pid_recall@32']:.4%} | {item['inference_seconds']:.1f} | "
+                f"{item['task_work_seconds']} |"
+            )
+    lines.extend(
+        (
+            "",
+            f"Per-repeat wall time: min {total_times['min']:.0f} s, "
+            f"median {total_times['median']:.1f} s, max {total_times['max']:.0f} s, "
+            f"sample SD {total_times['sample_stddev']:.1f} s.",
+            f"All {repeats} repeats wall time: {result['total_wall_seconds']} s.",
+            "This variation is on one fixed 1000-sample set; it does not estimate "
+            "uncertainty relative to the full test sets.",
+        )
+    )
+    if baseline_path is not None:
+        status = (
+            "FAILED" if failures else "pending confirmation" if confirmation_required else "passed"
+        )
+        lines.append(f"Baseline check: {status}.")
+        if confirmation_required:
+            lines.append("Confirmation needed for: " + ", ".join(suspected_tasks) + ".")
+    if failures:
+        lines.extend(("", *[f"- {failure}" for failure in failures]))
+    return candidate, result, "\n".join(lines) + "\n", failures
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--result-dir", type=Path, required=True)
+    parser.add_argument("--repeats", type=int, required=True)
+    args = parser.parse_args()
+    baseline_name = os.environ.get("V1_RECALL_BASELINE_FILE")
+    baseline_path = Path(baseline_name) if baseline_name else None
+    candidate, result, summary, failures = summarize(args.result_dir, args.repeats, baseline_path)
+    (args.result_dir / "b4_baseline_candidate.json").write_text(
+        json.dumps(candidate, indent=2) + "\n", encoding="utf-8"
+    )
+    (args.result_dir / "b4_repeat_summary.json").write_text(
+        json.dumps(result, indent=2) + "\n", encoding="utf-8"
+    )
+    (args.result_dir / "b4_repeat_summary.md").write_text(summary, encoding="utf-8")
+    print(summary, flush=True)
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(summary)
+    if failures:
+        raise SystemExit("Recall gate failed: " + "; ".join(failures))
+
+
+if __name__ == "__main__":
+    main()

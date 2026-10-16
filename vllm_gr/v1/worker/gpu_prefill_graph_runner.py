@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -13,9 +14,12 @@ from vllm_gr.config import BeamExecutionMode, GRConfig
 from vllm_gr.utils.npu_adapter import is_cuda_available
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_ENABLE_PREFILL_GRAPH,
+    ENV_PREFILL_GRAPH_BUCKETS,
     PREFILL_GRAPH_CAPTURE_NUM_REQS,
     BasePrefillGraphRunner,
     get_kv_capture_bound,
+    get_max_context_len,
+    get_prefill_graph_capture_num_reqs,
     is_prefill_graph_enabled,
 )
 
@@ -69,12 +73,11 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             scheduler_config = getattr(
                 getattr(runner, "vllm_config", None), "scheduler_config", None
             )
-        max_num_seqs = int(
-            getattr(scheduler_config, "max_num_seqs", PREFILL_GRAPH_CAPTURE_NUM_REQS[-1])
-        )
-        capture_num_reqs = tuple(
-            count for count in PREFILL_GRAPH_CAPTURE_NUM_REQS if count <= max_num_seqs
-        )
+        configured_num_reqs = get_prefill_graph_capture_num_reqs()
+        max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", configured_num_reqs[-1]))
+        capture_num_reqs = tuple(count for count in configured_num_reqs if count <= max_num_seqs)
+        custom_total_buckets = os.getenv(ENV_PREFILL_GRAPH_BUCKETS) is not None
+        max_context_len = get_max_context_len(runner)
         # Legacy Beam Search dispatches one request at a time. Keep its
         # original capture footprint; reserve B=4 graphs for V1 sessions.
         mode = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None)).beam_execution_mode
@@ -135,6 +138,25 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     base_len = bucket // num_reqs
                     rem = bucket % num_reqs
                     req_lens = [base_len + (1 if i < rem else 0) for i in range(num_reqs)]
+                    if custom_total_buckets and max_context_len:
+                        if any(length > max_context_len for length in req_lens):
+                            raise ValueError(
+                                f"prefill graph bucket {bucket} exceeds the per-request "
+                                f"model limit {max_context_len} at B={num_reqs}"
+                            )
+                        if bucket > max_context_len:
+                            # The bucket is a sum over requests; dummy RoPE
+                            # positions must still restart at zero per row.
+                            positions = torch.cat(
+                                [
+                                    torch.arange(length, device=runner.device, dtype=torch.int64)
+                                    for length in req_lens
+                                ]
+                            )
+                            if buf.positions_buf.ndim == 1:
+                                buf.positions_buf.copy_(positions)
+                            else:
+                                buf.positions_buf[:] = positions
 
                     # Set up seq_lens and query_start_loc for (bucket, num_reqs)
                     if hasattr(runner, "seq_lens") and hasattr(runner, "optimistic_seq_lens_cpu"):
@@ -157,7 +179,11 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                         num_tokens=bucket,
                         num_tokens_padded=bucket,
                         num_reqs=num_reqs,
-                        max_query_len=bucket,
+                        max_query_len=(
+                            min(bucket, max_context_len)
+                            if custom_total_buckets and max_context_len
+                            else bucket
+                        ),
                         ubatch_slices=None,
                         for_cudagraph_capture=True,
                         slot_mappings=slot_mappings_by_group,
@@ -178,12 +204,14 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     # touching buckets that already cover their contexts, so
                     # miss-path graphs stay byte-identical to the default.
                     bound = self._kv_capture_bound(bucket)
-                    if bound < bucket:
+                    if custom_total_buckets and max_context_len:
+                        bound = min(bound, max_context_len)
+                    if bound < max(req_lens):
                         logger.warning(
-                            "Prefill graph KV bound %d is below bucket %d; replays "
+                            "Prefill graph KV bound %d is below request length %d; replays "
                             "for this bucket can never cover their own query extent.",
                             bound,
-                            bucket,
+                            max(req_lens),
                         )
                     self._apply_max_seq_len_bound(attn_metadata, bound)
                     buf.max_seq_len_bounds[num_reqs] = bound

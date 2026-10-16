@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from abc import ABC
+from collections import Counter
 from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any, Dict, Optional, Type
@@ -180,6 +181,7 @@ class DataLoaderWrapper:
         task_name: str,
         split: str = "test",
         sample_size: Optional[Any] = None,
+        sample_ids: Optional[list[int | str]] = None,
     ):
         """Load data using new loader system"""
         if task_name not in self._loader_cache:
@@ -192,7 +194,7 @@ class DataLoaderWrapper:
             )
 
         loader = self._loader_cache[task_name]
-        return loader.load_data(split=split, sample_size=sample_size)
+        return loader.load_data(split=split, sample_size=sample_size, sample_ids=sample_ids)
 
 
 class BaseLoader(ABC):
@@ -228,7 +230,10 @@ class BaseLoader(ABC):
             )
 
     def load_data(
-        self, split: str = "test", sample_size: Optional[Any] = None
+        self,
+        split: str = "test",
+        sample_size: Optional[Any] = None,
+        sample_ids: Optional[list[int | str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Load data for the task in messages-based format
@@ -236,6 +241,8 @@ class BaseLoader(ABC):
         Args:
             split: Dataset split (default "test")
             sample_size: Override sample size (can be int, "full", or None to use task config)
+            sample_ids: Exact source parquet row indices, preserving input order.
+                Mutually exclusive with sample_size.
 
         Returns:
             Dictionary mapping sample_id to sample data:
@@ -250,6 +257,21 @@ class BaseLoader(ABC):
                 }
             }
         """
+        if sample_ids is not None:
+            if sample_size is not None:
+                raise ValueError("sample_ids and sample_size are mutually exclusive")
+            df = self._load_dataframe(split)
+            normalized_ids = [int(sample_id) for sample_id in sample_ids]
+            duplicates = [
+                sample_id for sample_id, count in Counter(normalized_ids).items() if count > 1
+            ]
+            if duplicates:
+                raise ValueError(f"sample_ids contains duplicates: {duplicates[:10]}")
+            missing = [sample_id for sample_id in normalized_ids if sample_id not in df.index]
+            if missing:
+                raise ValueError(f"sample_ids are not present in {self.task_name}: {missing[:10]}")
+            return self._process_dataframe(df.loc[normalized_ids])
+
         # Determine effective sample size
         if sample_size is not None:
             if sample_size == "full":

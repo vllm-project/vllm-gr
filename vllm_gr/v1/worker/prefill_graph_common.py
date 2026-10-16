@@ -53,6 +53,8 @@ ENV_ENABLE_PREFILL_GRAPH = "VLLM_ENABLE_PREFILL_CUDAGRAPH"
 ENV_PREFILL_GRAPH_BUCKET_STEP = "VLLM_GR_PREFILL_GRAPH_BUCKET_STEP"
 ENV_PREFILL_GRAPH_MAX_BUCKET = "VLLM_GR_PREFILL_GRAPH_MAX_BUCKET"
 ENV_PREFILL_GRAPH_KV_BOUND = "VLLM_GR_PREFILL_GRAPH_KV_BOUND"
+ENV_PREFILL_GRAPH_BUCKETS = "VLLM_GR_PREFILL_GRAPH_BUCKETS"
+ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS = "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS"
 
 
 def _read_positive_int_env(name: str, default: int) -> int:
@@ -98,6 +100,12 @@ def get_default_buckets() -> list[int]:
     baked for the same request and would drop replays the previous grid
     admitted. Opting in with the bound keeps the default grid unchanged.
     """
+    custom = os.getenv(ENV_PREFILL_GRAPH_BUCKETS)
+    if custom is not None:
+        buckets = _parse_int_list_env(ENV_PREFILL_GRAPH_BUCKETS, custom)
+        if get_kv_capture_bound() is not None:
+            buckets = sorted(set(buckets) | {b for b in SMALL_PREFILL_BUCKETS if b <= buckets[-1]})
+        return buckets
     step = _read_positive_int_env(ENV_PREFILL_GRAPH_BUCKET_STEP, PREFILL_GRAPH_BUCKET_STEP_DEFAULT)
     max_bucket = _read_positive_int_env(
         ENV_PREFILL_GRAPH_MAX_BUCKET, PREFILL_GRAPH_MAX_BUCKET_DEFAULT
@@ -119,6 +127,30 @@ def get_default_buckets() -> list[int]:
         # its meaning.
         buckets.update(b for b in SMALL_PREFILL_BUCKETS if b <= max_bucket)
     return sorted(buckets)
+
+
+def _parse_int_list_env(name: str, raw: str) -> list[int]:
+    try:
+        values = [int(part.strip()) for part in raw.split(",")]
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a comma-separated list of positive integers") from exc
+    if not values or any(value <= 0 for value in values) or values != sorted(set(values)):
+        raise ValueError(f"{name} must be a strictly increasing list of positive integers")
+    return values
+
+
+def get_prefill_graph_capture_num_reqs() -> tuple[int, ...]:
+    """Allow one process to capture only the request counts it will serve."""
+    raw = os.getenv(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS)
+    if raw is None:
+        return PREFILL_GRAPH_CAPTURE_NUM_REQS
+    values = _parse_int_list_env(ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS, raw)
+    if any(value not in PREFILL_GRAPH_CAPTURE_NUM_REQS for value in values):
+        raise ValueError(
+            f"{ENV_PREFILL_GRAPH_CAPTURE_NUM_REQS} must contain only "
+            f"{PREFILL_GRAPH_CAPTURE_NUM_REQS}"
+        )
+    return tuple(values)
 
 
 def get_max_context_len(runner: Any) -> int:
@@ -358,16 +390,21 @@ class BasePrefillGraphRunner:
         )
         self.buckets = sorted(buckets or get_default_buckets())
 
-        # Requests cannot exceed either scheduler/model limit, so larger
-        # graphs are unreachable and waste memory. The set() dedupes buckets
-        # clamped to the same effective maximum.
+        # The default grid is bounded by max_model_len. An explicitly
+        # configured multi-request grid counts tokens across all requests,
+        # so the per-request model limit must not clamp its total length.
         scheduler_config = getattr(model_runner, "scheduler_config", None)
         if scheduler_config is None:
             vllm_config = getattr(model_runner, "vllm_config", None)
             scheduler_config = getattr(vllm_config, "scheduler_config", None)
         max_num_batched_tokens = getattr(scheduler_config, "max_num_batched_tokens", None)
         max_model_len = get_max_context_len(model_runner)
-        bucket_limits = [int(limit) for limit in (max_num_batched_tokens, max_model_len) if limit]
+        limits = (
+            (max_num_batched_tokens,)
+            if os.getenv(ENV_PREFILL_GRAPH_BUCKETS) is not None
+            else (max_num_batched_tokens, max_model_len)
+        )
+        bucket_limits = [int(limit) for limit in limits if limit]
         if bucket_limits:
             effective_max_bucket = min(bucket_limits)
             clamped = sorted({min(b, effective_max_bucket) for b in self.buckets})

@@ -43,7 +43,9 @@ def process_json(input_file_path: str, output_file_path: str) -> int:
         raise ValueError(f"Failed to decode JSON from: {input_path}") from error
 
     if not isinstance(data, dict):
-        raise ValueError(f"Expected JSON object in {input_path}, got {type(data).__name__} instead")
+        raise ValueError(  # noqa: TRY004 - preserve the CLI's existing validation error
+            f"Expected JSON object in {input_path}, got {type(data).__name__} instead"
+        )
 
     result_list: list[list[str]] = []
 
@@ -78,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         help="Dataset root path containing sid2pid.json. Default: data.",
     )
     parser.add_argument(
+        "--mapping-file",
+        default="sid2pid.json",
+        choices=("sid2pid.json", "sid2iid.json"),
+        help="SID mapping to convert; product uses sid2iid.json.",
+    )
+    parser.add_argument(
         "--output-path",
         "-o",
         default="catalog.json",
@@ -97,7 +105,7 @@ def main() -> int:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
 
-    input_path = Path(args.dataset_path) / "sid2pid.json"
+    input_path = Path(args.dataset_path) / args.mapping_file
     try:
         count = process_json(str(input_path), args.output_path)
     except (FileNotFoundError, ValueError) as error:
