@@ -100,6 +100,28 @@ def _set_sid_recall(root: Path, run: int, task: str, recall: float) -> None:
     file.write_text(json.dumps(metrics), encoding="utf-8")
 
 
+def test_npu_shared_prefill_capture_requires_b4_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    for task in TASKS:
+        file = tmp_path / "runs" / "run-01" / task / f"model_{task}_bw128_bs4_1000.json"
+        metrics = json.loads(file.read_text(encoding="utf-8"))
+        metrics["graph_runtime"]["device"] = "npu"
+        metrics["graph_runtime"]["captures"] = [[[16, 1]]]
+        file.write_text(json.dumps(metrics), encoding="utf-8")
+
+    _, _, _, failures = summarize(tmp_path, 1)
+    assert not failures
+
+    file = tmp_path / "runs" / "run-01" / "video" / "model_video_bw128_bs4_1000.json"
+    metrics = json.loads(file.read_text(encoding="utf-8"))
+    metrics["graph_runtime"]["dispatches"] = {"fallback:4:no_graph": 250}
+    file.write_text(json.dumps(metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="B=4 graph execution"):
+        summarize(tmp_path, 1)
+
+
 def test_ten_repeats_report_variation_and_confirm_task_specific_regression(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -162,8 +184,41 @@ def test_repeated_gate_rejects_changed_sample_identity(
     metrics = json.loads(file.read_text(encoding="utf-8"))
     metrics["sample_ids"][0] = -1
     file.write_text(json.dumps(metrics), encoding="utf-8")
-    with pytest.raises(ValueError, match="run 2/ad: input differs from run 1: sample_ids"):
-        summarize(tmp_path, 10)
+    _, result, summary, failures = summarize(tmp_path, 10)
+    assert len(failures) == 1
+    assert "run 2/ad: input differs from run 1: sample_ids" in failures[0]
+    assert "first differing index 0" in summary
+    assert result["baseline_failures"] == failures
+
+
+def test_baseline_digest_mismatch_keeps_scores_in_failure_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    candidate, _, _, _ = summarize(tmp_path, 3)
+    candidate["calibration_sid_recall32"] = {
+        task: [candidate["tasks"][task]["recall@32"]] * 10 for task in TASKS
+    }
+    candidate["tasks"]["video"]["artifact_digest"] = "baseline-artifact"
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(candidate), encoding="utf-8")
+
+    _, result, summary, failures = summarize(tmp_path, 3, baseline_path)
+    assert len(failures) == 1
+    assert "expected='baseline-artifact', actual='artifact'" in failures[0]
+    assert "| video | 1 | 4.0010% |" in summary
+    assert "Baseline check: FAILED." in summary
+    assert result["baseline_failures"] == failures
+
+    monkeypatch.setenv("V1_RECALL_BASELINE_FILE", str(baseline_path))
+    monkeypatch.setattr(
+        sys, "argv", ["v1_recall_summary", "--result-dir", str(tmp_path), "--repeats", "3"]
+    )
+    with pytest.raises(SystemExit, match="Recall gate failed"):
+        main()
+    output = capsys.readouterr().out
+    assert "expected='baseline-artifact', actual='artifact'" in output
+    assert "| video | 1 | 4.0010% |" in output
 
 
 def test_cli_writes_repeat_artifacts_and_step_summary(

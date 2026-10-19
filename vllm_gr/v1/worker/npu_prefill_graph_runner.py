@@ -85,6 +85,14 @@ def build_update_lists_from_metadata(
     return build_update_lists(token_counts, bucket)
 
 
+def _stage_block_table(live: torch.Tensor, staging: torch.Tensor, num_reqs: int) -> torch.Tensor:
+    """Keep FIA's block table contiguous and at the captured buffer address."""
+    staged = staging[:num_reqs]
+    staged.zero_()
+    staged[:, : live.shape[1]].copy_(live[:num_reqs], non_blocking=True)
+    return staged
+
+
 class NPUPrefillGraphRunner(BasePrefillGraphRunner):
     """Manages Ascend Graph capture and execution on Huawei Ascend NPUs.
 
@@ -296,7 +304,15 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         blocks_per_req = (max_req_len + builder.block_size - 1) // builder.block_size
         if num_blocks is None:
             num_blocks = blocks_per_req * num_reqs
-        block_table = torch.zeros((num_reqs, blocks_per_req), dtype=torch.int32, device=self.device)
+        # Capture with the same contiguous, full-width table used by task
+        # updates. A column slice of the padded table has a larger row stride
+        # than its width and triggers aclnnContiguous inside FIA on replay.
+        block_table = (
+            buf.block_table_buf[:num_reqs]
+            if buf.block_table_buf is not None
+            else torch.zeros((num_reqs, blocks_per_req), dtype=torch.int32, device=self.device)
+        )
+        block_table.zero_()
         blk = 0
         for r in range(num_reqs):
             for c in range(blocks_per_req):
@@ -539,16 +555,20 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         # reading it, so the copy is ordered before the replay's reads.
         live_bt = meta.block_table
         bt_buf = buf.block_table_buf
-        if bt_buf is None or live_bt.shape[1] > bt_buf.shape[1]:
+        if (
+            bt_buf is None
+            or live_bt.ndim != 2
+            or live_bt.shape[0] < num_reqs
+            or live_bt.shape[1] > bt_buf.shape[1]
+        ):
             logger.warning(
-                "NPU prefill graph replay: block table shape %s exceeds the "
-                "staged buffer; falling back to eager prefill.",
+                "NPU prefill graph replay: block table shape %s is incompatible "
+                "with %d requests and the staged buffer; falling back to eager prefill.",
                 tuple(live_bt.shape),
+                num_reqs,
             )
             return None
-        num_cols = min(live_bt.shape[1], bt_buf.shape[1])
-        bt_staged = bt_buf[: live_bt.shape[0], :num_cols]
-        bt_staged.copy_(live_bt[: live_bt.shape[0], :num_cols], non_blocking=True)
+        bt_staged = _stage_block_table(live_bt, bt_buf, num_reqs)
 
         from vllm_gr.v1.attention.backends.beam_attn_npu import update_graph_params
 

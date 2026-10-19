@@ -4,6 +4,11 @@ set -euo pipefail
 
 repo_root="${V1_PERF_REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$repo_root"
+device="${BENCHMARK_DEVICE:-gpu}"
+if [[ "$device" != "gpu" && "$device" != "npu" ]]; then
+  echo "BENCHMARK_DEVICE must be gpu or npu, got: $device" >&2
+  exit 2
+fi
 # A/B can share one driver while importing each side's runtime from its own tree.
 driver="${V1_PERF_DRIVER:-$repo_root/benchmarks/beam_search/v1_performance_gate.py}"
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
@@ -19,7 +24,11 @@ warmup_runs="${V1_PERF_WARMUP_RUNS:-2}"
 measured_runs="${V1_PERF_MEASURED_RUNS:-5}"
 request_timeout="${V1_PERF_REQUEST_TIMEOUT:-180}"
 max_model_len="${V1_PERF_MAX_MODEL_LEN:-8192}"
-gpu_memory_utilization="${V1_PERF_GPU_MEMORY_UTILIZATION:-0.7}"
+default_memory_utilization=0.7
+if [[ "$device" == "npu" ]]; then
+  default_memory_utilization=0.5
+fi
+gpu_memory_utilization="${V1_PERF_GPU_MEMORY_UTILIZATION:-$default_memory_utilization}"
 read -r -a batch_sizes <<< "${V1_PERF_BATCH_SIZES:-1 2 4}"
 max_batch_size=0
 for size in "${batch_sizes[@]}"; do
@@ -33,6 +42,7 @@ if [[ ! -d "$model" ]]; then
   revision_args=(--revision "${V1_PERF_MODEL_REVISION:-cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b}")
 fi
 args=(
+  --device "$device"
   --model "$model"
   "${revision_args[@]}"
   --triples "$triples"
@@ -53,9 +63,11 @@ args=(
 mkdir -p "$output_dir"
 echo "V1 performance output: $output_dir"
 git -C "$repo_root" rev-parse HEAD | tee "$output_dir/commit.txt"
-if command -v nvidia-smi >/dev/null 2>&1; then
+if [[ "$device" == "gpu" ]] && command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv \
     | tee "$output_dir/gpu.csv" || true
+elif [[ "$device" == "npu" ]] && command -v npu-smi >/dev/null 2>&1; then
+  npu-smi info | tee "$output_dir/npu.txt" || true
 fi
 python "$driver" prepare "${args[@]}"
 cat "$output_dir/setup.json"
@@ -77,7 +89,15 @@ stop_server() {
     server_pid=""
   fi
 }
-trap stop_server EXIT
+on_exit() {
+  local status=$?
+  stop_server
+  if [[ "$device" == "npu" && "$status" -ne 0 && -s "$output_dir/server.log" ]]; then
+    echo "NPU V1 online server log (last 80 lines):" >&2
+    tail -80 "$output_dir/server.log" >&2
+  fi
+}
+trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 

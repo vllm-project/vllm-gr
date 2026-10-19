@@ -77,7 +77,7 @@ def prepare(args: argparse.Namespace) -> None:
         },
         "constraint_table": {
             "enabled": True,
-            "backend": "cuda",
+            "backend": "cuda" if args.device == "gpu" else "npu",
             "max_top_k": args.beam_width,
             "path": str(artifact.resolve()),
             "format": "constraint_table_v1",
@@ -85,6 +85,8 @@ def prepare(args: argparse.Namespace) -> None:
             "tokenizer_digest": tokenizer_digest,
         },
     }
+    if args.device == "npu":
+        config["beam"]["graph_batch_size"] = max(args.batch_sizes)
     (args.output_dir / "vllm_gr_config.yaml").write_text(
         yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
     )
@@ -92,6 +94,7 @@ def prepare(args: argparse.Namespace) -> None:
         args.output_dir / "setup.json",
         {
             "benchmark_driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "device": args.device,
             "model": args.model,
             "revision": args.revision,
             "triples": str(args.triples.resolve()),
@@ -362,6 +365,7 @@ async def run_online(args: argparse.Namespace, result: dict[str, Any]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("prepare", "offline", "online"))
+    parser.add_argument("--device", choices=("gpu", "npu"), default="gpu")
     parser.add_argument("--model", required=True)
     parser.add_argument("--served-model-name")
     parser.add_argument("--revision")
@@ -405,6 +409,9 @@ def main() -> None:
         return
     if not (args.output_dir / "vllm_gr_config.yaml").is_file():
         raise FileNotFoundError("V1 config missing; run prepare first")
+    setup = json.loads((args.output_dir / "setup.json").read_text(encoding="utf-8"))
+    if setup.get("device", "gpu") != args.device:
+        raise ValueError("V1 prepared device differs from measurement device")
     prompt = args.prompt.read_text(encoding="utf-8").strip()
     if not prompt:
         raise ValueError("empty benchmark prompt")

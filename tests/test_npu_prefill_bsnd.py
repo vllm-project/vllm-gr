@@ -437,6 +437,7 @@ class ForwardRouting(unittest.TestCase):
             "_select_bsnd_spec": lambda *args: spec,
             "logger": SimpleNamespace(debug=lambda *args: None),
         }
+        extract(PATCH, "_record_npu_prefill_dispatch", env)
         factory = extract(PATCH, "make_patched_model_forward_npu", env)
         forward = factory(native)
         runner = SimpleNamespace(
@@ -451,6 +452,8 @@ class ForwardRouting(unittest.TestCase):
         )
         with patch.dict(sys.modules, {"vllm.forward_context": context}):
             result = forward(runner, 400, object(), object(), **(model_kwargs or {}))
+        if not model_kwargs:
+            self.assertEqual(runner._gr_prefill_graph_dispatches, {"replay:4": 1})
         return calls, cast(str, result)
 
     def test_bsnd_hit_returns_compact_hidden_without_tnd(self) -> None:

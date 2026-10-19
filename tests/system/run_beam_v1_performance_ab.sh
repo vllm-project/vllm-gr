@@ -3,7 +3,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 set -euo pipefail
-export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+device="${BENCHMARK_DEVICE:-gpu}"
+if [[ "$device" != "gpu" && "$device" != "npu" ]]; then
+  echo "BENCHMARK_DEVICE must be gpu or npu, got: $device" >&2
+  exit 2
+fi
+if [[ "$device" == "npu" ]]; then
+  export VLLM_GR_TARGET_DEVICE=npu
+else
+  export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+fi
 export V1_PERF_BEAM_WIDTH=128
 # This workload prefills 1024 tokens per request at B=1,2,4. Keep its graph
 # captures local to the A/B job instead of changing the runtime defaults.
@@ -14,12 +23,34 @@ export VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS=1,2,4
 unset VLLM_GR_PREFILL_GRAPH_KV_BOUND
 
 candidate_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-base_sha="${V1_PERF_BASE_SHA:?V1_PERF_BASE_SHA is required}"
-candidate_sha="${V1_PERF_CANDIDATE_SHA:?V1_PERF_CANDIDATE_SHA is required}"
-head_sha="${V1_PERF_HEAD_SHA:?V1_PERF_HEAD_SHA is required}"
-pr_number="${V1_PERF_PR_NUMBER:?V1_PERF_PR_NUMBER is required}"
+direct_head="${V1_PERF_DIRECT_HEAD:-0}"
+parents=()
+if [[ "$direct_head" == 1 ]]; then
+  candidate_sha="$(git -C "$candidate_root" rev-parse HEAD)"
+  read -r -a parents <<< "$(git -C "$candidate_root" show -s --format=%P HEAD)"
+  if [[ ${#parents[@]} -eq 1 ]]; then
+    base_sha="${V1_PERF_BASE_SHA:-${parents[0]}}"
+    head_sha="$candidate_sha"
+  elif [[ ${#parents[@]} -eq 2 ]]; then
+    base_sha="${V1_PERF_BASE_SHA:-${parents[0]}}"
+    head_sha="${parents[1]}"
+  else
+    echo "NPU A/B requires a single-commit head or PR merge commit" >&2
+    exit 2
+  fi
+  pr_number="${V1_PERF_PR_NUMBER:-0}"
+else
+  base_sha="${V1_PERF_BASE_SHA:?V1_PERF_BASE_SHA is required}"
+  candidate_sha="${V1_PERF_CANDIDATE_SHA:?V1_PERF_CANDIDATE_SHA is required}"
+  head_sha="${V1_PERF_HEAD_SHA:?V1_PERF_HEAD_SHA is required}"
+  pr_number="${V1_PERF_PR_NUMBER:?V1_PERF_PR_NUMBER is required}"
+fi
 output_dir="${V1_PERF_OUTPUT_DIR:?V1_PERF_OUTPUT_DIR is required}"
-temp_root="${RUNNER_TEMP:?RUNNER_TEMP is required}"
+if [[ "$direct_head" == 1 ]]; then
+  temp_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+else
+  temp_root="${RUNNER_TEMP:?RUNNER_TEMP is required}"
+fi
 base_root="$(mktemp -d "$temp_root/beam-v1-perf-base.XXXXXXXX")"
 worktree_added=0
 candidate_installed=1
@@ -27,7 +58,7 @@ candidate_installed=1
 cleanup() {
   local status=$?
   trap - EXIT
-  if (( ! candidate_installed )); then
+  if [[ "$device" == "gpu" ]] && (( ! candidate_installed )); then
     cd "$candidate_root"
     uv pip install -e '.[dev]' || status=1
   fi
@@ -45,19 +76,36 @@ trap 'exit 143' TERM
 [[ "$base_sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid base SHA" >&2; exit 2; }
 [[ "$candidate_sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid candidate SHA" >&2; exit 2; }
 [[ "$head_sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid PR head SHA" >&2; exit 2; }
-[[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR number" >&2; exit 2; }
+if [[ "$direct_head" == 1 ]]; then
+  [[ "$pr_number" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "invalid PR number" >&2; exit 2; }
+else
+  [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR number" >&2; exit 2; }
+fi
 [[ "$(git -C "$candidate_root" rev-parse HEAD)" == "$candidate_sha" ]] || {
   echo "candidate checkout does not match the PR event" >&2
   exit 2
 }
-[[ "$(git -C "$candidate_root" rev-parse 'HEAD^')" == "$base_sha" ]] || {
-  echo "PR merge commit does not use the event base" >&2
-  exit 2
-}
-[[ "$(git -C "$candidate_root" rev-parse 'HEAD^2')" == "$head_sha" ]] || {
-  echo "PR merge commit does not use the event head" >&2
-  exit 2
-}
+if [[ "$direct_head" == 1 ]]; then
+  [[ "${parents[0]}" == "$base_sha" ]] || {
+    echo "NPU A/B base must be the checkout's first parent" >&2
+    exit 2
+  }
+  if [[ ${#parents[@]} -eq 2 ]]; then
+    [[ "${parents[1]}" == "$head_sha" ]] || {
+      echo "NPU A/B merge commit has the wrong PR head" >&2
+      exit 2
+    }
+  fi
+else
+  [[ "$(git -C "$candidate_root" rev-parse 'HEAD^')" == "$base_sha" ]] || {
+    echo "PR merge commit does not use the event base" >&2
+    exit 2
+  }
+  [[ "$(git -C "$candidate_root" rev-parse 'HEAD^2')" == "$head_sha" ]] || {
+    echo "PR merge commit does not use the event head" >&2
+    exit 2
+  }
+fi
 if ! git -C "$candidate_root" cat-file -e "$base_sha^{commit}" 2>/dev/null; then
   git -C "$candidate_root" fetch --no-tags origin "$base_sha"
 fi
@@ -78,35 +126,50 @@ done
 run_pass() {
   local repo_root="$1"
   local result_dir="$2"
+  local warmup_runs=10
+  local measured_runs=20
+  if [[ "$device" == "npu" ]]; then
+    warmup_runs=20
+    measured_runs=40
+  fi
   cd "$repo_root"
   V1_PERF_REPO_ROOT="$repo_root" V1_PERF_OUTPUT_DIR="$result_dir" \
+    BENCHMARK_DEVICE="$device" \
     V1_PERF_DRIVER="$candidate_root/benchmarks/beam_search/v1_performance_gate.py" \
     V1_PERF_MEASURE_ONLY=1 V1_PERF_OFFLINE_ONLY=1 \
-    V1_PERF_WARMUP_RUNS=10 V1_PERF_MEASURED_RUNS=20 \
+    V1_PERF_WARMUP_RUNS="$warmup_runs" V1_PERF_MEASURED_RUNS="$measured_runs" \
     bash "$candidate_root/tests/system/run_beam_v1_performance.sh"
 }
 
 run_abba() {
   local results="$1"
   cd "$base_root"
-  candidate_installed=0
-  uv pip install -e '.[dev]'
+  if [[ "$device" == "gpu" ]]; then
+    candidate_installed=0
+    uv pip install -e '.[dev]'
+  fi
   run_pass "$base_root" "$results/base/1"
 
   cd "$candidate_root"
-  uv pip install -e '.[dev]'
-  candidate_installed=1
+  if [[ "$device" == "gpu" ]]; then
+    uv pip install -e '.[dev]'
+    candidate_installed=1
+  fi
   run_pass "$candidate_root" "$results/pr/1"
   run_pass "$candidate_root" "$results/pr/2"
 
   cd "$base_root"
-  candidate_installed=0
-  uv pip install -e '.[dev]'
+  if [[ "$device" == "gpu" ]]; then
+    candidate_installed=0
+    uv pip install -e '.[dev]'
+  fi
   run_pass "$base_root" "$results/base/2"
 
   cd "$candidate_root"
-  uv pip install -e '.[dev]'
-  candidate_installed=1
+  if [[ "$device" == "gpu" ]]; then
+    uv pip install -e '.[dev]'
+    candidate_installed=1
+  fi
 }
 
 mkdir -p "$output_dir"
@@ -130,7 +193,7 @@ if V1_PERF_DEFER_SUMMARY=1 python -m benchmarks.beam_search.v1_performance_ab \
   exit 0
 fi
 
-# Only a complete regression confined to one batch size gets a confirmation run.
+# Confirm every NPU regression; GPU confirms only a single affected batch size.
 python - "$output_dir/initial/report.json" "$output_dir/initial/decision.txt" <<'PY'
 import sys
 from pathlib import Path
@@ -157,7 +220,7 @@ if [[ "$retry_decision" == "fail" ]]; then
   exit 1
 fi
 
-echo "One batch size exceeded +1%; repeating the full ABBA measurement."
+echo "A/B regression exceeded +2%; repeating the full ABBA measurement."
 run_abba "$output_dir/retry"
 python - "$output_dir" "$base_sha" "$candidate_sha" <<'PY'
 import json

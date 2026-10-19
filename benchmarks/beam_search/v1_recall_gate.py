@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Measure fixed-sample OneRec Recall@32 with native GPU Beam V1 batches."""
+"""Measure fixed-sample OneRec Recall@32 with native Beam V1 batches."""
 
 import argparse
 import copy
@@ -33,15 +33,15 @@ def sha256_file(path):
 
 
 def memory_utilization_for_budget(free_bytes, total_bytes, requested=None):
-    """vLLM's utilization is a fraction of total VRAM, not currently free VRAM."""
+    """vLLM's utilization is a fraction of total device memory, not free memory."""
     if not 0 < free_bytes <= total_bytes:
-        raise ValueError("invalid or exhausted CUDA memory snapshot")
+        raise ValueError("invalid or exhausted accelerator memory snapshot")
     if requested is not None:
         if not 0 < requested < 1:
             raise ValueError("GPU memory utilization must be in (0, 1)")
         if math.ceil(total_bytes * requested) > free_bytes:
             raise ValueError(
-                f"Requested GPU budget {total_bytes * requested / 2**30:.2f} GiB "
+                f"Requested accelerator budget {total_bytes * requested / 2**30:.2f} GiB "
                 f"exceeds free memory {free_bytes / 2**30:.2f} GiB. "
                 "Unset GPU_MEMORY_UTILIZATION to use the automatic budget, "
                 "or choose a lower value."
@@ -52,21 +52,29 @@ def memory_utilization_for_budget(free_bytes, total_bytes, requested=None):
     headroom = max(4 * 2**30, free_bytes * 0.1)
     utilization = math.floor(min(0.3, (free_bytes - headroom) / total_bytes) * 1000) / 1000
     if utilization <= 0:
-        raise ValueError("Not enough free GPU memory after reserving startup headroom")
+        raise ValueError("Not enough free accelerator memory after reserving startup headroom")
     return utilization
 
 
-def resolve_memory_utilization(requested):
+def resolve_memory_utilization(requested, device="gpu"):
     import torch
 
-    # Logical cuda:0 follows CUDA_VISIBLE_DEVICES, including UUID selections.
-    free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+    if device not in ("gpu", "npu"):
+        raise ValueError(f"unsupported benchmark device: {device}")
+    if device == "npu" and not hasattr(torch, "npu"):
+        import torch_npu  # noqa: F401
+
+    accelerator = torch.cuda if device == "gpu" else torch.npu
+    visibility = "CUDA_VISIBLE_DEVICES" if device == "gpu" else "ASCEND_RT_VISIBLE_DEVICES"
+    free_bytes, total_bytes = accelerator.mem_get_info(0)
     utilization = memory_utilization_for_budget(free_bytes, total_bytes, requested)
     logger.info(
-        "CUDA_VISIBLE_DEVICES=%s cuda:0 (%s): free=%.2f GiB total=%.2f GiB; "
+        "%s=%s %s:0 (%s): free=%.2f GiB total=%.2f GiB; "
         "gpu_memory_utilization=%.3f budget=%.2f GiB (%s)",
-        os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
-        torch.cuda.get_device_name(0),
+        visibility,
+        os.environ.get(visibility, "all"),
+        "cuda" if device == "gpu" else "npu",
+        accelerator.get_device_name(0),
         free_bytes / 2**30,
         total_bytes / 2**30,
         utilization,
@@ -120,7 +128,7 @@ def graph_stats(llm):
     return stats
 
 
-def graph_delta(before, after, expected_batches):
+def graph_delta(before, after, expected_batches, device="gpu"):
     if len(before) != len(after):
         raise RuntimeError("prefill graph worker count changed during Recall run")
     captures = []
@@ -140,7 +148,8 @@ def graph_delta(before, after, expected_batches):
             if change < 0:
                 raise RuntimeError("prefill graph counters moved backwards")
             dispatches[key] += change
-    if not all(any(width == 4 for _, width in worker) for worker in captures):
+    capture_width = 1 if device == "npu" else 4
+    if not all(any(width == capture_width for _, width in worker) for worker in captures):
         raise RuntimeError("Recall run did not capture a B=4 prefill graph on every worker")
     expected_replays = expected_batches * len(after)
     if dispatches["replay:4"] != expected_replays or any(
@@ -151,6 +160,7 @@ def graph_delta(before, after, expected_batches):
             f"expected {expected_replays} replays, got {dict(dispatches)}"
         )
     return {
+        "device": device,
         "captures": captures,
         "effective_profiles": effective_profiles,
         "dispatches": dict(dispatches),
@@ -160,6 +170,7 @@ def graph_delta(before, after, expected_batches):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", choices=("gpu", "npu"), default="gpu")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--model-revision", help="Immutable model snapshot commit")
     parser.add_argument("--dataset-path", type=Path, required=True)
@@ -325,7 +336,7 @@ def main():
     }
     logger.info("engine_config=%s", engine_config)
     if args.validate_only:
-        print("Data, prompt lengths and batch plan validated; no GPU inference started.")
+        print("Data, prompt lengths and batch plan validated; no inference started.")
         return
 
     from examples.offline_inference.beam_search.offline_beam_search_v1 import (
@@ -368,7 +379,7 @@ def main():
             },
             "constraint_table": {
                 "enabled": True,
-                "backend": "cuda",
+                "backend": "cuda" if args.device == "gpu" else "npu",
                 "max_top_k": args.n,
                 "path": str(artifact),
                 "format": "constraint_table_v1",
@@ -376,8 +387,10 @@ def main():
                 "tokenizer_digest": tokenizer_digest,
             },
         }
+        if args.device == "npu":
+            config["beam"]["graph_batch_size"] = args.batch_size
         engine_config["gpu_memory_utilization"] = resolve_memory_utilization(
-            args.gpu_memory_utilization
+            args.gpu_memory_utilization, args.device
         )
         init_start = time.perf_counter()
         with GRLLM(
@@ -410,6 +423,7 @@ def main():
                     graph_before,
                     graph_stats(llm),
                     sum(end - start == 4 for start, end in item["batches"]),
+                    args.device,
                 )
 
                 # Preserve the existing per-task evaluator and SID/PID definitions.
@@ -442,7 +456,9 @@ def main():
                     catalog_path=str(args.catalog_path),
                     engine_config=engine_config,
                     runtime_provenance={
-                        "accelerator": torch.cuda.get_device_name(0),
+                        "accelerator": (
+                            torch.cuda if args.device == "gpu" else torch.npu
+                        ).get_device_name(0),
                         "cuda": torch.version.cuda,
                         "torch": torch.__version__,
                         "vllm": version("vllm"),

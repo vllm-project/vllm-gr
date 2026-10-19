@@ -1088,6 +1088,14 @@ def _select_bsnd_spec(runner, scheduler_output, p_runner, num_reqs):
     return (T, B, token_counts)
 
 
+def _record_npu_prefill_dispatch(runner, num_reqs: int, outcome: str) -> None:
+    dispatches = getattr(runner, "_gr_prefill_graph_dispatches", None)
+    if dispatches is None:
+        dispatches = runner._gr_prefill_graph_dispatches = {}
+    key = f"{outcome}:{num_reqs}" if outcome == "replay" else f"fallback:{num_reqs}:{outcome}"
+    dispatches[key] = dispatches.get(key, 0) + 1
+
+
 def make_patched_model_forward_npu(_orig_model_forward):
     """Wrap _model_forward to intercept and replay pure prefill NPU graphs."""
     if getattr(_orig_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, False):
@@ -1162,6 +1170,7 @@ def make_patched_model_forward_npu(_orig_model_forward):
                     )
                     if output_buf is not None:
                         p_runner.log_replay_bsnd(T, B, total_tokens)
+                        _record_npu_prefill_dispatch(self, num_reqs, "replay")
                         return output_buf
                     # BSND miss → fall through to the TND path below.
 
@@ -1192,6 +1201,7 @@ def make_patched_model_forward_npu(_orig_model_forward):
 
                     if output_buf is not None:
                         p_runner.log_replay(bucket, num_reqs, total_tokens)
+                        _record_npu_prefill_dispatch(self, num_reqs, "replay")
                         logger.debug(
                             "Prefill NPU Graph Replay: Executed captured graph "
                             "for bucket %d (reqs=%d, %d actual tokens).",
@@ -1200,6 +1210,11 @@ def make_patched_model_forward_npu(_orig_model_forward):
                             total_tokens,
                         )
                         return output_buf
+                _record_npu_prefill_dispatch(
+                    self,
+                    num_reqs,
+                    "no_bucket" if bucket is None else "graph_unavailable_or_rejected",
+                )
         return _orig_model_forward(
             self,
             num_tokens_padded,

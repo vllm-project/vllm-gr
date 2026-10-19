@@ -121,6 +121,83 @@ echo "Online elapsed failures: $online_elapsed_failure_mode"
 echo "Offline elapsed failures: $offline_elapsed_failure_mode"
 echo "Execution, transport, timeout, and parsing failures: blocking"
 
+beam_recall_status=0
+beam_performance_status=0
+beam_gate_tmp_dir=""
+cleanup_beam_gate_tmp() {
+  if [[ -n "$beam_gate_tmp_dir" ]]; then
+    rm -rf -- "$beam_gate_tmp_dir"
+    beam_gate_tmp_dir=""
+  fi
+}
+if [[ "$device" == "npu" ]]; then
+  # This video entry point is also used by the external NPU gate. Prepare the
+  # fixed-sample Beam V1 inputs here instead of relying on GitHub Actions.
+  # The external runner exposes logs but not workspace artifacts. Keep default
+  # intermediate results in a temporary directory and remove them on exit.
+  beam_gate_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vllm-gr-npu-beam-XXXXXXXX")" || exit 1
+  trap cleanup_beam_gate_tmp EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  beam_model="$MODEL_PATH"
+  if [[ -d "$beam_model" ]]; then
+    beam_model="$(realpath "$beam_model")" || exit 1
+  fi
+  beam_dataset="$(realpath "$DATASET_PATH")" || exit 1
+  beam_triples="$(realpath "$triples_path")" || exit 1
+  recall_output_dir="${V1_RECALL_OUTPUT_DIR:-$beam_gate_tmp_dir/recall}"
+  mkdir -p "$recall_output_dir/constraints" || exit 1
+  recall_output_dir="$(realpath "$recall_output_dir")" || exit 1
+  echo "Beam V1 Recall results: $recall_output_dir"
+
+  for mapping in sid2pid sid2iid; do
+    catalog="$recall_output_dir/constraints/$mapping-catalog.json"
+    if ! python benchmarks/open_one_rec/tools/convert_catalog.py \
+        --dataset-path "$beam_dataset" \
+        --mapping-file "$mapping.json" \
+        --output-path "$catalog"; then
+      beam_recall_status=1
+      break
+    fi
+    if ! python tools/build_constraint_triples.py \
+        --catalog "$catalog" \
+        --output "$recall_output_dir/constraints/${mapping}_triples.json" \
+        --begin '<|sid_begin|>' \
+        --end '<|sid_end|>'; then
+      beam_recall_status=1
+      break
+    fi
+  done
+
+  if [[ "$beam_recall_status" -eq 0 ]]; then
+    echo "Running NPU Beam V1 B=4 OneRec Recall gate"
+    BENCHMARK_DEVICE=npu \
+      VLLM_GR_TEST_MODEL="$beam_model" \
+      V1_RECALL_DATASET_PATH="$beam_dataset" \
+      V1_RECALL_TRIPLES_PATH="$recall_output_dir/constraints/sid2pid_triples.json" \
+      V1_RECALL_TRIPLES_IID_PATH="$recall_output_dir/constraints/sid2iid_triples.json" \
+      V1_RECALL_OUTPUT_DIR="$recall_output_dir" \
+      V1_RECALL_BASELINE_FILE="${V1_RECALL_BASELINE_FILE:-$SCRIPT_DIR/../../benchmarks/beam_search/v1_recall_b4_baseline.json}" \
+      V1_RECALL_REPEATS="${V1_RECALL_REPEATS:-1}" \
+      bash "$SCRIPT_DIR/run_beam_v1_recall.sh"
+    beam_recall_status=$?
+  fi
+
+  performance_output_dir="${V1_PERF_OUTPUT_DIR:-$beam_gate_tmp_dir/performance}"
+  mkdir -p "$performance_output_dir" || exit 1
+  performance_output_dir="$(realpath "$performance_output_dir")" || exit 1
+  echo "Running NPU Beam V1 performance A/B gate; results: $performance_output_dir"
+  BENCHMARK_DEVICE=npu \
+    V1_PERF_DIRECT_HEAD=1 \
+    VLLM_GR_TEST_MODEL="$beam_model" \
+    TRIPLES_PATH="$beam_triples" \
+    V1_PERF_OUTPUT_DIR="$performance_output_dir" \
+    bash "$SCRIPT_DIR/run_beam_v1_performance_ab.sh"
+  beam_performance_status=$?
+  echo "NPU Beam V1 gate status: Recall=$beam_recall_status performance=$beam_performance_status"
+  cleanup_beam_gate_tmp
+fi
+
 extract_numeric_value() {
     local input_lines="$1"
     local string_key="$2"
@@ -349,4 +426,9 @@ validate_performance_metric "online elapsed_time" "$elapsed_time_online" \
 
 stop_server
 trap - EXIT
+trap - INT TERM
+if [[ "$beam_recall_status" -ne 0 || "$beam_performance_status" -ne 0 ]]; then
+  echo "NPU Beam V1 Recall or performance gate failed." >&2
+  exit 1
+fi
 exit 0

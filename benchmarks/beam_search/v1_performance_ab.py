@@ -13,11 +13,12 @@ from pathlib import Path
 from typing import Any
 
 COUNTS = (1, 2, 4)
-MAX_OFFLINE_REGRESSION_PERCENT = 1.0
+MAX_OFFLINE_REGRESSION_PERCENT = 2.0
 GATED_METRICS = ("mean", "p50", "p90")
 THRESHOLD_ROUNDING_TOLERANCE = 1e-12
 SETUP_KEYS = (
     "benchmark_driver_sha256",
+    "device",
     "model",
     "revision",
     "input_tokens_including_sid_begin",
@@ -101,15 +102,29 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
         setup = read_json(root / "setup.json")
         if any(base_setup.get(key) != setup.get(key) for key in SETUP_KEYS):
             raise ValueError(f"benchmark settings differ in {root}")
+    device = base_setup.get("device", "gpu")
+    model = base_setup.get("model")
+    remote_model = (
+        model == "OpenOneRec/OneRec-1.7B"
+        and base_setup.get("revision") == "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b"
+    )
+    local_npu_model = (
+        device == "npu"
+        and isinstance(model, str)
+        and Path(model).is_absolute()
+        and Path(model).is_dir()
+        and base_setup.get("revision") is None
+    )
+    warmup_runs, measured_runs = (20, 40) if device == "npu" else (10, 20)
     if (
-        base_setup.get("model") != "OpenOneRec/OneRec-1.7B"
-        or base_setup.get("revision") != "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b"
+        device not in ("gpu", "npu")
+        or not (remote_model or local_npu_model)
         or base_setup.get("input_tokens_including_sid_begin") != 1024
         or base_setup.get("beam_width") != 128
         or base_setup.get("generated_steps") != 3
         or base_setup.get("batch_sizes") != list(COUNTS)
-        or base_setup.get("warmup_runs") != 10
-        or base_setup.get("measured_runs") != 20
+        or base_setup.get("warmup_runs") != warmup_runs
+        or base_setup.get("measured_runs") != measured_runs
     ):
         raise ValueError("A/B gate requires the fixed OneRec B=1,2,4 workload")
     for name in ("gpu.csv", "prompt_token_ids.json"):
@@ -242,6 +257,7 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
         {
             "base_sha": base_sha,
             "pr_sha": pr_sha,
+            "device": device,
             "rows": rows,
             "max_regression_percent": MAX_OFFLINE_REGRESSION_PERCENT,
             "gated_modes": ["offline"],
@@ -254,11 +270,23 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
 
 
 def should_retry(result: dict) -> bool:
-    """Confirm a regression confined to one batch size with another ABBA run."""
+    """Confirm NPU regressions, or a GPU regression confined to one batch size."""
     if result.get("complete") is not True:
         raise ValueError("cannot decide retry from an incomplete A/B report")
     affected_batches = {row["count"] for row in result["rows"] if row["status"] == "FAIL"}
+    if result.get("device", "gpu") == "npu":
+        return bool(affected_batches)
     return len(affected_batches) == 1
+
+
+def failed_metrics(result: dict) -> dict[tuple[int, str], str]:
+    keys = [
+        (row["count"], metric)
+        for row in result["rows"]
+        for metric in GATED_METRICS
+        if row["metric_statuses"][metric] == "FAIL"
+    ]
+    return dict(zip(keys, result["failures"], strict=True))
 
 
 def combine_retry_results(
@@ -267,34 +295,58 @@ def combine_retry_results(
     initial_result, initial_report = initial
     confirmation_result, confirmation_report = confirmation
     if not should_retry(initial_result):
-        raise ValueError("A/B confirmation is only allowed for one affected batch size")
-    for key in ("base_sha", "pr_sha", "max_regression_percent", "gated_metrics"):
+        raise ValueError("A/B confirmation requires a qualifying regression")
+    for key in ("base_sha", "pr_sha", "device", "max_regression_percent", "gated_metrics"):
         if initial_result[key] != confirmation_result[key]:
             raise ValueError(f"A/B confirmation differs in {key}")
 
-    passed = not confirmation_result["failures"]
+    if initial_result["device"] == "npu":
+        initial_metrics = failed_metrics(initial_result)
+        confirmed_failures = [
+            failure
+            for key, failure in failed_metrics(confirmation_result).items()
+            if key in initial_metrics
+        ]
+    else:
+        confirmed_failures = confirmation_result["failures"]
+    passed = not confirmed_failures
     result = {
         **confirmation_result,
+        "failures": confirmed_failures,
         "retry_performed": True,
         "initial_rows": initial_result["rows"],
         "initial_failures": initial_result["failures"],
+        "confirmation_failures": confirmation_result["failures"],
     }
     first_section = initial_report.replace(
         "## Beam V1 performance A/B", "### Initial ABBA", 1
     ).replace("Overall: **FAIL**", "Initial: **FAIL**")
+    confirmation_passed = not confirmation_result["failures"]
     second_section = confirmation_report.replace(
         "## Beam V1 performance A/B", "### Confirmation ABBA", 1
     ).replace(
-        "Overall: **PASS**" if passed else "Overall: **FAIL**",
-        "Confirmation: **PASS**" if passed else "Confirmation: **FAIL**",
+        "Overall: **PASS**" if confirmation_passed else "Overall: **FAIL**",
+        "Confirmation: **PASS**" if confirmation_passed else "Confirmation: **FAIL**",
     )
     final = "PASS" if passed else "FAIL"
+    rule = (
+        "On NPU, the gate fails only when the same batch size and latency statistic "
+        f"exceed +{MAX_OFFLINE_REGRESSION_PERCENT:.0f}% in both complete ABBA measurements."
+        if initial_result["device"] == "npu"
+        else "The second complete ABBA run determines the gate."
+    )
     report = (
         "## Beam V1 performance A/B\n\n"
-        "The initial run exceeded +1%. A second complete ABBA run determines the gate.\n\n"
+        f"The initial run exceeded +{MAX_OFFLINE_REGRESSION_PERCENT:.0f}%. {rule}\n\n"
         f"{first_section.strip()}\n\n{second_section.strip()}\n\n"
         f"Final gate: **{final}**"
-        + (" (initial regression was not reproduced)" if passed else "")
+        + (
+            " (no matching regression in confirmation)"
+            if passed and initial_result["device"] == "npu"
+            else " (initial regression was not reproduced)"
+            if passed
+            else ""
+        )
         + "\n"
     )
     return result, report

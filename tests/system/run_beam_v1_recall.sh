@@ -4,6 +4,11 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
+device="${BENCHMARK_DEVICE:-gpu}"
+if [[ "$device" != "gpu" && "$device" != "npu" ]]; then
+  echo "BENCHMARK_DEVICE must be gpu or npu, got: $device" >&2
+  exit 2
+fi
 dataset="${V1_RECALL_DATASET_PATH:-$repo_root/OpenOneRec/benchmark_data}"
 output_dir="${V1_RECALL_OUTPUT_DIR:-$repo_root/v1_recall_results}"
 model="${VLLM_GR_TEST_MODEL:-OpenOneRec/OneRec-1.7B}"
@@ -20,9 +25,11 @@ done
 
 mkdir -p "$output_dir"
 git rev-parse HEAD > "$output_dir/commit.txt"
-if command -v nvidia-smi >/dev/null 2>&1; then
+if [[ "$device" == "gpu" ]] && command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv \
     > "$output_dir/gpu.csv" || true
+elif [[ "$device" == "npu" ]] && command -v npu-smi >/dev/null 2>&1; then
+  npu-smi info > "$output_dir/npu.txt" || true
 fi
 
 if [[ -d "$model" ]]; then
@@ -52,6 +59,14 @@ fi
 if [[ -n "${V1_RECALL_BASELINE_FILE:-}" && "$repeat_count" -eq 2 ]]; then
   echo "A configured Recall gate requires one screening run or at least three runs" >&2
   exit 1
+fi
+memory_args=()
+memory_utilization="${V1_RECALL_GPU_MEMORY_UTILIZATION:-}"
+if [[ "$device" == "npu" && -z "$memory_utilization" ]]; then
+  memory_utilization=0.5
+fi
+if [[ -n "$memory_utilization" ]]; then
+  memory_args=(--gpu-memory-utilization "$memory_utilization")
 fi
 # These overrides are exclusive to this accuracy gate. The runtime defaults
 # remain unchanged for serving and other benchmarks. The graded buckets cover
@@ -84,6 +99,7 @@ run_group() {
   local group_start=$SECONDS
   VLLM_ENABLE_V1_MULTIPROCESSING=0 \
     python -m benchmarks.beam_search.v1_recall_gate \
+      --device "$device" \
       --model "$model_path" \
       "${model_revision_args[@]}" \
       --dataset-path "$dataset" \
@@ -93,6 +109,7 @@ run_group() {
       --batch-size 4 \
       --n 128 \
       --temperature 0.6 \
+      "${memory_args[@]}" \
       --result-dir "$run_dir" 2>&1 | tee "$group_dir/run.log"
   echo "$((SECONDS - group_start))" > "$group_dir/wall_seconds.txt"
 }

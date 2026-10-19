@@ -510,6 +510,38 @@ def test_npu_capture_buffers_int32_slot_mapping() -> None:
     assert buf.positions_buf[-1].item() == 127
 
 
+def test_npu_prefill_block_table_uses_contiguous_static_width() -> None:
+    from vllm_gr.v1.worker.npu_prefill_graph_runner import (
+        NPUPrefillGraphRunner,
+        _stage_block_table,
+    )
+
+    runner = MockModelRunner()
+    graph_runner = NPUPrefillGraphRunner(runner, buckets=[128])
+    buf = graph_runner.buffers[128]
+    graph_runner._prepare_capture_buffers(buf, 128, runner)
+    assert buf.block_table_buf is not None
+    captured = graph_runner._build_dummy_metadata(128, MockNPUAttnBuilder(), buf)
+    assert captured.block_table.shape[1] == buf.block_table_buf.shape[1]
+    assert captured.block_table.is_contiguous()
+    assert captured.block_table.data_ptr() == buf.block_table_buf.data_ptr()
+
+    live = torch.arange(12, dtype=torch.int32).reshape(4, 3)
+    staged = _stage_block_table(live, buf.block_table_buf, 4)
+    assert staged.shape == (4, buf.block_table_buf.shape[1])
+    assert staged.is_contiguous()
+    assert staged.data_ptr() == captured.block_table.data_ptr()
+    assert torch.equal(staged[:, :3], live)
+    assert torch.count_nonzero(staged[:, 3:]) == 0
+
+    next_live = torch.full((2, 1), 9, dtype=torch.int32)
+    next_staged = _stage_block_table(next_live, buf.block_table_buf, 2)
+    assert next_staged.is_contiguous()
+    assert next_staged.data_ptr() == captured.block_table.data_ptr()
+    assert torch.equal(next_staged[:, :1], next_live)
+    assert torch.count_nonzero(next_staged[:, 1:]) == 0
+
+
 def test_npu_shared_workspace_binding() -> None:
     from types import SimpleNamespace
 

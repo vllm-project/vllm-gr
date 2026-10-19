@@ -74,6 +74,8 @@ def _task_result(run_dir, task):
     }
     graph_profile = metrics.get("graph_profile")
     graph_runtime = metrics.get("graph_runtime")
+    graph_device = graph_runtime.get("device", "gpu") if isinstance(graph_runtime, dict) else None
+    capture_width = 1 if graph_device == "npu" else 4
     if (
         not isinstance(graph_profile, dict)
         or set(graph_profile)
@@ -84,9 +86,13 @@ def _task_result(run_dir, task):
             "v1_startup_capture_batch_size",
         }
         or not isinstance(graph_runtime, dict)
+        or graph_device not in ("gpu", "npu")
         or not graph_runtime.get("captures")
         or not graph_runtime.get("effective_profiles")
-        or any(not any(width == 4 for _, width in worker) for worker in graph_runtime["captures"])
+        or any(
+            not any(width == capture_width for _, width in worker)
+            for worker in graph_runtime["captures"]
+        )
         or graph_runtime.get("dispatches", {}).get("replay:4", 0)
         != graph_runtime.get("expected_b4_replays", -1)
         or graph_runtime.get("expected_b4_replays", 0) <= 0
@@ -124,6 +130,20 @@ def _stats(values, scale=1):
     }
 
 
+def _identity_mismatch(task, key, expected, actual, *, run=None):
+    where = f"run {run}/{task}" if run is not None else task
+    if key == "sample_ids" and isinstance(expected, list) and isinstance(actual, list):
+        first = next(
+            (index for index, pair in enumerate(zip(expected, actual)) if pair[0] != pair[1]),
+            min(len(expected), len(actual)),
+        )
+        detail = f"first differing index {first}"
+    else:
+        detail = f"expected={expected!r}, actual={actual!r}"
+    comparison = "input differs from run 1" if run is not None else "baseline input differs"
+    return f"{where}: {comparison}: {key} ({detail})"
+
+
 def summarize(root, repeats, baseline_path=None):
     if repeats <= 0:
         raise ValueError("repeats must be positive")
@@ -143,6 +163,8 @@ def summarize(root, repeats, baseline_path=None):
         "tasks": {},
     }
     runs = []
+    input_failures = []
+    mismatched_tasks = set()
     for index in range(1, repeats + 1):
         run_dir = root / "runs" / f"run-{index:02d}"
         run = {
@@ -171,8 +193,13 @@ def summarize(root, repeats, baseline_path=None):
         else:
             for task in TASKS:
                 for key in IDENTITY_KEYS:
-                    if run["tasks"][task]["identity"][key] != candidate["tasks"][task][key]:
-                        raise ValueError(f"run {index}/{task}: input differs from run 1: {key}")
+                    actual = run["tasks"][task]["identity"][key]
+                    expected = candidate["tasks"][task][key]
+                    if actual != expected:
+                        mismatched_tasks.add(task)
+                        input_failures.append(
+                            _identity_mismatch(task, key, expected, actual, run=index)
+                        )
         for task in TASKS:
             if (
                 run["tasks"][task]["graph_profile"] != candidate["graph_profile"]
@@ -192,7 +219,7 @@ def summarize(root, repeats, baseline_path=None):
         for task in TASKS
     }
     total_times = _stats([run["wall_seconds"] for run in runs])
-    failures = []
+    failures = list(input_failures)
     baseline = None
     floors = None
     suspected_tasks = []
@@ -217,8 +244,17 @@ def summarize(root, repeats, baseline_path=None):
         for task in TASKS:
             expected = baseline["tasks"][task]
             for key in IDENTITY_KEYS:
-                if candidate["tasks"][task][key] != expected.get(key):
-                    raise ValueError(f"{task}: baseline input differs: {key}")
+                actual = candidate["tasks"][task][key]
+                baseline_value = expected.get(key)
+                if actual != baseline_value:
+                    mismatched_tasks.add(task)
+                    message = _identity_mismatch(task, key, baseline_value, actual)
+                    if key == "artifact_digest":
+                        message += (
+                            f"; tokenizer_digest baseline={expected.get('tokenizer_digest')!r}, "
+                            f"actual={candidate['tasks'][task]['tokenizer_digest']!r}"
+                        )
+                    failures.append(message)
             values = calibration[task]
             if (
                 not isinstance(values, list)
@@ -233,7 +269,7 @@ def summarize(root, repeats, baseline_path=None):
             ):
                 raise ValueError(f"{task}: invalid historical SID calibration")
             floors[task] = min(values)
-            if runs[0]["tasks"][task]["recall@32"] < floors[task]:
+            if task not in mismatched_tasks and runs[0]["tasks"][task]["recall@32"] < floors[task]:
                 suspected_tasks.append(task)
         if repeats >= 3:
             for task in suspected_tasks:
@@ -384,7 +420,9 @@ def summarize(root, repeats, baseline_path=None):
     )
     if repeats > 1:
         lines.append(
-            "This variation is on one fixed 1000-sample set; it does not estimate "
+            "Inputs differ across repeats; variation is not comparable."
+            if input_failures
+            else "This variation is on one fixed 1000-sample set; it does not estimate "
             "uncertainty relative to the full test sets."
         )
     if baseline_path is not None:
