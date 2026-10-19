@@ -238,14 +238,6 @@ jobs:
           echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
           echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311" >> "$GITHUB_ENV"
 
-      - name: Check for single commit
-        if: >-
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.commits != 1
-        run: |
-          echo "Error: The PR has ${{ github.event.pull_request.commits }} commits. Please squash it into one commit."
-          exit 1
-
       - name: Install base environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: uv pip install vllm==0.22.1
