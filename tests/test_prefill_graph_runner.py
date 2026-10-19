@@ -26,7 +26,7 @@ def _force_non_npu(monkeypatch: pytest.MonkeyPatch) -> None:
 class MockModelRunner:
     def __init__(self) -> None:
         self.device = torch.device("cpu")
-        self.vllm_config = None
+        self.vllm_config: Any = None
 
 
 def test_match_bucket_standard() -> None:
@@ -647,15 +647,57 @@ def test_opt_in_graded_b4_prefill_graph_config(monkeypatch: pytest.MonkeyPatch) 
 def test_custom_b4_bucket_limit_uses_total_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     from types import SimpleNamespace
 
+    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
     from vllm_gr.v1.worker.prefill_graph_common import ENV_PREFILL_GRAPH_BUCKETS
 
     runner = MockModelRunner()
+    runner.vllm_config = SimpleNamespace(
+        _vllm_gr_parsed_config=SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1)
+    )
     setattr(runner, "scheduler_config", SimpleNamespace(max_num_batched_tokens=24))
     setattr(runner, "model_config", SimpleNamespace(max_model_len=8))
 
+    monkeypatch.delenv(ENV_PREFILL_GRAPH_BUCKETS, raising=False)
+    monkeypatch.delenv("VLLM_GR_PREFILL_GRAPH_KV_BOUND", raising=False)
     assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8]
     monkeypatch.setenv(ENV_PREFILL_GRAPH_BUCKETS, "4,8,12,24")
     assert BeamPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8, 12, 24]
+    assert NPUPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8]
+
+
+def test_legacy_prefill_capture_keeps_b1_when_only_b4_configured() -> None:
+    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.v1.worker.gpu_prefill_graph_runner import _capture_request_counts
+
+    assert _capture_request_counts((4,), 4, BeamExecutionMode.LEGACY) == (1,)
+    assert _capture_request_counts((4,), 4, BeamExecutionMode.V1) == (4,)
+
+
+def test_b4_capture_geometry_respects_per_request_model_limit() -> None:
+    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.v1.worker.gpu_prefill_graph_runner import (
+        _capture_dummy_positions,
+        _capture_eligible_request_counts,
+        _capture_query_len,
+        _capture_request_counts,
+        _capture_request_lengths,
+    )
+    from vllm_gr.v1.worker.prefill_graph_common import PREFILL_GRAPH_CAPTURE_NUM_REQS
+
+    counts = _capture_request_counts(PREFILL_GRAPH_CAPTURE_NUM_REQS, 4, BeamExecutionMode.V1)
+    assert counts == (1, 2, 4)
+    assert _capture_eligible_request_counts(32768, counts, 8192, True) == (4,)
+    assert _capture_eligible_request_counts(8192, counts, 8192, True) == counts
+    assert _capture_request_lengths(32768, 4, 8192, True) == [8192] * 4
+
+    lengths = _capture_request_lengths(24, 4, 8, True)
+    assert lengths == [6, 6, 6, 6]
+    positions = _capture_dummy_positions(lengths, torch.device("cpu"))
+    assert positions.tolist() == list(range(6)) * 4
+    assert _capture_query_len(24, 8, True) == 8
+    with pytest.raises(ValueError, match="per-request model limit"):
+        _capture_request_lengths(36, 4, 8, True)
 
 
 def test_npu_max_kvlen_from_model_config() -> None:
@@ -1115,7 +1157,7 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
         assert replays == ([1024] if async_stage and native_padding else [1024, 1024, 1152, 1024])
 
 
-def test_prefill_runner_init_survives_allocation_failure(
+def test_prefill_runner_init_propagates_allocation_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Static buffer allocation failures disable the runner instead of aborting startup."""
@@ -1125,7 +1167,80 @@ def test_prefill_runner_init_survives_allocation_failure(
         raise RuntimeError("no memory")
 
     monkeypatch.setattr(torch, "full", fail_full)
-    graph_runner = BeamPrefillGraphRunner(MockModelRunner(), buckets=[512])
-    assert graph_runner.buckets == []
-    assert graph_runner.buffers == {}
-    assert graph_runner.has_captured_graph(512) is False
+    with pytest.raises(RuntimeError, match="no memory"):
+        BeamPrefillGraphRunner(MockModelRunner(), buckets=[512])
+
+
+def test_fatal_prefill_capture_error_reaches_worker_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from vllm_gr.config import BeamExecutionMode
+    from vllm_gr.v1.worker import gpu_model_runner_patch as patch
+    from vllm_gr.v1.worker import gr_async_output, gr_startup, model_runner_patch
+
+    stream = SimpleNamespace(wait_stream=lambda _other: None)
+    monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda: True)
+    monkeypatch.setattr(patch.torch.cuda, "Stream", lambda: stream)
+    monkeypatch.setattr(patch.torch.cuda, "stream", lambda _side: nullcontext())
+    monkeypatch.setattr(patch.torch.accelerator, "current_stream", lambda: stream)
+    monkeypatch.setattr(patch.torch.accelerator, "synchronize", lambda: None)
+    error = RuntimeError("operation failed due to a previous error during capture")
+
+    def fail(_runner: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(
+        patch, "get_prefill_graph_runner", lambda _runner: SimpleNamespace(capture_graphs=fail)
+    )
+    runner = SimpleNamespace()
+    with pytest.raises(RuntimeError) as raised:
+        patch.capture_prefill_graphs(runner)
+    assert raised.value is error
+    assert not getattr(runner, "_prefill_graphs_captured", False)
+
+    events: list[str] = []
+
+    class Runner:
+        _vllm_gr_config = SimpleNamespace(beam_execution_mode=BeamExecutionMode.V1)
+
+        def execute_model(self) -> None:
+            pass
+
+        def _prepare_inputs(self) -> None:
+            pass
+
+        def _bookkeeping_sync(self) -> None:
+            pass
+
+        def capture_model(self) -> None:
+            events.append("native")
+
+    platform = SimpleNamespace(
+        discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
+        make_patched_prepare_inputs=lambda original: original,
+        make_patched_bookkeeping_sync=lambda original: original,
+        capture_prefill_graphs=patch.capture_prefill_graphs,
+    )
+    monkeypatch.setattr(gr_async_output, "install_async_output_guard", lambda: None)
+    monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_active_runner_module_name",
+        lambda: model_runner_patch._GPU_PATCH_MODULE,
+    )
+    monkeypatch.setattr(model_runner_patch, "_get_active_platform_module", lambda: platform)
+    monkeypatch.setattr(gr_startup, "capture_async_forward", lambda _runner: None)
+    monkeypatch.setattr(
+        model_runner_patch,
+        "freeze_gc_after_graph_capture",
+        lambda _runner: events.append("freeze"),
+    )
+
+    model_runner_patch.apply_worker_patches()
+    with pytest.raises(RuntimeError) as raised:
+        Runner().capture_model()
+    assert raised.value is error
+    assert events == ["native"]

@@ -10,6 +10,9 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.config import BeamExecutionMode, GRConfig
+from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+
 logger = init_logger(__name__)
 
 PREFILL_GRAPH_BUCKET_STEP_DEFAULT = 128
@@ -393,6 +396,8 @@ class PrefillBucketBuffers:
 class BasePrefillGraphRunner:
     """Base class for bucket matching and buffer management across hardware backends."""
 
+    supports_multi_request_total_buckets = False
+
     def __init__(
         self,
         model_runner: Any,
@@ -413,9 +418,19 @@ class BasePrefillGraphRunner:
             scheduler_config = getattr(vllm_config, "scheduler_config", None)
         max_num_batched_tokens = getattr(scheduler_config, "max_num_batched_tokens", None)
         max_model_len = get_max_context_len(model_runner)
+        # Only GPU V1 prepares per-request positions for total-token buckets
+        # larger than one model context. Other runners keep the model limit.
+        supports_total_buckets = (
+            self.supports_multi_request_total_buckets
+            and GRConfig.from_vllm_config(
+                getattr(model_runner, "vllm_config", None)
+            ).beam_execution_mode
+            is BeamExecutionMode.V1
+            and os.getenv(ENV_PREFILL_GRAPH_BUCKETS) is not None
+        )
         limits = (
             (max_num_batched_tokens,)
-            if os.getenv(ENV_PREFILL_GRAPH_BUCKETS) is not None
+            if supports_total_buckets
             else (max_num_batched_tokens, max_model_len)
         )
         bucket_limits = [int(limit) for limit in limits if limit]
@@ -442,15 +457,16 @@ class BasePrefillGraphRunner:
         # per-bucket staging buffers); None when the config is unavailable.
         block_table_cols = _get_block_table_cols(model_runner)
 
-        # Eager static-buffer allocation: a failure here must not abort
-        # worker startup. Disable the runner instead — every replay then
-        # falls back to eager and the capture loops become no-ops.
+        # Eager static-buffer allocation. Only capture-unsupported failures
+        # may disable this optional runner; device or model failures abort startup.
         try:
             self.buffers: dict[int, PrefillBucketBuffers] = {
                 b: PrefillBucketBuffers(b, max_seqs, self.device, block_table_cols=block_table_cols)
                 for b in self.buckets
             }
         except Exception as e:  # noqa: BLE001
+            if not isinstance(e, RuntimeError) or not is_recoverable_capture_error(e):
+                raise
             logger.warning("Prefill Graph runner disabled: static buffer allocation failed: %r", e)
             self.buckets = []
             self.buffers = {}

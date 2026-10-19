@@ -984,6 +984,11 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                         )
 
                         if output_buf is not None:
+                            dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
+                            if dispatches is None:
+                                dispatches = self._gr_prefill_graph_dispatches = {}
+                            key = f"replay:{num_reqs}"
+                            dispatches[key] = dispatches.get(key, 0) + 1
                             logger.debug(
                                 "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
                                 "bucket=%s outcome=replay",
@@ -993,6 +998,11 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                             )
                             return output_buf
                         reason = getattr(p_runner, "last_replay_reason", "runner_rejected")
+                    dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
+                    if dispatches is None:
+                        dispatches = self._gr_prefill_graph_dispatches = {}
+                    key = f"fallback:{num_reqs}:{reason}"
+                    dispatches[key] = dispatches.get(key, 0) + 1
                     logger.debug(
                         "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
                         "bucket=%s outcome=%s",
@@ -1011,8 +1021,8 @@ def capture_prefill_graphs(runner) -> None:
     """Startup capture of pure-prefill CUDA graphs keyed by bucket and request count.
 
     Chained after the beam decode-graph capture in ``capture_model``; runs
-    only when the prefill graph env gate is enabled. Every failure falls back
-    to eager prefill (the interception simply never matches a bucket).
+    only when the prefill graph env gate is enabled. Only explicitly
+    recoverable capture failures fall back to eager prefill.
     """
     if not is_prefill_graph_enabled():
         return
@@ -1031,7 +1041,12 @@ def capture_prefill_graphs(runner) -> None:
         torch.accelerator.current_stream().wait_stream(side)
         torch.accelerator.synchronize()
         runner._prefill_graphs_captured = True
-    except Exception:
+    except Exception as error:
+        from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+
+        if not isinstance(error, RuntimeError) or not is_recoverable_capture_error(error):
+            raise
+        torch.accelerator.synchronize()
         logger.exception(
             "vllm-gr: prefill CUDA graph capture failed; prefill will fall back to eager"
         )

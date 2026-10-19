@@ -81,8 +81,11 @@ def _capture(worker: SimpleNamespace, *, allow: bool = True) -> bool:
 
 @pytest.mark.parametrize("hooks_type", [stages._StageExecutionHooks, V2StageExecutionHooks])  # type: ignore[misc]
 def test_success_publishes_only_after_release_and_sync(
-    capture_runtime: CaptureRuntime, hooks_type: type[stages._StageExecutionHooks]
+    capture_runtime: CaptureRuntime,
+    hooks_type: type[stages._StageExecutionHooks],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, raising=False)
     worker, owner, graph, stream, health = capture_runtime
     assert startup.capture_async_forward(worker, hooks_type=hooks_type)
     assert cast(Mock, stages.get_stage_runner).call_args.kwargs == {"hooks_type": hooks_type}
@@ -97,23 +100,38 @@ def test_success_publishes_only_after_release_and_sync(
     graph.clear.assert_not_called()
 
 
-@pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
-def test_v1_startup_batch_override_does_not_change_v2(
-    capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch, v2: bool
+@pytest.mark.parametrize("batch_size", [1, 2, 4])  # type: ignore[misc]
+def test_opt_in_startup_capture_uses_requested_rows(
+    capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch, batch_size: int
 ) -> None:
-    monkeypatch.setenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, "4")
+    monkeypatch.setenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, str(batch_size))
     worker, owner, _graph, _stream, _health = capture_runtime
-    entry = capture_multibatch_forward if v2 else startup.capture_async_forward
-    assert entry(worker)
+    assert startup.capture_async_forward(worker)
     scheduled = cast(Mock, stages.get_stage_runner).call_args.args[1]
     prefill = scheduled.gr_stage_metadata["__async_scheduling_startup_capture__"]
     decode = owner.prepare_cpu.call_args.args[0]
-    batch_size = 1 if v2 else 4
     assert len(prefill.request_ids) == batch_size
     assert prefill.num_prompt_tokens == batch_size
     assert prefill.num_prompt_tokens_by_request == (1,) * batch_size
     assert scheduled.num_scheduled_tokens == dict.fromkeys(prefill.request_ids, 1)
     assert decode.kv_blocks == ((0,),) * batch_size
+    owner.release.assert_called_once()
+
+
+def test_v1_startup_batch_override_does_not_change_v2(
+    capture_runtime: CaptureRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(startup.ENV_V1_STARTUP_CAPTURE_BATCH_SIZE, "4")
+    worker, owner, _graph, _stream, _health = capture_runtime
+    assert capture_multibatch_forward(worker)
+    scheduled = cast(Mock, stages.get_stage_runner).call_args.args[1]
+    prefill = scheduled.gr_stage_metadata["__async_scheduling_startup_capture__"]
+    decode = owner.prepare_cpu.call_args.args[0]
+    assert len(prefill.request_ids) == 1
+    assert prefill.num_prompt_tokens == 1
+    assert prefill.num_prompt_tokens_by_request == (1,)
+    assert scheduled.num_scheduled_tokens == dict.fromkeys(prefill.request_ids, 1)
+    assert decode.kv_blocks == ((0,),)
     owner.release.assert_called_once()
 
 

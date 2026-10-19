@@ -50,9 +50,39 @@ def make_repeated_results(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                 "artifact_digest": "artifact",
                 "tokenizer_digest": "tokenizer",
                 "interactive_tailcut_count": 0,
+                "model_revision": "test-revision",
                 "engine_config": {
                     "max_model_len": 8192,
                     "max_num_batched_tokens": 10000,
+                    "async_scheduling": True,
+                    "enable_prefix_caching": True,
+                    "enable_chunked_prefill": False,
+                    "max_num_seqs": 128,
+                    "max_logprobs": 256,
+                    "enforce_eager": False,
+                    "dtype": "auto",
+                    "seed": 0,
+                },
+                "graph_profile": {
+                    "prefill_bucket_grid": "16,24,32,48",
+                    "prefill_capture_num_reqs": "4",
+                    "prefill_kv_bound": "8192",
+                    "v1_startup_capture_batch_size": "4",
+                },
+                "graph_runtime": {
+                    "captures": [[[16, 4]]],
+                    "effective_profiles": [
+                        {"runner": "MockRunner", "buckets": [16], "kv_bounds": {"16:4": 8192}}
+                    ],
+                    "dispatches": {"replay:4": 250},
+                    "expected_b4_replays": 250,
+                },
+                "runtime_provenance": {
+                    "accelerator": "test GPU",
+                    "cuda": "test",
+                    "torch": "test",
+                    "vllm": "test",
+                    "python": "test",
                 },
                 "prefill_graph_buckets": "16,24,32,48",
                 "prefill_graph_capture_num_reqs": "4",
@@ -92,6 +122,9 @@ def test_ten_repeats_report_variation_and_confirm_task_specific_regression(
     assert not failures
     assert result["baseline_sid_recall32_floors"]["video"] == pytest.approx(0.03907)
     assert result["confirmation_required"] is False
+    assert "| Task | SID baseline | Current SID | Delta SID (pp) | " in summary
+    assert "| video | 3.9070% | 4.0045% | +0.0975 | 3.0010% | 3.0055% | +0.0045 |" in summary
+    assert "Historical median" not in summary
     assert "Baseline check: passed." in summary
 
     _set_sid_recall(tmp_path, 1, "video", 0.038)
@@ -99,6 +132,12 @@ def test_ten_repeats_report_variation_and_confirm_task_specific_regression(
     assert not failures
     assert result["suspected_tasks"] == ["video"]
     assert result["confirmation_required"] is True
+    assert "| video | 3.9070% | 3.8000% | -0.1070 | 3.0010% | 3.0010% | +0.0000 |" in summary
+    assert "| Task | Inference s | Task work s |" in summary
+    assert "| Task | Run | SID Recall@32 |" not in summary
+    assert "| Run | Five-task wall s |" not in summary
+    assert "| Task | SID min | SID median |" not in summary
+    assert "Total wall time:" in summary
     assert "Baseline check: pending confirmation." in summary
 
     _set_sid_recall(tmp_path, 2, "video", 0.038)
@@ -109,7 +148,7 @@ def test_ten_repeats_report_variation_and_confirm_task_specific_regression(
     _set_sid_recall(tmp_path, 3, "video", 0.038)
     _, result, summary, failures = summarize(tmp_path, 3, baseline_path)
     assert failures == [
-        "video: SID Recall@32 below historical minimum 3.9070% in all first three runs"
+        "video: SID Recall@32 below committed baseline 3.9070% in all three measurements"
     ]
     assert result["baseline_failures"] == failures
     assert "Baseline check: FAILED." in summary
@@ -143,3 +182,58 @@ def test_cli_writes_repeat_artifacts_and_step_summary(
     assert repeated["repeat_count"] == 10
     assert len(repeated["runs"]) == 10
     assert "All 10 repeats wall time: 1050 s." in step_summary.read_text(encoding="utf-8")
+
+
+def test_cli_confirmed_failure_preserves_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    candidate, result, _, _ = summarize(tmp_path, 10)
+    candidate["calibration_sid_recall32"] = {
+        task: [run["tasks"][task]["recall@32"] for run in result["runs"]] for task in TASKS
+    }
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(candidate), encoding="utf-8")
+    monkeypatch.setenv("V1_RECALL_BASELINE_FILE", str(baseline))
+    monkeypatch.setattr(
+        sys, "argv", ["v1_recall_summary", "--result-dir", str(tmp_path), "--repeats", "3"]
+    )
+    for run in (1, 2, 3):
+        _set_sid_recall(tmp_path, run, "video", 0.038)
+    with pytest.raises(SystemExit, match="Recall gate failed"):
+        main()
+    assert (tmp_path / "b4_baseline_candidate.json").exists()
+    assert (tmp_path / "b4_repeat_summary.json").exists()
+    assert "FAILED" in (tmp_path / "b4_repeat_summary.md").read_text(encoding="utf-8")
+
+
+def test_graph_profile_comes_from_metrics_and_requires_b4_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    monkeypatch.setenv("VLLM_GR_PREFILL_GRAPH_KV_BOUND", "changed")
+    candidate, _, _, _ = summarize(tmp_path, 1)
+    assert candidate["graph_profile"]["prefill_kv_bound"] == "8192"
+    path = tmp_path / "runs" / "run-01" / "video" / "model_video_bw128_bs4_1000.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    metrics["graph_runtime"]["dispatches"] = {"fallback:4:no_graph": 250}
+    path.write_text(json.dumps(metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="B=4 graph execution"):
+        summarize(tmp_path, 1)
+
+
+def test_different_tasks_dipping_in_different_rounds_do_not_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    candidate, result, _, _ = summarize(tmp_path, 10)
+    candidate["calibration_sid_recall32"] = {
+        task: [run["tasks"][task]["recall@32"] for run in result["runs"]] for task in TASKS
+    }
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(candidate), encoding="utf-8")
+    for run, task in ((1, "video"), (2, "ad"), (3, "product")):
+        _set_sid_recall(tmp_path, run, task, 0.038)
+    _, result, _, failures = summarize(tmp_path, 3, baseline)
+    assert result["suspected_tasks"] == ["video"]
+    assert failures == []

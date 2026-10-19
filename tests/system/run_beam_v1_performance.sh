@@ -61,6 +61,15 @@ server_pid=""
 stop_server() {
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 20; attempt++)); do
+      if ! kill -0 "$server_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.5
+    done
+    if kill -0 "$server_pid" 2>/dev/null; then
+      kill -KILL "$server_pid" 2>/dev/null || true
+    fi
     wait "$server_pid" 2>/dev/null || true
     server_pid=""
   fi
@@ -74,13 +83,22 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 \
   python -m benchmarks.beam_search.v1_performance_gate offline "${args[@]}"
 
 echo "Starting online V1 server"
-if curl --silent --fail "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
-  echo "Port $port already has a server; refusing to measure an unrelated process" >&2
-  exit 1
-fi
+server_identity="v1-perf-$(python -c 'import uuid; print(uuid.uuid4().hex)')"
+python - "$port" <<'PY'
+import socket
+import sys
+
+with socket.socket() as probe:
+    try:
+        probe.bind(("127.0.0.1", int(sys.argv[1])))
+    except OSError as exc:
+        raise SystemExit(f"Port {sys.argv[1]} is occupied: {exc}") from exc
+PY
 server_args=(
   serve
+  "$model"
   --port "$port"
+  --served-model-name "$server_identity"
   --seed 0
   --vllm-gr-config "$output_dir/vllm_gr_config.yaml"
   --async-scheduling
@@ -95,11 +113,11 @@ server_args=(
 if [[ ${#revision_args[@]} -gt 0 ]]; then
   server_args+=("${revision_args[@]}")
 fi
-vllm-gr "${server_args[@]}" "$model" > "$output_dir/server.log" 2>&1 &
+vllm-gr "${server_args[@]}" > "$output_dir/server.log" 2>&1 &
 server_pid=$!
 
 deadline=$((SECONDS + 600))
-while ! curl --silent --show-error --fail "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
+while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
   if ! kill -0 "$server_pid" 2>/dev/null; then
     echo "Online V1 server exited during startup" >&2
     tail -80 "$output_dir/server.log" >&2
@@ -112,14 +130,34 @@ while ! curl --silent --show-error --fail "http://127.0.0.1:$port/health" >/dev/
   fi
   sleep 2
 done
+if ! kill -0 "$server_pid" 2>/dev/null; then
+  echo "Online V1 server exited after readiness" >&2
+  exit 1
+fi
+python - "$server_identity" "$port" <<'PY'
+import json
+import sys
+from urllib.request import urlopen
+
+with urlopen(f"http://127.0.0.1:{sys.argv[2]}/v1/models", timeout=3) as response:
+    models = json.load(response)
+if sys.argv[1] not in {model.get("id") for model in models.get("data", [])}:
+    raise SystemExit("Ready server does not expose this run's unique model identity")
+PY
+if ! kill -0 "$server_pid" 2>/dev/null; then
+  echo "Online V1 server exited before measurement" >&2
+  exit 1
+fi
 
 echo "Running online V1 HTTP concurrency performance"
-python -m benchmarks.beam_search.v1_performance_gate online "${args[@]}"
+python -m benchmarks.beam_search.v1_performance_gate online "${args[@]}" \
+  --served-model-name "$server_identity"
 stop_server
 
 python - "$output_dir" <<'PY'
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -130,7 +168,9 @@ baseline_ms = {
     "online": {1: 55.08, 2: 82.82, 4: 156.22},
 }
 if (
-    setup["input_tokens_including_sid_begin"] != 1024
+    setup["model"] != "OpenOneRec/OneRec-1.7B"
+    or setup["revision"] != "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b"
+    or setup["input_tokens_including_sid_begin"] != 1024
     or setup["beam_width"] != 32
     or setup["generated_steps"] != 3
     or setup["batch_sizes"] != [1, 2, 4]
@@ -154,6 +194,15 @@ lines = [
     "rounded up to whole milliseconds. Offline misses fail the job. Online misses "
     "are warnings and do not fail the job.",
     "",
+    "### Baseline comparison",
+    "",
+    "Change = current - baseline; positive values mean higher latency.",
+    "",
+    "| Mode | B / concurrency | Baseline ms | Current ms | Change ms | "
+    "Change % | Limit ms | Gate |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+]
+details = [
     "| Mode | B / concurrency | Input tokens | Mean group ms | P50 | P95 | P99 | "
     "Mean request ms | Requests/s | Beam tokens/s | Limit ms | Gate |",
     "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
@@ -173,7 +222,8 @@ for mode in ("offline", "online"):
             raise SystemExit(f"unexpected or repeated {mode} B/C={count}")
         seen.add(count)
         mean_ms = group["mean_ms"]
-        limit_ms = math.ceil(baseline_ms[mode][count] + 3.0)
+        baseline = baseline_ms[mode][count]
+        limit_ms = math.ceil(baseline + 3.0)
         input_lengths = case["prompt_tokens_including_sid_begin"]
         if len(input_lengths) != count or any(
             length != setup["input_tokens_including_sid_begin"] for length in input_lengths
@@ -191,8 +241,14 @@ for mode in ("offline", "online"):
             else:
                 blocking.append(message)
                 gate = "FAIL"
-        input_range = f"{min(input_lengths)}–{max(input_lengths)}"
+        change_ms = mean_ms - baseline
         lines.append(
+            f"| {mode} | {count} | {baseline:.2f} | {mean_ms:.3f} | "
+            f"{change_ms:+.3f} | {change_ms / baseline * 100:+.2f}% | "
+            f"{limit_ms} | {gate} |"
+        )
+        input_range = f"{min(input_lengths)}–{max(input_lengths)}"
+        details.append(
             f"| {mode} | {count} | {input_range} | {mean_ms:.3f} | "
             f"{group['p50_ms']:.2f} | {group['p95_ms']:.2f} | "
             f"{group['p99_ms']:.2f} | {request['mean_ms']:.2f} | "
@@ -202,9 +258,10 @@ for mode in ("offline", "online"):
         )
     if seen != set(baseline_ms[mode]):
         raise SystemExit(f"missing {mode} performance cases: {set(baseline_ms[mode]) - seen}")
+lines.extend(("", "### Detailed measurements", "", *details))
 summary = "\n".join(lines) + "\n"
 print(summary, flush=True)
-if summary_path := __import__("os").environ.get("GITHUB_STEP_SUMMARY"):
+if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
     with open(summary_path, "a", encoding="utf-8") as stream:
         stream.write(summary)
 for message in warnings:

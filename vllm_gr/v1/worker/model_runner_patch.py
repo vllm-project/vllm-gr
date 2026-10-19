@@ -373,7 +373,15 @@ def apply_worker_patches() -> None:
                     elif _beam_capture is not None:
                         try:
                             _beam_capture(self)
-                        except Exception:
+                        except Exception as error:
+                            from vllm_gr.v1.worker.cudagraph_capture import (
+                                is_recoverable_capture_error,
+                            )
+
+                            if not isinstance(
+                                error, RuntimeError
+                            ) or not is_recoverable_capture_error(error):
+                                raise
                             logger.exception(
                                 "vllm-gr: beam decode graph dummy capture failed; "
                                 "beam decode will fall back to eager"
@@ -381,7 +389,15 @@ def apply_worker_patches() -> None:
                     if _prefill_capture is not None:
                         try:
                             _prefill_capture(self)
-                        except Exception:
+                        except Exception as error:
+                            from vllm_gr.v1.worker.cudagraph_capture import (
+                                is_recoverable_capture_error,
+                            )
+
+                            if not isinstance(
+                                error, RuntimeError
+                            ) or not is_recoverable_capture_error(error):
+                                raise
                             logger.exception(
                                 "vllm-gr: prefill graph capture failed; "
                                 "prefill will fall back to eager"

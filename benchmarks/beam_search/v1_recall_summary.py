@@ -16,6 +16,7 @@ IDENTITY_KEYS = (
     "artifact_digest",
     "tokenizer_digest",
     "interactive_tailcut_count",
+    "model_revision",
     "engine_config",
     "prefill_graph_buckets",
     "prefill_graph_capture_num_reqs",
@@ -58,12 +59,53 @@ def _task_result(run_dir, task):
         "max_model_len": metrics["engine_config"]["max_model_len"],
         "max_num_batched_tokens": metrics["engine_config"]["max_num_batched_tokens"],
     }
+    policy = {
+        key: metrics["engine_config"][key]
+        for key in (
+            "async_scheduling",
+            "enable_prefix_caching",
+            "enable_chunked_prefill",
+            "max_num_seqs",
+            "max_logprobs",
+            "enforce_eager",
+            "dtype",
+            "seed",
+        )
+    }
+    graph_profile = metrics.get("graph_profile")
+    graph_runtime = metrics.get("graph_runtime")
+    if (
+        not isinstance(graph_profile, dict)
+        or set(graph_profile)
+        != {
+            "prefill_bucket_grid",
+            "prefill_capture_num_reqs",
+            "prefill_kv_bound",
+            "v1_startup_capture_batch_size",
+        }
+        or not isinstance(graph_runtime, dict)
+        or not graph_runtime.get("captures")
+        or not graph_runtime.get("effective_profiles")
+        or any(not any(width == 4 for _, width in worker) for worker in graph_runtime["captures"])
+        or graph_runtime.get("dispatches", {}).get("replay:4", 0)
+        != graph_runtime.get("expected_b4_replays", -1)
+        or graph_runtime.get("expected_b4_replays", 0) <= 0
+        or any(
+            key.startswith("fallback:4:") and count
+            for key, count in graph_runtime.get("dispatches", {}).items()
+        )
+    ):
+        raise ValueError(f"{run_dir.name}/{task}: B=4 graph execution was not verified")
     return {
         "recall@32": metrics["recall@32"],
         "pid_recall@32": metrics["pid_recall@32"],
         "inference_seconds": metrics["elapsed_time"],
         "task_work_seconds": _read_seconds(run_dir / task / "wall_seconds.txt"),
         "identity": identity,
+        "graph_profile": graph_profile,
+        "graph_runtime": graph_runtime,
+        "engine_policy": policy,
+        "runtime_provenance": metrics.get("runtime_provenance"),
     }
 
 
@@ -95,12 +137,9 @@ def summarize(root, repeats, baseline_path=None):
         "temperature": 0.6,
         "sample_count_per_task": 1000,
         "execution_groups": [["video", "ad", "label_cond", "interactive"], ["product"]],
-        "graph_profile": {
-            "prefill_bucket_grid": os.environ["VLLM_GR_PREFILL_GRAPH_BUCKETS"],
-            "prefill_capture_num_reqs": os.environ["VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS"],
-            "prefill_kv_bound": os.environ["VLLM_GR_PREFILL_GRAPH_KV_BOUND"],
-            "v1_startup_capture_batch_size": os.environ["VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"],
-        },
+        "graph_profile": None,
+        "engine_policy": None,
+        "runtime_provenance": None,
         "tasks": {},
     }
     runs = []
@@ -118,6 +157,9 @@ def summarize(root, repeats, baseline_path=None):
             "tasks": {task: _task_result(run_dir, task) for task in TASKS},
         }
         if index == 1:
+            candidate["graph_profile"] = run["tasks"][TASKS[0]]["graph_profile"]
+            candidate["engine_policy"] = run["tasks"][TASKS[0]]["engine_policy"]
+            candidate["runtime_provenance"] = run["tasks"][TASKS[0]]["runtime_provenance"]
             candidate["tasks"] = {
                 task: {
                     "recall@32": run["tasks"][task]["recall@32"],
@@ -131,6 +173,13 @@ def summarize(root, repeats, baseline_path=None):
                 for key in IDENTITY_KEYS:
                     if run["tasks"][task]["identity"][key] != candidate["tasks"][task][key]:
                         raise ValueError(f"run {index}/{task}: input differs from run 1: {key}")
+        for task in TASKS:
+            if (
+                run["tasks"][task]["graph_profile"] != candidate["graph_profile"]
+                or run["tasks"][task]["engine_policy"] != candidate["engine_policy"]
+                or run["tasks"][task]["runtime_provenance"] != candidate["runtime_provenance"]
+            ):
+                raise ValueError(f"run {index}/{task}: graph, engine, or runtime profile differs")
         runs.append(run)
 
     variability = {
@@ -157,6 +206,7 @@ def summarize(root, repeats, baseline_path=None):
             or baseline.get("sample_count_per_task") != 1000
             or baseline.get("execution_groups") != candidate["execution_groups"]
             or baseline.get("graph_profile") != candidate["graph_profile"]
+            or baseline.get("engine_policy") != candidate["engine_policy"]
             or set(baseline.get("tasks", {})) != set(TASKS)
         ):
             raise ValueError("invalid B=4 1000-sample Recall baseline")
@@ -189,8 +239,8 @@ def summarize(root, repeats, baseline_path=None):
             for task in suspected_tasks:
                 if all(run["tasks"][task]["recall@32"] < floors[task] for run in runs[:3]):
                     failures.append(
-                        f"{task}: SID Recall@32 below historical minimum "
-                        f"{floors[task]:.4%} in all first three runs"
+                        f"{task}: SID Recall@32 below committed baseline "
+                        f"{floors[task]:.4%} in all three measurements"
                     )
     confirmation_required = bool(suspected_tasks) and repeats < 3
     result = {
@@ -209,79 +259,134 @@ def summarize(root, repeats, baseline_path=None):
         "baseline_failures": failures,
     }
     lines = [
-        f"## Beam V1 B=4 OneRec Recall@32: {repeats} repeats × five tasks × 1000 samples",
+        f"## Beam V1 B=4 OneRec Recall@32: {repeats} "
+        f"{'run' if repeats == 1 else 'runs'} × five tasks × 1000 samples",
         "",
-        "Each repeat starts two fresh engines, runs the same fixed samples, and includes "
+        "Each run starts two fresh engines, uses the same fixed samples, and includes "
         "model initialization, constraint artifact construction and graph capture in "
         "its wall time. Model download and source-catalog generation happen outside "
         "these timings.",
         "",
         (
-            "The baseline candidate is **run 1 only**. No Recall floor is configured."
+            "The candidate file records the initial measurement. No Recall floor is configured."
             if baseline_path is None
-            else "The committed fixed-sample baseline uses each task's minimum "
-            "SID Recall@32 from ten historical runs. If run 1 falls below it, "
-            "two fresh runs confirm the result. The gate fails only if the same "
-            "task is below its historical minimum in all first three runs."
+            else "The committed SID baseline is each task's minimum Recall@32 "
+            "from ten calibration measurements on fixed samples. A result below "
+            "it triggers two fresh confirmation runs. The gate fails only if "
+            "all three measurements for the same task are below that baseline."
         ),
         "",
-        "| Run | Five-task wall s | Shared SID group s | Product group s |",
-        "| ---: | ---: | ---: | ---: |",
     ]
-    for run in runs:
-        lines.append(
-            f"| {run['number']} | {run['wall_seconds']} | "
-            f"{run['sid_group_wall_seconds']} | {run['product_group_wall_seconds']} |"
-        )
-    lines.extend(
-        (
-            "",
-            "| Task | SID min | SID median | SID max | SID range (pp) | "
-            "SID sample SD (pp) | PID range (pp) |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
-        )
-    )
-    for task in TASKS:
-        sid = variability[task]["sid_recall32_pp"]
-        pid = variability[task]["pid_recall32_pp"]
-        lines.append(
-            f"| {task} | {sid['min']:.4f}% | {sid['median']:.4f}% | "
-            f"{sid['max']:.4f}% | {sid['range']:.4f} | "
-            f"{sid['sample_stddev']:.4f} | {pid['range']:.4f} |"
-        )
     if baseline is not None:
         lines.extend(
             (
+                "### Accuracy compared with the committed baseline",
                 "",
-                "| Task | Historical run 1 | Historical minimum | Current run 1 |",
-                "| --- | ---: | ---: | ---: |",
+                "Current values are medians across the available measurements "
+                "(one measurement when there is one run). Delta = current - "
+                "baseline, in percentage points. Only the SID baseline is gated; "
+                "the PID baseline is a fixed reference for comparison.",
+                "",
+                "| Task | SID baseline | Current SID | Delta SID (pp) | "
+                "PID baseline | Current PID | Delta PID (pp) |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             )
         )
         for task in TASKS:
-            expected = baseline["tasks"][task]["recall@32"]
-            current = runs[0]["tasks"][task]["recall@32"]
-            lines.append(f"| {task} | {expected:.4%} | {floors[task]:.4%} | {current:.4%} |")
-    lines.extend(("", "| Task | Run | SID Recall@32 | PID Recall@32 | Inference s | Task work s |"))
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
-    for task in TASKS:
-        for run in runs:
-            item = run["tasks"][task]
+            sid_baseline = floors[task]
+            sid_current = statistics.median(run["tasks"][task]["recall@32"] for run in runs)
+            pid_baseline = baseline["tasks"][task]["pid_recall@32"]
+            pid_current = statistics.median(run["tasks"][task]["pid_recall@32"] for run in runs)
             lines.append(
-                f"| {task} | {run['number']} | {item['recall@32']:.4%} | "
-                f"{item['pid_recall@32']:.4%} | {item['inference_seconds']:.1f} | "
-                f"{item['task_work_seconds']} |"
+                f"| {task} | {sid_baseline:.4%} | {sid_current:.4%} | "
+                f"{(sid_current - sid_baseline) * 100:+.4f} | {pid_baseline:.4%} | "
+                f"{pid_current:.4%} | {(pid_current - pid_baseline) * 100:+.4f} |"
             )
     lines.extend(
         (
             "",
-            f"Per-repeat wall time: min {total_times['min']:.0f} s, "
-            f"median {total_times['median']:.1f} s, max {total_times['max']:.0f} s, "
-            f"sample SD {total_times['sample_stddev']:.1f} s.",
-            f"All {repeats} repeats wall time: {result['total_wall_seconds']} s.",
-            "This variation is on one fixed 1000-sample set; it does not estimate "
-            "uncertainty relative to the full test sets.",
+            (
+                "| Five-task wall s | Shared SID group s | Product group s |"
+                if repeats == 1
+                else "| Run | Five-task wall s | Shared SID group s | Product group s |"
+            ),
+            "| ---: | ---: | ---: |" if repeats == 1 else "| ---: | ---: | ---: | ---: |",
         )
     )
+    for run in runs:
+        if repeats == 1:
+            lines.append(
+                f"| {run['wall_seconds']} | {run['sid_group_wall_seconds']} | "
+                f"{run['product_group_wall_seconds']} |"
+            )
+        else:
+            lines.append(
+                f"| {run['number']} | {run['wall_seconds']} | "
+                f"{run['sid_group_wall_seconds']} | {run['product_group_wall_seconds']} |"
+            )
+    if repeats > 1:
+        lines.extend(
+            (
+                "",
+                "| Task | SID min | SID median | SID max | SID range (pp) | "
+                "SID sample SD (pp) | PID range (pp) |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            )
+        )
+        for task in TASKS:
+            sid = variability[task]["sid_recall32_pp"]
+            pid = variability[task]["pid_recall32_pp"]
+            lines.append(
+                f"| {task} | {sid['min']:.4f}% | {sid['median']:.4f}% | "
+                f"{sid['max']:.4f}% | {sid['range']:.4f} | "
+                f"{sid['sample_stddev']:.4f} | {pid['range']:.4f} |"
+            )
+    single_baseline = baseline is not None and repeats == 1
+    if single_baseline:
+        lines.extend(
+            (
+                "",
+                "### Task timing",
+                "",
+                "| Task | Inference s | Task work s |",
+                "| --- | ---: | ---: |",
+            )
+        )
+    else:
+        lines.extend(
+            ("", "| Task | Run | SID Recall@32 | PID Recall@32 | Inference s | Task work s |")
+        )
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+    for task in TASKS:
+        for run in runs:
+            item = run["tasks"][task]
+            if single_baseline:
+                lines.append(
+                    f"| {task} | {item['inference_seconds']:.1f} | {item['task_work_seconds']} |"
+                )
+            else:
+                lines.append(
+                    f"| {task} | {run['number']} | {item['recall@32']:.4%} | "
+                    f"{item['pid_recall@32']:.4%} | {item['inference_seconds']:.1f} | "
+                    f"{item['task_work_seconds']} |"
+                )
+    lines.append("")
+    if repeats > 1:
+        lines.append(
+            f"Per-repeat wall time: min {total_times['min']:.0f} s, "
+            f"median {total_times['median']:.1f} s, max {total_times['max']:.0f} s, "
+            f"sample SD {total_times['sample_stddev']:.1f} s."
+        )
+    lines.append(
+        f"Total wall time: {result['total_wall_seconds']} s."
+        if repeats == 1
+        else f"All {repeats} repeats wall time: {result['total_wall_seconds']} s."
+    )
+    if repeats > 1:
+        lines.append(
+            "This variation is on one fixed 1000-sample set; it does not estimate "
+            "uncertainty relative to the full test sets."
+        )
     if baseline_path is not None:
         status = (
             "FAILED" if failures else "pending confirmation" if confirmation_required else "passed"

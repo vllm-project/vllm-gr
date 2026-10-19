@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 
 from vllm_gr.config import BeamExecutionMode, GRConfig
 from vllm_gr.utils.npu_adapter import is_cuda_available
+from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_ENABLE_PREFILL_GRAPH,
     ENV_PREFILL_GRAPH_BUCKETS,
@@ -26,8 +27,53 @@ from vllm_gr.v1.worker.prefill_graph_common import (
 logger = init_logger(__name__)
 
 
+def _capture_request_counts(
+    configured: tuple[int, ...], max_num_seqs: int, mode: BeamExecutionMode
+) -> tuple[int, ...]:
+    if mode is not BeamExecutionMode.V1:
+        return (1,) if max_num_seqs >= 1 else ()
+    return tuple(count for count in configured if count <= max_num_seqs)
+
+
+def _capture_eligible_request_counts(
+    bucket: int,
+    capture_num_reqs: tuple[int, ...],
+    max_context_len: int,
+    custom_total_buckets: bool,
+) -> tuple[int, ...]:
+    return tuple(
+        count
+        for count in capture_num_reqs
+        if bucket >= count
+        and (not custom_total_buckets or not max_context_len or bucket <= count * max_context_len)
+    )
+
+
+def _capture_request_lengths(
+    bucket: int, num_reqs: int, max_context_len: int, custom_total_buckets: bool
+) -> list[int]:
+    base_len, remainder = divmod(bucket, num_reqs)
+    lengths = [base_len + (index < remainder) for index in range(num_reqs)]
+    if custom_total_buckets and max_context_len and max(lengths) > max_context_len:
+        raise ValueError(
+            f"prefill graph bucket {bucket} exceeds the per-request "
+            f"model limit {max_context_len} at B={num_reqs}"
+        )
+    return lengths
+
+
+def _capture_query_len(bucket: int, max_context_len: int, custom_total_buckets: bool) -> int:
+    return min(bucket, max_context_len) if custom_total_buckets and max_context_len else bucket
+
+
+def _capture_dummy_positions(lengths: list[int], device: torch.device) -> torch.Tensor:
+    return torch.cat([torch.arange(length, device=device, dtype=torch.int64) for length in lengths])
+
+
 class GPUPrefillGraphRunner(BasePrefillGraphRunner):
     """Manages CUDA graph capture and replay on NVIDIA GPUs."""
+
+    supports_multi_request_total_buckets = True
 
     def __init__(
         self,
@@ -75,14 +121,12 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
             )
         configured_num_reqs = get_prefill_graph_capture_num_reqs()
         max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", configured_num_reqs[-1]))
-        capture_num_reqs = tuple(count for count in configured_num_reqs if count <= max_num_seqs)
         custom_total_buckets = os.getenv(ENV_PREFILL_GRAPH_BUCKETS) is not None
         max_context_len = get_max_context_len(runner)
         # Legacy Beam Search dispatches one request at a time. Keep its
         # original capture footprint; reserve B=4 graphs for V1 sessions.
         mode = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None)).beam_execution_mode
-        if mode is not BeamExecutionMode.V1:
-            capture_num_reqs = capture_num_reqs[:1]
+        capture_num_reqs = _capture_request_counts(configured_num_reqs, max_num_seqs, mode)
 
         logger.info(
             "Beginning Prefill CUDA graph capture for buckets: %s (batch sizes: %s)",
@@ -129,30 +173,19 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                 for layer_name in kv_cache_config.kv_cache_groups[0].layer_names:
                     slot_mappings_by_layer[layer_name] = buf.slot_mapping_buf
 
-            for num_reqs in capture_num_reqs:
-                if bucket < num_reqs:
-                    continue
-
+            for num_reqs in _capture_eligible_request_counts(
+                bucket, capture_num_reqs, max_context_len, custom_total_buckets
+            ):
                 try:
                     # Distribute bucket tokens evenly across num_reqs for capture
-                    base_len = bucket // num_reqs
-                    rem = bucket % num_reqs
-                    req_lens = [base_len + (1 if i < rem else 0) for i in range(num_reqs)]
+                    req_lens = _capture_request_lengths(
+                        bucket, num_reqs, max_context_len, custom_total_buckets
+                    )
                     if custom_total_buckets and max_context_len:
-                        if any(length > max_context_len for length in req_lens):
-                            raise ValueError(
-                                f"prefill graph bucket {bucket} exceeds the per-request "
-                                f"model limit {max_context_len} at B={num_reqs}"
-                            )
                         if bucket > max_context_len:
                             # The bucket is a sum over requests; dummy RoPE
                             # positions must still restart at zero per row.
-                            positions = torch.cat(
-                                [
-                                    torch.arange(length, device=runner.device, dtype=torch.int64)
-                                    for length in req_lens
-                                ]
-                            )
+                            positions = _capture_dummy_positions(req_lens, runner.device)
                             if buf.positions_buf.ndim == 1:
                                 buf.positions_buf.copy_(positions)
                             else:
@@ -179,10 +212,8 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                         num_tokens=bucket,
                         num_tokens_padded=bucket,
                         num_reqs=num_reqs,
-                        max_query_len=(
-                            min(bucket, max_context_len)
-                            if custom_total_buckets and max_context_len
-                            else bucket
+                        max_query_len=_capture_query_len(
+                            bucket, max_context_len, custom_total_buckets
                         ),
                         ubatch_slices=None,
                         for_cudagraph_capture=True,
@@ -299,6 +330,9 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                     buf.static_attn_metadatas[num_reqs] = attn_metadata
 
                 except Exception as e:  # noqa: BLE001
+                    if not isinstance(e, RuntimeError) or not is_recoverable_capture_error(e):
+                        raise
+                    torch.accelerator.synchronize()
                     logger.warning(
                         "Failed to capture Prefill CUDA graph for bucket %d (num_reqs=%d): %r.",
                         bucket,

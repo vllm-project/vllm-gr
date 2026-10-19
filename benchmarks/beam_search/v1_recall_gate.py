@@ -9,11 +9,15 @@ import json
 import logging
 import math
 import os
+import platform
 import subprocess
 import tempfile
 import time
 from collections import Counter
+from importlib.metadata import version
 from pathlib import Path
+
+from benchmarks.beam_search.v1_sid_validation import validate_sid_tokens
 
 os.environ.setdefault("USE_TF", "0")
 logger = logging.getLogger(__name__)
@@ -99,8 +103,7 @@ def infer_batch(llm, tokenizer, token_rows, params):
             if full_tokens[: len(tokens)] != tokens:
                 raise RuntimeError("output prompt/order mismatch within the batch")
             suffix = full_tokens[len(tokens) :]
-            if len(suffix) != params.max_tokens:
-                raise RuntimeError(f"unexpected SID output length: {len(suffix)}")
+            validate_sid_tokens(tokenizer, suffix, "Recall beam")
             suffixes.append(suffix)
         predictions.append(
             tokenizer.batch_decode(
@@ -110,16 +113,62 @@ def infer_batch(llm, tokenizer, token_rows, params):
     return predictions
 
 
+def graph_stats(llm):
+    stats = llm.llm_engine.collective_rpc("get_gr_beam_graph_runtime_stats")
+    if not stats or any("gr_prefill_dispatches" not in worker for worker in stats):
+        raise RuntimeError("prefill graph runtime statistics are unavailable")
+    return stats
+
+
+def graph_delta(before, after, expected_batches):
+    if len(before) != len(after):
+        raise RuntimeError("prefill graph worker count changed during Recall run")
+    captures = []
+    effective_profiles = []
+    dispatches = Counter()
+    for previous, current in zip(before, after, strict=True):
+        captures.append(current.get("gr_prefill_captures", []))
+        effective_profiles.append(
+            {
+                "runner": current["runner"],
+                "buckets": current.get("gr_prefill_buckets", []),
+                "kv_bounds": current.get("gr_prefill_kv_bounds", {}),
+            }
+        )
+        for key, value in current["gr_prefill_dispatches"].items():
+            change = value - previous["gr_prefill_dispatches"].get(key, 0)
+            if change < 0:
+                raise RuntimeError("prefill graph counters moved backwards")
+            dispatches[key] += change
+    if not all(any(width == 4 for _, width in worker) for worker in captures):
+        raise RuntimeError("Recall run did not capture a B=4 prefill graph on every worker")
+    expected_replays = expected_batches * len(after)
+    if dispatches["replay:4"] != expected_replays or any(
+        key.startswith("fallback:4:") and value for key, value in dispatches.items()
+    ):
+        raise RuntimeError(
+            f"Recall B=4 graph replay/fallback policy failed: "
+            f"expected {expected_replays} replays, got {dict(dispatches)}"
+        )
+    return {
+        "captures": captures,
+        "effective_profiles": effective_profiles,
+        "dispatches": dict(dispatches),
+        "expected_b4_replays": expected_replays,
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--model-revision", help="Immutable model snapshot commit")
     parser.add_argument("--dataset-path", type=Path, required=True)
     parser.add_argument("--catalog-path", type=Path, required=True, help="Constraint triples JSON")
     task_group = parser.add_mutually_exclusive_group(required=True)
     task_group.add_argument("--task-type", choices=TASKS)
     task_group.add_argument("--task-types", choices=TASKS, nargs="+")
     parser.add_argument("--num-prompts", type=int, help="Omit to run the full test Parquet")
-    parser.add_argument("--batch-size", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--batch-size", type=int, choices=(4,), default=4)
     parser.add_argument("--n", type=int, default=128, help="Beam width")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -147,6 +196,8 @@ def parse_args():
     for path in (args.model, args.dataset_path, args.catalog_path):
         if not path.exists():
             parser.error(f"missing path: {path}")
+    if args.model_revision and args.model.resolve().name != args.model_revision:
+        parser.error("--model must resolve to the requested immutable snapshot revision")
     return args
 
 
@@ -155,6 +206,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     import pandas as pd
     import pyarrow.parquet as pq
+    import torch
     from tqdm import tqdm
     from transformers import AutoTokenizer
 
@@ -268,6 +320,7 @@ def main():
         "max_logprobs": args.n * 2,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enforce_eager": False,
+        "dtype": "auto",
         "seed": 0,
     }
     logger.info("engine_config=%s", engine_config)
@@ -336,6 +389,7 @@ def main():
             for item in prepared:
                 task = item["task"]
                 task_start = time.perf_counter()
+                graph_before = graph_stats(llm)
                 samples = {}
                 elapsed = 0.0
                 for start, end in tqdm(item["batches"], desc=f"{task} B={args.batch_size}"):
@@ -352,6 +406,11 @@ def main():
                             "ground_truth": original["ground_truth"],
                             "metadata": original.get("metadata", {}),
                         }
+                graph_runtime = graph_delta(
+                    graph_before,
+                    graph_stats(llm),
+                    sum(end - start == 4 for start, end in item["batches"]),
+                )
 
                 # Preserve the existing per-task evaluator and SID/PID definitions.
                 evaluator = item["registry"].evaluator_class(
@@ -366,6 +425,7 @@ def main():
                 repo = Path(__file__).resolve().parents[2]
                 metrics.update(
                     model=str(args.model),
+                    model_revision=args.model_revision,
                     task=task,
                     beam_width=args.n,
                     temperature=args.temperature,
@@ -381,6 +441,25 @@ def main():
                     dataset_path=str(args.dataset_path),
                     catalog_path=str(args.catalog_path),
                     engine_config=engine_config,
+                    runtime_provenance={
+                        "accelerator": torch.cuda.get_device_name(0),
+                        "cuda": torch.version.cuda,
+                        "torch": torch.__version__,
+                        "vllm": version("vllm"),
+                        "python": platform.python_version(),
+                    },
+                    graph_runtime=graph_runtime,
+                    graph_profile={
+                        # The effective per-group buckets are recorded in graph_runtime.
+                        "prefill_bucket_grid": custom_buckets,
+                        "prefill_capture_num_reqs": os.getenv(
+                            "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS"
+                        ),
+                        "prefill_kv_bound": os.getenv("VLLM_GR_PREFILL_GRAPH_KV_BOUND"),
+                        "v1_startup_capture_batch_size": os.getenv(
+                            "VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE"
+                        ),
+                    },
                     prefill_graph_buckets=os.getenv("VLLM_GR_PREFILL_GRAPH_BUCKETS"),
                     prefill_graph_capture_num_reqs=os.getenv(
                         "VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS"

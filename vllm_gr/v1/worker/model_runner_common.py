@@ -1259,6 +1259,21 @@ def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
         "captured_widths": sorted(int(width) for width in getattr(runner, "_beam_graph_keys", ())),
         "full_dispatches": int(getattr(runner, "_beam_graph_full_dispatch_count", 0)),
     }
+    prefill = getattr(runner, "_prefill_graph_runner", None)
+    if prefill is not None:
+        stats["gr_prefill_buckets"] = list(prefill.buckets)
+        stats["gr_prefill_captures"] = sorted(
+            [int(bucket), int(num_reqs)]
+            for bucket, buffers in prefill.buffers.items()
+            for num_reqs in buffers.captured_graphs
+        )
+        stats["gr_prefill_kv_bounds"] = {
+            f"{bucket}:{num_reqs}": int(bound)
+            for bucket, buffers in prefill.buffers.items()
+            for num_reqs, bound in buffers.max_seq_len_bounds.items()
+            if num_reqs in buffers.captured_graphs
+        }
+    stats["gr_prefill_dispatches"] = dict(getattr(runner, "_gr_prefill_graph_dispatches", {}))
     manager = getattr(runner, "cudagraph_manager", None)
     counts = getattr(manager, "dispatch_counts", None)
     if counts is not None:

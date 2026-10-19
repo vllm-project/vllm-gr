@@ -7,6 +7,16 @@
   "beam_width": 128,
   "temperature": 0.6,
   "sample_count_per_task": 1000,
+  "engine_policy": {
+    "async_scheduling": true,
+    "enable_prefix_caching": true,
+    "enable_chunked_prefill": false,
+    "max_num_seqs": 128,
+    "max_logprobs": 256,
+    "enforce_eager": false,
+    "dtype": "auto",
+    "seed": 0
+  },
   "execution_groups": [
     [
       "video",
@@ -28,6 +38,7 @@
     "video": {
       "recall@32": 0.03725000000000007,
       "pid_recall@32": 0.0364944444444445,
+      "model_revision": "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b",
       "source_sha256": "66079915e3c3daab7df3487f9babb658df99ec1672c3ef42d7893d87cef2e6d8",
       "sample_ids": [
         14782,
@@ -1045,6 +1056,7 @@
     "ad": {
       "recall@32": 0.07046865079365083,
       "pid_recall@32": 0.06628571428571432,
+      "model_revision": "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b",
       "source_sha256": "d671fb497eb5495d05705688980db57a7bf5640eb7c18b9ab0cc89c76193e6c8",
       "sample_ids": [
         20869,
@@ -2062,6 +2074,7 @@
     "product": {
       "recall@32": 0.06653888888888902,
       "pid_recall@32": 0.03890793650793653,
+      "model_revision": "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b",
       "source_sha256": "355dd1807995a62af6bd33fe28eefbe9b267e836b4a76f081d8e92eb3996d5bb",
       "sample_ids": [
         3834,
@@ -3079,6 +3092,7 @@
     "label_cond": {
       "recall@32": 0.02464682539682539,
       "pid_recall@32": 0.024063492063492058,
+      "model_revision": "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b",
       "source_sha256": "b339ea60a1acfae625822b1e865dde170cd65ad75d9cd770838b625323373c8f",
       "sample_ids": [
         24263,
@@ -4096,6 +4110,7 @@
     "interactive": {
       "recall@32": 0.2084623015873016,
       "pid_recall@32": 0.19728888888888893,
+      "model_revision": "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b",
       "source_sha256": "1ebcd2a20fa54430daba3600df2fe9bd2ddbbbcbe38601ca81211a78eed16a25",
       "sample_ids": [
         0,

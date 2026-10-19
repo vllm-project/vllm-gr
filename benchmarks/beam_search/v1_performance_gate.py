@@ -13,6 +13,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from benchmarks.beam_search.v1_sid_validation import (
+    validate_sid_text,
+    validate_sid_tokens,
+)
+
 
 def distribution(values: list[float]) -> dict[str, float]:
     if not values or any(not math.isfinite(value) or value <= 0 for value in values):
@@ -140,6 +145,32 @@ def case_result(
     }
 
 
+def validate_online_response(
+    body: dict[str, Any], *, index: int, beam_width: int, prompt_tokens: int
+) -> None:
+    choices = body.get("choices")
+    if not isinstance(choices, list) or len(choices) != beam_width:
+        raise RuntimeError(f"online request={index}: incomplete V1 output")
+    for beam_index, choice in enumerate(choices):
+        validate_sid_text(choice.get("text"), f"online request={index} beam={beam_index}")
+    usage = body.get("usage")
+    if usage is not None:
+        expected_completion = beam_width * 5
+        if (
+            not isinstance(usage, dict)
+            or usage.get("prompt_tokens") != prompt_tokens
+            or usage.get("completion_tokens") != expected_completion
+            or usage.get("total_tokens") != prompt_tokens + expected_completion
+        ):
+            raise RuntimeError(f"online request={index}: inconsistent token usage: {usage!r}")
+
+
+def error_details(error: BaseException) -> str:
+    if isinstance(error, BaseExceptionGroup):
+        return "; ".join(error_details(child) for child in error.exceptions)
+    return f"{type(error).__name__}: {error}"
+
+
 def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -> None:
     import torch
     import yaml
@@ -209,6 +240,15 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
                     len(output.sequences) != args.beam_width for output in outputs
                 ):
                     raise RuntimeError(f"offline B={count}: incomplete V1 output")
+                for request_index, (prompt_ids, output) in enumerate(
+                    zip(prompt_token_ids[:count], outputs, strict=True)
+                ):
+                    for beam_index, sequence in enumerate(output.sequences):
+                        tokens = list(sequence.tokens)
+                        context = f"offline B={count} request={request_index} beam={beam_index}"
+                        if tokens[: len(prompt_ids)] != prompt_ids:
+                            raise RuntimeError(f"{context}: output prompt/order mismatch")
+                        validate_sid_tokens(tokenizer, tokens[len(prompt_ids) :], context)
                 if iteration >= args.warmup_runs:
                     group_samples.append(elapsed)
             case = case_result(
@@ -246,7 +286,7 @@ async def run_online(args: argparse.Namespace, result: dict[str, Any]) -> None:
 
     async def one_request(session: aiohttp.ClientSession, index: int) -> float:
         payload = {
-            "model": args.model,
+            "model": args.served_model_name or args.model,
             "prompt": prompt_token_ids[index],
             "use_beam_search": True,
             "n": args.beam_width,
@@ -263,8 +303,12 @@ async def run_online(args: argparse.Namespace, result: dict[str, Any]) -> None:
                 raise RuntimeError(f"online request failed ({response.status}): {body}")
             body = await response.json()
         elapsed = (time.perf_counter_ns() - start) / 1e6
-        if len(body.get("choices", [])) != args.beam_width:
-            raise RuntimeError(f"online C request {index}: incomplete V1 output")
+        validate_online_response(
+            body,
+            index=index,
+            beam_width=args.beam_width,
+            prompt_tokens=len(prompt_token_ids[index]),
+        )
         return elapsed
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -295,6 +339,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("prepare", "offline", "online"))
     parser.add_argument("--model", required=True)
+    parser.add_argument("--served-model-name")
     parser.add_argument("--revision")
     parser.add_argument("--triples", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, required=True)
@@ -312,7 +357,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if (
         args.beam_width <= 0
-        or args.generated_steps not in (1, 2, 3)
+        or args.generated_steps != 3
         or args.warmup_runs < 0
         or args.measured_runs <= 0
         or not args.batch_sizes
@@ -353,7 +398,7 @@ def main() -> None:
         else:
             asyncio.run(run_online(args, result))
     except BaseException as exc:
-        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["error"] = error_details(exc)
         write_json(args.output_dir / f"{args.mode}.json", result)
         raise
     result["complete"] = True

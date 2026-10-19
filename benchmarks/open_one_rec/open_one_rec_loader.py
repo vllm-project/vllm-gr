@@ -15,6 +15,7 @@ from abc import ABC
 from collections import Counter
 from dataclasses import dataclass
 from json import JSONDecodeError
+from numbers import Integral
 from typing import Any, Dict, Optional, Type
 
 import pandas as pd
@@ -261,7 +262,19 @@ class BaseLoader(ABC):
             if sample_size is not None:
                 raise ValueError("sample_ids and sample_size are mutually exclusive")
             df = self._load_dataframe(split)
-            normalized_ids = [int(sample_id) for sample_id in sample_ids]
+            normalized_ids = []
+            for sample_id in sample_ids:
+                if isinstance(sample_id, bool) or not (
+                    isinstance(sample_id, Integral)
+                    or (
+                        isinstance(sample_id, str) and sample_id.isascii() and sample_id.isdecimal()
+                    )
+                ):
+                    raise ValueError(f"sample_ids must be nonnegative integers: {sample_id!r}")
+                normalized = int(sample_id)
+                if normalized < 0:
+                    raise ValueError(f"sample_ids must be nonnegative integers: {sample_id!r}")
+                normalized_ids.append(normalized)
             duplicates = [
                 sample_id for sample_id, count in Counter(normalized_ids).items() if count > 1
             ]

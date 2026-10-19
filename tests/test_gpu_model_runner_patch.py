@@ -871,6 +871,7 @@ def test_beam_graph_runtime_stats_reports_capture_and_dispatch_state() -> None:
         "beam_max_width": 128,
         "captured_widths": [128],
         "full_dispatches": 2,
+        "gr_prefill_dispatches": {},
     }
 
 

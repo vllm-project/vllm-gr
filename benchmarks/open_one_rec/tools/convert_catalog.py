@@ -50,13 +50,19 @@ def process_json(input_file_path: str, output_file_path: str) -> int:
     result_list: list[list[str]] = []
 
     for key_str in data:
-        try:
-            key = int(key_str)
-        except (TypeError, ValueError):
-            LOGGER.warning("Skipping non-integer key: %s", key_str)
-            continue
-
+        if (
+            not isinstance(key_str, str)
+            or not key_str.isascii()
+            or not key_str.isdecimal()
+            or (len(key_str) > 1 and key_str.startswith("0"))
+        ):
+            raise ValueError(f"Invalid SID key: {key_str!r}")
+        key = int(key_str)
+        if key >= BASE**3:
+            raise ValueError(f"SID key exceeds three-component range: {key_str!r}")
         result_list.append(_build_sid_tokens(key))
+    if not result_list:
+        raise ValueError(f"No SID entries in {input_path}")
 
     output_dir = output_path.parent
     if str(output_dir):

@@ -26,7 +26,12 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 if [[ -d "$model" ]]; then
+  if [[ -n "${V1_RECALL_BASELINE_FILE:-}" ]]; then
+    echo "A calibrated Recall gate requires the pinned model snapshot" >&2
+    exit 1
+  fi
   model_path="$model"
+  model_revision_args=()
 else
   model_path="$(python - "$model" "$revision" <<'PY'
 import sys
@@ -35,6 +40,7 @@ from huggingface_hub import snapshot_download
 print(snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2]))
 PY
 )"
+  model_revision_args=(--model-revision "$revision")
 fi
 
 total_start=$SECONDS
@@ -79,6 +85,7 @@ run_group() {
   VLLM_ENABLE_V1_MULTIPROCESSING=0 \
     python -m benchmarks.beam_search.v1_recall_gate \
       --model "$model_path" \
+      "${model_revision_args[@]}" \
       --dataset-path "$dataset" \
       --catalog-path "$group_triples" \
       --task-types "$@" \
