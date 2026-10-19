@@ -393,8 +393,14 @@ def _fia_v2_graph_kwargs(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attn_metadata: BeamAttentionMetadata,
+    *,
+    mask: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    num_heads: int,
+    num_kv_heads: int,
     scale: float,
+    sparse_mode: int,
     qlen_list: list,
     kvlen_list: list,
 ) -> dict:
@@ -403,16 +409,16 @@ def _fia_v2_graph_kwargs(
         "query": query,
         "key": key,
         "value": value,
-        "atten_mask": attn_metadata.npu_causal_atten_mask if attn_metadata.causal else None,
-        "block_table": attn_metadata.block_table,
+        "atten_mask": mask,
+        "block_table": block_table,
         "input_layout": "TND",
-        "block_size": attn_metadata.block_size,
+        "block_size": block_size,
         "actual_seq_qlen": qlen_list,
         "actual_seq_kvlen": kvlen_list,
-        "num_key_value_heads": attn_metadata.num_kv_heads,
-        "num_query_heads": attn_metadata.num_heads,
+        "num_key_value_heads": num_kv_heads,
+        "num_query_heads": num_heads,
         "softmax_scale": scale,
-        "sparse_mode": 3 if attn_metadata.causal else 0,
+        "sparse_mode": sparse_mode,
     }
 
 
@@ -445,7 +451,20 @@ def _prefill_attention_graph(
     kvlen_list = sl[:num_reqs]
     key = key_cache.view(*key_cache.shape[:-2], -1)
     value = value_cache.view(*value_cache.shape[:-2], -1)
-    kw = _fia_v2_graph_kwargs(query, key, value, attn_metadata, scale, qlen_list, kvlen_list)
+    kw = _fia_v2_graph_kwargs(
+        query,
+        key,
+        value,
+        mask=attn_metadata.npu_causal_atten_mask if attn_metadata.causal else None,
+        block_table=attn_metadata.block_table,
+        block_size=attn_metadata.block_size,
+        num_heads=attn_metadata.num_heads,
+        num_kv_heads=attn_metadata.num_kv_heads,
+        scale=scale,
+        sparse_mode=3 if attn_metadata.causal else 0,
+        qlen_list=qlen_list,
+        kvlen_list=kvlen_list,
+    )
     if entry.workspace is None:
         # Size the workspace for the maximum supported per-request KV length
         # (the model's max context), not the dummy capture-time lengths: the
@@ -468,9 +487,7 @@ def _prefill_attention_graph(
         else:
             ws_qlen_list = qlen_list
             ws_kvlen_list = kvlen_list
-        ws_kw = _fia_v2_graph_kwargs(
-            query, key, value, attn_metadata, scale, ws_qlen_list, ws_kvlen_list
-        )
+        ws_kw = dict(kw, actual_seq_qlen=ws_qlen_list, actual_seq_kvlen=ws_kvlen_list)
         entry.workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(**ws_kw)
         if entry.workspace is None:
             raise RuntimeError("FIA-v2 workspace sizing failed during prefill graph capture")
@@ -480,11 +497,9 @@ def _prefill_attention_graph(
     torch.npu.graph_task_group_begin(stream)
     torch_npu.npu_fused_infer_attention_score_v2.out(**kw, workspace=workspace, out=[output, lse])
     handle = torch.npu.graph_task_group_end(stream)
-    mask = (
-        attn_metadata.npu_causal_atten_mask
-        if attn_metadata.npu_causal_atten_mask is not None
-        else None
-    )
+    # Persist the effective capture parameters, including the absence of a
+    # causal mask. Metadata may carry a prebuilt mask even for non-causal FIA.
+    mask = kw["atten_mask"]
     entry.layers.append(
         NPUGraphLayerTask(
             handle=handle,
@@ -494,11 +509,11 @@ def _prefill_attention_graph(
             value=_make_weak_graph_tensor(value),
             mask=_make_weak_graph_tensor(mask) if mask is not None else mask,
             lse=_make_weak_graph_tensor(lse),
-            block_size=attn_metadata.block_size,
-            num_heads=attn_metadata.num_heads,
-            num_kv_heads=attn_metadata.num_kv_heads,
-            scale=scale,
-            sparse_mode=3 if attn_metadata.causal else 0,
+            block_size=kw["block_size"],
+            num_heads=kw["num_query_heads"],
+            num_kv_heads=kw["num_key_value_heads"],
+            scale=kw["softmax_scale"],
+            sparse_mode=kw["sparse_mode"],
         )
     )
 
@@ -553,24 +568,23 @@ def update_graph_params(
                     "aborting the update (the replay would execute with stale params)."
                 )
                 return False
-            mask = task.mask
+            kw = _fia_v2_graph_kwargs(
+                query,
+                key,
+                value,
+                mask=task.mask,
+                block_table=block_table,
+                block_size=task.block_size,
+                num_heads=task.num_heads,
+                num_kv_heads=task.num_kv_heads,
+                scale=task.scale,
+                sparse_mode=task.sparse_mode,
+                qlen_list=qlen_list,
+                kvlen_list=kvlen_list,
+            )
             torch.npu.graph_task_update_begin(update_stream, task.handle)
             torch_npu.npu_fused_infer_attention_score_v2.out(
-                query=query,
-                key=key,
-                value=value,
-                atten_mask=mask,
-                block_table=block_table,
-                input_layout="TND",
-                block_size=task.block_size,
-                actual_seq_qlen=qlen_list,
-                actual_seq_kvlen=kvlen_list,
-                num_key_value_heads=task.num_kv_heads,
-                num_query_heads=task.num_heads,
-                softmax_scale=task.scale,
-                sparse_mode=task.sparse_mode,
-                workspace=entry.workspace,
-                out=[output, lse],
+                **kw, workspace=entry.workspace, out=[output, lse]
             )
             torch.npu.graph_task_update_end(update_stream)
     return True
