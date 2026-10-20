@@ -131,6 +131,9 @@ class BeamAttentionMetadata:
     beam_layer_idx: int = 0
     beam_pool_slots: list = None  # Per beam-request slot index (for max_batch>1)
     incremental_suffix_kv_len: int = 0  # decode_step + 1
+    # Host proof that the current NPU batch routes every row in order. Graph
+    # dispatch must preserve this layout: replay does not re-run Python guards.
+    npu_prefix_rows_are_identity: bool = False
 
 
 class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadata]):
@@ -1660,6 +1663,18 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # In incremental decode, suffix KV length = decode_step + 1
             incremental_suffix_kv_len = beam_decode_step_list[0] + 1
 
+        # Use the current CPU routing, including geometry-hit q_start updates.
+        # Counts or contiguity alone do not prove a zero-based identity range.
+        npu_prefix_rows_are_identity = (
+            getattr(self, "_is_npu", False)
+            and is_incremental
+            and not std_indices
+            and len(prefix_indices) > 0
+            and len(prefix_indices) == common_attn_metadata.num_actual_tokens
+            and len(prefix_indices) == getattr(beam_session, "attention_width", 0)
+            and all(index == row for row, index in enumerate(prefix_indices))
+        )
+
         meta = BeamAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -1713,6 +1728,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             num_kv_heads=self.num_kv_heads,
             # Incremental decode fields
             is_beam_decode=is_incremental,
+            npu_prefix_rows_are_identity=npu_prefix_rows_are_identity,
             beam_session=beam_session,
             beam_pool_slots=beam_pool_slots,
             incremental_suffix_kv_len=incremental_suffix_kv_len,

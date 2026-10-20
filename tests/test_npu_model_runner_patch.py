@@ -621,8 +621,20 @@ def _make_determine_wrapper(native_result: Any) -> Any:
 
 
 def _make_beam_info(session: Any, req_ids: list[str], beam_keys: list[str]) -> dict[str, Any]:
+    width = int(getattr(session, "request_width", getattr(session, "beam_width", 4)))
     beam_data = {
-        req_id: ({"is_beam_decode": True, "decode_step": 0} if req_id in beam_keys else {})
+        req_id: (
+            {
+                "is_beam_decode": True,
+                "decode_step": 0,
+                "beam_decode_steps": 1,
+                "beam_width": width,
+                "prefix_len": 128,
+                "cache_len": 128,
+            }
+            if req_id in beam_keys
+            else {}
+        )
         for req_id in req_ids
     }
     return {
@@ -729,13 +741,17 @@ def test_npu_determine_cascade_mode_downgrades_full() -> None:
 def test_npu_determine_pure_beam_batch_grants_full() -> None:
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
 
-    session = SimpleNamespace(is_active=True, slot=0, batch_size=1, request_width=4)
+    session = SimpleNamespace(
+        is_active=True, slot=0, batch_size=1, request_width=4, attention_width=4
+    )
     beam_info = _make_beam_info(session, ["beam-1"], ["beam-1"])
     native = (CUDAGraphMode.NONE, BatchDescriptor(num_tokens=4))
     runner = SimpleNamespace(
         _current_beam_info=beam_info,
         _beam_graph_keys={4},
         _gr_npu_beam_graph_shapes={(1, 4)},
+        _current_scheduler_output=SimpleNamespace(num_scheduled_tokens={"beam-1": 4}),
+        query_start_loc=SimpleNamespace(np=np.array([0, 4], dtype=np.int32)),
     )
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
@@ -765,6 +781,7 @@ def test_npu_determine_same_token_count_wrong_shape_falls_back(native_mode: str)
         slot=0,
         batch_size=4,
         request_width=2,
+        attention_width=8,
     )
     request_ids = [f"beam-{index}" for index in range(4)]
     beam_info = _make_beam_info(session, request_ids, request_ids)
@@ -773,6 +790,10 @@ def test_npu_determine_same_token_count_wrong_shape_falls_back(native_mode: str)
         _current_beam_info=beam_info,
         _beam_graph_keys={8},
         _gr_npu_beam_graph_shapes={(2, 4)},
+        _current_scheduler_output=SimpleNamespace(
+            num_scheduled_tokens=dict.fromkeys(request_ids, 2)
+        ),
+        query_start_loc=SimpleNamespace(np=np.arange(0, 9, 2, dtype=np.int32)),
     )
 
     orig_xllm = npu_patch._npu_xllm_decode_mode_active
@@ -794,6 +815,151 @@ def test_npu_determine_same_token_count_wrong_shape_falls_back(native_mode: str)
     finally:
         npu_patch._npu_xllm_decode_mode_active = orig_xllm
         npu_patch._beam_graph_enabled_for_run = orig_enabled
+
+
+def _identity_layout_runner(batch_size: int = 2, width: int = 4) -> SimpleNamespace:
+    request_ids = [f"beam-{index}" for index in range(batch_size)]
+    session = SimpleNamespace(
+        is_active=True,
+        slot=0,
+        batch_size=batch_size,
+        request_width=width,
+        attention_width=batch_size * width,
+    )
+    return SimpleNamespace(
+        _current_beam_info=_make_beam_info(session, request_ids, request_ids),
+        _beam_graph_keys={batch_size * width},
+        _gr_npu_beam_graph_shapes={(batch_size, width)},
+        _current_scheduler_output=SimpleNamespace(
+            num_scheduled_tokens=dict.fromkeys(request_ids, width)
+        ),
+        query_start_loc=SimpleNamespace(
+            np=np.arange(0, (batch_size + 1) * width, width, dtype=np.int32)
+        ),
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+def test_npu_identity_layout_gate_accepts_physical_request_order(batch_size: int) -> None:
+    runner = _identity_layout_runner(batch_size)
+    assert npu_patch._npu_beam_identity_layout_matches(
+        runner, runner._current_beam_info, batch_size * 4
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+@pytest.mark.parametrize("native_mode", ["NONE", "PIECEWISE", "FULL"])  # type: ignore[misc]
+def test_npu_determine_attributes_uncaptured_nonidentity_batch_to_shape_miss(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int, native_mode: str
+) -> None:
+    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
+
+    runner = _identity_layout_runner(batch_size)
+    runner._gr_npu_beam_graph_shapes.clear()
+    beam_info = runner._current_beam_info
+    cached_prefix = beam_info["beam_data"]["beam-0"]["cache_len"]
+    beam_info["beam_data"]["beam-0"]["cache_len"] = 0
+    tokens = batch_size * 4
+    assert not npu_patch._npu_beam_identity_layout_matches(runner, beam_info, tokens)
+    native = (getattr(CUDAGraphMode, native_mode), BatchDescriptor(num_tokens=tokens), "extra")
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_beam_graph_enabled_for_run", lambda _runner: True)
+
+    wrapped = _make_determine_wrapper(native)
+    result = wrapped(runner, num_tokens=tokens)
+    expected_mode = CUDAGraphMode.PIECEWISE if native_mode == "PIECEWISE" else CUDAGraphMode.NONE
+    assert result[0] == expected_mode
+    assert result[1].num_tokens == tokens and result[2:] == native[2:]
+    if native_mode != "FULL":
+        assert result is native
+    assert runner._beam_graph_fallback_count == 1
+    assert runner._beam_graph_fallback_reasons == {"shape_miss": 1}
+    assert getattr(runner, "_beam_graph_full_dispatch_count", 0) == 0
+
+    runner._gr_npu_beam_graph_shapes.add((batch_size, 4))
+    assert wrapped(runner, num_tokens=tokens)[0] == expected_mode
+    assert runner._beam_graph_fallback_count == 2
+    assert runner._beam_graph_fallback_reasons == {"shape_miss": 1, "identity_layout": 1}
+
+    beam_info["beam_data"]["beam-0"]["cache_len"] = cached_prefix
+    assert wrapped(runner, num_tokens=tokens)[0] == CUDAGraphMode.FULL
+    assert runner._beam_graph_full_dispatch_count == 1
+    assert runner._beam_graph_fallback_count == 2
+
+
+@pytest.mark.parametrize("native_mode", ["NONE", "PIECEWISE", "FULL"])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "invalid_layout",
+    [
+        "missing-schedule",
+        "logical-counts",
+        "unequal-counts",
+        "request-order",
+        "cached-prefix-lost",
+        "wrong-query-starts",
+        "missing-query-mirror",
+        "wrong-attention-width",
+        "boolean-decode-step",
+        "missing-decode-rows",
+        "inconsistent-decode-step",
+    ],
+)
+def test_npu_determine_rejects_nonidentity_layout_at_same_shape(
+    monkeypatch: pytest.MonkeyPatch, native_mode: str, invalid_layout: str
+) -> None:
+    """An exact B/W bucket must not replay a graph with baked identity views."""
+    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
+
+    runner = _identity_layout_runner()
+    beam_info = runner._current_beam_info
+    if invalid_layout == "missing-schedule":
+        runner._current_scheduler_output = None
+    elif invalid_layout == "logical-counts":
+        runner._current_scheduler_output.num_scheduled_tokens = {"beam-0": 1, "beam-1": 1}
+    elif invalid_layout == "unequal-counts":
+        runner._current_scheduler_output.num_scheduled_tokens = {"beam-0": 3, "beam-1": 5}
+    elif invalid_layout == "request-order":
+        runner._current_scheduler_output.num_scheduled_tokens = {"beam-1": 4, "beam-0": 4}
+    elif invalid_layout == "cached-prefix-lost":
+        beam_info["beam_data"]["beam-0"]["cache_len"] = 0
+    elif invalid_layout == "wrong-query-starts":
+        runner.query_start_loc.np = np.array([0, 3, 8], dtype=np.int32)
+    elif invalid_layout == "missing-query-mirror":
+        runner.query_start_loc = None
+    elif invalid_layout == "wrong-attention-width":
+        beam_info["beam_session"].attention_width = 4
+    elif invalid_layout == "boolean-decode-step":
+        beam_info["beam_data"]["beam-0"]["decode_step"] = True
+    elif invalid_layout == "missing-decode-rows":
+        beam_info["beam_data"]["beam-0"]["beam_decode_steps"] = 0
+    elif invalid_layout == "inconsistent-decode-step":
+        beam_info["beam_data"]["beam-0"]["beam_decode_steps"] = 2
+
+    native = (getattr(CUDAGraphMode, native_mode), BatchDescriptor(num_tokens=8), "extra")
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_beam_graph_enabled_for_run", lambda _runner: True)
+    result = _make_determine_wrapper(native)(runner, num_tokens=8)
+    expected_mode = CUDAGraphMode.PIECEWISE if native_mode == "PIECEWISE" else CUDAGraphMode.NONE
+    assert result[0] == expected_mode
+    assert result[1].num_tokens == 8 and result[2:] == native[2:]
+    assert runner._beam_graph_fallback_reasons == {"identity_layout": 1}
+
+
+def test_npu_determine_does_not_reuse_identity_grant_after_prefix_layout_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
+
+    runner = _identity_layout_runner()
+    native = (CUDAGraphMode.NONE, BatchDescriptor(num_tokens=8))
+    monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    monkeypatch.setattr(npu_patch, "_beam_graph_enabled_for_run", lambda _runner: True)
+    wrapped = _make_determine_wrapper(native)
+    assert wrapped(runner, num_tokens=8)[0] == CUDAGraphMode.FULL
+    runner._current_beam_info["beam_data"]["beam-0"]["cache_len"] = 0
+    assert wrapped(runner, num_tokens=8)[0] == CUDAGraphMode.NONE
+    assert runner._beam_graph_full_dispatch_count == 1
+    assert runner._beam_graph_fallback_reasons == {"identity_layout": 1}
 
 
 def test_npu_determine_active_lora_downgrades_full() -> None:

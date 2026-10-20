@@ -329,8 +329,17 @@ class BeamAttentionImpl(AttentionImpl):
             if attn_metadata.prefix_indices is not None:
                 # Beam tokens at prefix_indices positions (always set on the
                 # incremental decode path, mixed or pure batch alike).
-                beam_key = key[attn_metadata.prefix_indices]  # [W, H, D]
-                beam_value = value[attn_metadata.prefix_indices]  # [W, H, D]
+                select_rows = (
+                    getattr(platform_execution, "select_beam_rows", None)
+                    if key.device.type == "npu"
+                    else None
+                )
+                if select_rows is not None:
+                    beam_key = select_rows(key, attn_metadata)
+                    beam_value = select_rows(value, attn_metadata)
+                else:
+                    beam_key = key[attn_metadata.prefix_indices]  # [W, H, D]
+                    beam_value = value[attn_metadata.prefix_indices]  # [W, H, D]
             else:
                 # Fallback kept for callers that do not set prefix_indices;
                 # the incremental path always sets it (see beam_attn_metadata).
