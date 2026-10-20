@@ -19,6 +19,14 @@ on:
     branches:
       - main
       - decode_graph
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - converted_to_draft
+      - labeled
+      - unlabeled
     paths-ignore:
       - 'docs/**'
       - 'examples/**'
@@ -31,8 +39,25 @@ on:
       - 'LICENSE'
   workflow_dispatch:
 
+concurrency:
+  # Unrelated label edits must not cancel queued or running CI for this PR.
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event.pull_request.number || github.ref
+    }}-${{
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+      github.event.label.name != 'ready' && format('ignored-{0}', github.run_id) || 'ci'
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+       contains(github.event.pull_request.labels.*.name, 'ready') &&
+       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+        github.event.label.name == 'ready'))
     runs-on: ubuntu-latest
     strategy:
       matrix:
