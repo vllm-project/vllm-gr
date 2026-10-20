@@ -75,5 +75,13 @@ def _cleanup_torch_backend(backend, *, collect_ipc: bool) -> bool:
 
 def release_accelerator_memory() -> None:
     """Release cached CUDA/NPU memory after engine shutdown."""
-    _cleanup_torch_backend(getattr(torch, "npu", None), collect_ipc=False)
+    npu = getattr(torch, "npu", None)
+    try:
+        npu_initialized = npu is not None and npu.is_initialized()
+    except Exception:
+        logger.debug("NPU initialization probe failed during cleanup", exc_info=True)
+    else:
+        # synchronize() would lazily initialize an unused NPU runtime.
+        if npu_initialized:
+            _cleanup_torch_backend(npu, collect_ipc=False)
     _cleanup_torch_backend(getattr(torch, "cuda", None), collect_ipc=True)
