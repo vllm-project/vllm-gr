@@ -122,14 +122,39 @@ def merge_short_suffix_attention(
     Prefix LSE is natural-log, [query_heads, beams], in canonical head order.
     The caller dispatches only plain, unwindowed attention without softcap,
     ALiBi or sinks. Key/value pools have identical strides and independent
-    beam histories. Accumulation is FP32, including when inputs are FP32;
-    no TF32 or reduced-precision dot products are used.
+    beam histories. Tiny FP16/BF16 pools preserve FA2's intermediate rounding
+    stages. The general kernel, including the independent FP32 validation path,
+    accumulates in FP32 without TF32 or reduced-precision dot products.
     """
     width, heads, dim = query.shape
     steps = pool_key.shape[3]
     assert steps >= 1
     assert pool_key.shape == pool_value.shape and pool_key.stride() == pool_value.stride()
     assert heads % pool_key.shape[2] == 0
+    if (
+        steps <= 3
+        and dim in (64, 128, 256)
+        and heads // pool_key.shape[2] <= 16
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and query.dtype == prefix_output.dtype == output.dtype == pool_key.dtype == pool_value.dtype
+    ):
+        from vllm_gr.v1.attention.backends.beam_short_suffix_fa2 import (
+            merge_short_suffix_fa2,
+        )
+
+        merge_short_suffix_fa2(
+            output,
+            query,
+            prefix_output,
+            prefix_lse,
+            pool_key,
+            pool_value,
+            slot,
+            decode_step,
+            scale,
+            active_mask,
+        )
+        return
     _short_suffix_merge_kernel[(triton.cdiv(width * heads, 4),)](
         query,
         pool_key,

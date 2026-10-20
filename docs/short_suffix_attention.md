@@ -2,7 +2,7 @@
 
 When explicitly enabled, incremental beam decode with one query per beam
 uses a fused Triton suffix/merge kernel for any configured positive KV pool
-capacity. It reads K/V from the existing pool, computes suffix scores in
+capacity. It reads K/V from the existing pool, accumulates suffix scores in
 FP32, and merges them
 with the prefix attention output and natural-log LSE. It writes the final
 attention output directly.
@@ -53,14 +53,68 @@ the selected implementation. CUDA graph enablement is independent.
 There is no fixed suffix-length upper limit imposed by this optimization.
 Users select the implementation explicitly; performance gains depend on the
 actual suffix length and should be measured for their workload. Tiny pools
-retain static unrolling; larger pools loop over the actual device-side
-suffix extent, avoiding computation for unused capacity.
+preserve FA2's rounding stages as described below; larger pools loop over
+the actual device-side suffix extent, avoiding computation for unused capacity.
 Compare both paths on the same checkout and workload, starting a fresh engine
 for each value of `beam.enable_short_suffix_attention`. Keep the model,
 input/output token interval, context length, beam width, generation length,
 warmup count, and CUDA graph settings identical.
 
 ## Numerical validation
+
+### FA2 arithmetic for tiny FP16/BF16 pools
+
+For a configured pool capacity of 1/2/3, head dimensions 64/128/256 and GQA
+groups of at most 16 query heads per KV head, the FP16/BF16 fast path retains
+the disabled implementation's arithmetic stages:
+
+- QK uses activation-dtype Tensor Core operands with FP32 accumulation and
+  the same `kWidth=2` operand layout as FA2.
+- Softmax uses FA2's `exp2` scaling and natural-log LSE calculation.
+- Unnormalized probabilities are rounded to the activation dtype before PV.
+- The normalized suffix output is rounded to the activation dtype before merge.
+- Prefix/suffix merging uses CUDA `expf`, round-to-nearest weights and the
+  original FMA ordering.
+
+The probability and suffix-output casts stay in registers. KV packing,
+suffix output/LSE tensors and a separate merge launch remain eliminated.
+The larger-pool kernel, groups above 16, and the independent FP32 validation
+path retain the previous online FP32 implementation. This change does not
+claim FA2 output equivalence for those paths.
+
+The original fused implementation changed the numerical algorithm by
+removing the intermediate FP16/BF16 rounding and using a different dot,
+softmax and merge reduction order. A small attention difference can change
+scores and beam ordering after multiple transformer layers; it does not
+by itself establish a KV indexing error or worse error against FP64.
+Matching the disabled FA2 path and matching a dense FP32/FP64 reference are
+separate validation goals.
+
+`tests/kernels/attention/test_beam_short_suffix_fa2.py` compares the tiny-pool
+path with the actual packed FA2 suffix, GQA LSE conversion and CUDA merge,
+using zero absolute and relative tolerance. It covers FP16/BF16, MHA/GQA/MQA,
+non-power-of-two GQA groups, partial tiles, request-major widths up to 512,
+strided tensors, runtime slots and graph replay with changing step, mask
+and pool contents. The independent reference tests below remain in place
+with their original tolerances.
+
+On 2026-10-20, a Qwen3-0.6B BF16 comparison on L20 covered B=1/2/4,
+beam width 128, context 128/512/1024/2048, and three generated tokens
+(prefill plus two decode rounds). Each cell used 100 distinct prompts and
+2048 legal three-token paths, with four branches at each of the two suffix
+levels. Fresh engines ran disabled / patched / original fused / patched /
+disabled. Both patched/disabled pairs matched complete token lists, order
+and scores exactly in every cell; same-toggle repeats also matched.
+The original fused kernel's Top-1 agreement was 91%-99%, with matching-candidate
+score differences up to 0.212887 on these inputs.
+
+Each engine also recorded 40 unprofiled fixed-input timings per cell,
+excluding output normalization. Averaging the two patched and two disabled engine medians,
+patched latency was 0.006%-1.008% above the original fused arm and
+5.39%-22.03% below the disabled path. These results cover this Qwen workload;
+OneRec end-to-end output agreement was not remeasured.
+
+### Independent dense references
 
 `tests/kernels/attention/test_beam_short_suffix.py` compares with an
 independent dense attention reference over the concatenated prefix and
@@ -87,6 +141,7 @@ Run the kernel tests and relevant regression tests:
 ```bash
 .venv/bin/pytest -q -s \
   tests/kernels/attention/test_beam_short_suffix.py \
+  tests/kernels/attention/test_beam_short_suffix_fa2.py \
   tests/test_short_suffix_config.py \
   tests/test_gr_config.py \
   tests/test_gr_config_v1.py \
