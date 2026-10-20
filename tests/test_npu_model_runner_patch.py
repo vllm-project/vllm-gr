@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for NPU ModelRunner wrappers."""
 
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -1475,6 +1476,349 @@ def test_npu_eager_decode_binds_winners_and_sampling_rows() -> None:
     assert remapped.temperature.tolist() == pytest.approx([0.5] * 3 + [0.9] * 3)
     assert remapped.top_p.tolist() == pytest.approx([0.8] * 3 + [0.7] * 3)
     assert source.temperature.tolist() == pytest.approx([0.5, 0.9])
+
+
+class _NPUPositionTensor(torch.Tensor):  # type: ignore[misc]
+    @property
+    def device(self) -> torch.device:
+        # Only the Python device guard is mocked; storage remains on CPU.
+        return cast(torch.device, SimpleNamespace(type="npu"))
+
+
+class _CUDAPositionTensor(torch.Tensor):  # type: ignore[misc]
+    @property
+    def device(self) -> torch.device:
+        return cast(torch.device, SimpleNamespace(type="cuda"))
+
+
+def _position_plan(
+    prompt_lengths: tuple[int, ...],
+    step: int,
+    beam_width: int = 3,
+    dynamic_beam_widths: tuple[int, ...] | None = None,
+) -> NPUEagerStagePlan:
+    output = _eager_stage_output(
+        kind="decode", batch_size=len(prompt_lengths), beam_width=beam_width, decode_step=step
+    )
+    metadata = next(iter(output.gr_stage_metadata.values()))
+    metadata.num_prompt_tokens_by_request = prompt_lengths
+    metadata.num_prompt_tokens = sum(prompt_lengths)
+    metadata.beam_params.dynamic_beam_widths = dynamic_beam_widths
+    return NPUEagerStagePlan.from_scheduler_output(output)
+
+
+class _CountingPositionTuple(tuple[int, ...]):
+    reads: list[int]
+
+    def __new__(cls, values: tuple[int, ...]) -> "_CountingPositionTuple":
+        instance = super().__new__(cls, values)
+        instance.reads = []
+        return instance
+
+    def __getitem__(self, index: Any) -> Any:
+        assert isinstance(index, int)
+        self.reads.append(index)
+        return super().__getitem__(index)
+
+
+@pytest.mark.parametrize("beam_width", [1, 3, 128])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "prompt_lengths",
+    [
+        (128,),
+        (128, 128, 128, 128),
+        (1, 127, 4096, 8192),
+        (128, 128, 4096, 4096),
+        (128, 4096, 128, 4096),
+    ],
+)
+def test_npu_decode_positions_read_only_request_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    beam_width: int,
+    prompt_lengths: tuple[int, ...],
+) -> None:
+    plan = _position_plan(prompt_lengths, 1, beam_width)
+    assert plan.decode_positions is not None
+    expected = torch.tensor(plan.decode_positions, dtype=torch.int64)
+    counted = _CountingPositionTuple(plan.decode_positions)
+    plan = replace(plan, decode_positions=counted)
+    rows = expected.numel()
+    input_ids = torch.full((rows + 2,), -7, dtype=torch.int32)
+    positions = torch.full((rows + 2,), -9, dtype=torch.int64).as_subclass(_NPUPositionTensor)
+    winners = torch.arange(rows, dtype=torch.int32).reshape(len(prompt_lengths), beam_width)
+    calls: list[tuple[int, int, int]] = []
+
+    def fill(tensor: torch.Tensor, value: int) -> torch.Tensor:
+        calls.append((tensor.storage_offset(), tensor.numel(), value))
+        return torch.Tensor.fill_(tensor, value)
+
+    monkeypatch.setattr(_NPUPositionTensor, "fill_", fill)
+    plan.prepare_decode_inputs(input_ids, positions, winners)
+
+    # This is independent of width: the former per-row scan reads B * W
+    # positions, including interior rows, even when every request is equal.
+    assert counted.reads == [index * beam_width for index in range(len(prompt_lengths))]
+    expected_runs = sum(
+        index == 0 or length != prompt_lengths[index - 1]
+        for index, length in enumerate(prompt_lengths)
+    )
+    assert len(calls) == expected_runs
+    assert sum(count for _offset, count, _value in calls) == rows
+    torch.testing.assert_close(positions[:rows].as_subclass(torch.Tensor), expected)
+    torch.testing.assert_close(input_ids[:rows], winners.flatten())
+    assert positions[rows:].as_subclass(torch.Tensor).tolist() == [-9, -9]
+    assert input_ids[rows:].tolist() == [-7, -7]
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "dynamic_beam_widths", [(128, 64, 32), (32, 128, 256)]
+)
+@pytest.mark.parametrize("step", [0, 1])  # type: ignore[misc]
+@pytest.mark.parametrize("prompt_lengths", [(128,), (128, 128, 4096, 4096)])  # type: ignore[misc]
+def test_npu_decode_positions_dynamic_boundaries_use_active_input_width(
+    monkeypatch: pytest.MonkeyPatch,
+    dynamic_beam_widths: tuple[int, ...],
+    step: int,
+    prompt_lengths: tuple[int, ...],
+) -> None:
+    capacity = 256
+    plan = _position_plan(prompt_lengths, step, capacity, dynamic_beam_widths)
+    width = dynamic_beam_widths[step]
+    assert plan.execution.input_width == width < capacity
+    assert plan.decode_positions is not None
+    expected = torch.tensor(plan.decode_positions, dtype=torch.int64)
+    counted = _CountingPositionTuple(plan.decode_positions)
+    plan = replace(plan, decode_positions=counted)
+    rows = len(prompt_lengths) * width
+    # Capacity is larger than the active input: never fill inactive Beam rows.
+    input_ids = torch.full((len(prompt_lengths) * capacity + 2,), -7, dtype=torch.int32)
+    positions = torch.full_like(input_ids, -9, dtype=torch.int64).as_subclass(_NPUPositionTensor)
+    winners = torch.arange(rows, dtype=torch.int32).reshape(len(prompt_lengths), width)
+    calls: list[tuple[int, int, int]] = []
+
+    def fill(tensor: torch.Tensor, value: int) -> torch.Tensor:
+        calls.append((tensor.storage_offset(), tensor.numel(), value))
+        return torch.Tensor.fill_(tensor, value)
+
+    monkeypatch.setattr(_NPUPositionTensor, "fill_", fill)
+    plan.prepare_decode_inputs(input_ids, positions, winners)
+
+    assert counted.reads == [index * width for index in range(len(prompt_lengths))]
+    expected_calls = (
+        [(0, width, prompt_lengths[0] + step)]
+        if len(prompt_lengths) == 1
+        else [(0, 2 * width, 128 + step), (2 * width, 2 * width, 4096 + step)]
+    )
+    assert calls == expected_calls
+    torch.testing.assert_close(positions[:rows].as_subclass(torch.Tensor), expected)
+    torch.testing.assert_close(input_ids[:rows], winners.flatten())
+    assert torch.all(positions[rows:].as_subclass(torch.Tensor) == -9)
+    assert torch.all(input_ids[rows:] == -7)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("prompt_lengths", "runs"),
+    [
+        ((128,), 1),
+        ((128, 128, 128, 128), 1),
+        ((1, 127, 4096, 8192), 4),
+        ((128, 128, 4096, 4096), 2),
+        ((128, 4096, 128, 4096), 4),
+    ],
+)
+def test_npu_decode_positions_fill_only_adjacent_equal_rows_without_host_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    prompt_lengths: tuple[int, ...],
+    runs: int,
+) -> None:
+    rows = len(prompt_lengths) * 3
+    input_ids = torch.full((rows + 2,), -7, dtype=torch.int32)
+    positions = torch.full((rows + 2,), -9, dtype=dtype).as_subclass(_NPUPositionTensor)
+    pointers = (input_ids.data_ptr(), positions.data_ptr())
+    calls: list[tuple[int, int, int]] = []
+
+    def fill(tensor: torch.Tensor, value: int) -> torch.Tensor:
+        calls.append((tensor.storage_offset(), tensor.numel(), value))
+        return torch.Tensor.fill_(tensor, value)
+
+    def forbid_host_transfer(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("NPU position binding must not create or read a host tensor")
+
+    monkeypatch.setattr(_NPUPositionTensor, "fill_", fill)
+    for step in (0, 1, 7):
+        plan = _position_plan(prompt_lengths, step)
+        winners = torch.arange(rows, dtype=torch.int32) + step * 100
+        expected_positions = torch.tensor(plan.decode_positions, dtype=dtype)
+        calls.clear()
+        with monkeypatch.context() as guard:
+            guard.setattr(torch, "as_tensor", forbid_host_transfer)
+            guard.setattr(torch.Tensor, "cpu", forbid_host_transfer)
+            guard.setattr(torch.Tensor, "item", forbid_host_transfer)
+            guard.setattr(torch.Tensor, "tolist", forbid_host_transfer)
+            plan.prepare_decode_inputs(
+                input_ids,
+                positions,
+                winners if step == 1 else winners.reshape(len(prompt_lengths), 3),
+            )
+        assert len(calls) == runs
+        assert sum(count for _offset, count, _value in calls) == rows
+        assert pointers == (input_ids.data_ptr(), positions.data_ptr())
+        torch.testing.assert_close(positions[:rows].as_subclass(torch.Tensor), expected_positions)
+        torch.testing.assert_close(input_ids[:rows], winners)
+        assert positions[rows:].as_subclass(torch.Tensor).tolist() == [-9, -9]
+        assert input_ids[rows:].tolist() == [-7, -7]
+
+
+@pytest.mark.parametrize("mock_cuda", [False, True])  # type: ignore[misc]
+def test_non_npu_decode_positions_keep_original_tensor_copy(
+    monkeypatch: pytest.MonkeyPatch, mock_cuda: bool
+) -> None:
+    plan = _position_plan((128, 4096), 1)
+    positions = torch.full((8,), -9, dtype=torch.int64)
+    if mock_cuda:
+        positions = positions.as_subclass(_CUDAPositionTensor)
+    input_ids = torch.full((8,), -7, dtype=torch.int32)
+    winners = torch.arange(6, dtype=torch.int32)
+    original = torch.as_tensor
+    calls: list[tuple[Any, torch.dtype, str]] = []
+
+    def as_tensor(data: Any, *, dtype: torch.dtype, device: Any) -> torch.Tensor:
+        calls.append((data, dtype, device.type))
+        # Fake CUDA storage is still CPU storage, so keep the real operation on CPU.
+        return original(data, dtype=dtype, device="cpu")
+
+    monkeypatch.setattr(torch, "as_tensor", as_tensor)
+    plan.prepare_decode_inputs(input_ids, positions, winners)
+    assert calls == [(plan.decode_positions, torch.int64, "cuda" if mock_cuda else "cpu")]
+    torch.testing.assert_close(
+        positions.as_subclass(torch.Tensor),
+        torch.tensor([129, 129, 129, 4097, 4097, 4097, -9, -9]),
+    )
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("invalid", "message"),
+    [
+        ("prefill", "requires a Decode plan"),
+        ("input-rank", "input_ids has insufficient"),
+        ("input-capacity", "input_ids has insufficient"),
+        ("position-rank", "positions has insufficient"),
+        ("position-capacity", "positions has insufficient"),
+        ("winner-shape", "winner_token_ids must have shape"),
+        ("winner-device", "must be on the same device"),
+    ],
+)
+def test_npu_decode_positions_retain_input_validation(invalid: str, message: str) -> None:
+    plan = _position_plan((128,), 1)
+    input_ids = torch.full((5,), -7, dtype=torch.int32)
+    positions = torch.full((5,), -9, dtype=torch.int64).as_subclass(_NPUPositionTensor)
+    winners = torch.arange(3, dtype=torch.int32)
+    if invalid == "prefill":
+        plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
+    elif invalid == "input-rank":
+        input_ids = input_ids.unsqueeze(0)
+    elif invalid == "input-capacity":
+        input_ids = input_ids[:2]
+    elif invalid == "position-rank":
+        positions = positions.unsqueeze(0)
+    elif invalid == "position-capacity":
+        positions = positions[:2]
+    elif invalid == "winner-shape":
+        winners = winners.unsqueeze(1)
+    elif invalid == "winner-device":
+        winners = winners.as_subclass(_CUDAPositionTensor)
+    with pytest.raises(BeamExecutionContractError, match=message):
+        plan.prepare_decode_inputs(input_ids, positions, winners)
+    assert torch.all(input_ids == -7)
+    assert torch.all(positions.as_subclass(torch.Tensor) == -9)
+
+
+@pytest.mark.npu_integration  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "prompt_lengths",
+    [(128,), (128, 128, 128, 128), (1, 127, 4096, 8192), (128, 4096, 128, 4096)],
+)
+def test_npu_decode_positions_match_original_construction_across_async_steps(
+    dtype: torch.dtype, prompt_lengths: tuple[int, ...]
+) -> None:
+    pytest.importorskip("torch_npu")
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("Ascend NPU is not available")
+    plans = [_position_plan(prompt_lengths, step, beam_width=128) for step in (0, 1, 7)]
+    rows = len(prompt_lengths) * 128
+    input_ids = torch.full((rows + 2,), -7, dtype=torch.int32, device="npu")
+    positions = torch.full((rows + 2,), -9, dtype=dtype, device="npu")
+    winners = torch.empty((len(prompt_lengths), 128), dtype=torch.int32, device="npu")
+    original_positions = [
+        torch.as_tensor(plan.decode_positions, dtype=dtype, device=positions.device)
+        for plan in plans
+    ]
+    pointers = (input_ids.data_ptr(), positions.data_ptr(), winners.data_ptr())
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    snapshots = []
+    with torch.npu.stream(stream):
+        for index, plan in enumerate(plans):
+            winners.fill_(100 + index)
+            plan.prepare_decode_inputs(input_ids, positions, winners)
+            snapshots.append((input_ids.clone(), positions.clone()))
+    # No host reads or synchronization between successive device updates.
+    stream.synchronize()
+    assert pointers == (input_ids.data_ptr(), positions.data_ptr(), winners.data_ptr())
+    for index, ((ids, actual), expected) in enumerate(zip(snapshots, original_positions)):
+        torch.testing.assert_close(actual[:rows], expected, rtol=0, atol=0)
+        assert ids[:rows].cpu().tolist() == [100 + index] * rows
+        assert ids[rows:].cpu().tolist() == [-7, -7]
+        assert actual[rows:].cpu().tolist() == [-9, -9]
+
+
+@pytest.mark.npu_integration  # type: ignore[misc]
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "dynamic_beam_widths", [(128, 64, 32), (32, 128, 256)]
+)
+@pytest.mark.parametrize("prompt_lengths", [(128,), (128, 128, 4096, 4096)])  # type: ignore[misc]
+def test_npu_decode_positions_dynamic_widths_match_original_across_async_steps(
+    dtype: torch.dtype,
+    dynamic_beam_widths: tuple[int, ...],
+    prompt_lengths: tuple[int, ...],
+) -> None:
+    pytest.importorskip("torch_npu")
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("Ascend NPU is not available")
+    capacity = 256
+    batch = len(prompt_lengths)
+    plans = [_position_plan(prompt_lengths, step, capacity, dynamic_beam_widths) for step in (0, 1)]
+    input_ids = torch.full((batch * capacity + 2,), -7, dtype=torch.int32, device="npu")
+    positions = torch.full((batch * capacity + 2,), -9, dtype=dtype, device="npu")
+    winners = torch.empty((batch * capacity,), dtype=torch.int32, device="npu")
+    expected_positions = [
+        torch.as_tensor(plan.decode_positions, dtype=dtype, device="npu") for plan in plans
+    ]
+    pointers = (input_ids.data_ptr(), positions.data_ptr(), winners.data_ptr())
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    snapshots = []
+    with torch.npu.stream(stream):
+        for step, plan in enumerate(plans):
+            width = dynamic_beam_widths[step]
+            rows = batch * width
+            input_ids.fill_(-7)
+            positions.fill_(-9)
+            winners.fill_(100 + step)
+            plan.prepare_decode_inputs(input_ids, positions, winners[:rows].view(batch, width))
+            snapshots.append((input_ids.clone(), positions.clone()))
+    stream.synchronize()
+    assert pointers == (input_ids.data_ptr(), positions.data_ptr(), winners.data_ptr())
+    for step, ((ids, actual), expected) in enumerate(zip(snapshots, expected_positions)):
+        rows = batch * dynamic_beam_widths[step]
+        torch.testing.assert_close(actual[:rows], expected, rtol=0, atol=0)
+        assert ids[:rows].cpu().tolist() == [100 + step] * rows
+        assert torch.all(ids[rows:] == -7)
+        assert torch.all(actual[rows:] == -9)
 
 
 def test_npu_eager_attention_layout_keeps_request_ownership() -> None:
