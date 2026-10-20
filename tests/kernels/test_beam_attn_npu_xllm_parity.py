@@ -51,6 +51,8 @@ from vllm_gr.v1.beam import (  # noqa: E402
     BeamSearchSession,
 )
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR  # noqa: E402
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView  # noqa: E402
+from vllm_gr.v1.beam.npu_execution_batch import NPUBeamExecutionBatch  # noqa: E402
 
 DEVICE = torch.device("npu")
 DTYPE = torch.bfloat16
@@ -68,12 +70,14 @@ def _build_incremental_metadata(
     beam_width: int,
     prefix_len: int,
     decode_step: int,
-    session: BeamSearchSession,
+    session: BeamSearchSession | NPUBeamExecutionBatch,
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     std_req: tuple[int, int, int] | None = None,
+    request_ids: tuple[str, ...] | None = None,
+    num_query_heads: int = NUM_HEADS,
 ) -> BeamAttentionMetadata:
     """Build real incremental-decode metadata through the real builder.
 
@@ -86,11 +90,10 @@ def _build_incremental_metadata(
 
     # std tokens are not part of the beam query tensor here
     query_start_loc_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32)
-    # Beam request occupies the first w query rows; each beam contributes 1.
+    # Requests occupy consecutive w-row groups; each beam contributes 1.
     if std_req is None:
-        query_start_loc_cpu[1] = beam_width
-        query_start_loc_cpu[2:] = beam_width
-        num_actual_tokens = beam_width
+        query_start_loc_cpu[:] = torch.arange(num_reqs + 1) * beam_width
+        num_actual_tokens = num_reqs * beam_width
     else:
         std_idx, std_q_len, _ = std_req
         # std rows come first (std_indices gather), beam rows after.
@@ -124,8 +127,10 @@ def _build_incremental_metadata(
     common.causal = True
     common.slot_mapping = torch.zeros(num_actual_tokens, dtype=torch.long, device=DEVICE)
 
+    req_ids = request_ids or tuple(f"req_{i}" for i in range(num_reqs))
+    beam_req_ids = req_ids if std_req is None else ("req_0",)
     beam_data: dict[str, object] = {
-        "req_0": {
+        req_id: {
             "is_beam_decode": True,
             "prefix_len": prefix_len,
             "beam_width": beam_width,
@@ -133,10 +138,11 @@ def _build_incremental_metadata(
             "cache_len": prefix_len // BLOCK_SIZE * BLOCK_SIZE,
             "decode_step": decode_step,
         }
+        for req_id in beam_req_ids
     }
     beam_info: dict[str, object] = {
         "beam_data": beam_data,
-        "req_ids": [f"req_{i}" for i in range(num_reqs)],
+        "req_ids": list(req_ids),
         "beam_session": session,
     }
 
@@ -150,7 +156,7 @@ def _build_incremental_metadata(
         builder.use_full_cuda_graph = False
         builder.max_cudagraph_size = None
         builder.max_num_splits = 0
-        builder.num_heads_q = NUM_HEADS
+        builder.num_heads_q = num_query_heads
         builder.num_kv_heads = NUM_KV_HEADS
         builder._is_cuda = False
         builder._is_npu = True
@@ -195,6 +201,161 @@ def _run_mode(
     )
     torch.npu.synchronize()
     return output
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+@pytest.mark.parametrize("decode_step", [0, 2])  # type: ignore[misc]
+@pytest.mark.parametrize("num_query_heads", [NUM_HEADS, 2 * NUM_KV_HEADS])  # type: ignore[misc]
+def test_cascade_execution_batch_matches_individual_requests(
+    batch_size: int, decode_step: int, num_query_heads: int
+) -> None:
+    """The production batch facade must read all B*W request-local histories.
+
+    Compare the flattened execution with independent single-request Cascade
+    calls and a dense FP32 reference for both MHA and GQA. Distinct queries,
+    prefix blocks, and suffix values make missing or cross-request KV rows
+    observable. The dense comparison uses the existing BF16 attention
+    tolerance, since FIA computes prefix and suffix separately before their
+    LSE-weighted merge.
+    """
+    torch.manual_seed(1000 + batch_size * 10 + decode_step)
+    beam_width, prefix_len = 32, 256
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    steps = decode_step + 1
+    request_ids = tuple(f"cascade_req_{index}" for index in range(batch_size))
+    context = BeamAttentionContext(
+        max_batch=batch_size,
+        max_beams=beam_width,
+        num_kv_heads=NUM_KV_HEADS,
+        max_decode_steps=MAX_DECODE_STEPS,
+        head_dim=HEAD_DIM,
+        num_layers=NUM_LAYERS,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    sessions = []
+    for request_id in request_ids:
+        slot = context.registry.allocate(request_id, beam_width=beam_width, prefix_len=prefix_len)
+        session = BeamSearchSession(session_id=request_id, slot=slot, context=context)
+        session.begin_session(beam_width=beam_width, prefix_len=prefix_len)
+        session._state.decode_step = decode_step
+        sessions.append(session)
+    execution = BeamBatchExecutionView(
+        session_id="cascade_batch",
+        dispatch_id=0,
+        stage_index=decode_step + 1,
+        kind="decode",
+        decode_step=decode_step,
+        owner_generation=0,
+        request_ids=request_ids,
+        num_prompt_tokens_by_request=(prefix_len,) * batch_size,
+        beam_width=beam_width,
+        produces_output=True,
+    )
+    batch = NPUBeamExecutionBatch(execution, sessions)
+    try:
+        blocks_per_req = prefix_len // BLOCK_SIZE
+        cache_shape = (
+            batch_size * blocks_per_req,
+            BLOCK_SIZE,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+        )
+        key_cache_cpu = torch.randn(cache_shape, dtype=DTYPE) * 0.5
+        value_cache_cpu = torch.randn(cache_shape, dtype=DTYPE) * 0.5
+        history_shape = (batch_size, beam_width, NUM_KV_HEADS, steps, HEAD_DIM)
+        history_k_cpu = torch.randn(history_shape, dtype=DTYPE) * 0.5
+        history_v_cpu = torch.randn(history_shape, dtype=DTYPE) * 0.5
+        for index in range(batch_size):
+            block_start = index * blocks_per_req
+            value_cache_cpu[block_start : block_start + blocks_per_req] += index * 0.5
+            history_v_cpu[index] += index + 1
+        key_cache = key_cache_cpu.to(DEVICE)
+        value_cache = value_cache_cpu.to(DEVICE)
+        source_pool = context.pools[0]
+        source_pool.unshared_key[:, :, :, :steps, :] = history_k_cpu.to(DEVICE)
+        source_pool.unshared_value[:, :, :, :steps, :] = history_v_cpu.to(DEVICE)
+        block_tables = torch.arange(batch_size * blocks_per_req, dtype=torch.int32).reshape(
+            batch_size, blocks_per_req
+        )
+        query_cpu = (
+            torch.randn(batch_size * beam_width, num_query_heads, HEAD_DIM, dtype=DTYPE) * 0.5
+        )
+        query = query_cpu.to(DEVICE)
+        metadata = _build_incremental_metadata(
+            beam_width=beam_width,
+            prefix_len=prefix_len,
+            decode_step=decode_step,
+            session=batch,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_tables=block_tables,
+            request_ids=request_ids,
+            num_query_heads=num_query_heads,
+        )
+        assert metadata.beam_session is batch
+        assert metadata.num_prefix_indices == batch_size * beam_width
+        assert metadata.suffix_cu_seqlens_kv_cpu is not None
+        assert metadata.suffix_cu_seqlens_kv_cpu[-1] == batch_size * beam_width * steps
+        batch_output = _run_mode(
+            beam_attn_npu, metadata, query, key_cache, value_cache, batch.pools[0], scale
+        )
+        for index, session in enumerate(sessions):
+            row_start = index * beam_width
+            query_slice = query[row_start : row_start + beam_width]
+            single_metadata = _build_incremental_metadata(
+                beam_width=beam_width,
+                prefix_len=prefix_len,
+                decode_step=decode_step,
+                session=session,
+                query=query_slice,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_tables=block_tables[index : index + 1],
+                request_ids=(session.session_id,),
+                num_query_heads=num_query_heads,
+            )
+            individual_output = _run_mode(
+                beam_attn_npu,
+                single_metadata,
+                query_slice,
+                key_cache,
+                value_cache,
+                source_pool,
+                scale,
+            )
+            actual = batch_output[row_start : row_start + beam_width].float().cpu()
+            torch.testing.assert_close(
+                actual, individual_output.float().cpu(), rtol=2e-2, atol=2e-2
+            )
+
+            blocks = block_tables[index].long()
+            prefix_k = key_cache_cpu[blocks].reshape(prefix_len, NUM_KV_HEADS, HEAD_DIM)
+            prefix_v = value_cache_cpu[blocks].reshape(prefix_len, NUM_KV_HEADS, HEAD_DIM)
+            full_k = torch.cat(
+                [
+                    prefix_k.permute(1, 0, 2).unsqueeze(0).expand(beam_width, -1, -1, -1),
+                    history_k_cpu[index],
+                ],
+                dim=2,
+            ).float()
+            full_v = torch.cat(
+                [
+                    prefix_v.permute(1, 0, 2).unsqueeze(0).expand(beam_width, -1, -1, -1),
+                    history_v_cpu[index],
+                ],
+                dim=2,
+            ).float()
+            heads_per_kv_head = num_query_heads // NUM_KV_HEADS
+            full_k = full_k.repeat_interleave(heads_per_kv_head, dim=1)
+            full_v = full_v.repeat_interleave(heads_per_kv_head, dim=1)
+            q = query_cpu[row_start : row_start + beam_width].float()
+            logits = torch.einsum("whd,whld->whl", q, full_k) * scale
+            expected = torch.einsum("whl,whld->whd", logits.softmax(dim=-1), full_v)
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    finally:
+        batch.end_session()
 
 
 @pytest.mark.parametrize("beam_width", [2, 4])  # type: ignore[misc]

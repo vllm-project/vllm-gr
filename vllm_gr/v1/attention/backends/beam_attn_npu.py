@@ -166,7 +166,9 @@ def cascade_attention(
             slot = beam_session.slot
             H = pool.num_kv_heads
             D = pool.head_dim
-            W = beam_session.beam_width
+            # Batch sessions flatten B requests into B*W attention rows;
+            # beam_width remains the per-request width on that facade.
+            W = int(getattr(beam_session, "attention_width", beam_session.beam_width))
 
             # Read pool slice: [W, H, step+1, D]
             pool_k = pool.unshared_key[slot, :W, :, : step + 1, :]
