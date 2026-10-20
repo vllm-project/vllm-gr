@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # mypy: disallow-untyped-decorators=False
 
+import subprocess
+import sys
+from textwrap import dedent
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +20,39 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetada
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
 
 
+def test_short_suffix_import_does_not_require_gluon() -> None:
+    # Use a fresh interpreter so a Gluon import from another test cannot hide
+    # the regression. NPU Triton builds may ship an incompatible Gluon module.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            dedent("""
+                import importlib.abc
+                import sys
+
+                class BlockGluon(importlib.abc.MetaPathFinder):
+                    def find_spec(self, fullname, path=None, target=None):
+                        if fullname == "triton.experimental.gluon" or fullname.startswith(
+                            "triton.experimental.gluon."
+                        ):
+                            raise ImportError("Gluon deliberately unavailable")
+
+                sys.meta_path.insert(0, BlockGluon())
+                from vllm_gr.v1.attention.backends import beam_short_suffix
+
+                assert callable(beam_short_suffix.merge_short_suffix_attention)
+                assert "vllm_gr.v1.attention.backends.beam_short_suffix_fa2" not in sys.modules
+            """),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("capacity", [1, 3, 4, 8, 16, 32, 128])
 def test_config_roundtrip(enabled: bool, capacity: int) -> None:
@@ -30,10 +66,13 @@ def test_config_roundtrip(enabled: bool, capacity: int) -> None:
         "constraint_table": {"max_top_k": 256},
     }
     config = gr_config_from_mapping(raw)
+
     assert config.enable_short_suffix_attention is enabled
     assert gr_config_from_mapping(gr_config_to_mapping(config)) == config
+
     worker = SimpleNamespace(additional_config={"vllm_gr": gr_config_to_mapping(config)})
     assert GRConfig.from_vllm_config(worker).enable_short_suffix_attention is enabled
+
     legacy = GRConfig(
         beam_max_width=256,
         beam_max_decode_steps=capacity,
@@ -41,6 +80,7 @@ def test_config_roundtrip(enabled: bool, capacity: int) -> None:
     )
     worker = SimpleNamespace(additional_config={})
     legacy.write_to_vllm_config(worker)
+
     assert GRConfig.from_vllm_config(worker) == legacy
 
 
@@ -191,6 +231,7 @@ def _cascade_case(batch: int, enabled: bool, routing: str) -> SimpleNamespace:
     """Use CPU storage to exercise the real request-major cascade routing."""
     request_width, heads, kv_heads, dim, capacity, step = 4, 2, 1, 64, 3, 1
     width = batch * request_width
+
     physical = (
         torch.arange(batch * request_width * kv_heads * capacity * dim)
         .reshape(batch, request_width, kv_heads, capacity, dim)
@@ -203,6 +244,7 @@ def _cascade_case(batch: int, enabled: bool, routing: str) -> SimpleNamespace:
         unshared_key=physical,
         unshared_value=physical + 1000,
     )
+
     context = SimpleNamespace(
         enable_short_suffix_attention=enabled,
         max_beams=request_width,
@@ -212,6 +254,7 @@ def _cascade_case(batch: int, enabled: bool, routing: str) -> SimpleNamespace:
         suffix_k_buf=torch.full((width * capacity, kv_heads, dim), float("nan")),
         suffix_v_buf=torch.full((width * capacity, kv_heads, dim), float("nan")),
     )
+
     sessions = tuple(
         SimpleNamespace(
             context=context,
@@ -253,15 +296,18 @@ def _cascade_case(batch: int, enabled: bool, routing: str) -> SimpleNamespace:
         beam_rows = 0
     else:
         assert routing == "pure"
+
     query = (
         torch.arange((actual_rows + 2) * heads * dim).reshape(actual_rows + 2, heads, dim).float()
     )
     output = torch.full_like(query, -10000)
     key_cache = torch.zeros(1, 16, kv_heads, dim)
     value_cache = torch.ones_like(key_cache)
+
     suffix_offsets = torch.arange(width + 1) * suffix_max_q_len
     if routing == "prefix_count":
         suffix_offsets[-1] = beam_rows
+
     metadata = BeamAttentionMetadata(
         num_actual_tokens=actual_rows,
         max_query_len=actual_rows,
@@ -294,6 +340,7 @@ def _cascade_case(batch: int, enabled: bool, routing: str) -> SimpleNamespace:
         beam_session=session,
         beam_active_mask=torch.ones(width, dtype=torch.bool),
     )
+
     return SimpleNamespace(
         metadata=metadata,
         query=query,
@@ -318,6 +365,7 @@ def _run_cascade(monkeypatch: pytest.MonkeyPatch, case: SimpleNamespace) -> list
         if not kwargs.get("return_softmax_lse", False):
             calls.append("std")
             return query + 1000
+
         prefix = kwargs["k"] is case.key_cache
         calls.append("prefix" if prefix else "suffix")
         if not prefix:
@@ -329,6 +377,7 @@ def _run_cascade(monkeypatch: pytest.MonkeyPatch, case: SimpleNamespace) -> list
                 expected = source[case.session.slot, : case.width, :, : case.step + 1, :]
                 expected = expected.permute(0, 2, 1, 3).reshape(total, 1, 64)
                 torch.testing.assert_close(buffer[:total], expected)
+
         return query + (10 if prefix else 20), torch.zeros(query.shape[1], query.shape[0])
 
     def merge(
@@ -362,11 +411,13 @@ def _run_cascade(monkeypatch: pytest.MonkeyPatch, case: SimpleNamespace) -> list
         assert active is case.metadata.beam_active_mask
         assert scale == 64**-0.5
         assert prefix_lse.shape == (query.shape[1], query.shape[0])
+
         output.copy_(prefix + 50)
 
     monkeypatch.setattr(beam_attn_gpu, "flash_attn_varlen_func", flash_attention)
     monkeypatch.setattr(beam_attn_gpu, "merge_attn_states", merge)
     monkeypatch.setattr(beam_short_suffix, "merge_short_suffix_attention", fused)
+
     beam_attn_gpu.cascade_attention(
         case.output,
         case.query,
@@ -379,6 +430,7 @@ def _run_cascade(monkeypatch: pytest.MonkeyPatch, case: SimpleNamespace) -> list
         2,
         beam_pool=case.pool,
     )
+
     return calls
 
 
@@ -389,11 +441,13 @@ def test_cascade_routes_pure_request_major_beams(
 ) -> None:
     case = _cascade_case(batch, enabled, "pure")
     calls = _run_cascade(monkeypatch, case)
+
     assert calls == (["prefix", "fused"] if enabled else ["prefix", "suffix", "merge"])
     torch.testing.assert_close(
         case.output[: case.width], case.query[: case.width] + (60 if enabled else 15)
     )
     assert torch.all(case.output[case.width :] == -10000)
+
     if enabled:
         assert torch.isnan(case.session.suffix_k_buf).all()
         assert torch.isnan(case.session.suffix_v_buf).all()
@@ -405,10 +459,13 @@ def test_cascade_mixed_batch_preserves_standard_and_scattered_beam_outputs(
 ) -> None:
     case = _cascade_case(1, enabled, "mixed")
     calls = _run_cascade(monkeypatch, case)
+
     assert calls == ["std", "prefix", "suffix", "merge"]
+
     expected = torch.full_like(case.output, -10000)
     expected[case.metadata.std_indices] = case.query[case.metadata.std_indices] + 1000
     expected[case.metadata.prefix_indices] = case.query[case.metadata.prefix_indices] + 15
+
     torch.testing.assert_close(case.output, expected)
 
 
@@ -419,6 +476,7 @@ def test_cascade_nonpure_batches_use_generic_attention_without_overwriting_other
 ) -> None:
     case = _cascade_case(1, enabled, routing)
     calls = _run_cascade(monkeypatch, case)
+
     expected = torch.full_like(case.output, -10000)
     if routing == "std_only":
         assert calls == ["std"]
@@ -426,6 +484,7 @@ def test_cascade_nonpure_batches_use_generic_attention_without_overwriting_other
     else:
         assert calls == ["prefix", "suffix", "merge"]
         expected[: case.beam_rows] = case.query[: case.beam_rows] + 15
+
     torch.testing.assert_close(case.output, expected)
 
 
