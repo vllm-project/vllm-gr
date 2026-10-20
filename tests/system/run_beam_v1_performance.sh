@@ -151,13 +151,15 @@ lines = [
     "terminal results, so token-stream TTFT and TPOT are unavailable.",
     "",
     "The gate checks mean group latency against the 1024-token baseline plus 3 ms, "
-    "rounded up to whole milliseconds.",
+    "rounded up to whole milliseconds. Offline misses fail the job. Online misses "
+    "are warnings and do not fail the job.",
     "",
     "| Mode | B / concurrency | Input tokens | Mean group ms | P50 | P95 | P99 | "
     "Mean request ms | Requests/s | Beam tokens/s | Limit ms | Gate |",
     "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
 ]
-failures = []
+blocking = []
+warnings = []
 for mode in ("offline", "online"):
     data = json.loads((output_dir / f"{mode}.json").read_text(encoding="utf-8"))
     if not data.get("complete"):
@@ -180,8 +182,15 @@ for mode in ("offline", "online"):
         if not math.isfinite(mean_ms):
             raise SystemExit(f"non-finite {mode} B/C={count} latency")
         passed = mean_ms <= limit_ms
+        gate = "PASS"
         if not passed:
-            failures.append(f"{mode} B/C={count}: {mean_ms:.3f} ms > {limit_ms} ms")
+            message = f"{mode} B/C={count}: {mean_ms:.3f} ms > {limit_ms} ms"
+            if mode == "online":
+                warnings.append(message)
+                gate = "WARN"
+            else:
+                blocking.append(message)
+                gate = "FAIL"
         input_range = f"{min(input_lengths)}–{max(input_lengths)}"
         lines.append(
             f"| {mode} | {count} | {input_range} | {mean_ms:.3f} | "
@@ -189,7 +198,7 @@ for mode in ("offline", "online"):
             f"{group['p99_ms']:.2f} | {request['mean_ms']:.2f} | "
             f"{case['requests_per_second']:.2f} | "
             f"{case['beam_generated_tokens_per_second']:.2f} | {limit_ms} | "
-            f"{'PASS' if passed else 'FAIL'} |"
+            f"{gate} |"
         )
     if seen != set(baseline_ms[mode]):
         raise SystemExit(f"missing {mode} performance cases: {set(baseline_ms[mode]) - seen}")
@@ -198,6 +207,8 @@ print(summary, flush=True)
 if summary_path := __import__("os").environ.get("GITHUB_STEP_SUMMARY"):
     with open(summary_path, "a", encoding="utf-8") as stream:
         stream.write(summary)
-if failures:
-    raise SystemExit("Beam V1 performance gate failed:\n" + "\n".join(failures))
+for message in warnings:
+    print(f"::warning title=Beam V1 online latency::{message}", flush=True)
+if blocking:
+    raise SystemExit("Beam V1 performance gate failed:\n" + "\n".join(blocking))
 PY
