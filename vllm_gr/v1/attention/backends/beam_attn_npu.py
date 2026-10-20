@@ -313,11 +313,13 @@ class NPUPrefillGraphEntry:
     workspace: Any = None
     max_kvlen: int = 0
     layers: list[NPUGraphLayerTask] = field(default_factory=list)
+    _last_update_signature: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
 
 
 @contextmanager
 def prefill_graph_capture(entry: NPUPrefillGraphEntry):
     """Marks the prefill fast path as graph-capturing and registers layer tasks."""
+    entry._last_update_signature = None
     prev = (_GRAPH_CAPTURE_STATE["capturing"], _GRAPH_CAPTURE_STATE["entry"])
     _GRAPH_CAPTURE_STATE["capturing"] = True
     _GRAPH_CAPTURE_STATE["entry"] = entry
@@ -518,6 +520,20 @@ def _prefill_attention_graph(
     )
 
 
+def _graph_tensor_binding(tensor: torch.Tensor | None) -> tuple[Any, ...] | None:
+    """Snapshot an FIA tensor binding without reading or synchronizing its data."""
+    if tensor is None:
+        return None
+    return (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tensor.stride(),
+        tensor.dtype,
+        tensor.device,
+        tensor.storage_offset(),
+    )
+
+
 def update_graph_params(
     update_stream: Any,
     entry: NPUPrefillGraphEntry,
@@ -528,9 +544,10 @@ def update_graph_params(
     """Rewrites the per-layer FIA task-group params before a graph replay.
 
     Called by the NPU prefill-graph runner with the fresh per-request host
-    lists and the current batch's block table. The replayed graph executes
-    each task group with these updated params (the update may change the
-    request count and re-bind the block table).
+    lists and the current batch's block table. Reuses a complete previous
+    update only when lengths, tensor bindings, task configuration, and the
+    serving stream are unchanged. Tensor contents are deliberately excluded:
+    the runner refreshes its fixed input buffers before every replay.
 
     Returns True on success. The caller MUST NOT replay the graph on False:
     a partially-updated graph would execute with stale per-layer params and
@@ -542,13 +559,60 @@ def update_graph_params(
     if not isinstance(entry, NPUPrefillGraphEntry):
         logger.debug("update_graph_params: non-prefill-graph entry; skipping.")
         return False
+    previous_signature = entry._last_update_signature
+    # Never reuse a partial or failed update, including signature validation
+    # failures. A cache entry is restored only on a hit or complete success.
+    entry._last_update_signature = None
     if entry.workspace is None:
         logger.warning("NPU prefill graph update: entry has no workspace; skipping.")
         return False
+    if not entry.layers:
+        return True
+    for task in entry.layers:
+        if any(
+            tensor is None for tensor in (task.output, task.query, task.key, task.value, task.lse)
+        ):
+            logger.warning(
+                "NPU prefill graph update: layer tensors are missing; "
+                "aborting the update (the replay would execute with stale params)."
+            )
+            return False
+    serving_stream = torch.npu.current_stream()
+    signature = (
+        serving_stream,
+        tuple(qlen_list),
+        tuple(kvlen_list),
+        _graph_tensor_binding(block_table),
+        _graph_tensor_binding(entry.workspace),
+        tuple(
+            (
+                # Retain the handle as well as its identity so replacement
+                # cannot accidentally match a recycled Python object id.
+                id(task.handle),
+                task.handle,
+                _graph_tensor_binding(task.output),
+                _graph_tensor_binding(task.query),
+                _graph_tensor_binding(task.key),
+                _graph_tensor_binding(task.value),
+                _graph_tensor_binding(task.mask),
+                _graph_tensor_binding(task.lse),
+                task.block_size,
+                task.num_heads,
+                task.num_kv_heads,
+                task.scale,
+                task.sparse_mode,
+            )
+            for task in entry.layers
+        ),
+    )
+    if signature == previous_signature:
+        # No update work is issued on a hit. The runner still refreshes its
+        # input buffers and orders replays on this same serving stream.
+        entry._last_update_signature = signature
+        return True
     # CANN's RIC task update requires the update stream to be the CURRENT
     # stream (vllm-ascend wraps update_attn_params the same way); issuing the
     # update on a non-current stream fails with 507000.
-    serving_stream = torch.npu.current_stream()
     with torch.npu.stream(update_stream):
         # Order this update's device work AFTER the previous replay: without
         # this dependency the update's FIA executions would run on the update
@@ -587,4 +651,5 @@ def update_graph_params(
                 **kw, workspace=entry.workspace, out=[output, lse]
             )
             torch.npu.graph_task_update_end(update_stream)
+    entry._last_update_signature = signature
     return True
