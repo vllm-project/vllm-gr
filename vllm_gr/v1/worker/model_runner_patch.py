@@ -7,6 +7,7 @@ from __future__ import annotations
 from functools import wraps
 from importlib import import_module
 from types import ModuleType
+from typing import Any, cast
 
 from vllm.logger import init_logger
 
@@ -38,6 +39,10 @@ def close_constraint_backend(runner: object) -> None:
     # Detach first so no concurrent observer can discover a Backend while it is
     # being closed, and so repeated shutdown/load calls are naturally idempotent.
     runner.constraint_backend = None
+    projection = getattr(runner, "_gr_npu_stage_projection", None)
+    if projection is not None:
+        cast(Any, runner)._gr_npu_stage_projection = None
+        projection.close()
     for processor in getattr(runner, "_gr_vocab_slice_processors", ()):
         processor._gr_vocab_slice = None
     runner._gr_vocab_slice_processors = ()
@@ -92,7 +97,7 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
 
     @wraps(original)
     def load_model_with_constraint_backend(self, *args, **kwargs):
-        from vllm_gr.config import GRConfig
+        from vllm_gr.config import BeamExecutionMode, GRConfig
 
         # A complete load replaces the model runtime. Release the previous
         # Backend before loading weights so a failed reload cannot leave stale
@@ -125,6 +130,19 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
 
             from vllm_gr.constraints.loader import load_constraint_backend
 
+            stage_options = {}
+            if (
+                table_config.backend is ConstraintTableBackendEnum.NPU
+                and gr_config.beam_execution_mode is BeamExecutionMode.V1
+                and gr_config.beam_max_decode_steps <= 3
+            ):
+                from vllm_gr.ops.npu_stage_logits import (
+                    can_install_npu_stage_projection,
+                )
+
+                # Check the loaded model before allocating compact tables.
+                if can_install_npu_stage_projection(self):
+                    stage_options["enable_npu_stage_vocab"] = True
             backend = load_constraint_backend(
                 config=table_config,
                 device=getattr(self, "device", None),
@@ -132,6 +150,7 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
                 dtype=getattr(getattr(self, "model_config", None), "dtype", None),
                 # V1 retains its row bound; V2 opts into batched sampling.
                 max_rows=max_batch * max_rows,
+                **stage_options,
             )
             if backend is None:
                 raise RuntimeError("enabled canonical constraint table loader returned no Backend")
@@ -165,8 +184,23 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
                     # Explicit None also overrides unrelated legacy global settings.
                     processor._gr_vocab_slice = window
                 self._gr_vocab_slice_processors = processors
+            elif (
+                getattr(backend.info, "backend", None) is ConstraintTableBackendEnum.NPU
+                and getattr(backend, "stage_vocab", None) is not None
+            ):
+                # Keep NPU projection imports isolated from CPU/CUDA startup.
+                from vllm_gr.ops.npu_stage_logits import install_npu_stage_projection
+
+                projection = install_npu_stage_projection(self, backend)
+                if projection is not None:
+                    self._gr_npu_stage_projection = projection
+                    self.model_memory_usage += projection.device_memory_bytes
             return result
         except BaseException:
+            projection = getattr(self, "_gr_npu_stage_projection", None)
+            if projection is not None:
+                self._gr_npu_stage_projection = None
+                projection.close()
             if backend is not None:
                 backend.close()
             self.constraint_backend = None
@@ -301,6 +335,11 @@ def apply_worker_patches() -> None:
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
             runner_class.load_model = make_load_model_with_constraint_backend(load_model)
+
+        reload_patcher = getattr(platform_module, "make_patched_reload_weights", None)
+        reload_weights = getattr(runner_class, "reload_weights", None)
+        if reload_patcher is not None and callable(reload_weights):
+            runner_class.reload_weights = reload_patcher(reload_weights)
 
         workspace_load_patcher = getattr(
             platform_module,

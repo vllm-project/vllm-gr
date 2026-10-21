@@ -200,6 +200,61 @@ def test_unique_storage_memory_is_deduplicated() -> None:
     )
 
 
+@pytest.mark.parametrize("env", [None, "1", "0", "invalid"])
+@pytest.mark.parametrize("eligible", [False, True])
+def test_npu_stage_vocab_allocation_requires_explicit_eligible_worker(
+    env: str | None, eligible: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if env is None:
+        monkeypatch.delenv("VLLM_GR_NPU_STAGE_LM_HEAD", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", env)
+    table = make_table()
+    allocations: list[ConstraintTable] = []
+
+    def build_stage_vocab(table: ConstraintTable, *args: object) -> None:
+        allocations.append(table)
+
+    monkeypatch.setattr(loader, "build_npu_stage_vocab", build_stage_vocab)
+    monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
+    backend, _ = loader._upload_npu_backend(  # noqa: SLF001
+        table,
+        device=torch.device("cpu"),
+        op=lambda *args: (torch.empty(0), torch.empty(0)),
+        max_top_k=2,
+        max_rows=2,
+        enable_npu_stage_vocab=eligible,
+    )
+    try:
+        assert allocations == ([table] if eligible and env in (None, "1") else [])
+        assert backend.stage_vocab is None
+    finally:
+        backend.close()
+
+
+def test_direct_npu_upload_does_not_allocate_stage_vocab_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "1")
+    monkeypatch.setattr(
+        loader,
+        "build_npu_stage_vocab",
+        lambda *args, **kwargs: pytest.fail("Direct backend upload has no eligible runner"),
+    )
+    monkeypatch.setattr(loader, "_synchronize_current_npu_stream", lambda device: None)
+    backend, _ = loader._upload_npu_backend(  # noqa: SLF001
+        make_table(),
+        device=torch.device("cpu"),
+        op=lambda *args: (torch.empty(0), torch.empty(0)),
+        max_top_k=2,
+        max_rows=2,
+    )
+    try:
+        assert backend.stage_vocab is None
+    finally:
+        backend.close()
+
+
 def _readiness_backend(
     op: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     *,

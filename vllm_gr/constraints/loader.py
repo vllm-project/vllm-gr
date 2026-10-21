@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +26,7 @@ from vllm_gr.constraints.backend import (
 from vllm_gr.constraints.cpu_backend import CPUConstraintBackend
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.constraints.npu_backend import NPUConstraintBackend
+from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab, build_npu_stage_vocab
 from vllm_gr.constraints.table import (
     CONSTRAINT_TABLE_TENSOR_NAMES,
     ConstraintTable,
@@ -190,6 +192,7 @@ def _upload_npu_backend(
     op: NPUConstraintOp,
     max_top_k: int,
     max_rows: int,
+    enable_npu_stage_vocab: bool = False,
 ) -> tuple[NPUConstraintBackend, tuple[_ReadyCase, ...]]:
     cases = _readiness_cases(table, max_top_k)
     device_tables: dict[str, torch.Tensor] = {}
@@ -197,6 +200,11 @@ def _upload_npu_backend(
     try:
         for name in CONSTRAINT_TABLE_TENSOR_NAMES:
             device_tables[name] = _upload_table_tensor(getattr(table, name), device)
+        stage_vocab = None
+        if enable_npu_stage_vocab and os.environ.get("VLLM_GR_NPU_STAGE_LM_HEAD", "1") == "1":
+            stage_vocab = build_npu_stage_vocab(table, device, _upload_table_tensor)
+            if stage_vocab is not None:
+                device_tables.update(stage_vocab.owned_tensors())
         _synchronize_current_npu_stream(device)
         info = _backend_info(
             table,
@@ -215,6 +223,7 @@ def _upload_npu_backend(
             prefix2_values=device_tables["prefix2_values"],
             info=info,
             op=op,
+            stage_vocab=stage_vocab,
         )
         return backend, cases
     except BaseException:
@@ -381,6 +390,7 @@ def _run_device_readiness(
     max_rows: int,
     synchronize: Callable[[torch.device], None],
     normalize_over_candidates: bool,
+    stage_vocab: NPUStageVocab | None = None,
 ) -> None:
     rows = min(max_rows, 2)
     vocab_size = backend.info.table_metadata.vocab_size
@@ -390,7 +400,7 @@ def _run_device_readiness(
             torch.tensor(_READINESS_BACKGROUND_LOGIT, dtype=dtype).float().item()
         )
         logits = torch.full(
-            (rows, vocab_size),
+            (rows, stage_vocab.vocab_size if stage_vocab is not None else vocab_size),
             background_logit,
             dtype=dtype,
             device=device,
@@ -403,6 +413,10 @@ def _run_device_readiness(
             selected = case.first_tokens if row % 2 == 0 else tuple(reversed(case.last_tokens))
             if selected:
                 indices = torch.tensor(selected, dtype=torch.long, device=device)
+                if stage_vocab is not None:
+                    indices = torch.searchsorted(
+                        stage_vocab.stage_token_ids[case.current_step], indices
+                    )
                 host_values = (
                     torch.arange(
                         len(selected),
@@ -500,6 +514,17 @@ def _run_npu_readiness(
         synchronize=_synchronize_current_npu_stream,
         normalize_over_candidates=True,
     )
+    if backend.stage_vocab is not None:
+        _run_device_readiness(
+            backend,
+            cases=cases,
+            device=device,
+            dtype=dtype,
+            max_rows=max_rows,
+            synchronize=_synchronize_current_npu_stream,
+            normalize_over_candidates=True,
+            stage_vocab=backend.stage_vocab,
+        )
 
 
 def load_constraint_backend(
@@ -509,6 +534,7 @@ def load_constraint_backend(
     vocab_size: int,
     dtype: torch.dtype,
     max_rows: int,
+    enable_npu_stage_vocab: bool = False,
 ) -> ConstraintBackend | None:
     """Load exactly one independent Backend, or return ``None`` when disabled."""
 
@@ -590,6 +616,7 @@ def load_constraint_backend(
         op=op,
         max_top_k=config.max_top_k,
         max_rows=max_rows,
+        enable_npu_stage_vocab=enable_npu_stage_vocab,
     )
     # ``cases`` contains at most 2 * max_top_k Python integers per step and no
     # NumPy views. Drop the full Host table before launching readiness.

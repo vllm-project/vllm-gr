@@ -16,6 +16,7 @@ from vllm_gr.constraints.backend import (
     build_constraint_output,
     validate_select_inputs,
 )
+from vllm_gr.constraints.npu_stage_vocab import NPUStageVocab
 from vllm_gr.constraints.validity import (
     constraint_candidate_counts,
     valid_mask_from_counts,
@@ -41,6 +42,7 @@ class NPUConstraintBackend:
         "_prefix1_values",
         "_prefix2_value_offsets",
         "_prefix2_values",
+        "_stage_vocab",
         "_state",
     )
 
@@ -55,6 +57,7 @@ class NPUConstraintBackend:
         prefix2_values: torch.Tensor,
         info: ConstraintBackendInfo,
         op: NPUConstraintOp,
+        stage_vocab: NPUStageVocab | None = None,
     ) -> None:
         self._first_token_ids: torch.Tensor | None = first_token_ids
         self._prefix1_offsets: torch.Tensor | None = prefix1_offsets
@@ -64,11 +67,16 @@ class NPUConstraintBackend:
         self._prefix2_values: torch.Tensor | None = prefix2_values
         self._info = info
         self._op: NPUConstraintOp | None = op
+        self._stage_vocab = stage_vocab
         self._state = _BackendState.INITIALIZING
 
     @property
     def info(self) -> ConstraintBackendInfo:
         return self._info
+
+    @property
+    def stage_vocab(self) -> NPUStageVocab | None:
+        return self._stage_vocab
 
     def _tables(self) -> tuple[torch.Tensor, ...]:
         tables = (
@@ -88,11 +96,24 @@ class NPUConstraintBackend:
         logits: torch.Tensor,
         metadata: ConstraintMetadata,
     ) -> ConstraintOutput:
-        validate_select_inputs(logits, metadata, self._info)
+        stage_vocab = self._stage_vocab
+        if stage_vocab is not None and (
+            logits.dim() != 2
+            or logits.shape[1] != stage_vocab.vocab_size
+            or stage_vocab.vocab_size >= self._info.table_metadata.vocab_size
+        ):
+            stage_vocab = None
+        validate_select_inputs(
+            logits,
+            metadata,
+            self._info,
+            expected_logits_vocab_size=stage_vocab.vocab_size if stage_vocab is not None else None,
+        )
         tables = self._tables()
+        op_tables = stage_vocab.tables if stage_vocab is not None else tables
         if self._op is None:
             raise RuntimeError("NPU constraint backend is closed")
-        for table in tables:
+        for table in op_tables:
             if table.device != logits.device:
                 raise RuntimeError(
                     "all NPU constraint tables must share logits.device; "
@@ -101,7 +122,10 @@ class NPUConstraintBackend:
 
         # The fused operator consumes [B, W, max_steps]. A singleton W is a
         # zero-copy view of the public flat [rows, 3] Backend metadata.
-        sequence_group = metadata.prefix_token_ids.unsqueeze(1)
+        prefixes = metadata.prefix_token_ids
+        if stage_vocab is not None:
+            prefixes = stage_vocab.local_prefixes(prefixes, metadata.current_step)
+        sequence_group = prefixes.unsqueeze(1)
         # The fused kernel's bf16 load path reads stale unified-buffer data on
         # ascend910b and produces garbage logprobs, while its fp32 path is
         # correct; bf16 -> fp32 is a lossless bit extension, so widen first.
@@ -110,7 +134,7 @@ class NPUConstraintBackend:
         token_ids, logprobs = self._op(
             op_logits,
             sequence_group,
-            *tables,
+            *op_tables,
             metadata.temperatures,
             metadata.current_step,
             metadata.top_k,
@@ -126,13 +150,23 @@ class NPUConstraintBackend:
             current_step=metadata.current_step,
             vocab_size=self._info.table_metadata.vocab_size,
         )
-        return build_constraint_output(
+        valid_mask = valid_mask_from_counts(valid_counts, metadata.top_k)
+        output = build_constraint_output(
             token_ids,
             logprobs,
-            valid_mask_from_counts(valid_counts, metadata.top_k),
+            valid_mask,
             logits=logits,
             top_k=metadata.top_k,
         )
+        if stage_vocab is not None:
+            return ConstraintOutput(
+                token_ids=stage_vocab.global_tokens(
+                    output.token_ids, valid_mask, metadata.current_step
+                ),
+                logprobs=output.logprobs,
+                valid_mask=valid_mask,
+            )
+        return output
 
     def _select_for_readiness(
         self,
@@ -169,6 +203,7 @@ class NPUConstraintBackend:
         self._prefix2_value_offsets = None
         self._prefix2_values = None
         self._op = None
+        self._stage_vocab = None
         self._state = _BackendState.CLOSED
 
 

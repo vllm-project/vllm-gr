@@ -39,6 +39,12 @@ from vllm_gr.v1.worker.prefill_graph_runner import (
 logger = init_logger(__name__)
 
 
+def make_patched_reload_weights(original):
+    from vllm_gr.ops.npu_stage_logits import make_npu_stage_reload_weights
+
+    return make_npu_stage_reload_weights(original)
+
+
 def make_patched_update_states_npu(_orig_update_states):
     """Keep native request progression logical while forward counts are physical."""
     marker = "_vllm_gr_npu_update_states_patch"
