@@ -412,7 +412,7 @@ def test_cascade_mixed_batch_preserves_standard_and_scattered_beam_outputs(
     torch.testing.assert_close(case.output, expected)
 
 
-@pytest.mark.parametrize("routing", ["many_queries", "prefix_count", "total_count", "std_only"])
+@pytest.mark.parametrize("routing", ["prefix_count", "total_count", "std_only"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_cascade_nonpure_batches_use_generic_attention_without_overwriting_other_rows(
     monkeypatch: pytest.MonkeyPatch, routing: str, enabled: bool
@@ -427,6 +427,18 @@ def test_cascade_nonpure_batches_use_generic_attention_without_overwriting_other
         assert calls == ["prefix", "suffix", "merge"]
         expected[: case.beam_rows] = case.query[: case.beam_rows] + 15
     torch.testing.assert_close(case.output, expected)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cascade_rejects_multi_query_beams_without_writing_outputs(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    case = _cascade_case(1, enabled, "many_queries")
+    with pytest.raises(ValueError, match="exactly one query token per beam"):
+        _run_cascade(monkeypatch, case)
+    assert torch.all(case.output == -10000)
+    assert torch.isnan(case.session.suffix_k_buf).all()
+    assert torch.isnan(case.session.suffix_v_buf).all()
 
 
 @pytest.mark.parametrize("enabled", [False, True])

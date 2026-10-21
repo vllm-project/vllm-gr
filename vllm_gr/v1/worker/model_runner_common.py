@@ -14,7 +14,6 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
-from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
 logger = init_logger(__name__)
 
@@ -65,51 +64,6 @@ def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tens
     return gpu_positions, cpu_positions
 
 
-def _write_position_segments(
-    token_offset: int,
-    seg_starts: list[int],
-    seg_lens: list[int],
-    gpu_pos: torch.Tensor | None,
-    cpu_pos: torch.Tensor | None,
-) -> None:
-    """Write concatenated per-beam position-id segments in one pass.
-
-    Each active beam contributes ``range(st_b, st_b + len_b)``.  The result is
-    element-wise identical to the historical per-beam ``torch.arange`` writes,
-    but the concatenation is built with numpy on the host (microseconds) and
-    committed with a single host->device copy for ``gpu_pos``.
-
-    NOTE: the previous implementation used ``torch.repeat_interleave`` to
-    expand per-segment offsets; on Ascend that aten op is a pure host-side
-    stall (profiling bw128_1k_t3: 45.5ms + 90.6ms per decode step with zero
-    device activity), because the ACL backend materializes the repeat on
-    device. Asynchronous scheduling instead builds positions with plain NumPy
-    writes before uploading the completed layout.
-    """
-    if not seg_lens:
-        return
-    import numpy as np
-
-    lens = np.asarray(seg_lens, dtype=np.int64)
-    total = int(lens.sum())
-    if total == 0:
-        return
-    starts = np.asarray(seg_starts, dtype=np.int64)
-    # Output offset where each segment begins (prefix sum minus own length).
-    seg_off = np.cumsum(lens) - lens
-    gidx = np.arange(total, dtype=np.int64)
-    # positions[start:end] = st + arange(len) for each segment, vectorized:
-    # repeat the per-segment start/offset by the segment length and add the
-    # within-segment index (gidx - seg_off_rep).
-    starts_rep = np.repeat(starts, lens)
-    seg_off_rep = np.repeat(seg_off, lens)
-    positions = torch.from_numpy(starts_rep + (gidx - seg_off_rep))
-    if gpu_pos is not None:
-        gpu_pos[token_offset : token_offset + total] = positions.to(gpu_pos.device)
-    if cpu_pos is not None:
-        cpu_pos[token_offset : token_offset + total] = positions.to(cpu_pos.device)
-
-
 def _process_beam_decode_request(
     mdata: dict[str, Any],
     seq_len: int,
@@ -117,76 +71,24 @@ def _process_beam_decode_request(
     gpu_pos: torch.Tensor | None,
     cpu_pos: torch.Tensor | None,
     new_logits_indices: list[int],
-    is_incremental: bool = False,
 ) -> tuple[int, int, int, list[int]]:
-    """Traces allocation arrays and mutates position buffers for a speculative request.
-
-    When is_incremental=True, each beam inputs 1 token with position_id = prefix_len + decode_step.
-    """
+    """Prepare one new token per beam at position prefix_len + decode_step."""
     prefix_len = mdata["prefix_len"]
     beam_width = mdata["beam_width"]
-    decode_steps = mdata["beam_decode_steps"]
-    cache_len = mdata["cache_len"]
-    active_beam_ids = []  # Track structural beam locations
-
-    # --- Incremental decode path ---
-    if is_incremental:
-        decode_step = mdata.get("decode_step", 0)
-        # W identical single-token rows: contiguous logits rows and the full
-        # beam set.  Built with C-level list ops instead of a per-beam Python
-        # append loop (the loop dominated the host time of this function for
-        # beam_width=128 on every decode step).
-        new_logits_indices.extend(range(token_offset, token_offset + beam_width))
-        active_beam_ids = list(range(beam_width))
-
-        # All beams share one constant position id this step, so a scalar
-        # slice-fill is enough: a single device-side fill kernel, no host
-        # build, no H2D copy (matches the recompute path's no-stall goal).
-        pos_id = prefix_len + decode_step
-        if gpu_pos is not None:
-            gpu_pos[token_offset : token_offset + beam_width] = pos_id
-        if cpu_pos is not None:
-            cpu_pos[token_offset : token_offset + beam_width] = pos_id
-
-        return beam_width, beam_width, token_offset + beam_width, active_beam_ids
-
-    # --- Standard (recompute) path ---
-    chunk_budget = seq_len
-    curr_offset = token_offset
-    valid_rows_for_req = 0
-    logits_row_cnt = 0
-    b_cache_len = cache_len
-    seg_starts = []
-    seg_lens = []
-    for b in range(beam_width):
-        if chunk_budget <= 0:
-            break
-
-        b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
-            b, prefix_len, b_cache_len, decode_steps, chunk_budget
-        )
-
-        if b_uncached > 0:
-            st = cache_len if (prefix_len >= b_cache_len) else (prefix_len + b_past_suffix)
-            seg_starts.append(st)
-            seg_lens.append(b_uncached)
-
-            if b_past_suffix + b_uncached >= decode_steps:
-                new_logits_indices.append(curr_offset + b_uncached - 1)
-                active_beam_ids.append(b_physical)
-
-                logits_row_cnt += 1
-
-            valid_rows_for_req += 1
-            curr_offset += b_uncached
-            chunk_budget -= b_uncached
-            b_cache_len += b_uncached
-
-    # Batched position-id write: one vectorized build (CPU) + single H2D copy
-    # instead of one torch.arange per beam (up to beam_width GPU launches/call).
-    _write_position_segments(token_offset, seg_starts, seg_lens, gpu_pos, cpu_pos)
-
-    return valid_rows_for_req, logits_row_cnt, curr_offset, active_beam_ids
+    decode_step = mdata.get("decode_step")
+    if type(decode_step) is not int or decode_step < 0:
+        raise ValueError("Beam decode requires a nonnegative integer decode_step")
+    if type(beam_width) is not int or beam_width < 1:
+        raise ValueError("Beam decode requires a positive integer beam_width")
+    if mdata["cache_len"] >= prefix_len and seq_len != beam_width:
+        raise ValueError("Beam decode requires exactly one query token per beam")
+    new_logits_indices.extend(range(token_offset, token_offset + beam_width))
+    pos_id = prefix_len + decode_step
+    if gpu_pos is not None:
+        gpu_pos[token_offset : token_offset + beam_width] = pos_id
+    if cpu_pos is not None:
+        cpu_pos[token_offset : token_offset + beam_width] = pos_id
+    return beam_width, beam_width, token_offset + beam_width, list(range(beam_width))
 
 
 def _remux_logprobs_tensors(
@@ -605,6 +507,13 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
         all_incremental = False
     if layout_key is not None and all_incremental:
         cached_layout = layout_cache.get(layout_key)
+        if cached_layout is not None and any(
+            beam_data[rid]["beam_width"] != width or beam_data[rid]["prefix_len"] != prefix_len
+            for rid, width, prefix_len in cached_layout[-1]
+        ):
+            # A new session may reuse a request id with different geometry.
+            # Rebuild its layout instead of applying stale positions/row maps.
+            cached_layout = None
         if cached_layout is not None:
             (
                 row_to_req_id,
@@ -619,7 +528,10 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
             token_offset = 0
             for req_id, width, prefix_len in widths_offsets:
                 mdata = beam_data[req_id]
-                pos_id = prefix_len + int(mdata.get("decode_step", 0))
+                step = mdata.get("decode_step")
+                if type(step) is not int or step < 0:
+                    raise ValueError("Beam decode requires a nonnegative integer decode_step")
+                pos_id = prefix_len + step
                 if gpu_positions is not None:
                     gpu_positions[token_offset : token_offset + width] = pos_id
                 if cpu_positions is not None:
@@ -665,9 +577,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
 
         mdata = beam_data.get(req_id)
         if mdata and mdata.get("is_beam_decode", False):
-            # Check if incremental decode is active
-            is_incremental = "decode_step" in mdata
-            beams_count, beams_count_with_logits, next_offset, active_beam_ids = (
+            beams_count, beams_count_with_logits, _next_offset, active_beam_ids = (
                 _process_beam_decode_request(
                     mdata,
                     seq_len,
@@ -675,7 +585,6 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
                     gpu_positions,
                     cpu_positions,
                     new_logits_indices,
-                    is_incremental=is_incremental,
                 )
             )
             row_to_req_id.extend([req_id] * beams_count)
@@ -686,8 +595,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
                 (req_id, input_row_idx, beams_count_with_logits, active_beam_ids)
             )
             input_row_idx += beams_count
-            if is_incremental:
-                incremental_widths.append((req_id, mdata["beam_width"], mdata["prefix_len"]))
+            incremental_widths.append((req_id, mdata["beam_width"], mdata["prefix_len"]))
         else:
             num_computed_tokens = runner.input_batch.num_computed_tokens_cpu[batch_idx]
             num_prompt_tokens = runner.input_batch.num_prompt_tokens[batch_idx]
@@ -772,8 +680,8 @@ def _materialize_logits_indices(runner: Any, indices: list[int]) -> torch.Tensor
     Fully incremental beam decode fills ``indices`` as the contiguous range
     ``[0, num_logits)``; that shape is materialized directly on the device with
     ``torch.arange``, eliminating the host->device copy (and the Python list
-    itself) entirely.  A non-contiguous index list (chunked prefill / standard
-    recompute rows) falls back to the host copy path.
+    itself) entirely. A non-contiguous index list (chunked prefill or mixed
+    standard/beam rows) falls back to the host copy path.
 
     Returns a view of the buffer containing exactly the given indices.  The
     caller must consume the value before the next call to this helper (the

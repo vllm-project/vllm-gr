@@ -460,11 +460,9 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
     metadata = SimpleNamespace(
         is_beam_decode=True,
         beam_session=session,
-        is_incremental_decode=True,
-        incremental_beam_width=2,
         incremental_suffix_kv_len=1,
+        suffix_max_q_len=1,
         prefix_max_seq_len=5,
-        suffix_total_tokens=2,
         prefix_indices=torch.arange(2),
     )
 
@@ -641,3 +639,46 @@ def test_npu_prefill_attention_consumes_common_metadata(
     assert fia_kwargs["block_size"] == 16
     assert fia_kwargs["input_layout"] == "TND"
     assert torch.equal(output[:4], torch.zeros(4, 8, 64))
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "invalid",
+    ["missing-session", "inactive-session", "old-metadata", "multi-query", "missing-pool"],
+)
+def test_incremental_forward_rejects_invalid_state_before_cache_write(
+    monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    from vllm_gr.v1.attention.backends import beam_attn
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("invalid beam state reached a device operation")
+
+    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
+    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
+    monkeypatch.setattr(
+        beam_attn,
+        "_get_platform_execution_module",
+        lambda: SimpleNamespace(
+            reshape_and_cache=unexpected, cache_unshared_kv=unexpected, cascade_attention=unexpected
+        ),
+    )
+    session = SimpleNamespace(is_active=invalid != "inactive-session", pools=[])
+    metadata = SimpleNamespace(
+        is_beam_decode=invalid != "old-metadata",
+        prefix_indices=torch.arange(2),
+        suffix_max_q_len=2 if invalid == "multi-query" else 1,
+        beam_session=None if invalid == "missing-session" else session,
+    )
+    impl = object.__new__(beam_attn.BeamAttentionImpl)
+    impl.vllm_flash_attn_version = 2
+    tensor = torch.empty(2, 1, 8)
+    with pytest.raises((RuntimeError, ValueError), match="Beam decode requires"):
+        impl.forward(
+            SimpleNamespace(layer_name="model.layers.0.self_attn"),
+            tensor,
+            tensor,
+            tensor,
+            torch.empty(2, 1, 16, 1, 8),
+            metadata,
+            output=tensor,
+        )

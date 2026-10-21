@@ -64,7 +64,11 @@ def _build_metadata(
     req_ids: list[str],
     beam_data: dict[str, dict[str, Any]],
 ) -> BeamAttentionMetadata:
-    token = BEAM_DATA_VAR.set({"beam_data": beam_data, "req_ids": req_ids})
+    session = SimpleNamespace(
+        is_active=True,
+        context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda req_id: 0)),
+    )
+    token = BEAM_DATA_VAR.set({"beam_data": beam_data, "req_ids": req_ids, "beam_session": session})
     try:
         return _make_builder().build(0, common)
     finally:
@@ -154,8 +158,8 @@ def test_native_cpu_length_fallback_preserves_exact_lengths(
     ),
     [
         pytest.param(
-            [0, 4],
-            [8],
+            [0, 2],
+            [6],
             [[0, 1, 2, 3]],
             ["beam"],
             {
@@ -164,27 +168,27 @@ def test_native_cpu_length_fallback_preserves_exact_lengths(
                     "prefix_len": 4,
                     "beam_width": 2,
                     "beam_decode_steps": 2,
+                    "decode_step": 1,
                     "cache_len": 4,
                 }
             },
             {
                 "std_indices": [],
-                "prefix_indices": [0, 1, 2, 3],
+                "prefix_indices": [0, 1],
                 "std_q": [],
                 "std_kv": [],
-                "prefix_q": [4],
+                "prefix_q": [2],
                 "prefix_kv": [4],
-                "suffix_q": [2, 2],
+                "suffix_q": [1, 1],
                 "suffix_kv": [2, 2],
                 "std_blocks": None,
                 "prefix_blocks": [[0, 1]],
-                "suffix_slots": [100, 101, 102, 103],
             },
             id="beam-only",
         ),
         pytest.param(
-            [0, 2, 6],
-            [3, 8],
+            [0, 2, 4],
+            [3, 6],
             [[0, 1, 2, 3], [10, 11, 12, 13]],
             ["ordinary", "beam"],
             {
@@ -193,21 +197,21 @@ def test_native_cpu_length_fallback_preserves_exact_lengths(
                     "prefix_len": 4,
                     "beam_width": 2,
                     "beam_decode_steps": 2,
+                    "decode_step": 1,
                     "cache_len": 4,
                 }
             },
             {
                 "std_indices": [0, 1],
-                "prefix_indices": [2, 3, 4, 5],
+                "prefix_indices": [2, 3],
                 "std_q": [2],
                 "std_kv": [3],
-                "prefix_q": [4],
+                "prefix_q": [2],
                 "prefix_kv": [4],
-                "suffix_q": [2, 2],
+                "suffix_q": [1, 1],
                 "suffix_kv": [2, 2],
                 "std_blocks": [[0, 1]],
                 "prefix_blocks": [[10, 11]],
-                "suffix_slots": [102, 103, 104, 105],
             },
             id="mixed-batch",
         ),
@@ -251,14 +255,8 @@ def test_build_routes_standard_and_beam_metadata(
     prefix_blocks = (
         metadata.prefix_block_table.tolist() if metadata.prefix_block_table is not None else None
     )
-    suffix_slots = (
-        metadata.suffix_slot_mapping_out.tolist()
-        if metadata.suffix_slot_mapping_out is not None
-        else None
-    )
     assert std_blocks == expected["std_blocks"]
     assert prefix_blocks == expected["prefix_blocks"]
-    assert suffix_slots == expected["suffix_slots"]
 
     if expected["suffix_q"]:
         assert metadata.prefix_cu_seqlens_q_cpu == [
@@ -578,7 +576,6 @@ def test_incremental_seqlens_through_create_beam_tensors() -> None:
             suffix_cu_seqlens_q_cpu=[1, 2, 3, 4],
             suffix_cu_seqlens_kv_cpu=[step + 1, 2 * (step + 1), 3 * (step + 1), 4 * (step + 1)],
             suffix_seqlens_kv_cpu=[step + 1] * 4,
-            suffix_slot_mapping_out_list=[],
             prefix_req_idxs_cpu=[0],
             max_prefix_blocks_count=2,
             device=torch.device("cpu"),
@@ -591,12 +588,12 @@ def test_incremental_seqlens_through_create_beam_tensors() -> None:
     assert m0[1].tolist() == [8]  # prefix_seqlens_kv_device
     assert m0[2] == 16  # prefix_max_seq_len (4 blocks * block_size 2)
     assert m0[6].tolist() == [1, 1, 1, 1]  # suffix_seqlens_kv_device
-    assert m0[10].tolist() == [0, 1, 2, 3, 4]  # suffix_cu_seqlens_q_device
+    assert m0[8].tolist() == [0, 1, 2, 3, 4]  # suffix_cu_seqlens_q_device
 
     # Step 3: suffix KV length = 4, cu_seqlens_k = [0,4,8,12,16].
     m3 = run(3)
     assert m3[6].tolist() == [4, 4, 4, 4]
-    assert m3[11].tolist() == [0, 4, 8, 12, 16]
+    assert m3[9].tolist() == [0, 4, 8, 12, 16]
     # Fixed prefix untouched across the cached step.
     assert m3[1].tolist() == [8]
 
@@ -606,7 +603,7 @@ def test_create_beam_tensors_geom_key_arrange_contiguity() -> None:
 
     The device-side arange fast path is only valid when ``prefix_indices`` is
     one contiguous range.  Supplying a geom_key does not by itself prove that
-    (the caller could hand over an arbitrary recompute/gather layout), so the
+    (standard rows may separate two beam requests), so the
     builder must still fall back to the host copy for a non-contiguous index
     list.  This guards the fast path against a future optimization that would
     turn a gather layout into a bogus strided arange."""
@@ -625,7 +622,6 @@ def test_create_beam_tensors_geom_key_arrange_contiguity() -> None:
             suffix_cu_seqlens_q_cpu=list(range(1, len(prefix_indices) + 1)),
             suffix_cu_seqlens_kv_cpu=[1] * len(prefix_indices),
             suffix_seqlens_kv_cpu=[1] * len(prefix_indices),
-            suffix_slot_mapping_out_list=[],
             prefix_req_idxs_cpu=[0],
             max_prefix_blocks_count=2,
             device=torch.device("cpu"),
@@ -662,7 +658,6 @@ def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
             suffix_cu_seqlens_q_cpu=list(range(1, len(prefix_indices) + 1)),
             suffix_cu_seqlens_kv_cpu=[1] * len(prefix_indices),
             suffix_seqlens_kv_cpu=[1] * len(prefix_indices),
-            suffix_slot_mapping_out_list=[],
             prefix_req_idxs_cpu=[0],
             max_prefix_blocks_count=2,
             device=torch.device("cpu"),
@@ -685,22 +680,16 @@ def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
 
 def test_build_beam_mappings_incremental_returns_analytic_scalars() -> None:
     """The incremental path returns its scalar reductions analytically:
-    a contiguous prefix flag of True and per-geometry max q lens; the
-    recompute path returns False (scan required) and list-derived maxima."""
+    a contiguous prefix flag of True and per-geometry max q lens."""
     builder = _make_builder()
-    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
     geom_key = ("beam", (1, 4, 8, 8), builder.block_size)
 
     inc = builder._build_beam_mappings(
         beam_req_idxs=[0],
         beam_prefix_lens=[8],
         beam_widths=[4],
-        beam_decode_steps=[1],
-        beam_cache_lens=[8],
         beam_q_start_offsets=[0],
         q_starts=[0, 4],
-        common_attn_metadata=common,
-        is_incremental=True,
         beam_decode_step_list=[2],
         geom_key=geom_key,
     )
@@ -709,26 +698,6 @@ def test_build_beam_mappings_incremental_returns_analytic_scalars() -> None:
     assert inc[-3] == 4  # prefix_max_q_len == beam_width
     assert inc[-2] == 1  # suffix_max_q_len (one query token per beam)
     assert inc[-1] == 3  # suffix_max_seq_len == decode_step + 1 (step=2)
-
-    rec = builder._build_beam_mappings(
-        beam_req_idxs=[0],
-        beam_prefix_lens=[8],
-        beam_widths=[4],
-        beam_decode_steps=[2],
-        beam_cache_lens=[8],
-        beam_q_start_offsets=[0],
-        q_starts=[0, 4],
-        common_attn_metadata=common,
-        is_incremental=False,
-        beam_decode_step_list=None,
-        geom_key=None,
-    )
-    # The recompute path reports the SCANNED verdict (this single-group layout
-    # happens to be contiguous); multi-group gather layouts scan False.
-    assert rec[-4] is True
-    assert rec[-3] == 4  # prefix_max_q_len derived from the group list
-    assert rec[-2] == 2  # suffix_max_q_len: recompute splits chunk budget (2/beam)
-    assert rec[-1] == 2  # suffix_max_seq_len derived from suffix_seqlens_kv list
 
 
 def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
@@ -740,7 +709,6 @@ def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
     cumsum + tolist on every decode step, while the step-dependent suffix
     cumsum is still recomputed."""
     builder = _make_builder()
-    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
     geom_key = ("beam", (1, 4, 8, 8), builder.block_size)
 
     def run(step: int) -> Any:
@@ -748,27 +716,23 @@ def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
             beam_req_idxs=[0],
             beam_prefix_lens=[8],
             beam_widths=[4],
-            beam_decode_steps=[1],
-            beam_cache_lens=[8],
             beam_q_start_offsets=[0],
             q_starts=[0, 4],
-            common_attn_metadata=common,
-            is_incremental=True,
             beam_decode_step_list=[step],
             geom_key=geom_key,
         )
 
     m0 = run(0)
-    assert m0[7] == [4]  # prefix_cu_seqlens_q_cpu (cumsum([4]))
-    assert m0[8] == [8]  # prefix_cu_seqlens_kv_cpu (cumsum([8]))
-    assert m0[9] == [1, 2, 3, 4]  # suffix_cu_seqlens_q_cpu (cumsum([1]*4))
-    assert m0[10] == [1, 2, 3, 4]  # suffix_cu_seqlens_kv_cpu, step 0 -> s=1
+    assert m0[6] == [4]  # prefix_cu_seqlens_q_cpu (cumsum([4]))
+    assert m0[7] == [8]  # prefix_cu_seqlens_kv_cpu (cumsum([8]))
+    assert m0[8] == [1, 2, 3, 4]  # suffix_cu_seqlens_q_cpu (cumsum([1]*4))
+    assert m0[9] == [1, 2, 3, 4]  # suffix_cu_seqlens_kv_cpu, step 0 -> s=1
 
     # Same geometry, later step: fixed lists must be the SAME objects (cache
     # hit, no recompute); the step-derived suffix_cu_seqlens_kv changes.
     m1 = run(2)
-    assert m1[7] is m0[7] and m1[8] is m0[8] and m1[9] is m0[9]
-    assert m1[10] == [3, 6, 9, 12]  # step 2 -> s=3, recomputed
+    assert m1[6] is m0[6] and m1[7] is m0[7] and m1[8] is m0[8]
+    assert m1[9] == [3, 6, 9, 12]  # step 2 -> s=3, recomputed
 
     # A different geometry must not share the cached lists.
     other_key = ("beam", (2, 8, 16, 16), builder.block_size)
@@ -776,18 +740,14 @@ def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
         beam_req_idxs=[0],
         beam_prefix_lens=[16],
         beam_widths=[2],
-        beam_decode_steps=[1],
-        beam_cache_lens=[16],
         beam_q_start_offsets=[0],
         q_starts=[0, 2],
-        common_attn_metadata=common,
-        is_incremental=True,
         beam_decode_step_list=[0],
         geom_key=other_key,
     )
-    assert m2[7] is not m0[7]
-    assert m2[8] == [16]
-    assert m2[9] == [1, 2]
+    assert m2[6] is not m0[6]
+    assert m2[7] == [16]
+    assert m2[8] == [1, 2]
 
 
 def test_build_geometry_hit_fast_path_replays_layout() -> None:
@@ -971,3 +931,83 @@ def test_block_table_copied_set_eviction_survives_fixed_buffers() -> None:
     # Session B sweeps A's set entry without raising TypeError.
     run_build("req-b")
     assert not any("req-a" in str(k) for k in btc)
+
+
+@pytest.mark.parametrize("session_state", ["missing", "inactive"])  # type: ignore[misc]
+def test_beam_builder_rejects_missing_active_session(session_state: str) -> None:
+    data = {
+        "beam": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "cache_len": 4,
+            "beam_width": 2,
+            "decode_step": 0,
+        }
+    }
+    token = BEAM_DATA_VAR.set(
+        {
+            "req_ids": ["beam"],
+            "beam_data": data,
+            "beam_session": None
+            if session_state == "missing"
+            else SimpleNamespace(is_active=False),
+        }
+    )
+    try:
+        with pytest.raises(RuntimeError, match="active beam session"):
+            _make_builder().build(0, _common_metadata([0, 2], [6], [[0, 1, 2]]))
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+
+@pytest.mark.parametrize("step", [None, -1, True, 0.5])  # type: ignore[misc]
+def test_beam_builder_rejects_invalid_decode_step(step: Any) -> None:
+    data = {"beam": {"is_beam_decode": True, "prefix_len": 4, "cache_len": 4, "beam_width": 2}}
+    if step is not None:
+        data["beam"]["decode_step"] = step
+    with pytest.raises(ValueError, match="decode_step"):
+        _build_metadata(_common_metadata([0, 2], [6], [[0, 1, 2]]), ["beam"], data)
+
+
+def test_cached_geometry_does_not_accept_multi_token_beam_queries() -> None:
+    builder = _make_builder()
+    session = SimpleNamespace(
+        is_active=True, context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda rid: 0))
+    )
+    data = {
+        "beam": {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "cache_len": 4,
+            "beam_width": 2,
+            "decode_step": 0,
+        }
+    }
+    token = BEAM_DATA_VAR.set({"req_ids": ["beam"], "beam_data": data, "beam_session": session})
+    try:
+        builder.build(0, _common_metadata([0, 2], [6], [[0, 1, 2]]))
+        assert builder._geometry_cache()["layout"]
+        with pytest.raises(ValueError, match="one query token per beam"):
+            builder.build(0, _common_metadata([0, 4], [8], [[0, 1, 2]]))
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+
+def test_interleaved_standard_rows_preserve_beam_indices() -> None:
+    data = {
+        rid: {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "cache_len": 4,
+            "beam_width": 2,
+            "decode_step": 1,
+        }
+        for rid in ("a", "b")
+    }
+    metadata = _build_metadata(
+        _common_metadata([0, 2, 3, 5], [6, 1, 6], [[0, 1, 2]] * 3), ["a", "ordinary", "b"], data
+    )
+    assert metadata.prefix_indices.tolist() == [0, 1, 3, 4]
+    assert metadata.std_indices.tolist() == [2]
+    assert metadata.prefix_seqlens_q_cpu == [2, 2]
+    assert metadata.suffix_seqlens_kv_cpu == [2] * 4

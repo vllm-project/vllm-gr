@@ -200,7 +200,6 @@ patches:
         - BeamAttentionMetadata
         - BeamAttentionMetadataBuilder
         - BEAM_DATA_VAR
-        - _compute_beam_bounds
     removal_condition: vLLM supports named third-party backend identities without a shared CUSTOM slot
 
   - id: GR-PATCH-014

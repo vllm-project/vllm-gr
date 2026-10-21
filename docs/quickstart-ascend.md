@@ -150,6 +150,12 @@ at Decode, while the NPU model executes `batch_size * beam_width` tokens.
 The incremental beam decode branch on Ascend NPU has two execution modes,
 selected through the engine's `additional_config`:
 
+Both modes require an active Beam session and persistent suffix KV pool.
+The old paged-suffix recompute path has been removed: missing session state
+or invalid Decode metadata raises an error. The `xllm` fallback to `cascade`
+still uses incremental KV; ordinary requests, Prefill and standard prefix
+segments retain their paged-cache execution.
+
 - `xllm` (default when the xllm-ops library from step 5 is installed): the
   fused path — a single `x_attention` kernel attends over the paged shared
   prefix and the contiguous unshared beam pool at once, and the fused

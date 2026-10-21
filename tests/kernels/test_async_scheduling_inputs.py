@@ -66,7 +66,9 @@ def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, 
             built = BeamAttentionMetadataBuilder.build_async(
                 layout=prepared.layout,
                 views=views,
-                session=SimpleNamespace(context=SimpleNamespace(max_decode_steps=3)),
+                session=SimpleNamespace(
+                    is_active=True, context=SimpleNamespace(max_decode_steps=3)
+                ),
                 mask=torch.ones(width, device="cuda", dtype=torch.bool),
                 slots=torch.full((width,), -1, device="cuda", dtype=torch.int64),
                 block_size=16,

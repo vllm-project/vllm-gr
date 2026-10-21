@@ -278,7 +278,7 @@ aligned with it.
 - Compatibility facade:
     - `beam_attn` intentionally continues to export
       `BeamAttentionMetadata`, `BeamAttentionMetadataBuilder`,
-      `BEAM_DATA_VAR`, and `_compute_beam_bounds`;
+      `BEAM_DATA_VAR`;
     - new internal code should import those symbols from their owner modules.
 - Ownership risk:
     - CUSTOM is one shared process-global slot;

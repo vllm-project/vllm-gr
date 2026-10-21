@@ -18,38 +18,13 @@ from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.worker import model_runner_common as common
 
 
-def test_position_helpers_support_buffer_forms_and_partial_beam() -> None:
+def test_position_helpers_support_buffer_forms() -> None:
     device = torch.full((8,), -1, dtype=torch.long)
     host = torch.full((8,), -1, dtype=torch.long)
-
-    buffered_runner = SimpleNamespace(positions=SimpleNamespace(gpu=device, cpu=host))
-    assert common._get_positions_buffers(buffered_runner) == (device, host)
-
-    plain_runner = SimpleNamespace(positions=device, _positions_cpu_buf=host)
-    assert common._get_positions_buffers(plain_runner) == (device, host)
-
-    logits_indices: list[int] = []
-    result = common._process_beam_decode_request(
-        {
-            "prefix_len": 10,
-            "beam_width": 2,
-            "beam_decode_steps": 4,
-            "cache_len": 12,
-        },
-        seq_len=3,
-        token_offset=1,
-        gpu_pos=device,
-        cpu_pos=host,
-        new_logits_indices=logits_indices,
-    )
-
-    assert result == (2, 1, 4, [0])
-    assert logits_indices == [2]
-    assert device.tolist() == [-1, 12, 13, 10, -1, -1, -1, -1]
-    assert torch.equal(device, host)
-
-    common._write_position_segments(0, [], [], device, host)
-    assert torch.equal(device, host)
+    buffered = SimpleNamespace(positions=SimpleNamespace(gpu=device, cpu=host))
+    plain = SimpleNamespace(positions=device, _positions_cpu_buf=host)
+    assert common._get_positions_buffers(buffered) == (device, host)
+    assert common._get_positions_buffers(plain) == (device, host)
 
 
 def test_incremental_beam_decode_fills_constant_position_ids() -> None:
@@ -70,7 +45,6 @@ def test_incremental_beam_decode_fills_constant_position_ids() -> None:
         gpu_pos=device,
         cpu_pos=host,
         new_logits_indices=logits_indices,
-        is_incremental=True,
     )
 
     assert result == (3, 3, 4, [0, 1, 2])
@@ -114,14 +88,15 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
                 "beam_width": 2,
                 "beam_decode_steps": 2,
                 "cache_len": 4,
+                "decode_step": 1,
             }
         }
     )
 
-    logits_indices = common._beam_remap_inputs(runner, scheduler_output, [2, 4, 1, 3])
+    logits_indices = common._beam_remap_inputs(runner, scheduler_output, [2, 2, 1, 3])
 
-    assert logits_indices == [3, 5, 9]
-    assert positions.gpu[2:6].tolist() == [4, 5, 4, 5]
+    assert logits_indices == [2, 3, 7]
+    assert positions.gpu[2:4].tolist() == [5, 5]
     assert torch.equal(positions.gpu, positions.cpu)
     assert scheduler_output._gr_request_row_configs == [
         ("ordinary", 0, 0, []),
@@ -214,18 +189,24 @@ def test_incremental_layout_cache_short_circuits_remap() -> None:
     assert so2._gr_request_row_configs == [("beam", 0, 4, [0, 1, 2, 3])]
     assert so2._gr_request_row_configs[0] is so1._gr_request_row_configs[0]
 
-    # A different token count (different layout key) must NOT hit the cache:
-    # the slow path reruns and builds a fresh (equal-valued) layout.  The row
-    # count still tracks beam_width (each beam contributes one token), so the
-    # logits list keeps 4 entries; only the per-frame token offsets differ.
+    # A token count inconsistent with the Beam width is rejected, even after
+    # this request has populated the layout cache.
     pos3 = SimpleNamespace(
         gpu=torch.zeros((5,), dtype=torch.long),
         cpu=torch.zeros((5,), dtype=torch.long),
     )
     r3, so3 = make_frame(2, pos3)
-    idx3 = common._beam_remap_inputs(r3, so3, [5])
-    assert idx3 == [0, 1, 2, 3]
-    assert so3._gr_request_row_configs[0] is not so2._gr_request_row_configs[0]
+    with pytest.raises(ValueError, match="one query token per beam"):
+        common._beam_remap_inputs(r3, so3, [5])
+
+    # Reusing a request id for a different prompt must rebuild the valid
+    # geometry instead of reusing stale positions or rejecting the new session.
+    pos4 = SimpleNamespace(gpu=torch.zeros(4), cpu=torch.zeros(4))
+    r4, so4 = make_frame(0, pos4)
+    so4.beam_data["beam"].update(prefix_len=11, cache_len=11)
+    assert common._beam_remap_inputs(r4, so4, [4]) == [0, 1, 2, 3]
+    assert pos4.gpu.tolist() == [11] * 4
+    assert so4._gr_request_row_configs[0] is not so2._gr_request_row_configs[0]
 
 
 def test_sampling_metadata_remap_is_cached_and_warmed_at_remap() -> None:
@@ -259,11 +240,12 @@ def test_sampling_metadata_remap_is_cached_and_warmed_at_remap() -> None:
                 "beam_width": 2,
                 "beam_decode_steps": 2,
                 "cache_len": 4,
+                "decode_step": 1,
             }
         }
     )
 
-    common._beam_remap_inputs(runner, scheduler_output, [4])
+    common._beam_remap_inputs(runner, scheduler_output, [2])
     proxy = runner.input_batch
 
     # Eager warm: the metadata was remapped during _beam_remap_inputs
@@ -1423,3 +1405,22 @@ def test_slim_v2_wrapper_is_idempotent() -> None:
 
     wrapped = common.make_patched_execute_model_v2(execute_model)
     assert common.make_patched_execute_model_v2(wrapped) is wrapped
+
+
+@pytest.mark.parametrize("step", [None, -1, True])  # type: ignore[misc]
+def test_beam_input_rejects_missing_or_invalid_step(step: Any) -> None:
+    metadata = {"prefix_len": 4, "cache_len": 4, "beam_width": 2}
+    if step is not None:
+        metadata["decode_step"] = step
+    positions = torch.full((4,), -1)
+    logits: list[int] = []
+    with pytest.raises(ValueError, match="decode_step"):
+        common._process_beam_decode_request(metadata, 2, 0, positions, None, logits)
+    assert positions.tolist() == [-1] * 4
+    assert not logits
+
+
+def test_beam_input_rejects_full_suffix_rows() -> None:
+    metadata = {"prefix_len": 4, "cache_len": 4, "beam_width": 2, "decode_step": 1}
+    with pytest.raises(ValueError, match="one query token per beam"):
+        common._process_beam_decode_request(metadata, 4, 0, None, None, [])

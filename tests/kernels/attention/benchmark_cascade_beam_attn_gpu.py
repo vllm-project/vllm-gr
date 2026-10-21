@@ -20,6 +20,7 @@ import itertools
 import torch
 from cascade_beam_attn_utils import (
     NUM_HEADS,
+    build_beam_attn_metadata,
     prepare_inputs,
     run_cascade_beam_attention,
 )
@@ -34,6 +35,8 @@ except ImportError as e:
     raise SystemExit(f"vllm_flash_attn is not supported: {e}")
 
 
+# Each measurement uses prebuilt incremental metadata and an initialized KV pool.
+# It excludes fixture/metadata construction and measures the cascade attention call.
 def benchmark_one(
     batch_size: int,
     beam_width: int,
@@ -73,12 +76,15 @@ def benchmark_one(
         device=device,
     )
 
+    metadata = build_beam_attn_metadata(inputs, device)
+
     def run_once() -> torch.Tensor:
         return run_cascade_beam_attention(
             inputs,
             device=device,
             vllm_flash_attn_version=inputs.fa_version,
             logits_soft_cap=inputs.soft_cap,
+            metadata=metadata,
         )
 
     with torch.inference_mode():
@@ -114,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         "--seq-len",
         type=int,
         nargs=3,
-        default=[8, 2048, 8],
+        default=[1, 2048, 8],
         metavar=("Q_SEQ_LEN", "KV_SEQ_LEN", "SUFFIX_KV_LEN"),
     )
     parser.add_argument("--head-sizes", type=int, nargs="+", default=[128, 256])

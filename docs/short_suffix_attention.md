@@ -19,7 +19,11 @@ device inputs during replay.
 
 The dispatch is restricted to pure incremental FA2 decode, head dimensions
 64/128/256, and unwindowed attention without ALiBi, softcap, or sinks.
-With the optimization disabled, configurations use the original implementation.
+With the optimization disabled, configurations use the generic incremental
+implementation (pool packing, suffix FlashAttention and merge). Beam decode
+requires an active session, a persistent suffix KV pool and one query per beam;
+the old paged-suffix recompute path is no longer supported. Standard requests,
+Prefill and prefix-only chunks remain separate from beam suffix execution.
 The kernel itself supports FP32 for independent correctness validation, in addition
 to the FP16/BF16 activation types used by the model runner.
 

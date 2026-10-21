@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Beam-Consecutive Suffix Gather Attention Backend."""
+"""Beam Attention over a shared paged prefix and persistent per-beam suffix KV."""
 
 from types import ModuleType
 
@@ -26,6 +26,7 @@ from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
     BeamAttentionMetadataBuilder,
     _get_fp8_dtype_for_flashattn,
+    require_beam_decode_session,
 )
 
 __all__ = [
@@ -301,13 +302,13 @@ class BeamAttentionImpl(AttentionImpl):
             key_cache, value_cache = kv_cache.unbind(0)
 
         # --- Incremental decode path for beam decode ---
-        # When is_beam_decode is True and beam_session is available,
-        # use cache_unshared_kv + cascade_attention with pool slice
-        # instead of reshape_and_cache + cascade_attention with gather.
+        # Beam decode requires a live session: append current KV to its pool
+        # and run cascade attention over the paged prefix and pooled suffix.
         beam_session = getattr(attn_metadata, "beam_session", None)
         is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
 
-        if is_beam_decode and beam_session is not None and beam_session.is_active:
+        if is_beam_decode or getattr(attn_metadata, "prefix_indices", None) is not None:
+            beam_session = require_beam_decode_session(attn_metadata)
             # Cache only the layer index. The pool object is session-specific:
             # multi-request GPU execution replaces each physical [B, W, ...]
             # pool with a request-major [1, B*W, ...] view. Reusing the pool
@@ -319,7 +320,10 @@ class BeamAttentionImpl(AttentionImpl):
                 layer_name = getattr(layer, "layer_name", "")
                 layer_idx = extract_layer_index(layer_name)
                 layer._beam_pool_index = layer_idx
-            pool = beam_session.pools[layer_idx]
+            pools = getattr(beam_session, "pools", ())
+            if not 0 <= layer_idx < len(pools) or pools[layer_idx] is None:
+                raise RuntimeError("Beam decode requires a KV pool for the attention layer")
+            pool = pools[layer_idx]
 
             # Extract the beam tokens' KV from the key/value tensors (they
             # contain all scheduled tokens).  The gather runs inside the

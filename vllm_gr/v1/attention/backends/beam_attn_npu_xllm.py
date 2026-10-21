@@ -5,7 +5,7 @@
 NPU-only execution module selected by ``_get_platform_execution_module`` when
 ``vllm_gr_npu_decode_execution == "xllm"``.  It replaces the cascade
 per-operator path only for the incremental beam decode branch; every other
-branch (std requests, prefill, suffix recompute) forwards to
+branch (std requests, prefill) forwards to
 ``beam_attn_npu`` unchanged, and the CUDA path is never touched.
 
 The incremental branch becomes a single fused ``x_attention`` call that
@@ -24,6 +24,7 @@ from vllm_gr.ops.npu import beam_ops
 from vllm_gr.v1.attention.backends import beam_attn_npu
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
+    require_beam_decode_session,
 )
 from vllm_gr.v1.beam.npu_execution_batch import restore_npu_cache_pool_layout
 
@@ -238,7 +239,8 @@ def cascade_attention(
             beam_pool=beam_pool,
         )
 
-    if is_beam_decode and beam_session is not None and beam_session.is_active:
+    if is_beam_decode or attn_metadata.prefix_indices is not None:
+        beam_session = require_beam_decode_session(attn_metadata)
         if attn_metadata.std_indices is not None:
             # Mixed std/beam batch: the fused kernel only encodes beam rows;
             # the cascade module handles both branches.
@@ -247,7 +249,7 @@ def cascade_attention(
         if attn_metadata.prefix_indices is None:
             # No beam-row routing: cannot gather beam queries for the fused
             # kernel.  Loud failure would be a user-visible crash for a shape
-            # cascade handles (its beam branch falls back to full gather).
+            # cascade handles as a standard-only prefix chunk.
             _fallback_to_cascade()
             return
         # (-1, -1) is the "no sliding window" sentinel the impl passes for
@@ -284,7 +286,7 @@ def cascade_attention(
         )
         return
 
-    # Std requests, prefill, recompute and mixed batches keep the cascade
+    # Std requests, prefill and mixed batches keep the cascade
     # implementation.
     _fallback_to_cascade()
 
