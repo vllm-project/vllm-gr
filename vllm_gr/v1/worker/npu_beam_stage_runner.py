@@ -525,9 +525,9 @@ class NPUEagerBeamStageRunner:
     ) -> ConstraintOutput:
         """Select candidates within one Backend call's row capacity.
 
-        The canonical Backend is intentionally sized for one request's beam
-        rows. A multi-request Decode stage submits contiguous row chunks and
-        restores the request-major result with concatenation.
+        The canonical NPU Backend admits the supported B*W Decode rows in one
+        call. Backends with a smaller capacity still use contiguous chunks
+        and restore the request-major result with concatenation.
         """
         max_rows = int(backend.info.max_rows)
         if max_rows < 1:

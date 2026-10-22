@@ -1870,7 +1870,51 @@ def test_npu_single_step_filters_candidates_before_return_limit(
             assert sequence.finish_reason == "length" and sequence.stop_token_id is None
 
 
-def test_npu_constraint_candidates_chunk_multi_batch_rows() -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("rows", "top_k"), [(4, 128), (128, 128), (512, 128), (512, 64)]
+)
+@pytest.mark.parametrize("scalar_temperature", [False, True])  # type: ignore[misc]
+def test_npu_constraint_candidates_single_call_preserves_tensors(
+    rows: int, top_k: int, scalar_temperature: bool
+) -> None:
+    """B4 Decode and smaller stage widths use one call without repacking."""
+    logits = torch.arange(rows, dtype=torch.float32)[:, None].expand(-1, 128).contiguous()
+    metadata = ConstraintMetadata(
+        prefix_token_ids=torch.arange(rows * 3, dtype=torch.int32).view(rows, 3),
+        temperatures=torch.ones(1 if scalar_temperature else rows, dtype=torch.float32),
+        current_step=0 if rows == 4 else 2,
+        top_k=top_k,
+    )
+    expected = ConstraintOutput(
+        token_ids=torch.arange(rows * top_k, dtype=torch.int32).view(rows, top_k),
+        logprobs=torch.zeros(rows, top_k),
+        valid_mask=torch.ones(rows, top_k, dtype=torch.bool),
+    )
+    calls = 0
+
+    def select(
+        actual_logits: torch.Tensor, actual_metadata: ConstraintMetadata
+    ) -> ConstraintOutput:
+        nonlocal calls
+        calls += 1
+        assert actual_logits is logits
+        assert actual_metadata is metadata
+        return expected
+
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    result = stage._select_constraint_candidates(
+        SimpleNamespace(info=SimpleNamespace(max_rows=512), select=select), logits, metadata
+    )
+
+    assert calls == 1
+    assert result is expected
+
+
+@pytest.mark.parametrize("rows,max_rows", [(6, 3), (512, 128), (512, 192)])  # type: ignore[misc]
+@pytest.mark.parametrize("scalar_temperature", [False, True])  # type: ignore[misc]
+def test_npu_constraint_candidates_chunk_multi_batch_rows(
+    rows: int, max_rows: int, scalar_temperature: bool
+) -> None:
     calls: list[ConstraintMetadata] = []
 
     def select(logits: torch.Tensor, metadata: ConstraintMetadata) -> ConstraintOutput:
@@ -1882,26 +1926,32 @@ def test_npu_constraint_candidates_chunk_multi_batch_rows() -> None:
             valid_mask=torch.ones((logits.shape[0], metadata.top_k), dtype=torch.bool),
         )
 
-    prefixes = torch.arange(18, dtype=torch.int32).view(6, 3)
-    temperatures = torch.arange(6, dtype=torch.float32)
+    top_k = 2 if rows == 6 else 128
+    prefixes = torch.arange(rows * 3, dtype=torch.int32).view(rows, 3)
+    temperatures = torch.arange(1 if scalar_temperature else rows, dtype=torch.float32)
     metadata = ConstraintMetadata(
         prefix_token_ids=prefixes,
         temperatures=temperatures,
         current_step=1,
-        top_k=2,
+        top_k=top_k,
     )
     stage = object.__new__(NPUEagerBeamStageRunner)
     result = stage._select_constraint_candidates(
-        SimpleNamespace(info=SimpleNamespace(max_rows=3), select=select),
-        torch.arange(6, dtype=torch.float32)[:, None].expand(-1, 4),
+        SimpleNamespace(info=SimpleNamespace(max_rows=max_rows), select=select),
+        torch.arange(rows, dtype=torch.float32)[:, None].expand(-1, max(top_k, 4)),
         metadata,
     )
 
-    assert [item.prefix_token_ids.shape[0] for item in calls] == [3, 3]
+    assert [item.prefix_token_ids.shape[0] for item in calls] == [
+        min(max_rows, rows - start) for start in range(0, rows, max_rows)
+    ]
     torch.testing.assert_close(torch.cat([item.prefix_token_ids for item in calls]), prefixes)
-    torch.testing.assert_close(torch.cat([item.temperatures for item in calls]), temperatures)
-    assert all(item.current_step == 1 and item.top_k == 2 for item in calls)
-    torch.testing.assert_close(result.token_ids[:, 0], torch.arange(6, dtype=torch.int32))
+    if scalar_temperature:
+        assert all(item.temperatures is temperatures for item in calls)
+    else:
+        torch.testing.assert_close(torch.cat([item.temperatures for item in calls]), temperatures)
+    assert all(item.current_step == 1 and item.top_k == top_k for item in calls)
+    torch.testing.assert_close(result.token_ids[:, 0], torch.arange(rows, dtype=torch.int32))
     assert result.logprobs.is_contiguous() and result.valid_mask.all()
 
 
