@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for NPU ModelRunner wrappers."""
 
+import struct
 from types import SimpleNamespace
 from typing import Any
 
@@ -1868,6 +1869,273 @@ def test_npu_single_step_filters_candidates_before_return_limit(
             assert sequence.cumulative_logprob == pytest.approx(first_score if index == 0 else -0.2)
             assert sequence.parent_beam_indices == (0,)
             assert sequence.finish_reason == "length" and sequence.stop_token_id is None
+
+
+def _terminal_result_runner(
+    batch: int,
+    *,
+    returned: int = 2,
+    stop_ids: tuple[int, ...] = (),
+    ignore_stops: bool = False,
+    penalty: float = 1.0,
+    include_stop: bool = True,
+    include_score: bool = True,
+    include_parents: bool = True,
+) -> NPUEagerBeamStageRunner:
+    request_ids = tuple(f"request-{row}" for row in range(batch))
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.pending_plan = SimpleNamespace(execution=SimpleNamespace(request_ids=request_ids))
+    stage.session_request = SimpleNamespace(
+        batch_id="terminal-batch",
+        items=tuple(
+            SimpleNamespace(
+                item_index=row,
+                request=SimpleNamespace(request_id=request_id, prompt_token_ids=[1] * (row + 1)),
+            )
+            for row, request_id in enumerate(request_ids)
+        ),
+        beam_params=SimpleNamespace(
+            stop_token_ids=stop_ids, ignore_stop_tokens=ignore_stops, length_penalty=penalty
+        ),
+        output_options=SimpleNamespace(
+            num_return_sequences=returned,
+            include_stop_token=include_stop,
+            include_cumulative_logprob=include_score,
+            include_parent_beam_indices=include_parents,
+        ),
+    )
+    return stage
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "batch,steps,include_score,include_parents",
+    [
+        (1, 1, True, False),
+        (1, 2, False, True),
+        (1, 3, True, True),
+        (4, 1, False, False),
+        (4, 2, True, False),
+        (4, 3, True, True),
+    ],
+)
+def test_npu_terminal_fixed_lengths_preserve_rows_scores_and_output_flags(
+    batch: int, steps: int, include_score: bool, include_parents: bool
+) -> None:
+    stage = _terminal_result_runner(
+        batch, include_score=include_score, include_parents=include_parents
+    )
+    tokens = torch.tensor(
+        [
+            [[100 * row + 10 * beam + step for step in range(steps)] for beam in range(3)]
+            for row in range(batch)
+        ],
+        dtype=torch.int32,
+    )
+    parents = torch.tensor([[[0, 1, 2][:steps]] * 3] * batch, dtype=torch.int32)
+    scores = torch.tensor([[-0.25, -0.1, -0.2]] * batch, dtype=torch.float32)
+    original_tokens, original_parents = tokens.clone(), parents.clone()
+
+    result = stage._build_terminal_result(tokens, scores, parents)
+
+    assert result.batch_id == "terminal-batch" and result.failure is None
+    assert result.output is not None and len(result.output.items) == batch
+    for row, output in enumerate(result.output.items):
+        assert (output.item_index, output.request_id) == (row, f"request-{row}")
+        assert [sequence.token_ids for sequence in output.sequences] == [
+            tuple(100 * row + 10 * beam + step for step in range(steps)) for beam in (1, 2)
+        ]
+        for sequence, score_bits in zip(output.sequences, ("bdcccccd", "be4ccccd"), strict=True):
+            if include_score:
+                assert struct.pack(">f", sequence.cumulative_logprob).hex() == score_bits
+            else:
+                assert sequence.cumulative_logprob is None
+            assert sequence.parent_beam_indices == ((0, 1, 2)[:steps] if include_parents else ())
+            assert sequence.finish_reason == "length" and sequence.stop_token_id is None
+    assert torch.equal(tokens, original_tokens) and torch.equal(parents, original_parents)
+
+
+def test_npu_terminal_filters_nonfinite_before_limits_independently_per_request() -> None:
+    stage = _terminal_result_runner(4, include_score=False, include_parents=False)
+    tokens = torch.arange(20, dtype=torch.int32).view(4, 5, 1)
+    scores = torch.tensor(
+        [
+            [float("nan"), float("inf"), -float("inf"), -0.25, -0.125],
+            [-0.1, float("nan"), float("inf"), -float("inf"), float("nan")],
+            [-float("inf"), -float("inf"), -float("inf"), -0.125, -0.125],
+            [-0.3, float("nan"), float("inf"), -float("inf"), -0.2],
+        ],
+        dtype=torch.float32,
+    )
+
+    result = stage._build_terminal_result(tokens, scores, torch.zeros_like(tokens))
+
+    assert result.failure is None and result.output is not None
+    assert [[seq.token_ids for seq in item.sequences] for item in result.output.items] == [
+        [(4,), (3,)],
+        [(5,)],
+        [(13,), (14,)],
+        [(19,), (15,)],
+    ]
+    assert all(
+        seq.cumulative_logprob is None for item in result.output.items for seq in item.sequences
+    )
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "penalty,include_stop,order",
+    [
+        (1.0, True, [2, 0, 1]),
+        (1.0, False, [2, 0, 1]),
+        (0.0, False, [2, 0, 1]),
+        (-1.0, True, [0, 2, 1]),
+    ],
+)
+def test_npu_terminal_stop_lengths_rank_with_prompt_and_keep_parent_alignment(
+    penalty: float, include_stop: bool, order: list[int]
+) -> None:
+    stage = _terminal_result_runner(
+        1, returned=3, stop_ids=(99, 98), penalty=penalty, include_stop=include_stop
+    )
+    tokens = torch.tensor([[[99, 97, 99], [20, 21, 22], [30, 99, 98]]], dtype=torch.int32)
+    parents = torch.tensor([[[0, 1, 2], [0, 2, 1], [0, 1, 0]]], dtype=torch.int32)
+    result = stage._build_terminal_result(
+        tokens, torch.tensor([[-0.5, -1.0, -0.375]], dtype=torch.float32), parents
+    )
+
+    assert result.failure is None and result.output is not None
+    expected_tokens = [
+        (99,) if include_stop else (),
+        (20, 21, 22),
+        (30, 99) if include_stop else (30,),
+    ]
+    expected_parents = [(0,) if include_stop else (), (0, 2, 1), (0, 1) if include_stop else (0,)]
+    expected_scores = [-0.5, -1.0, -0.375]
+    for sequence, beam in zip(result.output.items[0].sequences, order, strict=True):
+        assert sequence.token_ids == expected_tokens[beam]
+        assert sequence.parent_beam_indices == expected_parents[beam]
+        assert sequence.cumulative_logprob == expected_scores[beam]
+        assert sequence.finish_reason == ("length" if beam == 1 else "stop")
+        assert sequence.stop_token_id == (None if beam == 1 else 99)
+
+
+def test_npu_terminal_ignored_stops_keep_full_history_and_same_parent_payload() -> None:
+    stage = _terminal_result_runner(1, stop_ids=(99, 98), ignore_stops=True, include_stop=False)
+    tokens = torch.tensor([[[99, 97, 99], [20, 21, 22], [30, 99, 98]]], dtype=torch.int32)
+    parents = torch.tensor([[[0, 1, 2], [0, 2, 1], [0, 1, 0]]], dtype=torch.int32)
+    scores = torch.tensor([[-0.5, -1.0, -0.375]], dtype=torch.float32)
+    included = stage._build_terminal_result(tokens, scores, parents)
+    stage.session_request.output_options.include_parent_beam_indices = False
+    omitted = stage._build_terminal_result(tokens, scores, parents)
+
+    assert included.output is not None and omitted.output is not None
+    for left, right, expected_tokens, expected_parents in zip(
+        included.output.items[0].sequences,
+        omitted.output.items[0].sequences,
+        [(30, 99, 98), (99, 97, 99)],
+        [(0, 1, 0), (0, 1, 2)],
+        strict=True,
+    ):
+        assert left.token_ids == right.token_ids == expected_tokens
+        assert left.parent_beam_indices == expected_parents and right.parent_beam_indices == ()
+        assert left.cumulative_logprob == right.cumulative_logprob
+        assert left.finish_reason == right.finish_reason == "length"
+        assert left.stop_token_id is right.stop_token_id is None
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "raw_scores,penalty,expected_tokens,expected_bits",
+    [
+        ([-0.0, 0.0, -0.5], 1.0, [10, 20, 30], ["80000000", "00000000", "bf000000"]),
+        (
+            [-8 * 2.0**-149, -(2.0**-149), -(2.0**-149)],
+            1023.0,
+            [20, 30, 10],
+            ["80000001", "80000001", "80000008"],
+        ),
+    ],
+)
+def test_npu_terminal_ties_keep_raw_score_then_original_beam_order(
+    raw_scores: list[float], penalty: float, expected_tokens: list[int], expected_bits: list[str]
+) -> None:
+    stage = _terminal_result_runner(1, returned=3, penalty=penalty)
+    tokens = torch.tensor([[[10], [20], [30]]], dtype=torch.int32)
+    result = stage._build_terminal_result(
+        tokens, torch.tensor([raw_scores], dtype=torch.float32), torch.zeros_like(tokens)
+    )
+
+    assert result.output is not None and result.failure is None
+    sequences = result.output.items[0].sequences
+    assert [sequence.token_ids for sequence in sequences] == [(token,) for token in expected_tokens]
+    assert [
+        struct.pack(">f", sequence.cumulative_logprob).hex() for sequence in sequences
+    ] == expected_bits
+
+
+@pytest.mark.parametrize("width", [0, 3])  # type: ignore[misc]
+def test_npu_terminal_empty_or_nonfinite_rows_do_not_evaluate_overflowing_penalty(
+    width: int,
+) -> None:
+    stage = _terminal_result_runner(1, penalty=1e6)
+    tokens = torch.zeros((1, width, 3), dtype=torch.int32)
+    scores = torch.tensor([[float("nan"), float("inf"), -float("inf")]], dtype=torch.float32)[
+        :, :width
+    ]
+
+    result = stage._build_terminal_result(tokens, scores, torch.zeros_like(tokens))
+
+    assert result.output is None and result.failure is not None
+    assert (result.failure.code, result.failure.item_index) == ("no_valid_beams", 0)
+
+
+def test_npu_terminal_invalid_second_request_returns_batch_failure_without_partial_output() -> None:
+    stage = _terminal_result_runner(4)
+    tokens = torch.arange(8, dtype=torch.int32).view(4, 2, 1)
+    scores = torch.tensor(
+        [[-0.1, -0.2], [float("nan"), float("inf")], [-0.3, -0.4], [-0.5, -0.6]],
+        dtype=torch.float32,
+    )
+
+    result = stage._build_terminal_result(tokens, scores, torch.zeros_like(tokens))
+
+    assert result.batch_id == "terminal-batch" and result.output is None
+    assert result.failure is not None
+    assert (result.failure.code, result.failure.message, result.failure.item_index) == (
+        "no_valid_beams",
+        "No valid final Beam candidates",
+        1,
+    )
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "invalid,message",
+    [
+        ("session", "missing session_init"),
+        ("order", "request order changed"),
+        ("scores", "inconsistent shapes"),
+        ("parents", "inconsistent shapes"),
+        ("parent_depth", "shape"),
+    ],
+)
+def test_npu_terminal_rejects_existing_session_order_and_tensor_errors(
+    invalid: str, message: str
+) -> None:
+    stage = _terminal_result_runner(1, include_parents=False)
+    tokens = torch.zeros((1, 2, 3), dtype=torch.int32)
+    scores = torch.zeros((1, 2), dtype=torch.float32)
+    parents = torch.zeros_like(tokens)
+    if invalid == "session":
+        stage.session_request = None
+    elif invalid == "order":
+        stage.pending_plan.execution.request_ids = ("different-request",)
+    elif invalid == "scores":
+        scores = scores[:, :1]
+    elif invalid == "parents":
+        parents = parents[:, :1]
+    else:
+        parents = parents[:, :, :2]
+
+    with pytest.raises(RuntimeError, match=message):
+        stage._build_terminal_result(tokens, scores, parents)
 
 
 def test_npu_constraint_candidates_chunk_multi_batch_rows() -> None:

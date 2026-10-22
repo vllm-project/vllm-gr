@@ -612,61 +612,62 @@ class NPUEagerBeamStageRunner:
         for row, item in enumerate(request.items):
             ranked = []
             prompt_length = len(item.request.prompt_token_ids or ())
-            for beam, raw_score in enumerate(score_rows[row]):
-                score = float(raw_score)
+            normalization = None
+            normalizations = {}
+            for beam, score in enumerate(score_rows[row]):
                 if not math.isfinite(score):
                     continue
-                token_ids = tuple(int(token) for token in sequence_rows[row][beam])
-                parent_ids = tuple(int(parent) for parent in parent_rows[row][beam])
-                stop_index = next(
-                    (index for index, token in enumerate(token_ids) if token in stop_ids),
-                    None,
-                )
-                if stop_index is None:
-                    finish_reason = "length"
-                    stop_token_id = None
-                    length = len(token_ids)
+                if stop_ids:
+                    token_ids = sequence_rows[row][beam]
+                    stop_index = next(
+                        (index for index, token in enumerate(token_ids) if token in stop_ids),
+                        None,
+                    )
+                    length = len(token_ids) if stop_index is None else stop_index + 1
+                    normalization = normalizations.get(length)
+                    if normalization is None:
+                        normalization = (
+                            float(prompt_length + length) ** params.length_penalty
+                            if params.length_penalty != 0
+                            else 1.0
+                        )
+                        normalizations[length] = normalization
                 else:
-                    finish_reason = "stop"
-                    stop_token_id = token_ids[stop_index]
-                    length = stop_index + 1
-                normalization = (
-                    float(prompt_length + length) ** params.length_penalty
-                    if params.length_penalty != 0
-                    else 1.0
-                )
+                    stop_index = None
+                    length = steps
+                    # Evaluate lazily: an all-invalid row must still report
+                    # no_valid_beams even if this exponent would overflow.
+                    if normalization is None:
+                        normalization = (
+                            float(prompt_length + length) ** params.length_penalty
+                            if params.length_penalty != 0
+                            else 1.0
+                        )
                 ranked.append(
                     (
                         score / normalization,
                         score,
                         beam,
-                        token_ids,
-                        parent_ids,
-                        finish_reason,
-                        stop_token_id,
                         length,
+                        stop_index,
                     )
                 )
             ranked.sort(key=lambda value: (value[0], value[1], -value[2]), reverse=True)
             selected = []
-            for (
-                _,
-                score,
-                _,
-                token_ids,
-                parent_ids,
-                finish_reason,
-                stop_token_id,
-                length,
-            ) in ranked[: options.num_return_sequences]:
+            for _, score, beam, length, stop_index in ranked[: options.num_return_sequences]:
+                token_ids = sequence_rows[row][beam]
+                finish_reason = "length" if stop_index is None else "stop"
+                stop_token_id = None if stop_index is None else token_ids[stop_index]
                 token_count = length
                 if finish_reason == "stop" and not options.include_stop_token:
                     token_count -= 1
                 selected.append(
                     BeamOutputSequence(
-                        token_ids[:token_count],
+                        tuple(token_ids[:token_count]),
                         score if options.include_cumulative_logprob else None,
-                        parent_ids[:token_count] if options.include_parent_beam_indices else (),
+                        tuple(parent_rows[row][beam][:token_count])
+                        if options.include_parent_beam_indices
+                        else (),
                         finish_reason,
                         stop_token_id,
                     )
