@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="${V1_PERF_REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$repo_root"
 model="${VLLM_GR_TEST_MODEL:-OpenOneRec/OneRec-1.7B}"
 triples="${TRIPLES_PATH:?TRIPLES_PATH must point to the CI video triples}"
@@ -82,6 +82,10 @@ echo "Running offline GRLLM.beam_search_v1 batch performance"
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
   python -m benchmarks.beam_search.v1_performance_gate offline "${args[@]}"
 
+if [[ "${V1_PERF_MEASURE_ONLY:-0}" == 1 && "${V1_PERF_OFFLINE_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
+
 echo "Starting online V1 server"
 server_identity="v1-perf-$(python -c 'import uuid; print(uuid.uuid4().hex)')"
 python - "$port" <<'PY'
@@ -154,118 +158,39 @@ python -m benchmarks.beam_search.v1_performance_gate online "${args[@]}" \
   --served-model-name "$server_identity"
 stop_server
 
+if [[ "${V1_PERF_MEASURE_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
+
 python - "$output_dir" <<'PY'
 import json
-import math
 import os
 import sys
 from pathlib import Path
 
 output_dir = Path(sys.argv[1])
 setup = json.loads((output_dir / "setup.json").read_text(encoding="utf-8"))
-baseline_ms = {
-    "offline": {1: 33.78, 2: 56.32, 4: 93.44},
-    "online": {1: 55.08, 2: 82.82, 4: 156.22},
-}
-if (
-    setup["model"] != "OpenOneRec/OneRec-1.7B"
-    or setup["revision"] != "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b"
-    or setup["input_tokens_including_sid_begin"] != 1024
-    or setup["beam_width"] != 32
-    or setup["generated_steps"] != 3
-    or setup["batch_sizes"] != [1, 2, 4]
-):
-    raise SystemExit(
-        "Beam V1 performance limits require 1024 tokens, width=32, steps=3, B/C=1,2,4"
-    )
 lines = [
-    "## Beam V1 performance on this CI runner",
+    "## Beam V1 performance measurement",
+    "",
+    "This push run has no PR base commit for an A/B comparison.",
     "",
     f"Model: `{setup['model']}`; revision: `{setup['revision']}`; "
-    f"input tokens: {setup['input_tokens_including_sid_begin']}; "
-    f"beam width: {setup['beam_width']}; generated steps: {setup['generated_steps']}; "
-    f"warmup runs: {setup['warmup_runs']}; measured runs: {setup['measured_runs']}",
+    f"warmup: {setup['warmup_runs']}; measured: {setup['measured_runs']}",
     "",
-    "Offline values use one fixed B-request batch per call. Online values use "
-    "C simultaneous HTTP requests, each with one logical request. V1 sends "
-    "terminal results, so token-stream TTFT and TPOT are unavailable.",
-    "",
-    "The gate checks mean group latency against the 1024-token baseline plus 3 ms, "
-    "rounded up to whole milliseconds. Offline misses fail the job. Online misses "
-    "are warnings and do not fail the job.",
-    "",
-    "### Baseline comparison",
-    "",
-    "Change = current - baseline; positive values mean higher latency.",
-    "",
-    "| Mode | B / concurrency | Baseline ms | Current ms | Change ms | "
-    "Change % | Limit ms | Gate |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    "| Mode | B / concurrency | Mean group latency ms |",
+    "| --- | ---: | ---: |",
 ]
-details = [
-    "| Mode | B / concurrency | Input tokens | Mean group ms | P50 | P95 | P99 | "
-    "Mean request ms | Requests/s | Beam tokens/s | Limit ms | Gate |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
-]
-blocking = []
-warnings = []
 for mode in ("offline", "online"):
     data = json.loads((output_dir / f"{mode}.json").read_text(encoding="utf-8"))
     if not data.get("complete"):
         raise SystemExit(f"{mode} performance result is incomplete")
-    seen = set()
     for case in data["cases"]:
-        group = case["group_latency_ms"]
-        request = case["request_latency_ms"]
         count = case.get("batch_size", case.get("concurrency"))
-        if count in seen or count not in baseline_ms[mode]:
-            raise SystemExit(f"unexpected or repeated {mode} B/C={count}")
-        seen.add(count)
-        mean_ms = group["mean_ms"]
-        baseline = baseline_ms[mode][count]
-        limit_ms = math.ceil(baseline + 3.0)
-        input_lengths = case["prompt_tokens_including_sid_begin"]
-        if len(input_lengths) != count or any(
-            length != setup["input_tokens_including_sid_begin"] for length in input_lengths
-        ):
-            raise SystemExit(f"unexpected {mode} B/C={count} input token length")
-        if not math.isfinite(mean_ms):
-            raise SystemExit(f"non-finite {mode} B/C={count} latency")
-        passed = mean_ms <= limit_ms
-        gate = "PASS"
-        if not passed:
-            message = f"{mode} B/C={count}: {mean_ms:.3f} ms > {limit_ms} ms"
-            if mode == "online":
-                warnings.append(message)
-                gate = "WARN"
-            else:
-                blocking.append(message)
-                gate = "FAIL"
-        change_ms = mean_ms - baseline
-        lines.append(
-            f"| {mode} | {count} | {baseline:.2f} | {mean_ms:.3f} | "
-            f"{change_ms:+.3f} | {change_ms / baseline * 100:+.2f}% | "
-            f"{limit_ms} | {gate} |"
-        )
-        input_range = f"{min(input_lengths)}–{max(input_lengths)}"
-        details.append(
-            f"| {mode} | {count} | {input_range} | {mean_ms:.3f} | "
-            f"{group['p50_ms']:.2f} | {group['p95_ms']:.2f} | "
-            f"{group['p99_ms']:.2f} | {request['mean_ms']:.2f} | "
-            f"{case['requests_per_second']:.2f} | "
-            f"{case['beam_generated_tokens_per_second']:.2f} | {limit_ms} | "
-            f"{gate} |"
-        )
-    if seen != set(baseline_ms[mode]):
-        raise SystemExit(f"missing {mode} performance cases: {set(baseline_ms[mode]) - seen}")
-lines.extend(("", "### Detailed measurements", "", *details))
+        lines.append(f"| {mode} | {count} | {case['group_latency_ms']['mean_ms']:.3f} |")
 summary = "\n".join(lines) + "\n"
 print(summary, flush=True)
 if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
     with open(summary_path, "a", encoding="utf-8") as stream:
         stream.write(summary)
-for message in warnings:
-    print(f"::warning title=Beam V1 online latency::{message}", flush=True)
-if blocking:
-    raise SystemExit("Beam V1 performance gate failed:\n" + "\n".join(blocking))
 PY

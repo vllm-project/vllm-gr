@@ -4,6 +4,9 @@ name: Pre-commit and Benchmark
 run-name: >-
   ${{ github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
+      !(github.event.pull_request.base.ref == 'decode_graph' &&
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'abtest') &&
       contains(github.event.pull_request.labels.*.name, 'ready') &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
        github.event.label.name == 'ready') &&
@@ -26,8 +29,6 @@ on:
       - converted_to_draft
       - labeled
       - unlabeled
-  push:
-    branches: [main, decode_graph]
   workflow_dispatch:
     inputs:
       rebuild_pre_commit_cache:
@@ -37,17 +38,26 @@ on:
         type: boolean
 
 concurrency:
-  # Unrelated label edits must not cancel queued or running CI for this PR.
+  # Keep A/B-only requests out of the full validation's single pending slot.
   group: >-
     ${{ github.workflow }}-${{ github.event_name }}-${{
       github.event.pull_request.number || github.ref
     }}-${{
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-      github.event.label.name != 'ready' && format('ignored-{0}', github.run_id) || 'ci'
+      github.event.label.name != 'ready' &&
+      (github.event.label.name != 'abtest' ||
+       github.event.action == 'unlabeled') &&
+      format('ignored-{0}', github.run_id) ||
+      (github.event.action == 'labeled' &&
+       github.event.label.name == 'abtest' && 'abtest' || 'ci')
     }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request' &&
+        !(github.event.action == 'labeled' &&
+          github.event.label.name == 'abtest') }}
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -55,11 +65,86 @@ env:
   CUDA_DEVICE_ORDER: PCI_BUS_ID
 
 jobs:
+  resolve-ab-freshness:
+    name: Resolve Beam V1 A/B freshness
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.base.ref == 'decode_graph' &&
+      contains(github.event.pull_request.labels.*.name, 'ready') &&
+      !(github.event.action == 'labeled' && github.event.label.name == 'abtest') &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+       github.event.label.name == 'ready')
+    runs-on: ubuntu-latest
+    outputs:
+      fresh: ${{ steps.lookup.outputs.fresh }}
+      passed: ${{ steps.lookup.outputs.passed }}
+    steps:
+      - name: Find a successful A/B run for this PR revision
+        id: lookup
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const pr = context.payload.pull_request;
+            const defaultTitle = `pull_request:${pr.number}/merge@${context.sha}`;
+            let fresh = false;
+            let passed = false;
+            try {
+              for (let page = 1; page <= 10 && !fresh; page++) {
+                const {data} = await github.rest.actions.listWorkflowRuns({
+                  owner, repo, workflow_id: 'pre-commit.yml', event: 'pull_request',
+                  head_sha: pr.head.sha, per_page: 100, page,
+                });
+                for (const run of data.workflow_runs) {
+                  const fullTitle =
+                    `ci-meta:v1;run=${run.id};pr=${pr.number};base=${pr.base.ref};` +
+                    `base_sha=${pr.base.sha};merge_sha=${context.sha}`;
+                  if (run.id === context.runId || run.status !== 'completed' ||
+                      !['success', 'failure'].includes(run.conclusion) ||
+                      run.head_sha !== pr.head.sha ||
+                      (run.display_title !== defaultTitle &&
+                       run.display_title !== fullTitle)) {
+                    continue;
+                  }
+                  const {data: jobs} = await github.rest.actions.listJobsForWorkflowRun({
+                    owner, repo, run_id: run.id, filter: 'latest', per_page: 100,
+                  });
+                  const ab = jobs.jobs.find(job =>
+                    job.name === 'Beam V1 performance A/B only' &&
+                    ['success', 'failure'].includes(job.conclusion));
+                  if (!ab) continue;
+                  const {data: artifacts} = await github.rest.actions.listWorkflowRunArtifacts({
+                    owner, repo, run_id: run.id, per_page: 100,
+                  });
+                  fresh = artifacts.artifacts.some(artifact =>
+                    artifact.name ===
+                      `beam-v1-performance-report-${run.id}-${run.run_attempt}` &&
+                    !artifact.expired);
+                  passed = fresh && ab.conclusion === 'success';
+                  if (fresh) break;
+                }
+                if (data.workflow_runs.length < 100) break;
+              }
+            } catch (error) {
+              core.warning(`A/B freshness lookup failed; rerunning A/B: ${error.message}`);
+              fresh = false;
+              passed = false;
+            }
+            core.setOutput('fresh', fresh ? 'true' : 'false');
+            core.setOutput('passed', passed ? 'true' : 'false');
+            core.info(fresh
+              ? `Current revision's A/B report ${passed ? 'passed' : 'failed'}; reusing it.`
+              : 'A/B report is missing or stale; rerunning after regular GPU checks.');
+
   benchmark-policy:
     name: Resolve benchmark policy
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
+       !(github.event.pull_request.base.ref == 'decode_graph' &&
+         github.event.action == 'labeled' &&
+         github.event.label.name == 'abtest') &&
        contains(github.event.pull_request.labels.*.name, 'ready') &&
        ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
         github.event.label.name == 'ready'))
@@ -223,6 +308,10 @@ jobs:
     needs: benchmark-policy
     if: needs.benchmark-policy.result == 'success'
     runs-on: self-hosted
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      queue: max
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -307,6 +396,10 @@ jobs:
       needs.benchmark-policy.result == 'success' &&
       needs.pre-commit.result == 'success'
     runs-on: self-hosted
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      queue: max
+      cancel-in-progress: false
     env:
       BENCHMARK_POLICY_NAME: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_POLICY_NAME }}
       BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
@@ -460,29 +553,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Measure Beam V1 offline batch and online concurrency
-        if: >-
-          (github.ref_name == 'decode_graph' ||
-           github.event.pull_request.base.ref == 'decode_graph') &&
-          env.BENCHMARK_DEVICE == 'gpu'
-        env:
-          TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
-          V1_PERF_OUTPUT_DIR: ${{ github.workspace }}/v1_performance_results
-        run: bash ./tests/system/run_beam_v1_performance.sh
-
-      - name: Upload Beam V1 performance measurements
-        if: >-
-          always() &&
-          (github.ref_name == 'decode_graph' ||
-           github.event.pull_request.base.ref == 'decode_graph') &&
-          env.BENCHMARK_DEVICE == 'gpu'
-        uses: actions/upload-artifact@v4
-        with:
-          name: beam-v1-performance-${{ github.run_id }}-${{ github.run_attempt }}
-          path: v1_performance_results
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Execute decode benchmark gates
         if: >-
           github.ref_name != 'decode_graph' &&
@@ -497,6 +567,147 @@ jobs:
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
 
+  beam-performance-ab-only:
+    name: Beam V1 performance A/B only
+    needs: [resolve-ab-freshness, pangu-online]
+    if: >-
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.base.ref == 'decode_graph' &&
+      ((github.event.action == 'labeled' &&
+        github.event.label.name == 'abtest') ||
+       (contains(github.event.pull_request.labels.*.name, 'ready') &&
+        ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+         github.event.label.name == 'ready') &&
+        needs.resolve-ab-freshness.outputs.fresh != 'true'))
+    runs-on: self-hosted
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v1
+
+      - name: Require a CUDA runner
+        run: nvidia-smi --query-gpu=name --format=csv,noheader
+
+      - name: Restore virtual environment
+        uses: corca-ai/local-cache@v2
+        id: cache-venv
+        with:
+          path: .venv
+          base: /data/actions/cache
+          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+
+      - name: Create virtual environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: uv venv --seed .venv
+
+      - name: Set up virtual environment
+        run: |
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
+          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
+
+      - name: Install base environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: uv pip install vllm==0.22.1
+
+      - name: Refresh editable installation
+        run: |
+          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+          uv pip install -e ".[dev]"
+
+      - name: Verify CUDA device mapping before cleanup
+        id: cuda-mapping
+        run: |
+          python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
+          echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+
+      - name: Kill stale process on device
+        run: bash ./scripts/kill_vllm_on_device.sh
+
+      - name: Cache OpenOneRec dataset
+        uses: corca-ai/local-cache@v2
+        id: cache-dataset
+        with:
+          path: OpenOneRec
+          base: /data/actions/cache
+          key: dataset-openonerec-${{ runner.os }}
+
+      - name: Download OpenOneRec dataset
+        if: steps.cache-dataset.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [[ -z "$HF_TOKEN" ]]; then
+            echo "HF_TOKEN is required for the gated OpenOneRec dataset." >&2
+            exit 1
+          fi
+          uv tool install hf
+          mkdir -p OpenOneRec
+          hf download OpenOneRec/OpenOneRec-RecIF \
+            --token "$HF_TOKEN" \
+            --local-dir ./OpenOneRec \
+            --repo-type=dataset
+
+      - name: Build catalog
+        run: |
+          mkdir -p generated_data
+          python ./benchmarks/open_one_rec/tools/create_task_catalog.py \
+            -t video \
+            -d ./OpenOneRec/benchmark_data \
+            -o generated_data/video_catalog.json
+          python ./tools/build_constraint_triples.py \
+            --catalog generated_data/video_catalog.json \
+            --output generated_data/video_constraint_triples.json \
+            --begin "<|sid_begin|>" \
+            --end "<|sid_end|>"
+
+      - name: Run Beam V1 performance A/B
+        env:
+          TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
+          V1_PERF_OUTPUT_DIR: ${{ github.workspace }}/v1_performance_results
+          V1_PERF_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          V1_PERF_CANDIDATE_SHA: ${{ github.sha }}
+          V1_PERF_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          V1_PERF_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash ./tests/system/run_beam_v1_performance_ab.sh
+
+      - name: Upload Beam V1 performance measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beam-v1-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: v1_performance_results
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Beam V1 A/B report for PR comment
+        if: always() && hashFiles('v1_performance_results/report.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: beam-v1-performance-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            v1_performance_results/context.json
+            v1_performance_results/report.json
+            v1_performance_results/report.md
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check clear device
+        if: always() && steps.cuda-mapping.outcome == 'success'
+        run: bash ./scripts/check_vllm_on_device.sh
+
   pangu-offline:
     name: Pangu offline accuracy
     needs: [benchmark-policy, pre-commit, decode-benchmark]
@@ -505,6 +716,10 @@ jobs:
       needs.benchmark-policy.result == 'success' &&
       needs.pre-commit.result == 'success' }}
     runs-on: self-hosted
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      queue: max
+      cancel-in-progress: false
     env:
       BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
       PANGU1B_OFFLINE_ACCURACY_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_OFFLINE_ACCURACY_THRESHOLD }}
@@ -582,6 +797,10 @@ jobs:
       needs.benchmark-policy.result == 'success' &&
       needs.pre-commit.result == 'success' }}
     runs-on: self-hosted
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
+      queue: max
+      cancel-in-progress: false
     env:
       BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
       PANGU1B_ONLINE_ACCURACY_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_ONLINE_ACCURACY_THRESHOLD }}
@@ -657,28 +876,84 @@ jobs:
       ${{ github.event_name == 'pull_request' &&
           (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
           github.event.label.name != 'ready' &&
-          'Ignored label event' || 'Benchmark blocking gate' }}
+          (github.event.label.name != 'abtest' ||
+           github.event.action == 'unlabeled') &&
+          'Ignored label event' ||
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.base.ref == 'decode_graph' &&
+          contains(github.event.pull_request.labels.*.name, 'abtest') &&
+          !(github.event.action == 'unlabeled' &&
+            github.event.label.name == 'ready') &&
+          (!contains(github.event.pull_request.labels.*.name, 'ready') ||
+           (github.event.action == 'labeled' &&
+            github.event.label.name == 'abtest')) &&
+          'Beam V1 performance A/B gate' ||
+          'Benchmark blocking gate' }}
     needs:
+      - resolve-ab-freshness
       - benchmark-policy
       - pre-commit
       - decode-benchmark
+      - beam-performance-ab-only
       - pangu-offline
       - pangu-online
     if: >-
       always() &&
       (github.event_name != 'pull_request' ||
        (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-       github.event.label.name == 'ready')
+       github.event.label.name == 'ready' ||
+       (github.event.label.name == 'abtest' &&
+        github.event.action == 'labeled'))
     runs-on: ubuntu-latest
     steps:
       - name: Require every blocking check to pass
         env:
+          ABTEST_ONLY: >-
+            ${{ github.event_name == 'pull_request' &&
+                github.event.pull_request.base.ref == 'decode_graph' &&
+                contains(github.event.pull_request.labels.*.name, 'abtest') &&
+                !(github.event.action == 'unlabeled' &&
+                  github.event.label.name == 'ready') &&
+                (!contains(github.event.pull_request.labels.*.name, 'ready') ||
+                 (github.event.action == 'labeled' &&
+                  github.event.label.name == 'abtest')) }}
+          ABTEST_RESULT: ${{ needs.beam-performance-ab-only.result }}
+          ABTEST_FRESH: ${{ needs.resolve-ab-freshness.outputs.fresh }}
+          ABTEST_PASSED: ${{ needs.resolve-ab-freshness.outputs.passed }}
+          ABTEST_REQUIRED: >-
+            ${{ github.event_name == 'pull_request' &&
+                github.event.pull_request.base.ref == 'decode_graph' &&
+                contains(github.event.pull_request.labels.*.name, 'ready') &&
+                !(github.event.action == 'labeled' &&
+                  github.event.label.name == 'abtest') }}
           POLICY_RESULT: ${{ needs.benchmark-policy.result }}
           PRE_COMMIT_RESULT: ${{ needs.pre-commit.result }}
           DECODE_RESULT: ${{ needs.decode-benchmark.result }}
           PANGU_OFFLINE_RESULT: ${{ needs.pangu-offline.result }}
           PANGU_ONLINE_RESULT: ${{ needs.pangu-online.result }}
         run: |
+          if [[ "$ABTEST_ONLY" == true ]]; then
+            echo "ABTEST_RESULT=$ABTEST_RESULT"
+            if [[ "$ABTEST_RESULT" != success ]]; then
+              if [[ "$ABTEST_RESULT" == skipped ]]; then
+                echo "::error::A/B has not run for this revision. Remove and re-add the abtest label to start it."
+              else
+                echo "::error::Beam V1 performance A/B did not pass."
+              fi
+              exit 1
+            fi
+            exit 0
+          fi
+          if [[ "$ABTEST_REQUIRED" == true ]]; then
+            if [[ "$ABTEST_FRESH" == true && "$ABTEST_PASSED" != true ]]; then
+              echo "::error::The current revision's A/B report failed. Re-add abtest to rerun it."
+              exit 1
+            fi
+            if [[ "$ABTEST_FRESH" != true && "$ABTEST_RESULT" != success ]]; then
+              echo "::error::Beam V1 performance A/B is stale or did not pass for this revision."
+              exit 1
+            fi
+          fi
           failed=0
           for result_name in \
             POLICY_RESULT \
