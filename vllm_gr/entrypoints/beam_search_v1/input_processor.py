@@ -220,7 +220,8 @@ def _create_batch_request(
         include_stop_token=bool(getattr(params, "include_stop_str_in_output", False)),
         include_cumulative_logprob=True,
         # Public offline/online outputs expose sequences and scores only.
-        # Beam execution still retains its complete parent/KV history.
+        # Optional output parent lineage is separate from the required
+        # Beam decision and KV state, which execution still retains.
         include_parent_beam_indices=False,
     )
     request = BeamBatchRequest(
