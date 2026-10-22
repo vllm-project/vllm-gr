@@ -46,6 +46,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--generated-steps", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--beam-width", type=int, default=128)
+    parser.add_argument(
+        "--dynamic-beam-widths",
+        help="NPU per-stage retained widths, e.g. 128,64,32 (beam-width remains capacity)",
+    )
+    parser.add_argument(
+        "--result-width",
+        type=int,
+        help="NPU final sequence count; defaults to the last stage width",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--max-model-len", type=int, default=8192)
@@ -78,6 +87,28 @@ def parse_args() -> argparse.Namespace:
         help="Complete batches to profile; print only the last result (requires --profile-dir)",
     )
     args = parser.parse_args()
+    if args.dynamic_beam_widths is not None:
+        try:
+            widths = [int(value.strip()) for value in args.dynamic_beam_widths.split(",")]
+        except ValueError:
+            parser.error("--dynamic-beam-widths must contain comma-separated integers")
+        if len(widths) != args.generated_steps or any(
+            not 1 <= width <= args.beam_width for width in widths
+        ):
+            parser.error(
+                "--dynamic-beam-widths needs one width per generated step, each in [1, beam-width]"
+            )
+        args.dynamic_beam_widths = widths
+    if args.dynamic_beam_widths is not None or args.result_width is not None:
+        if args.constraint_backend != "npu":
+            parser.error("dynamic-beam-widths and result-width currently require the NPU backend")
+        final_width = (
+            args.dynamic_beam_widths[-1]
+            if args.dynamic_beam_widths is not None
+            else args.beam_width
+        )
+        if args.result_width is not None and not 1 <= args.result_width <= final_width:
+            parser.error("--result-width must be in [1, last-stage-width]")
     if args.profile_warmup_runs < 0 or args.profile_runs <= 0:
         parser.error("--profile-warmup-runs must be nonnegative and --profile-runs positive")
     if args.warmup_runs < 0 or (args.repeat is not None and args.repeat <= 0):
@@ -183,6 +214,10 @@ def benchmark_beam_search(
             for index, (latency, beams) in enumerate(zip(latencies_ms, returned_beams, strict=True))
         ],
     }
+    if getattr(args, "dynamic_beam_widths", None) is not None:
+        report["dynamic_beam_widths"] = list(args.dynamic_beam_widths)
+    if getattr(args, "result_width", None) is not None:
+        report["result_width"] = args.result_width
     return outputs, report
 
 
@@ -275,17 +310,18 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         args.catalog.resolve(),
         artifact_path,
     )
+    beam_config: dict[str, object] = {
+        "execution_mode": "v1",
+        "graph_enabled": not is_npu or args.execution == "graph",
+        "graph_batch_size": args.batch_size,
+        "worker_decision": True,
+        "max_width": args.beam_width,
+        "max_decode_steps": args.generated_steps,
+    }
     vllm_gr_config = {
         "schema_version": 1,
         "attention_backend": "CUSTOM",
-        "beam": {
-            "execution_mode": "v1",
-            "graph_enabled": not is_npu or args.execution == "graph",
-            "graph_batch_size": args.batch_size,
-            "worker_decision": True,
-            "max_width": args.beam_width,
-            "max_decode_steps": args.generated_steps,
-        },
+        "beam": beam_config,
         "constraint_table": {
             "enabled": True,
             "backend": args.constraint_backend,
@@ -296,8 +332,14 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
             "tokenizer_digest": tokenizer_digest,
         },
     }
+    dynamic_widths = getattr(args, "dynamic_beam_widths", None)
+    result_width = getattr(args, "result_width", None)
+    if dynamic_widths is not None and len(dynamic_widths) > 1:
+        beam_config["graph_widths"] = sorted(set(dynamic_widths[:-1]))
     params = BeamSearchParams(
         beam_width=args.beam_width,
+        dynamic_beam_widths=dynamic_widths,
+        result_width=result_width,
         # Public max_tokens includes the begin and end boundary positions.
         max_tokens=args.generated_steps + 2,
         temperature=0.0,
@@ -350,11 +392,12 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
                     sort_keys=True,
                 )
             )
-            expected_shape = (args.batch_size, args.beam_width)
+            decode_widths = dynamic_widths[:-1] if dynamic_widths is not None else [args.beam_width]
+            expected_shapes = {(args.batch_size, width) for width in decode_widths}
             captured_shapes = {tuple(shape) for shape in stats.get("captured_shapes", ())}
             # N=1 finishes in Prefill and must not require a Decode graph.
             if args.generated_steps > 1 and (
-                expected_shape not in captured_shapes or not stats["full_dispatches"]
+                not expected_shapes.issubset(captured_shapes) or not stats["full_dispatches"]
             ):
                 raise RuntimeError("NPU Beam graph capture/replay was not observed")
             if benchmark is not None:

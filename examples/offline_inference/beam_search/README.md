@@ -538,3 +538,186 @@ Do not combine this with `msprof` collection. Graph statistics include warmup an
 profile runs; their cumulative dispatch count need not be 2. Confirm the trace
 contains Worker model operations and actual graph replay, not just frontend
 events. Use separate unprofiled repeated runs for latency/throughput measurements.
+
+### NPU per-stage Beam widths from the CLI
+
+The CLI exposes the Python request options above as `--dynamic-beam-widths`
+and `--result-width`. They require `--constraint-backend npu`; CUDA examples
+keep their fixed-width behavior. There must be exactly `--generated-steps`
+comma-separated widths, each between 1 and `--beam-width`. `--beam-width` remains
+the engine capacity, not the first-stage width.
+
+`--result-width R` returns at most R valid Beams per request, independently of
+`--print-beams`, which only limits how many returned Beams are printed. For
+example, R=32 with `--print-beams 5` still returns up to 32 Beams per request and
+prints at most five. If R is omitted it defaults to the last stage width, or to
+the capacity when no schedule is supplied. Giving R alone retains fixed search
+widths. An empty legal continuation can leave fewer valid results than R.
+
+For a schedule with Decode stages, the example configures
+`beam.graph_widths = sorted(set(schedule[:-1]))` before starting the engine.
+These are previous-stage winner counts, hence Decode input widths; the engine
+also captures the capacity width. For `128,64,32`, the required Decode inputs
+are 128 and 64. The final 32 is a selection width, not another model-forward
+stage. With `--execution graph`, the example checks that all required `(B, W)`
+shapes were captured and that Decode replay occurred. For a single generated
+step, selection completes in Prefill and no Decode replay is required.
+
+#### Prepare paths and the NPU device
+
+Run the following blocks from the repository root in the same Bash shell.
+Replace `MODEL` with the installed model directory and choose the visible NPU
+card for the run. The catalog and prompt below are tracked repository resources;
+the catalog tokens must match the selected model's tokenizer.
+
+```bash
+set -o pipefail
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export ASCEND_RT_VISIBLE_DEVICES=0
+export VLLM_ENABLE_PREFILL_CUDAGRAPH=0
+MODEL=/absolute/path/to/Qwen3-0.6B-OneRecVocab
+CATALOG=tools/AB_Tests/constraints/video_constraint_triples.json
+PROMPT=tests/resources/single_one_rec_prompt.txt
+DYNAMIC_RUN="$PWD/test-results/npu_dynamic_beam_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$DYNAMIC_RUN/logs" "$DYNAMIC_RUN/json" "$DYNAMIC_RUN/profile"
+```
+
+The directory creation must precede `tee`: the shell opens its log before Python
+runs. These commands disable independent Prefill graphs to isolate Decode;
+Beam Decode graphs remain enabled by `--execution graph`. Keep the Prefill
+setting and all other conditions unchanged when comparing schedules. Enabling
+Prefill graphs retains the precision boundary described earlier.
+
+#### Benchmark B=1 and B=4
+
+These commands time 20 complete batches after three untimed warmups. They use
+N=3 with the script's existing begin/end boundaries (`max_tokens=5`), capacity
+128, the `128,64,32` schedule and R=32. `--input-len 128` includes the BEGIN token
+appended by the API. All batch rows use the same prepared prompt with independent
+cache salts; each timed call includes Prefill.
+
+B=1:
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --catalog "$CATALOG" --prompt "$PROMPT" \
+  --constraint-backend npu --execution graph \
+  --batch-size 1 --beam-width 128 --input-len 128 --generated-steps 3 \
+  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 \
+  --warmup-runs 3 --repeat 20 \
+  --output-json "$DYNAMIC_RUN/json/b1_narrow.json" \
+  2>&1 | tee "$DYNAMIC_RUN/logs/b1_narrow.log"
+```
+
+B=4:
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --catalog "$CATALOG" --prompt "$PROMPT" \
+  --constraint-backend npu --execution graph \
+  --batch-size 4 --beam-width 128 --input-len 128 --generated-steps 3 \
+  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 \
+  --warmup-runs 3 --repeat 20 \
+  --output-json "$DYNAMIC_RUN/json/b4_narrow.json" \
+  2>&1 | tee "$DYNAMIC_RUN/logs/b4_narrow.log"
+```
+
+Each invocation starts a separate engine. The B=1 Decode inputs contain 128 then
+64 rows; B=4 contains 512 then 256. For a comparison at the same return limit,
+change only the schedule to `128,128,128`, keep R=32, and use different output
+filenames. This compares two search schedules, not equal search coverage. Narrow
+widths can alter the returned set and low-precision scores; evaluate the quality
+tradeoff separately. Re-run with `--execution eager` when comparing Decode graph
+and eager execution under otherwise identical conditions.
+
+#### Profile B=1 and B=4 separately
+
+Use separate invocations for profiling and latency measurement. `--repeat`
+cannot be combined with `--profile-dir`; `--output-json` is a benchmark option
+and requires `--repeat`. The following collect five complete batches after one
+unprofiled warmup, and print only the last batch's results.
+
+B=1:
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --catalog "$CATALOG" --prompt "$PROMPT" \
+  --constraint-backend npu --execution graph \
+  --batch-size 1 --beam-width 128 --input-len 128 --generated-steps 3 \
+  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 \
+  --profile-dir "$DYNAMIC_RUN/profile/b1_narrow" \
+  --profile-warmup-runs 1 --profile-runs 5 \
+  2>&1 | tee "$DYNAMIC_RUN/logs/b1_narrow_profile.log"
+```
+
+B=4:
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --catalog "$CATALOG" --prompt "$PROMPT" \
+  --constraint-backend npu --execution graph \
+  --batch-size 4 --beam-width 128 --input-len 128 --generated-steps 3 \
+  --dynamic-beam-widths 128,64,32 --result-width 32 --print-beams 5 \
+  --profile-dir "$DYNAMIC_RUN/profile/b4_narrow" \
+  --profile-warmup-runs 1 --profile-runs 5 \
+  2>&1 | tee "$DYNAMIC_RUN/logs/b4_narrow_profile.log"
+```
+
+Worker trace files and their rank/run subdirectories are under the supplied
+profile directory. Startup and output printing are outside collection. Do not
+interpret profiled timings as benchmark latency or combine this with `msprof`.
+Graph counters include both warmup and collected batches.
+
+#### Optional increasing schedule at capacity 256, B=1
+
+This example uses eager execution within the B=1 capacity-256 validation scope;
+it does not claim B=4 capacity-256 hardware coverage. Reuse the same path/device
+setup:
+
+```bash
+python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  --model "$MODEL" --catalog "$CATALOG" --prompt "$PROMPT" \
+  --constraint-backend npu --execution eager \
+  --batch-size 1 --beam-width 256 --input-len 128 --generated-steps 3 \
+  --dynamic-beam-widths 32,64,256 --result-width 32 --print-beams 5 \
+  --warmup-runs 3 --repeat 20 \
+  --output-json "$DYNAMIC_RUN/json/b1_capacity256_wide.json" \
+  2>&1 | tee "$DYNAMIC_RUN/logs/b1_capacity256_wide.log"
+```
+
+Its Decode input widths are 32 and 64; this eager example does not request Beam
+graph capture. The final stage may retain up to 256 candidates, while the API
+returns at most 32 per request. Expanding a later width cannot recover SA/SB prefixes pruned by
+an earlier stage. A wider final stage is not a guarantee of baseline search
+quality or of R legal final paths.
+
+#### Benchmark JSON and returned-result metadata
+
+The `beam_benchmark` JSON log and `--output-json` file use the same benchmark
+payload. The new fields are emitted only when explicitly supplied:
+
+| Field | Meaning |
+| --- | --- |
+| `beam_width` | Engine capacity |
+| `dynamic_beam_widths` | Parsed retained widths, e.g. `[128, 64, 32]`; absent for an omitted schedule |
+| `result_width` | Explicit R; absent when omitted, in which case derive the default from the final width |
+| `batch_size`, `input_len`, `generated_steps` | Input and generation conditions |
+| `repeat`, `warmup_runs` | Measured and untimed batch counts |
+| `batch_latency_ms` | Mean, P50, P95, min and max batch API latency |
+| `runs[].returned_beams` | Actual total valid Beams returned across the whole batch in that run |
+| `requests_per_second` | Timed request throughput |
+| `returned_beams_per_second` | Timed throughput based on actual returned counts, not assumed B times R |
+| `npu_beam_graph` | Graph-run counters, including captured shapes and fallbacks; present for NPU graph benchmarking |
+
+The benchmark JSON contains conditions and timing/count metadata; it is not a
+serialized list of result sequences. Standard output separately prints
+`request=... returned_beams=...` for each request in the last batch, followed by
+up to `--print-beams` JSON records containing `request`, `rank`,
+`cumulative_logprob`, `finish_reason`, `stop_reason`, `sid_token_ids`, and
+`sid_tokens`. Printing fewer ranks does not reduce the recorded actual return
+counts. The SID fields are the script's trailing generated/boundary token slice.
+
+Compare latency only with matching model/catalog/prompt, device, B, capacity,
+input length, return limit, Prefill setting and measurement setup. Keep search
+quality and the existing NPU legal-set score contract separate from performance
+claims.
