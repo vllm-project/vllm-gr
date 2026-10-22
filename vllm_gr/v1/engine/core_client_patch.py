@@ -20,7 +20,6 @@ from vllm_gr.v1.engine.core_client import (
     add_requests_async,
     beam_request_step_update_async,
     make_patched_background_resources_call,
-    make_patched_ensure_output_queue_task,
 )
 
 logger = init_logger(__name__)
@@ -92,12 +91,6 @@ def apply_engine_client_patches() -> None:
     AsyncMPClient.add_requests_async = add_requests_async
     AsyncMPClient.beam_request_step_update_async = beam_request_step_update_async
     AsyncMPClient.supports_beamproc_transport = True
-    if not getattr(AsyncMPClient, "_vllm_gr_beamproc_output_patched", False):
-        AsyncMPClient._ensure_output_queue_task = make_patched_ensure_output_queue_task(
-            AsyncMPClient._ensure_output_queue_task
-        )
-        AsyncMPClient._vllm_gr_beamproc_output_patched = True
-
     if not getattr(BackgroundResources, "_vllm_gr_beamproc_cleanup_patched", False):
         BackgroundResources.__call__ = make_patched_background_resources_call(
             BackgroundResources.__call__

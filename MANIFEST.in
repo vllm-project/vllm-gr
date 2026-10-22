@@ -1,3 +1,5 @@
 include rust/Cargo.lock
 include rust/Cargo.toml
 recursive-include rust/beam-proc/src *.rs
+recursive-include rust/ce-transport/src *.rs
+recursive-include rust/examples *.rs

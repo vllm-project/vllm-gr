@@ -2,6 +2,9 @@
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+# Always exercise the checkout that owns this script.  A console-script entry
+# point otherwise resolves an older editable install before the current tree.
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # shellcheck source=tools/ci/benchmark_gate_helpers.sh
 source "$SCRIPT_DIR/../../tools/ci/benchmark_gate_helpers.sh"
 
@@ -240,6 +243,7 @@ start_server() {
             --num-prompts "$warmup_prompts" \
             --use-beam-search \
             --port "$run_port" \
+            --max-concurrency 1 \
             --request-rate 1 \
             --n 128)
         echo "Warmup complete."
@@ -272,6 +276,7 @@ run_latency_benchmark() {
       --dataset-path "$DATASET_PATH" \
       --task-type video \
       --num-prompts 10 \
+      --max-concurrency 1 \
       --use-beam-search \
       --port "$run_port" \
       --request-rate 0.5 \
@@ -319,6 +324,7 @@ run_online_accuracy_benchmark() {
       --dataset-path "$DATASET_PATH" \
       --dataset-name onerec \
       --num-prompts 100 \
+      --max-concurrency 16 \
       --use-beam-search \
       --backend openai-chat \
       --task-type video \
@@ -492,6 +498,7 @@ stop_server
 # Rust BeamProc latency and accuracy gates.
 if [[ "$device" == "gpu" || "$device" == "npu" ]]; then
     rust_binary="$REPO_ROOT/rust/target/release/beam-proc"
+    rust_library="$REPO_ROOT/rust/target/release/libce_transport.so"
 
     echo "Building Rust BeamProc release binary for the latency and accuracy gates..."
     rustc --version
@@ -501,7 +508,9 @@ if [[ "$device" == "gpu" || "$device" == "npu" ]]; then
       --locked \
       --manifest-path "$REPO_ROOT/rust/Cargo.toml" \
       --target-dir "$REPO_ROOT/rust/target" \
-      --bin beam-proc; then
+      --bin beam-proc \
+      --lib \
+      --features iceoryx; then
         echo "Rust BeamProc release build failed." >&2
         exit 1
     fi
@@ -509,15 +518,23 @@ if [[ "$device" == "gpu" || "$device" == "npu" ]]; then
         echo "Rust BeamProc build did not produce an executable at $rust_binary." >&2
         exit 1
     fi
+    if [[ ! -f "$rust_library" ]]; then
+        echo "Rust CE transport build did not produce a library at $rust_library." >&2
+        exit 1
+    fi
 
     beamproc_log_dir="${RUNNER_TEMP:-/tmp}"
     beamproc_log_file=$(mktemp "$beamproc_log_dir/vllm-gr-beam-proc.XXXXXX.log")
     echo "Rust BeamProc binary: $rust_binary"
+    echo "Rust CE shared-memory library: $rust_library"
     echo "Rust BeamProc log file: $beamproc_log_file (streaming to CI stderr)"
 
     export VLLM_GR_BEAM_PROC_ENABLED=1
     export VLLM_GR_BEAM_PROC_NUM_WORKERS=4
     export VLLM_GR_BEAM_PROC_BINARY="$rust_binary"
+    export VLLM_GR_CE_BP_TRANSPORT=sharedmem
+    # Test the freshly built library even if an older wheel is installed.
+    export VLLM_GR_CE_TRANSPORT_LIBRARY="$rust_library"
     export VLLM_GR_BEAM_PROC_LOG_LEVEL=warn
     export VLLM_GR_BEAM_PROC_LOG_FILE="$beamproc_log_file"
     export VLLM_GR_BEAM_PROC_FINAL_TIMEOUT_S=60
@@ -536,19 +553,21 @@ if [[ "$device" == "gpu" || "$device" == "npu" ]]; then
         rust_device_args+=(--gpu-memory-utilization 0.8)
     fi
 
-    start_server "Rust BeamProc" 5 \
+    start_server "Rust BeamProc sharedmem" 5 \
         "${rust_device_args[@]}" \
         --max_num_seqs 128 \
         --max_num_batched_tokens 16384 \
         --catalog-path "$CATALOG_PATH"
 
-    run_latency_benchmark "Rust" "$rust_p99_ttft_th" || exit $?
-    run_online_accuracy_benchmark "Rust" || exit $?
+    run_latency_benchmark "Rust sharedmem" "$rust_p99_ttft_th" || exit $?
+    run_online_accuracy_benchmark "Rust sharedmem" || exit $?
     stop_server
 
     unset VLLM_GR_BEAM_PROC_ENABLED
     unset VLLM_GR_BEAM_PROC_NUM_WORKERS
     unset VLLM_GR_BEAM_PROC_BINARY
+    unset VLLM_GR_CE_BP_TRANSPORT
+    unset VLLM_GR_CE_TRANSPORT_LIBRARY
     unset VLLM_GR_BEAM_PROC_LOG_LEVEL
     unset VLLM_GR_BEAM_PROC_LOG_FILE
     unset VLLM_GR_BEAM_PROC_FINAL_TIMEOUT_S

@@ -95,7 +95,12 @@ def make_patched_engine_core_proc_run_busy_loop(original_run_busy_loop):
     @wraps(original_run_busy_loop)
     def patched_run_busy_loop(self, *args, **kwargs):
         _ensure_beamproc_io_started(self)
-        return original_run_busy_loop(self, *args, **kwargs)
+        try:
+            return original_run_busy_loop(self, *args, **kwargs)
+        finally:
+            from vllm_gr.v1.engine.core import _stop_beamproc_native_io
+
+            _stop_beamproc_native_io(self)
 
     setattr(patched_run_busy_loop, _BEAMPROC_BUSY_LOOP_MARKER, True)
     return patched_run_busy_loop
@@ -125,8 +130,8 @@ def apply_engine_core_request_patches() -> None:
         process_output_sockets,
     )
 
-    logger.warning(
-        "[vllm-gr CE diagnostic] pid=%s patch_file=%s "
+    logger.debug(
+        "EngineCore BeamProc configuration pid=%s patch_file=%s "
         "upstream_core_file=%s enabled=%r binary=%r tx=%r rx=%r",
         os.getpid(),
         __file__,

@@ -346,19 +346,6 @@ def ensure_beamproc_output_task(self, output_addr: str | None = None) -> None:
     )
 
 
-def make_patched_ensure_output_queue_task(original_ensure_output_queue_task):
-    def patched_ensure_output_queue_task(self):
-        original_ensure_output_queue_task(self)
-        logger.debug(
-            "Ensuring BeamProc APIServer output task from AsyncMPClient output "
-            "queue lifecycle client=%s",
-            type(self).__name__,
-        )
-        ensure_beamproc_output_task(self)
-
-    return patched_ensure_output_queue_task
-
-
 def make_patched_background_resources_call(original_call):
     def patched_call(self):
         beamproc_task = getattr(self, "beamproc_output_task", None)

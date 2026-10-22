@@ -331,8 +331,9 @@ class TestBeamDecodeSamplingParams:
 
 
 class TestTypesSerialization:
-    def test_decodes_v3_final_logprob_steps(self):
-        payload = {
+    @pytest.mark.parametrize("with_timing", [False, True])
+    def test_decodes_v3_final_logprob_steps(self, with_timing):
+        payload: dict[str, Any] = {
             "version": 3,
             "final_beams": 2,
             "final_token_ids_len": 3,
@@ -343,6 +344,14 @@ class TestTypesSerialization:
             "final_logprob_step_offsets_len": 4,
             "final_logprob_beam_offsets_len": 3,
         }
+
+        if with_timing:
+            payload["num_processed_tokens"] = 32768
+            payload["beam_timing"] = {
+                "clock": "CLOCK_MONOTONIC",
+                "prefill_end": 123.5,
+                "prefill_only": False,
+            }
 
         def frame(value: bytes) -> SimpleNamespace:
             return SimpleNamespace(buffer=memoryview(value))
@@ -361,6 +370,8 @@ class TestTypesSerialization:
 
         decoded = _decode_beamproc_final_frames(frames)
 
+        assert decoded.get("beam_timing") == payload.get("beam_timing")
+        assert decoded.get("num_processed_tokens") == payload.get("num_processed_tokens")
         assert decoded["final_token_ids"] == [[10, 11], [20]]
         assert decoded["final_logprob_token_ids"].tolist() == [1, 2, 3, 4, 5, 6]
         assert decoded["final_logprob_values"].tolist() == pytest.approx(
