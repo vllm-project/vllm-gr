@@ -242,6 +242,14 @@ aligned with it.
     - speculative decoding and token-compression state.
 - Removal condition: vLLM-Ascend exposes stable grouped input and output adaptation hooks.
 
+- Optional BSND Prefill: `_model_forward` selects fixed `(T,B)` captures only for
+  complete prompts without history when `VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS`
+  is configured. Other requests retain TND/native fallback. Graph metadata owns
+  scratch buffers; device capture errors propagate when this mode is enabled.
+- Validation: `tests/test_npu_prefill_bsnd.py` and the explicitly scoped BSND
+  constructor cases in `tests/test_prefill_graph_runner.py`.
+- Configuration and limitations: [NPU BSND Prefill](npu_prefill_bsnd.md).
+
 ### GR-PATCH-013 — CUSTOM Attention Backend Registration
 
 - Mechanism: `register_backend(AttentionBackendEnum.CUSTOM)`

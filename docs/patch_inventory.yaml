@@ -159,10 +159,12 @@ patches:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_npu_model_runner_patch.py
       - tests/test_model_runner_patch.py
+      - tests/test_npu_prefill_bsnd.py
+      - tests/test_prefill_graph_runner.py
     process_roles: [npu_worker]
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
     risk: critical
-    contract: null
+    contract: docs/npu_prefill_bsnd.md
     removal_condition: vLLM-Ascend exposes stable grouped input and output hooks
 
   - id: GR-PATCH-013

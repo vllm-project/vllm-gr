@@ -3,6 +3,7 @@
 """Beam-Consecutive Suffix Gather Attention Backend."""
 
 from types import ModuleType
+from typing import ClassVar
 
 import torch
 from vllm import envs
@@ -508,6 +509,40 @@ class BeamAttentionImpl(AttentionImpl):
         """Streamlined fast-path for pure prefill execution in Full Graph mode."""
         platform_execution = _get_platform_execution_module()
 
+        # Port only BSND routing; preserve latest decode and TND implementations.
+        # Validate the captured layout before submitting even the cache write.
+        # A BSND dummy has no block table and cannot fall through to paged TND.
+        use_bsnd = NPU_DEVICE and getattr(attn_metadata, "prefill_fia_layout", "TND") == "BSND"
+        if use_bsnd:
+            batch_size = attn_metadata.num_reqs
+            lengths = attn_metadata.seq_lens_cpu
+            tokens = query.shape[0]
+            if (
+                batch_size <= 0
+                or tokens <= 0
+                or tokens % batch_size
+                or lengths is None
+                or len(lengths) != batch_size
+                or any(length != tokens // batch_size for length in lengths)
+            ):
+                raise ValueError(
+                    "BSND prefill requires fixed [P]*B metadata; cannot fall back to TND"
+                )
+            if key is None or value is None or self.kv_sharing_target_layer_name is not None:
+                raise ValueError("BSND prefill requires this layer's key/value without KV sharing")
+            if key.shape[0] != tokens or value.shape[0] != tokens:
+                raise ValueError("BSND prefill Q/K/V token counts must match")
+            if not attn_metadata.causal or attn_metadata.npu_causal_atten_mask is None:
+                raise ValueError("BSND padded prefill requires the static causal mask")
+            if (
+                self.sliding_window not in (None, (-1, -1))
+                or self.logits_soft_cap
+                or self.sinks is not None
+                or self.alibi_slopes is not None
+                or self.kv_cache_dtype.startswith("fp8")
+            ):
+                raise ValueError("BSND prefill does not support this attention configuration")
+
         if isinstance(kv_cache, tuple):
             key_cache, value_cache = kv_cache[0], kv_cache[1]
         else:
@@ -531,6 +566,20 @@ class BeamAttentionImpl(AttentionImpl):
             dtype = BeamAttentionBackend.get_fp8_dtype_for_flashattn(self.kv_cache_dtype)
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
+
+        # Both warmup and capture use current-layer K/V; replay runs this graph.
+        if use_bsnd:
+            from vllm_gr.v1.attention.backends import beam_attn_npu
+
+            beam_attn_npu.prefill_attention_bsnd(
+                output=output,
+                query=query,
+                key=key,
+                value=value,
+                attn_metadata=attn_metadata,
+                scale=self.scale,
+            )
+            return output
 
         sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
 
@@ -585,7 +634,7 @@ class BeamAttentionImpl(AttentionImpl):
 @register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
     accept_output_buffer = True
-    supported_dtypes = [torch.float16, torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
