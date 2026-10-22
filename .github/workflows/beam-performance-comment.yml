@@ -1,0 +1,115 @@
+name: Beam V1 performance PR comment
+
+# GitHub requires workflow_run listeners to live on the repository default branch.
+# This workflow never checks out or executes the benchmarked PR's code.
+on:
+  workflow_run:
+    workflows: [Pre-commit and Benchmark]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  find_report:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      found: ${{ steps.artifact.outputs.found }}
+    steps:
+      - name: Find performance report from this run
+        id: artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const name = `beam-v1-performance-report-${run.id}-${run.run_attempt}`;
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              { ...context.repo, run_id: run.id, per_page: 100 }
+            );
+            core.setOutput('found', artifacts.some(a => a.name === name && !a.expired));
+
+  comment:
+    needs: find_report
+    if: needs.find_report.outputs.found == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: beam-v1-performance-comment-${{ github.event.workflow_run.head_repository.id }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    steps:
+      - name: Download performance report
+        uses: actions/download-artifact@v4
+        with:
+          name: beam-v1-performance-report-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/beam-performance-report
+
+      - name: Update PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const root = path.join(process.env.RUNNER_TEMP, 'beam-performance-report');
+            const read = name => fs.readFileSync(path.join(root, name), 'utf8');
+            const meta = JSON.parse(read('context.json'));
+            const result = JSON.parse(read('report.json'));
+            const report = read('report.md');
+            const run = context.payload.workflow_run;
+            if (!Number.isSafeInteger(meta.pr_number) || meta.pr_number <= 0 ||
+                !/^[a-f0-9]{40}$/i.test(meta.base_sha) ||
+                !/^[a-f0-9]{40}$/i.test(meta.head_sha) ||
+                !/^[a-f0-9]{40}$/i.test(meta.merge_sha) ||
+                report.length > 60000 || !result.complete ||
+                result.base_sha !== meta.base_sha ||
+                result.pr_sha !== meta.merge_sha ||
+                ![meta.head_sha, meta.merge_sha].includes(run.head_sha)) {
+              throw new Error('Invalid or mismatched performance artifact');
+            }
+            if ((run.pull_requests || []).length &&
+                !run.pull_requests.some(pr => pr.number === meta.pr_number)) {
+              throw new Error('Artifact PR is not associated with workflow run');
+            }
+            const { data: pull } = await github.rest.pulls.get({
+              ...context.repo, pull_number: meta.pr_number
+            });
+            if (pull.state !== 'open' || pull.base.ref !== 'decode_graph' ||
+                pull.base.sha !== meta.base_sha || pull.head.sha !== meta.head_sha ||
+                !pull.head.repo || !run.head_repository ||
+                pull.head.repo.id !== run.head_repository.id ||
+                pull.merge_commit_sha !== meta.merge_sha) {
+              core.info('PR changed after the benchmark; skip stale report');
+              return;
+            }
+            const marker = '<!-- beam-v1-performance-ab -->';
+            const runMarker = `<!-- beam-v1-performance-run:${run.id}:${run.run_attempt} -->`;
+            const body = `${marker}\n${runMarker}\n${report}\n` +
+              `[Actions run](${run.html_url})`;
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { ...context.repo, issue_number: meta.pr_number, per_page: 100 }
+            );
+            const previous = comments.find(comment =>
+              comment.user.login === 'github-actions[bot]' &&
+              comment.body.startsWith(marker)
+            );
+            if (previous) {
+              const match = previous.body.match(/beam-v1-performance-run:(\d+):(\d+)/);
+              if (match && (Number(match[1]) > run.id ||
+                  (Number(match[1]) === run.id && Number(match[2]) >= run.run_attempt))) {
+                core.info('A newer report is already posted');
+                return;
+              }
+              await github.rest.issues.updateComment({
+                ...context.repo, comment_id: previous.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: meta.pr_number, body
+              });
+            }
