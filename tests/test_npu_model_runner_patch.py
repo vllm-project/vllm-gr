@@ -1942,6 +1942,8 @@ def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, d
 
 
 def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
     from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
     from vllm_gr.v1.worker import model_runner_common as common
 
@@ -1966,7 +1968,10 @@ def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch
 
     captured_pointers = pointers()
     worker = SimpleNamespace(
-        _gr_npu_graph_context=graph_context, _gr_npu_beam_graph_shapes={(2, 4)}
+        _gr_npu_graph_context=graph_context,
+        _gr_npu_beam_graph_shapes={(2, 4)},
+        input_batch=object(),
+        _update_states=Mock(),
     )
     created: list[int] = []
 
@@ -1982,6 +1987,8 @@ def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch
         worker._current_scheduler_output = scheduled
         stage = object.__new__(NPUEagerBeamStageRunner)
         stage.worker, stage.attention_batch = worker, None
+        stage.closed, stage.pending_plan = False, None
+        stage.previous = NPUEagerStagePlan.from_scheduler_output(scheduled).execution
         stage.prefill_candidates = ConstraintOutput(
             token_ids=torch.arange(batch_size * 4, dtype=torch.int32).view(batch_size, 4),
             logprobs=torch.zeros(batch_size, 4),
@@ -2148,6 +2155,7 @@ def test_npu_retirement_clears_failed_dispatch_state() -> None:
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.attention_batch = None
     stage.closed = False
+    stage.pending_plan = stage.previous = None
     stage.logical_scheduler_output = object()
     stage.execution_error = ValueError("failed dispatch")
     stage._release()
@@ -2280,6 +2288,14 @@ def test_npu_terminal_result_keeps_batch_identity_and_output_options() -> None:
     assert (first.finish_reason, first.stop_token_id) == ("stop", 99)
 
 
+def _assert_terminal_native_cleanup(worker: Any, request_ids: tuple[str, ...]) -> None:
+    worker._update_states.assert_called_once()
+    cleanup = worker._update_states.call_args.args[0]
+    assert cleanup.finished_req_ids == set(request_ids)
+    assert not cleanup.num_scheduled_tokens
+    assert cleanup.total_num_scheduled_tokens == 0
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     "device", ["cpu", pytest.param("npu", marks=pytest.mark.npu_integration)]
 )
@@ -2291,6 +2307,8 @@ def test_npu_terminal_result_keeps_batch_identity_and_output_options() -> None:
 def test_npu_single_step_filters_candidates_before_return_limit(
     device: str, batch_size: int, result_width: int, case: str
 ) -> None:
+    from unittest.mock import Mock
+
     if device == "npu":
         pytest.importorskip("torch_npu")
         if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -2341,9 +2359,12 @@ def test_npu_single_step_filters_candidates_before_return_limit(
         constraint_backend=SimpleNamespace(
             info=SimpleNamespace(max_rows=batch_size), select=select
         ),
+        input_batch=SimpleNamespace(req_ids=list(plan.execution.request_ids)),
+        _update_states=Mock(),
     )
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker, stage.pending_plan, stage.execution_error = worker, plan, None
+    stage.closed = False
     stage.logits = torch.zeros((batch_size, 16), device=device)
     stage.attention_batch = None
     stage.session_request = SimpleNamespace(
@@ -2363,6 +2384,7 @@ def test_npu_single_step_filters_candidates_before_return_limit(
     result = receipt.terminal_result
     assert receipt.finished and receipt.resources_released
     assert stage.closed and stage.pending_plan is None
+    _assert_terminal_native_cleanup(worker, plan.execution.request_ids)
     if case == "all_invalid":
         assert result.output is None and result.failure.code == "no_valid_beams"
         assert result.failure.item_index == batch_size - 1
@@ -2721,6 +2743,8 @@ def test_npu_parent_history_follows_output_options_through_session(
         ),
         execute_model_state=None,
         kv_connector_output=None,
+        input_batch=SimpleNamespace(req_ids=[item.request.request_id for item in request.items]),
+        _update_states=Mock(),
     )
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker, stage.session_request = worker, request
@@ -2759,6 +2783,12 @@ def test_npu_parent_history_follows_output_options_through_session(
         output = stage.sample()
         terminal = output.gr_worker_results["batch-0"].terminal_result
         assert stage.closed is (index == steps - 1)
+        if index == steps - 1:
+            _assert_terminal_native_cleanup(
+                worker, tuple(item.request.request_id for item in request.items)
+            )
+        else:
+            worker._update_states.assert_not_called()
 
     assert terminal is not None and terminal.output is not None and terminal.failure is None
     expected_tokens = (
@@ -2921,6 +2951,7 @@ def test_npu_dynamic_parent_history_is_not_advanced_twice(
     dynamic_select = Mock(return_value=decision)
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.session_request, stage.pending_plan, stage.execution_error = request, plan, None
+    stage.closed = False
     stage.parent_history = None
     stage.dynamic_state = SimpleNamespace(
         select=dynamic_select,
@@ -2936,6 +2967,8 @@ def test_npu_dynamic_parent_history_is_not_advanced_twice(
             info=SimpleNamespace(max_rows=execution.num_execution_rows),
             select=Mock(return_value=candidates),
         ),
+        input_batch=SimpleNamespace(req_ids=list(execution.request_ids)),
+        _update_states=Mock(),
     )
     stage.logits = torch.zeros(execution.num_execution_rows, 128)
     native = Mock(side_effect=AssertionError("dynamic lineage must not use the native decision"))
@@ -2958,6 +2991,7 @@ def test_npu_dynamic_parent_history_is_not_advanced_twice(
 
     assert stage._uses_dynamic_state(plan)
     result = stage.sample().gr_worker_results["batch-0"].terminal_result
+    _assert_terminal_native_cleanup(stage.worker, execution.request_ids)
 
     dynamic_select.assert_called_once_with(
         candidates,

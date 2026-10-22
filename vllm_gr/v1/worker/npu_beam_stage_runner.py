@@ -723,7 +723,31 @@ class NPUEagerBeamStageRunner:
             None,
         )
 
-    def _release(self) -> None:
+    def _release(self, scheduler_output: Any = None) -> None:
+        if self.closed:
+            return
+        execution = self.pending_plan.execution if self.pending_plan is not None else self.previous
+        if execution is not None:
+            from vllm.v1.core.sched.output import SchedulerOutput
+
+            from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
+
+            # A terminal stage has no later native finished-request dispatch.
+            # Consume the native cleanup here, including each logical request
+            # in a multi-request session, rather than just its batch/session ID.
+            cleanup = (
+                SchedulerOutput.make_empty() if scheduler_output is None else copy(scheduler_output)
+            )
+            cleanup.finished_req_ids = set(cleanup.finished_req_ids)
+            cleanup.finished_req_ids.update(execution.request_ids)
+            # Native bookkeeping mutates pinned InputBatch buffers. Drain any
+            # outstanding input DMA before unwrapping the physical Beam view.
+            event = getattr(self.worker, "prepare_inputs_event", None)
+            if event is not None:
+                event.synchronize()
+            if isinstance(self.worker.input_batch, InputBatchProxy):
+                self.worker.input_batch = object.__getattribute__(self.worker.input_batch, "_obj")
+            self.worker._update_states(cleanup)
         if self.attention_batch is not None:
             request_ids = tuple(session.session_id for session in self.attention_batch.sessions)
             self.attention_batch.end_session()
@@ -793,11 +817,7 @@ def execute_npu_gr_retirement(worker: Any, scheduler_output: Any) -> Any:
         or owner.previous.owner_generation != metadata.owner_generation
     ):
         raise RuntimeError("Asynchronous scheduling retirement has no matching live NPU owner")
-    owner._release()
-    event = worker.prepare_inputs_event
-    if event is not None:
-        event.synchronize()
-    worker._update_states(scheduler_output)
+    owner._release(scheduler_output)
 
     from vllm.v1.outputs import ModelRunnerOutput
 
