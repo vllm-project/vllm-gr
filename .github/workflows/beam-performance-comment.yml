@@ -85,9 +85,46 @@ jobs:
               core.info('PR changed after the benchmark; skip stale report');
               return;
             }
+            const baseLine = 'Base: `' + meta.base_sha + '`; PR: `' + meta.merge_sha + '`';
+            if (!report.includes(baseLine)) {
+              throw new Error('Performance report does not identify its base and PR commits');
+            }
+            const basePrs = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              { ...context.repo, commit_sha: meta.base_sha, per_page: 100 }
+            );
+            const basePr = basePrs.find(pr =>
+              pr.merged_at && pr.base.ref === pull.base.ref &&
+              pr.merge_commit_sha === meta.base_sha
+            );
+            const baseTimestamp = basePr
+              ? basePr.merged_at
+              : (await github.rest.repos.getCommit({
+                  ...context.repo, ref: meta.base_sha
+                })).data.commit.committer.date;
+            const baseDate = new Date(baseTimestamp);
+            if (Number.isNaN(baseDate.getTime())) {
+              throw new Error('Invalid base commit or merge time');
+            }
+            const baseTime = new Date(baseDate.getTime() + 8 * 60 * 60 * 1000)
+              .toISOString().slice(0, 16).replace('T', ' ') + ' UTC+8';
+            const baseUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/commit/${meta.base_sha}`;
+            const baseTitle = basePr
+              ? basePr.title.replace(/\s+/g, ' ').trim()
+                  .replace(/\\/g, '\\\\').replace(/\[/g, '\\[')
+                  .replace(/\]/g, '\\]').replace(/@/g, '\\@')
+              : null;
+            const baseDescription = `Base: [${baseTime}](${baseUrl})` +
+              (basePr
+                ? ` · last merged PR: [#${basePr.number} ${baseTitle}](${basePr.html_url})`
+                : ' · no merged PR linked to this commit');
+            const candidateUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/pull/${meta.pr_number}`;
+            const commentReport = report.replace(
+              baseLine, `${baseDescription}; PR: [#${meta.pr_number}](${candidateUrl})`
+            );
             const marker = '<!-- beam-v1-performance-ab -->';
             const runMarker = `<!-- beam-v1-performance-run:${run.id}:${run.run_attempt} -->`;
-            const body = `${marker}\n${runMarker}\n${report}\n` +
+            const body = `${marker}\n${runMarker}\n${commentReport}\n` +
               `[Actions run](${run.html_url})`;
             const comments = await github.paginate(
               github.rest.issues.listComments,
