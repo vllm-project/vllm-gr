@@ -140,6 +140,10 @@ Refer to [quickstart](quickstart.md#quick-start) for deployment.
 After installation, use the [online V1 serving example](../examples/online_serving/beam_search/README.md)
 with `constraint_table.backend: npu` and the NPU execution settings below.
 
+For the optional Ascend910B4 BF16 Gate/Up + SwiGLU fusion, see the
+[fused FFN build and usage guide](../csrc/npu/fused_ffn/README.md).
+It is disabled by default and requires a separate local operator build.
+
 ## NPU decode execution compatibility options
 
 Beam Search V1 uses a fixed request width equal to `beam.max_width`

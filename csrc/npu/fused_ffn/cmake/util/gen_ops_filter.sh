@@ -1,0 +1,70 @@
+#!/bin/bash
+#
+# Copyright (C) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+if [[ -z "$1" ]]; then
+    echo -e "[ERROR] No source dir provided"
+    exit 1
+fi
+
+if [[ -z "$2" ]]; then
+    echo -e "[ERROR] No destination dir provided"
+    exit 1
+fi
+
+src=$1
+dest_file=$2/npu_supported_ops.json
+
+if [ -f "$dest_file" ];then
+    chmod u+w "$dest_file"
+fi
+
+printf '%s\n' "$*"
+
+add_ops() {
+    name=$1
+    isHeavy=$2
+    file=$3
+    if grep -w "\"$name\"" "$file" >/dev/null; then
+        return
+    fi
+    echo "  \"${name}\": {" >> "$file"
+    echo "    \"isGray\": false," >> "$file"
+    echo "    \"isHeavy\": ${isHeavy}" >> "$file"
+    echo "  }," >> "$file"
+}
+
+echo "{" > "$dest_file"
+ini_files=$(find "$src" -name "*.ini")
+for file in ${ini_files} ; do
+    name=$(grep '^\[' "$file" | sed 's/\[//g' | sed 's/]//g' | sed 's/\r//g')
+    if grep 'heavyOp.flag' "$file" >/dev/null; then
+        isHeavy=$(grep 'heavyOp.flag' "$file" | awk -F= '{print $2}')
+    else
+        isHeavy="false"
+    fi
+    for op in ${name} ; do
+        add_ops "$op" "false" "$dest_file"
+    done
+done
+echo "}" >> "$dest_file"
+file_count=$(wc -l < "$dest_file")
+line=$((file_count-1))
+sed -i "${line}{s/,//g}" "$dest_file"
+
+chmod 640 "${dest_file}"
+echo -e "[INFO] Succeeded generated ${dest_file}"
+
+exit 0

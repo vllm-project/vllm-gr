@@ -4,6 +4,7 @@
 """Compatibility patches for vLLM-Ascend integration points."""
 
 import logging
+import os
 from typing import Any, cast
 
 from vllm_gr.config import GRAttentionBackend, GRConfig
@@ -134,6 +135,13 @@ def patch_npu_worker_init_device() -> int:
             "hook was not installed for this attempt."
         )
         return 0
+
+    # Bind eligible model-local FFN instances after native loading and before
+    # warmup. Default-off and GPU startup do not import the optional adapter.
+    if os.environ.get("VLLM_GR_NPU_FUSED_FFN") == "1":
+        from vllm_gr.ops.npu.ffn import install_npu_fused_ffn_worker_hook
+
+        install_npu_fused_ffn_worker_hook(NPUWorker)
 
     original_init_device = NPUWorker.init_device
 

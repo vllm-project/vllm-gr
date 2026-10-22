@@ -31,16 +31,28 @@ patches:
     removal_condition: vLLM-Ascend preserves and resolves explicit CUSTOM backend intent
 
   - id: GR-PATCH-002
-    owner: vllm_gr/v1/ascend_compat.py
-    installer: vllm_gr.v1.ascend_compat.patch_npu_worker_init_device
-    activation: the active platform is NPU and the hook is not installed
+    owner: vllm_gr/v1/ascend_compat.py and vllm_gr/ops/npu/ffn.py
+    installer: >-
+      vllm_gr.v1.ascend_compat.patch_npu_worker_init_device, optionally delegating to
+      vllm_gr.ops.npu.ffn.install_npu_fused_ffn_worker_hook
+    activation: >-
+      the active platform is NPU and the initialization hook is not installed;
+      the optional load_model wrapper requires VLLM_GR_NPU_FUSED_FFN=1,
+      and model-local FFN binding requires eligible graph configuration after loading
     validator_or_test:
       - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+      - tests/test_ops_npu_ffn.py::test_disabled_ffn_keeps_native_worker_and_does_not_load_extension
+      - tests/test_ops_npu_ffn.py::test_worker_load_hook_preserves_order_errors_and_idempotence
+      - tests/st/test_npu_fused_ffn.py::test_npu_fused_ffn_opt_in_graph_precision_and_fallback
     process_roles: [worker]
-    target: vllm_ascend.worker.worker.NPUWorker.init_device
+    target: >-
+      NPUWorker.init_device and optional NPUWorker.load_model in
+      vllm_ascend.worker.worker_v1 (or worker fallback)
     risk: high
     contract: null
-    removal_condition: stable NPU worker initialization installs compatibility before ModelRunner construction
+    removal_condition: >-
+      stable NPU worker hooks install compatibility before ModelRunner construction
+      and support optional model-local FFN binding after loading and before warmup
 
   - id: GR-PATCH-003
     owner: vllm_gr/logprobs.py

@@ -98,3 +98,7 @@ CANN = "CANN"
 arange_np = "arange_np"
 cann = "cann"
 fx_arange = "fx_arange"
+
+[tool.typos.default.extend-words]
+cann = "cann"
+nd = "nd"

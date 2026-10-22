@@ -188,6 +188,8 @@ repos:
     - id: check-characters
       name: Check valid characters in files
       entry: python tools/pre_commit/check_english.py
+      # Preserve the supplied third-party license text verbatim.
+      exclude: ^csrc/npu/fused_ffn/LICENSE\.CANN$
       language: python
 
 

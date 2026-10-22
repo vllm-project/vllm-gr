@@ -17,19 +17,56 @@ COMMON_FILE = REPO_ROOT / "requirements" / "common.txt"
 
 
 def _load_setup_module() -> ModuleType:
-    # setup.py imports setuptools_scm at the top level, which may not be
-    # installed in lightweight test environments.  Inject a stub so the
-    # module can be loaded without the real package.
-    if "setuptools_scm" not in sys.modules:
-        sys.modules["setuptools_scm"] = MagicMock()
-
     setup_path = REPO_ROOT / "setup.py"
     spec = importlib.util.spec_from_file_location("vllm_gr_setup", setup_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
-    sys.modules["vllm_gr_setup"] = module
-    spec.loader.exec_module(module)
+    # Lightweight test environments may not have setuptools_scm. Keep its
+    # stub local to this load so later setuptools entry points can import the
+    # real package. Restore both module entries even if setup.py raises.
+    with pytest.MonkeyPatch.context() as patcher:
+        if "setuptools_scm" not in sys.modules:
+            patcher.setitem(sys.modules, "setuptools_scm", MagicMock())
+        patcher.setitem(sys.modules, "vllm_gr_setup", module)
+        spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("preloaded", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("load_error", [False, True])  # type: ignore[misc]
+def test_setup_module_load_restores_import_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, preloaded: bool, load_error: bool
+) -> None:
+    names = ("setuptools_scm", "vllm_gr_setup")
+    existing = {name: ModuleType(name) for name in names}
+    get_version = MagicMock(return_value="0.22.1")
+    existing["setuptools_scm"].get_version = get_version  # type: ignore[attr-defined]
+    for name in names:
+        if preloaded:
+            monkeypatch.setitem(sys.modules, name, existing[name])
+        else:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    if load_error:
+        (tmp_path / "setup.py").write_text(
+            "from setuptools_scm import get_version\nraise RuntimeError('setup load failed')\n"
+        )
+        monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+        with pytest.raises(RuntimeError, match="setup load failed"):
+            _load_setup_module()
+    else:
+        module = _load_setup_module()
+        assert callable(module.get_version)
+        if preloaded:
+            assert module.get_version is get_version
+            assert module.get_version() == "0.22.1"
+            get_version.assert_called_once_with()
+
+    for name in names:
+        if preloaded:
+            assert sys.modules[name] is existing[name]
+        else:
+            assert name not in sys.modules
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]

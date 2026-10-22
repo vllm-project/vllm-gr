@@ -40,7 +40,7 @@ aligned with it.
 | --- | --- | --- | --- | --- | --- |
 | GR-PATCH-000 | `vllm_gr/plugin.py` | `vllm_gr.plugin.register` | vLLM general-plugin loading | `test_plugin_exposes_simple_per_patch_status` | main, EngineCore, worker |
 | GR-PATCH-001 | `vllm_gr/v1/ascend_compat.py` | `apply_ascend_attention_backend_patch` | CUSTOM is registered and overridden | `_validate` behavior in `test_ascend_compat.py`; Ascend integration test | EngineCore, worker |
-| GR-PATCH-002 | `vllm_gr/v1/ascend_compat.py` | `patch_npu_worker_init_device` | active NPU platform, first installation | `test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract` | worker |
+| GR-PATCH-002 | `vllm_gr/v1/ascend_compat.py`, `vllm_gr/ops/npu/ffn.py` | `patch_npu_worker_init_device`, optional `install_npu_fused_ffn_worker_hook` | active NPU platform, first installation; optional load wrapper requires `VLLM_GR_NPU_FUSED_FFN=1`, model binding requires eligible graph configuration after loading | `init_device` lifecycle test; `test_ops_npu_ffn.py`; `test_npu_fused_ffn.py` | worker |
 | GR-PATCH-003 | `vllm_gr/logprobs.py` | `logprobs_patch.patch_flat_logprobs` | required frontend plan finds the method absent | `_validate_flat_logprobs_patch`; patch initialization tests | offline frontend, API server |
 | GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; serving dispatch tests | API server |
 | GR-PATCH-005 | `vllm_gr/engine/arg_utils_gr.py` | `patch_add_cli_args` | required frontend plan finds GR EngineArgs methods absent | `_validate_engine_args_patch`; attention backend configuration tests | main, API server |
@@ -84,17 +84,20 @@ aligned with it.
 - Ordinary request impact: the selector is process-global, although the GR branch is used only for explicit Beam backend intent.
 - Removal condition: vLLM-Ascend preserves explicit CUSTOM backend intent and resolves the registered backend without a private selector override.
 
-### GR-PATCH-002 — NPUWorker Initialization Hook
+### GR-PATCH-002 — NPUWorker Initialization and Optional FFN Load Hooks
 
-- Source: `vllm_gr/v1/ascend_compat.py`
+- Sources: `vllm_gr/v1/ascend_compat.py`, `vllm_gr/ops/npu/ffn.py`
 - Orchestration: `vllm_gr/patch.py`
-- Target: `vllm_ascend.worker.worker.NPUWorker.init_device`
-- Mutation: lifecycle method wrapper
+- Installation: `patch_npu_worker_init_device`, optionally delegating to `install_npu_fused_ffn_worker_hook`.
+- Targets: `NPUWorker.init_device` and optional `NPUWorker.load_model` in `vllm_ascend.worker.worker_v1`, with `vllm_ascend.worker.worker` as the compatibility fallback.
+- Mutation: lifecycle method wrappers; eligible FFN bindings are local to loaded model instances.
 - Platform: NPU
 - Risk: High
 - Behavior: ensures required compatibility patches are active before the NPU ModelRunner resolves its Attention backend.
-- Dependency: NPU ModelRunner construction occurs during `init_device()`.
-- Removal condition: the required Ascend compatibility is installed through a stable worker or platform extension point before ModelRunner construction.
+- Optional FFN activation: `VLLM_GR_NPU_FUSED_FFN=1` installs the load wrapper during initial NPU patch installation. After the native load completes, eligible graph configurations bind the adapter before warmup; unsupported configurations retain native MLP execution.
+- Validation: the existing `init_device` lifecycle test covers initialization alongside the current worker hooks. `tests/test_ops_npu_ffn.py` checks default-off behavior and the optional load wrapper's ordering, idempotence, and error propagation. `tests/st/test_npu_fused_ffn.py` checks actual fused capture/replay and native fallback on NPU; see the [FFN guide](../csrc/npu/fused_ffn/README.md#confirm-execution-and-interpret-results) for whole-model profile checks.
+- Dependencies: NPU ModelRunner construction occurs during `init_device()`; the optional FFN hook requires `load_model()` to expose the loaded runner before its first warmup/trace.
+- Removal condition: stable worker or platform extension points install required Ascend compatibility before ModelRunner construction and support optional model-local FFN binding after loading and before warmup.
 
 ### GR-PATCH-003 — FlatLogprobs Fast Append Override
 
