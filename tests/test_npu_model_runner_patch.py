@@ -1049,23 +1049,55 @@ def test_npu_capture_ubatching_returns_false(monkeypatch: pytest.MonkeyPatch) ->
     assert npu_patch.capture_beam_decode_graph(runner) is False
 
 
-def test_npu_capture_reentry_returns_true(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stub_beam_graph_install(
+    monkeypatch: pytest.MonkeyPatch, ready_widths: tuple[int, ...] = ()
+) -> list[Any]:
+    import sys
+    from types import ModuleType
+
+    calls: list[Any] = []
+    module = ModuleType("vllm_gr.v1.worker.npu_beam_decode_graph")
+
+    def install(runner: Any) -> Any:
+        calls.append(runner)
+        model = SimpleNamespace(graph_ready=lambda width: width in ready_widths)
+        runner._gr_npu_graph_model = runner.model = model
+        return model
+
+    module.install_npu_beam_graph_model = install  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return calls
+
+
+@pytest.mark.parametrize("graph_widths", [None, (4,)])  # type: ignore[misc]
+def test_npu_capture_reentry_returns_true(
+    monkeypatch: pytest.MonkeyPatch, graph_widths: tuple[int, ...] | None
+) -> None:
     """If a graph for the width is already recorded, capture short-circuits True."""
     _stub_gr_config(
         monkeypatch,
-        SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3),
+        SimpleNamespace(
+            beam_graph_active=True,
+            beam_max_width=4,
+            beam_max_decode_steps=3,
+            beam_graph_widths=graph_widths,
+        ),
     )
     monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
+    installs = _stub_beam_graph_install(monkeypatch, ready_widths=(4,))
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False),
         _beam_graph_keys={4},
         _gr_npu_beam_graph_shapes={(1, 4)},
     )
     assert npu_patch.capture_beam_decode_graph(runner) is True
+    assert installs == [runner]
+    assert runner.model is runner._gr_npu_graph_model
 
 
+@pytest.mark.parametrize("graph_widths", [None, (4,)])  # type: ignore[misc]
 def test_npu_capture_forwards_run_under_inference_mode(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, graph_widths: tuple[int, ...] | None
 ) -> None:
     """Warmup + capture forwards must run inside torch.inference_mode().
 
@@ -1086,6 +1118,7 @@ def test_npu_capture_forwards_run_under_inference_mode(
             beam_graph_batch_size=2,
             beam_max_width=4,
             beam_max_decode_steps=3,
+            beam_graph_widths=graph_widths,
         ),
     )
     monkeypatch.setattr(npu_patch, "_npu_xllm_decode_mode_active", lambda: True)
@@ -1117,6 +1150,7 @@ def test_npu_capture_forwards_run_under_inference_mode(
         fake_create,
     )
 
+    installs = _stub_beam_graph_install(monkeypatch)
     inference_flags: list[bool] = []
 
     def fake_forward(*args: Any, **kwargs: Any) -> None:
@@ -1133,6 +1167,7 @@ def test_npu_capture_forwards_run_under_inference_mode(
         _current_beam_info=None,
     )
     assert npu_patch.capture_beam_decode_graph(runner) is True
+    assert installs == [runner]
     assert create_args[0][2] == 2
     assert runner._gr_npu_beam_graph_shapes == {(2, 4)}
     assert len(inference_flags) == npu_patch._BEAM_CAPTURE_NUM_WARMUPS + 1
@@ -1142,86 +1177,115 @@ def test_npu_capture_forwards_run_under_inference_mode(
 # ---------------------------------------------------------------------------
 # _verify_and_record_captured_graph_npu — ACL entry verification
 # ---------------------------------------------------------------------------
-# These tests monkeypatch vllm_ascend.compilation.acl_graph.ACLGraphWrapper,
-# which requires vllm-ascend to be installed (it is an optional dependency on
-# GPU-only gates). Keep the skip local so the platform-neutral NPU wrapper
-# contracts above still run on CPU/GPU CI.
-
-
-def test_npu_verify_and_record_records_on_match(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip(
-        "vllm_ascend.compilation.acl_graph",
-        reason="vllm-ascend is not installed",
-    )
-    from unittest.mock import MagicMock
-
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
-
-    mock_entry = MagicMock()
-    mock_entry.aclgraph = MagicMock()  # not None → captured
-
-    mock_wrapper = MagicMock()
-    mock_wrapper.runtime_mode = CUDAGraphMode.FULL
-    mock_wrapper.concrete_aclgraph_entries = {
-        BatchDescriptor(num_tokens=4, uniform=True): mock_entry
-    }
-
-    runner = SimpleNamespace()
-    monkeypatch.setattr(
-        "vllm_ascend.compilation.acl_graph.ACLGraphWrapper._all_instances",
-        [mock_wrapper],
-    )
+def test_npu_verify_and_record_records_on_match() -> None:
+    beam_model = SimpleNamespace(graph_ready=lambda width: width == 4)
+    runner = SimpleNamespace(model=beam_model, _gr_npu_graph_model=beam_model)
     assert npu_patch._verify_and_record_captured_graph_npu(runner, width=4) is True
-    assert 4 in runner._beam_graph_keys
+    assert runner._beam_graph_keys == {4}
 
 
-def test_npu_verify_and_record_no_match(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip(
-        "vllm_ascend.compilation.acl_graph",
-        reason="vllm-ascend is not installed",
-    )
-    from unittest.mock import MagicMock
-
-    mock_wrapper = MagicMock()
-    mock_wrapper.runtime_mode = MagicMock()  # not FULL
-    mock_wrapper.concrete_aclgraph_entries = {}
-
-    runner = SimpleNamespace()
-    monkeypatch.setattr(
-        "vllm_ascend.compilation.acl_graph.ACLGraphWrapper._all_instances",
-        [mock_wrapper],
-    )
+@pytest.mark.parametrize("owner_state", ["absent", "replaced", "uncaptured"])  # type: ignore[misc]
+def test_npu_verify_and_record_rejects_unowned_or_missing_graph(owner_state: str) -> None:
+    # A matching descriptor elsewhere must never establish Beam ownership.
+    ordinary = SimpleNamespace(concrete_aclgraph_entries={4: object()})
+    runner = SimpleNamespace(model=ordinary)
+    if owner_state != "absent":
+        beam_model = SimpleNamespace(graph_ready=lambda width: owner_state != "uncaptured")
+        runner._gr_npu_graph_model = beam_model
+        if owner_state == "uncaptured":
+            runner.model = beam_model
     assert npu_patch._verify_and_record_captured_graph_npu(runner, width=4) is False
     assert not hasattr(runner, "_beam_graph_keys")
 
 
-def test_npu_verify_and_record_appends_to_existing_keys(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pytest.importorskip(
-        "vllm_ascend.compilation.acl_graph",
-        reason="vllm-ascend is not installed",
-    )
-    from unittest.mock import MagicMock
-
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
-
-    mock_entry = MagicMock()
-    mock_entry.aclgraph = MagicMock()
-
-    mock_wrapper = MagicMock()
-    mock_wrapper.runtime_mode = CUDAGraphMode.FULL
-    mock_wrapper.concrete_aclgraph_entries = {
-        BatchDescriptor(num_tokens=8, uniform=True): mock_entry
-    }
-
-    runner = SimpleNamespace(_beam_graph_keys={4})
-    monkeypatch.setattr(
-        "vllm_ascend.compilation.acl_graph.ACLGraphWrapper._all_instances",
-        [mock_wrapper],
-    )
+def test_npu_verify_and_record_appends_to_existing_keys() -> None:
+    beam_model = SimpleNamespace(graph_ready=lambda width: width == 8)
+    runner = SimpleNamespace(model=beam_model, _gr_npu_graph_model=beam_model, _beam_graph_keys={4})
     assert npu_patch._verify_and_record_captured_graph_npu(runner, width=8) is True
     assert runner._beam_graph_keys == {4, 8}
+
+
+@pytest.mark.parametrize("first_path", ["ordinary", "beam"])  # type: ignore[misc]
+def test_npu_beam_and_ordinary_graphs_isolate_matching_descriptors(
+    monkeypatch: pytest.MonkeyPatch, first_path: str
+) -> None:
+    acl_graph = pytest.importorskip(
+        "vllm_ascend.compilation.acl_graph", reason="vllm-ascend is not installed"
+    )
+    from vllm.v1.cudagraph_dispatcher import BatchDescriptor
+
+    from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+    from vllm_gr.v1.worker.npu_beam_decode_graph import NPUBeamGraphModel
+
+    descriptor = BatchDescriptor(num_tokens=4, uniform=True)
+
+    def native_forward(wrapper: Any) -> Any:
+        entries = wrapper.concrete_aclgraph_entries
+        if descriptor not in entries:
+            entries[descriptor] = SimpleNamespace(aclgraph=object())
+        return entries[descriptor].aclgraph
+
+    monkeypatch.setattr(acl_graph.ACLGraphWrapper, "__call__", native_forward)
+    ordinary = object.__new__(acl_graph.ACLGraphWrapper)
+    ordinary.concrete_aclgraph_entries = {}
+    beam = object.__new__(NPUBeamGraphModel)
+    beam.original_model = ordinary
+    beam.concrete_aclgraph_entries = {}
+    runner = SimpleNamespace(model=beam, _gr_npu_graph_model=beam)
+
+    def forward(path: str) -> Any:
+        token = BEAM_DATA_VAR.set({"beam_session": object()} if path == "beam" else None)
+        try:
+            return beam()
+        finally:
+            BEAM_DATA_VAR.reset(token)
+
+    first_graph = forward(first_path)
+    if first_path == "ordinary":
+        assert not npu_patch._verify_and_record_captured_graph_npu(runner, 4)
+    other_path = "beam" if first_path == "ordinary" else "ordinary"
+    other_graph = forward(other_path)
+    assert other_graph is not first_graph
+    assert forward(first_path) is first_graph
+    assert forward(other_path) is other_graph
+    assert beam.concrete_aclgraph_entries is not ordinary.concrete_aclgraph_entries
+    assert npu_patch._verify_and_record_captured_graph_npu(runner, 4)
+    assert not beam.graph_ready(8)
+
+
+def test_npu_suffix_bank_storage_count_deduplicates_packed_views() -> None:
+    packed = torch.empty((2, 2, 1, 4, 3), dtype=torch.float32)
+    pools = [
+        SimpleNamespace(unshared_key=packed[0, layer], unshared_value=packed[1, layer])
+        for layer in range(2)
+    ]
+    context = SimpleNamespace(pools=pools, _npu_beam_width_pools={})
+    worker = SimpleNamespace(
+        _gr_npu_graph_context=context, _gr_npu_graph_contexts={(1, 4): context}
+    )
+    assert npu_patch._retained_npu_suffix_kv_bytes(worker) == packed.numel() * packed.element_size()
+
+
+def test_npu_capture_logs_requested_and_retained_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    _stub_gr_config(
+        monkeypatch,
+        SimpleNamespace(beam_graph_active=True, beam_max_width=4, beam_graph_widths=(2,)),
+    )
+    worker = SimpleNamespace(_gr_npu_beam_graph_shapes={(1, 4)})
+    capture = Mock(side_effect=[True, False])
+    logger = Mock()
+    monkeypatch.setattr(npu_patch, "_capture_beam_decode_graph_width", capture)
+    monkeypatch.setattr(npu_patch, "logger", logger)
+    assert npu_patch.capture_beam_decode_graph(worker)
+    assert [call.args[1] for call in capture.call_args_list] == [4, 2]
+    messages = [call.args[0] % call.args[1:] for call in logger.info.call_args_list]
+    assert "widths=[4, 2] (count=2, B=1)" in messages[0]
+    assert "captured (B, W)=[(1, 4)]" in messages[-1]
+    assert "excludes graph and scratch memory" in messages[-1]
 
 
 def test_npu_eager_decode_binds_winners_and_sampling_rows() -> None:
@@ -1705,6 +1769,107 @@ def test_npu_terminal_result_keeps_batch_identity_and_output_options() -> None:
     assert (first.finish_reason, first.stop_token_id) == ("stop", 99)
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "device", ["cpu", pytest.param("npu", marks=pytest.mark.npu_integration)]
+)
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+@pytest.mark.parametrize("result_width", [1, 2])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "case", ["nan", "posinf", "neginf", "masked", "finite", "unsorted", "all_invalid"]
+)
+def test_npu_single_step_filters_candidates_before_return_limit(
+    device: str, batch_size: int, result_width: int, case: str
+) -> None:
+    if device == "npu":
+        pytest.importorskip("torch_npu")
+        if not hasattr(torch, "npu") or not torch.npu.is_available():
+            pytest.skip("Ascend NPU is unavailable")
+    scheduled = _eager_stage_output(kind="prefill", batch_size=batch_size, beam_width=2)
+    metadata = next(iter(scheduled.gr_stage_metadata.values()))
+    metadata.beam_params.temperature = 1.0
+    metadata.beam_params.dynamic_beam_widths = (2,)
+    metadata.beam_params.max_tokens = 1
+    metadata.is_last_stage = True
+    metadata.output_device_state = None
+    metadata.output_options = SimpleNamespace(
+        num_return_sequences=result_width,
+        include_stop_token=False,
+        include_cumulative_logprob=True,
+        include_parent_beam_indices=True,
+    )
+    plan = NPUEagerStagePlan.from_scheduler_output(scheduled)
+    first_score = {
+        "nan": float("nan"),
+        "posinf": float("inf"),
+        "neginf": -float("inf"),
+        "masked": 0.0,
+        "finite": -0.1,
+        "unsorted": -0.9,
+        "all_invalid": -0.1,
+    }[case]
+    token_ids = torch.tensor(
+        [[11 + row * 10, 12 + row * 10] for row in range(batch_size)],
+        dtype=torch.int32,
+        device=device,
+    )
+    scores = torch.tensor([[first_score, -0.2]] * batch_size, device=device)
+    valid_mask = torch.ones_like(scores, dtype=torch.bool)
+    if case == "masked":
+        valid_mask[:, 0] = False
+    elif case == "all_invalid":
+        scores[-1] = torch.tensor([float("nan"), float("inf")], device=device)
+    candidates = ConstraintOutput(token_ids=token_ids, logprobs=scores, valid_mask=valid_mask)
+
+    def select(logits: torch.Tensor, constraint: ConstraintMetadata) -> ConstraintOutput:
+        assert logits.device.type == device
+        assert constraint.current_step == 0 and constraint.top_k == 2
+        return candidates
+
+    worker = SimpleNamespace(
+        _current_scheduler_output=scheduled,
+        constraint_backend=SimpleNamespace(
+            info=SimpleNamespace(max_rows=batch_size), select=select
+        ),
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.worker, stage.pending_plan, stage.execution_error = worker, plan, None
+    stage.logits = torch.zeros((batch_size, 16), device=device)
+    stage.attention_batch = None
+    stage.session_request = SimpleNamespace(
+        batch_id="batch-0",
+        items=tuple(
+            SimpleNamespace(
+                item_index=row,
+                request=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+            )
+            for row, request_id in enumerate(plan.execution.request_ids)
+        ),
+        beam_params=SimpleNamespace(stop_token_ids=(), ignore_stop_tokens=True, length_penalty=0.0),
+        output_options=metadata.output_options,
+    )
+    output = stage.sample()
+    receipt = output.gr_worker_results[plan.execution.session_id]
+    result = receipt.terminal_result
+    assert receipt.finished and receipt.resources_released
+    assert stage.closed and stage.pending_plan is None
+    if case == "all_invalid":
+        assert result.output is None and result.failure.code == "no_valid_beams"
+        assert result.failure.item_index == batch_size - 1
+        return
+    assert result.failure is None
+    assert tuple(item.request_id for item in result.output.items) == plan.execution.request_ids
+    expected = [0, 1] if case == "finite" else [1, 0] if case == "unsorted" else [1]
+    for row, item in enumerate(result.output.items):
+        selected = expected[:result_width]
+        assert [seq.token_ids for seq in item.sequences] == [
+            (11 + row * 10 + index,) for index in selected
+        ]
+        for sequence, index in zip(item.sequences, selected):
+            assert sequence.cumulative_logprob == pytest.approx(first_score if index == 0 else -0.2)
+            assert sequence.parent_beam_indices == (0,)
+            assert sequence.finish_reason == "length" and sequence.stop_token_id is None
+
+
 def test_npu_constraint_candidates_chunk_multi_batch_rows() -> None:
     calls: list[ConstraintMetadata] = []
 
@@ -1738,3 +1903,23 @@ def test_npu_constraint_candidates_chunk_multi_batch_rows() -> None:
     assert all(item.current_step == 1 and item.top_k == 2 for item in calls)
     torch.testing.assert_close(result.token_ids[:, 0], torch.arange(6, dtype=torch.int32))
     assert result.logprobs.is_contiguous() and result.valid_mask.all()
+
+
+@pytest.mark.parametrize("ignore_stop_tokens", [False, True])  # type: ignore[misc]
+def test_npu_dynamic_beam_admission_requires_fixed_horizon(ignore_stop_tokens: bool) -> None:
+    from vllm_gr.v1.beam.batch_contracts import BeamBatchParams
+    from vllm_gr.v1.engine.beam_search_v1 import _validate_gr_generation_params
+
+    params = BeamBatchParams(
+        beam_width=4,
+        max_tokens=3,
+        temperature=0.0,
+        stop_token_ids=(99,),
+        ignore_stop_tokens=ignore_stop_tokens,
+        dynamic_beam_widths=(4, 2, 1),
+    )
+    if ignore_stop_tokens:
+        _validate_gr_generation_params(params)
+    else:
+        with pytest.raises(ValueError, match="requires ignore_eos=True"):
+            _validate_gr_generation_params(params)

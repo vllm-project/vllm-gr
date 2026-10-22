@@ -99,6 +99,8 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
             options = request.output_options
             budget = request.beam_params.max_tokens
             width = request.beam_params.beam_width
+            stage_widths = request.beam_params.dynamic_beam_widths
+            parent_widths = None if stage_widths is None else (1, *stage_widths[:-1])
             include_scores = options.include_cumulative_logprob
             include_parents = options.include_parent_beam_indices
             expected_sequence = (
@@ -143,8 +145,15 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
                                 "terminal Beam result contains unrequested parent indices"
                             )
                         raise ValueError("terminal Beam result has invalid parent indices")
-                    if include_parents and max(parents) >= width:
-                        raise ValueError("terminal Beam result has invalid parent indices")
+                    if include_parents:
+                        if parent_widths is None:
+                            invalid_parent = max(parents) >= width
+                        else:
+                            invalid_parent = any(
+                                parent >= bound for parent, bound in zip(parents, parent_widths)
+                            )
+                        if invalid_parent:
+                            raise ValueError("terminal Beam result has invalid parent indices")
         return result
     return BeamBatchResult(
         protocol_version=request.protocol_version,

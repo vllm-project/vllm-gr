@@ -270,6 +270,18 @@ def validate_beam_max_width(value: object) -> int | None:
     return width
 
 
+def validate_beam_graph_widths(value: object) -> tuple[int, ...] | None:
+    """Normalize explicit NPU Decode widths to prewarm at startup."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("beam.graph_widths must be a nonempty list of integers or null")
+    widths = tuple(validate_beam_width(width) for width in value)
+    if len(set(widths)) != len(widths):
+        raise ValueError("beam.graph_widths must not contain duplicates")
+    return tuple(sorted(widths))
+
+
 def validate_beam_width(value: object) -> int:
     width = _validate_positive_int(value, "beam_width")
     if width > MAX_BEAM_WIDTH:

@@ -8,7 +8,7 @@ It contains two entrypoints:
 - `offline_beam_search_v1.py` for the EngineCore-owned asynchronous V1 path.
 
 The V1 example accepts a model, Constraint Table triples document, and prompt.
-It compiles a temporary CUDA Constraint Table artifact, builds the canonical V1
+It compiles a temporary CUDA or NPU Constraint Table artifact, builds the canonical V1
 configuration, calls `GRLLM.beam_search_v1`, and prints the leading Beam results.
 Run `python offline_beam_search_v1.py --help` for its arguments.
 
@@ -68,8 +68,8 @@ combinations described here follow the working local profiling and A/B scripts.
 | Intermediate data | Per-step results return through the legacy path | Intermediate Beam state stays on the device |
 | Final processing | Legacy materialization path | GPU ranks and packs final candidates, then copies one compact payload to the host |
 | Public output | Materialized by the legacy frontend | Token/text fields are lazily materialized on first access |
-| Constraints | Supports the existing legacy configurations | Requires an enabled canonical CUDA Constraint Table |
-| Width | Uses the legacy width behavior | Request width must equal the engine's fixed width |
+| Constraints | Supports the existing legacy configurations | Requires an enabled canonical Constraint Table matching the device |
+| Width | Uses the legacy width behavior | Request capacity must equal the engine width; NPU per-stage widths are described below |
 | Generation budget | Uses the general legacy behavior | Effective generation budget must be 1, 2, or 3 |
 
 The V1 flow is:
@@ -93,9 +93,9 @@ ordinary/legacy Beam requests with V1 requests in the same engine.
 
 The current V1 implementation requires:
 
-- CUDA and an enabled canonical CUDA Constraint Table.
+- CUDA or NPU and an enabled canonical Constraint Table matching the device.
 - `async_scheduling=True`.
-- One prompt per call.
+- B=1, 2, or 4 prompts per call, sharing generation parameters.
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
 - Request `beam_width == beam.max_width`.
 - Effective generation budget `N` in `{1, 2, 3}`.
@@ -117,7 +117,7 @@ python tools/build_constraint_triples.py \
 ```
 
 The standalone `offline_beam_search_v1.py` example accepts this triples document
-and compiles a temporary CUDA artifact automatically. For a reusable artifact,
+and compiles a temporary artifact automatically. For a reusable artifact,
 run:
 
 ```bash
@@ -134,8 +134,9 @@ constraint data or a different tokenizer.
 
 ### Engine configuration
 
-The standalone example builds the following configuration in memory. The same
-mapping can be stored as a YAML file for other applications:
+The standalone example builds the following CUDA configuration in memory. The
+same mapping can be stored as a YAML file for other applications. For NPU, use
+`constraint_table.backend: npu`:
 
 ```yaml
 schema_version: 1
@@ -166,7 +167,7 @@ constraint_table:
 | `graph_enabled` | Enables the fixed-shape Beam CUDA graph | `true` |
 | `worker_decision` | Performs Beam selection on the Worker | `true` |
 | `engine_driven` | Lets EngineCore chain stages without frontend step RPCs | Omit for the CUDA default, or set `true` |
-| `max_width` | Fixed runtime Beam width | Same as request `beam_width` |
+| `max_width` | Engine Beam capacity | Same as request `beam_width` |
 | `max_decode_steps` | Maximum effective generation budget | `1`, `2`, or `3` |
 
 #### Constraint Table parameters
@@ -174,7 +175,7 @@ constraint_table:
 | Parameter | Meaning |
 | --- | --- |
 | `enabled` | Must be `true` for V1 |
-| `backend` | Must currently be `cuda` |
+| `backend` | `cuda` or `npu`, matching the device |
 | `max_top_k` | Candidate capacity; use the configured Beam width |
 | `path` | Constraint Table `.safetensors` artifact |
 | `format` | Must be `constraint_table_v1` |
@@ -380,6 +381,124 @@ across B values. Request throughput is `B * repeat / total_timed_seconds`; batch
 latency divided by B is only amortized cost, not individual request latency.
 NPU graph counters saved in the report include both warmup and measured runs;
 check the captured shape and `fallbacks` when comparing graph performance.
+
+### NPU per-stage Beam widths through the Python API
+
+NPU V1 supports a retained Beam width for each generated token, plus a separate
+final result limit. CUDA and legacy entrypoints reject these request options;
+omitting both options preserves the existing fixed-width behavior.
+
+For an existing NPU V1 engine `llm` and a B=1, 2, or 4 batch `prompts`, use:
+
+```python
+from vllm_gr.sampling_params import BeamSearchParams
+
+params = BeamSearchParams(
+    beam_width=128,
+    dynamic_beam_widths=[128, 64, 32],
+    result_width=16,
+    max_tokens=5,
+    begin_token="<|sid_begin|>",
+    end_token="<|sid_end|>",
+    temperature=0.0,
+    ignore_eos=True,
+    include_stop_str_in_output=True,
+    length_penalty=1.0,
+)
+outputs = llm.beam_search_v1(prompts, params)
+```
+
+`beam_width` remains the engine capacity in `[1, 256]` and must equal
+`beam.max_width`.
+The schedule has exactly one integer in `[1, beam_width]` per effective generated
+step N, which remains limited to 1, 2, or 3. Begin/end boundary positions are
+excluded from the schedule. With both boundary tokens above, `max_tokens=5`
+means N=3: retain 128 SA candidates, then 64 SB candidates, then 32 SC candidates.
+The API appends BEGIN before Prefill; do not append it again to the input prompt.
+END is handled by the existing boundary/output rules, not an extra scheduled
+model step.
+
+Prefill processes the prompt tokens and selects the first-stage winners from
+one final prompt position per request. It does not forward 128 Beam model rows
+for that first selection. Subsequent Decode stages use the previous retained
+width: for B=4, this example forwards 512 and 256 Decode rows. Increasing
+schedules such as `[32, 64, 128]` are supported within the same capacity.
+All prompts within one call share the same schedule and result limit.
+
+`result_width` is a positive integer no larger than the final retained width.
+It limits the number returned per request to at most R; a catalog with fewer
+valid paths may produce fewer. If omitted, R is the final schedule width, or
+`beam_width` when no schedule is supplied. Setting only `result_width` limits
+returned results while retaining the fixed search widths.
+
+Use the existing NPU V1 constraints: an enabled canonical NPU Constraint Table,
+`async_scheduling=True`, `enable_chunked_prefill=False`, token/text prompts,
+`ignore_eos=True`, and `catalog_strategy=None`. Existing TP/PP/DP/DCP/PCP=1,
+FP16/BF16 and unsupported-model restrictions still apply. These options do not
+add concurrent sessions or per-prompt schedules. Engine processes must use the
+same code and schema revision across the frontend, EngineCore, and Workers.
+Stop and restart them together when deploying this change. Mixed-revision
+operation and rolling upgrades are unsupported for **all** Beam requests,
+including fixed-width requests: the appended array-encoded schedule field is
+sent even when its value is `None`, and an older strict decoder rejects it.
+Matching request-contract version numbers alone do not establish compatibility.
+
+This path uses a fixed generated-token horizon: `ignore_eos=True` becomes
+`ignore_stop_tokens=True` at engine admission. Surviving paths within a request
+have the same final length, so truncating to `result_width` before length
+normalization preserves score order. Variable-length early stopping is not
+supported by this dynamic-width implementation.
+
+For graph execution, construct `GRLLM` with the canonical engine configuration
+above, selecting `constraint_table.backend: npu`, and set these Beam fields
+before engine initialization:
+
+```yaml
+beam:
+  execution_mode: v1
+  graph_enabled: true
+  graph_batch_size: 4
+  graph_widths: [64, 128]
+  worker_decision: true
+  max_width: 128
+  max_decode_steps: 3
+```
+
+Retain the existing schema version, attention backend, Constraint Table artifact
+path/digests and `constraint_table.max_top_k: 128`. `graph_widths` lists Decode
+**input** widths, so this schedule needs 128 and 64, not its final output width
+32. Use `GRLLM(..., async_scheduling=True, enable_chunked_prefill=False,
+enforce_eager=False, vllm_gr_config=config)` with enough sequence and token
+capacity for the batch. The engine also captures `max_width`; omitting
+`graph_widths` keeps the previous startup capture of that width alone.
+
+When Beam graphs are enabled, at most **8 distinct widths** may be captured,
+including the implicitly added `max_width`. For example, 8 explicit widths
+that omit `max_width` would require 9 captures and are rejected before engine
+startup. Listing `max_width` explicitly counts it once. This conservative
+resource policy bounds the number of retained banks and graphs; it does not
+guarantee a configuration fits device memory. Disabling Beam graphs does not
+apply this capture-count limit.
+
+Beam FULL replay requires an exact captured `(B, input_width)` shape. A shape
+miss rejects Beam FULL while retaining native PIECEWISE/NONE execution; fallback
+does not necessarily mean eager-only execution. Additional captured widths keep
+separate contiguous KV banks and increase startup time and memory use. The
+suffix K/V bank storage alone scales with the sum of the captured widths;
+capturing widths 1 through 128 would require 64.5 times the suffix storage of
+one width-128 bank and is rejected by the count limit. Graphs, scratch buffers,
+and activations require additional memory. Capture only the Decode input
+widths needed by the schedules you intend to serve; uncaptured widths retain
+the native fallback path described above. The
+existing padded-Prefill precision limitation remains independent of Decode
+widths; set `VLLM_ENABLE_PREFILL_CUDAGRAPH=0` when isolating Decode parity for
+padded or mixed prompt lengths.
+
+Narrower intermediate widths intentionally prune the search; later expansion
+cannot recover an earlier discarded prefix. Results and low-precision model
+scores can change as execution shapes change. Validate application Recall/NDCG
+and latency for the selected schedule; catalog validity and implementation
+parity alone do not establish unchanged recommendation quality.
 
 ### Profile inference
 

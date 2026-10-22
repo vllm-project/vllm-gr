@@ -271,6 +271,74 @@ def test_terminal_result_honors_score_and_lineage_options() -> None:
     )
 
 
+@pytest.mark.parametrize("wire", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "widths,parents,accepted",
+    [
+        ((4, 2, 1), (0, 3, 1), True),
+        ((1, 2, 4), (0, 0, 1), True),
+        ((4, 2, 1), (1, 3, 1), False),
+        ((1, 2, 4), (0, 1, 1), False),
+        ((4, 2, 1), (0, 3, 2), False),
+        ((1, 2, 4), (0, 0, 2), False),
+        ((4,), (0,), True),
+        ((4,), (1,), False),
+        ((1, 4), (0, 0), True),
+        ((1, 4), (0, 1), False),
+        (None, (1, 3, 2), True),
+        (None, (0, 3, 4), False),
+    ],
+)
+def test_terminal_parent_indices_follow_retained_stage_widths(
+    wire: bool,
+    widths: tuple[int, ...] | None,
+    parents: tuple[int, ...],
+    accepted: bool,
+) -> None:
+    request = _request(
+        beam_params=_params(
+            beam_width=4,
+            max_tokens=len(parents),
+            dynamic_beam_widths=widths,
+            ignore_stop_tokens=widths is not None,
+        ),
+        output_options=_options(num_return_sequences=1),
+    )
+    validate_beam_batch_request(request)
+    result = BeamBatchResult(
+        request.protocol_version,
+        request.batch_id,
+        BeamBatchOutput(
+            tuple(
+                BeamRequestOutput(
+                    item.item_index,
+                    item.request.request_id,
+                    (
+                        BeamOutputSequence(
+                            tuple(range(10, 10 + len(parents))),
+                            -0.5,
+                            # A valid first item must not hide invalid lineage in
+                            # another request in the same logical batch.
+                            parents if item.item_index else (0,) * len(parents),
+                            "length",
+                            None,
+                        ),
+                    ),
+                )
+                for item in request.items
+            )
+        ),
+        None,
+    )
+    payload = MsgpackDecoder().decode(MsgpackEncoder().encode(result)) if wire else result
+    output = SimpleNamespace(kv_transfer_params={"gr_batch_result": payload})
+    if accepted:
+        assert _terminal_result(request, output) == result
+    else:
+        with pytest.raises(ValueError, match="invalid parent indices"):
+            _terminal_result(request, output)
+
+
 def test_result_rejects_invalid_finish_reason_and_bad_length_output() -> None:
     request = _request()
     invalid = BeamOutputSequence((1,), -1.0, (0,), "other", None)

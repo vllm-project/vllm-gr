@@ -24,6 +24,7 @@ from vllm_gr.config.validation import (
     validate_beam_execution_mode,
     validate_beam_graph_batch_size,
     validate_beam_graph_enabled,
+    validate_beam_graph_widths,
     validate_beam_max_decode_steps,
     validate_beam_max_width,
     validate_beam_online_batch_sizes,
@@ -54,6 +55,7 @@ VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
 SHORT_SUFFIX_ATTENTION_KEY: Final = "vllm_gr_enable_short_suffix_attention"
 BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
 BEAM_GRAPH_BATCH_SIZE_KEY: Final = "vllm_gr_beam_graph_batch_size"
+BEAM_GRAPH_WIDTHS_KEY: Final = "vllm_gr_beam_graph_widths"
 BEAM_ONLINE_BATCH_SIZES_KEY: Final = "vllm_gr_beam_online_batch_sizes"
 BEAM_MAX_WIDTH_KEY: Final = "vllm_gr_beam_max_width"
 BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
@@ -73,6 +75,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         BEAM_GRAPH_ENABLED_KEY,
         SHORT_SUFFIX_ATTENTION_KEY,
         BEAM_GRAPH_BATCH_SIZE_KEY,
+        BEAM_GRAPH_WIDTHS_KEY,
         BEAM_ONLINE_BATCH_SIZES_KEY,
         BEAM_MAX_WIDTH_KEY,
         BEAM_MAX_DECODE_STEPS_KEY,
@@ -91,6 +94,7 @@ _BEAM_KEYS: Final = frozenset(
         "graph_enabled",
         "enable_short_suffix_attention",
         "graph_batch_size",
+        "graph_widths",
         "online_batch_sizes",
         "max_width",
         "max_decode_steps",
@@ -201,6 +205,7 @@ def gr_config_from_mapping(
             beam_raw.get("enable_short_suffix_attention", False)
         ),
         beam_graph_batch_size=validate_beam_graph_batch_size(beam_raw.get("graph_batch_size", 1)),
+        beam_graph_widths=validate_beam_graph_widths(beam_raw.get("graph_widths")),
         beam_online_batch_sizes=validate_beam_online_batch_sizes(
             beam_raw.get("online_batch_sizes", DEFAULT_ONLINE_BATCH_SIZES)
         ),
@@ -258,6 +263,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         beam["enable_short_suffix_attention"] = True
     if config.beam_graph_batch_size != 1:
         beam["graph_batch_size"] = config.beam_graph_batch_size
+    if config.beam_graph_widths is not None:
+        beam["graph_widths"] = list(config.beam_graph_widths)
     if config.beam_online_batch_sizes != DEFAULT_ONLINE_BATCH_SIZES:
         beam["online_batch_sizes"] = list(config.beam_online_batch_sizes)
     # Keep omitted values omitted so existing schema-v1 artifacts round-trip
@@ -372,6 +379,7 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_graph_batch_size=validate_beam_graph_batch_size(
             additional_config.get(BEAM_GRAPH_BATCH_SIZE_KEY, 1)
         ),
+        beam_graph_widths=validate_beam_graph_widths(additional_config.get(BEAM_GRAPH_WIDTHS_KEY)),
         beam_online_batch_sizes=validate_beam_online_batch_sizes(
             additional_config.get(BEAM_ONLINE_BATCH_SIZES_KEY, DEFAULT_ONLINE_BATCH_SIZES)
         ),
@@ -464,6 +472,11 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(BEAM_GRAPH_BATCH_SIZE_KEY, None)
     else:
         additional_config[BEAM_GRAPH_BATCH_SIZE_KEY] = gr_config.beam_graph_batch_size
+
+    if gr_config.beam_graph_widths is None:
+        additional_config.pop(BEAM_GRAPH_WIDTHS_KEY, None)
+    else:
+        additional_config[BEAM_GRAPH_WIDTHS_KEY] = list(gr_config.beam_graph_widths)
 
     if gr_config.beam_max_width is None:
         additional_config.pop(BEAM_MAX_WIDTH_KEY, None)

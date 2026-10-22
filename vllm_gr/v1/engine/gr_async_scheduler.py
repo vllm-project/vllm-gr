@@ -273,7 +273,7 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
         validate_gr_request(request, config=config)
         if config is not None:
             validate_gr_execution_config(config)
-            validate_gr_device_config(config)
+            validate_gr_device_config(config, request)
     except ValueError as error:
         raise GRAdmissionError(str(error)) from error
     session_id = request.batch_id

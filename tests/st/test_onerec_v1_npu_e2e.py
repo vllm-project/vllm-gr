@@ -107,6 +107,8 @@ def _assert_exact_prefill(prefill: dict[str, Any], label: str) -> None:
 def _build_constraint_artifact(
     model: str,
     artifact: Path,
+    *,
+    beam_width: int = _BEAM_WIDTH,
 ) -> tuple[Any, str, str, set[tuple[int, int, int]]]:
     from transformers import AutoConfig, AutoTokenizer
 
@@ -119,7 +121,7 @@ def _build_constraint_artifact(
     vocab_size = AutoConfig.from_pretrained(model, trust_remote_code=True).vocab_size
     triples = [
         [f"<s_a_{a}>", f"<s_b_{b}>", f"<s_c_{c}>"]
-        for a, b, c in product(range(_BEAM_WIDTH), range(4), range(4))
+        for a, b, c in product(range(beam_width), range(4), range(4))
     ]
     tokenizer_digest = compute_tokenizer_digest(tokenizer)
     table = ConstraintTableArtifactCompiler(

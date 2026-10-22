@@ -167,7 +167,7 @@ class NPUEagerStagePlan:
             raise BeamExecutionContractError("input_ids has insufficient Decode capacity")
         if positions.ndim != 1 or positions.numel() < rows:
             raise BeamExecutionContractError("positions has insufficient Decode capacity")
-        expected = (self.execution.batch_size, self.execution.beam_width)
+        expected = (self.execution.batch_size, self.execution.input_width)
         if tuple(winner_token_ids.shape) not in (expected, (rows,)):
             raise BeamExecutionContractError(
                 f"winner_token_ids must have shape {expected} or ({rows},)"
@@ -279,7 +279,7 @@ class NPUEagerFirstDecodeHandoff:
         winner_token_ids: torch.Tensor,
     ) -> NPUEagerFirstDecodeHandoff:
         execution = prefill_plan.execution
-        expected = (execution.batch_size, execution.beam_width)
+        expected = (execution.batch_size, execution.output_width)
         if execution.kind != "prefill":
             raise BeamExecutionContractError("winner handoff requires a Prefill plan")
         if tuple(winner_token_ids.shape) != expected:

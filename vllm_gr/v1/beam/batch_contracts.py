@@ -63,6 +63,10 @@ class BeamBatchParams(
     constraint_resource_id: str = DEFAULT_CONSTRAINT_RESOURCE_ID
     length_penalty: float = 1.0
     catalog_strategy: Literal["fill", "null"] | None = None
+    # A new decoder accepts old arrays through this trailing default. New
+    # arrays still include this field, so old strict decoders reject them even
+    # for fixed-width calls. All participating processes need the same schema.
+    dynamic_beam_widths: tuple[int, ...] | None = None
 
 
 class BeamOutputOptions(
@@ -259,6 +263,18 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
     if beam_width > MAX_BEAM_WIDTH:
         _fail(f"beam_params.beam_width must be <= {MAX_BEAM_WIDTH}, got {beam_width}")
     _positive_int("beam_params.max_tokens", params.max_tokens)
+    widths = params.dynamic_beam_widths
+    if widths is not None:
+        if (
+            params.max_tokens not in (1, 2, 3)
+            or not isinstance(widths, tuple)
+            or len(widths) != params.max_tokens
+        ):
+            _fail("beam_params.dynamic_beam_widths must contain one immutable width per step")
+        for index, width in enumerate(widths):
+            normalized = _positive_int(f"beam_params.dynamic_beam_widths[{index}]", width)
+            if normalized > beam_width:
+                _fail("beam_params.dynamic_beam_widths entries must not exceed beam_width")
     if (
         isinstance(params.temperature, bool)
         or not isinstance(params.temperature, (int, float))
@@ -299,7 +315,7 @@ def _validate_output_options(options: BeamOutputOptions, *, beam_width: int) -> 
     )
     if num_sequences > beam_width:
         _fail(
-            "output_options.num_return_sequences must be <= beam_params.beam_width "
+            "output_options.num_return_sequences must be <= the final retained beam width "
             f"({beam_width}), got {num_sequences}"
         )
     _bool("output_options.include_stop_token", options.include_stop_token)
@@ -323,7 +339,11 @@ def validate_beam_batch_request(request: BeamBatchRequest) -> None:
     _validate_beam_params(request.beam_params)
     _validate_output_options(
         request.output_options,
-        beam_width=request.beam_params.beam_width,
+        beam_width=(
+            request.beam_params.beam_width
+            if request.beam_params.dynamic_beam_widths is None
+            else request.beam_params.dynamic_beam_widths[-1]
+        ),
     )
     if not request.items:
         _fail("items must contain at least one BeamBatchItem")

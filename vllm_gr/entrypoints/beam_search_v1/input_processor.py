@@ -98,7 +98,7 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
 
     try:
         validate_gr_execution_config(vllm_config)
-        validate_gr_device_config(vllm_config)
+        validate_gr_device_config(vllm_config, request)
         validate_gr_request(request, config=vllm_config)
     except ValueError as error:
         raise BeamSearchRequestError(str(error)) from error
@@ -174,6 +174,26 @@ def _create_batch_request(
     sampling_params = engine_request.sampling_params
     if sampling_params is None or sampling_params.max_tokens is None:
         raise BeamSearchRequestError("beam_search_v1 requires sampling parameters with max_tokens")
+    dynamic_widths = getattr(params, "dynamic_beam_widths", None)
+    result_width = getattr(params, "result_width", None)
+    device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
+    if str(device).split(":")[0] != "npu" and (
+        dynamic_widths is not None or result_width is not None
+    ):
+        raise BeamSearchRequestError(
+            "dynamic_beam_widths and result_width require NPU beam_search_v1"
+        )
+    if dynamic_widths is not None and (
+        not isinstance(dynamic_widths, list)
+        or len(dynamic_widths) != sampling_params.max_tokens
+        or any(
+            type(width) is not int or not 1 <= width <= params.beam_width
+            for width in dynamic_widths
+        )
+    ):
+        raise BeamSearchRequestError(
+            "dynamic_beam_widths must contain one integer in [1, beam_width] per effective step"
+        )
     # Native processing merges generation_config EOS IDs and stores the primary
     # EOS separately. Beam metadata must describe the same effective stop set.
     stop_token_ids = set(sampling_params.stop_token_ids or ())
@@ -188,9 +208,15 @@ def _create_batch_request(
         constraint_resource_id=DEFAULT_CONSTRAINT_RESOURCE_ID,
         length_penalty=params.length_penalty,
         catalog_strategy=getattr(params, "catalog_strategy", None),
+        dynamic_beam_widths=None if dynamic_widths is None else tuple(dynamic_widths),
+    )
+    final_width = (
+        batch_params.beam_width
+        if batch_params.dynamic_beam_widths is None
+        else batch_params.dynamic_beam_widths[-1]
     )
     output_options = BeamOutputOptions(
-        num_return_sequences=batch_params.beam_width,
+        num_return_sequences=final_width if result_width is None else result_width,
         include_stop_token=bool(getattr(params, "include_stop_str_in_output", False)),
         include_cumulative_logprob=True,
         # Public offline/online outputs expose sequences and scores only.

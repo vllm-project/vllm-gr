@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -96,6 +97,29 @@ def test_online_batch_sizes_round_trip(sizes: list[int], tmp_path: Path) -> None
 def test_online_batch_sizes_default_and_normalization() -> None:
     assert GRConfig().beam_online_batch_sizes == DEFAULT_ONLINE_BATCH_SIZES == (1, 2, 4)
     assert GRConfig(beam_online_batch_sizes=(7, 1, 3)).beam_online_batch_sizes == (1, 3, 7)
+
+
+@pytest.mark.parametrize("canonical", [False, True])  # type: ignore[misc]
+def test_graph_widths_and_online_batch_sizes_survive_transport(
+    tmp_path: Path, canonical: bool
+) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    beam = raw["beam"]
+    assert isinstance(beam, dict)
+    beam.update(graph_widths=[8, 16, 32], online_batch_sizes=[1, 3, 7])
+    config = gr_config_from_mapping(raw)
+    assert gr_config_to_mapping(config) == raw
+
+    host = SimpleNamespace(additional_config={})
+    if canonical:
+        write_canonical_gr_config(host, config)
+    else:
+        replace(config, constraint_table=None).write_to_vllm_config(host)
+    restored = GRConfig.from_vllm_config(
+        SimpleNamespace(additional_config=json.loads(json.dumps(host.additional_config)))
+    )
+    assert restored.beam_graph_widths == (8, 16, 32)
+    assert restored.beam_online_batch_sizes == (1, 3, 7)
 
 
 @pytest.mark.parametrize("max_num_seqs", [1, 2, 3])  # type: ignore[misc]

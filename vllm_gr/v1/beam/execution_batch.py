@@ -60,8 +60,8 @@ class BeamBatchExecutionView:
     """Immutable logical-request to physical-row mapping for one GR stage.
 
     Prefill has one execution row per request. Decode uses request-major
-    B * W rows, so physical row r * W + b always belongs to logical request r
-    and its local Beam row b.
+    B * input_width rows. beam_width is the session's immutable storage
+    capacity; dynamic stages may consume and retain different active widths.
     """
 
     session_id: str
@@ -74,6 +74,7 @@ class BeamBatchExecutionView:
     num_prompt_tokens_by_request: tuple[int, ...]
     beam_width: int
     produces_output: bool
+    dynamic_beam_widths: tuple[int, ...] | None = None
     row_request_indices: tuple[int, ...] = field(init=False)
     row_beam_indices: tuple[int, ...] = field(init=False)
     prompt_token_offsets: tuple[int, ...] = field(init=False)
@@ -85,6 +86,13 @@ class BeamBatchExecutionView:
         _non_negative_int("stage_index", self.stage_index)
         _non_negative_int("owner_generation", self.owner_generation)
         width = _positive_int("beam_width", self.beam_width)
+        if self.dynamic_beam_widths is not None:
+            widths = _immutable_tuple("dynamic_beam_widths", self.dynamic_beam_widths)
+            if len(widths) not in (1, 2, 3) or self.stage_index >= len(widths):
+                _fail("dynamic_beam_widths must cover every stage in a 1/2/3-step session")
+            for index, active_width in enumerate(widths):
+                if _positive_int(f"dynamic_beam_widths[{index}]", active_width) > width:
+                    _fail("dynamic_beam_widths entries must not exceed beam_width")
         if not isinstance(self.produces_output, bool):
             _fail(f"produces_output must be a bool, got {self.produces_output!r}")
 
@@ -120,7 +128,7 @@ class BeamBatchExecutionView:
                 _fail("Decode requires stage_index>0 and decode_step=stage_index-1")
             if not self.produces_output:
                 _fail("Decode must produce output")
-            rows_per_request = width
+            rows_per_request = self.input_width
         else:
             _fail(f"kind must be 'prefill' or 'decode', got {self.kind!r}")
 
@@ -163,6 +171,7 @@ class BeamBatchExecutionView:
             num_prompt_tokens_by_request=cast(tuple[int, ...], prompt_counts),
             beam_width=cast(int, _attribute(params, "beam_width")),
             produces_output=cast(bool, _attribute(metadata, "produces_output")),
+            dynamic_beam_widths=getattr(params, "dynamic_beam_widths", None),
         )
 
         total_prompt_tokens = _positive_int(
@@ -182,7 +191,29 @@ class BeamBatchExecutionView:
 
     @property
     def rows_per_request(self) -> int:
-        return 1 if self.kind == "prefill" else self.beam_width
+        return self.input_width
+
+    @property
+    def input_width(self) -> int:
+        """Actual parent rows per request consumed by this stage."""
+        if self.kind == "prefill":
+            return 1
+        if self.dynamic_beam_widths is None:
+            return self.beam_width
+        return self.dynamic_beam_widths[self.stage_index - 1]
+
+    @property
+    def output_width(self) -> int:
+        """Winners retained after this stage, independently of parent width."""
+        if self.dynamic_beam_widths is None:
+            return self.beam_width
+        return self.dynamic_beam_widths[self.stage_index]
+
+    @property
+    def candidate_top_k(self) -> int:
+        # Taking fewer than the target width per parent can lose global Top-K
+        # winners when a schedule expands after an earlier pruning step.
+        return self.output_width
 
     @property
     def num_execution_rows(self) -> int:
@@ -238,6 +269,7 @@ class BeamBatchExecutionView:
             self.request_ids,
             self.num_prompt_tokens_by_request,
             self.beam_width,
+            self.dynamic_beam_widths,
         )
         other_identity = (
             other.session_id,
@@ -245,6 +277,7 @@ class BeamBatchExecutionView:
             other.request_ids,
             other.num_prompt_tokens_by_request,
             other.beam_width,
+            other.dynamic_beam_widths,
         )
         if other_identity != identity:
             _fail("logical Beam batch identity changed across stages")
@@ -259,13 +292,13 @@ class BeamBatchExecutionView:
 
         if self.kind != "decode":
             _fail("parent rows are only defined for Decode")
-        if len(parent_rows) != self.num_execution_rows:
-            _fail("parent_rows must contain one parent per Decode row")
+        if len(parent_rows) != self.batch_size * self.output_width:
+            _fail("parent_rows must contain one parent per output Beam row")
         local: list[int] = []
         for child_row, parent_row in enumerate(parent_rows):
             if not _is_int(parent_row) or not 0 <= parent_row < self.num_execution_rows:
                 _fail(f"parent_rows[{child_row}] is outside the Decode row range")
-            child_request = self.row_request_indices[child_row]
+            child_request = child_row // self.output_width
             parent_request = self.row_request_indices[parent_row]
             if parent_request != child_request:
                 _fail(f"parent_rows[{child_row}] crosses a logical request boundary")

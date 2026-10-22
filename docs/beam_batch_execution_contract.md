@@ -58,6 +58,22 @@ The codec supports typed round trips for all three values. This specifies their
 serialization; it does not claim that a production transport channel exists in
 this change.
 
+### Deployment compatibility
+
+All frontend, EngineCore, and Worker processes participating in Beam execution
+must use the same code and schema revision. Stop and restart these processes as
+one deployment; mixed-revision operation and rolling upgrades are unsupported
+for both fixed-width and dynamic-width Beam requests. A matching
+`protocol_version == 1` alone does not establish schema compatibility.
+
+`BeamBatchParams` uses an array-like MsgPack struct with strict unknown-field
+validation. Its appended `dynamic_beam_widths` field has a default so a new
+decoder can read an older, shorter array. However, array encoding still emits
+the trailing field when its value is `None`; an old strict decoder rejects that
+new array even for a fixed-width request. Supporting rolling upgrades would
+require capability negotiation and compatible encoding, not just a protocol
+number change or relaxing validation.
+
 ### Request
 
 ```python
@@ -73,6 +89,9 @@ class BeamBatchParams:
     stop_token_ids: tuple[int, ...]
     ignore_stop_tokens: bool
     constraint_resource_id: str = "default"
+    length_penalty: float = 1.0
+    catalog_strategy: Literal["fill", "null"] | None = None
+    dynamic_beam_widths: tuple[int, ...] | None = None
 
 
 class BeamOutputOptions:
@@ -381,6 +400,15 @@ state or perform a KV reorder.
 For equal final scores from different generations, the earlier generation wins;
 the per-generation logical flat index breaks the remaining tie. There is no
 length penalty or final token-sequence deduplication in protocol version 1.
+
+The production NPU V1 dynamic-width path has a narrower, fixed-horizon scope:
+the frontend requires `ignore_eos=True`, and engine admission requires
+`ignore_stop_tokens=True`. Every surviving path within a request generates the
+same number of tokens (N=1, 2, or 3). Consequently final length normalization
+applies one common denominator, and selecting Top-R by cumulative log
+probability before normalization preserves ranking. This does not extend to
+variable-length early completion, which needs separate ranking semantics; the
+generic CPU reference above continues to cover stop completion independently.
 
 Raw-logit ties inside a per-parent Constraint TopK operation are outside this
 change. The CPU reference assumes each parent row already has a deterministic

@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 from functools import wraps
+from time import perf_counter
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -518,6 +520,7 @@ def _capture_create_dummy_context_npu(
     width: int,
     steps_upper: int,
     prefix_len: int,
+    context=None,
 ) -> tuple:
     """Create an exact-B context and production NPU attention facade.
 
@@ -542,19 +545,27 @@ def _capture_create_dummy_context_npu(
         owner_generation=0,
         request_ids=request_ids,
         num_prompt_tokens_by_request=(prefix_len,) * batch_size,
-        beam_width=width,
+        beam_width=int(gr_cfg.beam_max_width),
         produces_output=True,
+        dynamic_beam_widths=(width, width, width) if width != int(gr_cfg.beam_max_width) else None,
     )
-    context = _create_beam_context(runner, gr_cfg, max_batch=batch_size)
+    if context is None:
+        context = _create_beam_context(runner, gr_cfg, max_batch=batch_size)
+        if getattr(gr_cfg, "beam_graph_widths", None) is not None:
+            from vllm_gr.v1.beam.npu_dynamic_beam import (
+                initialize_npu_packed_stage_pools,
+            )
+
+            initialize_npu_packed_stage_pools(context)
     sessions = []
     for request_id in request_ids:
         slot = context.registry.allocate(
             request_id,
-            beam_width=width,
+            beam_width=int(gr_cfg.beam_max_width),
             prefix_len=prefix_len,
         )
         session = BeamSearchSession(session_id=request_id, slot=slot, context=context)
-        session.begin_session(width, prefix_len)
+        session.begin_session(int(gr_cfg.beam_max_width), prefix_len)
         sessions.append(session)
     attention_batch = NPUBeamExecutionBatch(execution, sessions)
 
@@ -689,32 +700,21 @@ def _dummy_beam_forward_npu(
 
 
 def _verify_and_record_captured_graph_npu(runner, width: int) -> bool:
-    """Confirm an ACL graph was captured for the beam descriptor; record width.
-
-    Walks ``ACLGraphWrapper._all_instances`` looking for a FULL-mode entry
-    keyed by ``BatchDescriptor(num_tokens=width, uniform=True)``.  On a hit,
-    records ``width`` in ``runner._beam_graph_keys`` for the O(1) runtime
-    lookup used by ``_beam_full_graph_ready``.
-    """
-    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
-    from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
-
-    desc = BatchDescriptor(num_tokens=width, uniform=True)
-    for wrapper in ACLGraphWrapper._all_instances:
-        if wrapper.runtime_mode != CUDAGraphMode.FULL:
-            continue
-        entry = wrapper.concrete_aclgraph_entries.get(desc)
-        if entry is not None and entry.aclgraph is not None:
-            beam_keys = getattr(runner, "_beam_graph_keys", None)
-            if beam_keys is None:
-                beam_keys = set()
-                runner._beam_graph_keys = beam_keys
-            beam_keys.add(width)
-            return True
-    return False
+    """Record only graphs owned by this runner's installed Beam wrapper."""
+    beam_model = getattr(runner, "_gr_npu_graph_model", None)
+    if beam_model is None or getattr(runner, "model", None) is not beam_model:
+        return False
+    if not beam_model.graph_ready(width):
+        return False
+    keys = getattr(runner, "_beam_graph_keys", None)
+    if keys is None:
+        keys = set()
+        runner._beam_graph_keys = keys
+    keys.add(width)
+    return True
 
 
-def capture_beam_decode_graph(runner) -> bool:
+def _capture_beam_decode_graph_width(runner, width: int) -> bool:
     """Startup dummy capture of the beam-decode FULL ACL graph (NPU).
 
     Runs once after ``capture_model()`` when the GRConfig beam graph is
@@ -772,10 +772,16 @@ def capture_beam_decode_graph(runner) -> bool:
     # Capture one exact logical-B shape; other B values keep native
     # PIECEWISE/NONE dispatch. Never pad inactive rows into Beam state/KV ownership.
     batch_size = int(getattr(gr_cfg, "beam_graph_batch_size", 1))
-    width = int(gr_cfg.beam_max_width)
     num_tokens = batch_size * width
+    from vllm_gr.v1.worker.npu_beam_decode_graph import install_npu_beam_graph_model
+
+    # The implicit capacity-width capture needs the same isolation as explicit
+    # stage widths. Install before the cached-shape check and verify ownership.
+    install_npu_beam_graph_model(runner)
     captured_shapes = getattr(runner, "_gr_npu_beam_graph_shapes", set())
-    if (batch_size, width) in captured_shapes and _beam_full_graph_ready(runner, num_tokens):
+    if (batch_size, width) in captured_shapes and _verify_and_record_captured_graph_npu(
+        runner, num_tokens
+    ):
         return True
 
     scheduler_config = getattr(runner, "scheduler_config", None)
@@ -809,7 +815,13 @@ def capture_beam_decode_graph(runner) -> bool:
     prefix_len = min(_BEAM_CAPTURE_PREFIX_LEN, model_capacity - width)
 
     context, attention_batch, beam_info, batch_descriptor = _capture_create_dummy_context_npu(
-        runner, gr_cfg, batch_size, width, steps_upper, prefix_len
+        runner,
+        gr_cfg,
+        batch_size,
+        width,
+        steps_upper,
+        prefix_len,
+        getattr(runner, "_gr_npu_graph_context", None),
     )
     runner._gr_npu_graph_context = context
     runner._gr_npu_graph_batch_size = batch_size
@@ -853,11 +865,18 @@ def capture_beam_decode_graph(runner) -> bool:
 
             captured = _verify_and_record_captured_graph_npu(runner, num_tokens)
             if captured:
+                if getattr(context, "_npu_packed_width_pools", None) is not None:
+                    context._npu_beam_graph_captured = True
                 shapes = getattr(runner, "_gr_npu_beam_graph_shapes", None)
                 if shapes is None:
                     shapes = set()
                     runner._gr_npu_beam_graph_shapes = shapes
                 shapes.add((batch_size, width))
+                contexts = getattr(runner, "_gr_npu_graph_contexts", None)
+                if contexts is None:
+                    contexts = {}
+                    runner._gr_npu_graph_contexts = contexts
+                contexts[(batch_size, width)] = context
     finally:
         set_cudagraph_capturing_enabled(False)
         # Drop the dummy session even if capture threw.  The context and
@@ -883,6 +902,58 @@ def capture_beam_decode_graph(runner) -> bool:
             batch_size,
             width,
             num_tokens,
+        )
+    return captured
+
+
+def _retained_npu_suffix_kv_bytes(runner: Any) -> int:
+    """Count unique retained suffix-bank storages, excluding graph/scratch memory."""
+    contexts = list(getattr(runner, "_gr_npu_graph_contexts", {}).values())
+    context = getattr(runner, "_gr_npu_graph_context", None)
+    if context is not None:
+        contexts.append(context)
+    storages: dict[tuple[Any, int], int] = {}
+    for context in contexts:
+        banks = [getattr(context, "pools", ())]
+        banks.extend(getattr(context, "_npu_beam_width_pools", {}).values())
+        for pools in banks:
+            for pool in pools:
+                for tensor in (pool.unshared_key, pool.unshared_value):
+                    storage = tensor.untyped_storage()
+                    storages[(tensor.device, storage.data_ptr())] = storage.nbytes()
+    return sum(storages.values())
+
+
+def capture_beam_decode_graph(runner: Any) -> bool:
+    """Capture configured widths over private graphs and stable suffix banks."""
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    config = _get_gr_config(runner)
+    if not config.beam_graph_active:
+        return False
+    widths = set(getattr(config, "beam_graph_widths", None) or ())
+    widths.add(int(config.beam_max_width))
+    selected_widths = sorted(widths, reverse=True)
+    logger.info(
+        "vllm-gr: NPU Beam graph capture widths=%s (count=%d, B=%d)",
+        selected_widths,
+        len(selected_widths),
+        int(getattr(config, "beam_graph_batch_size", 1)),
+    )
+    started = perf_counter()
+    captured = False
+    try:
+        for width in selected_widths:
+            captured = _capture_beam_decode_graph_width(runner, width) or captured
+    finally:
+        shapes = sorted(getattr(runner, "_gr_npu_beam_graph_shapes", ()))
+        logger.info(
+            "vllm-gr: NPU Beam graph capture finished in %.3f s; captured "
+            "(B, W)=%s; retained suffix-KV bank storage=%.3f MiB "
+            "(excludes graph and scratch memory)",
+            perf_counter() - started,
+            shapes,
+            _retained_npu_suffix_kv_bytes(runner) / (1024 * 1024),
         )
     return captured
 

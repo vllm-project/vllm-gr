@@ -154,13 +154,22 @@ def validate_gr_execution_runtime(config: Any) -> None:
         raise ValueError("Asynchronous scheduling does not support quantization")
 
 
-def validate_gr_device_config(config: Any) -> None:
+def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = None) -> None:
     """Reject unavailable adapters without importing a device runtime."""
     device = getattr(getattr(config, "device_config", None), "device", None)
     if device is not None and str(device).split(":")[0] not in ("cuda", "npu"):
         raise ValueError(
             "Asynchronous scheduling requires a CUDA ModelRunner or NPU ModelRunner V1"
         )
+    if (
+        request is not None
+        and str(device).split(":")[0] != "npu"
+        and (
+            request.beam_params.dynamic_beam_widths is not None
+            or request.output_options.num_return_sequences != request.beam_params.beam_width
+        )
+    ):
+        raise ValueError("dynamic beam widths and result widths require NPU beam_search_v1")
 
 
 def validate_gr_request(request: BeamBatchRequest, *, config: Any = None) -> None:
@@ -529,6 +538,11 @@ def validate_dispatch(
         ):
             raise ValueError("GR dispatch flags and step have invalid types")
         params = m.beam_params
+        if (
+            params.dynamic_beam_widths is not None
+            and len(params.dynamic_beam_widths) != params.max_tokens
+        ):
+            raise ValueError("dynamic_beam_widths must contain one width per effective step")
         capacity = m.execution_capacity or GRExecutionCapacity(params.beam_width)
         capacity.validate(params)
         if (

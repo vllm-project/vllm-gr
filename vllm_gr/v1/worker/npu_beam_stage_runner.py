@@ -66,11 +66,27 @@ class NPUEagerBeamStageRunner:
         self.decode_candidates: Any = None
         self.logits: torch.Tensor | None = None
         self.attention_batch: NPUBeamExecutionBatch | None = None
+        self.dynamic_state: Any = None
         self.closed = False
 
     def _metadata(self, scheduler_output: Any) -> Any:
         mapping = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR)
         return next(iter(mapping.values()))
+
+    def _uses_dynamic_state(self, plan: NPUEagerStagePlan) -> bool:
+        metadata = self._metadata(self.worker._current_scheduler_output)
+        output_options = getattr(metadata, "output_options", None)
+        capacity = plan.execution.beam_width
+        widths = plan.execution.dynamic_beam_widths
+        # Preserve native fixed-width execution and its tie ordering. The
+        # fused multi-step final selector requires a multiple of 32 results.
+        native_schedule = widths is None or (
+            all(width == capacity for width in widths) and (len(widths) == 1 or capacity % 32 == 0)
+        )
+        return (
+            not native_schedule
+            or getattr(output_options, "num_return_sequences", capacity) != capacity
+        )
 
     def _validate_sequence(self, plan: NPUEagerStagePlan) -> None:
         current = plan.execution
@@ -92,6 +108,10 @@ class NPUEagerBeamStageRunner:
     def _ensure_attention_batch(self, plan: NPUEagerStagePlan) -> None:
         if self.attention_batch is not None:
             self.attention_batch.execution.assert_same_logical_batch(plan.execution)
+            if plan.execution.dynamic_beam_widths is not None:
+                self.attention_batch = NPUBeamExecutionBatch(
+                    plan.execution, self.attention_batch.sessions
+                )
             return
         from vllm_gr.v1.worker.model_runner_common import (
             _create_beam_context,
@@ -105,14 +125,19 @@ class NPUEagerBeamStageRunner:
         required_steps = self._metadata(
             self.worker._current_scheduler_output
         ).beam_params.max_tokens
-        shape = (execution.batch_size, execution.beam_width)
+        shape = (execution.batch_size, execution.input_width)
         captured_shapes = getattr(
             self.worker,
             "_gr_npu_beam_graph_shapes",
             set(),
         )
         graph_context = getattr(self.worker, "_gr_npu_graph_context", None)
-        if shape in captured_shapes:
+        use_graph_context = shape in captured_shapes or (
+            execution.dynamic_beam_widths is not None
+            and graph_context is not None
+            and graph_context.max_batch == execution.batch_size
+        )
+        if use_graph_context:
             if (
                 graph_context is None
                 or graph_context.max_batch != execution.batch_size
@@ -134,9 +159,27 @@ class NPUEagerBeamStageRunner:
                     config,
                     max_batch=execution.batch_size,
                 )
+                if getattr(
+                    config, "beam_graph_widths", None
+                ) is not None or self._uses_dynamic_state(plan):
+                    from vllm_gr.v1.beam.npu_dynamic_beam import (
+                        initialize_npu_packed_stage_pools,
+                    )
+
+                    initialize_npu_packed_stage_pools(context)
                 self.worker._gr_npu_eager_context = context
         if required_steps > context.decision.sequence.shape[2]:
             raise ValueError("NPU Beam history exceeds the configured Decode capacity")
+        if self._uses_dynamic_state(plan):
+            from vllm_gr.v1.beam.npu_dynamic_beam import prune_npu_stage_pools
+
+            widths = execution.dynamic_beam_widths or (execution.beam_width,) * required_steps
+            keep_widths = set(widths[:-1])
+            if context is graph_context:
+                keep_widths.update(
+                    width for batch, width in captured_shapes if batch == execution.batch_size
+                )
+            prune_npu_stage_pools(context, keep_widths)
         sessions = []
         for request_id, prompt_len in zip(
             execution.request_ids,
@@ -151,6 +194,16 @@ class NPUEagerBeamStageRunner:
             session.begin_session(execution.beam_width, prompt_len)
             sessions.append(session)
         self.attention_batch = NPUBeamExecutionBatch(execution, sessions)
+        if self._uses_dynamic_state(plan):
+            from vllm_gr.v1.beam.npu_dynamic_beam import NPUDynamicBeamState
+
+            if self.previous is None or self.previous.kind != "prefill":
+                raise RuntimeError("dynamic NPU Beam state requires the preceding Prefill")
+            self.dynamic_state = NPUDynamicBeamState(context, execution.batch_size, required_steps)
+            self.dynamic_state.initialize(self.prefill_candidates, self.previous.output_width)
+            self.worker._beam_context = context
+            self.worker._beam_sessions = {session.session_id: session for session in sessions}
+            return
         width = execution.beam_width
         candidates = self.prefill_candidates
         initial_scores = candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf"))
@@ -171,9 +224,9 @@ class NPUEagerBeamStageRunner:
                 "cache_len": prompt_len,
                 "max_decode_steps": metadata.beam_params.max_tokens,
                 "is_beam_decode": True,
-                "beam_width": execution.beam_width,
+                "beam_width": execution.input_width,
                 "beam_decode_steps": step + 1,
-                "parent_beam_ids": [0] * execution.beam_width,
+                "parent_beam_ids": [0] * execution.input_width,
                 "decode_step": step,
             }
             for request_id, prompt_len in zip(
@@ -192,7 +245,7 @@ class NPUEagerBeamStageRunner:
             return scheduler_output
         runtime = copy(scheduler_output)
         runtime.num_scheduled_tokens = {
-            request_id: plan.execution.beam_width for request_id in plan.execution.request_ids
+            request_id: plan.execution.input_width for request_id in plan.execution.request_ids
         }
         runtime.total_num_scheduled_tokens = plan.model_token_count
         return runtime
@@ -233,6 +286,8 @@ class NPUEagerBeamStageRunner:
             assert self.attention_batch is not None
             for session in self.attention_batch.sessions:
                 session._state.is_last_step = bool(metadata.is_last_stage)
+                if self._uses_dynamic_state(plan):
+                    session._state.decode_step = plan.execution.decode_step
             beam_data = self._beam_data(plan, metadata)
             beam_info = {
                 "beam_data": beam_data,
@@ -295,7 +350,7 @@ class NPUEagerBeamStageRunner:
         prepared_output = scheduler_output
         prepared_counts = num_scheduled_tokens
         if execution.kind == "decode":
-            physical = {request_id: execution.beam_width for request_id in execution.request_ids}
+            physical = {request_id: execution.input_width for request_id in execution.request_ids}
             prepared_output.num_scheduled_tokens = physical
             prepared_output.total_num_scheduled_tokens = plan.model_token_count
             if (
@@ -304,7 +359,7 @@ class NPUEagerBeamStageRunner:
                 or num_scheduled_tokens.dtype != np.int32
             ):
                 raise TypeError("NPU Decode counts must be an int32 ndarray of logical batch size")
-            prepared_counts = np.full_like(num_scheduled_tokens, execution.beam_width)
+            prepared_counts = np.full_like(num_scheduled_tokens, execution.input_width)
 
         if self.worker._current_beam_info is not None:
             self.worker._current_beam_info["req_ids"] = list(execution.request_ids)
@@ -360,7 +415,7 @@ class NPUEagerBeamStageRunner:
                 device=self.logits.device,
             ),
             current_step=plan.execution.stage_index,
-            top_k=plan.execution.beam_width,
+            top_k=plan.execution.candidate_top_k,
         )
         backend = getattr(self.worker, "constraint_backend", None)
         if backend is None or not callable(getattr(backend, "select", None)):
@@ -368,7 +423,7 @@ class NPUEagerBeamStageRunner:
         candidates = self._select_constraint_candidates(backend, self.logits.contiguous(), metadata)
         expected = (
             plan.execution.num_execution_rows,
-            plan.execution.beam_width,
+            plan.execution.candidate_top_k,
         )
         if tuple(candidates.token_ids.shape) != expected:
             raise RuntimeError("NPU constraint backend returned an invalid candidate shape")
@@ -381,11 +436,13 @@ class NPUEagerBeamStageRunner:
             self.handoff = NPUEagerFirstDecodeHandoff.from_prefill(plan, candidates.token_ids)
             self.latest_token_ids = candidates.token_ids
             if is_last:
+                # The terminal builder filters invalid/non-finite scores and
+                # ranks all candidates before applying the return limit.
                 terminal_result = self._build_terminal_result(
                     candidates.token_ids.unsqueeze(2),
                     candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf")),
                     torch.zeros(
-                        (*candidates.token_ids.shape, 1),
+                        (execution.batch_size, execution.output_width, 1),
                         dtype=torch.int32,
                         device=candidates.token_ids.device,
                     ),
@@ -394,16 +451,32 @@ class NPUEagerBeamStageRunner:
             self.decode_candidates = candidates
             if self.attention_batch is None:
                 raise RuntimeError("Decode decision has no persistent attention batch")
-            decision = run_beam_decision_candidates(
-                self.worker,
-                self.attention_batch,
-                candidates.token_ids,
-                candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf")),
-                is_last_step=is_last,
-                result_width=execution.beam_width,
-            )
+            if self._uses_dynamic_state(plan):
+                if self.dynamic_state is None:
+                    raise RuntimeError("dynamic NPU Beam decision has no state")
+                decision = self.dynamic_state.select(
+                    candidates,
+                    execution.input_width,
+                    execution.output_width,
+                    execution.stage_index,
+                    is_last=is_last,
+                    result_width=stage_metadata.output_options.num_return_sequences
+                    if is_last
+                    else execution.output_width,
+                )
+                self.parent_history = decision["out_parent_history"]
+            else:
+                decision = run_beam_decision_candidates(
+                    self.worker,
+                    self.attention_batch,
+                    candidates.token_ids,
+                    candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf")),
+                    is_last_step=is_last,
+                    result_width=execution.beam_width,
+                )
             self.latest_token_ids = decision["out_token_ids"]
-            self._advance_parent_history(decision, execution.stage_index)
+            if not self._uses_dynamic_state(plan):
+                self._advance_parent_history(decision, execution.stage_index)
             if is_last:
                 assert self.parent_history is not None
                 terminal_result = self._build_terminal_result(
@@ -641,9 +714,13 @@ class NPUEagerBeamStageRunner:
             if self.attention_batch is None:
                 raise RuntimeError("Decode constraint selection has no Beam state")
             steps = plan.execution.stage_index
-            sequence = self.attention_batch.context.decision.sequence[
-                : plan.execution.batch_size, : plan.execution.beam_width, :steps
-            ]
+            dynamic_state = getattr(self, "dynamic_state", None)
+            if dynamic_state is not None:
+                sequence = dynamic_state.sequence[:, : plan.execution.input_width, :steps]
+            else:
+                sequence = self.attention_batch.context.decision.sequence[
+                    : plan.execution.batch_size, : plan.execution.input_width, :steps
+                ]
             prefixes[:, :steps].copy_(sequence.reshape(rows, steps))
         return prefixes
 

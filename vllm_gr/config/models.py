@@ -13,6 +13,9 @@ CONSTRAINT_TABLE_MAX_DECODE_STEPS = 3
 # runtime contract, and fused kernel on this single limit until wider kernels
 # are implemented and qualified end to end.
 MAX_BEAM_WIDTH = 256
+# Conservative startup resource policy, including the implicit max-width bank.
+# This bounds retained width count; it is not a guarantee that graphs fit memory.
+MAX_NPU_BEAM_GRAPH_WIDTHS = 8
 SUPPORTED_BEAM_BATCH_SIZES = tuple(range(1, 9))
 DEFAULT_ONLINE_BATCH_SIZES = (1, 2, 4)
 
@@ -172,6 +175,9 @@ class GRConfig:
     enable_short_suffix_attention: bool = False
     """Fuse CUDA suffix attention and prefix merging when explicitly enabled."""
 
+    beam_graph_widths: tuple[int, ...] | None = None
+    """Additional exact NPU Decode input widths to capture at startup."""
+
     beam_online_batch_sizes: tuple[int, ...] = DEFAULT_ONLINE_BATCH_SIZES
     """Online batching policy and default CUDA capture sizes, not engine capacity."""
 
@@ -182,6 +188,7 @@ class GRConfig:
             validate_beam_execution_mode,
             validate_beam_graph_batch_size,
             validate_beam_graph_enabled,
+            validate_beam_graph_widths,
             validate_beam_max_decode_steps,
             validate_beam_max_width,
             validate_beam_online_batch_sizes,
@@ -222,6 +229,21 @@ class GRConfig:
             validate_beam_graph_batch_size(self.beam_graph_batch_size),
         )
         object.__setattr__(self, "beam_max_width", validate_beam_max_width(self.beam_max_width))
+        object.__setattr__(
+            self, "beam_graph_widths", validate_beam_graph_widths(self.beam_graph_widths)
+        )
+        if self.beam_graph_widths is not None and (
+            self.beam_max_width is None or max(self.beam_graph_widths) > self.beam_max_width
+        ):
+            raise ValueError("beam.graph_widths requires max_width >= every captured width")
+        if self.beam_graph_active:
+            capture_widths = set(self.beam_graph_widths or ()) | {self.beam_max_width}
+            if len(capture_widths) > MAX_NPU_BEAM_GRAPH_WIDTHS:
+                raise ValueError(
+                    "beam.graph_widths allows at most "
+                    f"{MAX_NPU_BEAM_GRAPH_WIDTHS} captured widths including max_width, "
+                    f"got {len(capture_widths)}; use fewer widths or disable beam graphs"
+                )
         object.__setattr__(
             self,
             "beam_online_batch_sizes",

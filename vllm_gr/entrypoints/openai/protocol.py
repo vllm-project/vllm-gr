@@ -26,4 +26,6 @@ def to_beam_search_params(self, max_tokens: int, default_sampling_params: dict) 
         # Absent → None: the coordinator resolves the backend-appropriate
         # default (Trie: "fill"; Constraint Tables: None).
         catalog_strategy=extra_args.get("catalog_strategy"),
+        dynamic_beam_widths=extra_args.get("dynamic_beam_widths"),
+        result_width=extra_args.get("result_width"),
     )

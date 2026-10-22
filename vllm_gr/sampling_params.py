@@ -43,6 +43,10 @@ class BeamSearchParams(
     # historical "fill"; the Constraint Table backend rejects an explicit
     # value because candidate validity is enforced in the Worker.
     catalog_strategy: str | None = None
+    # NPU V1 only. Each entry is the number of winners retained after that
+    # generated token; beam_width remains the fixed storage capacity.
+    dynamic_beam_widths: list[int] | None = None
+    result_width: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -60,4 +64,36 @@ class BeamSearchParams(
                 f"catalog_strategy must be 'fill', 'null', or None, got {self.catalog_strategy!r}",
                 parameter="catalog_strategy",
                 value=self.catalog_strategy,
+            )
+        widths = self.dynamic_beam_widths
+        if widths is not None:
+            decode_steps = (
+                self.max_tokens
+                - int(self.begin_token is not None)
+                - int(self.end_token is not None)
+                if type(self.max_tokens) is int
+                else 0
+            )
+            if (
+                not isinstance(widths, list)
+                or decode_steps not in (1, 2, 3)
+                or len(widths) != decode_steps
+                or any(
+                    type(width) is not int or not 1 <= width <= self.beam_width for width in widths
+                )
+            ):
+                raise VLLMValidationError(
+                    "dynamic_beam_widths must contain one integer in [1, beam_width] "
+                    "per effective generation step (1, 2, or 3 steps)",
+                    parameter="dynamic_beam_widths",
+                    value=widths,
+                )
+        final_width = self.beam_width if widths is None else widths[-1]
+        if self.result_width is not None and (
+            type(self.result_width) is not int or not 1 <= self.result_width <= final_width
+        ):
+            raise VLLMValidationError(
+                f"result_width must be an integer in [1, {final_width}]",
+                parameter="result_width",
+                value=self.result_width,
             )

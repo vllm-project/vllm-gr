@@ -600,6 +600,50 @@ def test_beam_max_width_rejects_values_above_global_limit() -> None:
         GRConfig(beam_max_width=257)
 
 
+@pytest.mark.parametrize("widths", [tuple(range(1, 8)), (*range(1, 8), 128)])  # type: ignore[misc]
+def test_beam_graph_capture_limit_counts_implicit_capacity_once(
+    widths: tuple[int, ...],
+) -> None:
+    config = GRConfig(beam_max_width=128, beam_graph_widths=widths)
+    assert config.beam_graph_active
+    assert config.beam_graph_widths == widths
+
+
+@pytest.mark.parametrize("widths", [tuple(range(1, 9)), (*range(1, 9), 128)])  # type: ignore[misc]
+def test_beam_graph_capture_limit_rejects_more_than_eight_effective_widths(
+    widths: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="at most 8 captured widths including max_width"):
+        GRConfig(beam_max_width=128, beam_graph_widths=widths)
+
+
+def test_beam_graph_capture_limit_preserves_default_and_disabled_graphs() -> None:
+    assert GRConfig().beam_graph_widths is None
+    default = GRConfig(beam_max_width=128)
+    assert default.beam_graph_widths is None
+    assert default.beam_graph_active
+    disabled = GRConfig(
+        beam_graph_enabled=False,
+        beam_max_width=128,
+        beam_graph_widths=tuple(range(1, 129)),
+    )
+    assert not disabled.beam_graph_active
+    assert disabled.beam_graph_widths == tuple(range(1, 129))
+
+
+def test_canonical_beam_config_enforces_capture_limit_before_engine_start() -> None:
+    from vllm_gr.config import gr_config_from_mapping
+
+    with pytest.raises(ValueError, match="at most 8 captured widths including max_width"):
+        gr_config_from_mapping(
+            {
+                "schema_version": 1,
+                "constraint_table": {"max_top_k": 128},
+                "beam": {"max_width": 128, "graph_widths": list(range(1, 9))},
+            }
+        )
+
+
 def test_npu_beam_without_catalog_stays_unconstrained() -> None:
     """A catalog-free NPU GRLLM must not auto-promote to Constraint Tables.
 

@@ -31,7 +31,7 @@ class NPUBeamExecutionBatch:
         self.context = first.context
         self.slot = 0
         self.session_id = execution.session_id
-        self.request_width = execution.beam_width
+        self.request_width = execution.input_width
         self.beam_width = self.request_width
         self.batch_size = execution.batch_size
         self.attention_width = self.batch_size * self.request_width
@@ -40,13 +40,19 @@ class NPUBeamExecutionBatch:
             raise RuntimeError("NPU Beam batch slots must be contiguous and request ordered")
         if any(session.context is not self.context for session in self.sessions):
             raise RuntimeError("NPU Beam batch sessions must share one attention context")
-        if any(session.beam_width != self.request_width for session in self.sessions):
+        if any(session.beam_width != execution.beam_width for session in self.sessions):
             raise RuntimeError("NPU Beam batch sessions must use the fixed Beam width")
-        if self.context.max_beams != self.request_width:
-            raise RuntimeError("NPU Beam pool width must equal the execution width")
+        if self.context.max_beams != execution.beam_width:
+            raise RuntimeError("NPU Beam pool width must equal the execution capacity")
+
+        sources = self.context.pools
+        if execution.dynamic_beam_widths is not None:
+            from vllm_gr.v1.beam.npu_dynamic_beam import get_npu_stage_pools
+
+            sources = get_npu_stage_pools(self.context, self.request_width)
 
         self.pools = []
-        for source in self.context.pools:
+        for source in sources:
             pool = copy(source)
             pool.max_batch = 1
             pool.max_beams = self.attention_width
