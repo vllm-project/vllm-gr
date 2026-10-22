@@ -55,6 +55,7 @@ aligned with it.
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
 | GR-PATCH-016 | `vllm/utils/system_utils.py` | `npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
+| GR-PATCH-017 | `v1/worker/npu_memory_counters.py` | `install_npu_memory_counter_patch` | NPU worker initialization finds the supported native sampler and nested memory API | `tests/test_npu_memory_counters.py`; NPU worker lifecycle test | NPU worker |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -330,6 +331,44 @@ aligned with it.
   in the process that is about to create worker subprocesses.
 - Removal condition: upstream `_maybe_force_spawn()` covers NPU (or delegates the
   decision to the platform interface).
+
+### GR-PATCH-017 — NPU Worker Memory Counters
+
+- Source: `vllm_gr/v1/worker/npu_memory_counters.py`
+- Installer: `install_npu_memory_counter_patch`
+- Orchestration: `vllm_gr/v1/ascend_compat.py::patch_npu_worker_init_device`
+- Target: `NPUWorker.profile_memory` in `vllm_ascend.worker.worker` or
+  `vllm_ascend.worker.worker_v1`
+- Mutation: native method replacement during worker device initialization
+- Platform / process role: NPU worker
+- Risk: Medium
+- Supported runtime: `vllm-ascend==0.22.1rc1`, `torch-npu==2.10.0`.
+- Native contract: `profile_memory(self)` sets `torch_reserved` and
+  `torch_allocated` from the current device allocator counters, emits the native
+  debug log, and returns `None`.
+- Behavior: reads the public `torch_npu.npu.memory.memory_stats_as_nested_dict()`
+  once and selects `reserved_bytes.all.current` and
+  `allocated_bytes.all.current`, preserving native zero defaults for an
+  uninitialized allocator or missing counters. Allocator errors propagate.
+- Installation guards: only the two native module paths and the self-only
+  signature are accepted; custom methods, existing wrappers, missing native
+  `logger.debug`, and unavailable or non-callable nested memory APIs keep their
+  original method. Repeated installation is idempotent.
+- Compatibility fallback: a malformed nested schema or non-integer counter
+  calls the original sampler. A future native implementation with the same
+  module and signature still requires review of the two-counter contract.
+- Validation:
+    - `tests/test_npu_memory_counters.py::test_one_snapshot_preserves_counters_and_original_logger`;
+    - `tests/test_npu_memory_counters.py::test_uninitialized_and_missing_counters_match_native_zero_defaults`;
+    - `tests/test_npu_memory_counters.py::test_each_call_refreshes_fields_and_installation_is_idempotent`;
+    - `tests/test_npu_memory_counters.py::test_missing_nested_api_keeps_original_method`;
+    - `tests/test_npu_memory_counters.py::test_unknown_worker_profiles_keep_original_semantics`;
+    - `tests/test_npu_memory_counters.py::test_changed_nested_schema_falls_back_to_native`;
+    - `tests/test_npu_memory_counters.py::test_allocator_errors_are_propagated`;
+    - `tests/test_npu_memory_counters.py::test_module_import_does_not_load_npu_runtime`;
+    - `tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`.
+- Removal condition: vLLM-Ascend reads the two allocator counters without
+  flattening full memory statistics.
 
 ## Benchmark-only Runtime Mutations
 

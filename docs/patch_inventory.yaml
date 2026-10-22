@@ -243,3 +243,26 @@ patches:
     risk: medium
     contract: npu-spawn-start-method
     removal_condition: upstream _maybe_force_spawn() covers NPU (or delegates to the platform interface)
+
+  - id: GR-PATCH-017
+    owner: vllm_gr/v1/worker/npu_memory_counters.py
+    installer: vllm_gr.v1.worker.npu_memory_counters.install_npu_memory_counter_patch
+    activation: the NPUWorker init_device hook finds a supported native profile_memory method and the public nested memory API
+    validator_or_test:
+      - tests/test_npu_memory_counters.py::test_one_snapshot_preserves_counters_and_original_logger
+      - tests/test_npu_memory_counters.py::test_uninitialized_and_missing_counters_match_native_zero_defaults
+      - tests/test_npu_memory_counters.py::test_each_call_refreshes_fields_and_installation_is_idempotent
+      - tests/test_npu_memory_counters.py::test_missing_nested_api_keeps_original_method
+      - tests/test_npu_memory_counters.py::test_unknown_worker_profiles_keep_original_semantics
+      - tests/test_npu_memory_counters.py::test_changed_nested_schema_falls_back_to_native
+      - tests/test_npu_memory_counters.py::test_allocator_errors_are_propagated
+      - tests/test_npu_memory_counters.py::test_module_import_does_not_load_npu_runtime
+      - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+    process_roles: [npu_worker]
+    target: NPUWorker.profile_memory in vllm_ascend.worker.worker or vllm_ascend.worker.worker_v1
+    risk: medium
+    contract: npu-worker-memory-counters
+    supported_runtime:
+      vllm_ascend: "0.22.1rc1"
+      torch_npu: "2.10.0"
+    removal_condition: vLLM-Ascend reads the two allocator counters without flattening full memory statistics
