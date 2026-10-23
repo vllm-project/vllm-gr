@@ -116,6 +116,7 @@ def test_offline_releases_consumed_outputs_before_next_call(
         input_len=8,
         batch_sizes=[1, 2],
         warmup_runs=2,
+        b1_warmup_runs=4,
         measured_runs=3,
     )
     result: dict[str, Any] = {"cases": []}
@@ -127,7 +128,9 @@ def test_offline_releases_consumed_outputs_before_next_call(
     assert events == [
         event
         for count in args.batch_sizes
-        for _ in range(args.warmup_runs + args.measured_runs)
+        for _ in range(
+            (args.b1_warmup_runs if count == 1 else args.warmup_runs) + args.measured_runs
+        )
         for event in (
             ["start", "infer"]
             + ["text"] * (count * args.beam_width)

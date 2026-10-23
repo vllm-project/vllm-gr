@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 COUNTS = (1, 2, 4)
+MEASURE_ORDER = (4, 2, 1)
 MAX_OFFLINE_REGRESSION_PERCENT = 1.0
 GATED_METRICS = ("mean", "p50", "p90")
 THRESHOLD_ROUNDING_TOLERANCE = 1e-12
@@ -25,6 +26,7 @@ SETUP_KEYS = (
     "generated_steps",
     "batch_sizes",
     "warmup_runs",
+    "b1_warmup_runs",
     "measured_runs",
     "max_model_len",
     "gpu_memory_utilization",
@@ -107,11 +109,12 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
         or base_setup.get("input_tokens_including_sid_begin") != 1024
         or base_setup.get("beam_width") != 128
         or base_setup.get("generated_steps") != 3
-        or base_setup.get("batch_sizes") != list(COUNTS)
+        or base_setup.get("batch_sizes") != list(MEASURE_ORDER)
         or base_setup.get("warmup_runs") != 10
+        or base_setup.get("b1_warmup_runs") != 20
         or base_setup.get("measured_runs") != 20
     ):
-        raise ValueError("A/B gate requires the fixed OneRec B=1,2,4 workload")
+        raise ValueError("A/B gate requires the fixed OneRec B=4,2,1 workload")
     for name in ("gpu.csv", "prompt_token_ids.json"):
         base_file = base_roots[0] / name
         if name == "prompt_token_ids.json" and not base_file.is_file():
@@ -209,7 +212,9 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
         f"Model: `{base_setup['model']}`; revision: `{base_setup['revision']}`; "
         f"input tokens: {base_setup['input_tokens_including_sid_begin']}; "
         f"beam width: {base_setup['beam_width']}; generated steps: {base_setup['generated_steps']}; "
-        f"order: A→B→B→A; warmup: {base_setup['warmup_runs']} per pass; "
+        f"order: A→B→B→A; batches per pass: B=4→2→1; "
+        f"warmup per pass: B=1 {base_setup['b1_warmup_runs']}, "
+        f"B=2/4 {base_setup['warmup_runs']}; "
         f"measured: {base_setup['measured_runs']} per pass "
         f"({2 * base_setup['measured_runs']} per side)",
         "",
@@ -253,53 +258,6 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
     )
 
 
-def should_retry(result: dict) -> bool:
-    """Confirm a regression confined to one batch size with another ABBA run."""
-    if result.get("complete") is not True:
-        raise ValueError("cannot decide retry from an incomplete A/B report")
-    affected_batches = {row["count"] for row in result["rows"] if row["status"] == "FAIL"}
-    return len(affected_batches) == 1
-
-
-def combine_retry_results(
-    initial: tuple[dict, str], confirmation: tuple[dict, str]
-) -> tuple[dict, str]:
-    initial_result, initial_report = initial
-    confirmation_result, confirmation_report = confirmation
-    if not should_retry(initial_result):
-        raise ValueError("A/B confirmation is only allowed for one affected batch size")
-    for key in ("base_sha", "pr_sha", "max_regression_percent", "gated_metrics"):
-        if initial_result[key] != confirmation_result[key]:
-            raise ValueError(f"A/B confirmation differs in {key}")
-
-    passed = not confirmation_result["failures"]
-    result = {
-        **confirmation_result,
-        "retry_performed": True,
-        "initial_rows": initial_result["rows"],
-        "initial_failures": initial_result["failures"],
-    }
-    first_section = initial_report.replace(
-        "## Beam V1 performance A/B", "### Initial ABBA", 1
-    ).replace("Overall: **FAIL**", "Initial: **FAIL**")
-    second_section = confirmation_report.replace(
-        "## Beam V1 performance A/B", "### Confirmation ABBA", 1
-    ).replace(
-        "Overall: **PASS**" if passed else "Overall: **FAIL**",
-        "Confirmation: **PASS**" if passed else "Confirmation: **FAIL**",
-    )
-    final = "PASS" if passed else "FAIL"
-    report = (
-        "## Beam V1 performance A/B\n\n"
-        "The initial run exceeded +1%. A second complete ABBA run determines the gate.\n\n"
-        f"{first_section.strip()}\n\n{second_section.strip()}\n\n"
-        f"Final gate: **{final}**"
-        + (" (initial regression was not reproduced)" if passed else "")
-        + "\n"
-    )
-    return result, report
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", type=Path, required=True)
@@ -315,9 +273,7 @@ def main() -> None:
     )
     (args.output_dir / "report.md").write_text(report, encoding="utf-8")
     print(report, end="", flush=True)
-    if (path := os.environ.get("GITHUB_STEP_SUMMARY")) and os.environ.get(
-        "V1_PERF_DEFER_SUMMARY"
-    ) != "1":
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(report)
     if result["failures"]:

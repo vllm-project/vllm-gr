@@ -101,6 +101,7 @@ def prepare(args: argparse.Namespace) -> None:
             "generated_steps": args.generated_steps,
             "batch_sizes": args.batch_sizes,
             "warmup_runs": args.warmup_runs,
+            "b1_warmup_runs": args.b1_warmup_runs,
             "measured_runs": args.measured_runs,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -269,11 +270,12 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
         for count in args.batch_sizes:
             prompts = [{"prompt_token_ids": tokens} for tokens in prompt_token_ids[:count]]
             group_samples = []
-            for iteration in range(args.warmup_runs + args.measured_runs):
+            warmup_runs = args.b1_warmup_runs if count == 1 else args.warmup_runs
+            for iteration in range(warmup_runs + args.measured_runs):
                 elapsed = _measure_offline_batch(
                     llm, prompts, params, tokenizer, prompt_token_ids, count, args.beam_width
                 )
-                if iteration >= args.warmup_runs:
+                if iteration >= warmup_runs:
                     group_samples.append(elapsed)
             case = case_result(
                 "offline",
@@ -373,16 +375,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generated-steps", type=int, default=3)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--warmup-runs", type=int, default=2)
+    parser.add_argument("--b1-warmup-runs", type=int)
     parser.add_argument("--measured-runs", type=int, default=5)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--port", type=int, default=7001)
     args = parser.parse_args()
+    if args.b1_warmup_runs is None:
+        args.b1_warmup_runs = args.warmup_runs
     if (
         args.beam_width <= 0
         or args.generated_steps != 3
         or args.warmup_runs < 0
+        or args.b1_warmup_runs < 0
         or args.measured_runs <= 0
         or not args.batch_sizes
         or any(size <= 0 for size in args.batch_sizes)

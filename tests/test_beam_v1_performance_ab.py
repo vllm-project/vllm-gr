@@ -7,11 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.beam_search.v1_performance_ab import (
-    combine_retry_results,
-    compare,
-    should_retry,
-)
+from benchmarks.beam_search.v1_performance_ab import compare
 
 BASE_SHA = "a" * 40
 PR_SHA = "b" * 40
@@ -29,8 +25,9 @@ def write_pass(root: Path, sha: str, offline_ms: list[float | list[float]]) -> N
                 "input_tokens_including_sid_begin": 1024,
                 "beam_width": 128,
                 "generated_steps": 3,
-                "batch_sizes": [1, 2, 4],
+                "batch_sizes": [4, 2, 1],
                 "warmup_runs": 10,
+                "b1_warmup_runs": 20,
                 "measured_runs": 20,
                 "max_model_len": 8192,
                 "gpu_memory_utilization": 0.7,
@@ -46,7 +43,9 @@ def write_pass(root: Path, sha: str, offline_ms: list[float | list[float]]) -> N
     )
     (root / "prompt_token_ids.json").write_text('"same"', encoding="utf-8")
     cases = []
-    for count, values in zip((1, 2, 4), offline_ms, strict=True):
+    values_by_count = dict(zip((1, 2, 4), offline_ms, strict=True))
+    for count in (4, 2, 1):
+        values = values_by_count[count]
         samples = [values] * 20 if isinstance(values, (int, float)) else values
         cases.append(
             {
@@ -93,6 +92,8 @@ def test_ab_report_fails_offline_regression(tmp_path: Path) -> None:
     assert "| 1 | p50 | 33.780 | 34.320 | +1.60% | FAIL |" in report
     assert "| 1 | p90 | 33.780 | 34.320 | +1.60% | FAIL |" in report
     assert "Base CV" in report
+    assert "batches per pass: B=4→2→1" in report
+    assert "warmup per pass: B=1 20, B=2/4 10" in report
     assert "Overall: **FAIL**" in report
 
 
@@ -145,48 +146,6 @@ def test_ab_accepts_exact_one_percent_boundary(tmp_path: Path) -> None:
     assert result["failures"] == []
     assert all(set(row["metric_statuses"].values()) == {"PASS"} for row in result["rows"])
     assert "Overall: **PASS**" in report
-
-
-def test_ab_confirmation_run_decides_gate(tmp_path: Path) -> None:
-    initial = tmp_path / "initial"
-    initial.mkdir()
-    write_run(initial / "base", BASE_SHA, [100.0, 100.0, 100.0])
-    write_run(initial / "pr", PR_SHA, [101.5, 100.0, 100.0])
-    first = compare(initial / "base", initial / "pr", BASE_SHA, PR_SHA)
-    for name, confirmation_ms, passes in (("passes", 100.5, True), ("fails", 102.0, False)):
-        retry = tmp_path / name
-        retry.mkdir()
-        write_run(retry / "base", BASE_SHA, [100.0, 100.0, 100.0])
-        write_run(retry / "pr", PR_SHA, [confirmation_ms, 100.0, 100.0])
-        second = compare(retry / "base", retry / "pr", BASE_SHA, PR_SHA)
-        result, report = combine_retry_results(first, second)
-
-        assert result["retry_performed"] is True
-        assert result["initial_failures"]
-        assert bool(result["failures"]) is not passes
-        assert "### Initial ABBA" in report
-        assert "### Confirmation ABBA" in report
-        assert f"Final gate: **{'PASS' if passes else 'FAIL'}**" in report
-
-
-def test_ab_retry_requires_failures_in_only_one_batch_size(tmp_path: Path) -> None:
-    base = tmp_path / "base"
-    pr = tmp_path / "pr"
-    write_run(base, BASE_SHA, [100.0, 100.0, 100.0])
-    write_run(pr, PR_SHA, [101.5, 100.0, 100.0])
-    one_batch = compare(base, pr, BASE_SHA, PR_SHA)
-    assert len(one_batch[0]["failures"]) == 3
-    assert should_retry(one_batch[0]) is True
-
-    write_run(tmp_path / "pr_two", PR_SHA, [101.5, 101.5, 100.0])
-    two_batches = compare(base, tmp_path / "pr_two", BASE_SHA, PR_SHA)
-    assert should_retry(two_batches[0]) is False
-    with pytest.raises(ValueError, match="only allowed for one affected batch"):
-        combine_retry_results(two_batches, one_batch)
-
-    write_run(tmp_path / "pr_pass", PR_SHA, [100.0, 100.0, 100.0])
-    passed = compare(base, tmp_path / "pr_pass", BASE_SHA, PR_SHA)
-    assert should_retry(passed[0]) is False
 
 
 def test_ab_reports_tail_and_variability_from_forty_samples(tmp_path: Path) -> None:
