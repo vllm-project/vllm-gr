@@ -232,44 +232,63 @@ jobs:
 
       - uses: astral-sh/setup-uv@v1
 
+      - name: Resolve candidate runtime
+        id: runtime
+        env:
+          RUNTIME_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
+        run: >-
+          python tools/ci/resolve_runtime.py resolve
+          --device "$RUNTIME_DEVICE"
+          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
+          --github-output "$GITHUB_OUTPUT"
+          --github-env "$GITHUB_ENV"
+
       - name: Cache virtual environment
         uses: corca-ai/local-cache@v2
         id: cache-venv
         with:
           path: .venv
           base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+          key: ${{ steps.runtime.outputs.cache-key }}
 
       - name: Create virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: uv venv --seed .venv
+        run: |
+          if [[ "$VLLM_GR_TARGET_DEVICE" == "npu" ]]; then
+            # The selected base Python must already contain the vendor runtime.
+            uv venv --seed --system-site-packages .venv
+          else
+            uv venv --seed .venv
+          fi
 
       - name: Set up virtual environment
         run: |
           echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
-          echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311" >> "$GITHUB_ENV"
+          {
+            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
+            echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+            echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311"
+          } >> "$GITHUB_ENV"
 
-      - name: Install base environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: uv pip install vllm==0.22.1
-
-      - name: Install dependencies
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
+      - name: Install CUDA base environment
+        if: >-
+          steps.cache-venv.outputs.cache-hit != 'true' &&
+          env.VLLM_GR_TARGET_DEVICE == 'cuda'
+        run: uv pip install "$CI_VLLM_REQUIREMENT"
 
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
 
-      - name: Verify vLLM compatibility
-        run: |
-          python -c 'import importlib.metadata as m; version = m.version("vllm").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM 0.22.1, found {version}"'
-          python -c 'import importlib.metadata as m; version = m.version("vllm-gr").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM-GR 0.22.1, found {version}"'
+      - name: Verify installed runtime identity
+        run: >-
+          python tools/ci/resolve_runtime.py verify
+          --spec "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
+          --venv "$VIRTUAL_ENV"
+          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/installed.json"
+          --cache-root "$RUNNER_TEMP/gr-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          --github-env "$GITHUB_ENV"
 
       - name: Verify CUDA device mapping before cleanup
         id: cuda-mapping
@@ -295,6 +314,15 @@ jobs:
           --show-diff-on-failure
           --color=always
           --all-files
+
+      - name: Upload runtime identity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gr-runtime-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
@@ -331,13 +359,24 @@ jobs:
 
       - uses: astral-sh/setup-uv@v1
 
+      - name: Resolve candidate runtime
+        id: runtime
+        env:
+          RUNTIME_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
+        run: >-
+          python tools/ci/resolve_runtime.py resolve
+          --device "$RUNTIME_DEVICE"
+          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
+          --github-output "$GITHUB_OUTPUT"
+          --github-env "$GITHUB_ENV"
+
       - name: Restore virtual environment
         uses: corca-ai/local-cache@v2
         id: cache-venv
         with:
           path: .venv
           base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+          key: ${{ steps.runtime.outputs.cache-key }}
 
       - name: Require cached virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -348,13 +387,24 @@ jobs:
       - name: Set up virtual environment
         run: |
           echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
+          {
+            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
+            echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          } >> "$GITHUB_ENV"
 
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
+
+      - name: Verify installed runtime identity
+        run: >-
+          python tools/ci/resolve_runtime.py verify
+          --spec "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
+          --venv "$VIRTUAL_ENV"
+          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/installed.json"
+          --cache-root "$RUNNER_TEMP/gr-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          --github-env "$GITHUB_ENV"
 
       - name: Verify CUDA device mapping before cleanup
         id: cuda-mapping
@@ -493,6 +543,15 @@ jobs:
           TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
         run: ./tests/system/run_benchmark_and_verify.sh
 
+      - name: Upload runtime identity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gr-runtime-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
@@ -519,13 +578,24 @@ jobs:
 
       - uses: astral-sh/setup-uv@v1
 
+      - name: Resolve candidate runtime
+        id: runtime
+        env:
+          RUNTIME_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
+        run: >-
+          python tools/ci/resolve_runtime.py resolve
+          --device "$RUNTIME_DEVICE"
+          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
+          --github-output "$GITHUB_OUTPUT"
+          --github-env "$GITHUB_ENV"
+
       - name: Restore virtual environment
         uses: corca-ai/local-cache@v2
         id: cache-venv
         with:
           path: .venv
           base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+          key: ${{ steps.runtime.outputs.cache-key }}
 
       - name: Require cached virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -534,13 +604,24 @@ jobs:
       - name: Set up virtual environment
         run: |
           echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
+          {
+            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
+            echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          } >> "$GITHUB_ENV"
 
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
+
+      - name: Verify installed runtime identity
+        run: >-
+          python tools/ci/resolve_runtime.py verify
+          --spec "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
+          --venv "$VIRTUAL_ENV"
+          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/installed.json"
+          --cache-root "$RUNNER_TEMP/gr-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          --github-env "$GITHUB_ENV"
 
       - name: Verify CUDA device mapping before cleanup
         id: cuda-mapping
@@ -570,6 +651,15 @@ jobs:
       - name: Run Pangu offline accuracy gate
         run: ./tests/system/run_pangu1b_acc_and_verify.sh
 
+      - name: Upload runtime identity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gr-runtime-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
@@ -596,13 +686,24 @@ jobs:
 
       - uses: astral-sh/setup-uv@v1
 
+      - name: Resolve candidate runtime
+        id: runtime
+        env:
+          RUNTIME_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
+        run: >-
+          python tools/ci/resolve_runtime.py resolve
+          --device "$RUNTIME_DEVICE"
+          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
+          --github-output "$GITHUB_OUTPUT"
+          --github-env "$GITHUB_ENV"
+
       - name: Restore virtual environment
         uses: corca-ai/local-cache@v2
         id: cache-venv
         with:
           path: .venv
           base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
+          key: ${{ steps.runtime.outputs.cache-key }}
 
       - name: Require cached virtual environment
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -611,13 +712,24 @@ jobs:
       - name: Set up virtual environment
         run: |
           echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
+          {
+            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
+            echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          } >> "$GITHUB_ENV"
 
       - name: Refresh editable installation
         run: |
           export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
           uv pip install -e ".[dev]"
+
+      - name: Verify installed runtime identity
+        run: >-
+          python tools/ci/resolve_runtime.py verify
+          --spec "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/spec.json"
+          --venv "$VIRTUAL_ENV"
+          --output "$RUNNER_TEMP/gr-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}/installed.json"
+          --cache-root "$RUNNER_TEMP/gr-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          --github-env "$GITHUB_ENV"
 
       - name: Verify CUDA device mapping before cleanup
         id: cuda-mapping
@@ -646,6 +758,15 @@ jobs:
 
       - name: Run Pangu online accuracy and API contract gate
         run: ./tests/system/run_pangu1b_online_and_verify.sh
+
+      - name: Upload runtime identity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gr-runtime-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
