@@ -29,9 +29,9 @@ def initialize_runtime() -> dict[str, object]:
 
     configure_model_runner_default()
 
-    from vllm_gr.patch import get_last_beam_patch_report, re_apply_patches
-
     check_environment()
+
+    from vllm_gr.patch import get_last_beam_patch_report, re_apply_patches
 
     patch_count = re_apply_patches()
 

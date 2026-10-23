@@ -350,7 +350,7 @@ def test_different_lengths_can_share_the_real_generation_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the real formula the budget is the request's, not the length's."""
-    from vllm.entrypoints.utils import get_max_tokens
+    from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 
     serving = make_serving(prompt_lengths={0: 10, 1: 20, 2: 30, 3: 40})
     monkeypatch.setattr(patch_module, "get_max_tokens", get_max_tokens)
@@ -495,7 +495,7 @@ def restore_route() -> Any:
         patch_module._original_create_completion = original
 
 
-def test_the_patch_installs_verifies_and_is_idempotent(restore_route: Any) -> None:  # noqa: ARG001
+def test_the_patch_installs_verifies_and_is_idempotent(restore_route: Any) -> None:
     patch_completion_batch()
 
     assert OpenAIServingCompletion._create_completion is create_completion_batch_dispatch

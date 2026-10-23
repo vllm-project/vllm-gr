@@ -68,13 +68,13 @@ async def beam_search_dispatch(
 
 
 def patch_beam_search():
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 
     from vllm_gr.entrypoints.openai.completion_batch_patch import patch_completion_batch
     from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
 
-    OpenAIServing.beam_search = beam_search_dispatch
-    OpenAIServing.beam_search_v1 = beam_search_v1
+    GenerateBaseServing.beam_search = beam_search_dispatch
+    GenerateBaseServing.beam_search_v1 = beam_search_v1
     patch_admission_rejection_reporting()
     patch_completion_batch()
 
@@ -93,7 +93,7 @@ def patch_admission_rejection_reporting():
     """
     from functools import wraps
 
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
     from vllm.exceptions import VLLMValidationError
 
     from vllm_gr.v1.engine.async_llm import (
@@ -103,7 +103,7 @@ def patch_admission_rejection_reporting():
 
     patch_client_request_id()
 
-    original = OpenAIServing._raise_if_error
+    original = GenerateBaseServing._raise_if_error
     if getattr(original, _ADMISSION_REJECTION_PATCH_MARKER, False):
         return
 
@@ -120,7 +120,7 @@ def patch_admission_rejection_reporting():
         return original(self, finish_reason, request_id)
 
     setattr(patched_raise_if_error, _ADMISSION_REJECTION_PATCH_MARKER, True)
-    OpenAIServing._raise_if_error = patched_raise_if_error
+    GenerateBaseServing._raise_if_error = patched_raise_if_error
 
 
 def patch_client_request_id():
@@ -134,7 +134,7 @@ def patch_client_request_id():
     frontend still holds both.
 
     Two wrapper sites, and each is the only one of its kind: upstream resolves
-    a caller's name through ``OpenAIServing._base_request_id`` and nowhere
+    a caller's name through ``BaseServing._base_request_id`` and nowhere
     else, and every request -- completing, beam session, or batch item --
     reaches the frontend's request table through ``OutputProcessor.add_request``.
     The first publishes the resolved name for the request being handled in that
@@ -142,7 +142,7 @@ def patch_client_request_id():
     """
     from functools import wraps
 
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    from vllm.entrypoints.serve.engine.serving import BaseServing
     from vllm.v1.engine.output_processor import OutputProcessor
 
     from vllm_gr.v1.engine.async_llm import (
@@ -150,7 +150,7 @@ def patch_client_request_id():
         remember_client_request_id,
     )
 
-    original_base_request_id = OpenAIServing._base_request_id
+    original_base_request_id = BaseServing._base_request_id
     if not getattr(original_base_request_id, _CLIENT_REQUEST_ID_PATCH_MARKER, False):
 
         @wraps(original_base_request_id)
@@ -160,7 +160,7 @@ def patch_client_request_id():
             return request_id
 
         setattr(patched_base_request_id, _CLIENT_REQUEST_ID_PATCH_MARKER, True)
-        OpenAIServing._base_request_id = staticmethod(patched_base_request_id)
+        BaseServing._base_request_id = staticmethod(patched_base_request_id)
 
     original_add_request = OutputProcessor.add_request
     if getattr(original_add_request, _SUBMIT_REQUEST_ID_PATCH_MARKER, False):

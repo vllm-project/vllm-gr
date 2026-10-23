@@ -16,9 +16,10 @@ import os
 
 logger = logging.getLogger("vllm_gr.env_check")
 
-_SUPPORTED_VLLM_VERSION = "0.22.1"
-_SUPPORTED_VLLM_ASCEND_VERSION = "0.22.1rc1"
-_SUPPORTED_TRITON_ASCEND_VERSION = "3.2.1"
+_SUPPORTED_VLLM_VERSION = "0.30.0"
+_SUPPORTED_VLLM_ASCEND_VERSION = "0.30.0rc2"
+# Resolve against the actual rc2 vendor image during the NPU migration.
+_SUPPORTED_TRITON_ASCEND_VERSION: str | None = None
 
 _OPENCV_PKGS = [
     "opencv-python",
@@ -102,7 +103,7 @@ def check_runtime_versions(*, require_ascend: bool = False) -> dict[str, str]:
         raise RuntimeError(
             "Unsupported vLLM-Ascend version: "
             f"found {ascend_version}, required {_SUPPORTED_VLLM_ASCEND_VERSION}. "
-            "This vllm-gr build relies on the native 0.22 YuanRong and hybrid KV-pool APIs."
+            "The Ascend runtime must match the version declared by this GR build."
         )
     versions["vllm-ascend"] = ascend_version
     return versions
@@ -116,6 +117,11 @@ def check_ascend_environment(*, require_npu_platform: bool = False) -> dict[str,
     and can overwrite its files. Import the Ascend backend as the authoritative
     check of the module that Python will actually use.
     """
+    if _SUPPORTED_TRITON_ASCEND_VERSION is None:
+        raise RuntimeError(
+            "Ascend migration to vLLM 0.30.0 / vllm-ascend 0.30.0rc2 is pending. "
+            "The vendor runtime and GR NPU path must be validated before enabling NPU."
+        )
     report = check_runtime_versions(require_ascend=True)
 
     triton_ascend_version = _distribution_version("triton-ascend")

@@ -59,8 +59,9 @@ def literal(path: Path, name: str) -> str:
 
 
 def declarations(repo: Path, device: str) -> dict[str, str]:
+    packages = tuple(GUARDS) if device == "npu" else ("vllm",)
     guards = {
-        package: literal(repo / "vllm_gr/_env_check.py", name) for package, name in GUARDS.items()
+        package: literal(repo / "vllm_gr/_env_check.py", GUARDS[package]) for package in packages
     }
     base = literal(repo / "setup.py", "VLLM_GR_BASE_VERSION")
     config = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))

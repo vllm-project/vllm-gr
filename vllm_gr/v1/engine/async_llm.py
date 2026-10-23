@@ -32,7 +32,7 @@ _ADMISSION_REJECTION_MAX = 256
 
 # The name the caller of the request being handled in this task will be told.
 # Both of the OpenAI frontends resolve a caller-supplied id through
-# ``OpenAIServing._base_request_id`` and extend it before submitting it to the
+# ``BaseServing._base_request_id`` and extend it before submitting it to the
 # engine, so the two names differ for every ordinary request and only the
 # frontend holds both. It publishes the caller's name here as it resolves it
 # (see ``patch_client_request_id``), and both the submit path and the report

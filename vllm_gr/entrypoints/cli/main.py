@@ -48,7 +48,10 @@ def main() -> None:
 
     configure_model_runner_default()
 
-    from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
+    from vllm.entrypoints.serve.utils.api_utils import (
+        VLLM_SUBCMD_PARSER_EPILOG,
+        cli_env_setup,
+    )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     import vllm_gr.entrypoints.cli.check_env as gr_check_env

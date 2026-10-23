@@ -1,4 +1,4 @@
 -r common.txt
 
-vllm==0.22.1
+vllm==0.30.0
 # Keep LMCache out of the default install for now.

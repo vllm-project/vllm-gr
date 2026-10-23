@@ -23,11 +23,9 @@ from contextlib import aclosing
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorResponse,
-    RequestResponseMetadata,
-)
-from vllm.entrypoints.utils import get_max_tokens
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 from vllm.renderers.inputs.preprocess import prompt_to_seq
 
 from vllm_gr.config import BeamExecutionMode, GRConfig

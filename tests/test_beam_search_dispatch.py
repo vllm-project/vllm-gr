@@ -10,8 +10,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
-from vllm.entrypoints.openai.engine.serving import OpenAIServing
 
 from vllm_gr.entrypoints.gr import GRLLM
 from vllm_gr.entrypoints.openai import serving_engine
@@ -86,8 +86,8 @@ def test_patch_is_idempotent_and_keeps_native_mixin(monkeypatch: Any) -> None:
     native = BeamSearchOnlineMixin.beam_search
     patch_beam_search()
     patch_beam_search()
-    assert OpenAIServing.beam_search is beam_search_dispatch
-    assert OpenAIServing.beam_search_v1 is serving_engine.beam_search_v1
+    assert GenerateBaseServing.beam_search is beam_search_dispatch
+    assert GenerateBaseServing.beam_search_v1 is serving_engine.beam_search_v1
     assert BeamSearchOnlineMixin.beam_search is native
     assert _validate_openai_beam_search_patch() is None
     assert _dispatch(None, monkeypatch)[0][0] == "native"

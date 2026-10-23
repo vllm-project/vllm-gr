@@ -194,6 +194,18 @@ class TestRuntimeResolution(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertFalse(json.loads(output.read_text())["ok"])
 
+    def test_pending_npu_pin_does_not_prevent_cuda_resolution(self) -> None:
+        path = self.repo / "vllm_gr/_env_check.py"
+        path.write_text(
+            path.read_text().replace(
+                '_SUPPORTED_TRITON_ASCEND_VERSION = "3.2.1"',
+                "_SUPPORTED_TRITON_ASCEND_VERSION: str | None = None",
+            )
+        )
+        self.assertEqual(runtime.resolve(self.repo, "cuda")["expected"]["vllm"], "0.22.1")
+        with self.assertRaisesRegex(ValueError, "_SUPPORTED_TRITON_ASCEND_VERSION"):
+            runtime.resolve(self.repo, "npu")
+
 
 class TestRuntimeWorkflow(unittest.TestCase):
     def test_every_runtime_job_resolves_before_cache_and_verifies_before_execution(self) -> None:

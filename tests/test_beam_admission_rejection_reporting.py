@@ -17,12 +17,10 @@ from typing import Any
 
 import msgspec
 import pytest
-from vllm.entrypoints.openai.engine.protocol import GenerationError
-from vllm.entrypoints.openai.engine.serving import OpenAIServing
-from vllm.exceptions import VLLMValidationError
+from vllm.entrypoints.generate.base.serving import GenerateBaseServing
+from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.v1.engine import EngineCoreOutput, FinishReason
 
-import vllm_gr.v1.engine.async_llm as async_llm
 from vllm_gr.entrypoints.openai.beam_search_patch import (
     patch_admission_rejection_reporting,
 )
@@ -34,6 +32,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     admission_rejected,
     admission_rejection,
 )
+from vllm_gr.v1.engine import async_llm
 from vllm_gr.v1.engine.async_llm import (
     adopt_admission_rejection,
     make_patched_process_outputs,
@@ -97,7 +96,7 @@ def client(processor: _Processor | None) -> Any:
 
 
 def serving(processor: _Processor | None) -> Any:
-    """A stand-in for ``OpenAIServing`` holding only what the patch reads."""
+    """A stand-in for ``GenerateBaseServing`` holding only what the patch reads."""
     return SimpleNamespace(engine_client=client(processor))
 
 
@@ -114,7 +113,7 @@ def raise_if_error(
     try:
         # Read through the class so the test exercises whatever patch is
         # installed.
-        getattr(OpenAIServing, "_raise_if_error")(serving(processor), "error", request_id)
+        GenerateBaseServing._raise_if_error(serving(processor), "error", request_id)
     finally:
         async_llm._CLIENT_REQUEST_ID.reset(token)
 

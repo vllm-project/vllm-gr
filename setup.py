@@ -20,7 +20,7 @@ from setuptools_scm import get_version
 logger = logging.getLogger("vllm_gr.setup")
 
 _VALID_DEVICES = frozenset(("cuda", "npu", "cpu"))
-VLLM_GR_BASE_VERSION = "0.22.1"
+VLLM_GR_BASE_VERSION = "0.30.0"
 
 # Module-level cache so that detect_target_device() is evaluated exactly once
 # per setup.py invocation, avoiding duplicate log output and potential
@@ -109,9 +109,9 @@ def get_vllm_gr_version() -> str:
     Get the vllm-gr version with optional device-specific suffix.
 
     Version format examples:
-        - 0.22.1 (cuda, no suffix)
-        - 0.22.1+npu
-        - 0.22.1+cpu
+        - 0.30.0 (cuda, no suffix)
+        - 0.30.0+npu
+        - 0.30.0+cpu
 
     Environment variables:
         VLLM_GR_VERSION_OVERRIDE: Override version completely
