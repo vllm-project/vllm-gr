@@ -31,7 +31,7 @@ def _recorder(name: str, calls: list[tuple[str, dict[str, Any]]]) -> Callable[..
 
 
 def _dispatch(
-    additional: dict[str, Any] | None, monkeypatch: Any
+    additional: dict[str, Any] | None, monkeypatch: Any, session_id: str | None = None
 ) -> list[tuple[str, dict[str, Any]]]:
     calls: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(serving_engine, "beam_search_v1", _recorder("v1", calls))
@@ -43,7 +43,13 @@ def _dispatch(
         outputs = [
             output
             async for output in beam_search_dispatch(
-                serving, "prompt", "request-id", "params", "lora", {"trace": "id"}
+                serving,
+                "prompt",
+                "request-id",
+                "params",
+                "lora",
+                {"trace": "id"},
+                session_id=session_id,
             )
         ]
         assert len(outputs) == 1
@@ -62,6 +68,7 @@ def test_v1_dispatch_preserves_upstream_arguments(monkeypatch: Any) -> None:
                 "params": "params",
                 "lora_request": "lora",
                 "trace_headers": {"trace": "id"},
+                "session_id": None,
             },
         )
     ]
@@ -70,6 +77,12 @@ def test_v1_dispatch_preserves_upstream_arguments(monkeypatch: Any) -> None:
 def test_non_gr_engine_uses_upstream_beam(monkeypatch: Any) -> None:
     for additional in (None, {}, {"unrelated": True}):
         assert _dispatch(additional, monkeypatch)[0][0] == "native"
+
+
+def test_dispatch_preserves_native_session_hint_for_both_engines(monkeypatch: Any) -> None:
+    for config in (None, {"vllm_gr_beam_execution_mode": "v1"}):
+        calls = _dispatch(config, monkeypatch, session_id="caller-session")
+        assert calls[0][1]["session_id"] == "caller-session"
 
 
 def test_legacy_gr_configuration_is_rejected(monkeypatch: Any) -> None:

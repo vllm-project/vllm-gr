@@ -24,6 +24,7 @@ async def beam_search_dispatch(
     params: BeamSearchParams,
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
+    session_id: str | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
     """Adapt upstream OpenAI Beam calls to GR V1 or native non-GR inference.
 
@@ -63,6 +64,7 @@ async def beam_search_dispatch(
         params=params,
         lora_request=lora_request,
         trace_headers=trace_headers,
+        session_id=session_id,
     ):
         yield output
 

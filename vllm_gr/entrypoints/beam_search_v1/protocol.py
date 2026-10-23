@@ -43,6 +43,9 @@ class OnlineBeamSearchRequest:
     priority: int = 0
     data_parallel_rank: int | None = None
 
+    # Native caller affinity hint, distinct from the internal Beam batch/session ID.
+    session_id: str | None = None
+
     def __post_init__(self) -> None:
         # The field is a sequence on the wire; pinning the concrete type here
         # keeps a caller's list from being mutated under a running session.

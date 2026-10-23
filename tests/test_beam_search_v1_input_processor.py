@@ -122,6 +122,7 @@ def test_online_request_preserves_native_external_id_routing(
                     prompts=([1, 2],),
                     request_id=request_id,
                     params=BeamSearchParams(beam_width=2, max_tokens=3, ignore_eos=True),
+                    session_id="caller-session",
                 ),
             )
             for request_id in (external_id, external_id, "unrelated-request")
@@ -134,6 +135,8 @@ def test_online_request_preserves_native_external_id_routing(
     for batch in batches:
         request = batch.items[0].request
         assert request.request_id == batch.batch_id
+        assert request.session_id == "caller-session"
+        assert request.request_id != request.session_id
         output_processor.add_request(request, prompt=None)
 
     # Reused external IDs must route to every corresponding internal session.
