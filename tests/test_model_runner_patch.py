@@ -54,12 +54,15 @@ def test_dispatcher_selects_one_platform_module(
     assert imported == [model_runner_patch._NPU_PATCH_MODULE]
 
 
-def test_cuda_dispatcher_installs_stage_wrappers_once(
+@pytest.mark.parametrize("with_bookkeeping", [False, True])  # type: ignore[misc]
+def test_dispatcher_installs_required_and_optional_hooks_once(
     monkeypatch: pytest.MonkeyPatch,
+    with_bookkeeping: bool,
 ) -> None:
     # V1-platform install test: pin the V2 flag off (see
     # test_dispatcher_selects_one_platform_module).
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
+    native_result = object()
 
     class Runner:
         def execute_model(self, scheduler_output: Any) -> None:
@@ -77,21 +80,35 @@ def test_cuda_dispatcher_installs_stage_wrappers_once(
             scheduler_output: Any,
             *args: Any,
             **kwargs: Any,
-        ) -> None:
-            return None
+        ) -> object:
+            return native_result
 
     platform_module = SimpleNamespace(
         discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
     )
+    if with_bookkeeping:
+        from vllm_gr.v1.worker import npu_model_runner_patch
+
+        platform_module.make_patched_bookkeeping_sync = (
+            npu_model_runner_patch.make_patched_bookkeeping_sync
+        )
     monkeypatch.setattr(
         model_runner_patch,
         "_get_active_platform_module",
         lambda: platform_module,
     )
 
+    bookkeeping = Runner._bookkeeping_sync
     model_runner_patch.apply_worker_patches()
     first = (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync)
+    if with_bookkeeping:
+        assert Runner._bookkeeping_sync is not bookkeeping
+        assert getattr(Runner._bookkeeping_sync, "__wrapped__") is bookkeeping
+    else:
+        assert Runner._bookkeeping_sync is bookkeeping
+    # Ordinary inference still delegates to the native method on either path.
+    assert Runner()._bookkeeping_sync(SimpleNamespace()) is native_result
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert getattr(Runner, "_patched_for_beam_pos_ids") is True
     # No _sample on this Runner -> the Constraint Tables hook must not be added.

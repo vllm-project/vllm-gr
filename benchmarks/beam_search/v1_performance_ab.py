@@ -17,6 +17,7 @@ MAX_OFFLINE_REGRESSION_PERCENT = 1.0
 GATED_METRICS = ("mean", "p50", "p90")
 THRESHOLD_ROUNDING_TOLERANCE = 1e-12
 SETUP_KEYS = (
+    "benchmark_driver_sha256",
     "model",
     "revision",
     "input_tokens_including_sid_begin",

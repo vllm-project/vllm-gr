@@ -64,9 +64,9 @@ fi
 git -C "$candidate_root" worktree add --detach "$base_root" "$base_sha"
 worktree_added=1
 
-# Both sides must measure the same workload with the same benchmark driver.
+# Both sides run the candidate's benchmark driver, including lifetime fixes.
+# Its SID validator and prompt are still imported/read from each selected tree.
 for path in \
-  benchmarks/beam_search/v1_performance_gate.py \
   benchmarks/beam_search/v1_sid_validation.py \
   tests/resources/single_one_rec_prompt.txt; do
   if ! git -C "$candidate_root" diff --quiet "$base_sha" "$candidate_sha" -- "$path"; then
@@ -80,6 +80,7 @@ run_pass() {
   local result_dir="$2"
   cd "$repo_root"
   V1_PERF_REPO_ROOT="$repo_root" V1_PERF_OUTPUT_DIR="$result_dir" \
+    V1_PERF_DRIVER="$candidate_root/benchmarks/beam_search/v1_performance_gate.py" \
     V1_PERF_MEASURE_ONLY=1 V1_PERF_OFFLINE_ONLY=1 \
     V1_PERF_WARMUP_RUNS=10 V1_PERF_MEASURED_RUNS=20 \
     bash "$candidate_root/tests/system/run_beam_v1_performance.sh"

@@ -258,7 +258,7 @@ class CUDAConstraintBackend:
     ) -> None:
         """Write to a prevalidated persistent Worker workspace.
 
-        Initialization and ``prepare_cuda_prefill_constraint`` establish the
+        Backend initialization and StageRunner admission establish the
         device, dtype, table, shape, and capacity invariants.  Keeping only the
         backend state check here avoids repeating the complete public input
         validation between LM-Head and the CUDA TopK launch.

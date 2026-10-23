@@ -4,6 +4,9 @@ set -euo pipefail
 
 repo_root="${V1_PERF_REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$repo_root"
+# A/B can share one driver while importing each side's runtime from its own tree.
+driver="${V1_PERF_DRIVER:-$repo_root/benchmarks/beam_search/v1_performance_gate.py}"
+export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 model="${VLLM_GR_TEST_MODEL:-OpenOneRec/OneRec-1.7B}"
 triples="${TRIPLES_PATH:?TRIPLES_PATH must point to the CI video triples}"
 output_dir="${V1_PERF_OUTPUT_DIR:-$repo_root/v1_performance_results}"
@@ -54,7 +57,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv \
     | tee "$output_dir/gpu.csv" || true
 fi
-python -m benchmarks.beam_search.v1_performance_gate prepare "${args[@]}"
+python "$driver" prepare "${args[@]}"
 cat "$output_dir/setup.json"
 
 server_pid=""
@@ -80,7 +83,7 @@ trap 'exit 143' TERM
 
 echo "Running offline GRLLM.beam_search_v1 batch performance"
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-  python -m benchmarks.beam_search.v1_performance_gate offline "${args[@]}"
+  python "$driver" offline "${args[@]}"
 
 if [[ "${V1_PERF_MEASURE_ONLY:-0}" == 1 && "${V1_PERF_OFFLINE_ONLY:-0}" == 1 ]]; then
   exit 0
@@ -154,7 +157,7 @@ if ! kill -0 "$server_pid" 2>/dev/null; then
 fi
 
 echo "Running online V1 HTTP concurrency performance"
-python -m benchmarks.beam_search.v1_performance_gate online "${args[@]}" \
+python "$driver" online "${args[@]}" \
   --served-model-name "$server_identity"
 stop_server
 

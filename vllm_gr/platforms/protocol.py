@@ -14,16 +14,16 @@ if TYPE_CHECKING:
 
 
 class ModelRunnerPatchHooks(Protocol):
-    """Platform-specific hooks used to patch vLLM ModelRunner classes."""
+    """Required hooks for the V1 ModelRunner patch dispatcher.
+
+    Additional factories, including ``make_patched_bookkeeping_sync``, are
+    optional capabilities discovered by the dispatcher. CUDA keeps native
+    bookkeeping; NPU supplies its six-item bookkeeping wrapper.
+    """
 
     def discover_worker_runners(self) -> tuple[tuple[str, type[Any]], ...]: ...
 
     def make_patched_prepare_inputs(
-        self,
-        original: Callable[..., Any],
-    ) -> Callable[..., Any]: ...
-
-    def make_patched_bookkeeping_sync(
         self,
         original: Callable[..., Any],
     ) -> Callable[..., Any]: ...

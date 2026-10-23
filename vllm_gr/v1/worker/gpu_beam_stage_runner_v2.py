@@ -455,11 +455,6 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         )
 
 
-def make_v2_stage_hooks(worker: Any) -> V2StageExecutionHooks:
-    """Construct the V2 execution hooks for one worker."""
-    return V2StageExecutionHooks(worker)
-
-
 def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -> bool:
     """Unselected/refused shapes fall back; missing selected graphs remain fatal."""
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config

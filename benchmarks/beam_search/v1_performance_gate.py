@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
+import os
 import statistics
 import time
 from pathlib import Path
@@ -89,6 +91,7 @@ def prepare(args: argparse.Namespace) -> None:
     write_json(
         args.output_dir / "setup.json",
         {
+            "benchmark_driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "model": args.model,
             "revision": args.revision,
             "triples": str(args.triples.resolve()),
@@ -171,13 +174,51 @@ def error_details(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"
 
 
-def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -> None:
+def _measure_offline_batch(
+    llm: Any,
+    prompts: list[dict[str, list[int]]],
+    params: Any,
+    tokenizer: Any,
+    prompt_token_ids: list[list[int]],
+    count: int,
+    beam_width: int,
+) -> float:
+    """Consume and validate one batch, releasing its outputs before the next call."""
     import torch
+
+    start = time.perf_counter_ns()
+    outputs = llm.beam_search_v1(prompts, params, use_tqdm=False)
+    for output in outputs:
+        for sequence in output.sequences:
+            _ = sequence.text
+    torch.accelerator.synchronize()
+    elapsed = (time.perf_counter_ns() - start) / 1e6
+    if len(outputs) != count or any(len(output.sequences) != beam_width for output in outputs):
+        raise RuntimeError(f"offline B={count}: incomplete V1 output")
+    for request_index, (prompt_ids, output) in enumerate(
+        zip(prompt_token_ids[:count], outputs, strict=True)
+    ):
+        for beam_index, sequence in enumerate(output.sequences):
+            tokens = list(sequence.tokens)
+            context = f"offline B={count} request={request_index} beam={beam_index}"
+            if tokens[: len(prompt_ids)] != prompt_ids:
+                raise RuntimeError(f"{context}: output prompt/order mismatch")
+            validate_sid_tokens(tokenizer, tokens[len(prompt_ids) :], context)
+    return elapsed
+
+
+def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -> None:
     import yaml
 
+    from vllm_gr.entrypoints import gr
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
 
+    runtime_source = Path(gr.__file__).resolve()
+    if root := os.environ.get("V1_PERF_REPO_ROOT"):
+        if not runtime_source.is_relative_to(Path(root).resolve() / "vllm_gr"):
+            raise RuntimeError(f"benchmark imported the wrong runtime: {runtime_source}")
+    result["runtime_source"] = str(runtime_source)
     config = yaml.safe_load((args.output_dir / "vllm_gr_config.yaml").read_text())
     engine_args = {
         "model": args.model,
@@ -229,26 +270,9 @@ def run_offline(args: argparse.Namespace, prompt: str, result: dict[str, Any]) -
             prompts = [{"prompt_token_ids": tokens} for tokens in prompt_token_ids[:count]]
             group_samples = []
             for iteration in range(args.warmup_runs + args.measured_runs):
-                start = time.perf_counter_ns()
-                outputs = llm.beam_search_v1(prompts, params, use_tqdm=False)
-                for output in outputs:
-                    for sequence in output.sequences:
-                        _ = sequence.text
-                torch.accelerator.synchronize()
-                elapsed = (time.perf_counter_ns() - start) / 1e6
-                if len(outputs) != count or any(
-                    len(output.sequences) != args.beam_width for output in outputs
-                ):
-                    raise RuntimeError(f"offline B={count}: incomplete V1 output")
-                for request_index, (prompt_ids, output) in enumerate(
-                    zip(prompt_token_ids[:count], outputs, strict=True)
-                ):
-                    for beam_index, sequence in enumerate(output.sequences):
-                        tokens = list(sequence.tokens)
-                        context = f"offline B={count} request={request_index} beam={beam_index}"
-                        if tokens[: len(prompt_ids)] != prompt_ids:
-                            raise RuntimeError(f"{context}: output prompt/order mismatch")
-                        validate_sid_tokens(tokenizer, tokens[len(prompt_ids) :], context)
+                elapsed = _measure_offline_batch(
+                    llm, prompts, params, tokenizer, prompt_token_ids, count, args.beam_width
+                )
                 if iteration >= args.warmup_runs:
                     group_samples.append(elapsed)
             case = case_result(

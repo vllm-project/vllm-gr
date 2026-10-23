@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -48,43 +49,42 @@ DEFAULT_TASK_TYPES = "ad,product,label_cond,video,interactive,label_pred"
 # ============================================================================
 # Prometheus Metrics Collection
 # ============================================================================
-def _fetch_prometheus_metrics(metrics_url: str) -> dict:
+_BeamMetricSnapshot = dict[str, dict[tuple[tuple[str, str], ...], float]]
+
+
+def _fetch_prometheus_metrics(metrics_url: str) -> _BeamMetricSnapshot:
     """Fetch beam search metrics from the /metrics endpoint using Prometheus exposition format."""
     try:
+        from prometheus_client.parser import text_string_to_metric_families
+
         response = requests.get(f"{metrics_url}/metrics", timeout=5)
         if response.status_code != HTTP_OK:
             return {}
 
-        metrics = {
-            "prefill_time": 0.0,
-            "decode_time": 0.0,
-            "sort_time": 0.0,
-            "requests": 0.0,
-            "beams": 0.0,
-        }
+        # This is compatibility with older servers. Missing metrics must stay
+        # absent: V1 has no producer for the retired frontend phase counters.
+        metrics: _BeamMetricSnapshot = {}
 
         metric_names = {
-            "prefill_time": "vllm_gr_beam_search_prefill_time_seconds_total",
-            "decode_time": "vllm_gr_beam_search_decode_time_seconds_total",
-            "sort_time": "vllm_gr_beam_search_sort_time_seconds_total",
-            "requests": "vllm_gr_beam_search_requests_total",
-            "beams": "vllm_gr_beam_search_total_beams_generated_total",
+            "vllm_gr_beam_search_prefill_time_seconds_total": "prefill_time",
+            "vllm_gr_beam_search_decode_time_seconds_total": "decode_time",
+            "vllm_gr_beam_search_sort_time_seconds_total": "sort_time",
+            "vllm_gr_beam_search_requests_total": "requests",
+            "vllm_gr_beam_search_total_beams_generated_total": "beams",
         }
 
-        # Parse exposition format line-by-line
-        for line in response.text.split("\n"):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            # Parse: metric_name{labels} value
-            for key, metric_name in metric_names.items():
-                if line.startswith(metric_name):
-                    try:
-                        value = float(line.split()[-1])
-                        metrics[key] = value
-                    except (ValueError, IndexError):
-                        pass
+        for family in text_string_to_metric_families(response.text):
+            for sample in family.samples:
+                # Match exactly: *_created is not the counter. Preserve labels
+                # until deltas are validated so another engine cannot hide a reset.
+                key = metric_names.get(sample.name)
+                if key is None:
+                    continue
+                labels = tuple(sorted(sample.labels.items()))
+                series = metrics.setdefault(key, {})
+                if labels in series or not math.isfinite(sample.value) or sample.value < 0:
+                    return {}
+                series[labels] = sample.value
 
         return metrics
     except Exception:
@@ -101,16 +101,43 @@ def _get_metrics_url(args) -> str | None:
     return None
 
 
-def _print_beam_search_delta(before: dict, after: dict):
+def _print_beam_search_delta(
+    before: _BeamMetricSnapshot | None, after: _BeamMetricSnapshot | None
+) -> None:
     """Print beam search metrics delta."""
-    if not before or not after:
+    required = {"prefill_time", "decode_time", "sort_time", "requests"}
+    # Some older servers omit beams. Once observed, it must obey the same
+    # snapshot consistency checks even though it is not used in phase averages.
+    if (before and "beams" in before) or (after and "beams" in after):
+        required.add("beams")
+    if not before or not after or not required <= before.keys() & after.keys():
+        logger.info("Legacy Beam phase metrics unavailable; use benchmark E2E statistics.")
         return
-    num = after.get("requests", 0) - before.get("requests", 0)
-    if num <= 0:
+    labels = before["requests"].keys()
+    if not labels or any(
+        snapshot[key].keys() != labels for snapshot in (before, after) for key in required
+    ):
+        logger.info("Legacy Beam phase series changed or incomplete; use benchmark E2E statistics.")
         return
-    avg_prefill = (after.get("prefill_time", 0) - before.get("prefill_time", 0)) / num
-    avg_decode = (after.get("decode_time", 0) - before.get("decode_time", 0)) / num
-    avg_sort = (after.get("sort_time", 0) - before.get("sort_time", 0)) / num
+    series_deltas = {
+        key: [after[key][label] - before[key][label] for label in labels] for key in required
+    }
+    # Reject the whole window before aggregation, including resets hidden by
+    # growth in other series. A stable series with no new requests is valid.
+    if any(
+        not math.isfinite(value) or value < 0
+        for values in series_deltas.values()
+        for value in values
+    ):
+        logger.info("Legacy Beam phase counter reset; use benchmark E2E statistics.")
+        return
+    delta = {key: sum(values) for key, values in series_deltas.items()}
+    if delta["requests"] <= 0 or not all(math.isfinite(value) for value in delta.values()):
+        return
+    num = delta["requests"]
+    avg_prefill = delta["prefill_time"] / num
+    avg_decode = delta["decode_time"] / num
+    avg_sort = delta["sort_time"] / num
     total = avg_prefill + avg_decode + avg_sort
     print("---------------Beam Search Metrics----------------")
     print(f"Avg Prefill Time (ms):                   {avg_prefill * 1000:.2f}")
@@ -551,7 +578,7 @@ def patched_serve_add_cli_args(parser):
 
 
 def patched_serve_main(args):
-    """Patch serve.main to collect beam search metrics before/after."""
+    """Run the benchmark, optionally reading phase counters from older servers."""
     metrics_url = _get_metrics_url(args)
     is_beam_search = USE_BEAM_SEARCH or (hasattr(args, "n") and getattr(args, "n", 1) > 1)
 

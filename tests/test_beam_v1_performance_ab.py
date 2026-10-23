@@ -23,6 +23,7 @@ def write_pass(root: Path, sha: str, offline_ms: list[float | list[float]]) -> N
     (root / "setup.json").write_text(
         json.dumps(
             {
+                "benchmark_driver_sha256": "d" * 64,
                 "model": "OpenOneRec/OneRec-1.7B",
                 "revision": "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b",
                 "input_tokens_including_sid_begin": 1024,
@@ -119,6 +120,18 @@ def test_ab_allows_offline_changes_within_one_percent(tmp_path: Path) -> None:
     assert len(result["rows"]) == 3
     assert all(row["status"] == "PASS" for row in result["rows"])
     assert "Overall: **PASS**" in report
+
+
+def test_ab_rejects_different_benchmark_drivers(tmp_path: Path) -> None:
+    base, pr = tmp_path / "base", tmp_path / "pr"
+    write_run(base, BASE_SHA, [100.0, 100.0, 100.0])
+    write_run(pr, PR_SHA, [100.0, 100.0, 100.0])
+    path = pr / "2/setup.json"
+    setup = json.loads(path.read_text())
+    setup["benchmark_driver_sha256"] = "e" * 64
+    path.write_text(json.dumps(setup))
+    with pytest.raises(ValueError, match="benchmark settings differ"):
+        compare(base, pr, BASE_SHA, PR_SHA)
 
 
 def test_ab_accepts_exact_one_percent_boundary(tmp_path: Path) -> None:

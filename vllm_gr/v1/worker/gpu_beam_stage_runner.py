@@ -735,8 +735,6 @@ class GPUBeamStageRunner:
         worker._current_scheduler_output = scheduler_output
         worker._current_beam_data = {}
         worker._current_beam_info = None
-        worker._gr_prepared_cuda_prefill_constraint = None
-        worker._gr_prelaunched_cuda_prefill = None
         for entry in execution.entries:
             m = entry.metadata
             if m.kind is GRStageKind.PREFILL:

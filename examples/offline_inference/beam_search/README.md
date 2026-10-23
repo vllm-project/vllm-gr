@@ -2,10 +2,8 @@
 
 This directory contains a standalone example demonstrating how to run beam search in **offline mode** using the `vllm-gr` framework for generative recommendation models.
 
-It contains two entrypoints:
-
-- `offline_beam_search.py` for the legacy Beam path.
-- `offline_beam_search_v1.py` for the EngineCore-owned asynchronous V1 path.
+The entrypoint is `offline_beam_search_v1.py`, the EngineCore-owned
+asynchronous V1 path. The old `offline_beam_search.py` example is retired.
 
 The V1 example accepts a model, Constraint Table triples document, and prompt.
 It compiles a temporary CUDA or NPU Constraint Table artifact, builds the canonical V1
@@ -22,55 +20,16 @@ Follow the instructions in
 [`docs/quickstart.md`](../../../docs/quickstart.md)  
 to install the required dependencies and set up your environment.
 
-## Legacy example
-
-This example shows how to run offline beam search on the **OneRec‑1.7B** model using `vllm-gr`.
-
-```bash
-python offline_beam_search.py \
-    --model OpenOneRec/OneRec-1.7B \
-    --beam_width 128 \
-    --compare latency
-```
-
-Key arguments:
-
-- `--model`: Name or path of the model to load (required).
-- `--beam_width`: Beam width used during beam search (default: 128).
-- `--compare`: Comparison mode against vanilla vLLM. Options: none, latency, output, both (default: none).
-
-### Expected result
-
-The script prints the latency of running the predefined input through vllm-gr, and—if comparison is enabled—also reports the latency of vanilla vLLM.
-
-Example:
-
-```bash
-python offline_beam_search.py --model OpenOneRec/OneRec-1.7B --compare latency
-...
-...
-Vanilla vLLM with BW=128 took 4.882346 seconds
-vLLM-gr with BW=128 took 0.627150 seconds
-```
-
 ## Beam Search V1
 
 Beam Search V1 is the EngineCore-owned asynchronous Beam path. The parameter
 combinations described here follow the working local profiling and A/B scripts.
 
-### V1 versus the legacy path
+### Public entrypoint
 
-| Area | Legacy `beam_search` | V1 `beam_search_v1` |
-| --- | --- | --- |
-| Engine mode | `beam.execution_mode: legacy` | `beam.execution_mode: v1` |
-| Scheduling | The frontend participates in every Beam step | The request is submitted once and EngineCore schedules Prefill and Decode |
-| Beam decision | May use the frontend/legacy decision path | Runs on the Worker with persistent GPU Beam state |
-| Intermediate data | Per-step results return through the legacy path | Intermediate Beam state stays on the device |
-| Final processing | Legacy materialization path | GPU ranks and packs final candidates, then copies one compact payload to the host |
-| Public output | Materialized by the legacy frontend | Token/text fields are lazily materialized on first access |
-| Constraints | Supports the existing legacy configurations | Requires an enabled canonical Constraint Table matching the device |
-| Width | Uses the legacy width behavior | Request capacity must equal the engine width; NPU per-stage widths are described below |
-| Generation budget | Uses the general legacy behavior | Effective generation budget must be 1, 2, or 3 |
+Use `GRLLM.beam_search_v1()` with `beam.execution_mode: v1`.
+`GRLLM.beam_search()` raises a migration error instead of falling through to
+upstream vLLM's implementation. Legacy frontend step orchestration is retired.
 
 The V1 flow is:
 
@@ -85,17 +44,18 @@ beam_search_v1()
   -> release the session
 ```
 
-Execution mode is selected when the engine is initialized. Do not call
-`beam_search_v1` on a legacy engine, call `beam_search` on a V1 engine, or mix
-ordinary/legacy Beam requests with V1 requests in the same engine.
+Execution mode is selected when the engine is initialized. Native non-Beam
+inference remains available in ordinary engine configurations; do not mix it
+with an active V1 Beam session.
 
 ### Current restrictions
 
-The current V1 implementation requires:
+The constrained example requires:
 
 - CUDA or NPU and an enabled canonical Constraint Table matching the device.
 - `async_scheduling=True`.
-- B=1, 2, or 4 prompts per call, sharing generation parameters.
+- Logical B=1..8 with shared generation parameters; online batch/capture policy
+  defaults to `[1, 2, 4]` and must fit engine capacity.
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
 - Request `beam_width == beam.max_width`.
 - Effective generation budget `N` in `{1, 2, 3}`.
@@ -166,7 +126,7 @@ constraint_table:
 | `execution_mode` | Selects the engine-lifetime Beam interface | `v1` |
 | `graph_enabled` | Enables the fixed-shape Beam CUDA graph | `true` |
 | `worker_decision` | Performs Beam selection on the Worker | `true` |
-| `engine_driven` | Lets EngineCore chain stages without frontend step RPCs | Omit for the CUDA default, or set `true` |
+| `engine_driven` | Retired input; V1 always owns scheduling | Omit; old `true` warns and is discarded, `false` is rejected |
 | `max_width` | Engine Beam capacity | Same as request `beam_width` |
 | `max_decode_steps` | Maximum effective generation budget | `1`, `2`, or `3` |
 
@@ -721,3 +681,15 @@ Compare latency only with matching model/catalog/prompt, device, B, capacity,
 input length, return limit, Prefill setting and measurement setup. Keep search
 quality and the existing NPU legal-set score contract separate from performance
 claims.
+
+### Retired scheduling control
+
+`beam.engine_driven`, `vllm_gr_beam_engine_driven`, the Python
+`beam_engine_driven` argument, and `--beam-engine-driven` no longer select an
+execution path. Omit them. For migration, `true` is accepted with a warning
+and discarded; `false` / `--no-beam-engine-driven` is rejected because the
+frontend step loop no longer exists. Null remains equivalent to omission.
+The accepted legacy boolean strings follow the same rules; other types and
+invalid strings fail validation. This option is never serialized to workers
+or auto-enabled by platform defaults. `worker_decision` remains a separate
+control, and an explicit False value is still preserved.

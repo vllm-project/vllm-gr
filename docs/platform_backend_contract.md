@@ -8,9 +8,11 @@ binds an exact canonical vLLM `device_type` to ModelRunner patch hooks,
 Beam Attention execution primitives, environment validation, and any
 platform-specific compatibility patches.
 
-This first-stage contract is additive infrastructure. The production runtime
-continues to use its existing dispatch paths until the later integration
-stages switch them to the provider APIs.
+Production startup already uses provider activation, environment validation,
+runtime compatibility patches, and the constrained TopK execution factory.
+The worker and attention dispatchers still select their implementations
+directly; the two provider getters describe available modules but do not
+replace those dispatchers.
 
 ## Lifecycle and process model
 
@@ -35,10 +37,9 @@ is idempotent; switching to another provider is an error. Backend aliases are
 not resolved by the registry. In particular, `gpu` does not mean `cuda` and
 `ascend` does not mean `npu`.
 
-An unknown backend is always an error and never falls back to CUDA. During the
-first infrastructure-only stage, this guarantee applies to the new registry
-APIs. The existing production dispatchers acquire the same guarantee when
-they are migrated to the provider boundary.
+An unknown backend is always an error in the registry APIs and never falls
+back to CUDA. This registry guarantee does not describe every independent
+worker or attention dispatch branch.
 
 ## Provider contract
 
@@ -96,7 +97,7 @@ the registration function is explicitly called.
 
 ## ModelRunner patch hooks
 
-Platform ModelRunner hooks provide:
+V1 platform ModelRunner hook modules must provide:
 
 ```python
 class ModelRunnerPatchHooks(Protocol):
@@ -106,12 +107,23 @@ class ModelRunnerPatchHooks(Protocol):
 
     def make_patched_prepare_inputs(self, original): ...
 
-    def make_patched_bookkeeping_sync(self, original): ...
 ```
+
+Other factories are optional capabilities discovered by
+`model_runner_patch.apply_worker_patches()`. In particular,
+`make_patched_bookkeeping_sync(original)` is optional: CUDA retains the native
+method and records its identity, while NPU installs its six-item bookkeeping
+wrapper. A module without this factory still satisfies `ModelRunnerPatchHooks`.
+Optional sample, sample-tokens, state-update, reload, and graph hooks remain
+owned by the corresponding platform module.
 
 `make_patched_execute_model()` is intentionally absent. It is shared GPU/NPU
 logic owned by `model_runner_common.py` and remains part of the neutral patch
 orchestrator.
+
+The CUDA dispatcher selects MR V1 or MR V2 before installing their respective
+hooks. The provider's V1 hook getter is not a replacement for this selection;
+NPU continues to use its existing runner path.
 
 ## Beam Attention execution
 
@@ -127,6 +139,10 @@ The complete call signatures are defined by
 `vllm_gr.platforms.protocol.BeamAttentionExecution`. The current
 `beam_attn_gpu.py` and `beam_attn_npu.py` modules satisfy the contract directly;
 providers return those modules rather than copying or wrapping their kernels.
+
+Production attention dispatch also selects the NPU xllm or cascade execution
+path. Returning the base `beam_attn_npu` module from a provider must not bypass
+that selection. Getter unification is a separate migration.
 
 Metadata construction, KV memory management, and the shared execute-model
 wrapper are deliberately outside this contract until their owning migration

@@ -5,10 +5,9 @@ with OneRec-1.7B. One offline request exercises Prefill, asynchronous Decode,
 GPU Beam decisions, and the CUDA Constraint Table. Keep the values in this
 guide unchanged for the first run.
 
-> The V1 reproduction entry point is offline `GRLLM.beam_search_v1()`.
-> The `vllm-gr serve` and OpenAI Chat API examples are separate online and
-> compatibility paths. Do not add the V1 configuration from this guide to
-> those commands.
+> This reproduction uses offline `GRLLM.beam_search_v1()`. Online requests
+> also use V1; see the [online serving example](../examples/online_serving/beam_search/README.md)
+> for the matching canonical configuration and server command.
 
 ## 1. Check the environment
 

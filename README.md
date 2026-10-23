@@ -58,61 +58,20 @@ documented in [benchmarks/qwen/README.md](benchmarks/qwen/README.md).
 
 ## NPU Serving with Constraint Tables
 
-When serving on NPU with beam search enabled (e.g. `--beam-max-width` +
-`--beam-worker-decision`), the platform auto-promotes the constraint backend
-to Constraint Tables. In that mode you **must** pass
-`--catalog-path <triples_document>`, where the document is produced by
-`tools/build_constraint_triples.py` from the real catalog (e.g.
-`video_constraint_triples.json`).
+Use a canonical `--vllm-gr-config` file with `beam.execution_mode: v1` and
+`constraint_table.backend: npu`. Build the `.safetensors` artifact with the
+same model/tokenizer snapshot used by the server and include the printed
+artifact and tokenizer digests in the configuration.
 
-Without it, the tables are auto-built from the tokenizer's `<s_a_*>` /
-`<s_b_*>` / `<s_c_*>` groups; a model whose groups exceed `max_valid_items`
-(currently 500) fails fast at startup:
+Follow the [artifact build instructions](examples/offline_inference/beam_search/README.md#constraint-table-artifact),
+then the [online V1 example](examples/online_serving/beam_search/README.md).
+The old frontend `--catalog-path` injection flow is retired; a triples JSON
+is an artifact build input, not a replacement for the canonical configuration.
 
-```text
-ValueError: tokenizer constraint tables would be truncated: item groups
-s_a/s_b/s_c have 8192/8192/8192 items but max_valid_items=500. ... Provide
---constraint-data built from the real catalog via tools/build_constraint_triples.py,
-or pass valid_item_ids/prefix files covering the full universe.
-```
-
-The triples document is generated from the real recommendation catalog:
-
-```bash
-python tools/build_constraint_triples.py \
-  --catalog /workspace/ckpt/OpenOneRec-RecIF/generated_data/video_catalog.json \
-  --output /workspace/ckpt/OpenOneRec-RecIF/generated_data/video_constraint_triples.json \
-  --begin "<|sid_begin|>" \
-  --end "<|sid_end|>"
-```
-
-The catalog itself is converted from the OpenOneRec dataset's `sid2pid.json`
-(= list of acceptable SIDs), see
-[examples/online_serving/catalog/README.md](examples/online_serving/catalog/README.md):
-
-```bash
-python benchmarks/open_one_rec/tools/convert_catalog.py \
-  --dataset-path /workspace/ckpt/OpenOneRec-RecIF/benchmark_data \
-  --output-path /workspace/ckpt/OpenOneRec-RecIF/generated_data/video_catalog.json
-```
-
-`tests/system/run_benchmark_and_verify.sh` builds it on demand when the file
-is missing (from `TRIPLES_PATH` or the catalog directory).
-
-Example:
-
-```bash
-vllm-gr serve $REC_MODEL \
-  --port 9312 \
-  --trust-remote-code \
-  --max-logprobs 1024 \
-  --beam-max-width 128 \
-  --beam-worker-decision \
-  --catalog-path $REC_TRIPLES \  # video_constraint_triples.json
-  --attention-backend CUSTOM
-```
-
-See `server.sh` for a complete working NPU serve script.
+The [NPU quickstart](docs/quickstart-ascend.md) describes the Ascend environment
+and execution choices. Benchmark gates additionally require local dataset and
+catalog paths plus a resolved benchmark policy; see
+[benchmark instructions](docs/benchmarks/README.md).
 
 ## Uninstall
 

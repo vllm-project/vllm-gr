@@ -66,59 +66,6 @@ class _PayloadLayout:
         )
 
 
-def _build_result(
-    payload: Any,
-    layout: _PayloadLayout,
-    *,
-    session_id: str,
-    request_id: str,
-    item_index: int,
-    options: BeamOutputOptions,
-) -> BeamBatchResult:
-    """Wrap the GPU-ranked compact payload in the existing transport ABI."""
-
-    values = payload.numpy() if isinstance(payload, torch.Tensor) else payload
-    count = int(values[_CONTROL_WORDS])
-    sequences = []
-    steps = layout.steps
-    stride = layout.row_stride
-    rows = values[_CONTROL_WORDS + 1 :].reshape(layout.width, stride)
-    include_score = options.include_cumulative_logprob
-    include_parents = options.include_parent_beam_indices
-    include_stop = options.include_stop_token
-    # The wire row uses native int32/float32 words without alignment padding.
-    # Unpack directly to Python tuples, avoiding two tolist conversions and
-    # per-field scalar casts. The small CPU copy also detaches reused storage.
-    for row in struct.iter_unpack(f"={2 * steps}ifiii", rows[:count].tobytes()):
-        length, reason, stop_token = row[-3:]
-        stopped = reason == FINISH_STOP
-        token_count = length - (stopped and not include_stop)
-        sequences.append(
-            BeamOutputSequence(
-                row[:token_count],
-                row[-4] if include_score else None,
-                row[steps : steps + length] if include_parents else (),
-                "stop" if stopped else "length",
-                stop_token if stopped else None,
-            )
-        )
-
-    return BeamBatchResult(
-        protocol_version=BEAM_BATCH_PROTOCOL_VERSION,
-        batch_id=session_id,
-        output=(
-            BeamBatchOutput((BeamRequestOutput(item_index, request_id, tuple(sequences)),))
-            if sequences
-            else None
-        ),
-        failure=(
-            None
-            if sequences
-            else BeamBatchFailure("no_valid_beams", "No valid final Beam candidates", item_index)
-        ),
-    )
-
-
 def _build_batch_result(
     payload: Any,
     layout: _PayloadLayout,

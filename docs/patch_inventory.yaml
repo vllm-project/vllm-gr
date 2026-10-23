@@ -62,7 +62,7 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_openai_beam_search_patch
       - vllm_gr.patch._validate_chat_sampling_patch
-      - tests/test_serving_beam_lifecycle.py
+      - tests/test_beam_search_dispatch.py
     process_roles: [api_server]
     target: OpenAIServing.beam_search and ChatCompletionRequest.to_beam_search_params
     risk: high
@@ -82,27 +82,13 @@ patches:
     contract: engine-args-descriptors
     removal_condition: vLLM configuration hooks cover every active GR option
 
-  - id: GR-PATCH-006
-    owner: vllm_gr/entrypoints/openai/serving_models.py
-    installer: vllm_gr.entrypoints.openai.serving_models.patch_OpenAIServingModels_init
-    activation: the required frontend patch plan detects the constructor is not installed
-    validator_or_test:
-      - vllm_gr.patch._validate_serving_models_patch
-      - tests/test_serving_catalog.py
-    process_roles: [api_server]
-    target: OpenAIServingModels.__init__
-    risk: high
-    contract: null
-    removal_condition: Catalog state uses composition or a stable serving extension point
-
   - id: GR-PATCH-007
     owner: vllm_gr/v1/engine/core_client.py, core_client_patch.py, and async_llm.py
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_batch_and_fork
     activation: the required frontend patch plan detects grouped Beam client methods are incomplete
     validator_or_test:
       - vllm_gr.patch._validate_batch_and_fork_patch
-      - tests/test_beam_request_unit.py
-      - tests/test_dp_beam_request_unit.py
+      - tests/test_beam_admission_rejection_reporting.py
     process_roles: [api_server]
     target: EngineCore clients and AsyncLLM
     risk: critical
@@ -129,7 +115,7 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
-      - tests/test_beam_request_unit.py
+      - tests/test_gr_async_scheduler.py
     process_roles: [engine_core]
     target: vllm.v1.engine.core.EngineCoreProc
     risk: critical
@@ -137,7 +123,7 @@ patches:
     removal_condition: vLLM exposes stable control-message and request-dispatch extension points
 
   - id: GR-PATCH-010
-    owner: vllm_gr/v1/engine/engine_core_patch.py and scheduler_metadata.py
+    owner: vllm_gr/v1/engine/engine_core_patch.py and gr_async_scheduler.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_scheduler_patch
     activation: the EngineCore patch plan detects scheduler metadata propagation is absent
     validator_or_test:

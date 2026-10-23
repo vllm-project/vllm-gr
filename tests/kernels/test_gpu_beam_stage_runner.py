@@ -755,3 +755,59 @@ def test_terminal_materialization_preserves_fatal_error_channel(monkeypatch, fat
         result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
         assert result.terminal_result.failure.code == "beam_final_output_error"
         assert result.resources_released and owner.closed
+
+
+@pytest.mark.parametrize("n", [1, 3])
+def test_prefill_sampling_orders_producer_compute_and_host_copy(monkeypatch, n):
+    """Exercise production sampling and both terminal/control D2H routes."""
+    # Warm the same kernels before delaying device work so JIT compilation
+    # cannot turn a missing stream dependency into an accidental host fence.
+    warm = runtime(n=n)
+    warm.admit(dispatch(metadata(n=n)))
+    warm.logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
+    warm.sample().get_output()
+    if not warm.closed:
+        done = torch.Event()
+        done.record()
+        warm.release(warm.binding, consumer_done=done)
+
+    owner = runtime(n=n)
+    owner.admit(dispatch(metadata(n=n)))
+    logits = torch.zeros((1, 6), device="cuda", dtype=torch.float16)
+    producer = torch.cuda.Stream()
+    compute = torch.cuda.Stream()
+    initialized = torch.Event()
+    initialized.record()
+    ready = torch.Event()
+    observed_streams = []
+    select = type(owner.backend).select_out_unchecked
+
+    def record_select(backend, *args, **kwargs):
+        observed_streams.append(torch.cuda.current_stream())
+        select(backend, *args, **kwargs)
+
+    monkeypatch.setattr(type(owner.backend), "select_out_unchecked", record_select)
+    with torch.cuda.stream(producer):
+        producer.wait_event(initialized)
+        torch.cuda._sleep(20_000_000)
+        logits[0, 3] = 9
+        ready.record(producer)
+    with torch.cuda.stream(compute):
+        compute.wait_event(ready)
+        owner.logits = logits
+        receipt = owner.sample()
+    result = getattr(receipt.get_output(), GR_WORKER_RESULT_ATTR)["session-0"]
+
+    assert observed_streams == [compute]
+    assert owner.tokens[0, 0].item() == 3
+    assert result.produced_token_count == 1
+    if n == 1:
+        assert result.terminal_result.output.items[0].sequences[0].token_ids == (3,)
+        assert owner.final_output.final_d2h_count == 1
+    else:
+        assert result.terminal_result is None
+        assert owner.host_control[receipt.slot, 0].tolist() == [1, 0, 0]
+    if not owner.closed:
+        done = torch.Event()
+        done.record(compute)
+        owner.release(owner.binding, consumer_done=done)

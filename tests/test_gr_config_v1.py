@@ -200,23 +200,27 @@ def test_canonical_beam_runtime_options_round_trip(
     beam = raw["beam"]
     assert isinstance(beam, dict)
     beam["worker_decision"] = worker_decision
-    beam["engine_driven"] = False
 
     config = gr_config_from_mapping(raw)
 
     assert config.beam_worker_decision is worker_decision
-    assert config.beam_engine_driven is False
+    assert config.beam_engine_driven is None
     assert gr_config_to_mapping(config) == raw
 
 
-def test_canonical_self_advance_requires_worker_decision(tmp_path: Path) -> None:
+def test_retired_canonical_engine_control_does_not_require_worker_decision(tmp_path: Path) -> None:
     raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
     beam = raw["beam"]
     assert isinstance(beam, dict)
     beam["engine_driven"] = True
 
-    with pytest.raises(ValueError, match="requires beam_worker_decision=True"):
-        gr_config_from_mapping(raw)
+    with pytest.warns(FutureWarning, match="retired and ignored"):
+        config = gr_config_from_mapping(raw)
+    assert config.beam_worker_decision is None
+    assert config.beam_engine_driven is None
+    encoded_beam = gr_config_to_mapping(config)["beam"]
+    assert isinstance(encoded_beam, dict)
+    assert "engine_driven" not in encoded_beam
 
 
 def test_canonical_mapping_defaults_constraint_backend_to_cuda(tmp_path: Path) -> None:
@@ -515,14 +519,10 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
     assert result.additional_config[GR_CONFIG_KEY]["constraint_table"]["backend"] == device
 
 
-@pytest.mark.parametrize(  # type: ignore[misc]
-    ("async_scheduling", "expected_engine_driven"),
-    [(False, True), (True, True)],
-)
+@pytest.mark.parametrize("async_scheduling", [False, True])  # type: ignore[misc]
 def test_engine_creation_serializes_cuda_decision_defaults(
     tmp_path: Path,
     async_scheduling: bool,
-    expected_engine_driven: bool | None,
 ) -> None:
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
@@ -548,6 +548,6 @@ def test_engine_creation_serializes_cuda_decision_defaults(
 
     payload = vllm_config.additional_config[GR_CONFIG_KEY]
     assert payload["beam"]["worker_decision"] is True
-    assert payload["beam"].get("engine_driven") is expected_engine_driven
+    assert "engine_driven" not in payload["beam"]
     assert parse_gr_config(vllm_config).beam_worker_decision is True
-    assert parse_gr_config(vllm_config).beam_engine_driven is expected_engine_driven
+    assert parse_gr_config(vllm_config).beam_engine_driven is None

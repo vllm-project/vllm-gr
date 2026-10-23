@@ -151,17 +151,10 @@ class GRConfig:
     # select_unshared_kv) into the accelerator worker and returns the result via
     # ModelRunnerOutput.beam_search_result, aligning with the asynchronous scheduling save flow.
     # CUDA beam deployments default to True; NPU requires xllm execution.
-    # False explicitly keeps the frontend NumPy path.
+    # Explicit False is preserved; it does not enable a legacy frontend path.
     beam_worker_decision: bool | None = None
-    # None = unset (the Driver enables this by default for accelerator beam
-    # deployments with worker decisions).  True makes EngineCore chain both
-    # the prefill -> step0 transition AND every decode-step transition
-    # in-process from the worker's beam decision.  The frontend still
-    # consumes each step's output (EOS / materialize / streaming) but skips
-    # the per-step RPC when the engine chained that step.  Safe under async
-    # scheduling: the advance runs in the busy-loop iteration that processes
-    # the step's outputs.  Only valid with beam_worker_decision=True (the
-    # chain consumes worker beam decisions).
+    # Deprecated constructor input only. Validation consumes True with a
+    # warning and rejects False; no engine-driven state is serialized.
     beam_engine_driven: bool | None = None
     # Unset keeps native inference enabled without selecting GR Beam.
     beam_execution_mode: BeamExecutionMode | None = None
@@ -283,11 +276,6 @@ class GRConfig:
             self, "beam_execution_mode", validate_beam_execution_mode(self.beam_execution_mode)
         )
         validate_enable_short_suffix_attention(self.enable_short_suffix_attention)
-        if self.beam_engine_driven and not self.beam_worker_decision:
-            raise ValueError(
-                "vllm-gr beam_engine_driven=True requires beam_worker_decision=True "
-                "(the engine-driven session consumes worker beam decisions)"
-            )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None
@@ -321,7 +309,6 @@ class GRConfig:
             or (self.constraint_table is not None and self.constraint_table.enabled)
             or self.constrained_generation is not None
             or self.beam_worker_decision is not None
-            or self.beam_engine_driven is not None
             or self.beam_execution_mode is not None
         )
 
