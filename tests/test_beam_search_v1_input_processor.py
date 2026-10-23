@@ -12,6 +12,7 @@ import pytest
 import torch
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import embeds_input, tokens_input
+from vllm.renderers.params import TokenizeParams
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 
@@ -64,7 +65,7 @@ def _make_engine(
         additional_config=(
             {"vllm_gr": _canonical_gr_config()} if additional_config is None else additional_config
         ),
-        model_config=SimpleNamespace(max_model_len=32),
+        model_config=SimpleNamespace(max_model_len=32, is_encoder_decoder=False),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32, async_scheduling=True),
         parallel_config=parallel_config
         or SimpleNamespace(
@@ -76,9 +77,14 @@ def _make_engine(
     native.vllm_config = config
     native.model_config = config.model_config
     native.generation_config_fields = {}
-    native.renderer = SimpleNamespace(tokenizer=None, get_eos_token_id=lambda: 2)
-    native.input_preprocessor = SimpleNamespace(
-        preprocess=lambda prompt, **kwargs: tokens_input(prompt)
+    # 0.30 renders raw prompts through Renderer, not InputPreprocessor.
+    # Keep native prompt parsing and request construction; only token rendering
+    # is stubbed so these metadata/routing tests need no model or tokenizer.
+    native.renderer = SimpleNamespace(
+        tokenizer=None,
+        get_eos_token_id=lambda: 2,
+        default_cmpl_tok_params=TokenizeParams(max_total_tokens=32),
+        render_cmpl=lambda prompts, params: [tokens_input(p["prompt_token_ids"]) for p in prompts],
     )
     native._validate_params = lambda *args: None
     native._validate_lora = lambda *args: None

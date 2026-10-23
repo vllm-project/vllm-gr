@@ -348,10 +348,10 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
 
 async def _run_online(work_dir: Path) -> None:
     from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
     from vllm.entrypoints.openai.api_server import (
         build_async_engine_client_from_engine_args,
     )
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
     from vllm.entrypoints.openai.models.serving import (
         BaseModelPath,
         OpenAIServingModels,
@@ -362,9 +362,16 @@ async def _run_online(work_dir: Path) -> None:
 
     initialize_runtime()
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
-    args = AsyncEngineArgs(additional_config={"vllm_gr": config}, **_engine_kwargs(model, config))
+    # The native 0.30 default is zero: it kills EngineCore before IPC cleanup.
+    # Give the real shutdown path time to run and check its exit below.
+    args = AsyncEngineArgs(
+        additional_config={"vllm_gr": config},
+        shutdown_timeout=10,
+        **_engine_kwargs(model, config),
+    )
     async with build_async_engine_client_from_engine_args(args) as engine:
-        serving = OpenAIServing(
+        processes = list(engine.engine_core.resources.engine_manager.processes)
+        serving = GenerateBaseServing(
             engine_client=engine,
             request_logger=None,
             models=OpenAIServingModels(
@@ -375,6 +382,7 @@ async def _run_online(work_dir: Path) -> None:
         )
         await engine.collective_rpc("onerec_v1_st_observe")
         rows = []
+        cancellations = []
 
         async def run(length: int, steps: int, cold: bool, request_id: str) -> None:
             if cold:
@@ -413,11 +421,21 @@ async def _run_online(work_dir: Path) -> None:
             stream = serving.beam_search_v1(tokens_input(newline * 1023), "cancelled", _params(3))
             task = asyncio.create_task(anext(stream))
             try:
+                deadline = time.monotonic() + 30
+                while not engine.output_processor.request_states:
+                    assert not task.done() and time.monotonic() < deadline
+                    await asyncio.sleep(0.001)
+                (session_id,) = engine.output_processor.request_states
                 if waiting:
-                    await asyncio.sleep(0.05)
+                    # A sleep alone can pass before the request was submitted.
+                    # Fence actual EngineCore admission while scheduling is paused.
+                    while await engine.engine_core.call_utility_async(
+                        "is_gr_session_retired", session_id
+                    ):
+                        assert not task.done() and time.monotonic() < deadline
+                        await asyncio.sleep(0.001)
                     assert len((await engine.collective_rpc("onerec_v1_st_events"))[0]) == before
                 else:
-                    deadline = time.monotonic() + 30
                     while True:
                         events = (await engine.collective_rpc("onerec_v1_st_events"))[0][before:]
                         if any(e["method"] == "execute" for e in events):
@@ -432,6 +450,25 @@ async def _run_online(work_dir: Path) -> None:
                 await stream.aclose()
                 if waiting:
                     await engine.resume_generation()
+            assert await engine.engine_core.call_utility_async("is_gr_session_retired", session_id)
+            assert not engine.output_processor.has_unfinished_requests()
+            assert not engine.output_processor.external_req_ids
+            snapshot = (await engine.collective_rpc("onerec_v1_st_snapshot"))[0]
+            assert snapshot["retired"] and not snapshot["active_sessions"]
+            assert snapshot["registry_size"] == 0
+            assert snapshot["context_released"] and snapshot["workspace_released"]
+            assert not any(snapshot["control_busy"]) and not snapshot["pending"]
+            events = (await engine.collective_rpc("onerec_v1_st_events"))[0][before:]
+            cancellations.append(
+                dict(
+                    waiting=waiting,
+                    session_id=session_id,
+                    events=events,
+                    core_retired=True,
+                    frontend_empty=True,
+                    worker_released=True,
+                )
+            )
             await run(1024, 3, False, "after-cancel")
 
         await cancel(waiting=True)
@@ -439,6 +476,11 @@ async def _run_online(work_dir: Path) -> None:
         _write_evidence(
             work_dir, "online", rows, (await engine.collective_rpc("onerec_v1_st_events"))[0]
         )
+    shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
+    assert shutdown and all(not p["alive"] and p["exitcode"] == 0 for p in shutdown), shutdown
+    (work_dir / "online-lifecycle.json").write_text(
+        json.dumps(dict(cancellations=cancellations, shutdown=shutdown), indent=2)
+    )
 
 
 async def _run_online_completion_batch(work_dir: Path) -> None:
