@@ -8,7 +8,11 @@ from typing import Any
 import pytest
 
 from benchmarks.beam_search.v1_performance_gate import validate_online_response
-from benchmarks.beam_search.v1_recall_gate import graph_delta, infer_batch
+from benchmarks.beam_search.v1_recall_gate import (
+    eager_runtime,
+    graph_delta,
+    infer_batch,
+)
 from benchmarks.open_one_rec.tools.convert_catalog import process_json
 
 VALID = ["<|sid_begin|>", "<s_a_1>", "<s_b_2>", "<s_c_3>", "<|sid_end|>"]
@@ -80,3 +84,44 @@ def test_recall_graph_gate_requires_every_b4_batch_to_replay() -> None:
     after[0]["gr_prefill_dispatches"] = {"replay:4": 1, "fallback:4:no_graph": 1}
     with pytest.raises(RuntimeError, match="expected 2 replays"):
         graph_delta(before, after, 2)
+
+
+@pytest.mark.parametrize("snapshot", ["before", "after"])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("key", "value"),
+    [
+        ("beam_graph_enabled", True),
+        ("captured_widths", [128]),
+        ("full_dispatches", 1),
+        ("gr_prefill_captures", [[16, 4]]),
+        ("gr_prefill_dispatches", {"replay:4": 1}),
+        ("gr_prefill_dispatches", {"fallback:4:no_graph": 1}),
+    ],
+)
+def test_eager_recall_rejects_startup_or_inference_graph_activity(
+    snapshot: str, key: str, value: Any
+) -> None:
+    snapshots = {
+        name: [
+            {
+                "beam_graph_enabled": False,
+                "captured_widths": [],
+                "full_dispatches": 0,
+                "gr_prefill_dispatches": {},
+            }
+        ]
+        for name in ("before", "after")
+    }
+    assert eager_runtime(**snapshots)["execution_mode"] == "eager"
+    snapshots[snapshot][0][key] = value
+    with pytest.raises(RuntimeError, match="enabled, captured or dispatched"):
+        eager_runtime(**snapshots)
+
+
+def test_eager_recall_requires_complete_worker_statistics() -> None:
+    with pytest.raises(RuntimeError, match="empty or changed"):
+        eager_runtime([], [])
+    with pytest.raises(RuntimeError, match="empty or changed"):
+        eager_runtime([{}], [{}, {}])
+    with pytest.raises(RuntimeError, match="incomplete"):
+        eager_runtime([{}], [{}])
