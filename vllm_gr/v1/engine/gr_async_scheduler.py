@@ -464,13 +464,13 @@ def attach_gr_stage_metadata(
         # Scheduler owns the native block refcounts. Python references in a
         # Worker cannot prevent block reuse after abort or preemption.
         touched: list[Any] = []
-        lease: list[Any] = []
+        lease_groups: list[tuple[Any, ...]] = []
         block_rows: list[tuple[int, ...]] = []
         for request_id in request_ids:
             kv = manager.get_blocks(request_id)
             for group in kv.blocks:
                 touched.extend(group)
-                lease.extend(reversed(group))
+                lease_groups.append(tuple(reversed(group)))
             # Only one uniform KV group can be represented as one row per
             # request. Keep the lease for every group even when publication is
             # unavailable; the Worker rejects unsupported multi-group GR.
@@ -491,7 +491,7 @@ def attach_gr_stage_metadata(
             kv_blocks = tuple(block_rows)
         if touched:
             manager.block_pool.touch(touched)
-            session._kv_dispatch_leases[dispatch_id] = tuple(lease)
+            session._kv_dispatch_leases[dispatch_id] = tuple(lease_groups)
     metadata = GRStageMetadata(
         session_id=session.session_id,
         dispatch_id=dispatch_id,
@@ -625,8 +625,10 @@ def update_gr_from_output(
     # the Worker's persistent resources have been released.
     session._in_flight_dispatches.remove(metadata.dispatch_id)
     _progress(scheduler)
-    blocks = session._kv_dispatch_leases.pop(metadata.dispatch_id, None)
-    if blocks is not None:
+    lease_groups = session._kv_dispatch_leases.pop(metadata.dispatch_id, ())
+    for blocks in lease_groups:
+        # Match native per-group free calls: uncached blocks are prepended,
+        # cached blocks appended. Flattening groups changes eviction order.
         scheduler.kv_cache_manager.block_pool.free_blocks(blocks)
     try:
         if session._dispatch_records.get(metadata.dispatch_id) != metadata:

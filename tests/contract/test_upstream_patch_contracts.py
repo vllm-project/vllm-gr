@@ -5,9 +5,9 @@
 from __future__ import annotations
 
 import inspect
-import re
 from pathlib import Path
 
+import regex as re
 import yaml
 
 
@@ -55,14 +55,19 @@ def test_scheduler_contracts() -> None:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    assert _parameter_names(Scheduler.schedule) == ["self"]
+    assert _parameter_names(Scheduler.schedule) == ["self", "throttle_prefills"]
+    assert inspect.signature(Scheduler.schedule).parameters["throttle_prefills"].default is False
     assert not hasattr(SchedulerOutput, "__slots__")
 
 
 def test_engine_args_descriptor_contracts() -> None:
     from vllm.engine.arg_utils import EngineArgs
 
+    from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+
+    patch_add_cli_args()
     assert isinstance(inspect.getattr_static(EngineArgs, "add_cli_args"), staticmethod)
+    assert EngineArgs.add_cli_args is object.__new__(EngineArgs).add_cli_args
     assert isinstance(inspect.getattr_static(EngineArgs, "from_cli_args"), classmethod)
     assert inspect.isfunction(inspect.getattr_static(EngineArgs, "create_engine_config"))
 

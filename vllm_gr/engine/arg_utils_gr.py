@@ -707,7 +707,7 @@ def create_engine_config(self, usage_context=None, headless=False):
 
 
 def patch_add_cli_args() -> None:
-    EngineArgs.add_cli_args = add_cli_args
+    EngineArgs.add_cli_args = staticmethod(add_cli_args)
     EngineArgs.create_engine_config = create_engine_config
     EngineArgs.from_cli_args = classmethod(from_cli_args)
     EngineArgs.__init__ = _init_engine_args

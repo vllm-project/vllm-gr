@@ -5,7 +5,7 @@
 
 import json
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import msgspec
@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.structured_output import StructuredOutputManager
 
 from tests.test_gr_async_scheduler import _batch_request
 from vllm_gr.v1.engine.beam_search_v1 import (
@@ -97,9 +98,11 @@ def scheduler(tmp_path, request):
         ],
     )
     config.cache_config.num_gpu_blocks = 8
-    return AsyncScheduler(
-        config, kv, SimpleNamespace(should_advance=lambda _: False), block_size=16
+    structured_output = SimpleNamespace(should_advance=lambda _: False)
+    structured_output.accept_tokens = MethodType(
+        StructuredOutputManager.accept_tokens, structured_output
     )
+    return AsyncScheduler(config, kv, structured_output, block_size=16)
 
 
 def add(scheduler, name, prompt=7, n=3):
@@ -160,6 +163,57 @@ def release_receipt(scheduled):
         GRRetireResult(m.session_id, m.owner_generation, m.retire_id, True),
     )
     return out
+
+
+@pytest.mark.parametrize("throttle_prefills", [False, True])
+@pytest.mark.parametrize("capacity_bound", [False, True])
+def test_native_prefill_throttle_preserves_decode_progress(
+    scheduler, throttle_prefills, capacity_bound
+):
+    """The GR wrapper must preserve native admission of ordinary requests."""
+    for name in ("decode", "prefill"):
+        request = _batch_request().items[0].request
+        request.request_id = name
+        scheduler.add_request(Request.from_engine_core_request(request, block_hasher=None))
+        if name == "decode":
+            first = scheduler.schedule()
+            scheduler.update_from_output(
+                first,
+                ModelRunnerOutput(
+                    req_ids=[name], req_id_to_index={name: 0}, sampled_token_ids=[[3]]
+                ),
+            )
+
+    scheduler.prefill_capacity_bound = capacity_bound
+    scheduled = scheduler.schedule(throttle_prefills)
+    assert scheduled.num_scheduled_tokens["decode"] == 1
+    deferred = throttle_prefills and not capacity_bound
+    assert ("prefill" in scheduled.num_scheduled_tokens) is not deferred
+    assert scheduled.gr_stage_metadata == {}
+    if deferred:
+        assert scheduler.requests["prefill"].status is RequestStatus.WAITING
+        assert scheduler.schedule(False).num_scheduled_tokens["prefill"] == 3
+
+
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("status", [RequestStatus.FINISHED_ABORTED, RequestStatus.FINISHED_ERROR])
+def test_native_finish_returns_original_requests_and_cleans_queues(scheduler, running, status):
+    request = Request.from_engine_core_request(_batch_request().items[0].request, block_hasher=None)
+    request.client_index = 7
+    scheduler.add_request(request)
+    if running:
+        scheduler.schedule()
+    finished = scheduler.finish_requests(None, status)
+    assert finished == [request]
+    assert finished[0] is request
+    assert finished[0].client_index == 7
+    assert request.status is status
+    assert not scheduler.requests
+    assert not scheduler.running
+    assert not scheduler.waiting
+    assert not scheduler.skipped_waiting
+    assert not getattr(scheduler, "_gr_v1_sessions", {})
+    assert scheduler.finish_requests(request.request_id, status) == []
 
 
 def test_fifo_owner_handoffs_on_terminal_receipt_without_retirement(scheduler):
@@ -313,8 +367,10 @@ def test_native_batch_queue_submits_successor_before_consuming_receipt(scheduler
         is_ec_consumer=True,
         is_pooling_model=False,
         model_executor=Executor(),
+        _should_throttle_prefills=lambda: False,
         log_error_detail=lambda _: nullcontext(),
-        log_iteration_details=lambda _: nullcontext(),
+        capture_iteration_details=lambda _: nullcontext(),
+        _attach_iteration_details=lambda *_: None,
         _process_aborts_queue=lambda: None,
     )
     add(scheduler, "A")
