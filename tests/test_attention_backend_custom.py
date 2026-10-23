@@ -201,7 +201,34 @@ class TestNpuDefaultBlockSize(unittest.TestCase):
 
 
 class TestBeamAttentionVllmApiContract(unittest.TestCase):
-    """Pin the vLLM 0.22 attention APIs used only on accelerator paths."""
+    """Pin the vLLM 0.30 attention APIs used only on accelerator paths."""
+
+    def test_backend_accepts_native_configuration_validation(self):
+        import torch
+        from vllm.platforms.interface import DeviceCapability
+
+        from vllm_gr.v1.attention.backends import beam_attn
+
+        execution = SimpleNamespace(is_available=lambda: True)
+        with (
+            mock.patch.object(beam_attn, "CUDA_DEVICE", True),
+            mock.patch.object(beam_attn, "NPU_DEVICE", False),
+            mock.patch.object(beam_attn, "_get_platform_execution_module", return_value=execution),
+        ):
+            reasons = beam_attn.BeamAttentionBackend.validate_configuration(
+                head_size=128,
+                dtype=torch.bfloat16,
+                kv_cache_dtype="auto",
+                block_size=16,
+                use_mla=False,
+                has_sink=False,
+                use_sparse=False,
+                use_mm_prefix=False,
+                use_per_head_quant_scales=False,
+                device_capability=DeviceCapability(8, 9),
+                attn_type="decoder",
+            )
+        assert reasons == []
 
     def test_impl_accepts_vllm_sinks_keyword(self):
         """Attention forwards extra implementation arguments as ``sinks``."""
