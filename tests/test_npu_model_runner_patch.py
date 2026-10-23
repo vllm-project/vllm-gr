@@ -2309,7 +2309,7 @@ def test_npu_dynamic_parent_history_is_not_advanced_twice(
     dynamic_select = Mock(return_value=decision)
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.session_request, stage.pending_plan, stage.execution_error = request, plan, None
-    stage.parent_history = torch.full((2, 3, 3), 9, dtype=torch.int32)
+    stage.parent_history = None
     stage.dynamic_state = SimpleNamespace(
         select=dynamic_select,
         sequence=torch.zeros(2, execution.input_width, 3, dtype=torch.int32),
@@ -2332,7 +2332,16 @@ def test_npu_dynamic_parent_history_is_not_advanced_twice(
         "vllm_gr.v1.worker.npu_beam_stage_runner.run_beam_decision_candidates", native
     )
     monkeypatch.setattr(stage, "_advance_parent_history", advance)
-    terminal = Mock(wraps=stage._build_terminal_result)
+    build_terminal = stage._build_terminal_result
+
+    def check_terminal_history(*args: Any) -> Any:
+        # Inspect before terminal cleanup clears the session's history.
+        assert (stage.parent_history is not None) is include_parents
+        if include_parents:
+            assert stage.parent_history is parents
+        return build_terminal(*args)
+
+    terminal = Mock(side_effect=check_terminal_history)
     monkeypatch.setattr(stage, "_build_terminal_result", terminal)
 
     assert stage._uses_dynamic_state(plan)

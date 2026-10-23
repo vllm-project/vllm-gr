@@ -473,7 +473,8 @@ class NPUEagerBeamStageRunner:
                     if is_last
                     else execution.output_width,
                 )
-                self.parent_history = decision["out_parent_history"]
+                if self._needs_parent_history():
+                    self.parent_history = decision["out_parent_history"]
             else:
                 decision = run_beam_decision_candidates(
                     self.worker,
