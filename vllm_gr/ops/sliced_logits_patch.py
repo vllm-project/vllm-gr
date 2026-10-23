@@ -54,11 +54,13 @@ def apply_sliced_logits_patch() -> bool:
 
         original_get_logits = LogitsProcessor._get_logits
 
-        def patched_get_logits(self, hidden_states, lm_head, embedding_bias):
+        def patched_get_logits(self, hidden_states, lm_head, embedding_bias, skip_gather=False):
             if hasattr(self, "_gr_vocab_slice"):
                 window = self._gr_vocab_slice
                 if window is None:
-                    return original_get_logits(self, hidden_states, lm_head, embedding_bias)
+                    return original_get_logits(
+                        self, hidden_states, lm_head, embedding_bias, skip_gather
+                    )
                 return compute_sliced_logits(
                     hidden_states,
                     lm_head,
@@ -67,6 +69,7 @@ def apply_sliced_logits_patch() -> bool:
                     slice_size=window[1],
                     logits_processor=self,
                     orig_get_logits=original_get_logits,
+                    skip_gather=skip_gather,
                 )
             if is_vocab_slice_enabled():
                 return compute_sliced_logits(
@@ -75,8 +78,9 @@ def apply_sliced_logits_patch() -> bool:
                     embedding_bias,
                     logits_processor=self,
                     orig_get_logits=original_get_logits,
+                    skip_gather=skip_gather,
                 )
-            return original_get_logits(self, hidden_states, lm_head, embedding_bias)
+            return original_get_logits(self, hidden_states, lm_head, embedding_bias, skip_gather)
 
         LogitsProcessor._get_logits = patched_get_logits
 
@@ -94,31 +98,29 @@ def apply_sliced_logits_patch() -> bool:
             logger.debug("vllm_gr: Could not patch Sampler.gather_logprobs: %s", exc)
 
         # V2 ModelRunner: sampling lives in the new worker-local module, whose
-        # ``compute_topk_logprobs`` does the same torch.topk the V1
+        # ``compute_topk_scores`` does the same torch.topk the V1
         # ``gather_logprobs`` clamp above protects. With a narrow catalog
         # vocabulary slice the logits have far fewer columns than the request's
         # num_logprobs (e.g. an impossible 3-token catalog slices to a single
         # column), and the unclamped topk raises "selected index k out of
         # range". The callers bind the function into their own module
-        # namespace (``from ... import compute_topk_logprobs``), so the clamp
+        # namespace (``from ... import compute_topk_scores``), so the clamp
         # must be installed on every importer's binding, not just the defining
         # module.
         def _make_clamped_v2_topk(original_v2_topk):
-            def patched_compute_topk_logprobs(logits, num_logprobs, *args, **kwargs):
+            def patched_compute_topk_scores(logits, num_logprobs, *args, **kwargs):
                 if logits is not None and torch.is_tensor(logits) and logits.numel() > 0:
                     num_logprobs = min(num_logprobs, logits.size(-1))
                 return original_v2_topk(logits, num_logprobs, *args, **kwargs)
 
-            return patched_compute_topk_logprobs
+            return patched_compute_topk_scores
 
         try:
             from vllm.v1.worker.gpu.sample import logprob as v2_logprob
 
-            v2_logprob.compute_topk_logprobs = _make_clamped_v2_topk(
-                v2_logprob.compute_topk_logprobs
-            )
+            v2_logprob.compute_topk_scores = _make_clamped_v2_topk(v2_logprob.compute_topk_scores)
         except Exception as exc:
-            logger.debug("vllm_gr: Could not patch V2 compute_topk_logprobs: %s", exc)
+            logger.debug("vllm_gr: Could not patch V2 compute_topk_scores: %s", exc)
 
         for _v2_module_name in (
             "vllm.v1.worker.gpu.sample.sampler",
@@ -128,12 +130,12 @@ def apply_sliced_logits_patch() -> bool:
                 import importlib
 
                 _v2_module = importlib.import_module(_v2_module_name)
-                _bound = getattr(_v2_module, "compute_topk_logprobs", None)
+                _bound = getattr(_v2_module, "compute_topk_scores", None)
                 if callable(_bound):
-                    _v2_module.compute_topk_logprobs = _make_clamped_v2_topk(_bound)
+                    _v2_module.compute_topk_scores = _make_clamped_v2_topk(_bound)
             except Exception as exc:
                 logger.debug(
-                    "vllm_gr: Could not patch %s.compute_topk_logprobs: %s",
+                    "vllm_gr: Could not patch %s.compute_topk_scores: %s",
                     _v2_module_name,
                     exc,
                 )

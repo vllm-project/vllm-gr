@@ -4,6 +4,7 @@
 import json
 from typing import Any
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +17,7 @@ from vllm_gr.ops.sliced_logits import (
     set_vocab_slice_config,
 )
 from vllm_gr.utils.catalog import Catalog
+from vllm_gr.utils.npu_adapter import is_cuda_available
 
 
 class MockLMHead(nn.Module):  # type: ignore[misc]
@@ -53,6 +55,7 @@ def test_sliced_logits_equivalence() -> None:
         quant_group_size=128,
     )
 
+    assert sliced_logits is not None
     assert sliced_logits.shape == (batch_size, slice_size)
     assert torch.allclose(sliced_logits, expected_slice_logits, atol=1e-5, rtol=1e-5)
 
@@ -80,6 +83,7 @@ def test_quantization_group_alignment() -> None:
         quant_group_size=group_size,
     )
 
+    assert sliced_logits is not None
     assert sliced_logits.shape == (batch_size, slice_size)
     assert torch.allclose(sliced_logits, expected_slice_logits, atol=1e-5, rtol=1e-5)
 
@@ -200,6 +204,8 @@ def test_tp_sliced_logits_equivalence_tp2() -> None:
         hidden_states, rank1_head, offset=offset, slice_size=slice_size
     )
 
+    assert rank0_logits is not None
+    assert rank1_logits is not None
     # Rank 0 should compute exact logits for the slice [2000:5000]
     assert torch.allclose(rank0_logits, ref_sliced_logits, atol=1e-5, rtol=1e-5)
     # Rank 1 overlap is empty
@@ -231,6 +237,8 @@ def test_tp_sliced_logits_spanning_multiple_ranks() -> None:
         hidden_states, rank1_head, offset=offset, slice_size=slice_size
     )
 
+    assert rank0_logits is not None
+    assert rank1_logits is not None
     # Rank 0 computes [4000:5000] (1000 logits), Rank 1 computes [5000:6000] (1000 logits)
     assert rank0_logits.shape[-1] == 1000
     assert rank1_logits.shape[-1] == 1000
@@ -272,6 +280,7 @@ def test_quantized_lm_head_fallback() -> None:
         hidden_states, quant_head, offset=offset, slice_size=slice_size
     )
 
+    assert sliced_logits is not None
     assert sliced_logits.shape == (batch_size, slice_size)
     assert sliced_logits.is_contiguous()
     assert projected_weight_shapes == [(vocab_size, embed_dim)]
@@ -316,39 +325,209 @@ def test_validation_vocab_offset_and_slice_size() -> None:
         validate_vocab_slice_size(True)
 
 
-def test_v2_compute_topk_logprobs_clamped_to_sliced_width() -> None:
-    """The V2 sampler's topk must clamp k to the sliced logits width.
+def _native_processor(vocab_size: int, head_dtype: torch.dtype | None = None) -> Any:
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-    With a narrow catalog vocabulary slice the lm_head produces far fewer
-    columns than a request's num_logprobs (an impossible 3-token catalog
-    slices to one column); the V1 ``gather_logprobs`` clamp cannot reach the
-    V2 worker-local ``compute_topk_logprobs`` because importers bind the name
-    into their own module namespace. The patch must rewrite every importer's
-    binding, and the clamp must keep k inside the slice.
-    """
+    from vllm_gr.ops.sliced_logits_patch import apply_sliced_logits_patch
 
+    apply_sliced_logits_patch()
+    with set_current_vllm_config(VllmConfig()):
+        processor = LogitsProcessor(vocab_size)
+    processor.head_dtype = head_dtype
+    return processor
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "device,dtype", [("cpu", torch.float32), ("cuda", torch.float16), ("cuda", torch.bfloat16)]
+)
+@pytest.mark.parametrize("head_dtype", [None, torch.float32])  # type: ignore[misc]
+@pytest.mark.parametrize("skip_gather", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("slice_mode", ["disabled", "global", "window", "override_none"])  # type: ignore[misc]
+def test_native_logits_forward(
+    device: str,
+    dtype: torch.dtype,
+    head_dtype: torch.dtype | None,
+    skip_gather: bool,
+    slice_mode: str,
+) -> None:
+    """Exercise the real 0.30 forward, projection and dtype handling."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+
+    if device == "cuda" and not is_cuda_available():
+        pytest.skip("CUDA is not available")
+    torch.manual_seed(43)
+    head = MockLMHead(384, 32).to(device=device, dtype=dtype)
+    head.weight.data.mul_(0.1)
+    head.bias.data.mul_(0.1)
+    head.quant_method = UnquantizedEmbeddingMethod()
+    head.tp_size = 1
+    hidden = torch.randn(3, 32, device=device, dtype=dtype) * 0.1
+    processor = _native_processor(350, head_dtype)
+    processor.scale = 0.7
+    processor.soft_cap = 1.5
+    window = None
+    if slice_mode != "disabled":
+        set_vocab_slice_config(129, 157)
+        window = (129, 157)
+    if slice_mode == "window":
+        window = (269, 57)
+        processor._gr_vocab_slice = window
+    elif slice_mode == "override_none":
+        processor._gr_vocab_slice = None
+        window = None
+
+    output = processor(head, hidden, head.bias, skip_gather)
+    expected_dtype = head_dtype or dtype
+    expected = F.linear(
+        hidden.to(expected_dtype), head.weight.to(expected_dtype), head.bias.to(expected_dtype)
+    )
+    if window is not None:
+        expected = expected[..., window[0] : window[0] + window[1]]
+        assert head._sliced_weight.shape[0] < head.weight.shape[0]
+        assert head._sliced_proxy.tp_size == 1
+    elif not skip_gather:
+        expected = expected[..., :350]
+    expected = torch.tanh(expected / processor.soft_cap) * processor.soft_cap
+    expected = expected * processor.scale
+    assert output is not None
+    assert output.dtype == expected_dtype
+    torch.testing.assert_close(
+        output, expected, atol=1e-5 if expected_dtype == torch.float32 else 2e-3, rtol=2e-3
+    )
+    if window is None:
+        assert not hasattr(head, "_sliced_weight")
+    else:
+        cached = head._sliced_weight
+        processor(head, hidden, head.bias, skip_gather)
+        assert head._sliced_weight is cached
+
+
+@pytest.mark.parametrize("quantized", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("skip_gather", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("rank", [0, 1])  # type: ignore[misc]
+@pytest.mark.parametrize("window", [(192, 160), (5, 11)])  # type: ignore[misc]
+def test_native_logits_tp_contract(
+    quantized: bool,
+    skip_gather: bool,
+    rank: int,
+    window: tuple[int, int],
+) -> None:
+    """Simulate the collective, but use the real upstream projection/forward."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+
+    torch.manual_seed(44)
+    weight = torch.randn(512, 32)
+    hidden = torch.randn(2, 32)
+    head = MockTPHead(weight, rank, 2)
+    projected = []
+
+    class DummyQuantMethod:
+        def apply(self, layer: Any, x: torch.Tensor, bias: Any = None) -> torch.Tensor:
+            projected.append(layer.weight.shape[0])
+            return F.linear(x, layer.weight, bias)
+
+    head.quant_method = DummyQuantMethod() if quantized else UnquantizedEmbeddingMethod()
+    processor = _native_processor(500)
+    processor._gr_vocab_slice = window
+    full = F.linear(hidden, weight)
+    gathered = []
+
+    def gather(local: torch.Tensor) -> torch.Tensor:
+        gathered.append(local.shape[-1])
+        torch.testing.assert_close(local, full[..., rank * 256 : (rank + 1) * 256])
+        return full
+
+    processor._gather_logits = gather
+    output = processor(head, hidden, None, skip_gather)
+    start, end = window[0], window[0] + window[1]
+    if skip_gather:
+        start = max(start, rank * 256)
+        end = max(start, min(end, (rank + 1) * 256))
+    assert output is not None
+    torch.testing.assert_close(output, full[..., start:end])
+    assert gathered == ([] if skip_gather else [256])
+    if quantized:
+        assert projected == [256]
+    if quantized or not skip_gather:
+        assert not hasattr(head, "_sliced_weight")
+
+
+@pytest.mark.parametrize("quantized", [False, True])  # type: ignore[misc]
+def test_native_logits_non_receiver_preserves_none(quantized: bool) -> None:
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+
+    head = MockTPHead(torch.randn(512, 32), rank=1, tp_size=2)
+
+    class DummyQuantMethod:
+        def apply(self, layer: Any, x: torch.Tensor, bias: Any = None) -> torch.Tensor:
+            return F.linear(x, layer.weight, bias)
+
+    head.quant_method = DummyQuantMethod() if quantized else UnquantizedEmbeddingMethod()
+    processor = _native_processor(500)
+    processor._gr_vocab_slice = (5, 11)  # this rank has no overlap, but must gather
+    calls = []
+
+    def gather(local: torch.Tensor) -> None:
+        calls.append(local.shape[-1])
+        return None
+
+    processor._gather_logits = gather
+    assert processor(head, torch.randn(2, 32)) is None
+    assert calls == [256]
+
+
+def test_native_quantized_head_dtype_rejection() -> None:
+    class DummyQuantMethod:
+        def apply(self, layer: Any, x: torch.Tensor, bias: Any = None) -> torch.Tensor:
+            return F.linear(x, layer.weight, bias)
+
+    head = MockLMHead(384, 32)
+    head.quant_method = DummyQuantMethod()
+    head.tp_size = 1
+    processor = _native_processor(350, torch.float64)
+    processor._gr_vocab_slice = (129, 157)
+    with pytest.raises(ValueError, match="only supported for an unquantized lm_head"):
+        processor(head, torch.randn(2, 32))
+
+
+@pytest.mark.parametrize("logits_mode", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("width", [1, 7])  # type: ignore[misc]
+@pytest.mark.parametrize("num_logprobs", [0, 1, 5])  # type: ignore[misc]
+def test_v2_compute_topk_scores_clamped_to_sliced_width(
+    logits_mode: bool,
+    width: int,
+    num_logprobs: int,
+) -> None:
+    """Check all 0.30 importer bindings and score modes against dense results."""
     import importlib
-
-    import pytest
 
     from vllm_gr.ops import sliced_logits_patch
 
-    if not torch.cuda.is_available():
-        pytest.skip("V2 compute_topk_logprobs uses a Triton logprob kernel (CUDA only)")
-
+    if not is_cuda_available():
+        pytest.skip("V2 score helper uses a Triton kernel (CUDA only)")
+    # Load importers before installation too: existing bindings must be patched.
+    modules = [
+        importlib.import_module(name)
+        for name in (
+            "vllm.v1.worker.gpu.sample.logprob",
+            "vllm.v1.worker.gpu.sample.sampler",
+            "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+        )
+    ]
     sliced_logits_patch.apply_sliced_logits_patch()
-
-    # Importers bind the (patched) name at module import; importing after the
-    # patch mirrors the EngineCore worker where the patch runs at startup.
-    sampler = importlib.import_module("vllm.v1.worker.gpu.sample.sampler")
-    logprob = importlib.import_module("vllm.v1.worker.gpu.sample.logprob")
-
-    logits = torch.randn(3, 1, device="cuda")  # one-column slice (impossible catalog)
-    sampled = torch.zeros(3, dtype=torch.int64, device="cuda")  # 1-D per contract
-    # The unpatched function raises "selected index k out of range".
-    out = sampler.compute_topk_logprobs(logits, 5, sampled)
-    assert out.logprob_token_ids.shape[1] == 2  # sampled + clamped top-1
-
-    # The defining module is patched too (clamps at the source).
-    out2 = logprob.compute_topk_logprobs(logits, 5, sampled)
-    assert out2.logprob_token_ids.shape[1] == 2
+    logits = torch.arange(3 * width, device="cuda", dtype=torch.float32).reshape(3, width) / 3
+    sampled = torch.zeros(3, dtype=torch.int64, device="cuda")
+    k = min(num_logprobs, width)
+    ids = torch.cat((sampled[:, None], logits.topk(k, dim=-1).indices), dim=-1)
+    expected = (logits if logits_mode else logits.log_softmax(-1)).gather(-1, ids)
+    for module in modules:
+        output = module.compute_topk_scores(logits, num_logprobs, sampled, logits_mode=logits_mode)
+        torch.testing.assert_close(output.logprob_token_ids, ids)
+        torch.testing.assert_close(output.logprobs, expected)
