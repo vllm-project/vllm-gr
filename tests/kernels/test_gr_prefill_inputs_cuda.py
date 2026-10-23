@@ -55,13 +55,12 @@ def make_runtime(
         return b
 
     table = MultiGroupBlockTable(
-        capacity,
-        max_model_len,
-        max_tokens,
-        True,
-        device,
-        list(block_sizes),
-        list(block_sizes),
+        max_num_reqs=capacity,
+        max_num_batched_tokens=max_tokens,
+        pin_memory=True,
+        device=device,
+        block_sizes=list(block_sizes),
+        kernel_block_sizes=list(block_sizes),
         max_num_blocks=[max_model_len // size for size in block_sizes],
     )
     for group, size in enumerate(block_sizes):
@@ -95,7 +94,8 @@ def make_runtime(
         max_num_tokens=max_tokens,
         max_num_reqs=capacity,
         uses_mrope=False,
-        uses_xdrope_dim=0,
+        mrope_num_dims=0,
+        _pp_recv_work=None,
         enable_prompt_embeds=False,
         lora_config=None,
         use_async_spec_decode=False,
@@ -174,9 +174,16 @@ def test_all_native_buffers_match(
     # Test a surviving request's previous-position bookkeeping too.
     native.input_batch.prev_req_id_to_index = {"r": capacity - 1}
     fast.input_batch.prev_req_id_to_index = {"r": capacity - 1}
-    expected_indices, spec = NATIVE_PREPARE(native, output, counts)
-    actual_indices = try_prepare_gr_prefill_inputs(fast, output, counts)
-    assert actual_indices is not None and spec is None
+    expected_indices, spec, max_sampled = NATIVE_PREPARE(native, output, counts)
+
+    def forbidden_fallback(*args: Any) -> None:
+        raise AssertionError("supported GR Prefill must use the fast path")
+
+    actual_indices, actual_spec, actual_max = make_patched_prepare_inputs_gpu(forbidden_fallback)(
+        fast, output, counts
+    )
+    assert actual_indices is not None and actual_spec is spec is None
+    assert actual_max == max_sampled == 1
     torch.testing.assert_close(actual_indices, expected_indices, rtol=0, atol=0)
     assert_same(snapshot(fast), snapshot(native))
 
@@ -193,7 +200,7 @@ def test_all_native_buffers_match(
             "output", "gr_stage_metadata", {"r": object(), "other": object()}, id="multi_stage"
         ),
         pytest.param("runner", "uses_mrope", True, id="mrope"),
-        pytest.param("runner", "uses_xdrope_dim", 4, id="xdrope"),
+        pytest.param("runner", "_pp_recv_work", object(), id="pending_pp_broadcast"),
         pytest.param("runner", "enable_prompt_embeds", True, id="embeds"),
         pytest.param("batch", "req_prompt_embeds", {0: object()}, id="request_embeds"),
         pytest.param("runner", "lora_config", object(), id="lora"),
@@ -227,12 +234,12 @@ def test_unsupported_inputs_fall_back_without_mutation(
     else:
         targets[target][attribute] = value
     before = snapshot(runner)
-    sentinel = (object(), object())
+    sentinel = (object(), object(), 7)
     calls: list[SimpleNamespace] = []
 
     def original(
         self: SimpleNamespace, out: SimpleNamespace, scheduled: NDArray[np.int32]
-    ) -> tuple[object, object]:
+    ) -> tuple[object, object, int]:
         assert_same(snapshot(self), before)
         calls.append(out)
         return sentinel
@@ -244,6 +251,45 @@ def test_unsupported_inputs_fall_back_without_mutation(
         assert make_patched_prepare_inputs_gpu(original)(runner, output, counts) == sentinel
         assert calls == [output]
     assert_same(snapshot(runner), before)
+
+
+@pytest.mark.parametrize("section_name", ["mrope_section", "xdrope_section"])
+@pytest.mark.parametrize("num_sections", [2, 3, 4])
+def test_multidimensional_rope_uses_native_guard_without_old_runner_field(
+    section_name: str, num_sections: int
+) -> None:
+    from transformers import PretrainedConfig
+    from vllm.transformers_utils.config import mrope_num_dims, uses_mrope
+
+    config = PretrainedConfig(rope_parameters={section_name: [16] * num_sections})
+    runner, output, counts = make_runtime()
+    runner.uses_mrope = uses_mrope(config)
+    runner.mrope_num_dims = mrope_num_dims(config)
+    assert runner.uses_mrope and runner.mrope_num_dims == max(3, num_sections)
+    assert not hasattr(runner, "uses_xdrope_dim")
+    before = snapshot(runner)
+    assert try_prepare_gr_prefill_inputs(runner, output, counts) is None
+    assert_same(snapshot(runner), before)
+
+
+def test_pending_pp_receive_uses_native_wait_and_input_preparation() -> None:
+    native, output, counts = make_runtime()
+    fallback, _, _ = make_runtime()
+    waits: list[str] = []
+    native._pp_recv_work = SimpleNamespace(wait=lambda: waits.append("native"))
+    fallback._pp_recv_work = SimpleNamespace(wait=lambda: waits.append("fallback"))
+
+    expected_indices, expected_spec, expected_max = NATIVE_PREPARE(native, output, counts)
+    actual_indices, actual_spec, actual_max = make_patched_prepare_inputs_gpu(NATIVE_PREPARE)(
+        fallback, output, counts
+    )
+
+    assert waits == ["native", "fallback"]
+    assert native._pp_recv_work is fallback._pp_recv_work is None
+    assert actual_spec is expected_spec is None
+    assert actual_max == expected_max == 1
+    torch.testing.assert_close(actual_indices, expected_indices, rtol=0, atol=0)
+    assert_same(snapshot(fallback), snapshot(native))
 
 
 def test_reuse_refreshes_current_tokens_blocks_and_preserves_previous_logits_indices() -> None:
@@ -259,7 +305,8 @@ def test_reuse_refreshes_current_tokens_blocks_and_preserves_previous_logits_ind
             runner.input_batch.num_computed_tokens_cpu[0] = computed
             runner.input_batch.token_ids_cpu[0] += 17
             runner.input_batch.block_table[0].add_row(list(range(block_start, block_start + 64)), 0)
-        expected, _ = NATIVE_PREPARE(native, output, counts)
+        expected, _, max_sampled = NATIVE_PREPARE(native, output, counts)
+        assert max_sampled == 1
         actual = try_prepare_gr_prefill_inputs(fast, output, counts)
         assert actual is not None
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

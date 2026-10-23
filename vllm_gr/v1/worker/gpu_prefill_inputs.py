@@ -37,8 +37,8 @@ def try_prepare_gr_prefill_inputs(
         return None
     if (
         runner.device.type != "cuda"
+        # vLLM 0.30 represents all multi-dimensional RoPE through uses_mrope.
         or runner.uses_mrope
-        or runner.uses_xdrope_dim > 0
         or runner.enable_prompt_embeds
         or batch.req_prompt_embeds
         or runner.lora_config
@@ -47,6 +47,8 @@ def try_prepare_gr_prefill_inputs(
         or runner.num_accepted_tokens_event is not None
         or runner.mamba_prev_last_scheduled_idx is not None
         or batch.prev_sampled_token_ids is not None
+        # Native input preparation waits for an outstanding PP token broadcast.
+        or runner._pp_recv_work is not None
     ):
         return None
     scheduled = int(num_scheduled_tokens[0])

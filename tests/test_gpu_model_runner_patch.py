@@ -249,7 +249,7 @@ def test_batch_session_prefill_rejects_partial_or_reordered_requests(
     assert eager_calls == [True]
 
 
-def test_gpu_prepare_preserves_order_and_two_item_contract(
+def test_gpu_prepare_preserves_order_and_three_item_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
@@ -266,16 +266,16 @@ def test_gpu_prepare_preserves_order_and_two_item_contract(
         self: Any,
         scheduler_output: Any,
         num_scheduled_tokens: Any,
-    ) -> tuple[object, object]:
+    ) -> tuple[object, object, int]:
         assert self._current_beam_info["req_ids"] == []
         events.append("original")
-        return original_logits, spec_metadata
+        return original_logits, spec_metadata, 5
 
     wrapped = gpu_patch.make_patched_prepare_inputs(original)
     assert gpu_patch.make_patched_prepare_inputs(wrapped) is wrapped
 
     ordinary = wrapped(runner, SimpleNamespace(beam_data={}), [1])
-    assert ordinary == (original_logits, spec_metadata)
+    assert ordinary == (original_logits, spec_metadata, 5)
     assert events == ["original"]
 
     assert runner._current_scheduler_output.beam_data == {}

@@ -160,7 +160,7 @@ def make_load_model_with_beam_postprocess_workspace(original):
 
 
 def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
-    """Wrap the GPU two-item ``_prepare_inputs`` contract."""
+    """Preserve native logits indices, spec metadata and maximum sampling width."""
     if getattr(_orig_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, False):
         return _orig_prepare_inputs
 
@@ -172,17 +172,19 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
         logits_indices = try_prepare_gr_prefill_inputs(self, scheduler_output, num_scheduled_tokens)
         if logits_indices is None:
-            logits_indices, spec_decode_metadata = _orig_prepare_inputs(
+            logits_indices, spec_decode_metadata, max_num_sampled_tokens = _orig_prepare_inputs(
                 self, scheduler_output, num_scheduled_tokens
             )
         else:
             spec_decode_metadata = None
+            # The single-request Prefill fast path excludes speculative tokens.
+            max_num_sampled_tokens = 1
 
         # GPU attention metadata is built after _prepare_inputs returns.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        return logits_indices, spec_decode_metadata
+        return logits_indices, spec_decode_metadata, max_num_sampled_tokens
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs
