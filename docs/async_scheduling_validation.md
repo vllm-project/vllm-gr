@@ -36,6 +36,45 @@ Beam candidate ordering, so equality across these geometries is not guaranteed.
 Use the existing precision gate and record replay/fallback counts on the matching
 workload before attributing accuracy or performance results to the padded path.
 
+## Independent-engine reduction policy
+
+CUDA ModelRunner V1 engines using `beam.execution_mode=v1` and Inductor now
+default `compilation_config.inductor_compile_config.dynamic_scale_rblock` to
+`false`. The native compilation configuration includes this choice in its cache
+identity. Existing explicit values take precedence; ModelRunner V2, NPU and
+non-Beam engines keep their own defaults.
+
+With the same OneRec inputs, weights and AOT artifact, Inductor could select
+either a 64-element or a 128-element reduction block for the generated Q/K norm
+and RoPE kernel. Selecting each existing binary reproduced the two previously
+observed candidate/score sequences exactly. Differences were already present in
+Prefill, before Beam candidate selection. The default disables that dynamic
+block-size adjustment while retaining compilation and CUDA graph replay.
+
+This policy addresses the observed independent-engine mismatch. It does not
+guarantee invariance across batch shapes, GPUs or compiler versions. Explicitly
+setting `dynamic_scale_rblock=true` restores the original tuning behavior and is
+outside this consistency guarantee. Business Recall and performance need their
+own acceptance measurements on the resulting candidate.
+
+The existing `test_onerec_v1_completion_batch_online` ST retains exact ordered
+candidate and score comparisons. Its optional diagnostics are excluded from
+performance measurements and disabled by default:
+
+- `VLLM_GR_TEST_STAGE_TRACE=1` saves inputs, logits and Beam state after each
+  stage, with CPU readback after the complete request.
+- `VLLM_GR_TEST_PREFILL_KV_TRACE=1` additionally saves real prompt KV and hidden
+  states for cold completion requests with tracing enabled. The completion ST
+  resets the prefix cache before each paired request.
+- `VLLM_GR_TEST_MODEL_IDENTITY=1` hashes loaded parameters after the B2 request.
+- `VLLM_GR_TEST_PROFILE=1` uses vLLM's native profiler around the B2 request.
+- `VLLM_GR_TEST_INDUCTOR_CONFIG` supplies a JSON compilation mapping for
+  controlled configuration experiments.
+
+Diagnostic copies and profiling can affect tuning choices. Preserve failing
+outputs, verify that each observer reproduces the original outputs, and repeat
+the final ST with these diagnostic settings unset.
+
 ## Historical correctness and lifecycle results
 
 The following configurations were compared with exact ordered device-state

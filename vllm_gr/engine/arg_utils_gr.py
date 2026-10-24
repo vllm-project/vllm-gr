@@ -703,6 +703,19 @@ def create_engine_config(self, usage_context=None, headless=False):
         from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
 
         validate_gr_execution_config(config)
+        compilation = getattr(config, "compilation_config", None)
+        if (
+            _is_cuda_platform()
+            and not getattr(config, "use_v2_model_runner", False)
+            and compilation is not None
+            and compilation.backend == "inductor"
+        ):
+            # Inductor can benchmark an extra, halved reduction block on each
+            # AOT load. Q/K norm rounding then changes across independent
+            # engines, including Beam candidate order and scores. Keep the
+            # compiled reduction geometry; record this in the native config
+            # so the AOT cache key includes it. Explicit overrides still win.
+            compilation.inductor_compile_config.setdefault("dynamic_scale_rblock", False)
     return config
 
 
