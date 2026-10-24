@@ -37,6 +37,11 @@ class OneRecV1STWorkerExtension:
     def onerec_v1_st_snapshot(self) -> dict[str, Any]:
         return _worker_snapshot(self)
 
+    def onerec_v1_st_graphs(self) -> dict[str, Any]:
+        from vllm_gr.v1.worker.model_runner_common import get_beam_graph_runtime_stats
+
+        return get_beam_graph_runtime_stats(self)
+
     def onerec_v1_st_observe(self) -> None:
         from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
         from vllm_gr.v1.worker.gpu_beam_stage_runner import (
@@ -125,6 +130,10 @@ def _worker_snapshot(worker: Any) -> dict[str, Any]:
         "error_code": int(state.error_code[row].item()),
         "stage_index": owner.previous.stage_index,
         "graph_captured": owner.graph is not None,
+        "constraint_backend": type(runner.constraint_backend).__name__
+        if runner.constraint_backend is not None
+        else None,
+        "unconstrained_topk": owner.unconstrained_topk_scratch is not None,
         "state_address": state.sequence.data_ptr(),
         "completed": {
             name: getattr(state, "completed_" + name)[row, :count].cpu().tolist() for name in names
@@ -524,6 +533,75 @@ async def _completion_http_client(app: Any) -> AsyncIterator[Any]:
             await asyncio.wait_for(task, timeout=35)
 
 
+def _completion_inputs(work_dir: Path) -> tuple[Any, ...]:
+    model, tokenizer, config, source, newline, legal = _inputs(work_dir)
+    configured_sizes = os.environ.get("VLLM_GR_TEST_ONLINE_BATCH_SIZES")
+    sizes = (1, 2, 4) if configured_sizes is None else tuple(json.loads(configured_sizes))
+    if configured_sizes is not None:
+        config["beam"]["online_batch_sizes"] = list(sizes)
+    kwargs = _engine_kwargs(model, config) | dict(
+        max_num_seqs=max(sizes),
+        max_num_batched_tokens=4096,
+        # Automatic memory profiling differs between cold offline compilation
+        # and an online engine loading that cache. Pair the actual KV capacity.
+        kv_cache_memory_bytes=8 * 1024**3,
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 16, *range(128, 4097, 128)]},
+    )
+    prompts = [
+        tokenizer.encode(f"slot {i}", add_special_tokens=False) + newline * (i * 16) + source[-256:]
+        for i in range(max(sizes))
+    ]
+    return model, config, sizes, kwargs, prompts, legal
+
+
+def _run_completion_reference(work_dir: Path) -> None:
+    """Run the HTTP inputs in a separate offline engine before starting HTTP."""
+    from vllm_gr.entrypoints.gr import GRLLM
+
+    model, config, sizes, kwargs, prompts, _ = _completion_inputs(work_dir)
+    rows = []
+    with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **kwargs) as llm:
+        processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
+        for count in (size for size in sizes if size > 1):
+            assert llm.reset_prefix_cache()
+            outputs = llm.beam_search_v1(
+                [{"prompt_token_ids": p} for p in prompts[:count]], _params(3)
+            )
+            assert len(outputs) == count
+            for prompt, output in zip(prompts[:count], outputs, strict=True):
+                assert all(s.tokens[: len(prompt)] == prompt for s in output.sequences)
+            rows.append(
+                dict(
+                    count=count,
+                    candidates=[
+                        [
+                            dict(tokens=s.tokens[len(prompt) :], score=s.cum_logprob)
+                            for s in output.sequences
+                        ]
+                        for prompt, output in zip(prompts[:count], outputs, strict=True)
+                    ],
+                )
+            )
+            assert not llm.llm_engine.has_unfinished_requests()
+        graphs = llm.collective_rpc("onerec_v1_st_graphs")
+    shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
+    assert shutdown and all(not p["alive"] and p["exitcode"] == 0 for p in shutdown), shutdown
+    (work_dir / "completion-offline-reference.json").write_text(
+        json.dumps(
+            dict(
+                model=model,
+                config=config,
+                engine_kwargs=kwargs,
+                prompts=prompts,
+                rows=rows,
+                graphs=graphs,
+                shutdown=shutdown,
+            ),
+            indent=2,
+        )
+    )
+
+
 async def _run_online_completion_batch(work_dir: Path) -> None:
     """Drive a prompt list through the completions HTTP route.
 
@@ -549,15 +627,13 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
     from vllm_gr.plugin import initialize_runtime
 
     initialize_runtime()
-    model, tokenizer, config, source, newline, legal = _inputs(work_dir)
-    configured_sizes = os.environ.get("VLLM_GR_TEST_ONLINE_BATCH_SIZES")
-    sizes = (1, 2, 4) if configured_sizes is None else tuple(json.loads(configured_sizes))
-    if configured_sizes is not None:
-        config["beam"]["online_batch_sizes"] = list(sizes)
-    kwargs = _engine_kwargs(model, config) | dict(
-        max_num_seqs=max(sizes),
-        max_num_batched_tokens=4096,
-        compilation_config={"cudagraph_capture_sizes": [1, 2, 16, *range(128, 4097, 128)]},
+    model, config, sizes, kwargs, prompts, legal = _completion_inputs(work_dir)
+    offline = json.loads((work_dir / "completion-offline-reference.json").read_text())
+    assert (offline["model"], offline["config"], offline["engine_kwargs"], offline["prompts"]) == (
+        model,
+        config,
+        kwargs,
+        prompts,
     )
     args = AsyncEngineArgs(additional_config={"vllm_gr": config}, shutdown_timeout=10, **kwargs)
     async with build_async_engine_client_from_engine_args(args) as engine:
@@ -583,12 +659,6 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
         app = FastAPI()
         app.state.openai_serving_completion = serving
         attach_router(app)
-        prompts = [
-            tokenizer.encode(f"slot {i}", add_special_tokens=False)
-            + newline * (i * 16)
-            + source[-256:]
-            for i in range(max(sizes))
-        ]
         body = {
             "model": model,
             "use_beam_search": True,
@@ -653,6 +723,26 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                     )
                 ]
                 assert [out.prompt_token_ids for out in direct] == prompts[:count]
+                reference = next(row for row in offline["rows"] if row["count"] == count)
+                direct_candidates = [
+                    [
+                        dict(tokens=list(c.token_ids), score=c.cumulative_logprob)
+                        for c in output.outputs
+                    ]
+                    for output in direct
+                ]
+                (work_dir / f"completion-pair-{count}.json").write_text(
+                    json.dumps(
+                        dict(
+                            count=count,
+                            offline=reference["candidates"],
+                            online=direct_candidates,
+                            response=data,
+                        ),
+                        indent=2,
+                    )
+                )
+                assert reference["candidates"] == direct_candidates
                 assert [c["token_ids"] for c in data["choices"]] == [
                     list(c.token_ids) for output in direct for c in output.outputs
                 ]
@@ -794,6 +884,9 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
             (work_dir / "completion-events.json").write_text(
                 json.dumps((await engine.collective_rpc("onerec_v1_st_events"))[0], indent=2)
             )
+            (work_dir / "completion-online-graphs.json").write_text(
+                json.dumps(await engine.collective_rpc("onerec_v1_st_graphs"), indent=2)
+            )
         (work_dir / "completion-batch-evidence.json").write_text(json.dumps(rows, indent=2))
     shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
     (work_dir / "completion-batch-lifecycle.json").write_text(json.dumps(shutdown, indent=2))
@@ -801,7 +894,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
 
 
 @pytest.mark.slow
-@pytest.mark.timeout(660)
+@pytest.mark.timeout(1200)
 @pytest.mark.parametrize("batch_sizes", [None, (1, 3, 7)], ids=["default", "custom"])
 def test_onerec_v1_completion_batch_online(
     tmp_path: Path, batch_sizes: tuple[int, ...] | None
@@ -820,22 +913,23 @@ def test_onerec_v1_completion_batch_online(
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
-    command = [
-        sys.executable,
-        "-m",
-        "tests.st.test_onerec_v1_scheduler_st",
-        str(tmp_path),
-        "--completion-batch",
-    ]
-    with subprocess.Popen(
-        command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-    ) as process:
-        try:
-            assert process.wait(timeout=600) == 0, "OneRec completion batch subprocess failed"
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+    for mode in ("--completion-reference", "--completion-batch"):
+        command = [
+            sys.executable,
+            "-m",
+            "tests.st.test_onerec_v1_scheduler_st",
+            str(tmp_path),
+            mode,
+        ]
+        with subprocess.Popen(
+            command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
+        ) as process:
+            try:
+                assert process.wait(timeout=550) == 0, f"OneRec {mode} subprocess failed"
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
 
 
 @pytest.mark.slow
@@ -870,7 +964,9 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool) -> None:
 
 
 if __name__ == "__main__":
-    if "--completion-batch" in sys.argv:
+    if "--completion-reference" in sys.argv:
+        _run_completion_reference(Path(sys.argv[1]))
+    elif "--completion-batch" in sys.argv:
         asyncio.run(_run_online_completion_batch(Path(sys.argv[1])))
     elif "--online" in sys.argv:
         asyncio.run(_run_online(Path(sys.argv[1])))
