@@ -15,9 +15,12 @@ import json
 import math
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -491,6 +494,36 @@ async def _run_online(work_dir: Path) -> None:
     )
 
 
+@asynccontextmanager
+async def _completion_http_client(app: Any) -> AsyncIterator[Any]:
+    """Use a real loopback socket so disconnects reach the native HTTP route."""
+    import httpx
+    import uvicorn
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        server = uvicorn.Server(
+            uvicorn.Config(app, log_level="warning", timeout_graceful_shutdown=30)
+        )
+        task = asyncio.create_task(server.serve(sockets=[sock]))
+        try:
+            async with asyncio.timeout(30):
+                while not server.started:
+                    if task.done():
+                        await task
+                        raise RuntimeError("HTTP server exited before startup")
+                    await asyncio.sleep(0.01)
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{sock.getsockname()[1]}",
+                timeout=60,
+                trust_env=False,
+            ) as client:
+                yield client
+        finally:
+            server.should_exit = True
+            await asyncio.wait_for(task, timeout=35)
+
+
 async def _run_online_completion_batch(work_dir: Path) -> None:
     """Drive a prompt list through the completions HTTP route.
 
@@ -499,7 +532,6 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
     asked to run, read off the existing stage probe, not on the response alone
     -- a single response object is what both shapes return.
     """
-    import httpx
     from fastapi import FastAPI
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.entrypoints.openai.api_server import (
@@ -511,21 +543,25 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
         BaseModelPath,
         OpenAIServingModels,
     )
-    from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+    from vllm.inputs import tokens_input
+    from vllm.renderers.online_renderer import OnlineRenderer
 
     from vllm_gr.plugin import initialize_runtime
 
     initialize_runtime()
-    model, tokenizer, config, source, newline, _legal = _inputs(work_dir)
+    model, tokenizer, config, source, newline, legal = _inputs(work_dir)
     configured_sizes = os.environ.get("VLLM_GR_TEST_ONLINE_BATCH_SIZES")
     sizes = (1, 2, 4) if configured_sizes is None else tuple(json.loads(configured_sizes))
     if configured_sizes is not None:
         config["beam"]["online_batch_sizes"] = list(sizes)
     kwargs = _engine_kwargs(model, config) | dict(
-        max_num_seqs=max(sizes), max_num_batched_tokens=4096
+        max_num_seqs=max(sizes),
+        max_num_batched_tokens=4096,
+        compilation_config={"cudagraph_capture_sizes": [1, 2, 16, *range(128, 4097, 128)]},
     )
-    args = AsyncEngineArgs(additional_config={"vllm_gr": config}, **kwargs)
+    args = AsyncEngineArgs(additional_config={"vllm_gr": config}, shutdown_timeout=10, **kwargs)
     async with build_async_engine_client_from_engine_args(args) as engine:
+        processes = list(engine.engine_core.resources.engine_manager.processes)
         models = OpenAIServingModels(
             engine_client=engine,
             base_model_paths=[BaseModelPath(name=model, model_path=model)],
@@ -534,10 +570,9 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
         serving = OpenAIServingCompletion(
             engine_client=engine,
             models=models,
-            openai_serving_render=OpenAIServingRender(
+            online_renderer=OnlineRenderer(
                 model_config=engine.model_config,
                 renderer=engine.renderer,
-                model_registry=models.registry,
                 request_logger=None,
                 chat_template=None,
                 chat_template_content_format="auto",
@@ -568,10 +603,33 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
             events = (await engine.collective_rpc("onerec_v1_st_events"))[0][before:]
             return [e for e in events if e["method"] == "execute"]
 
+        def check_response(response: Any, inputs: list[list[int]]) -> dict[str, Any]:
+            assert response.status_code == 200, response.text
+            data = response.json()
+            assert len(data["choices"]) == len(inputs) * _BEAM_WIDTH
+            assert [c["index"] for c in data["choices"]] == list(range(len(inputs) * _BEAM_WIDTH))
+            assert data["usage"]["prompt_tokens"] == sum(map(len, inputs))
+            assert data["usage"]["completion_tokens"] == len(inputs) * _BEAM_WIDTH * 5
+            for choice in data["choices"]:
+                assert choice["finish_reason"] == "length"
+                assert len(choice["token_ids"]) == 5
+                assert tuple(choice["token_ids"][1:-1]) in legal
+                if choice["index"] % _BEAM_WIDTH == 0:
+                    assert choice["prompt_token_ids"] == inputs[choice["index"] // _BEAM_WIDTH]
+            return data
+
+        async def check_released() -> None:
+            assert not engine.output_processor.has_unfinished_requests()
+            assert not engine.output_processor.external_req_ids
+            snapshot = (await engine.collective_rpc("onerec_v1_st_snapshot"))[0]
+            assert snapshot["retired"] and not snapshot["active_sessions"]
+            assert snapshot["registry_size"] == 0
+            assert snapshot["context_released"] and snapshot["workspace_released"]
+            assert not any(snapshot["control_busy"]) and not snapshot["pending"]
+
         rows = []
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
-        ) as client:
+        cancellations = []
+        async with _completion_http_client(app) as client:
             # A size this route forms runs as one session holding every prompt.
             for count in (size for size in sizes if size > 1):
                 assert await engine.reset_prefix_cache()
@@ -579,12 +637,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                 response = await client.post(
                     "/v1/completions", json={**body, "prompt": prompts[:count]}
                 )
-                assert response.status_code == 200, response.text
-                data = response.json()
-                assert len(data["choices"]) == count * _BEAM_WIDTH
-                assert [c["index"] for c in data["choices"]] == list(range(count * _BEAM_WIDTH))
-                assert data["usage"]["prompt_tokens"] == sum(map(len, prompts[:count]))
-                assert data["usage"]["completion_tokens"] == count * _BEAM_WIDTH * 5
+                data = check_response(response, prompts[:count])
                 stages = await stages_since(before)
                 assert [e["size"] for e in stages if e["stage"] == 0] == [count]
                 assert len({e["session_id"] for e in stages}) == 1
@@ -592,8 +645,159 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                 assert snapshot["retired"] and snapshot["registry_size"] == 0
                 assert not snapshot["active_sessions"]
                 assert not engine.output_processor.has_unfinished_requests()
-                rows.append(dict(count=count, sessions=1, size=count, usage=data["usage"]))
+                assert await engine.reset_prefix_cache()
+                direct = [
+                    output
+                    async for output in serving.beam_search_v1(
+                        [tokens_input(p) for p in prompts[:count]], "direct-reference", _params(3)
+                    )
+                ]
+                assert [out.prompt_token_ids for out in direct] == prompts[:count]
+                assert [c["token_ids"] for c in data["choices"]] == [
+                    list(c.token_ids) for output in direct for c in output.outputs
+                ]
+                rows.append(dict(count=count, sessions=1, size=count, response=data))
+
+            # The native rejection path must leave the engine usable.
+            before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
+            invalid = await client.post(
+                "/v1/completions", json={**body, "prompt": prompts[:2], "stream": True}
+            )
+            assert invalid.status_code == 400, invalid.text
+            assert not await stages_since(before)
+            await check_released()
+
+            references = []
+            for prompt in prompts[:2]:
+                assert await engine.reset_prefix_cache()
+                response = await client.post("/v1/completions", json={**body, "prompt": prompt})
+                references.append(check_response(response, [prompt]))
+            assert await engine.reset_prefix_cache()
+            await engine.pause_generation(mode="keep", clear_cache=False)
+            before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
+            pending = [
+                asyncio.create_task(
+                    client.post(
+                        "/v1/completions",
+                        json={**body, "prompt": p, "request_id": f"concurrent-{i}"},
+                    )
+                )
+                for i, p in enumerate(prompts[:2])
+            ]
+            try:
+                async with asyncio.timeout(30):
+                    while len(engine.output_processor.request_states) != 2:
+                        assert not any(task.done() for task in pending)
+                        await asyncio.sleep(0.001)
+                    sessions = list(engine.output_processor.request_states)
+                    for session in sessions:
+                        while await engine.engine_core.call_utility_async(
+                            "is_gr_session_retired", session
+                        ):
+                            await asyncio.sleep(0.001)
+            finally:
+                await engine.resume_generation()
+                responses = await asyncio.gather(*pending)
+            for i, response in enumerate(responses):
+                data = check_response(response, [prompts[i]])
+                assert data["id"] == f"cmpl-concurrent-{i}"
+                assert [c["token_ids"] for c in data["choices"]] == [
+                    c["token_ids"] for c in references[i]["choices"]
+                ]
+            stages = await stages_since(before)
+            assert {e["session_id"] for e in stages} == set(sessions)
+            assert [e["size"] for e in stages if e["stage"] == 0] == [1, 1]
+            await check_released()
+
+            # Close the TCP connection only after confirmed engine admission
+            # (and, for the active case, an actual Worker dispatch).
+            for waiting in (True, False):
+                assert await engine.reset_prefix_cache()
+                if waiting:
+                    await engine.pause_generation(mode="keep", clear_cache=False)
+                before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
+                payload = json.dumps({**body, "prompt": prompts[: sizes[1]]}).encode()
+                reader, writer = await asyncio.open_connection(
+                    client.base_url.host, client.base_url.port
+                )
+                received = asyncio.create_task(reader.read(1))
+                try:
+                    writer.write(
+                        b"POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n"
+                        b"Content-Type: application/json\r\nConnection: close\r\n"
+                        + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+                        + payload
+                    )
+                    await writer.drain()
+                    async with asyncio.timeout(30):
+                        while not engine.output_processor.request_states:
+                            assert not received.done(), "request completed before admission probe"
+                            await asyncio.sleep(0.001)
+                        (session,) = engine.output_processor.request_states
+                        while await engine.engine_core.call_utility_async(
+                            "is_gr_session_retired", session
+                        ):
+                            assert not received.done()
+                            await asyncio.sleep(0.001)
+                        if waiting:
+                            assert not await stages_since(before)
+                        else:
+                            while not await stages_since(before):
+                                assert not received.done(), "missed active cancellation"
+                                await asyncio.sleep(0.001)
+                        assert session in engine.output_processor.request_states
+                        assert not received.done(), "disconnect must precede the response"
+                        writer.close()
+                        await writer.wait_closed()
+                        while engine.output_processor.has_unfinished_requests() or not (
+                            await engine.engine_core.call_utility_async(
+                                "is_gr_session_retired", session
+                            )
+                        ):
+                            await asyncio.sleep(0.001)
+                    await check_released()
+                    cancellations.append(
+                        dict(
+                            waiting=waiting,
+                            session_id=session,
+                            disconnected_before_response=True,
+                            stages=await stages_since(before),
+                            core_retired=True,
+                            frontend_empty=True,
+                            worker_released=True,
+                        )
+                    )
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+                    received.cancel()
+                    await asyncio.gather(received, return_exceptions=True)
+                    if waiting:
+                        await engine.resume_generation()
+                response = await client.post(
+                    "/v1/completions", json={**body, "prompt": prompts[: sizes[1]]}
+                )
+                check_response(response, prompts[: sizes[1]])
+                await check_released()
+            (work_dir / "completion-http-lifecycle.json").write_text(
+                json.dumps(
+                    dict(
+                        transport="loopback TCP",
+                        concurrent_sessions=sessions,
+                        invalid_status=invalid.status_code,
+                        cancellations=cancellations,
+                        recoveries=2,
+                    ),
+                    indent=2,
+                )
+            )
+            (work_dir / "completion-events.json").write_text(
+                json.dumps((await engine.collective_rpc("onerec_v1_st_events"))[0], indent=2)
+            )
         (work_dir / "completion-batch-evidence.json").write_text(json.dumps(rows, indent=2))
+    shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
+    (work_dir / "completion-batch-lifecycle.json").write_text(json.dumps(shutdown, indent=2))
+    assert shutdown and all(not p["alive"] and p["exitcode"] == 0 for p in shutdown), shutdown
 
 
 @pytest.mark.slow

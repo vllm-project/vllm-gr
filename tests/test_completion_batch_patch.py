@@ -87,6 +87,11 @@ class _BatchSelf:
     def _maybe_get_adapters(self, request: Any) -> None:
         del request
 
+    _get_session_id = staticmethod(OpenAIServingCompletion._get_session_id)
+
+    async def _get_trace_headers(self, headers: Any) -> None:
+        del headers
+
     def _extract_prompt_len(self, engine_input: int) -> int:
         return self.prompt_lengths[engine_input]
 
@@ -157,6 +162,8 @@ def make_request() -> Callable[..., Any]:
             "max_tokens": 5,
             "truncate_prompt_tokens": None,
             "request_id": "request-0",
+            "session_id": None,
+            "vllm_xargs": None,
             "to_beam_search_params": lambda tokens, _defaults: {"max_tokens": tokens},
         }
         fields.update(overrides)
@@ -359,6 +366,36 @@ def test_different_lengths_can_share_the_real_generation_budget(
 
     assert len(serving.beam_calls) == 1
     assert serving.beam_calls[0]["params"]["max_tokens"] == 5
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "body, header, extra, expected",
+    [
+        ("body", "header", "extra", "body"),
+        (None, "header", "extra", "header"),
+        (None, None, "extra", "extra"),
+        (None, None, None, None),
+    ],
+)
+def test_batch_preserves_native_session_hint_precedence(
+    serving: _BatchSelf,
+    make_request: Callable[..., Any],
+    body: str | None,
+    header: str | None,
+    extra: str | None,
+    expected: str | None,
+) -> None:
+    from starlette.requests import Request
+
+    headers = [] if header is None else [(b"x-session-id", header.encode())]
+    raw = Request({"type": "http", "headers": headers})
+    request = make_request(session_id=body, vllm_xargs={"session_id": extra})
+
+    result = asyncio.run(create_completion_batch_dispatch(serving, request, raw))
+
+    assert result == "response-for-4"
+    assert serving.beam_calls[0]["session_id"] == expected
+    assert serving.beam_calls[0]["request_id"] == "cmpl-request-0"
 
 
 def test_a_render_that_disagrees_with_the_count_is_a_server_fault(

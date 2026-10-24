@@ -224,6 +224,7 @@ async def _create_completion_batched(
         params=batch_params,
         lora_request=lora_request,
         trace_headers=trace_headers,
+        session_id=self._get_session_id(request, raw_request),
     )
     try:
         async with aclosing(generator):
@@ -358,6 +359,7 @@ def _validate_completion_batch_patch() -> str | None:
             "_extract_prompt_text",
             "_log_inputs",
             "_get_trace_headers",
+            "_get_session_id",
             "beam_search",
         )
         if not hasattr(OpenAIServingCompletion, name)
