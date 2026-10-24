@@ -308,13 +308,18 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
     rows: list[dict[str, Any]] = []
     reference: dict[tuple[int, int], list[tuple[tuple[int, ...], float]]] = {}
-    with GRLLM(vllm_gr_config=config, **_engine_kwargs(model, config)) as llm:
+    with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **_engine_kwargs(model, config)) as llm:
         expected_client = (
             "InprocClient"
             if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"
             else "SyncMPClient"
         )
         assert type(llm.llm_engine.engine_core).__name__ == expected_client
+        processes = (
+            list(llm.llm_engine.engine_core.resources.engine_manager.processes)
+            if expected_client == "SyncMPClient"
+            else []
+        )
         llm.collective_rpc("onerec_v1_st_observe")
         state_address = None
         for length, steps, cold in _CASES:
@@ -344,6 +349,9 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
             rows.append(dict(prompt=length, n=steps, cold=cold, sequences=sequences))
         _write_evidence(work_dir, "offline", rows, llm.collective_rpc("onerec_v1_st_events")[0])
         assert llm.reset_prefix_cache()
+    shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
+    (work_dir / "offline-lifecycle.json").write_text(json.dumps(shutdown, indent=2))
+    assert all(not p["alive"] and p["exitcode"] == 0 for p in shutdown), shutdown
 
 
 async def _run_online(work_dir: Path) -> None:

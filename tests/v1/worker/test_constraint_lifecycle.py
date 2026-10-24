@@ -326,6 +326,7 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
     if current_platform.device_type == "npu":
         pytest.skip("CUDA vocabulary projection slicing is not used on Ascend NPU")
 
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
     from vllm_gr.config import ConstraintTableBackendEnum
@@ -349,11 +350,13 @@ def test_canonical_cuda_tp_falls_back_to_full_projection(monkeypatch: pytest.Mon
         return logits
 
     def weights(runner: Any) -> str:
-        runner.model = torch.nn.Sequential(LogitsProcessor(32000))
+        with set_current_vllm_config(VllmConfig()):
+            runner.model = torch.nn.Sequential(LogitsProcessor(32000))
         runner.model[0]._gather_logits = gather
         return "loaded"
 
     head = torch.nn.Linear(8, 256, bias=False)
+    head.tp_size = 2
     head.quant_method = SimpleNamespace(
         apply=lambda layer, hidden, bias=None: torch.nn.functional.linear(
             hidden, layer.weight, bias
@@ -383,6 +386,7 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
     if current_platform.device_type == "npu":
         pytest.skip("CUDA vocabulary projection slicing is not used on Ascend NPU")
 
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
     from vllm_gr.config import ConstraintTableBackendEnum
@@ -402,7 +406,8 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
 
     def weights(runner: Any) -> None:
         runner.model_memory_usage = 0
-        runner.model = torch.nn.Sequential(LogitsProcessor(32000))
+        with set_current_vllm_config(VllmConfig()):
+            runner.model = torch.nn.Sequential(LogitsProcessor(32000))
         runner.model[0]._gather_logits = lambda logits: logits
 
     load = make_load_model_with_constraint_backend(weights)
@@ -415,6 +420,7 @@ def test_two_runners_keep_independent_projection_windows(monkeypatch: pytest.Mon
         load(b)
         load(full)
         head = torch.nn.Linear(8, 256, bias=False)
+        head.tp_size = 1
         head.quant_method = type(
             "UnquantizedEmbeddingMethod",
             (),
