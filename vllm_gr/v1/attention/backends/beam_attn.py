@@ -123,21 +123,22 @@ class BeamAttentionImpl(AttentionImpl):
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
     ):
-        """Keep Beam decode FULL replay updates a no-op.
+        """Refresh ordinary FIA tasks; Beam uses persistent device buffers.
 
         Beam decode refreshes persistent fixed-address device buffers before
         replay. NPU prefill updates its native attention task groups directly
         in ``NPUPrefillGraphRunner`` and does not use this shared hook.
         """
-        del (
-            update_stream,
-            forward_context,
-            num_tokens,
-            vllm_config,
-            speculative_config,
-            num_dcp_pcp_tokens,
-            draft_attn_metadatas,
-        )
+        if NPU_DEVICE and not CUDA_DEVICE:
+            from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+
+            info = BEAM_DATA_VAR.get()
+            if not isinstance(info, dict) or info.get("beam_session") is None:
+                from vllm_gr.v1.attention.backends.npu_standard_graph import (
+                    update_standard_graph_params,
+                )
+
+                update_standard_graph_params(update_stream, forward_context, num_tokens)
         return None
 
     def __init__(
@@ -332,8 +333,17 @@ class BeamAttentionImpl(AttentionImpl):
             if attn_metadata.prefix_indices is not None:
                 # Beam tokens at prefix_indices positions (always set on the
                 # incremental decode path, mixed or pure batch alike).
-                beam_key = key[attn_metadata.prefix_indices]  # [W, H, D]
-                beam_value = value[attn_metadata.prefix_indices]  # [W, H, D]
+                select_rows = (
+                    getattr(platform_execution, "select_beam_rows", None)
+                    if key.device.type == "npu"
+                    else None
+                )
+                if select_rows is not None:
+                    beam_key = select_rows(key, attn_metadata)
+                    beam_value = select_rows(value, attn_metadata)
+                else:
+                    beam_key = key[attn_metadata.prefix_indices]  # [W, H, D]
+                    beam_value = value[attn_metadata.prefix_indices]  # [W, H, D]
             else:
                 # Fallback kept for callers that do not set prefix_indices;
                 # the incremental path always sets it (see beam_attn_metadata).
@@ -523,6 +533,37 @@ class BeamAttentionImpl(AttentionImpl):
             value_cache = value_cache.view(dtype)
 
         sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
+
+        if NPU_DEVICE and not CUDA_DEVICE:
+            from vllm.config import CUDAGraphMode
+            from vllm.forward_context import get_forward_context
+
+            from vllm_gr.v1.attention.backends import beam_attn_npu
+            from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+
+            context = get_forward_context()
+            beam_info = BEAM_DATA_VAR.get()
+            if (
+                context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and context.capturing
+                and not beam_attn_npu._GRAPH_CAPTURE_STATE["capturing"]
+                and (not isinstance(beam_info, dict) or beam_info.get("beam_session") is None)
+            ):
+                from vllm_gr.v1.attention.backends.npu_standard_graph import (
+                    capture_standard_fia,
+                )
+
+                capture_standard_fia(
+                    output,
+                    query,
+                    key_cache,
+                    value_cache,
+                    attn_metadata,
+                    self.scale,
+                    layer.layer_name,
+                    context.model_instance.vllm_config.model_config.max_model_len,
+                )
+                return output
 
         self.prefill_attention(
             output=output,

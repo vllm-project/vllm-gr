@@ -12,6 +12,21 @@ from vllm.config import CUDAGraphMode
 from vllm_gr.v1.worker import beam_decode_graph as shared
 
 
+def test_equal_token_counts_do_not_alias_different_beam_geometries() -> None:
+    graph = object.__new__(shared.BeamDecodeGraph)
+    graph.wrapper = SimpleNamespace(concrete_cudagraph_entries={})
+    graph._registries = {}
+    graph.select(2, 4)
+    descriptor = graph.descriptor
+    captured = object()
+    graph.wrapper.concrete_cudagraph_entries[descriptor] = captured
+    graph.select(4, 2)
+    assert graph.descriptor == descriptor
+    assert not graph.wrapper.concrete_cudagraph_entries
+    graph.select(2, 4)
+    assert graph.wrapper.concrete_cudagraph_entries[descriptor] is captured
+
+
 @pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])  # type: ignore[misc]
 @pytest.mark.parametrize("is_beam", [False, True])  # type: ignore[misc]
 def test_only_beam_full_uses_beam_registry(
@@ -128,6 +143,7 @@ def capture_graph(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Mock, Mock]:
     graph.width = 4
     graph.signature = shared.BeamDecodeGraphSignature(1, 4, 4)
     graph._bindings = {}
+    graph._registries = {}
     graph.capture_inputs = None
     graph.capture_attention = None
     graph.descriptor = object()

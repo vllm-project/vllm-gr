@@ -1,3 +1,4 @@
+# mypy: disable-error-code="no-untyped-def,no-untyped-call"
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Actual CUDA replay survives B switches and a shape-local capture refusal."""
@@ -27,6 +28,52 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import (
 from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@torch.inference_mode()
+def test_runtime_recapture_refusal_preserves_live_request(monkeypatch):
+    gc.collect()
+    worker = admission_worker(max_rows=32)
+    worker.model_config.enforce_eager = False
+    worker._vllm_gr_config.beam_graph_enabled = True
+    worker._vllm_gr_config.beam_worker_decision = True
+    worker._vllm_gr_config.beam_online_batch_sizes = (1,)
+    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
+    install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
+    assert capture_multibatch_forward(worker)
+    graph = worker._beam_decode_graph
+    assert graph.ready
+    graph.clear()
+    worker._gr_dynamic_graphs_discarded = True
+    m = metadata()
+    scheduled = dispatch(m)
+    owner = get_stage_runner(worker, scheduled, hooks_type=V2StageExecutionHooks)
+    decode = replace(m, kind=GRStageKind.DECODE, stage_index=1, decode_step=0, kv_blocks=((1,),))
+    owner.prepared = owner.prepare_cpu(decode, 0)
+    owner._bind_attention(decode)
+    owner.input_ids.fill_(3)
+    owner.positions.fill_(10)
+    original = owner._forward_hidden
+    attempts = []
+
+    def refuse(capture):
+        if capture:
+            attempts.append(True)
+            raise RuntimeError("operation not supported when stream is capturing")
+        return original(capture)
+
+    monkeypatch.setattr(owner, "_forward_hidden", refuse)
+    for _ in range(2):
+        result = owner.hooks.decode_logits(owner)
+        torch.testing.assert_close(result[:, 0], torch.full_like(result[:, 0], 13))
+    assert len(attempts) == 1
+    assert owner.graph is None
+    assert not torch.cuda.is_current_stream_capturing()
+    done = torch.Event()
+    done.record()
+    owner.release(owner.binding, consumer_done=done)
+    assert owner.closed and not worker._beam_sessions
 
 
 @pytest.mark.parametrize("fail_shape", [False, True])  # type: ignore[misc]

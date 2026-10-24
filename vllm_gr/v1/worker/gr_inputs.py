@@ -95,7 +95,7 @@ class GRInputBuffers:
         slot: int,
     ) -> PreparedGRInputs:
         view = BeamBatchExecutionView.from_stage_metadata(metadata)
-        if view.kind != "decode" or view.beam_width != self.width:
+        if view.kind != "decode" or view.input_width != self.width:
             raise ValueError(
                 "Asynchronous scheduling input preparation requires fixed-width Decode metadata"
             )
@@ -188,10 +188,11 @@ def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
     dispatch_error = torch.where(mismatch, ERROR_DISPATCH_STATE, error)
     state.error_code[rows] = dispatch_error
     running = initialized & ~finished & (dispatch_error == 0)
-    mask = running[:, None] & state.active_mask[rows]
+    width = BeamBatchExecutionView.from_stage_metadata(m).input_width
+    mask = running[:, None] & state.active_mask[rows, :width]
     flat_mask = mask.reshape(-1)
     owner.execution_mask.copy_(flat_mask)
-    owner.input_ids.copy_(torch.where(flat_mask, state.input_ids[rows].reshape(-1), 0))
+    owner.input_ids.copy_(torch.where(flat_mask, state.input_ids[rows, :width].reshape(-1), 0))
     owner.positions.copy_(torch.where(flat_mask, owner.device_positions, 0))
     owner.beam.session.context.decode_step_buf.copy_(
         torch.where(running.all(), step, -1).reshape(1)
@@ -201,11 +202,11 @@ def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
     owner.prefixes[:, :columns].copy_(
         torch.where(
             mask.reshape(-1, 1),
-            state.sequence[rows, :, :columns].reshape(-1, columns),
+            state.sequence[rows, :width, :columns].reshape(-1, columns),
             -1,
         )
     )
-    lengths = torch.where(running, step + 1, 1).repeat_interleave(state.beam_width)
+    lengths = torch.where(running, step + 1, 1).repeat_interleave(width)
     owner.metadata.suffix_seqlens_kv_device.copy_(lengths)
     owner.metadata.suffix_cu_seqlens_k_device[0].zero_()
     torch.cumsum(

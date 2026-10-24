@@ -277,52 +277,55 @@ class GPUBeamFinalOutput:
         if control is not None:
             self.device[:_CONTROL_WORDS].copy_(control)
             self._control_embedded = True
-        for request_index, binding in enumerate(self.bindings):
-            row = binding.state_row
-            ranking_scores = state.completed_scores[row : row + 1]
-            if self.length_penalty != 0:
-                beam_state_ops._rank_final_beams_kernel[
-                    (triton.cdiv(state.completed_capacity, 256),)
-                ](
+        if getattr(owner, "dynamic", None) is not None:
+            owner.dynamic.pack_final(self)
+        else:
+            for request_index, binding in enumerate(self.bindings):
+                row = binding.state_row
+                ranking_scores = state.completed_scores[row : row + 1]
+                if self.length_penalty != 0:
+                    beam_state_ops._rank_final_beams_kernel[
+                        (triton.cdiv(state.completed_capacity, 256),)
+                    ](
+                        ranking_scores,
+                        state.completed_lengths[row],
+                        state.completed_finish_reasons[row],
+                        self._ranking_scores,
+                        CAPACITY=state.completed_capacity,
+                        PROMPT_LENGTH=self.prompt_lengths[request_index],
+                        MAX_TOKENS=state.max_new_tokens,
+                        LENGTH_PENALTY=self.length_penalty,
+                        BLOCK=256,
+                    )
+                    ranking_scores = self._ranking_scores
+                _, selected_indices, _ = _hierarchical_topk_out(
+                    self._zero_score,
                     ranking_scores,
+                    None,
+                    1,
+                    1,
+                    state.completed_capacity,
+                    result_width,
+                    self._selection,
+                )
+                member_offset = _CONTROL_WORDS + request_index * self.layout.member_stride
+                beam_state_ops._pack_final_beams_kernel[(result_width,)](
+                    selected_indices,
+                    state.num_completed[row : row + 1],
+                    state.completed_token_ids[row],
+                    state.completed_scores[row],
+                    state.completed_parent_ids[row],
                     state.completed_lengths[row],
                     state.completed_finish_reasons[row],
-                    self._ranking_scores,
-                    CAPACITY=state.completed_capacity,
-                    PROMPT_LENGTH=self.prompt_lengths[request_index],
-                    MAX_TOKENS=state.max_new_tokens,
-                    LENGTH_PENALTY=self.length_penalty,
-                    BLOCK=256,
+                    state.history_token_ids[row],
+                    state.history_parent_ids[row],
+                    self.device[member_offset:],
+                    WIDTH=state.beam_width,
+                    STEPS=state.max_new_tokens,
+                    RESULT_WIDTH=result_width,
+                    ROW_STRIDE=self.layout.row_stride,
+                    ROW_BLOCK=triton.next_power_of_2(2 * state.max_new_tokens),
                 )
-                ranking_scores = self._ranking_scores
-            _, selected_indices, _ = _hierarchical_topk_out(
-                self._zero_score,
-                ranking_scores,
-                None,
-                1,
-                1,
-                state.completed_capacity,
-                result_width,
-                self._selection,
-            )
-            member_offset = _CONTROL_WORDS + request_index * self.layout.member_stride
-            beam_state_ops._pack_final_beams_kernel[(result_width,)](
-                selected_indices,
-                state.num_completed[row : row + 1],
-                state.completed_token_ids[row],
-                state.completed_scores[row],
-                state.completed_parent_ids[row],
-                state.completed_lengths[row],
-                state.completed_finish_reasons[row],
-                state.history_token_ids[row],
-                state.history_parent_ids[row],
-                self.device[member_offset:],
-                WIDTH=state.beam_width,
-                STEPS=state.max_new_tokens,
-                RESULT_WIDTH=result_width,
-                ROW_STRIDE=self.layout.row_stride,
-                ROW_BLOCK=triton.next_power_of_2(2 * state.max_new_tokens),
-            )
         self.pack_ready.record(produced)
         copy_words = (
             _CONTROL_WORDS

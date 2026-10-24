@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from vllm_gr.config import BeamExecutionMode
+from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
 from vllm_gr.v1.worker import gpu_model_runner_patch, model_runner_patch
 
 
@@ -103,12 +103,24 @@ def test_cuda_dispatcher_installs_stage_wrappers_once(
     assert (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync) == first
 
 
-def test_cuda_dispatcher_preserves_native_sampler_and_bookkeeping(
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("platform_module_name", "expected_max_batch"),
+    [
+        (model_runner_patch._GPU_PATCH_MODULE, 1),
+        (model_runner_patch._NPU_PATCH_MODULE, max(SUPPORTED_BEAM_BATCH_SIZES)),
+    ],
+)
+def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
     monkeypatch: pytest.MonkeyPatch,
+    platform_module_name: str,
+    expected_max_batch: int,
 ) -> None:
     # V1-platform install test: pin the V2 flag off (see
     # test_dispatcher_selects_one_platform_module).
     monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
+    monkeypatch.setattr(
+        model_runner_patch, "_active_platform_module_name", lambda: platform_module_name
+    )
     from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_PATCH_MARKER
     from vllm_gr.v1.worker.model_runner_patch import (
         _CONSTRAINT_LOAD_PATCH_MARKER,
@@ -156,6 +168,15 @@ def test_cuda_dispatcher_preserves_native_sampler_and_bookkeeping(
         lambda: platform_module,
     )
 
+    load_wrapper = model_runner_patch.make_load_model_with_constraint_backend
+    max_batches: list[int] = []
+
+    def install_load(original: Any, *, max_batch: int = 1) -> Any:
+        max_batches.append(max_batch)
+        return load_wrapper(original, max_batch=max_batch)
+
+    monkeypatch.setattr(model_runner_patch, "make_load_model_with_constraint_backend", install_load)
+
     reload_weights = Runner.reload_weights
     sample = Runner._sample
     bookkeeping = Runner._bookkeeping_sync
@@ -165,6 +186,7 @@ def test_cuda_dispatcher_preserves_native_sampler_and_bookkeeping(
     assert Runner._bookkeeping_sync is bookkeeping
     assert not getattr(Runner._sample, _WORKER_SAMPLE_PATCH_MARKER, False)
     assert getattr(Runner.load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False)
+    assert max_batches == [expected_max_batch]
     assert getattr(Runner.shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
     # In-place weight reloads do not rebuild the tokenizer/vocab-bound Backend.
     assert Runner.reload_weights is reload_weights

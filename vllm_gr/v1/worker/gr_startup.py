@@ -67,6 +67,13 @@ def capture_async_forward(
         return capture_beam_decode_graph(worker)
     if device_type != "cuda":
         return False
+    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
+
+    if getattr(_get_gr_config(worker), "beam_graph_widths", None) is not None:
+        logger.warning(
+            "beam.graph_widths is NPU-only startup pre-capture; CUDA captures "
+            "dynamic Decode (batch, width) shapes lazily on first use."
+        )
 
     existing = getattr(worker, "_gr_gpu_stage_runner", None)
     if existing is not None:

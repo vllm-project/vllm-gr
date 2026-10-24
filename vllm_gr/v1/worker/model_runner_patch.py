@@ -152,7 +152,7 @@ def make_load_model_with_constraint_backend(original, *, max_batch: int = 1, clo
                 device=getattr(self, "device", None),
                 vocab_size=_runner_vocab_size(self),
                 dtype=getattr(getattr(self, "model_config", None), "dtype", None),
-                # V1 retains its row bound; V2 opts into batched sampling.
+                # NPU V1 and CUDA V2 opt into batched sampling.
                 max_rows=max_batch * max_rows,
                 **stage_options,
             )
@@ -329,6 +329,14 @@ def apply_worker_patches() -> None:
         return
 
     platform_module = _get_active_platform_module()
+    constraint_max_batch = 1
+    if _active_platform_module_name() == _NPU_PATCH_MODULE:
+        from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
+
+        # A Decode stage contains B*W rows. Let the canonical NPU Backend
+        # process the supported logical batch in one call instead of W-row
+        # chunks; the GPU V1 row bound stays unchanged.
+        constraint_max_batch = max(SUPPORTED_BEAM_BATCH_SIZES)
     runners_to_patch = [
         (runner_name, runner_class)
         for runner_name, runner_class in platform_module.discover_worker_runners()
@@ -338,7 +346,9 @@ def apply_worker_patches() -> None:
     for runner_name, runner_class in runners_to_patch:
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
-            runner_class.load_model = make_load_model_with_constraint_backend(load_model)
+            runner_class.load_model = make_load_model_with_constraint_backend(
+                load_model, max_batch=constraint_max_batch
+            )
 
         reload_patcher = getattr(platform_module, "make_patched_reload_weights", None)
         reload_weights = getattr(runner_class, "reload_weights", None)

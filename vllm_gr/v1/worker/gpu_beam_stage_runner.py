@@ -345,7 +345,7 @@ class _StageExecutionHooks:
             and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
         )
         if graph_enabled:
-            graph = self.decode_graph(len(owner.bindings), owner.beam.state.beam_width)
+            graph = self.decode_graph(len(owner.bindings), owner.inputs.width)
             if not graph.ready:
                 graph.capture(
                     owner._forward_hidden,
@@ -502,6 +502,7 @@ class GPUBeamStageRunner:
         self.terminal_release_requested = False
         self.terminal_release_claimed = False
         self.execution_error: Exception | None = None
+        self.dynamic: Any = None
         self.unconstrained_topk_scratch: UnconstrainedTopKScratch | None = None
         self.inputs: GRInputBuffers | None = None
         self.prepared: PreparedGRInputs | None = None
@@ -609,6 +610,8 @@ class GPUBeamStageRunner:
 
     def prepare_cpu(self, m: GRStageMetadata, slot: int) -> PreparedGRInputs:
         worker = self.worker
+        if self.dynamic is not None:
+            self.dynamic.activate(BeamBatchExecutionView.from_stage_metadata(m).input_width)
         groups = worker.kv_cache_config.kv_cache_groups
         if len(groups) != 1:
             raise RuntimeError("Asynchronous scheduling requires one uniform KV cache group")
@@ -649,7 +652,10 @@ class GPUBeamStageRunner:
         self.metadata = BeamAttentionMetadataBuilder.build_async(
             layout=self.prepared.layout,
             views=views,
-            session=GPUBeamAttentionBatch(self.beam.sessions),
+            session=GPUBeamAttentionBatch(
+                self.beam.sessions,
+                width=BeamBatchExecutionView.from_stage_metadata(m).input_width,
+            ),
             mask=self.execution_mask,
             slots=self.slots,
             block_size=self.inputs.block_size,
@@ -681,7 +687,10 @@ class GPUBeamStageRunner:
 
     def capture_forward(self) -> Any:
         """Return a captured candidate; startup publishes it after cleanup."""
-        graph = self.hooks.decode_graph(len(self.bindings), self.beam.state.beam_width)
+        graph = self.hooks.decode_graph(
+            len(self.bindings),
+            self.inputs.width if self.inputs is not None else self.beam.state.beam_width,
+        )
         graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
         return graph
 
@@ -766,7 +775,11 @@ class GPUBeamStageRunner:
                     raise RuntimeError("GR output stage has no native model logits")
                 layout = BeamBatchExecutionView.from_stage_metadata(m)
                 rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
-                candidates = self.tokens[:rows], self.scores[:rows], self.valid[:rows]
+                candidates = (
+                    self.dynamic.candidate_buffers(rows, layout.candidate_top_k)
+                    if self.dynamic is not None
+                    else (self.tokens[:rows], self.scores[:rows], self.valid[:rows])
+                )
                 if self.backend is not None:
                     self.backend.select_out_unchecked(
                         self.logits,
@@ -774,7 +787,7 @@ class GPUBeamStageRunner:
                             self.prefixes[:rows],
                             self.temperatures[:rows],
                             0,
-                            m.beam_params.beam_width,
+                            layout.candidate_top_k,
                         ),
                         out_token_ids=candidates[0],
                         out_logprobs=candidates[1],
@@ -784,17 +797,20 @@ class GPUBeamStageRunner:
                     )
                 else:
                     logits = self.logits[:rows]
-                    if self.unconstrained_topk_scratch is None:
+                    if (
+                        self.unconstrained_topk_scratch is None
+                        or self.unconstrained_topk_scratch.top_k != layout.candidate_top_k
+                    ):
                         self.unconstrained_topk_scratch = allocate_unconstrained_topk_scratch(
                             batch_size=len(self.bindings) * self.beam.state.beam_width,
                             vocab_size=int(logits.shape[-1]),
-                            top_k=m.beam_params.beam_width,
+                            top_k=layout.candidate_top_k,
                             device=logits.device,
                         )
                     unconstrained_topk_out(
                         logits,
                         self.temperatures[:rows],
-                        m.beam_params.beam_width,
+                        layout.candidate_top_k,
                         self.unconstrained_topk_scratch,
                         candidates[0],
                         candidates[1],
@@ -802,7 +818,9 @@ class GPUBeamStageRunner:
                         self.counts[:rows],
                     )
                 candidate_batch = BeamCandidateBatch(layout, *candidates)
-                if m.kind is GRStageKind.PREFILL:
+                if self.dynamic is not None:
+                    self.dynamic.advance(layout, candidates, m.is_last_stage)
+                elif m.kind is GRStageKind.PREFILL:
                     self.beam.initialize_from_prefill(candidate_batch)
                 else:
                     self.beam.advance(candidate_batch)
@@ -1151,10 +1169,20 @@ def get_stage_runner(
         raise ValueError("captured Beam resource addresses or layouts changed")
     # The graph captures the adapter's fixed Forward and attention buffers,
     # not the request-local Beam state or its effective token budget.
+    from vllm_gr.v1.worker.gpu_dynamic_beam import (
+        GPUDynamicBeam,
+        discard_dynamic_graphs,
+        uses_dynamic_beam,
+    )
+
+    dynamic_requested = uses_dynamic_beam(m.beam_params)
+    existing_dynamic = getattr(existing, "dynamic", None)
     reuse_adapter = (
         existing is not None
         and existing.closed
         and resources_match
+        and (existing_dynamic is not None) == dynamic_requested
+        and existing.beam.layout.dynamic_beam_widths == view.dynamic_beam_widths
         and existing.beam.state.beam_width == m.beam_params.beam_width
         and existing.beam.session.context is context
         and existing.beam.workspace is workspace
@@ -1182,6 +1210,8 @@ def get_stage_runner(
             stop_token_ids=m.beam_params.stop_token_ids,
             ignore_stop_tokens=m.beam_params.ignore_stop_tokens,
         )
+    if not reuse_adapter and (existing_dynamic is not None or dynamic_requested):
+        discard_dynamic_graphs(worker, context)
     sessions = []
     bindings = []
     for item_index, (request_id, prompt_tokens) in enumerate(
@@ -1234,6 +1264,14 @@ def get_stage_runner(
         hooks = hooks_type(worker)
         hooks.prepare_new_adapter(view)
         adapter = GPUBeamStageRunner(worker, beam, binding_tuple, backend, hooks=hooks)
+    if dynamic_requested:
+        if adapter.dynamic is None:
+            adapter.dynamic = GPUDynamicBeam(adapter)
+        else:
+            adapter.dynamic.reset()
+        adapter.prefixes = workspace.prefix_token_ids[: view.batch_size].reshape(
+            view.batch_size * view.beam_width, -1
+        )
     worker._beam_sessions = {
         binding.native_request_id: session for binding, session in zip(binding_tuple, session_tuple)
     }

@@ -381,6 +381,54 @@ def _npu_graph_fallback(runner, result, reason: str):
     return _downgrade_to_none(result)
 
 
+def _npu_beam_identity_layout_matches(runner, beam_info, num_tokens: int) -> bool:
+    """Require the identity row layout baked into the NPU Beam FULL graph.
+
+    Attention's Python slice/gather choice is frozen during capture. Check
+    physical scheduler counts and complete cached prefixes before replay,
+    rather than trusting the runtime metadata flag to change that choice.
+    """
+    session = beam_info.get("beam_session")
+    batch = int(getattr(session, "batch_size", 1))
+    width = int(getattr(session, "request_width", getattr(session, "beam_width", 0)))
+    req_ids = tuple(beam_info.get("req_ids") or ())
+    scheduler_output = getattr(runner, "_current_scheduler_output", None)
+    counts = getattr(scheduler_output, "num_scheduled_tokens", None)
+    beam_data = beam_info.get("beam_data", {})
+    query_starts = getattr(getattr(runner, "query_start_loc", None), "np", None)
+    if (
+        batch < 1
+        or width < 1
+        or num_tokens != batch * width
+        or getattr(session, "attention_width", None) != num_tokens
+        or len(req_ids) != batch
+        or len(set(req_ids)) != batch
+        or not isinstance(counts, dict)
+        or tuple(counts) != req_ids
+        or set(beam_data) != set(req_ids)
+        or query_starts is None
+        or len(query_starts) < batch + 1
+        or tuple(query_starts[: batch + 1]) != tuple(range(0, num_tokens + 1, width))
+    ):
+        return False
+    for req_id in req_ids:
+        mdata = beam_data[req_id]
+        prefix_len = mdata.get("prefix_len", 0)
+        if (
+            counts[req_id] != width
+            or not mdata.get("is_beam_decode", False)
+            or mdata.get("beam_width") != width
+            or type(prefix_len) is not int
+            or prefix_len < 1
+            or mdata.get("cache_len") != prefix_len
+            or type(mdata.get("decode_step")) is not int
+            or mdata["decode_step"] < 0
+            or mdata.get("beam_decode_steps") != mdata["decode_step"] + 1
+        ):
+            return False
+    return True
+
+
 def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
     """Override cudagraph_mode to FULL for beam decode steps (NPU/ACL graph).
 
@@ -466,7 +514,6 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
         real_num_tokens = (
             int(num_tokens_arg) if num_tokens_arg is not None else result[1].num_tokens
         )
-
         # FULL iff the exact (B, W) shape and physical token bucket were
         # captured; otherwise preserve native PIECEWISE/NONE dispatch, never
         # a native FULL graph that does not contain the Beam attention path.
@@ -475,6 +522,8 @@ def make_patched_determine_batch_execution_and_padding_npu(_orig_determine):
         captured_shapes = getattr(self, "_gr_npu_beam_graph_shapes", set())
         if (batch_size, request_width) not in captured_shapes:
             return _npu_graph_fallback(self, result, "shape_miss")
+        if not _npu_beam_identity_layout_matches(self, beam_info, real_num_tokens):
+            return _npu_graph_fallback(self, result, "identity_layout")
         if not _beam_full_graph_ready(self, real_num_tokens):
             return _npu_graph_fallback(self, result, "token_bucket_miss")
 

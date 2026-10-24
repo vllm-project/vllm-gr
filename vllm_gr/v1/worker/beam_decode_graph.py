@@ -66,6 +66,9 @@ class BeamDecodeGraph:
         while isinstance(runnable, CUDAGraphWrapper):
             runnable = runnable.unwrap()
         self.wrapper = _BeamDecodeModel(self, runnable)
+        self._registries: dict[BeamDecodeGraphSignature, dict[Any, Any]] = {
+            self.signature: self.wrapper.concrete_cudagraph_entries
+        }
         # The caller chooses whether this wrapper remains the native model
         # entry (V1) or is installed only for the capture window (V2).
         self.installed = False
@@ -78,6 +81,7 @@ class BeamDecodeGraph:
     def select(self, batch_size: int, beam_width: int) -> BeamDecodeGraph:
         signature = BeamDecodeGraphSignature(batch_size, beam_width, batch_size * beam_width)
         self.signature = signature
+        self.wrapper.concrete_cudagraph_entries = self._registries.setdefault(signature, {})
         self.descriptor = BatchDescriptor(num_tokens=signature.num_model_rows, uniform=True)
         return self
 
@@ -112,6 +116,9 @@ class BeamDecodeGraph:
 
     def clear(self) -> None:
         """Discard graph entries and captured views after an aborted startup."""
+        for entries in self._registries.values():
+            entries.clear()
+        self._registries.clear()
         self.wrapper.clear_graphs()
         self._bindings.clear()
         self.capture_inputs = self.capture_attention = None

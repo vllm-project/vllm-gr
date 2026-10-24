@@ -68,6 +68,8 @@ repos:
     hooks:
       - id: actionlint
         files: ^\.github/workflows/.*\.ya?ml$
+        # GitHub supports concurrency.queue, but pinned actionlint does not yet parse it.
+        args: [-ignore, 'unexpected key "queue" for "concurrency" section']
 
 
   - repo: local

@@ -971,3 +971,89 @@ def test_block_table_copied_set_eviction_survives_fixed_buffers() -> None:
     # Session B sweeps A's set entry without raising TypeError.
     run_build("req-b")
     assert not any("req-a" in str(k) for k in btc)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+@pytest.mark.parametrize("is_npu", [False, True])  # type: ignore[misc]
+def test_incremental_identity_rows_are_proved_only_for_npu(batch_size: int, is_npu: bool) -> None:
+    """The device-view opt-in is derived from the current host row layout."""
+    width = 2
+    rows = batch_size * width
+    request_ids = [f"beam-{index}" for index in range(batch_size)]
+    beam_data = {
+        request_id: {
+            "is_beam_decode": True,
+            "prefix_len": 4,
+            "cache_len": 4,
+            "beam_width": width,
+            "beam_decode_steps": 1,
+            "decode_step": 0,
+        }
+        for request_id in request_ids
+    }
+    session = SimpleNamespace(
+        is_active=True,
+        beam_width=width,
+        attention_width=rows,
+        context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda _request: 0)),
+    )
+    builder = _make_builder()
+    builder._is_npu = is_npu
+    builder._is_cuda = not is_npu
+    common = _common_metadata(
+        list(range(0, rows + 1, width)),
+        [4 + width] * batch_size,
+        [[0, 1, 2, 3]] * batch_size,
+    )
+    token = BEAM_DATA_VAR.set(
+        {"beam_data": beam_data, "req_ids": request_ids, "beam_session": session}
+    )
+    try:
+        metadata = builder.build(0, common)
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+    assert metadata.prefix_indices is not None
+    assert metadata.prefix_indices.tolist() == list(range(rows))
+    assert metadata.npu_prefix_rows_are_identity is is_npu
+
+
+def test_identity_row_proof_is_not_reused_for_same_shape_changed_prefix() -> None:
+    """Losing cached prefix blocks changes routing without changing B or W."""
+    builder = _make_builder()
+    builder._is_npu = True
+    session = SimpleNamespace(
+        is_active=True,
+        beam_width=2,
+        attention_width=2,
+        context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda _request: 0)),
+    )
+
+    def build(cache_len: int) -> BeamAttentionMetadata:
+        token = BEAM_DATA_VAR.set(
+            {
+                "req_ids": ["beam"],
+                "beam_session": session,
+                "beam_data": {
+                    "beam": {
+                        "is_beam_decode": True,
+                        "prefix_len": 4,
+                        "cache_len": cache_len,
+                        "beam_width": 2,
+                        "beam_decode_steps": 1,
+                        "decode_step": 0,
+                    }
+                },
+            }
+        )
+        try:
+            return builder.build(0, _common_metadata([0, 2], [6], [[0, 1, 2, 3]]))
+        finally:
+            BEAM_DATA_VAR.reset(token)
+
+    first = build(4)
+    changed = build(0)
+    restored = build(4)
+    assert first.npu_prefix_rows_are_identity
+    assert not changed.npu_prefix_rows_are_identity
+    assert restored.npu_prefix_rows_are_identity
