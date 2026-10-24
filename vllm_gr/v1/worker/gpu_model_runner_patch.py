@@ -729,16 +729,17 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                     bucket = p_runner.match_bucket(total_tokens)
                     reason = "no_matching_bucket" if bucket is None else "graph_not_captured"
                     if gr_stages:
-                        # Reuse the same padded geometry and static buffers as
-                        # legacy Prefill. The runner keeps the real Attention
-                        # lengths and masks padded KV slots. Async scheduling
-                        # adds no exact-bucket requirement; adapters and invalid
-                        # live input shapes still fall back to the original path.
+                        # Native preprocessing may pad these 1D tensors to a
+                        # compilation bucket. Only their scheduled prefix is
+                        # live: the Prefill runner copies that prefix, preserves
+                        # real Attention lengths, and masks its own padded KV
+                        # slots. Native padding must not determine GR's bucket.
                         if (
                             input_ids is None
-                            or tuple(input_ids.shape) != (total_tokens,)
+                            or input_ids.ndim != 1
+                            or input_ids.shape[0] < total_tokens
                             or positions is None
-                            or tuple(positions.shape) != (total_tokens,)
+                            or tuple(positions.shape) != tuple(input_ids.shape)
                             or kwargs.get("inputs_embeds") is not None
                             or kwargs.get("intermediate_tensors") is not None
                         ):

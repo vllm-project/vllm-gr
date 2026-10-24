@@ -105,7 +105,8 @@ def test_async_scheduling_prefill_reuses_existing_padded_graph_without_runtime_c
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "invalid", ["ids", "positions", "inputs_embeds", "intermediate_tensors"]
+    "invalid",
+    ["ids", "positions", "mismatched_padding", "inputs_embeds", "intermediate_tensors"],
 )
 def test_async_prefill_padding_preserves_input_guards(
     monkeypatch: pytest.MonkeyPatch, invalid: str
@@ -136,6 +137,8 @@ def test_async_prefill_padding_preserves_input_guards(
         ids = ids[:3]
     elif invalid == "positions":
         positions = positions[None, :]
+    elif invalid == "mismatched_padding":
+        ids = torch.zeros(8, dtype=torch.int32)
     else:
         kwargs[invalid] = object()
     wrapped = gpu_patch.make_patched_model_forward(lambda *a, **k: "eager")
@@ -160,13 +163,15 @@ def test_async_scheduling_prefill_never_initializes_a_graph_runner_during_reques
     assert gpu_patch.make_patched_model_forward(lambda *args, **kwargs: "eager")(runner) == "eager"
 
 
+@pytest.mark.parametrize("padding", [0, 4])  # type: ignore[misc]
 def test_batch_session_prefill_selects_exact_four_request_graph(
     monkeypatch: pytest.MonkeyPatch,
+    padding: int,
 ) -> None:
     request_ids = ("r0", "r1", "r2", "r3")
     scheduled_tokens = dict.fromkeys(request_ids, 1)
-    tokens = torch.arange(4, dtype=torch.int32)
-    positions = torch.arange(4)
+    tokens = torch.arange(4 + padding, dtype=torch.int32)
+    positions = torch.arange(4 + padding)
     hidden = object()
     calls: list[str] = []
 

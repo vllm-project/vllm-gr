@@ -102,6 +102,40 @@ class OneRecV1STWorkerExtension:
         wrap(BeamDecodeGraph, "replay", lambda graph, args: {})
         wrap(GPUPrefillGraphRunner, "execute_model_prefill", lambda graph, args: {})
 
+        runner = getattr(self, "model_runner")
+        original_forward = runner._model_forward
+
+        def observe_forward(*args: Any, **kwargs: Any) -> Any:
+            scheduled = getattr(runner, "_current_scheduler_output", None)
+            stages = getattr(scheduled, "gr_stage_metadata", {})
+            if scheduled is None or not stages or any(m.stage_index != 0 for m in stages.values()):
+                return original_forward(*args, **kwargs)
+            ids = kwargs.get("input_ids", args[0] if args else None)
+            positions = kwargs.get("positions", args[1] if len(args) > 1 else None)
+            graph = getattr(runner, "_prefill_graph_runner", None)
+            before = dict(getattr(runner, "_gr_prefill_graph_dispatches", {}))
+            total = scheduled.total_num_scheduled_tokens
+            event = dict(
+                method="prefill_inputs",
+                scheduled=total,
+                request_tokens=list(scheduled.num_scheduled_tokens.values()),
+                input_shape=None if ids is None else list(ids.shape),
+                position_shape=None if positions is None else list(positions.shape),
+                inputs_embeds=kwargs.get("inputs_embeds") is not None,
+                intermediate_tensors=kwargs.get("intermediate_tensors") is not None,
+                bucket=None if graph is None else graph.match_bucket(total),
+            )
+            events.append(event)
+            result = original_forward(*args, **kwargs)
+            event["dispatches"] = {
+                key: count - before.get(key, 0)
+                for key, count in getattr(runner, "_gr_prefill_graph_dispatches", {}).items()
+                if count != before.get(key, 0)
+            }
+            return result
+
+        runner._model_forward = observe_forward
+
     def onerec_v1_st_events(self) -> list[dict[str, Any]]:
         return self._onerec_events
 
@@ -554,6 +588,21 @@ def _completion_inputs(work_dir: Path) -> tuple[Any, ...]:
     return model, config, sizes, kwargs, prompts, legal
 
 
+def _check_completion_prefill(events: list[dict[str, Any]], batch_size: int) -> None:
+    from vllm_gr.v1.worker.prefill_graph_common import is_prefill_graph_enabled
+
+    if _EAGER or not is_prefill_graph_enabled():
+        return
+    prefills = [e for e in events if e["method"] == "prefill_inputs"]
+    assert len(prefills) == 1
+    event = prefills[0]
+    assert len(event["request_tokens"]) == batch_size
+    assert event["input_shape"] == event["position_shape"]
+    assert event["input_shape"][0] >= event["scheduled"]
+    assert event["dispatches"] == {f"replay:{batch_size}": 1}, event
+    assert event["bucket"] is not None and event["bucket"] >= event["scheduled"], event
+
+
 def _run_completion_reference(work_dir: Path) -> None:
     """Run the HTTP inputs in a separate offline engine before starting HTTP."""
     from vllm_gr.entrypoints.gr import GRLLM
@@ -562,11 +611,14 @@ def _run_completion_reference(work_dir: Path) -> None:
     rows = []
     with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **kwargs) as llm:
         processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
+        llm.collective_rpc("onerec_v1_st_observe")
         for count in (size for size in sizes if size > 1):
             assert llm.reset_prefix_cache()
+            before = len(llm.collective_rpc("onerec_v1_st_events")[0])
             outputs = llm.beam_search_v1(
                 [{"prompt_token_ids": p} for p in prompts[:count]], _params(3)
             )
+            _check_completion_prefill(llm.collective_rpc("onerec_v1_st_events")[0][before:], count)
             assert len(outputs) == count
             for prompt, output in zip(prompts[:count], outputs, strict=True):
                 assert all(s.tokens[: len(prompt)] == prompt for s in output.sequences)
@@ -584,6 +636,7 @@ def _run_completion_reference(work_dir: Path) -> None:
             )
             assert not llm.llm_engine.has_unfinished_requests()
         graphs = llm.collective_rpc("onerec_v1_st_graphs")
+        events = llm.collective_rpc("onerec_v1_st_events")[0]
     shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
     assert shutdown and all(not p["alive"] and p["exitcode"] == 0 for p in shutdown), shutdown
     (work_dir / "completion-offline-reference.json").write_text(
@@ -595,6 +648,7 @@ def _run_completion_reference(work_dir: Path) -> None:
                 prompts=prompts,
                 rows=rows,
                 graphs=graphs,
+                events=events,
                 shutdown=shutdown,
             ),
             indent=2,
@@ -711,17 +765,24 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                 stages = await stages_since(before)
                 assert [e["size"] for e in stages if e["stage"] == 0] == [count]
                 assert len({e["session_id"] for e in stages}) == 1
+                _check_completion_prefill(
+                    (await engine.collective_rpc("onerec_v1_st_events"))[0][before:], count
+                )
                 snapshot = (await engine.collective_rpc("onerec_v1_st_snapshot"))[0]
                 assert snapshot["retired"] and snapshot["registry_size"] == 0
                 assert not snapshot["active_sessions"]
                 assert not engine.output_processor.has_unfinished_requests()
                 assert await engine.reset_prefix_cache()
+                before_direct = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
                 direct = [
                     output
                     async for output in serving.beam_search_v1(
                         [tokens_input(p) for p in prompts[:count]], "direct-reference", _params(3)
                     )
                 ]
+                _check_completion_prefill(
+                    (await engine.collective_rpc("onerec_v1_st_events"))[0][before_direct:], count
+                )
                 assert [out.prompt_token_ids for out in direct] == prompts[:count]
                 reference = next(row for row in offline["rows"] if row["count"] == count)
                 direct_candidates = [
@@ -738,6 +799,8 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                             offline=reference["candidates"],
                             online=direct_candidates,
                             response=data,
+                            events=(await engine.collective_rpc("onerec_v1_st_events"))[0][before:],
+                            graphs=await engine.collective_rpc("onerec_v1_st_graphs"),
                         ),
                         indent=2,
                     )
@@ -907,6 +970,10 @@ def test_onerec_v1_completion_batch_online(
     env.pop("VLLM_GR_TEST_ONLINE_BATCH_SIZES", None)
     if batch_sizes is not None:
         env["VLLM_GR_TEST_ONLINE_BATCH_SIZES"] = json.dumps(batch_sizes)
+        # The seven-request prompt list exceeds max_model_len in total.
+        # An explicit GR grid covers total batch tokens up to the scheduler
+        # budget; the production default remains bounded by max_model_len.
+        env["VLLM_GR_PREFILL_GRAPH_BUCKETS"] = ",".join(str(n) for n in range(128, 4097, 128))
     env.update(
         USE_TF="0",
         VLLM_USE_V2_MODEL_RUNNER="0",
