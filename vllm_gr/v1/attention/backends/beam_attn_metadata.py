@@ -633,7 +633,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     (prefix_seqlens_kv_view, list(prefix_seqlens_kv_cpu)),
                     (prefix_cu_seqlens_q_view, [0] + list(prefix_cu_seqlens_q_cpu)),
                     (suffix_cu_seqlens_q_view, [0] + list(suffix_cu_seqlens_q_cpu)),
-                ]
+                ],
+                non_blocking=getattr(self, "_is_npu", False),
             )
             cache[geom_key] = True
 
@@ -1009,7 +1010,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_max_seq_len,
         )
 
-    def _pack_int32_to_dev(self, entries: list[tuple[Any, list[int]]]) -> None:
+    def _pack_int32_to_dev(
+        self,
+        entries: list[tuple[Any, list[int]]],
+        *,
+        non_blocking: bool = False,
+    ) -> None:
         """Write several small host int lists to device in ONE H2D.
 
         ``entries`` is a list of ``(dst_slice, host_list)``.  All the step's
@@ -1038,9 +1044,19 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         np_dtype = np.int32 if self._h2d_host.dtype == torch.int32 else np.int64
         segments = [np.asarray(hl, dtype=np_dtype) for _dst, hl in entries]
         packed = np.concatenate(segments) if len(segments) > 1 else segments[0]
-        self._h2d_host[:total].copy_(torch.from_numpy(packed))
+        if non_blocking:
+            # A first NPU Beam geometry must not drain the preceding Prefill
+            # and TopK before the rest of Decode preparation can be submitted.
+            # Do not reuse _h2d_host here: a following request could overwrite
+            # it before this asynchronous H2D has consumed the payload. The
+            # pinned allocator tracks the copy and delays recycling this
+            # independent allocation until its transfer has completed.
+            host = torch.empty(total, dtype=self._h2d_host.dtype, pin_memory=True)
+        else:
+            host = self._h2d_host[:total]
+        host.copy_(torch.from_numpy(packed))
         # Single host -> device transfer for the whole payload.
-        self._h2d_dev[:total].copy_(self._h2d_host[:total])
+        self._h2d_dev[:total].copy_(host, non_blocking=non_blocking)
 
         off = 0
         for dst, host_list in entries:
@@ -1219,11 +1235,20 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # already in the address-stable buffer and can be skipped.
             copied = self._geometry_cache().setdefault("block_table_copied", set())
             if geom_key is None or geom_key not in copied:
-                prefix_block_table[:, :max_prefix_blocks_count].copy_(
-                    common_attn_metadata.block_table_tensor[
-                        prefix_req_idxs_cpu, :max_prefix_blocks_count
-                    ]
-                )
+                source = common_attn_metadata.block_table_tensor
+                if (
+                    getattr(self, "_is_npu", False)
+                    and geom_key is not None
+                    and all(row == index for index, row in enumerate(prefix_req_idxs_cpu))
+                ):
+                    # A request-major incremental batch already has its
+                    # prefix blocks in this order. Basic slicing avoids the
+                    # implicit CPU index tensor upload of list indexing, so
+                    # first Decode preparation can continue during Prefill.
+                    source = source[: len(prefix_req_idxs_cpu), :max_prefix_blocks_count]
+                else:
+                    source = source[prefix_req_idxs_cpu, :max_prefix_blocks_count]
+                prefix_block_table[:, :max_prefix_blocks_count].copy_(source)
                 if geom_key is not None:
                     copied.add(geom_key)
         else:

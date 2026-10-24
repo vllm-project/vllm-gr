@@ -401,6 +401,118 @@ def test_pack_int32_to_dev_leading_zero_cus() -> None:
     assert cu.tolist() == [0, 2, 4]
 
 
+def test_async_metadata_upload_keeps_each_pending_host_payload_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second request cannot overwrite the source of an enqueued H2D."""
+    builder = _make_builder()
+    builder._h2d_host = torch.zeros(16, dtype=torch.int32)
+    builder._h2d_dev = torch.zeros(16, dtype=torch.int32)
+    first, second = torch.zeros(4, dtype=torch.int32), torch.zeros(4, dtype=torch.int32)
+    staging_storage = builder._h2d_dev.untyped_storage().data_ptr()
+    queued: list[tuple[torch.Tensor, torch.Tensor, bool]] = []
+    allocated = []
+    original_empty, original_copy = torch.empty, torch.Tensor.copy_
+
+    def allocate(*args: Any, **kwargs: Any) -> torch.Tensor:
+        # CPU-only fixture models the private pinned allocation; hardware
+        # integration tests exercise the real allocator and transfer events.
+        assert kwargs.pop("pin_memory") is True
+        tensor = original_empty(*args, **kwargs)
+        allocated.append(tensor)
+        return tensor
+
+    def enqueue(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False) -> torch.Tensor:
+        if staging_storage in (dst.untyped_storage().data_ptr(), src.untyped_storage().data_ptr()):
+            queued.append((dst, src, non_blocking))
+            return dst
+        return original_copy(dst, src, non_blocking=non_blocking)
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    monkeypatch.setattr(torch.Tensor, "copy_", enqueue)
+    builder._pack_int32_to_dev([(first, [1, 2, 3, 4])], non_blocking=True)
+    builder._h2d_host.fill_(-1)
+    builder._pack_int32_to_dev([(second, [5, 6, 7, 8])], non_blocking=True)
+    builder._h2d_host.fill_(-2)
+    assert len(allocated) == 2
+    assert allocated[0].data_ptr() != allocated[1].data_ptr()
+    assert queued[0][2] and queued[2][2]
+    for dst, src, _ in queued:
+        original_copy(dst, src)
+    assert first.tolist() == [1, 2, 3, 4]
+    assert second.tolist() == [5, 6, 7, 8]
+
+
+@pytest.mark.parametrize("is_npu", [False, True])  # type: ignore[misc]
+def test_only_npu_incremental_geometry_uses_async_upload(
+    monkeypatch: pytest.MonkeyPatch, is_npu: bool
+) -> None:
+    builder = _make_fixed_builder()
+    builder._is_npu = is_npu
+    transfers = []
+
+    def upload(entries: Any, *, non_blocking: bool = False) -> None:
+        transfers.append(non_blocking)
+
+    monkeypatch.setattr(builder, "_pack_int32_to_dev", upload)
+    for step in (0, 1):
+        assert builder._upload_incremental_seqlens(
+            ("beam", 4),
+            step,
+            prefix_seqlens_kv_view=builder._prefix_seqlens_kv_buf[:1],
+            prefix_cu_seqlens_q_view=builder._prefix_cu_seqlens_q_buf[:2],
+            suffix_seqlens_kv_view=builder._suffix_seqlens_kv_buf[:4],
+            suffix_cu_seqlens_q_view=builder._suffix_cu_seqlens_q_buf[:5],
+            suffix_cu_seqlens_k_view=builder._suffix_cu_seqlens_k_buf[:5],
+            prefix_seqlens_kv_cpu=[8],
+            prefix_cu_seqlens_q_cpu=[4],
+            suffix_cu_seqlens_q_cpu=[1, 2, 3, 4],
+        )
+    assert transfers == [is_npu]
+
+
+@pytest.mark.npu_integration  # type: ignore[misc]
+def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
+    """Queued uploads retain immutable payloads after their local source dies."""
+    pytest.importorskip("torch_npu")
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("Ascend NPU is not available")
+    builder = _make_builder()
+    builder.device = torch.device("npu")
+    builder._is_npu = True
+    with torch.inference_mode():
+        builder._h2d_host = torch.zeros(64, dtype=torch.int32, pin_memory=True)
+        builder._h2d_dev = torch.zeros(64, dtype=torch.int32, device="npu")
+        work = torch.ones((1024, 1024), dtype=torch.float16, device="npu")
+        scratch = torch.empty_like(work)
+        stream = torch.npu.Stream()
+        stream.wait_stream(torch.npu.current_stream())
+        results = []
+        with torch.npu.stream(stream):
+            for request in range(32):
+                # Keep preceding work on the owning stream while the CPU
+                # submits multiple request payloads and churns pinned memory.
+                for _ in range(8):
+                    torch.mm(work, work, out=scratch)
+                first = torch.empty(8, dtype=torch.int32, device="npu")
+                second = torch.empty(12, dtype=torch.int32, device="npu")
+                values = list(range(20 * request, 20 * request + 20))
+                builder._pack_int32_to_dev(
+                    [(first, values[:8]), (second, values[8:])], non_blocking=True
+                )
+                results.append((first, second, values))
+                # The just-released upload source has exactly this size.
+                # It must not be recycled until its asynchronous H2D finishes.
+                churn = torch.empty(20, dtype=torch.int32, pin_memory=True)
+                churn.fill_(-1)
+                del churn
+                builder._h2d_host.fill_(-2)
+        stream.synchronize()
+        for first, second, values in results:
+            assert first.cpu().tolist() == values[:8]
+            assert second.cpu().tolist() == values[8:]
+
+
 def _make_fixed_builder() -> BeamAttentionMetadataBuilder:
     """Builder with fixed-address CPU buffers enabled (CUDA-graph-like path)."""
     builder = _make_builder()
@@ -421,6 +533,147 @@ def _make_fixed_builder() -> BeamAttentionMetadataBuilder:
     builder._h2d_host = torch.zeros(64, dtype=torch.int32)
     builder._h2d_dev = torch.zeros(64, dtype=torch.int32)
     return builder
+
+
+@pytest.mark.parametrize("is_npu", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("incremental", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("max_columns", [1, 3])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "request_rows", [[0], [0, 1, 2, 3], [3, 2, 1, 0], [0, 2], [0, 0]]
+)
+def test_prefix_block_table_view_requires_npu_incremental_identity_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    is_npu: bool,
+    incremental: bool,
+    max_columns: int,
+    request_rows: list[int],
+) -> None:
+    """Basic slicing preserves B1/B4 block rows, cache hits and new requests."""
+    builder = _make_fixed_builder()
+    builder._is_npu = is_npu
+    builder._is_cuda = not is_npu
+    builder._prefix_block_table_buf = torch.zeros((4, 8), dtype=torch.int32)
+    builder._suffix_cu_seqlens_q_buf = torch.zeros(16, dtype=torch.int32)
+    builder._suffix_cu_seqlens_k_buf = torch.zeros(16, dtype=torch.int32)
+    common = _common_metadata(
+        [0, 2, 4, 6, 8],
+        [8, 10, 12, 14],
+        [list(range(8 * row, 8 * row + 8)) for row in range(4)],
+    )
+    expected = common.block_table_tensor[request_rows, :max_columns].clone()
+    fixed_address = builder._prefix_block_table_buf.data_ptr()
+    advanced_reads = []
+    original_getitem, original_empty = torch.Tensor.__getitem__, torch.empty
+
+    def getitem(tensor: torch.Tensor, key: Any) -> torch.Tensor:
+        if tensor is common.block_table_tensor and isinstance(key[0], list):
+            advanced_reads.append(tuple(key[0]))
+        return original_getitem(tensor, key)
+
+    def allocate(*args: Any, **kwargs: Any) -> torch.Tensor:
+        # The private asynchronous pinned staging is covered on hardware by
+        # test_npu_async_metadata_upload_survives_pinned_allocator_reuse.
+        kwargs.pop("pin_memory", None)
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "__getitem__", getitem)
+    monkeypatch.setattr(torch, "empty", allocate)
+    count = len(request_rows)
+    rows = 2 * count
+
+    def build(key: Any, step: int) -> torch.Tensor:
+        return builder._create_beam_tensors(
+            common,
+            prefix_indices=list(range(rows)),
+            prefix_seqlens_q_cpu=[2] * count,
+            prefix_cu_seqlens_q_cpu=list(range(2, rows + 1, 2)),
+            prefix_seqlens_kv_cpu=[2 * max_columns] * count,
+            suffix_seqlens_q_cpu=[1] * rows,
+            suffix_cu_seqlens_q_cpu=list(range(1, rows + 1)),
+            suffix_cu_seqlens_kv_cpu=list(range(step + 1, (rows + 1) * (step + 1), step + 1)),
+            suffix_seqlens_kv_cpu=[step + 1] * rows,
+            suffix_slot_mapping_out_list=[],
+            prefix_req_idxs_cpu=request_rows,
+            max_prefix_blocks_count=max_columns,
+            device=torch.device("cpu"),
+            max_num_splits=0,
+            geom_key=key,
+            decode_step=step if incremental else None,
+        )[5]
+
+    key = ("request-a", tuple(request_rows)) if incremental else None
+    blocks = build(key, 0)
+    assert blocks.data_ptr() == fixed_address
+    assert blocks.shape == (count, 8)
+    torch.testing.assert_close(blocks[:, :max_columns], expected)
+    uses_view = is_npu and incremental and request_rows == list(range(count))
+    assert len(advanced_reads) == (0 if uses_view else 1)
+
+    common.block_table_tensor.add_(100)
+    blocks = build(key, 1)
+    # Same-request incremental geometry retains its original prefix blocks;
+    # mixed/recompute geometry refreshes the current native block table.
+    torch.testing.assert_close(blocks[:, :max_columns], expected if incremental else expected + 100)
+    if incremental:
+        blocks = build(("request-b", tuple(request_rows)), 0)
+        torch.testing.assert_close(blocks[:, :max_columns], expected + 100)
+    assert blocks.data_ptr() == fixed_address
+    assert len(advanced_reads) == (0 if uses_view else 2)
+
+
+@pytest.mark.parametrize("beam_first", [False, True])  # type: ignore[misc]
+def test_npu_mixed_metadata_keeps_indexed_block_rows_and_synchronous_upload(
+    monkeypatch: pytest.MonkeyPatch, beam_first: bool
+) -> None:
+    builder = _make_fixed_builder()
+    builder._is_npu = True
+    req_ids = ["beam", "ordinary"] if beam_first else ["ordinary", "beam"]
+    beam_index = req_ids.index("beam")
+    common = _common_metadata([0, 2, 4], [3, 3], [[1, 2, 3, 4], [5, 6, 7, 8]])
+    expected = common.block_table_tensor[beam_index : beam_index + 1, :2].clone()
+    reads, transfers = [], []
+    original_getitem = torch.Tensor.__getitem__
+    original_upload = builder._pack_int32_to_dev
+
+    def getitem(tensor: torch.Tensor, key: Any) -> torch.Tensor:
+        if tensor is common.block_table_tensor and isinstance(key[0], list):
+            reads.append(tuple(key[0]))
+        return original_getitem(tensor, key)
+
+    def upload(entries: Any, *, non_blocking: bool = False) -> None:
+        transfers.append(non_blocking)
+        original_upload(entries, non_blocking=non_blocking)
+
+    monkeypatch.setattr(torch.Tensor, "__getitem__", getitem)
+    monkeypatch.setattr(builder, "_pack_int32_to_dev", upload)
+    token = BEAM_DATA_VAR.set(
+        {
+            "req_ids": req_ids,
+            "beam_data": {
+                "beam": {
+                    "is_beam_decode": True,
+                    "prefix_len": 3,
+                    "cache_len": 3,
+                    "beam_width": 2,
+                    "beam_decode_steps": 1,
+                    "decode_step": 0,
+                }
+            },
+            "beam_session": SimpleNamespace(
+                is_active=True,
+                context=SimpleNamespace(registry=SimpleNamespace(get_slot=lambda _: 0)),
+            ),
+        }
+    )
+    try:
+        metadata = builder.build(0, common)
+    finally:
+        BEAM_DATA_VAR.reset(token)
+    assert (beam_index,) in reads
+    assert transfers and not any(transfers)
+    assert metadata.std_seqlens_kv_cpu == [3]
+    assert metadata.prefix_seqlens_kv_cpu == [3]
+    torch.testing.assert_close(metadata.prefix_block_table[:, :2], expected)
 
 
 def test_incremental_seqlens_step_updates_device_in_place() -> None:
