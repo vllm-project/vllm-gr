@@ -18,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -41,6 +42,38 @@ class OneRecV1STWorkerExtension:
         from vllm_gr.v1.worker.model_runner_common import get_beam_graph_runtime_stats
 
         return get_beam_graph_runtime_stats(self)
+
+    def onerec_v1_st_runtime(self) -> dict[str, Any]:
+        """Record resolved execution settings before the first request."""
+        import torch
+        import vllm.envs as envs
+
+        runner = getattr(self, "model_runner")
+        config = runner.vllm_config
+        model = runner.get_model()
+        return {
+            "runner": type(runner).__name__,
+            "model": type(model).__name__,
+            "config_hash": config.compute_hash(),
+            "model_config_hash": config.model_config.compute_hash(),
+            "dtype": str(config.model_config.dtype),
+            "seed": config.model_config.seed,
+            "scheduler": str(config.scheduler_config),
+            "cache": str(config.cache_config),
+            "kernel": str(config.kernel_config),
+            "matmul_precision": torch.get_float32_matmul_precision(),
+            "aot_compile": envs.VLLM_USE_AOT_COMPILE,
+            "mega_aot_artifact": envs.VLLM_USE_MEGA_AOT_ARTIFACT,
+            "compile_cache_dir": config.compilation_config.local_cache_dir,
+            "compiled_modules": {
+                name: {
+                    "type": type(module).__name__,
+                    "loaded_from_disk": module.was_aot_compile_fn_loaded_from_disk,
+                }
+                for name, module in model.named_modules()
+                if hasattr(module, "was_aot_compile_fn_loaded_from_disk")
+            },
+        }
 
     def onerec_v1_st_observe(self) -> None:
         from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
@@ -230,7 +263,15 @@ def _inputs(work_dir: Path) -> tuple[Any, ...]:
     artifact = Path(
         os.environ.get("VLLM_GR_TEST_ARTIFACT", str(work_dir / "onerec_v1_constraints.safetensors"))
     )
-    digest = save_constraint_table_artifact(table, artifact)
+    if artifact.exists():
+        # Reuse a historical artifact without rewriting it, but require the
+        # exact same deterministic SID table as this test's configuration.
+        with tempfile.TemporaryDirectory(dir=work_dir) as temporary:
+            expected = Path(temporary) / "expected.safetensors"
+            digest = save_constraint_table_artifact(table, expected)
+            assert artifact.read_bytes() == expected.read_bytes(), "ST artifact differs"
+    else:
+        digest = save_constraint_table_artifact(table, artifact)
     legal = {tuple(tokenizer.convert_tokens_to_ids(triple)) for triple in triples}
     config = {
         "schema_version": 1,
@@ -611,6 +652,9 @@ def _run_completion_reference(work_dir: Path) -> None:
     rows = []
     with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **kwargs) as llm:
         processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
+        (work_dir / "completion-runtime-offline.json").write_text(
+            json.dumps(llm.collective_rpc("onerec_v1_st_runtime"), indent=2)
+        )
         llm.collective_rpc("onerec_v1_st_observe")
         for count in (size for size in sizes if size > 1):
             assert llm.reset_prefix_cache()
@@ -692,6 +736,9 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
     args = AsyncEngineArgs(additional_config={"vllm_gr": config}, shutdown_timeout=10, **kwargs)
     async with build_async_engine_client_from_engine_args(args) as engine:
         processes = list(engine.engine_core.resources.engine_manager.processes)
+        (work_dir / "completion-runtime-online.json").write_text(
+            json.dumps(await engine.collective_rpc("onerec_v1_st_runtime"), indent=2)
+        )
         models = OpenAIServingModels(
             engine_client=engine,
             base_model_paths=[BaseModelPath(name=model, model_path=model)],
