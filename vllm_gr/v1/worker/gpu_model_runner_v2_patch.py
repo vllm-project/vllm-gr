@@ -100,11 +100,13 @@ def make_patched_prepare_inputs_v2(_orig_prepare_inputs):
         return _orig_prepare_inputs
 
     @wraps(_orig_prepare_inputs)
-    def patched_prepare_inputs(self, scheduler_output, batch_desc):
-        batch = try_prepare_gr_prefill_inputs_v2(self, scheduler_output, batch_desc)
+    def patched_prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+        batch = try_prepare_gr_prefill_inputs_v2(
+            self, scheduler_output, batch_req_state, batch_desc
+        )
         if batch is not None:
             return batch
-        return _orig_prepare_inputs(self, scheduler_output, batch_desc)
+        return _orig_prepare_inputs(self, scheduler_output, batch_req_state, batch_desc)
 
     setattr(patched_prepare_inputs, _WORKER_V2_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs

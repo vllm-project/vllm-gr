@@ -39,12 +39,15 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     compilation = SimpleNamespace(
         cudagraph_capture_sizes=[1, 2],
+        max_cudagraph_capture_size=2,
         adjust_cudagraph_sizes_for_spec_decode=lambda *args: None,
     )
     config = SimpleNamespace(
         parallel_config=parallel,
         compilation_config=compilation,
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=512),
+        speculative_config=None,
+        cache_config=SimpleNamespace(use_kda_recoverssm=False),
     )
     monkeypatch.setattr(
         native,
@@ -93,9 +96,7 @@ def fake_capture(
 ) -> list[tuple[Mode, int]]:
     observed: list[tuple[Mode, int]] = []
 
-    def capture(
-        manager: Any, *args: Any, **kwargs: Any
-    ) -> dict[native.BatchExecutionDescriptor, object]:
+    def capture(manager: Any, *args: Any, **kwargs: Any) -> None:
         descs = next(iter(manager._capture_descs.values()))
         for desc in descs:
             observed.append((desc.cg_mode, desc.num_tokens))
@@ -105,7 +106,6 @@ def fake_capture(
             if desc.cg_mode == Mode.FULL:
                 manager.graphs[desc] = object()
         manager._graphs_captured = True
-        return {desc: object() for desc in descs}
 
     monkeypatch.setattr(native.ModelCudaGraphManager, "capture", capture)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -186,7 +186,7 @@ def test_full_capture_admits_native_dummy_lengths_and_preserves_fallback(
     assert plan.buckets == tuple(sizes)
     buffers = InputBuffers(4, 8192, torch.device("cpu"))
     full = plan.descriptors()[Mode.FULL]
-    assert {(desc.num_reqs, desc.num_tokens) for desc in full} == {(4, 8189), (4, 8192)}
+    assert {(desc.num_reqs, desc.num_tokens) for desc in full} == {(4, size) for size in sizes}
     # Use upstream's actual split as the oracle instead of copying its formula.
     for size in sizes:
         dummy = InputBatch.make_dummy(4, size, buffers)
@@ -197,7 +197,7 @@ def test_full_capture_admits_native_dummy_lengths_and_preserves_fallback(
     pg2.install_prefill_graph_manager_v2(runner)
     manager = runner.cudagraph_manager
     manager.capture()
-    assert [size for mode, size in observed if mode == Mode.FULL] == [8192, 8189]
+    assert [size for mode, size in observed if mode == Mode.FULL] == list(reversed(sizes))
     assert not manager.full_capture_failures
     runner.req_states.req_id_to_index = {f"r{i}": i for i in range(4)}
     runner.req_states.num_computed_tokens_np = [0] * 4
@@ -207,11 +207,8 @@ def test_full_capture_admits_native_dummy_lengths_and_preserves_fallback(
         counts = {f"r{i}": size // 4 + int(i < size % 4) for i in range(4)}
         with manager.prefill_scope(SimpleNamespace(num_scheduled_tokens=counts)):
             desc = manager.dispatch(4, size, None)
-            expected = (
-                Mode.FULL if size in (8189, 8192) else Mode.PIECEWISE if piecewise else Mode.NONE
-            )
-            assert desc.cg_mode == expected
-            # Preserve same-bucket fallback; do not silently select FULL/8192.
+            assert desc.cg_mode == Mode.FULL
+            # Preserve the exact bucket rather than selecting a larger graph.
             assert desc.num_tokens == size
 
 

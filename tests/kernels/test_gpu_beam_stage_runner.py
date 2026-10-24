@@ -192,6 +192,7 @@ def admission_worker(
         supports_mm_inputs=False,
         vllm_config=SimpleNamespace(
             additional_config={"vllm_gr_beam_execution_mode": "v1"},
+            scheduler_config=SimpleNamespace(async_scheduling=True),
         ),
         cache_config=SimpleNamespace(cache_dtype="auto", sliding_window=None),
         _vllm_gr_config=SimpleNamespace(

@@ -161,10 +161,13 @@ def _run_arm(work_dir: Path, arm: str) -> None:
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
     config["beam"]["graph_enabled"] = arm != "eager"
     kwargs = _engine_kwargs(model, config)
+    kwargs["shutdown_timeout"] = 10
     kwargs["worker_extension_cls"] = _EXTENSIONS[arm]
     decode_graph = arm in ("graph", "prefill_fallback")
     results: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
     with GRLLM(vllm_gr_config=config, **kwargs) as llm, _decode_path_probe(llm):
+        processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
         previous = {"replay": 0, "eager": 0, "full": 0, "piecewise": 0}
         state_address = None
         session_ids: set[str] = set()
@@ -227,10 +230,15 @@ def _run_arm(work_dir: Path, arm: str) -> None:
                 for s in public.sequences
             )
             results.append({"length": length, "steps": steps, "sequences": sequences})
+            evidence.append(snapshot)
             print(f"V2 {arm}: prompt={length}, steps={steps}, paths={delta}, retired", flush=True)
         assert results[0] == results[3], "same-geometry repeat changed results"
         assert llm.reset_prefix_cache(), "scheduler retained resources after retirement"
     (work_dir / "results.json").write_text(json.dumps(results))
+    (work_dir / "execution.json").write_text(json.dumps(evidence, indent=2))
+    shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
+    (work_dir / "lifecycle.json").write_text(json.dumps(shutdown, indent=2))
+    assert shutdown and all(not p["alive"] and p["exitcode"] == 0 for p in shutdown), shutdown
 
 
 @pytest.mark.slow

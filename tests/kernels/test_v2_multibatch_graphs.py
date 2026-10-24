@@ -41,6 +41,7 @@ def test_all_batches_capture_at_startup_and_reuse_storage(
     # The V1 startup override must not replace any of the V2 capture shapes.
     monkeypatch.setenv("VLLM_GR_V1_STARTUP_CAPTURE_BATCH_SIZE", "4")
     worker = admission_worker(max_rows=32)
+    del worker.use_async_scheduling  # V2 reads the resolved scheduler config.
     worker.model_config.enforce_eager = False
     worker._vllm_gr_config.beam_graph_enabled = True
     worker._vllm_gr_config.beam_worker_decision = True

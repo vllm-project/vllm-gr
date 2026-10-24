@@ -1029,7 +1029,7 @@ def get_stage_runner(
     parallel = worker.parallel_config
     if (
         torch.device(worker.device).type != "cuda"
-        or not worker.use_async_scheduling
+        or not worker.vllm_config.scheduler_config.async_scheduling
         or parallel.tensor_parallel_size != 1
         or parallel.pipeline_parallel_size != 1
         or parallel.data_parallel_size != 1
@@ -1041,7 +1041,7 @@ def get_stage_runner(
         or cfg.beam_max_decode_steps < m.beam_params.max_tokens
     ):
         raise ValueError(
-            "persistent GR requires GPU V1 async, TP/PP/DP=1, FP16/BF16 and matching capacity"
+            "persistent GR requires CUDA async, TP/PP/DP=1, FP16/BF16 and matching capacity"
         )
     backend = getattr(worker, "constraint_backend", None)
     # A GRConfig without the switch (or a partial config object) keeps the

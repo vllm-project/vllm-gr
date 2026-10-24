@@ -73,8 +73,9 @@ def test_native_capture_replay_fixed_output_and_piecewise_recovery(
     monkeypatch.setattr(
         native,
         "prepare_inputs_to_capture",
-        lambda *args, skip_attn: native.CapturedAttentionState(None if skip_attn else {}, {}),
+        lambda *args, **kwargs: native.AttentionState({}, {}),
     )
+    monkeypatch.setattr(native, "has_compiled_submodule", lambda model: True)
     original = native.ModelCudaGraphManager(config, device, Mode.FULL_AND_PIECEWISE, 1)
     runner = SimpleNamespace(
         cudagraph_manager=original,
@@ -100,7 +101,11 @@ def test_native_capture_replay_fixed_output_and_piecewise_recovery(
     install_prefill_graph_manager_v2(runner)
     manager = runner.cudagraph_manager
     ids = torch.zeros(256, device=device)
-    inputs = SimpleNamespace(input_ids=ids, positions=torch.zeros_like(ids))
+    inputs = SimpleNamespace(
+        input_ids=ids,
+        positions=torch.zeros_like(ids),
+        is_padding=torch.zeros(256, device=device, dtype=torch.bool),
+    )
 
     class Model(torch.nn.Module):  # type: ignore[misc]
         def __init__(self, offset: float, failure: bool | str = False) -> None:
@@ -245,7 +250,9 @@ def test_capacity_boundary_capture_replays_real_prefill_attention() -> None:
     device = torch.device("cuda:0")
     plan = PrefillCapturePlan((8189, 8190, 8191, 8192), True, False, (1, 2, 4), 2048)
     full = plan.descriptors()[Mode.FULL]
-    assert {(desc.num_tokens, desc.num_reqs) for desc in full} == {(8189, 4), (8192, 4)}
+    assert {(desc.num_tokens, desc.num_reqs) for desc in full} == {
+        (size, 4) for size in plan.buckets
+    }
     inputs = InputBuffers(4, 8192, device)
     blocks = BlockTables([16], 4, 8192, [128], device, [16])
     # Use the minimal builder harness, with the real capture metadata logic

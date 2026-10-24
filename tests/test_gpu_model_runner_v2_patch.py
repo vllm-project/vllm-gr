@@ -49,7 +49,9 @@ def test_apply_v2_runner_patches_stamps_markers(
         def execute_model(self, scheduler_output: Any, *a: Any, **k: Any) -> None:
             return None
 
-        def prepare_inputs(self, scheduler_output: Any, batch_desc: Any) -> Any:
+        def prepare_inputs(
+            self, scheduler_output: Any, batch_req_state: Any, batch_desc: Any
+        ) -> Any:
             return None
 
         def sample(self, hidden_states: Any, input_batch: Any, grammar_output: Any = None) -> Any:
@@ -205,3 +207,35 @@ def test_stage_hooks_require_native_prefill_output_and_scheduler_kv() -> None:
         hooks.prefill_logits(lambda worker, scheduled: object(), object())
     with pytest.raises(RuntimeError, match="kv_blocks"):
         hooks.decode_block_ids("session")
+
+
+def test_profile_capture_keeps_native_temporary_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr.v1.worker import gpu_model_runner_v2_graph as graphs
+    from vllm_gr.v1.worker import gpu_prefill_graph_runner_v2 as prefill
+
+    worker = SimpleNamespace(_vllm_gr_config=SimpleNamespace(beam_max_width=128))
+    native = Mock(return_value=4096)
+    install = Mock()
+    decode = Mock()
+    freeze = Mock()
+    monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", install)
+    monkeypatch.setattr(graphs, "capture_multibatch_forward", decode)
+    monkeypatch.setattr(common, "freeze_gc_after_graph_capture", freeze)
+    assert graphs.make_patched_capture_model_v2(native)(worker, profile_only=True) == 4096
+    native.assert_called_once_with(worker, profile_only=True)
+    install.assert_not_called()
+    decode.assert_not_called()
+    freeze.assert_not_called()
+
+
+def test_prepare_inputs_preserves_native_batch_state_for_ordinary_requests() -> None:
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+
+    worker, state, result = object(), object(), object()
+    scheduled = SimpleNamespace(num_scheduled_tokens={"ordinary": 2})
+    desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, 2, 1)
+    native = Mock(return_value=result)
+    prepared = v2.make_patched_prepare_inputs_v2(native)(worker, scheduled, state, desc)
+    assert prepared is result
+    native.assert_called_once_with(worker, scheduled, state, desc)

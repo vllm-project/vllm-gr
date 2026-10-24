@@ -151,15 +151,14 @@ class PrefillCapturePlan:
                 for size in reversed(self.buckets)
             ]
         if self.full and self.buckets:
-            # Native InputBatch.make_dummy puts the entire T % B remainder
-            # in the last request; total capacity alone does not bound it.
+            # vLLM 0.30 distributes dummy tokens evenly over request rows.
             result[CUDAGraphMode.FULL] = [
                 BatchExecutionDescriptor(CUDAGraphMode.FULL, size, batch)
                 for size in reversed(self.buckets)
                 for batch in self.batch_sizes
                 if size >= batch
                 and (
-                    self.max_model_len is None or size // batch + size % batch <= self.max_model_len
+                    self.max_model_len is None or (size + batch - 1) // batch <= self.max_model_len
                 )
             ]
         return result
@@ -215,25 +214,24 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
         finally:
             self._prefill_scope = previous
 
-    def capture(self, *args: Any, **kwargs: Any) -> dict:
+    def capture(self, *args: Any, **kwargs: Any) -> None:
         if self._capture_finished:
-            return {}
+            return
         if self.graphs or self.hidden_states is not None:
             raise RuntimeError("GR Prefill capture must start with unbound output storage")
         plan = self._capture_descs
-        captured = {}
         try:
             # The largest PW warmup (or FULL if PW is disabled) allocates
             # hidden_states for the union of both modes before any binding.
             piecewise = plan.get(CUDAGraphMode.PIECEWISE, [])
             if piecewise:
                 self._capture_descs = {CUDAGraphMode.PIECEWISE: piecewise}
-                captured.update(super().capture(*args, **kwargs))
+                super().capture(*args, **kwargs)
                 self._successful.update(piecewise)
             for desc in plan.get(CUDAGraphMode.FULL, []):
                 self._capture_descs = {CUDAGraphMode.FULL: [desc]}
                 try:
-                    captured.update(super().capture(*args, **kwargs))
+                    super().capture(*args, **kwargs)
                 except RuntimeError as error:
                     if not is_recoverable_capture_error(error):
                         raise
@@ -253,7 +251,6 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
                 else:
                     self._successful.add(desc)
             self._capture_finished = True
-            return captured
         finally:
             self._capture_descs = plan
             # Native capture sets this after each sub-plan. Publish readiness
@@ -261,11 +258,29 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
             self._graphs_captured = self._capture_finished
 
     def dispatch(
-        self, num_reqs: int, num_tokens: int, uniform_token_count: int | None
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int = 0,
+        max_query_len: int | None = None,
+        num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
-        result = BatchExecutionDescriptor(CUDAGraphMode.NONE, num_tokens, num_reqs)
+        result = BatchExecutionDescriptor(
+            CUDAGraphMode.NONE,
+            num_tokens,
+            num_reqs,
+            num_active_loras=num_active_loras,
+            num_ubatches=num_ubatches,
+        )
         in_prefill = self._prefill_scope is not None
-        if self._capture_finished and 0 < num_reqs <= self.max_num_reqs and num_tokens > 0:
+        if (
+            self._capture_finished
+            and 0 < num_reqs <= self.max_num_reqs
+            and num_tokens > 0
+            and num_active_loras == 0
+            and num_ubatches == 1
+        ):
             index = bisect_left(self.plan.buckets, num_tokens)
             if index < len(self.plan.buckets):
                 bucket = self.plan.buckets[index]

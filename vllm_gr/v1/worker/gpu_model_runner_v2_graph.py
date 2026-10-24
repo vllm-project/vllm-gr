@@ -21,6 +21,10 @@ def make_patched_capture_model_v2(_orig_capture_model):
 
     @wraps(_orig_capture_model)
     def patched_capture_model(self, *args, **kwargs):
+        # Profiling uses temporary KV caches and graph pools. Its native caller
+        # owns their teardown; no persistent GR graph/state may escape it.
+        if kwargs.get("profile_only", False):
+            return _orig_capture_model(self, *args, **kwargs)
         # The Engine admits only beam_search_v1 for V2 Beam engines. The
         # execution layer checks whether Beam is enabled, not its protocol.
         if _get_gr_config(self).beam_max_width is not None:

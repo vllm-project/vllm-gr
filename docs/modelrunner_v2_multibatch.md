@@ -51,6 +51,30 @@ There is no new environment switch or duplicated Beam state machine.
 
 ## Configuration and scope
 
+### vLLM 0.30 integration
+
+V2 remains experimental and requires explicit opt-in; the default runner is V1.
+The adapter consumes the native `BatchReqState`, preserves the native request
+order and padding fields, and advances Prefill counts through
+`postprocess_num_computed_tokens`. GR consumes and clears the pending native
+forward state before producing its own Beam output.
+
+The Prefill manager uses the 0.30 `capture() -> None` contract and keeps its
+captured graphs in the native registry. Capture capacity follows the native
+dummy batch's evenly distributed token counts. Ordinary requests retain the
+native input preparation and sampling paths.
+
+`capture_model(profile_only=True)` delegates to native temporary profiling
+without publishing GR Decode graphs or freezing the serving heap. The native
+memory estimate currently covers its own capture plan, not the complete GR
+Prefill and Decode plans. GR graph memory budgeting still needs separate
+validation before using this estimate to size a deployment.
+
+Functional tests use `shutdown_timeout=10` and assert EngineCore exits with
+code zero; inference success alone does not establish clean shutdown.
+
+### Supported configuration
+
 Use the Beam configuration and Constraint Table artifact described in the
 [asynchronous quickstart](onerec_v1_async_quickstart.md). Set
 `VLLM_USE_V2_MODEL_RUNNER=1` before importing vLLM, and submit the complete

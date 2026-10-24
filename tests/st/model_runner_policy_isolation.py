@@ -111,6 +111,7 @@ class PolicyWorkerExtension:
             "backend_rows": runner.constraint_backend.info.max_rows,
             "owner_closed": owner is None or owner.closed,
             "native_requests": states.num_reqs if states is not None else len(runner.requests),
+            "pending_native_output": getattr(runner, "execute_model_state", None) is not None,
             "sessions": len(getattr(runner, "_beam_sessions", {})),
             "resources_released": owner is None
             or (
@@ -130,6 +131,7 @@ class PolicyWorkerExtension:
 def check_idle(value: dict[str, Any]) -> None:
     assert value["owner_closed"] and value["native_requests"] == value["sessions"] == 0
     assert value["resources_released"]
+    assert not value["pending_native_output"]
     assert not value["decode_failures"]
 
 
@@ -185,6 +187,7 @@ def run(args: argparse.Namespace) -> None:
         enforce_eager=args.mode == "eager",
         compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 128, 256, 512, 1024]},
         worker_extension_cls="tests.st.model_runner_policy_isolation.PolicyWorkerExtension",
+        shutdown_timeout=10,
     )
     expected_rows, expected_batches = startup_expectations(
         runner=args.runner,
@@ -207,6 +210,7 @@ def run(args: argparse.Namespace) -> None:
         (output / "results.json").write_text(json.dumps(result, indent=2) + "\n")
 
     llm = GRLLM(**kwargs, vllm_gr_config=config)
+    processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
     addresses = None
 
     def snapshot() -> dict[str, Any]:
@@ -311,11 +315,16 @@ def run(args: argparse.Namespace) -> None:
                     for key in ("batch", "cache", "steps", "outputs")
                 ), "baseline output changed"
             result["baseline_exact"] = True
-        result["passed"] = True
+        result["inference_passed"] = True
         save()
         llm.collective_rpc("policy_stop")
     finally:
-        llm.llm_engine.engine_core.shutdown()
+        llm.shutdown()
+        shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
+        (output / "lifecycle.json").write_text(json.dumps(shutdown, indent=2))
+        assert shutdown and all(not p["alive"] and p["exitcode"] == 0 for p in shutdown), shutdown
+    result["passed"] = True
+    save()
 
 
 if __name__ == "__main__":
