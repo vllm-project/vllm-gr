@@ -400,6 +400,23 @@ def test_capture_order_publication_registry_and_instance_scope(
     assert len(observed) == 8
 
 
+@pytest.mark.parametrize("limit", [0, 1, 2, None])  # type: ignore[misc]
+def test_profiling_limit_applies_to_whole_full_plan(
+    runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, limit: int | None
+) -> None:
+    observed = fake_capture(monkeypatch)
+    manager = make_manager(runner)
+    plan = manager._capture_descs
+    manager._max_full_descs_to_capture = limit
+    manager.capture()
+    expected_full = [512, 128, 16, 1][:limit]
+    assert observed == [(Mode.PIECEWISE, n) for n in (512, 128, 16, 1)] + [
+        (Mode.FULL, n) for n in expected_full
+    ]
+    assert manager._capture_descs is plan
+    assert len(plan[Mode.FULL]) == 4  # Native extrapolation still sees the total.
+
+
 def test_full_capture_unsupported_without_piecewise_falls_back_to_none(
     runner: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -228,7 +228,12 @@ class GRPrefillCudaGraphManager(ModelCudaGraphManager):
                 self._capture_descs = {CUDAGraphMode.PIECEWISE: piecewise}
                 super().capture(*args, **kwargs)
                 self._successful.update(piecewise)
-            for desc in plan.get(CUDAGraphMode.FULL, []):
+            full = plan.get(CUDAGraphMode.FULL, [])
+            if self._max_full_descs_to_capture is not None:
+                # The native profiler limits the whole plan, not each of our
+                # single-descriptor calls. Keep the full plan for extrapolation.
+                full = full[: self._max_full_descs_to_capture]
+            for desc in full:
                 self._capture_descs = {CUDAGraphMode.FULL: [desc]}
                 try:
                     super().capture(*args, **kwargs)

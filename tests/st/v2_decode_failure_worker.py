@@ -24,9 +24,13 @@ def _refuse_capture(
 V2StageExecutionHooks.forward_hidden = _refuse_capture
 
 
-class FailedDecodeWorkerExtension(OneRecV2ParityWorkerExtension):
+class FailedDecodeWorkerExtension(OneRecV2ParityWorkerExtension):  # type: ignore[misc]
     def onerec_v2_parity_snapshot(self) -> dict[str, Any]:
-        snapshot = super().onerec_v2_parity_snapshot()
+        snapshot: dict[str, Any] = super().onerec_v2_parity_snapshot()
         if snapshot.get("retired"):
-            assert self.model_runner._test_decode_capture_refusals == 1
+            # One refusal in temporary profiling and one in real startup.
+            # Serving requests must never retry capture after either fallback.
+            refusals = self.model_runner._test_decode_capture_refusals
+            assert refusals == 2
+            snapshot["decode_capture_refusals"] = refusals
         return snapshot

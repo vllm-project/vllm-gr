@@ -64,11 +64,20 @@ captured graphs in the native registry. Capture capacity follows the native
 dummy batch's evenly distributed token counts. Ordinary requests retain the
 native input preparation and sampling paths.
 
-`capture_model(profile_only=True)` delegates to native temporary profiling
-without publishing GR Decode graphs or freezing the serving heap. The native
-memory estimate currently covers its own capture plan, not the complete GR
-Prefill and Decode plans. GR graph memory budgeting still needs separate
-validation before using this estimate to size a deployment.
+Graph memory profiling uses the same GR Prefill plan as startup and includes
+Decode graphs and their fixed state. GR's token/request grid has nonuniform
+capture costs, so its complete plan is measured in the native temporary pool
+instead of extrapolating two FULL samples. This adds startup capture work.
+The adapter retires temporary Decode graphs, inputs, owners and newly created
+Beam context before real initialization. It preserves the enclosing capture
+window and does not freeze the serving heap during profiling.
+
+The worker applies this budget when
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1`. This does not add a profiling pass
+when upstream skips it (for example, native `cudagraph_mode=NONE` or an explicit
+KV cache byte budget); those configurations need their own memory allowance.
+Memory estimates remain configuration dependent and are not a performance
+baseline.
 
 Functional tests use `shutdown_timeout=10` and assert EngineCore exits with
 code zero; inference success alone does not establish clean shutdown.

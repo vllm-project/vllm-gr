@@ -181,6 +181,22 @@ def _apply_v2_runner_patches() -> None:
 
             runner_class.capture_model = make_patched_capture_model_v2(capture_model)
 
+        from vllm_gr.v1.worker.gpu_model_runner_v2_graph import (
+            make_patched_initialize_kv_cache_v2,
+            make_patched_profile_cudagraph_memory_v2,
+        )
+
+        initialize_kv_cache = getattr(runner_class, "initialize_kv_cache", None)
+        if callable(initialize_kv_cache):
+            runner_class.initialize_kv_cache = make_patched_initialize_kv_cache_v2(
+                initialize_kv_cache
+            )
+        profile_cudagraph_memory = getattr(runner_class, "profile_cudagraph_memory", None)
+        if callable(profile_cudagraph_memory):
+            runner_class.profile_cudagraph_memory = make_patched_profile_cudagraph_memory_v2(
+                profile_cudagraph_memory
+            )
+
         logger.info("%s V2 hooks patched successfully.", runner_name)
 
 
