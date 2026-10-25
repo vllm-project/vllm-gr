@@ -194,3 +194,20 @@ loader and evaluator, and records source fingerprints, configuration, raw
 candidates, per-sample metrics and graph counters. Exit code zero means that
 the structural checks and business thresholds passed; inspect the recorded
 cross-batch comparisons separately.
+
+## Online functional validation
+
+The shared `tests/st/test_onerec_v1_scheduler_st.py` suite explicitly
+parameterizes ModelRunner V1 and V2. The V1 in its filename and public
+`beam_search_v1` API names denotes the GR protocol, not a runner override.
+Select `test_onerec_v1_completion_batch_online` with `-k v2` to exercise
+independent offline and real HTTP engines at B=1/2/4 and B=1/3/7.
+The paired engines use the same fixed KV capacity.
+
+V2 probes observe native input preparation and completed Prefill FULL replays;
+they also reject request-time capture, Decode eager fallback and residual
+native requests or pending sampling output. The HTTP suite covers ordered
+candidates and scores, concurrent sessions, waiting/active TCP disconnects,
+recovery and EngineCore shutdown. These fixed-input checks do not replace
+business accuracy or performance acceptance. The optional V1 numerical trace
+is rejected explicitly when using V2.

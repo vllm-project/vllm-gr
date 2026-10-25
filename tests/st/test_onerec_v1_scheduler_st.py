@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # mypy: disable-error-code="misc,no-untyped-call,no-any-return"
-"""Real OneRec weights through the V1 multiprocess Scheduler/Worker pipeline.
+"""Real OneRec weights through the native multiprocess Scheduler/Worker pipeline.
 
 Exercise the public offline/online APIs and inspect release at return. Optional
 environment settings select representative width/dtype/eager configurations;
@@ -52,7 +52,7 @@ class OneRecV1STWorkerExtension:
         config = runner.vllm_config
         model = runner.get_model()
         return {
-            "runner": type(runner).__name__,
+            "runner": f"{type(runner).__module__}.{type(runner).__name__}",
             "model": type(model).__name__,
             "config_hash": config.compute_hash(),
             "model_config_hash": config.model_config.compute_hash(),
@@ -84,6 +84,12 @@ class OneRecV1STWorkerExtension:
         )
         from vllm_gr.v1.worker.gpu_prefill_graph_runner import GPUPrefillGraphRunner
 
+        runner = getattr(self, "model_runner")
+        is_v2 = hasattr(runner, "req_states")
+        assert is_v2 == (os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0") == "1")
+        if is_v2 and os.environ.get("VLLM_GR_TEST_STAGE_TRACE") == "1":
+            raise ValueError("The optional V1 numerical trace does not support ModelRunner V2")
+        assert not hasattr(self, "_onerec_events"), "observers already installed"
         events: list[dict[str, Any]] = []
         self._onerec_events = events
         trace = _StageTrace() if os.environ.get("VLLM_GR_TEST_STAGE_TRACE") == "1" else None
@@ -140,6 +146,11 @@ class OneRecV1STWorkerExtension:
             },
         )
         wrap(BeamDecodeGraph, "replay", lambda graph, args: {})
+        wrap(BeamDecodeGraph, "capture", lambda graph, args: {"kind": "decode"})
+        wrap(GPUBeamStageRunner, "_forward", lambda owner, args: {"kind": "decode_eager"})
+        if is_v2:
+            _observe_v2_prefill(runner, events, wrap)
+            return
         wrap(GPUPrefillGraphRunner, "execute_model_prefill", lambda graph, args: {})
 
         runner = getattr(self, "model_runner")
@@ -205,6 +216,48 @@ class OneRecV1STWorkerExtension:
             bf16_split_k=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction_split_k,
             matmul_precision=torch.get_float32_matmul_precision(),
         )
+
+
+def _observe_v2_prefill(runner: Any, events: list[dict[str, Any]], wrap: Any) -> None:
+    """Observe native V2 inputs and completed FULL replays without GPU readback."""
+    from vllm_gr.v1.worker.gpu_prefill_graph_runner_v2 import GRPrefillCudaGraphManager
+
+    original_prepare = runner.prepare_inputs
+    manager = runner.cudagraph_manager
+
+    def prepare(scheduled: Any, request_state: Any, desc: Any) -> Any:
+        batch = original_prepare(scheduled, request_state, desc)
+        stages = getattr(scheduled, "gr_stage_metadata", {})
+        if stages and all(m.stage_index == 0 for m in stages.values()):
+            events.append(
+                dict(
+                    method="prefill_inputs",
+                    runner="v2",
+                    scheduled=scheduled.total_num_scheduled_tokens,
+                    request_tokens=list(scheduled.num_scheduled_tokens.values()),
+                    native_request_tokens=batch.num_scheduled_tokens.tolist(),
+                    input_shape=list(batch.input_ids.shape),
+                    position_shape=list(batch.positions.shape),
+                    bucket=desc.num_tokens,
+                    dispatches={desc.cg_mode.name: 1},
+                )
+            )
+        return batch
+
+    runner.prepare_inputs = prepare
+    original_full = manager.run_fullgraph
+
+    def full(desc: Any) -> Any:
+        result = original_full(desc)
+        events.append(
+            dict(
+                method="run_fullgraph", outcome="replay", bucket=desc.num_tokens, size=desc.num_reqs
+            )
+        )
+        return result
+
+    manager.run_fullgraph = full
+    wrap(GRPrefillCudaGraphManager, "capture", lambda manager, args: {"kind": "prefill"})
 
 
 class _StageTrace:
@@ -356,6 +409,9 @@ def _worker_snapshot(worker: Any) -> dict[str, Any]:
     names = ("token_ids", "scores", "parent_ids", "lengths", "finish_reasons")
     return {
         "retired": True,
+        "runner": f"{type(runner).__module__}.{type(runner).__name__}",
+        "native_requests": runner.req_states.num_reqs if hasattr(runner, "req_states") else None,
+        "pending_native_output": getattr(runner, "execute_model_state", None) is not None,
         "session_id": owner.binding.session_id,
         "active_sessions": list(runner._beam_sessions),
         "registry_size": owner.beam.session.context.registry.num_active_sessions,
@@ -379,6 +435,25 @@ def _worker_snapshot(worker: Any) -> dict[str, Any]:
         "history_tokens": state.history_token_ids[row].cpu().tolist(),
         "history_parents": state.history_parent_ids[row].cpu().tolist(),
     }
+
+
+def _check_v2_idle(snapshot: dict[str, Any]) -> None:
+    if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0") != "1":
+        return
+    assert snapshot["retired"]
+    assert snapshot["native_requests"] == 0 and not snapshot["pending_native_output"], snapshot
+    assert not snapshot["active_sessions"] and snapshot["registry_size"] == 0
+    assert snapshot["context_released"] and snapshot["workspace_released"]
+    assert not any(snapshot["control_busy"]) and not snapshot["pending"]
+
+
+def _check_v2_graph_events(events: list[dict[str, Any]]) -> None:
+    if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0") != "1":
+        return
+    assert not any(e["method"] == "capture" for e in events), "request-time graph capture"
+    if not _EAGER:
+        assert not any(e["method"] == "_forward" for e in events), "Decode eager fallback"
+        assert any(e["method"] == "replay" for e in events)
 
 
 def _completed_sequences(
@@ -529,6 +604,7 @@ def _check_snapshot(
     assert not snapshot["active_sessions"] and snapshot["registry_size"] == 0
     assert snapshot["context_released"] and snapshot["workspace_released"]
     assert not any(snapshot["control_busy"]) and not snapshot["pending"]
+    _check_v2_idle(snapshot)
     assert snapshot["error_code"] == 0
     assert snapshot["generated"] == steps
     assert snapshot["decode_steps"] == steps - 1
@@ -822,7 +898,14 @@ def _check_completion_prefill(events: list[dict[str, Any]], batch_size: int) -> 
     assert len(event["request_tokens"]) == batch_size
     assert event["input_shape"] == event["position_shape"]
     assert event["input_shape"][0] >= event["scheduled"]
-    assert event["dispatches"] == {f"replay:{batch_size}": 1}, event
+    if event.get("runner") == "v2":
+        assert event["dispatches"] == {"FULL": 1}, event
+        assert sorted(event["native_request_tokens"]) == sorted(event["request_tokens"])
+        full = [e for e in events if e["method"] == "run_fullgraph"]
+        assert len(full) == 1 and full[0]["size"] == batch_size, full
+        assert full[0]["bucket"] == event["bucket"]
+    else:
+        assert event["dispatches"] == {f"replay:{batch_size}": 1}, event
     assert event["bucket"] is not None and event["bucket"] >= event["scheduled"], event
 
 
@@ -838,7 +921,7 @@ def _run_completion_reference(work_dir: Path) -> None:
             json.dumps(llm.collective_rpc("onerec_v1_st_runtime"), indent=2)
         )
         llm.collective_rpc("onerec_v1_st_observe")
-        for count in (size for size in sizes if size > 1):
+        for count in sizes:
             assert llm.reset_prefix_cache()
             before = len(llm.collective_rpc("onerec_v1_st_events")[0])
             if count == 2 and os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
@@ -873,8 +956,10 @@ def _run_completion_reference(work_dir: Path) -> None:
                 )
             )
             assert not llm.llm_engine.has_unfinished_requests()
+            _check_v2_idle(llm.collective_rpc("onerec_v1_st_snapshot")[0])
         graphs = llm.collective_rpc("onerec_v1_st_graphs")
         events = llm.collective_rpc("onerec_v1_st_events")[0]
+        _check_v2_graph_events(events)
     shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
     assert shutdown and all(not p["alive"] and p["exitcode"] == 0 for p in shutdown), shutdown
     (work_dir / "completion-offline-reference.json").write_text(
@@ -991,12 +1076,13 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
             assert snapshot["registry_size"] == 0
             assert snapshot["context_released"] and snapshot["workspace_released"]
             assert not any(snapshot["control_busy"]) and not snapshot["pending"]
+            _check_v2_idle(snapshot)
 
         rows = []
         cancellations = []
         async with _completion_http_client(app) as client:
             # A size this route forms runs as one session holding every prompt.
-            for count in (size for size in sizes if size > 1):
+            for count in sizes:
                 assert await engine.reset_prefix_cache()
                 before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
                 if count == 2 and os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
@@ -1069,6 +1155,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                 assert [c["token_ids"] for c in data["choices"]] == [
                     list(c.token_ids) for output in direct for c in output.outputs
                 ]
+                await check_released()
                 rows.append(dict(count=count, sessions=1, size=count, response=data))
 
             # The native rejection path must leave the engine usable.
@@ -1204,6 +1291,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                     indent=2,
                 )
             )
+            _check_v2_graph_events((await engine.collective_rpc("onerec_v1_st_events"))[0])
             (work_dir / "completion-events.json").write_text(
                 json.dumps((await engine.collective_rpc("onerec_v1_st_events"))[0], indent=2)
             )
@@ -1218,9 +1306,10 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
 
 @pytest.mark.slow
 @pytest.mark.timeout(1200)
+@pytest.mark.parametrize("runner", ["v1", "v2"])
 @pytest.mark.parametrize("batch_sizes", [None, (1, 3, 7)], ids=["default", "custom"])
 def test_onerec_v1_completion_batch_online(
-    tmp_path: Path, batch_sizes: tuple[int, ...] | None
+    tmp_path: Path, batch_sizes: tuple[int, ...] | None, runner: str
 ) -> None:
     import torch
 
@@ -1236,7 +1325,7 @@ def test_onerec_v1_completion_batch_online(
         env["VLLM_GR_PREFILL_GRAPH_BUCKETS"] = ",".join(str(n) for n in range(128, 4097, 128))
     env.update(
         USE_TF="0",
-        VLLM_USE_V2_MODEL_RUNNER="0",
+        VLLM_USE_V2_MODEL_RUNNER=str(int(runner == "v2")),
         VLLM_ENABLE_V1_MULTIPROCESSING="1",
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
@@ -1261,8 +1350,9 @@ def test_onerec_v1_completion_batch_online(
 
 @pytest.mark.slow
 @pytest.mark.timeout(660)
+@pytest.mark.parametrize("runner", ["v1", "v2"])
 @pytest.mark.parametrize("online", [False, True])
-def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool) -> None:
+def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool, runner: str) -> None:
     import torch
 
     if not torch.cuda.is_available():
@@ -1270,7 +1360,7 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool) -> None:
     env = dict(os.environ)
     env.update(
         USE_TF="0",
-        VLLM_USE_V2_MODEL_RUNNER="0",
+        VLLM_USE_V2_MODEL_RUNNER=str(int(runner == "v2")),
         VLLM_ENABLE_V1_MULTIPROCESSING=(
             "1" if online else os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
         ),
