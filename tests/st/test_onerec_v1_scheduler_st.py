@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# mypy: disable-error-code="misc,no-untyped-call,no-any-return"
+# mypy: disable-error-code="misc,no-untyped-call,no-any-return,untyped-decorator"
 """Real OneRec weights through the native multiprocess Scheduler/Worker pipeline.
 
 Exercise the public offline/online APIs and inspect release at return. Optional
@@ -30,6 +30,7 @@ import pytest
 
 _BEAM_WIDTH = int(os.environ.get("VLLM_GR_TEST_WIDTH", "128"))
 _EAGER = os.environ.get("VLLM_GR_TEST_EAGER", "0") == "1"
+_UNCONSTRAINED = os.environ.get("VLLM_GR_TEST_UNCONSTRAINED", "0") == "1"
 
 
 class OneRecV1STWorkerExtension:
@@ -447,6 +448,13 @@ def _check_v2_idle(snapshot: dict[str, Any]) -> None:
     assert not any(snapshot["control_busy"]) and not snapshot["pending"]
 
 
+def _check_unconstrained_mode(snapshot: dict[str, Any]) -> None:
+    if not _UNCONSTRAINED:
+        return
+    assert snapshot["constraint_backend"] is None
+    assert snapshot["unconstrained_topk"]
+
+
 def _check_v2_graph_events(events: list[dict[str, Any]]) -> None:
     if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0") != "1":
         return
@@ -857,6 +865,12 @@ async def _completion_http_client(app: Any) -> AsyncIterator[Any]:
 
 def _completion_inputs(work_dir: Path) -> tuple[Any, ...]:
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
+    if _UNCONSTRAINED:
+        config["constraint_table"] = {
+            "enabled": False,
+            "max_top_k": config["beam"]["max_width"],
+        }
+        config["constrained_generation"] = False
     configured_sizes = os.environ.get("VLLM_GR_TEST_ONLINE_BATCH_SIZES")
     sizes = (1, 2, 4) if configured_sizes is None else tuple(json.loads(configured_sizes))
     if configured_sizes is not None:
@@ -956,7 +970,9 @@ def _run_completion_reference(work_dir: Path) -> None:
                 )
             )
             assert not llm.llm_engine.has_unfinished_requests()
-            _check_v2_idle(llm.collective_rpc("onerec_v1_st_snapshot")[0])
+            snapshot = llm.collective_rpc("onerec_v1_st_snapshot")[0]
+            _check_v2_idle(snapshot)
+            _check_unconstrained_mode(snapshot)
         graphs = llm.collective_rpc("onerec_v1_st_graphs")
         events = llm.collective_rpc("onerec_v1_st_events")[0]
         _check_v2_graph_events(events)
@@ -1063,7 +1079,11 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
             for choice in data["choices"]:
                 assert choice["finish_reason"] == "length"
                 assert len(choice["token_ids"]) == 5
-                assert tuple(choice["token_ids"][1:-1]) in legal
+                if _UNCONSTRAINED:
+                    vocab_size = engine.model_config.get_vocab_size()
+                    assert all(0 <= token < vocab_size for token in choice["token_ids"][1:-1])
+                else:
+                    assert tuple(choice["token_ids"][1:-1]) in legal
                 if choice["index"] % _BEAM_WIDTH == 0:
                     assert choice["prompt_token_ids"] == inputs[choice["index"] // _BEAM_WIDTH]
             return data
@@ -1077,6 +1097,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
             assert snapshot["context_released"] and snapshot["workspace_released"]
             assert not any(snapshot["control_busy"]) and not snapshot["pending"]
             _check_v2_idle(snapshot)
+            _check_unconstrained_mode(snapshot)
 
         rows = []
         cancellations = []
@@ -1307,9 +1328,16 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
 @pytest.mark.slow
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize("runner", ["v1", "v2"])
-@pytest.mark.parametrize("batch_sizes", [None, (1, 3, 7)], ids=["default", "custom"])
+@pytest.mark.parametrize(
+    ("batch_sizes", "unconstrained"),
+    [(None, False), ((1, 3, 7), False), (None, True)],
+    ids=["default", "custom", "unconstrained"],
+)
 def test_onerec_v1_completion_batch_online(
-    tmp_path: Path, batch_sizes: tuple[int, ...] | None, runner: str
+    tmp_path: Path,
+    batch_sizes: tuple[int, ...] | None,
+    unconstrained: bool,
+    runner: str,
 ) -> None:
     import torch
 
@@ -1317,6 +1345,9 @@ def test_onerec_v1_completion_batch_online(
         pytest.skip("OneRec completion batching ST requires CUDA")
     env = dict(os.environ)
     env.pop("VLLM_GR_TEST_ONLINE_BATCH_SIZES", None)
+    env.pop("VLLM_GR_TEST_UNCONSTRAINED", None)
+    if unconstrained:
+        env["VLLM_GR_TEST_UNCONSTRAINED"] = "1"
     if batch_sizes is not None:
         env["VLLM_GR_TEST_ONLINE_BATCH_SIZES"] = json.dumps(batch_sizes)
         # The seven-request prompt list exceeds max_model_len in total.
