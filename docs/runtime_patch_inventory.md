@@ -4,9 +4,9 @@ This document records the runtime patches currently applied by `vllm-gr`, the up
 
 It is intended to remain valid beyond a single refactoring phase or pull request. Historical investigation notes, temporary implementation plans, and change-by-change corrections belong in pull request descriptions and issue discussions.
 
-## Supported Baseline
+## Historical Baseline and Upgrade Scope
 
-The current supported runtime baseline is:
+The recorded pre-upgrade runtime baseline is:
 
 - `vllm==0.22.1`
 - `vllm-ascend==0.22.1rc1` for the NPU path
@@ -20,6 +20,11 @@ The upstream source revisions used for compatibility analysis are:
     - commit: `f528cdd561969730504bfe8b5e96b6b7e69d6c4f`
 
 The vLLM-Ascend release branch is movable, so compatibility conclusions must retain the exact source commit.
+
+The current CUDA upgrade targets vLLM 0.30.0. The frontend entries and test references
+below have been updated for that candidate; the remaining historical API details
+are not a complete 0.30 compatibility certification. Ascend 0.30.0rc2 and optional
+integrations still require their own validation.
 
 ## Risk Levels
 
@@ -42,10 +47,9 @@ aligned with it.
 | GR-PATCH-001 | `vllm_gr/v1/ascend_compat.py` | `apply_ascend_attention_backend_patch` | CUSTOM is registered and overridden | `_validate` behavior in `test_ascend_compat.py`; Ascend integration test | EngineCore, worker |
 | GR-PATCH-002 | `vllm_gr/v1/ascend_compat.py` | `patch_npu_worker_init_device` | active NPU platform, first installation | `test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract` | worker |
 | GR-PATCH-003 | `vllm_gr/logprobs.py` | `logprobs_patch.patch_flat_logprobs` | required frontend plan finds the method absent | `_validate_flat_logprobs_patch`; patch initialization tests | offline frontend, API server |
-| GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; serving lifecycle tests | API server |
+| GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; `test_beam_search_v1_online_entry.py` and OneRec HTTP ST | API server |
 | GR-PATCH-005 | `vllm_gr/engine/arg_utils_gr.py` | `patch_add_cli_args` | required frontend plan finds GR EngineArgs methods absent | `_validate_engine_args_patch`; attention backend configuration tests | main, API server |
-| GR-PATCH-006 | `entrypoints/openai/serving_models.py` | `patch_OpenAIServingModels_init` | required frontend plan finds the constructor absent | `_validate_serving_models_patch`; serving Catalog tests | API server |
-| GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds grouped client methods incomplete | `_validate_batch_and_fork_patch`; BeamRequest and DP tests | API server |
+| GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds grouped client methods incomplete | `_validate_batch_and_fork_patch`; BeamRequest, admission queue, and online entry tests | API server |
 | GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
 | GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; BeamRequest tests | EngineCore |
 | GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `scheduler_metadata.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
@@ -113,8 +117,8 @@ aligned with it.
 ### GR-PATCH-004 — OpenAI Beam Serving Override
 
 - Targets:
-    - `OpenAIServing.beam_search`
-    - `ChatCompletionRequest.to_beam_search_params`
+    - `GenerateBaseServing.beam_search` and `beam_search_v1`
+    - `ChatCompletionRequest.to_beam_search_params` and `CompletionRequest.to_beam_search_params`
 - Mutation: existing method replacement
 - Process role: API server
 - Risk: High
@@ -144,15 +148,6 @@ aligned with it.
     - `from_cli_args` is a `classmethod`;
     - `create_engine_config` is an instance method.
 - Removal condition: vLLM provides stable configuration extension hooks that cover all active GR values.
-
-### GR-PATCH-006 — OpenAIServingModels Constructor Override
-
-- Target: `OpenAIServingModels.__init__`
-- Mutation: constructor replacement
-- Process role: API server
-- Risk: High
-- Behavior: attaches the Catalog state required by GR serving.
-- Removal condition: Catalog state is injected through composition or a stable serving extension point.
 
 ### GR-PATCH-007 — EngineCore Client and AsyncLLM Extensions
 
@@ -339,13 +334,12 @@ They should remain isolated from production initialization and should be removed
 
 ## Shared Implicit Contracts
 
-The current runtime also relies on undeclared attributes and string-based configuration.
+The following historical implicit contracts also need review during the 0.30 migration.
 
 ### Dynamic attributes
 
 ```text
 EngineArgs.catalog_path
-OpenAIServingModels.catalog
 Request.is_beam
 Request.beam_width
 Request.is_beam_decode
@@ -380,3 +374,12 @@ When an active runtime patch changes:
 3. keep the exact supported upstream version explicit;
 4. record an explicit removal condition for compatibility code expected to be temporary;
 5. avoid adding historical investigation notes or work-package planning to this document.
+
+## Retired Patches
+
+**GR-PATCH-006 — OpenAIServingModels Constructor Override** is retired. The
+Catalog serving installer, validator, and legacy tests have been removed. The
+canonical V1 constraint artifact loads in the worker, covered by
+`test_canonical_worker_enables_vocab_slice_before_first_forward` and
+`tests/test_gr_config_v1.py`. The ID is retained in the YAML `retired_patches`
+section and must not be counted as an active installer.

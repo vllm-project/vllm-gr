@@ -51,6 +51,12 @@ class Executor:
         self.before_consume = None
         self.submitted = []
 
+    def collective_rpc(self, method):
+        assert method == "synchronize_device"
+        # Completing pause must synchronize only after every native/GR frame drains.
+        assert not self.core.batch_queue
+        assert not self.core.has_work()
+
     def execute_model(self, scheduled, non_block):
         assert non_block
         self.current = scheduled
@@ -71,7 +77,8 @@ def core(admission_core):
     core._notify_idle_state_callbacks = EngineCoreProc._notify_idle_state_callbacks.__get__(core)
     core.model_executor = Executor(core)
     core.log_error_detail = lambda _: nullcontext()
-    core.log_iteration_details = lambda _: nullcontext()
+    # Exercise native capture_iteration_details with logging disabled.
+    core.log_stats = False
     core._process_aborts_queue = lambda: None
     core.is_ec_consumer = True
     core.is_pooling_model = False
@@ -160,20 +167,25 @@ def test_new_gr_add_while_paused_stays_queued_until_resume(core, mode):
     assert_finished(core, ["A"])
 
 
-@pytest.mark.parametrize("in_flight", [False, True])
-def test_keep_retains_active_state_and_kv_after_in_flight_drain(core, in_flight):
+@pytest.mark.parametrize(("queue_size", "in_flight"), [(1, False), (2, False), (2, True)])
+def test_keep_retains_active_state_and_kv_after_in_flight_drain(core, queue_size, in_flight):
     active = submit(core, "A")
     waiting = submit(core, "B")
+    core.batch_queue_size = queue_size
     core.model_executor.immediate = not in_flight
     step(core)
     core.model_executor.immediate = False
-    assert bool(core.batch_queue) is in_flight
+    # 0.30 retains even a completed Future when the native batch queue has room.
+    pending = queue_size > 1
+    assert bool(core.batch_queue) is pending
+    if pending:
+        assert core.batch_queue[-1][0].done() is not in_flight
     issued = active.issued_stages
     generation = active.owner_generation
     native = core.scheduler.requests["A"]
     free = core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     paused = core.pause_scheduler(mode="keep", clear_cache=False)
-    if in_flight:
+    if pending:
         assert isinstance(paused, Future) and not paused.done()
         assert not core.scheduler.has_requests()
         assert core.has_work()  # Native batch queue still needs draining.

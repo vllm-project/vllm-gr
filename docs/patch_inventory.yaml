@@ -62,9 +62,10 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_openai_beam_search_patch
       - vllm_gr.patch._validate_chat_sampling_patch
-      - tests/test_serving_beam_lifecycle.py
+      - tests/test_beam_search_v1_online_entry.py
+      - tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online
     process_roles: [api_server]
-    target: OpenAIServing.beam_search and ChatCompletionRequest.to_beam_search_params
+    target: GenerateBaseServing.beam_search/beam_search_v1 and ChatCompletionRequest/CompletionRequest.to_beam_search_params
     risk: high
     contract: null
     removal_condition: upstream exposes grouped-Beam serving and sampling extension points
@@ -82,19 +83,6 @@ patches:
     contract: engine-args-descriptors
     removal_condition: vLLM configuration hooks cover every active GR option
 
-  - id: GR-PATCH-006
-    owner: vllm_gr/entrypoints/openai/serving_models.py
-    installer: vllm_gr.entrypoints.openai.serving_models.patch_OpenAIServingModels_init
-    activation: the required frontend patch plan detects the constructor is not installed
-    validator_or_test:
-      - vllm_gr.patch._validate_serving_models_patch
-      - tests/test_serving_catalog.py
-    process_roles: [api_server]
-    target: OpenAIServingModels.__init__
-    risk: high
-    contract: null
-    removal_condition: Catalog state uses composition or a stable serving extension point
-
   - id: GR-PATCH-007
     owner: vllm_gr/v1/engine/core_client.py, core_client_patch.py, and async_llm.py
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_batch_and_fork
@@ -102,7 +90,8 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_batch_and_fork_patch
       - tests/test_beam_request_unit.py
-      - tests/test_dp_beam_request_unit.py
+      - tests/test_gr_admission_queue.py
+      - tests/test_beam_search_v1_online_entry.py
     process_roles: [api_server]
     target: EngineCore clients and AsyncLLM
     risk: critical
@@ -243,3 +232,12 @@ patches:
     risk: medium
     contract: npu-spawn-start-method
     removal_condition: upstream _maybe_force_spawn() covers NPU (or delegates to the platform interface)
+
+# IDs are retained here when the installer and its legacy surface have been removed.
+retired_patches:
+  - id: GR-PATCH-006
+    historical_target: OpenAIServingModels.__init__
+    reason: Legacy Catalog serving patch and its tests were removed; canonical V1 constraints load in the worker
+    replacement_coverage:
+      - tests/constraints/test_cuda_backend.py::test_canonical_worker_enables_vocab_slice_before_first_forward
+      - tests/test_gr_config_v1.py

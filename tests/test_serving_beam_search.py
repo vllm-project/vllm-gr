@@ -19,10 +19,10 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.openai.api_server import (
+from vllm.entrypoints.generate.base.serving import GenerateBaseServing
+from vllm.entrypoints.launchers.api_server.entry import (
     build_async_engine_client_from_engine_args,
 )
-from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingModels
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
@@ -63,8 +63,11 @@ async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
         enable_chunked_prefill=False,
         max_model_len=2048,
         max_num_batched_tokens=8192,
-        max_num_seqs=beam_width,
+        # V1 owns one logical request; beam rows are managed by the worker.
+        max_num_seqs=1,
+        enforce_eager=not config["beam"]["graph_enabled"],
         enable_log_requests=False,
+        shutdown_timeout=10,
         max_logprobs=2 * beam_width,
         gpu_memory_utilization=gpu_memory_utilization,
         additional_config={"vllm_gr": config},
@@ -76,7 +79,7 @@ async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
             engine_client=engine_client, base_model_paths=base_model_paths, lora_modules=None
         )
 
-        serving = OpenAIServing(
+        serving = GenerateBaseServing(
             engine_client=engine_client,
             models=models,
             request_logger=None,

@@ -496,6 +496,7 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
         device=torch.device("cuda"),
     )
 
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
     from vllm_gr.ops.sliced_logits_patch import apply_sliced_logits_patch
@@ -505,7 +506,9 @@ def test_canonical_worker_enables_vocab_slice_before_first_forward(
     def load_weights(self: SimpleNamespace) -> None:
         assert not is_vocab_slice_enabled()
         self.model_memory_usage = 0
-        self.model = torch.nn.Sequential(LogitsProcessor(256))
+        # The native model loader supplies the current config during construction.
+        with set_current_vllm_config(VllmConfig()):
+            self.model = torch.nn.Sequential(LogitsProcessor(256))
         self.model[0]._gather_logits = lambda logits: logits
 
     load = make_load_model_with_constraint_backend(load_weights)

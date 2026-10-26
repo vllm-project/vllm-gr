@@ -105,8 +105,12 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
         )
     }
     worker.late_interaction_runner = SimpleNamespace(on_requests_finished=noop)
+    worker._on_request_state_removed = MethodType(GPUModelRunner._on_request_state_removed, worker)
     worker.num_prompt_logprobs = {}
     worker.encoder_cache = {}
+    worker._process_encoder_cache_scheduler_output = MethodType(
+        GPUModelRunner._process_encoder_cache_scheduler_output, worker
+    )
     worker.speculative_config = None
     worker.use_async_spec_decode = False
     worker.use_async_scheduling = True
@@ -157,6 +161,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
         result.num_scheduled_tokens[m.session_id] = count
         result.finished_req_ids = set()
         result.new_block_ids_to_zero = None
+        result.kv_cache_block_copies = []
         result.free_encoder_mm_hashes = []
         result.scheduled_new_reqs = []
         result.scheduled_spec_decode_tokens = {}

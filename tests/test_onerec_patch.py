@@ -17,7 +17,7 @@ package import from side effects:
 The tests purge ``sys.modules`` between cases so each case observes a clean
 import state, mirroring the approach in ``test_yuanrong_monkey_patch.py``.
 
-When real ``vllm`` is unavailable (e.g. sandboxed CI without GPU deps), the
+When ``vllm`` is not installed, the
 ``TestPatchTriggerContractWithRealVllm`` cases auto-skip and the
 ``TestPatchTriggerContractWithStubVllm`` cases provide equivalent coverage by
 installing stub ``vllm.benchmarks.*`` modules.
@@ -26,6 +26,7 @@ installing stub ``vllm.benchmarks.*`` modules.
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
+import subprocess
 import sys
 import types
 import unittest
@@ -228,20 +229,6 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
     erf.RequestFuncInput.__init__ = lambda self, *a, **k: None
 
     return modules
-
-
-def _is_real_vllm_available() -> bool:
-    """Probe whether real vllm.benchmarks.datasets imports cleanly."""
-    saved = _purge_modules("vllm", "benchmarks.open_one_rec")
-    try:
-        try:
-            import vllm.benchmarks.datasets  # noqa: F401
-
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-    finally:
-        _restore_modules(saved)
 
 
 # ---------------------------------------------------------------------------
@@ -853,52 +840,47 @@ class TestOneRecDatasetExpectedOutputLen(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-@unittest.skipUnless(_is_real_vllm_available(), "real vllm.benchmarks not importable")
 class TestPatchTriggerContractWithRealVllm(unittest.TestCase):
-    """Same contract as above, but against the real installed vllm.
+    """Check real imports in fresh processes, without re-registering Torch types.
 
-    Runs in environments where vllm imports cleanly (dev box, GPU CI).
-    Auto-skips in bare/minimal environments (e.g. CPU-only sandboxes).
+    Purging vllm from sys.modules cannot undo Torch's opaque type registrations.
+    In a combined test run, importing it again fails before the contract runs.
+    Only an absent vllm installation is a skip; broken imports are failures.
     """
 
-    _PURGE_PREFIXES = (
-        "vllm.benchmarks",
-        "benchmarks.open_one_rec",
-    )
+    def _run_contract(self, explicit_patch: bool) -> None:
+        script = """
+import importlib.util
+import sys
 
-    def setUp(self) -> None:
-        self._saved = _purge_modules(*self._PURGE_PREFIXES)
+if importlib.util.find_spec("vllm") is None:
+    raise SystemExit(77)
 
-    def tearDown(self) -> None:
-        _restore_modules(self._saved)
+import vllm.benchmarks.datasets as datasets_mod
+original_get_samples = datasets_mod.get_samples
+import benchmarks.open_one_rec
+assert datasets_mod.get_samples is original_get_samples
+
+if sys.argv[1] == "patch":
+    import benchmarks.open_one_rec.one_rec_patch as patch_mod
+    assert datasets_mod.get_samples is patch_mod.patched_get_samples
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, "patch" if explicit_patch else "package"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 77:
+            self.skipTest("vllm is not installed")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_package_import_does_not_patch_real_vllm(self) -> None:
-        # isort: off
-        # Import order matters: must observe state after package import.
-        import benchmarks.open_one_rec as pkg  # noqa: F401
-
-        import vllm.benchmarks.datasets as datasets_mod
-        # isort: on
-
-        self.assertNotEqual(
-            datasets_mod.get_samples.__name__,
-            "patched_get_samples",
-            "importing the package must not patch vllm",
-        )
+        self._run_contract(explicit_patch=False)
 
     def test_explicit_patch_import_patches_real_vllm(self) -> None:
-        try:
-            import benchmarks.open_one_rec.one_rec_patch as patch_mod
-        except Exception as exc:  # noqa: BLE001
-            self.skipTest(f"could not import one_rec_patch against real vllm: {exc}")
-
-        import vllm.benchmarks.datasets as datasets_mod
-
-        self.assertIs(
-            datasets_mod.get_samples,
-            patch_mod.patched_get_samples,
-            "real-vllm datasets.get_samples not patched",
-        )
+        self._run_contract(explicit_patch=True)
 
 
 # ---------------------------------------------------------------------------

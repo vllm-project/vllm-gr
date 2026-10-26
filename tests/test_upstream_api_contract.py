@@ -64,9 +64,9 @@ def test_vllm_gpu_model_runner_patch_contract() -> None:
 
 def test_vllm_serving_and_client_patch_contract() -> None:
     from vllm.engine.arg_utils import EngineArgs
+    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.completion.protocol import CompletionRequest
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
     from vllm.entrypoints.openai.models.serving import OpenAIServingModels
     from vllm.logprobs import FlatLogprobs
     from vllm.v1.engine.async_llm import AsyncLLM
@@ -80,7 +80,7 @@ def test_vllm_serving_and_client_patch_contract() -> None:
         ("self", "engine_client", "base_model_paths", "lora_modules"),
     )
     assert callable(FlatLogprobs.append)
-    assert isinstance(OpenAIServing, type)
+    assert isinstance(GenerateBaseServing, type)
     assert isinstance(ChatCompletionRequest, type)
     assert isinstance(CompletionRequest, type)
     assert isinstance(AsyncLLM, type)
