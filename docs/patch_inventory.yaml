@@ -64,6 +64,7 @@ patches:
       - vllm_gr.patch._validate_chat_sampling_patch
       - tests/test_beam_search_v1_online_entry.py
       - tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online
+      - tests/test_beam_search_dispatch.py
     process_roles: [api_server]
     target: GenerateBaseServing.beam_search/beam_search_v1 and ChatCompletionRequest/CompletionRequest.to_beam_search_params
     risk: high
@@ -92,6 +93,7 @@ patches:
       - tests/test_beam_request_unit.py
       - tests/test_gr_admission_queue.py
       - tests/test_beam_search_v1_online_entry.py
+      - tests/test_beam_admission_rejection_reporting.py
     process_roles: [api_server]
     target: EngineCore clients and AsyncLLM
     risk: critical
@@ -118,7 +120,7 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_engine_core_request_group
       - vllm_gr.patch._validate_engine_core_entrypoint_patch
-      - tests/test_beam_request_unit.py
+      - tests/test_gr_async_scheduler.py
     process_roles: [engine_core]
     target: vllm.v1.engine.core.EngineCoreProc
     risk: critical
@@ -126,7 +128,7 @@ patches:
     removal_condition: vLLM exposes stable control-message and request-dispatch extension points
 
   - id: GR-PATCH-010
-    owner: vllm_gr/v1/engine/engine_core_patch.py and scheduler_metadata.py
+    owner: vllm_gr/v1/engine/engine_core_patch.py and gr_async_scheduler.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_scheduler_patch
     activation: the EngineCore patch plan detects scheduler metadata propagation is absent
     validator_or_test:
@@ -232,6 +234,29 @@ patches:
     risk: medium
     contract: npu-spawn-start-method
     removal_condition: upstream _maybe_force_spawn() covers NPU (or delegates to the platform interface)
+
+  - id: GR-PATCH-017
+    owner: vllm_gr/v1/worker/npu_memory_counters.py
+    installer: vllm_gr.v1.worker.npu_memory_counters.install_npu_memory_counter_patch
+    activation: the NPUWorker init_device hook finds a supported native profile_memory method and the public nested memory API
+    validator_or_test:
+      - tests/test_npu_memory_counters.py::test_one_snapshot_preserves_counters_and_original_logger
+      - tests/test_npu_memory_counters.py::test_uninitialized_and_missing_counters_match_native_zero_defaults
+      - tests/test_npu_memory_counters.py::test_each_call_refreshes_fields_and_installation_is_idempotent
+      - tests/test_npu_memory_counters.py::test_missing_nested_api_keeps_original_method
+      - tests/test_npu_memory_counters.py::test_unknown_worker_profiles_keep_original_semantics
+      - tests/test_npu_memory_counters.py::test_changed_nested_schema_falls_back_to_native
+      - tests/test_npu_memory_counters.py::test_allocator_errors_are_propagated
+      - tests/test_npu_memory_counters.py::test_module_import_does_not_load_npu_runtime
+      - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
+    process_roles: [npu_worker]
+    target: NPUWorker.profile_memory in vllm_ascend.worker.worker or vllm_ascend.worker.worker_v1
+    risk: medium
+    contract: npu-worker-memory-counters
+    supported_runtime:
+      vllm_ascend: "0.22.1rc1"
+      torch_npu: "2.10.0"
+    removal_condition: vLLM-Ascend reads the two allocator counters without flattening full memory statistics
 
 # IDs are retained here when the installer and its legacy surface have been removed.
 retired_patches:

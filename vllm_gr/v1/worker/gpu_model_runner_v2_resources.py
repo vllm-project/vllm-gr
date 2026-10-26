@@ -63,10 +63,16 @@ def close_v2_runtime(runner: Any) -> None:
         graph.uninstall()
         graph.clear()
         runner._beam_decode_graph = None
+    # Both capture-failure records describe graphs that only this runtime owns:
+    # the startup record is keyed by batch size, the runtime record by
+    # ``(batch, width)``.  A later runtime recaptures the same shapes, so a
+    # record left behind would veto a graph that has just been captured.
     for name in (
         "_gr_input_buffers",
         "_gr_gpu_stage_runner",
         "_gr_decode_capture_failures",
+        "_gr_runtime_decode_capture_failures",
+        "_gr_dynamic_graphs_discarded",
         "_gr_async_decode_graph_capture_failed",
         "_gr_async_decode_graph_capture_error",
     ):

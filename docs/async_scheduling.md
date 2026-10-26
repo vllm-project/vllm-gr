@@ -23,8 +23,9 @@ For a runnable OneRec-1.7B setup before reading this execution contract, see
   attention, multimodal inputs, hybrid models or microbatching.
 
 Public offline and online `beam_search_v1()` return complete sequences and
-cumulative scores only after matching resource-release confirmation. The legacy
-`beam_search()` API retains its existing execution path.
+cumulative scores only after matching resource-release confirmation.
+`GRLLM.beam_search()` raises a migration error; the legacy frontend step loop
+is retired.
 
 ## Native progress and execution ownership
 

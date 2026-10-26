@@ -130,16 +130,17 @@ python -m pip check
 7. **Verify installation**
 
 ```bash
-python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
+python -c "import vllm_gr; print(vllm_gr.__version__)"
 ```
 
 ## Quick Start
 
 Refer to [quickstart](quickstart.md#quick-start) for deployment.
 
-See [getting_started/installation/npu/npu.inc.md](getting_started/installation/npu/npu.inc.md) for the full NPU installation guide.
+After installation, use the [online V1 serving example](../examples/online_serving/beam_search/README.md)
+with `constraint_table.backend: npu` and the NPU execution settings below.
 
-## NPU decode execution mode
+## NPU decode execution compatibility options
 
 Beam Search V1 uses a fixed request width equal to `beam.max_width`
 (`vllm_gr_beam_max_width` in the legacy configuration encoding). A smaller
@@ -159,6 +160,10 @@ selected through the engine's `additional_config`:
   `npu_fused_infer_attention_score_v2` calls plus the pool-to-buffer copies
   and the merge operator chain. This is the default on NPU when xllm-ops is
   missing (a log line explains why) and always the default on CUDA.
+
+These legacy `additional_config` examples describe attention adapter selection,
+not a complete canonical V1 serving configuration. Do not combine them with
+`--vllm-gr-config`; use the canonical online example for the V1 service.
 
 ```bash
 # default (xllm on NPU with xllm-ops installed; cascade otherwise)

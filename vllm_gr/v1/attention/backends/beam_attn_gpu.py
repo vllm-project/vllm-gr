@@ -45,7 +45,7 @@ else:
 class GPUBeamAttentionBatch:
     """Zero-copy request-major attention view over contiguous Beam slots."""
 
-    def __init__(self, sessions: tuple[Any, ...]) -> None:
+    def __init__(self, sessions: tuple[Any, ...], *, width: int | None = None) -> None:
         if not sessions:
             raise ValueError("GPU Beam attention batch must not be empty")
         first = sessions[0]
@@ -53,7 +53,7 @@ class GPUBeamAttentionBatch:
         self.context = first.context
         self.slot = 0
         self.batch_size = len(sessions)
-        self.request_width = first.beam_width
+        self.request_width = first.beam_width if width is None else width
         self.beam_width = self.batch_size * self.request_width
         self.session_id = first.session_id
         if tuple(session.slot for session in sessions) != tuple(range(self.batch_size)):
@@ -63,11 +63,13 @@ class GPUBeamAttentionBatch:
         geometry = (first.beam_width, first.decode_step)
         if any((session.beam_width, session.decode_step) != geometry for session in sessions):
             raise RuntimeError("GPU Beam batch members changed width or Decode step")
-        if self.request_width != self.context.max_beams:
+        if not 1 <= self.request_width <= self.context.max_beams:
             raise RuntimeError("GPU Beam batch requires the configured exact Beam width")
 
         self.pools = []
-        for source in self.context.pools:
+        from vllm_gr.v1.beam.dynamic_beam import get_stage_pools
+
+        for source in get_stage_pools(self.context, self.request_width):
             pool = copy(source)
             storage_rows = self.batch_size * self.request_width
             pool.max_batch = 1

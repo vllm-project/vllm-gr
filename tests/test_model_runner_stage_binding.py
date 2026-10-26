@@ -141,8 +141,11 @@ def test_owner_hooks_cannot_change_on_active_or_released_owner(closed: bool) -> 
 
 
 @pytest.mark.parametrize("hooks_type", [stages._StageExecutionHooks, V2StageExecutionHooks])  # type: ignore[misc]
+@pytest.mark.parametrize("input_width", [None, 2])  # type: ignore[misc]
 def test_stage_capture_passes_bound_model_install_policy(
-    monkeypatch: pytest.MonkeyPatch, hooks_type: type[stages._StageExecutionHooks]
+    monkeypatch: pytest.MonkeyPatch,
+    hooks_type: type[stages._StageExecutionHooks],
+    input_width: int | None,
 ) -> None:
     from vllm_gr.v1.worker import beam_decode_graph
 
@@ -152,10 +155,13 @@ def test_stage_capture_passes_bound_model_install_policy(
     owner.hooks = hooks_type(worker)
     owner.bindings = (object(),)
     owner.beam = SimpleNamespace(state=SimpleNamespace(beam_width=4))
+    owner.inputs = None if input_width is None else SimpleNamespace(width=input_width)
     graph = Mock()
-    monkeypatch.setattr(beam_decode_graph, "get_beam_decode_graph", lambda *args, **kwargs: graph)
+    get_graph = Mock(return_value=graph)
+    monkeypatch.setattr(beam_decode_graph, "get_beam_decode_graph", get_graph)
     owner.graph = None
     assert owner.capture_forward() is graph
+    assert get_graph.call_args.kwargs["beam_width"] == (input_width or 4)
     graph.capture.assert_called_once_with(
         owner._forward_hidden, persistent_install=hooks_type is stages._StageExecutionHooks
     )

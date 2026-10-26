@@ -1,62 +1,42 @@
 # Beam Batch Execution Contract
 
-## Status and scope
+## Production boundary
 
-This document defines protocol version 1 of the prospective Worker-owned Beam
-batch boundary and its pure NumPy CPU reference implementation. This change
-defines transport-safe data, validation, and the correct Beam selection result.
-It does not connect the contracts to production execution.
+Beam Search V1 submits a `BeamBatchRequest` through the atomic
+`SUBMIT_GR_SESSION` EngineCore message and returns a `BeamBatchResult` through
+`EngineCoreOutput.kv_transfer_params["gr_batch_result"]`. These are the two
+transport contracts. Native `SchedulerOutput` carries scheduling data; there
+is no separately serialized Plan message.
 
-This change includes:
+```text
+GRLLM.beam_search_v1 / OpenAI Beam V1
+  -> input processing and request validation
+  -> SUBMIT_GR_SESSION(BeamBatchRequest)
+  -> EngineCore admission and native SchedulerOutput
+  -> Worker Prefill / Decode stages and resource retirement
+  -> BeamBatchResult
+  -> frontend result validation and public outputs
+```
 
-- Beam batch Request, Plan, and Result contracts;
-- a typed, fail-closed MsgPack codec for all three contracts;
-- structural, deployment-limit, Plan-completeness, and Result validation;
-- a pure NumPy CPU reference that starts after candidate generation;
-- hand-computed golden, legacy differential, and OneRec parity tests; and
-- lazy imports for existing Beam runtime primitives.
-
-It does not add an EngineCore wire enum, change `process_input_sockets()`,
-implement Scheduler FCFS or atomic reservation, allocate Prompt KV, call a
-ModelRunner, load Constraint resources, implement Worker run-to-completion,
-remove `BEAM_REQUEST_STEP_UPDATE`, or modify the production Constraint Table
-path from RFC #287. Chunked Prefill, mixed ordinary Requests, and Decode
-micro-batching are also out of scope.
+Contracts live in `vllm_gr/v1/beam/batch_contracts.py`. Production request
+transport uses the typed decoder in `vllm_gr/v1/engine/codec.py`, and final
+result validation lives in `gr_session_client._terminal_result`.
+The NumPy CPU reference is an independent selection oracle, not the production
+scheduler or Worker loop.
 
 ## Vocabulary
 
-- `batch`: one business Beam batch;
-- `item`: one request in the batch;
-- `beam`: one candidate that is still competing;
+- `batch`: one business Beam batch / GR session;
+- `item`: one native request in that batch;
+- `beam`: one candidate competing within an item;
 - `row`: one physical tensor or buffer row;
-- `sequence`: one final result returned to the caller;
-- `parent_beam_index`: the logical Beam that produced a candidate.
+- `sequence`: one returned candidate;
+- `parent_beam_index`: the logical Beam producing a candidate.
 
-The public API uses `Params`, `Options`, `Limits`, `Output`, `Result`, and
-`Failure`. It does not introduce Child, Lane, Lease, RunSlot, Session, Step,
-Epoch, Fragment, or Continuation protocol types. Types have no `V1` suffix.
-
-## Three top-level contracts
-
-The protocol has exactly three top-level transport-safe contracts:
-
-```text
-BeamBatchRequest
-        |
-        v
-BeamBatchPlan + native SchedulerOutput
-        |
-        v
-BeamBatchResult
-```
-
-All three carry `protocol_version == 1` and the same `batch_id`. A batch ID is
-unique across in-flight work and retained results. A retry creates a new batch
-ID, so protocol version 1 has no `execution_id` or `run_id`.
-
-The codec supports typed round trips for all three values. This specifies their
-serialization; it does not claim that a production transport channel exists in
-this change.
+Request and Result carry `protocol_version == 1` and the same `batch_id`.
+Native `EngineCoreRequest.request_id` identifies each item. A retry uses a new
+batch identity; execution ownership and dispatch generations remain runtime
+state, not additional public request fields.
 
 ### Deployment compatibility
 
@@ -127,59 +107,6 @@ Protocol version 1 admits only `constraint_resource_id="default"`. It does not
 transport a catalog path, digest, Trie, table payload, backend adapter,
 `constraint_step`, or `beam_suffix`.
 
-The Request keeps `EngineCoreRequest` input generic. It does not derive prompt
-length from `prompt_token_ids` and does not reject modality by inspecting
-Request fields. Future EngineCore runtime admission must reject unsupported
-modalities before scheduling. The Worker must not be the first component to
-discover a predictable unsupported-input failure.
-
-### Plan
-
-```python
-class BeamPrefillData:
-    item_index: int
-    request_id: str
-    num_prompt_tokens: int
-    num_computed_tokens: int
-    num_scheduled_tokens: int
-
-
-class BeamBatchPlan:
-    protocol_version: int
-    batch_id: str
-    items: tuple[BeamPrefillData, ...]
-    beam_params: BeamBatchParams
-    output_options: BeamOutputOptions
-```
-
-`BeamBatchPlan` is a validated scalar snapshot. The native
-`SchedulerOutput` remains the execution authority for request data, scheduled
-tokens, block tables, and slot mappings:
-
-```text
-Native SchedulerOutput             BeamBatchPlan
-|-- request data                   |-- batch/item identity
-|-- scheduled token counts         |-- Beam parameters
-|-- block tables                   |-- validated Prefill counts
-`-- slot mappings                  `-- output options
-              \                     /
-               future BeamWorkerInput
-```
-
-The integration boundary must cross-check Plan counts and identities against
-the native `SchedulerOutput` before invoking the Executor. The Plan does not
-copy Prompt KV bindings, block tables, or slot mappings.
-
-Full Prefill is expressed by one equation per item:
-
-```text
-num_computed_tokens + num_scheduled_tokens == num_prompt_tokens
-```
-
-This rejects chunked Prefill without adding chunk, barrier, fragment, or
-accumulator state. Native InputProcessor and Scheduler accounting provide the
-authoritative prompt token counts.
-
 ### Result
 
 ```python
@@ -225,104 +152,78 @@ R = num_return_sequences
 1 <= R <= W
 ```
 
-Only valid sequences are returned. An item may return fewer than R sequences,
-including zero, without failing the batch. There is no padding `valid` bit or
-redundant missing-sequence count.
+Only valid sequences are returned, without padding validity bits. The generic
+contract and CPU oracle can represent empty items and stop completion. The
+production V1 boundary is stricter: it requires at least one sequence per
+successful item, `finish_reason="length"`, the effective generation budget,
+and the score/parent fields selected by the request. A Worker with no valid
+final candidates returns `no_valid_beams` instead of a successful empty item.
 
-When a stop token is excluded from `token_ids`, its log probability still
-contributes to `cumulative_logprob`, its generation still appears in
-`parent_beam_indices`, and `stop_token_id` remains populated. A `length`
-sequence contains exactly `max_tokens` token IDs.
+Failure codes are non-empty strings, such as `admission_rejected`,
+`no_valid_beams`, and `worker_result_unavailable`. A failure may identify any
+item in the batch: `item_index` is either `None` or in `[0, len(request.items))`.
+The frontend validates nested field types and identities on both in-process
+and serialized result paths. An invalid transport payload is not a success.
 
-Failure codes are open, non-empty strings. Expected future integration codes
-include `UNSUPPORTED_INPUT`, `ADMISSION_REJECTED`, `PLAN_MISMATCH`,
-`MODEL_FAILURE`, and `INTERNAL_ERROR`; this list is descriptive, not an enum.
+The CPU oracle also defines stop-token exclusion: the excluded stop still
+contributes to cumulative score and parent history, and `stop_token_id`
+remains populated. This does not enable early stopping in the production V1
+path, which currently requires `ignore_eos=True`.
 
-## Fixed Beam KV Buffer
+## Scheduling and resource ownership
 
-Protocol version 1 assumes one active Beam batch and one fixed Worker-owned
-Beam KV Buffer. There are no multiple selectable buffers, reservations, leases,
-generations, or buffer identities in the contract.
+Native input processing and scheduling own prompt accounting, KV blocks,
+slot mappings, and scheduled token counts. GR stage metadata carries session,
+member, dispatch, and generation identities for the Worker execution view.
+It must agree with the native scheduling data.
 
-Every batch starts from a reset logical state. For the first runtime
-integration, the Worker must physically zero the fixed Beam KV Buffer before a
-new batch so stale rows cannot affect correctness. Ordinary writes may then
-overwrite the rows used by the batch. Buffer reset is runtime behavior and is
-not reported in `BeamBatchResult`.
-
-The deployment limit `BeamBatchLimits.max_num_beam_rows` admits or rejects
-`B * W`; the Plan does not report that a slot was acquired.
-
-## Validation layers
-
-Validation is deliberately staged so predictable failures occur before Worker
-execution:
+A complete Prefill may reuse prefix-cache tokens. For every item:
 
 ```text
-Codec and contract validation
-        |
-EngineCore runtime admission
-        |  reject unsupported modality/resource combination
-Native InputProcessor accounting
-        |  authoritative prompt token count
-Scheduler and Plan validation
-        |  full Prefill, limits, native SchedulerOutput cross-check
-Executor boundary
-        |
-Worker defensive assertions
+num_computed_tokens + num_scheduled_tokens == num_prompt_tokens
 ```
 
-The pure Contract layer validates backend-neutral shape and identity. Future
-runtime admission owns modality support. Plan validation owns facts that only
-exist after native prompt processing and scheduling. Worker checks are a final
-defense, not the primary admission mechanism.
+The scheduled count need not equal the full prompt length on a cache hit.
+Chunked/partial Prefill and recompute after generation are rejected. Decode
+advances native accounting by one logical token while Worker execution uses
+physical Beam rows. NPU stage widths and CUDA fixed-width state have their
+own adapter checks.
 
-### Structural validation
+The runtime currently admits one execution owner with two dispatch slots.
+Persistent buffers are rebound/reset under matching ownership; physical KV
+zeroing is not a wire-protocol requirement. Completion, cancellation, and
+failure must drain outstanding work before resources are reused. Terminal
+results are delivered only after matching resource-release confirmation.
+See [asynchronous scheduling](async_scheduling.md) for receipts and retirement.
 
-- non-empty batch and contiguous `item_index` values from zero;
-- unique, non-empty `EngineCoreRequest.request_id` values;
-- positive Beam width, `max_tokens`, and return width;
-- `num_return_sequences <= beam_width`;
-- finite, non-negative temperature;
-- unique, non-negative stop token IDs;
-- `sampling_params` present and `pooling_params` absent;
-- protocol version 1 resource ID; and
-- full Prefill equation for every Plan item.
+## Validation boundaries
 
-Python booleans are not accepted as integers.
+| Boundary | Responsibility |
+| --- | --- |
+| `batch_contracts` / typed codec | Structural types, protocol, identities, parameters, output shape |
+| V1 `input_processor` | Render/tokenize once, create native requests, validate device/config/request |
+| EngineCore `validate_gr_request` | Repeat admission checks at the process boundary before scheduling |
+| GR scheduler and Worker execution view | Capacity, complete remaining Prefill, native counts, member order and dispatch ownership |
+| `_terminal_result` | Normalize in-process/serialized data, match batch/items, validate failure index and requested result fields |
 
-### Deployment limits
+Structural checks include contiguous item indices starting at zero, unique
+non-empty request IDs, positive widths and generation budgets,
+`num_return_sequences <= beam_width`, finite non-negative temperature, valid
+stop IDs, sampling rather than pooling, and the supported resource identity.
+Booleans are not accepted in place of integers.
 
-`BeamBatchLimits` is a non-wire deployment snapshot:
+`BeamBatchLimits` is a non-wire capacity snapshot. Runtime admission also
+checks model length, token budget, native request capacity, Beam row capacity,
+and supported device features. Logical B=1..8 is supported by admission; the
+online batch/capture policy selects which exact sizes are enabled. Do not
+confuse this policy with native `max_num_seqs` capacity.
 
-```python
-class BeamBatchLimits:
-    max_batch_size: int
-    max_beam_width: int
-    max_tokens: int
-    max_num_beam_rows: int
-    max_num_batched_tokens: int
-    max_model_len: int
-    supported_constraint_resource_ids: tuple[str, ...]
-```
-
-Admission checks:
-
-- `B <= max_batch_size`;
-- `B <= max_num_seqs`;
-- `W <= max_beam_width`;
-- `max_tokens <= limits.max_tokens`;
-- `B * W <= max_num_beam_rows`;
-- `sum(num_scheduled_tokens) <= max_num_batched_tokens`; and
-- `num_prompt_tokens + max_tokens <= max_model_len` for each item.
-
-The scheduled-token budget intentionally uses `num_scheduled_tokens`, while
-model-length feasibility intentionally uses the complete authoritative prompt
-length. The two values must not be conflated.
-
-The current Constraint Table deployment uses `max_beam_width=256`,
-`max_tokens=3`, and `supported_constraint_resource_ids=("default",)`. Future
-capacity changes update Limits, not the protocol ABI.
+Constraint Table generation supports up to three effective output steps and
+width at most 256. Unconstrained V1 generation has its own configuration and
+budget checks; it does not require a catalog artifact. NPU dynamic widths
+must satisfy their stage-specific capacity/parent bounds. These deployment
+checks are implemented in `vllm_gr/v1/engine/beam_search_v1.py`, not in a
+parallel Plan schema.
 
 ## CPU candidate boundary
 

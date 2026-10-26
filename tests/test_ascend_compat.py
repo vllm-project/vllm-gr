@@ -45,6 +45,7 @@ def test_import_does_not_load_npu_worker() -> None:
 import sys
 import vllm_gr.v1.ascend_compat
 assert "vllm_ascend.worker.worker" not in sys.modules
+assert "vllm_gr.v1.worker.npu_memory_counters" not in sys.modules
 """
 
     subprocess.run(
@@ -197,6 +198,7 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
+    from vllm_gr.v1.worker import npu_memory_counters
 
     monkeypatch.setattr(ascend_compat, "_NPU_WORKER_PATCH_APPLIED", False)
     monkeypatch.setattr(ascend_compat, "is_npu_platform", lambda: False)
@@ -219,6 +221,17 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
 
     worker_class = _install_fake_npu_worker(monkeypatch, original_init_device)
 
+    def install_memory_counters(worker_cls: type[Any]) -> bool:
+        assert worker_cls is worker_class
+        events.append("memory_counters")
+        return True
+
+    monkeypatch.setattr(
+        npu_memory_counters,
+        "install_npu_memory_counter_patch",
+        install_memory_counters,
+    )
+
     def re_apply_patches() -> int:
         events.append("re_apply")
         return 0
@@ -232,7 +245,7 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     assert ascend_compat.patch_npu_worker_init_device() == 1
     assert ascend_compat.patch_npu_worker_init_device() == 0
     assert worker_class().init_device() == "ready"
-    assert events == ["re_apply", "original"]
+    assert events == ["re_apply", "memory_counters", "original"]
 
     from vllm_gr.v1.worker.model_runner_common import (
         freeze_gc_after_warmup,
@@ -246,4 +259,4 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     raise_from_original = True
     with pytest.raises(RuntimeError, match="init failed"):
         worker_class().init_device()
-    assert events == ["re_apply", "original"]
+    assert events == ["re_apply", "memory_counters", "original"]

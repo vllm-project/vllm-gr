@@ -177,11 +177,11 @@ def _create_batch_request(
     dynamic_widths = getattr(params, "dynamic_beam_widths", None)
     result_width = getattr(params, "result_width", None)
     device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
-    if str(device).split(":")[0] != "npu" and (
+    if str(device).split(":")[0] not in ("cuda", "npu") and (
         dynamic_widths is not None or result_width is not None
     ):
         raise BeamSearchRequestError(
-            "dynamic_beam_widths and result_width require NPU beam_search_v1"
+            "dynamic_beam_widths and result_width require CUDA or NPU beam_search_v1"
         )
     if dynamic_widths is not None and (
         not isinstance(dynamic_widths, list)
@@ -220,7 +220,8 @@ def _create_batch_request(
         include_stop_token=bool(getattr(params, "include_stop_str_in_output", False)),
         include_cumulative_logprob=True,
         # Public offline/online outputs expose sequences and scores only.
-        # Beam execution still retains its complete parent/KV history.
+        # Optional output parent lineage is separate from the required
+        # Beam decision and KV state, which execution still retains.
         include_parent_beam_indices=False,
     )
     request = BeamBatchRequest(

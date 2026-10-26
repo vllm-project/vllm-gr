@@ -88,7 +88,7 @@ Pitfalls to know:
 
 ## Known limitations
 
-- `run_offline_benchmark.py` measures the legacy `GRLLM.beam_search()` path. A PR that only changes `beam_search_v1()` (e.g. #373) will show no change — a flat result is expected. To A/B such PRs, the benchmark needs a `beam_search_v1` entry point first.
+- `run_offline_benchmark.py` measures `GRLLM.beam_search_v1()` through public text materialization. It reports cold/hit E2E; legacy frontend stage diagnostics are retired. Keep model, catalog, width, input length, warmup, and output consumption identical on both sides.
 - The report is only saved/printed; it is **not** auto-commented to the PR — whether to post it is up to you.
 - Server-side `ab_runner.sh` requires the worktree to be on a clean `decode_graph` branch, and it runs `git fetch origin decode_graph` and `git fetch origin pull/<N>/head` (the server must be able to reach GitHub).
 

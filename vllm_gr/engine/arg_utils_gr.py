@@ -22,10 +22,12 @@ from vllm_gr.config import (
 )
 from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
 from vllm_gr.config.parser import (
+    BEAM_ENGINE_DRIVEN_KEY,
     GR_CONFIG_KEY,
     KNOWN_GR_CONFIG_KEYS,
     normalize_gr_config_input,
 )
+from vllm_gr.config.validation import validate_beam_engine_driven
 
 
 def _catalog_is_triples_document(catalog_path: str) -> bool:
@@ -244,39 +246,29 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "select_unshared_kv) into the accelerator worker and return results via "
         "ModelRunnerOutput.beam_search_result (asynchronous result flow). CUDA "
         "beam deployments enable this by default; NPU requires xllm decode "
-        "execution and its operator library. Without it the frontend NumPy "
-        "decision path is kept.",
+        "execution and its operator library. Explicit False does not restore "
+        "the retired frontend decision path.",
     )
     model_group.add_argument(
         "--no-beam-worker-decision",
         action="store_false",
         dest="beam_worker_decision",
         default=None,
-        help="Explicitly keep the frontend NumPy beam decision path (opt-out "
-        "of worker-side beam decision).",
+        help="Explicitly disable worker decisions; this does not enable legacy Beam.",
     )
     model_group.add_argument(
         "--beam-engine-driven",
         action="store_true",
         default=None,
-        help="Make EngineCore chain beam step updates in-process from the "
-        "worker's beam decision (prefill -> step0 and every decode step). "
-        "The frontend still consumes each step's output (EOS / materialize) "
-        "but skips the per-step RPC when the engine chained that step. "
-        "Requires --beam-worker-decision. Safe under async scheduling: the "
-        "advance runs in the busy-loop iteration that processes the step's "
-        "outputs. Accelerator beam deployments with worker decisions enable "
-        "it by default. Inlined sample_tokens (skipping the second "
-        "collective RPC) additionally requires synchronous scheduling and "
-        "PP=1.",
+        help="Retired compatibility option. True is accepted with a warning and "
+        "ignored; Beam V1 always owns scheduling.",
     )
     model_group.add_argument(
         "--no-beam-engine-driven",
         action="store_false",
         dest="beam_engine_driven",
         default=None,
-        help="Keep the frontend-driven beam step-update loop (opt out of "
-        "EngineCore in-process chaining).",
+        help="Retired frontend step-loop option; engine configuration rejects it.",
     )
     return parser
 
@@ -417,25 +409,16 @@ def _constraint_explicitly_configured(
     return explicit_backend
 
 
-def _beam_decision_defaults(
+def _beam_worker_decision_default(
     *,
     beam_width_configured: bool,
     worker_decision: bool | None,
-    engine_driven: bool | None,
-) -> tuple[bool | None, bool | None]:
-    """Resolve omitted accelerator controls while preserving explicit False."""
+) -> bool | None:
+    """Resolve an omitted accelerator control while preserving explicit False."""
     if beam_width_configured and (_is_cuda_platform() or _is_npu_platform()):
         if worker_decision is None:
-            worker_decision = True
-        if worker_decision and engine_driven is None:
-            engine_driven = True
-    if engine_driven and not worker_decision:
-        raise ValueError(
-            "beam_engine_driven=True requires beam_worker_decision=True "
-            "(CLI --beam-worker-decision or additional_config "
-            "'vllm_gr_beam_worker_decision')"
-        )
-    return worker_decision, engine_driven
+            return True
+    return worker_decision
 
 
 def create_engine_config(self, usage_context=None, headless=False):
@@ -453,6 +436,11 @@ def create_engine_config(self, usage_context=None, headless=False):
         else []
     )
     existing_gr_config = GRConfig.from_vllm_config(config)
+    # Parsing consumes the retired value, so config equality alone cannot tell
+    # whether the raw additional_config sent to workers still needs cleanup.
+    retired_input_present = BEAM_ENGINE_DRIVEN_KEY in legacy_keys_in_additional_config
+    if canonical_in_additional_config:
+        retired_input_present = "engine_driven" in additional_config[GR_CONFIG_KEY].get("beam", {})
     canonical_input = getattr(self, "_vllm_gr_config_input", None)
     catalog_path = getattr(self, "catalog_path", None)
     constraint_backend = getattr(self, "constraint_backend", None)
@@ -517,11 +505,7 @@ def create_engine_config(self, usage_context=None, headless=False):
             if getattr(self, "beam_worker_decision", None) is not None
             else existing_gr_config.beam_worker_decision
         )
-        effective_beam_engine_driven = (
-            getattr(self, "beam_engine_driven", None)
-            if getattr(self, "beam_engine_driven", None) is not None
-            else existing_gr_config.beam_engine_driven
-        )
+        validate_beam_engine_driven(getattr(self, "beam_engine_driven", None))
         # NPU platform default for beam-serve deployments: when the user
         # enables beam search (beam_max_width) with a constraint catalog
         # (a Triples document) and no explicit backend choice, run Constraint
@@ -558,10 +542,9 @@ def create_engine_config(self, usage_context=None, headless=False):
             # unconstrained (legacy) instead of force-building tables.  A
             # catalog document is therefore required for the promotion.
             effective_constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
-        effective_beam_worker_decision, effective_beam_engine_driven = _beam_decision_defaults(
+        effective_beam_worker_decision = _beam_worker_decision_default(
             beam_width_configured=beam_width_configured,
             worker_decision=effective_beam_worker_decision,
-            engine_driven=effective_beam_engine_driven,
         )
         offset, slice_size = None, None
         # CUDA Constraint Tables support sliced logits while keeping global
@@ -621,7 +604,6 @@ def create_engine_config(self, usage_context=None, headless=False):
                 else existing_gr_config.beam_max_decode_steps
             ),
             beam_worker_decision=effective_beam_worker_decision,
-            beam_engine_driven=effective_beam_engine_driven,
             beam_execution_mode=existing_gr_config.beam_execution_mode,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
@@ -629,15 +611,13 @@ def create_engine_config(self, usage_context=None, headless=False):
         )
 
     if canonical_source:
-        worker_decision, engine_driven = _beam_decision_defaults(
+        worker_decision = _beam_worker_decision_default(
             beam_width_configured=effective_gr_config.beam_max_width is not None,
             worker_decision=effective_gr_config.beam_worker_decision,
-            engine_driven=effective_gr_config.beam_engine_driven,
         )
         effective_gr_config = replace(
             effective_gr_config,
             beam_worker_decision=worker_decision,
-            beam_engine_driven=engine_driven,
         )
 
     if effective_gr_config.constrained_generation is False:
@@ -684,7 +664,11 @@ def create_engine_config(self, usage_context=None, headless=False):
             "sequence capacity or select smaller batch sizes"
         )
 
-    if effective_gr_config != existing_gr_config or canonical_input is not None:
+    if (
+        effective_gr_config != existing_gr_config
+        or canonical_input is not None
+        or retired_input_present
+    ):
         # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
         # forbidden. Keep GR-only values in VllmConfig.additional_config so
         # that they also survive process serialization.

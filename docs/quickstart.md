@@ -52,66 +52,25 @@ python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); pri
 python -m pip check
 ```
 
-Platform dependencies come from the shared `requirements/common.txt`; there are no CUDA-only extras. See [getting_started/installation/](getting_started/installation/README.md).
+Platform dependencies come from the shared `requirements/common.txt`; there are no CUDA-only extras. See [the NPU installation guide](quickstart-ascend.md) for Ascend setup.
 
 > **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
 
 4. **Verify installation**
 
 ```bash
-python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
+python -c "import vllm_gr; print(vllm_gr.__version__)"
 ```
 
 ## Quick Start
 
-### API Server Mode (Production-like)
+- [Offline OneRec V1 quickstart](onerec_v1_async_quickstart.md): prepare the
+  catalog, compile an artifact, and run `GRLLM.beam_search_v1()`.
+- [Online V1 serving](../examples/online_serving/beam_search/README.md): start
+  `vllm-gr serve` with canonical configuration and send an OpenAI request.
+- [Beam configuration reference](../examples/offline_inference/beam_search/README.md):
+  device selection, graph policy, and generation limits.
 
-To run vllm-gr in a server--client configuration, use two terminals
-
-### On the first terminal: Run the server
-
-Use vllm-gr serve (beam search patches are automatically loaded via plugin)
-
-```bash
-vllm-gr serve OpenOneRec/OneRec-1.7B \
-  --max-logprobs 1024 \
-  --max-num-seqs 1024 \
-  --max-num-batched-tokens 16384 \
-  --enable-prefix-caching \
-  --beam-max-width 128 \
-  --scheduling-policy priority \
-  --default-chat-template-kwargs '{"enable_thinking": false}'
-```
-
-### On the second terminal: Run single request against server with CLI
-
-```bash
-# CLI Single request Inference
-curl -X POST "http://localhost:8000/v1/chat/completions" -H "Content-Type: application/json" \
-  --data '{
-    "model": "OpenOneRec/OneRec-1.7B",
-    "messages": [
-      {
-        "role": "user",
-        "content": "这是一个视频：<|sid_begin|><s_a_346><s_b_6566><s_c_5603><|sid_end|>，帮我总结一下这个视频讲述了什么内容"
-      }
-    ],
-    "use_beam_search": true,
-    "n": 5,
-    "temperature": 0.5,
-    "max_tokens": 5,
-    "ignore_eos": false,
-    "length_penalty": 1.0,
-    "vllm_xargs": { "begin_token": "<|sid_begin|>", "end_token": "<|sid_end|>" }
-  }'
-```
-
-Or use the [benchmark](benchmarks/README.md) to run a more complete benchmark test.
-
-### Data Parallelism
-
-To run `vllm-gr serve` with data parallelism, please see [data_parallelism.md](data_parallelism.md)
-
-### LMCache
-
-To run `vllm-gr serve` with LMCache, please see [lmcache.md](lmcache.md)
+Download the model and catalog separately. Use the same tokenizer snapshot
+for artifact compilation and serving. The retired `GRLLM.beam_search()` API
+and frontend catalog arguments are not valid substitutes for V1 configuration.

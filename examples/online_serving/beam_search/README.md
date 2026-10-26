@@ -1,51 +1,62 @@
-# Beam search example
+# Online Beam Search V1
 
-## Installation
+Install the [CUDA runtime](../../../docs/quickstart.md) or
+[Ascend runtime](../../../docs/quickstart-ascend.md) first. Run commands from
+the repository root with a local model snapshot and its matching tokenizer.
 
-refer to [quickstart.md](../../../docs/quickstart.md) for installation
+## Prepare the canonical configuration
 
-## running example
+Follow the [artifact build instructions](../../offline_inference/beam_search/README.md#constraint-table-artifact)
+to compile the real catalog into a `.safetensors` Constraint Table. Copy the
+[engine configuration](../../offline_inference/beam_search/README.md#engine-configuration)
+into `vllm_gr_config.yaml`, replacing the artifact path and both digests.
+Use `constraint_table.backend: cuda` on GPU or `npu` on Ascend. Keep
+`beam.max_width: 128`, `beam.max_decode_steps: 3`, and `execution_mode: v1`
+for this example. NPU execution choices are documented in the NPU quickstart.
 
-- This example demonstrates using vllm-gr for executing generative recommendation system based OneRec-1.7B model
-
-- Run server (beam search patches are auto-loaded via plugin)
-
-```bash
-vllm-gr serve OpenOneRec/OneRec-1.7B \
-    --default-chat-template-kwargs '{"enable_thinking": false}' \
-    --max-logprobs 1024 \
-    --max-num-seqs 1024 \
-    --max-num-batched-tokens 16384 \
-    --scheduling-policy priority
-```
-
-run client (on another terminal)
-
-- the client execute a predefined 120 items prompt and ask for item recommendations.
-- the server would reply with **beam_width** suggested items.
+## Start the server
 
 ```bash
-bash ./client.sh [-b beam_width ]
+export ONEREC_MODEL=/absolute/path/to/OneRec-1.7B
+vllm-gr serve "$ONEREC_MODEL" \
+  --served-model-name onerec \
+  --vllm-gr-config ./vllm_gr_config.yaml \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --max-logprobs 128 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 16384 \
+  --async-scheduling \
+  --no-enable-chunked-prefill
+```
 
-## Expected result
+GR patches load through the vLLM plugin. Do not combine the canonical config
+with legacy GR CLI options such as `--catalog-path` or `--beam-max-width`.
+Native prefix caching may be enabled without changing the artifact contract.
 
-- sorted recommendations in json format with fields:
-    - content: recommended token
-- total execution time
+## Send a request
+
+From another terminal:
 
 ```bash
-./client.sh -b 512  
+curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "model": "onerec",
+    "prompt": "Recommend the next video.",
+    "use_beam_search": true,
+    "n": 128,
+    "temperature": 0.0,
+    "max_tokens": 5,
+    "ignore_eos": true,
+    "vllm_xargs": {
+      "begin_token": "<|sid_begin|>",
+      "end_token": "<|sid_end|>"
+    }
+  }'
 ```
 
-Results of vllm-gr looks like this
-
-```json
-{"id":"chatcmpl-a779679c38e57685","object":"chat.completion","created":1770297709,"model":"OpenOneRec/OneRec-1.7B","choices":
-{"index":0,"message":{"role":"assistant","content":"<|sid_begin|><s_a_4113><s_b_7330><s_c_2009><|sid_end|>","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":[],"reasoning":null,"reasoning_content":null},"logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null}...{"index":511...}}
-total time: 1.610658s
-```
-
-- Example was demonstrated on:
-
-    - Host: Intel(R) Xeon(R) Gold 5320T CPU @ 2.30GHz
-    - Device: Nvidia RTX A6000 48GB
+The public budget includes the SID begin/end markers, leaving three generated
+SID components. The server returns complete candidates after matching resource
+release; candidate scores and latency depend on model, prompt, and hardware.
+For supported prompt-list batching, see the
+[V1 batching guide](../../../docs/onerec_v1_async_quickstart.md#batching-several-prompts-in-one-http-request).

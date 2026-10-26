@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any, cast
 
@@ -311,17 +312,29 @@ def validate_beam_worker_decision(value: object) -> bool | None:
 
 
 def validate_beam_engine_driven(value: object) -> bool | None:
+    """Consume the retired input without preserving a runtime mode switch."""
     if value is None:
         return None
-    if isinstance(value, bool):
-        return value
     if isinstance(value, str):
         lowered = value.strip().lower()
         if lowered in ("true", "1", "yes", "on"):
-            return True
-        if lowered in ("false", "0", "no", "off"):
-            return False
-    raise ValueError("vllm-gr beam_engine_driven must be a boolean or null")
+            value = True
+        elif lowered in ("false", "0", "no", "off"):
+            value = False
+    if not isinstance(value, bool):
+        raise ValueError("vllm-gr beam_engine_driven must be a boolean or null")
+    if not value:
+        raise ValueError(
+            "beam_engine_driven=False is retired: the frontend step loop was removed; "
+            "omit this option and use beam_search_v1()"
+        )
+    warnings.warn(
+        "beam_engine_driven=True is retired and ignored; Beam V1 owns scheduling. "
+        "Remove this option from the configuration.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return None
 
 
 def validate_beam_max_decode_steps(value: object) -> int:

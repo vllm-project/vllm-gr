@@ -272,8 +272,6 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     # serialization just like explicit True.
     if config.beam_worker_decision is not None:
         beam["worker_decision"] = config.beam_worker_decision
-    if config.beam_engine_driven is not None:
-        beam["engine_driven"] = config.beam_engine_driven
     if config.beam_execution_mode is not None:
         beam["execution_mode"] = config.beam_execution_mode.value
 
@@ -503,21 +501,15 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
 
     beam_worker_decision = validate_beam_worker_decision(gr_config.beam_worker_decision)
     if beam_worker_decision is None:
-        # Unset stays out of the serialized config; runtime keeps the
-        # frontend NumPy decision path.
+        # Unset stays out of the serialized config; the driver resolves
+        # platform defaults before worker initialization.
         additional_config.pop(BEAM_WORKER_DECISION_KEY, None)
     else:
         # Both explicit values round-trip (an opt-out must survive a write).
         additional_config[BEAM_WORKER_DECISION_KEY] = beam_worker_decision
 
-    beam_engine_driven = validate_beam_engine_driven(gr_config.beam_engine_driven)
-    if beam_engine_driven is None:
-        # Unset stays out of the serialized config; the runtime applies the
-        # accelerator engine-driven default at flag-read time.
-        additional_config.pop(BEAM_ENGINE_DRIVEN_KEY, None)
-    else:
-        # Both explicit values round-trip (an opt-out must survive a write).
-        additional_config[BEAM_ENGINE_DRIVEN_KEY] = beam_engine_driven
+    # Accepted only at ingress; never propagate a retired control to workers.
+    additional_config.pop(BEAM_ENGINE_DRIVEN_KEY, None)
 
     if gr_config.beam_execution_mode is None:
         additional_config.pop(BEAM_EXECUTION_MODE_KEY, None)

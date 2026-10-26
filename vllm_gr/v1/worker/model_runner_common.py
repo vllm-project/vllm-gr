@@ -1595,7 +1595,7 @@ def make_patched_execute_model_v2(_orig_execute_model):
 
     Refactor design §4.2: under V2 the beam surface is the persistent GR
     stage path; the LEGACY ``beam_data`` frame stack (M1 remap / M2 inline
-    sample / session refresh / constraint prelaunch) is not supported.  The
+    sample / session refresh) is not supported.  The
     wrapper therefore:
 
     - dispatches retirement and stage control frames (shared helpers);
@@ -1707,12 +1707,6 @@ def make_patched_execute_model(_orig_execute_model):
         self._beam_decision_result = None
         self._beam_decision_tensors = None
         self._beam_result_host_ready = False
-        # CUDA Prefill prelaunch state is single-step and single-consumer.
-        # Reset it before upstream input preparation may publish this run's
-        # prepared descriptor.
-        self._gr_prepared_cuda_prefill_constraint = None
-        self._gr_prelaunched_cuda_prefill = None
-
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info
         # Published for the optional Constraint Tables ``_sample`` hook

@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch_npu
 
 from vllm_gr.ops.npu import beam_ops
 from vllm_gr.v1.attention.backends import beam_attn_npu
@@ -44,6 +45,29 @@ is_available = beam_attn_npu.is_available
 get_flash_attn_version = beam_attn_npu.get_flash_attn_version
 supports_sinks = beam_attn_npu.supports_sinks
 reshape_and_cache = beam_attn_npu.reshape_and_cache
+
+
+def select_beam_rows(tensor: torch.Tensor, attn_metadata: BeamAttentionMetadata) -> torch.Tensor:
+    """Reuse dense NPU rows only when their routing is proven to be identity.
+
+    Fancy indexing also materializes contiguous storage. Keep it for strided,
+    blocked-format, padded or unproven inputs, even if the row counts match.
+    """
+    rows = attn_metadata.num_prefix_indices
+    if (
+        tensor.device.type == "npu"
+        and getattr(attn_metadata, "npu_prefix_rows_are_identity", False)
+        and attn_metadata.is_beam_decode
+        and attn_metadata.std_indices is None
+        and rows > 0
+        and rows == attn_metadata.num_actual_tokens
+        and tensor.shape[0] == rows
+        and tensor.is_contiguous()
+        and tensor.storage_offset() == 0
+        and torch_npu.get_npu_format(tensor) == 2  # standard unblocked format
+    ):
+        return tensor[:rows]
+    return tensor[attn_metadata.prefix_indices]
 
 
 def prefill_attention(
@@ -149,7 +173,7 @@ def _xllm_incremental_decode(
         )
 
     # Beam queries: [W, num_heads, D] (already gathered at prefix_indices).
-    beam_query = query[attn_metadata.prefix_indices]
+    beam_query = select_beam_rows(query, attn_metadata)
 
     # Contiguous unshared pool view: [W, H_kv, max_steps, D] -- exactly the
     # layout x_attention expects for the contiguous unshared branch
@@ -296,5 +320,6 @@ __all__ = [
     "is_available",
     "prefill_attention",
     "reshape_and_cache",
+    "select_beam_rows",
     "supports_sinks",
 ]

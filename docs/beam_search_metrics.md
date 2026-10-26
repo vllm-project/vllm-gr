@@ -1,93 +1,45 @@
 # Beam Search Metrics
 
-This document describes the new Prometheus metrics added to track beam search performance.
+## Current V1 measurements
 
-## Available Metrics
+Beam Search V1 owns Prefill and Decode in EngineCore and the Worker. The old
+frontend phase loop no longer calls a GR Prometheus collector. Consequently
+this version does not automatically expose the old
+`vllm_gr_beam_search_*` Prefill/Decode/sort counters or histograms.
+The unused `vllm_gr.v1.metrics.beam_search_metrics` collector and
+`vllm_gr.v1.metrics.stats.RequestStateStats` extension have been retired.
 
-All metrics are exposed at the `/metrics` endpoint (Prometheus format) with labels:
+The native vLLM `/metrics` endpoint is unchanged. Its native request metrics
+are not replacements for measured GR Beam stage durations. For reproducible
+Beam latency, use the [offline V1 benchmark](../benchmarks/qwen/README.md) or
+[paired offline A/B tool](../tools/AB_Tests/README.md), keeping the same model,
+input length, width, cache mode, warmup, and output-consumption scope.
+The offline A/B tool measures public text materialization as part of E2E.
+Online benchmarks additionally include transport and serving overhead.
 
-- `engine`: Engine ID (usually "0")
-- `model_name`: Model name (falls back to "unknown" if it cannot be determined)
+## Benchmark compatibility with older servers
 
-### Counter Metrics (Cumulative Totals)
+The OneRec online benchmark still reads historical phase counters when a
+server provides them. It requires Prefill, Decode, sort, and request counters
+in both snapshots before printing a phase summary. Missing or incomplete
+counters are reported as unavailable; they are not interpreted as zero cost.
+Non-successful HTTP responses and unavailable endpoints do not prevent the
+main benchmark from running. A counter reset invalidates the delta window.
 
-1. **`vllm_gr_beam_search_prefill_time_seconds_total`**
-   - Cumulative prefill (first token) time across all beam search requests
-   - Unit: seconds
+Each sample retains its metric name and complete label set until both
+snapshots have been validated. Every label set must have all four counters
+in both snapshots; new, disappearing, incomplete, or reset series invalidate
+the window. Only validated per-series deltas are summed, so growth in one
+engine cannot hide another engine's reset. Label and sample order do not
+affect identity. Stable series with no new requests are allowed.
+If the total-beams counter appears in either snapshot, it must also pass the
+presence, complete label-set, and per-series monotonicity checks. It remains
+optional when absent from both snapshots.
+The counters describe server-wide activity; isolate benchmark traffic if the
+result is intended to represent a particular run. This report is separate
+from client-observed E2E and is not a substitute for it.
 
-2. **`vllm_gr_beam_search_decode_time_seconds_total`**
-   - Cumulative decode time (generation phase) across all beam search requests
-   - Unit: seconds
-
-3. **`vllm_gr_beam_search_sort_time_seconds_total`**
-   - Cumulative time spent sorting beams by log probability
-   - Unit: seconds
-
-4. **`vllm_gr_beam_search_requests_total`**
-   - Total number of beam search requests processed
-
-5. **`vllm_gr_beam_search_total_beams_generated_total`**
-   - Total number of beams generated across all requests
-
-### Histogram Metrics (Distributions)
-
-1. **`vllm_gr_beam_search_prefill_duration_seconds`**
-   - Distribution of prefill times per request
-   - Buckets: 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0 seconds
-
-2. **`vllm_gr_beam_search_decode_duration_seconds`**
-   - Distribution of decode times per request
-   - Buckets: 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0 seconds
-
-3. **`vllm_gr_beam_search_sort_duration_seconds`**
-   - Distribution of beam sort times per request
-   - Buckets: 0.0001, 0.001, 0.01, 0.1, 0.5, 1.0 seconds
-
-4. **`vllm_gr_beam_search_beams_per_request`**
-   - Distribution of number of beams per request
-   - Buckets: 1, 2, 4, 8, 16, 32, 64, 128 beams
-
-## Querying Metrics
-
-### Using curl to fetch all metrics
-
-```bash
-curl http://localhost:8000/metrics | grep beam_search
-```
-
-### Using a Prometheus-compatible monitoring stack
-
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: 'vllm'
-    static_configs:
-      - targets: ['localhost:8000']
-    metrics_path: '/metrics'
-```
-
-### Example queries with Prometheus
-
-```promql
-# Total prefill time across all requests
-vllm_gr_beam_search_prefill_time_seconds_total
-
-# Average prefill time per request
-rate(vllm_gr_beam_search_prefill_time_seconds_total[5m]) / rate(vllm_gr_beam_search_requests_total[5m])
-
-# 95th percentile of beam sort time
-histogram_quantile(0.95, vllm_gr_beam_search_sort_duration_seconds_bucket)
-
-# Number of beams per request
-vllm_gr_beam_search_beams_per_request
-```
-
-## Implementation Details
-
-The metrics are automatically collected when:
-
-1. A beam search request completes on the server
-2. The `RequestStateStats` object contains timing information
-3. The `record_beam_search_metrics()` function is called from the OpenAI serving engine
-
-The metrics are created using the Prometheus Python client library and are automatically exposed as part of the vLLM Prometheus metrics collection.
+Future V1 stage metrics require explicit device/host timing boundaries and
+aggregation across EngineCore/Worker processes. They must not infer stage
+latency from the retired frontend timers or add synchronization to the hot
+path solely to reproduce those counters.

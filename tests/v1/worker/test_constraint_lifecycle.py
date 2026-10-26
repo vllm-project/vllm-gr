@@ -487,6 +487,7 @@ def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
         "_gr_input_buffers": object(),
         "_gr_gpu_stage_runner": object(),
         "_gr_decode_capture_failures": {2: "refused"},
+        "_gr_runtime_decode_capture_failures": {(1, 4): "refused"},
         "_gr_async_decode_graph_capture_failed": True,
         "_gr_async_decode_graph_capture_error": "refused",
     }

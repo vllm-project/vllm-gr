@@ -760,7 +760,6 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
 
 def _m2_runner(
     *,
-    beam_engine_driven: bool = True,
     beam_worker_decision: bool = True,
     use_async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -780,7 +779,6 @@ def _m2_runner(
     runner = SimpleNamespace(
         vllm_config=SimpleNamespace(additional_config={}),
         _vllm_gr_config=SimpleNamespace(
-            beam_engine_driven=beam_engine_driven,
             beam_worker_decision=beam_worker_decision,
         ),
         use_async_scheduling=use_async_scheduling,

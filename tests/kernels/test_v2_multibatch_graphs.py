@@ -1,3 +1,4 @@
+# mypy: disable-error-code="no-untyped-def,no-untyped-call"
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Actual CUDA replay survives B switches and a shape-local capture refusal."""
@@ -11,12 +12,15 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.constraints.test_table import make_table
 from tests.kernels.test_gpu_beam_stage_runner import (
     admission_worker,
     dispatch,
     install_decode_model,
     metadata,
 )
+from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
+from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
 from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     get_stage_runner,
@@ -25,8 +29,148 @@ from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import (
     V2StageExecutionHooks,
 )
 from vllm_gr.v1.worker.gpu_model_runner_v2_graph import capture_multibatch_forward
+from vllm_gr.v1.worker.gpu_model_runner_v2_resources import close_v2_runtime
+from vllm_gr.v1.worker.model_runner_patch import make_load_model_with_constraint_backend
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@torch.inference_mode()
+def test_runtime_recapture_refusal_preserves_live_request(monkeypatch):
+    gc.collect()
+    worker = admission_worker(max_rows=32)
+    worker.model_config.enforce_eager = False
+    worker._vllm_gr_config.beam_graph_enabled = True
+    worker._vllm_gr_config.beam_worker_decision = True
+    worker._vllm_gr_config.beam_online_batch_sizes = (1,)
+    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
+    install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
+    assert capture_multibatch_forward(worker)
+    graph = worker._beam_decode_graph
+    assert graph.ready
+    graph.clear()
+    worker._gr_dynamic_graphs_discarded = True
+    m = metadata()
+    scheduled = dispatch(m)
+    owner = get_stage_runner(worker, scheduled, hooks_type=V2StageExecutionHooks)
+    decode = replace(m, kind=GRStageKind.DECODE, stage_index=1, decode_step=0, kv_blocks=((1,),))
+    owner.prepared = owner.prepare_cpu(decode, 0)
+    owner._bind_attention(decode)
+    owner.input_ids.fill_(3)
+    owner.positions.fill_(10)
+    original = owner._forward_hidden
+    attempts = []
+
+    def refuse(capture):
+        if capture:
+            attempts.append(True)
+            raise RuntimeError("operation not supported when stream is capturing")
+        return original(capture)
+
+    monkeypatch.setattr(owner, "_forward_hidden", refuse)
+    for _ in range(2):
+        result = owner.hooks.decode_logits(owner)
+        torch.testing.assert_close(result[:, 0], torch.full_like(result[:, 0], 13))
+    assert len(attempts) == 1
+    assert owner.graph is None
+    assert not torch.cuda.is_current_stream_capturing()
+    done = torch.Event()
+    done.record()
+    owner.release(owner.binding, consumer_done=done)
+    assert owner.closed and not worker._beam_sessions
+
+
+@torch.inference_mode()  # type: ignore[misc]
+def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A replacement runtime must not inherit the previous one's refusals."""
+    gc.collect()
+    worker = admission_worker(max_rows=32)
+    worker.model_config.enforce_eager = False
+    worker._vllm_gr_config.beam_graph_enabled = True
+    worker._vllm_gr_config.beam_worker_decision = True
+    worker._vllm_gr_config.beam_online_batch_sizes = (1,)
+    worker._vllm_gr_config.constraint_table = SimpleNamespace(enabled=True)
+    worker.vllm_config.scheduler_config = SimpleNamespace(async_scheduling=True, max_num_seqs=8)
+    install_decode_model(worker, lambda ids, pos: (ids + pos)[:, None].to(torch.float16))
+    assert capture_multibatch_forward(worker)
+    # Refuse every capture attempt the way an unsupported op does. Only the
+    # capture call is refused, so the shape stays servable through eager.
+    refuse = [True]
+    original = V2StageExecutionHooks.forward_hidden
+
+    def forward(
+        self: Any,
+        ids: torch.Tensor,
+        positions: torch.Tensor,
+        attention: Any,
+        slots: Any,
+        capture: bool,
+    ) -> Any:
+        if capture and refuse[0]:
+            raise RuntimeError("operation not supported when stream is capturing")
+        return original(self, ids, positions, attention, slots, capture)
+
+    monkeypatch.setattr(V2StageExecutionHooks, "forward_hidden", forward)
+    slots = iter((0, 1))
+
+    def serve_decode() -> Any:
+        m = metadata()
+        scheduled = dispatch(m)
+        owner = get_stage_runner(worker, scheduled, hooks_type=V2StageExecutionHooks)
+        decode = replace(
+            m, kind=GRStageKind.DECODE, stage_index=1, decode_step=0, kv_blocks=((1,),)
+        )
+        owner.prepared = owner.prepare_cpu(decode, next(slots))
+        owner._bind_attention(decode)
+        owner.input_ids.fill_(3)
+        owner.positions.fill_(10)
+        result = owner.hooks.decode_logits(owner)
+        torch.testing.assert_close(result[:, 0], torch.full_like(result[:, 0], 13))
+        done = torch.Event()
+        done.record()
+        owner.release(owner.binding, consumer_done=done)
+        assert owner.closed and not worker._beam_sessions
+        return owner
+
+    # The runtime capture is refused: eager serves the shape and records the one
+    # geometry whose graph could not be built.
+    worker._beam_decode_graph.clear()
+    worker._gr_dynamic_graphs_discarded = True
+    assert serve_decode().graph is None
+    assert list(worker._gr_runtime_decode_capture_failures) == [(1, 4)]
+
+    # A complete load replaces this runtime; the record describes graphs that
+    # only the retired runtime owned and must not outlive it.  Drive the real
+    # entry point: it closes the previous runtime, then loads weights and
+    # republishes a constraint table, which is what a model reload does.
+    loaded: list[Any] = []
+
+    def native_load(runner: Any) -> None:
+        fresh, _ = _upload_cuda_backend(
+            make_table(), device=runner.device, max_top_k=4, max_rows=32
+        )
+        fresh._mark_ready()
+        runner.constraint_backend = fresh
+        loaded.append(runner)
+
+    monkeypatch.setattr(
+        "vllm_gr.constraints.loader.load_constraint_backend",
+        lambda **kwargs: pytest.fail(f"this runner configures no constraint table: {kwargs}"),
+    )
+    make_load_model_with_constraint_backend(native_load, close_runtime=close_v2_runtime)(worker)
+    assert loaded == [worker]
+    assert isinstance(worker.constraint_backend, CUDAConstraintBackend)
+    assert not hasattr(worker, "_gr_runtime_decode_capture_failures")
+
+    # The replacement recaptures the same geometry and really replays it.
+    refuse[0] = False
+    assert capture_multibatch_forward(worker)
+    replay = Mock(wraps=worker._beam_decode_graph.replay)
+    monkeypatch.setattr(worker._beam_decode_graph, "replay", replay)
+    forced = serve_decode()
+    assert forced.graph is not None
+    assert replay.call_count == 1
 
 
 @pytest.mark.parametrize("fail_shape", [False, True])  # type: ignore[misc]

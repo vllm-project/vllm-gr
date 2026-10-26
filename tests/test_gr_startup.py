@@ -336,6 +336,11 @@ def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
     owner = SimpleNamespace(
         bindings=(object(), object()),
         beam=SimpleNamespace(state=SimpleNamespace(beam_width=4)),
+        # ``prepare_cpu`` always publishes the stage buffers before
+        # ``decode_logits`` runs; the graph geometry is keyed by the live
+        # input width, not the configured beam width.
+        inputs=SimpleNamespace(width=4),
+        dynamic=None,
         graph=None,
         _forward_hidden=Mock(),
         _decode_logits=Mock(return_value="logits"),

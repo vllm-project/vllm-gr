@@ -17,7 +17,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from tests.kernels.test_gpu_beam_stage_runner import dispatch, metadata, runtime
 from vllm_gr.v1.engine.gr_async_scheduler import GR_WORKER_RESULT_ATTR
-from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import make_v2_stage_hooks
+from vllm_gr.v1.worker.gpu_beam_stage_runner_v2 import V2StageExecutionHooks
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 # mypy: disable-error-code="no-untyped-def,no-untyped-call"
@@ -70,7 +70,7 @@ def test_full_prefill_advances_native_state_without_counting_padding(
         worker.lora_config = None
         worker.speculative_config = None
         worker.max_num_tokens = 64
-    hooks = make_v2_stage_hooks(worker)
+    hooks = V2StageExecutionHooks(worker)
     req_index = worker.req_states.req_id_to_index["session-0"]
     observed = []
     kv = torch.zeros(len(prompt), dtype=torch.int32, device=worker.device)
@@ -139,7 +139,7 @@ def test_terminal_output_retires_native_v2_request():
     worker = _native_worker(list(range(7)))
     worker._beam_sessions = owner.worker._beam_sessions
     owner.worker = worker
-    owner.hooks = make_v2_stage_hooks(worker)
+    owner.hooks = V2StageExecutionHooks(worker)
     owner.admit(dispatch(metadata(n=1)))
     owner.logits = torch.zeros((1, 6), dtype=torch.float16, device=worker.device)
 
@@ -191,7 +191,7 @@ def test_multibatch_native_sort_and_reused_slots_preserve_member_results():
             input_batch=batch, hidden_states=batch.input_ids.float()[:, None]
         )
 
-    result = make_v2_stage_hooks(worker).prefill_logits(native_prefill, scheduled)
+    result = V2StageExecutionHooks(worker).prefill_logits(native_prefill, scheduled)
     assert result[:, 0].tolist() == [101, 202, 303, 404]
     for request_id, tokens in prompts.items():
         row = states.req_id_to_index[request_id]

@@ -88,6 +88,11 @@ class NPUEagerBeamStageRunner:
             or getattr(output_options, "num_return_sequences", capacity) != capacity
         )
 
+    def _needs_parent_history(self) -> bool:
+        """Keep optional output lineage separate from required Beam/KV parent indices."""
+        request = getattr(self, "session_request", None)
+        return request is None or bool(request.output_options.include_parent_beam_indices)
+
     def _validate_sequence(self, plan: NPUEagerStagePlan) -> None:
         current = plan.execution
         if self.previous is None:
@@ -210,7 +215,9 @@ class NPUEagerBeamStageRunner:
         context.decision.sequence[: execution.batch_size, :width, 0].copy_(candidates.token_ids)
         context.decision.beam_scores[: execution.batch_size, :width].copy_(initial_scores)
         context.decision.worker_decode_steps = 1
-        self.parent_history = torch.zeros_like(context.decision.sequence)
+        self.parent_history = (
+            torch.zeros_like(context.decision.sequence) if self._needs_parent_history() else None
+        )
         self.worker._beam_context = context
         self.worker._beam_sessions = {session.session_id: session for session in sessions}
 
@@ -436,16 +443,18 @@ class NPUEagerBeamStageRunner:
             self.handoff = NPUEagerFirstDecodeHandoff.from_prefill(plan, candidates.token_ids)
             self.latest_token_ids = candidates.token_ids
             if is_last:
-                # The terminal builder filters invalid/non-finite scores and
-                # ranks all candidates before applying the return limit.
-                terminal_result = self._build_terminal_result(
-                    candidates.token_ids.unsqueeze(2),
-                    candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf")),
-                    torch.zeros(
+                # Filter and rank all finite candidates before the return limit.
+                parents = None
+                if self._needs_parent_history():
+                    parents = torch.zeros(
                         (execution.batch_size, execution.output_width, 1),
                         dtype=torch.int32,
                         device=candidates.token_ids.device,
-                    ),
+                    )
+                terminal_result = self._build_terminal_result(
+                    candidates.token_ids.unsqueeze(2),
+                    candidates.logprobs.masked_fill(~candidates.valid_mask, float("-inf")),
+                    parents,
                 )
         else:
             self.decode_candidates = candidates
@@ -464,7 +473,8 @@ class NPUEagerBeamStageRunner:
                     if is_last
                     else execution.output_width,
                 )
-                self.parent_history = decision["out_parent_history"]
+                if self._needs_parent_history():
+                    self.parent_history = decision["out_parent_history"]
             else:
                 decision = run_beam_decision_candidates(
                     self.worker,
@@ -475,14 +485,18 @@ class NPUEagerBeamStageRunner:
                     result_width=execution.beam_width,
                 )
             self.latest_token_ids = decision["out_token_ids"]
-            if not self._uses_dynamic_state(plan):
+            if not self._uses_dynamic_state(plan) and self._needs_parent_history():
                 self._advance_parent_history(decision, execution.stage_index)
             if is_last:
-                assert self.parent_history is not None
+                parents = None
+                if self._needs_parent_history():
+                    if self.parent_history is None:
+                        raise RuntimeError("NPU Beam parent history is not initialized")
+                    parents = self.parent_history[:, : decision["out_sequence"].shape[1]]
                 terminal_result = self._build_terminal_result(
                     decision["out_sequence"],
                     decision["out_log_probs"],
-                    self.parent_history[:, : decision["out_sequence"].shape[1]],
+                    parents,
                 )
         if is_last:
             if terminal_result is None:
@@ -525,9 +539,9 @@ class NPUEagerBeamStageRunner:
     ) -> ConstraintOutput:
         """Select candidates within one Backend call's row capacity.
 
-        The canonical Backend is intentionally sized for one request's beam
-        rows. A multi-request Decode stage submits contiguous row chunks and
-        restores the request-major result with concatenation.
+        The canonical NPU Backend admits the supported B*W Decode rows in one
+        call. Backends with a smaller capacity still use contiguous chunks
+        and restore the request-major result with concatenation.
         """
         max_rows = int(backend.info.max_rows)
         if max_rows < 1:
@@ -572,7 +586,7 @@ class NPUEagerBeamStageRunner:
         self,
         sequences: torch.Tensor,
         scores: torch.Tensor,
-        parents: torch.Tensor,
+        parents: torch.Tensor | None,
     ) -> BeamBatchResult:
         request = self.session_request
         if request is None:
@@ -582,91 +596,104 @@ class NPUEagerBeamStageRunner:
         ):
             raise RuntimeError("terminal NPU Beam request order changed")
 
+        options = request.output_options
+        include_parents = options.include_parent_beam_indices
+        if include_parents and parents is None:
+            raise RuntimeError("terminal NPU Beam output is missing requested parent history")
         batch, width, steps = sequences.shape
-        if tuple(scores.shape) != (batch, width) or tuple(parents.shape[:2]) != (
-            batch,
-            width,
+        if tuple(scores.shape) != (batch, width) or (
+            include_parents
+            and parents is not None
+            and (
+                parents.ndim != 3
+                or tuple(parents.shape[:2]) != (batch, width)
+                or parents.shape[2] < steps
+            )
         ):
             raise RuntimeError("terminal NPU Beam tensors have inconsistent shapes")
         history_words = batch * width * steps
         score_words = batch * width
-        packed = torch.cat(
-            (
-                sequences.to(torch.int32).contiguous().reshape(-1),
-                parents[:, :, :steps].to(torch.int32).contiguous().reshape(-1),
-                scores.to(torch.float32).contiguous().reshape(-1).view(torch.int32),
-            )
-        ).to("cpu")
+        pieces = [sequences.to(torch.int32).contiguous().reshape(-1)]
+        if include_parents and parents is not None:
+            pieces.append(parents[:, :, :steps].to(torch.int32).contiguous().reshape(-1))
+        pieces.append(scores.to(torch.float32).contiguous().reshape(-1).view(torch.int32))
+        packed = torch.cat(pieces).to("cpu")
         sequence_rows = packed[:history_words].view(batch, width, steps).tolist()
-        parent_rows = packed[history_words : 2 * history_words].view(batch, width, steps).tolist()
+        parent_rows = None
+        score_offset = history_words
+        if include_parents:
+            parent_rows = (
+                packed[history_words : 2 * history_words].view(batch, width, steps).tolist()
+            )
+            score_offset += history_words
         score_rows = (
-            packed[2 * history_words : 2 * history_words + score_words]
+            packed[score_offset : score_offset + score_words]
             .view(torch.float32)
             .view(batch, width)
             .tolist()
         )
         params = request.beam_params
-        options = request.output_options
         outputs = []
         stop_ids = set(params.stop_token_ids) if not params.ignore_stop_tokens else set()
         for row, item in enumerate(request.items):
             ranked = []
             prompt_length = len(item.request.prompt_token_ids or ())
-            for beam, raw_score in enumerate(score_rows[row]):
-                score = float(raw_score)
+            normalization = None
+            normalizations = {}
+            for beam, score in enumerate(score_rows[row]):
                 if not math.isfinite(score):
                     continue
-                token_ids = tuple(int(token) for token in sequence_rows[row][beam])
-                parent_ids = tuple(int(parent) for parent in parent_rows[row][beam])
-                stop_index = next(
-                    (index for index, token in enumerate(token_ids) if token in stop_ids),
-                    None,
-                )
-                if stop_index is None:
-                    finish_reason = "length"
-                    stop_token_id = None
-                    length = len(token_ids)
+                if stop_ids:
+                    token_ids = sequence_rows[row][beam]
+                    stop_index = next(
+                        (index for index, token in enumerate(token_ids) if token in stop_ids),
+                        None,
+                    )
+                    length = len(token_ids) if stop_index is None else stop_index + 1
+                    normalization = normalizations.get(length)
+                    if normalization is None:
+                        normalization = (
+                            float(prompt_length + length) ** params.length_penalty
+                            if params.length_penalty != 0
+                            else 1.0
+                        )
+                        normalizations[length] = normalization
                 else:
-                    finish_reason = "stop"
-                    stop_token_id = token_ids[stop_index]
-                    length = stop_index + 1
-                normalization = (
-                    float(prompt_length + length) ** params.length_penalty
-                    if params.length_penalty != 0
-                    else 1.0
-                )
+                    stop_index = None
+                    length = steps
+                    # Evaluate lazily: an all-invalid row must still report
+                    # no_valid_beams even if this exponent would overflow.
+                    if normalization is None:
+                        normalization = (
+                            float(prompt_length + length) ** params.length_penalty
+                            if params.length_penalty != 0
+                            else 1.0
+                        )
                 ranked.append(
                     (
                         score / normalization,
                         score,
                         beam,
-                        token_ids,
-                        parent_ids,
-                        finish_reason,
-                        stop_token_id,
                         length,
+                        stop_index,
                     )
                 )
             ranked.sort(key=lambda value: (value[0], value[1], -value[2]), reverse=True)
             selected = []
-            for (
-                _,
-                score,
-                _,
-                token_ids,
-                parent_ids,
-                finish_reason,
-                stop_token_id,
-                length,
-            ) in ranked[: options.num_return_sequences]:
+            for _, score, beam, length, stop_index in ranked[: options.num_return_sequences]:
+                token_ids = sequence_rows[row][beam]
+                finish_reason = "length" if stop_index is None else "stop"
+                stop_token_id = None if stop_index is None else token_ids[stop_index]
                 token_count = length
                 if finish_reason == "stop" and not options.include_stop_token:
                     token_count -= 1
                 selected.append(
                     BeamOutputSequence(
-                        token_ids[:token_count],
+                        tuple(token_ids[:token_count]),
                         score if options.include_cumulative_logprob else None,
-                        parent_ids[:token_count] if options.include_parent_beam_indices else (),
+                        tuple(parent_rows[row][beam][:token_count])
+                        if options.include_parent_beam_indices
+                        else (),
                         finish_reason,
                         stop_token_id,
                     )
@@ -704,6 +731,7 @@ class NPUEagerBeamStageRunner:
             for request_id in request_ids:
                 sessions.pop(request_id, None)
         self.closed = True
+        self.parent_history = None
         self.logical_scheduler_output = None
         self.execution_error = None
 

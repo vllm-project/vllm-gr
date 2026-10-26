@@ -592,7 +592,7 @@ def test_npu_constraint_table_auto_promotion_respects_capacity(
     assert config.catalog_path == catalog_path
     assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
     assert config.beam_worker_decision is True
-    assert config.beam_engine_driven is True
+    assert config.beam_engine_driven is None
 
 
 def test_beam_max_width_rejects_values_above_global_limit() -> None:
@@ -820,7 +820,7 @@ def test_cuda_beam_enables_worker_decision_by_default() -> None:
     # decisions regardless of backend; actual chaining is lazy-gated by
     # data availability (trie-catalog deployments never produce worker
     # decisions, unconstrained deployments chain decode from step 1).
-    assert config.beam_engine_driven is True
+    assert config.beam_engine_driven is None
     assert config.constraint_backend is ConstraintBackend.TRIE
 
 
@@ -876,14 +876,9 @@ def test_non_cuda_constraint_table_backend_skips_vocab_slice_computation(
     set_slice.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("engine_driven", "async_scheduling", "expected_engine_driven"),
-    [(None, False, True), (False, False, False), (None, True, True)],
-)  # type: ignore[misc]
+@pytest.mark.parametrize("async_scheduling", [False, True])  # type: ignore[misc]
 def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
-    engine_driven: bool | None,
     async_scheduling: bool,
-    expected_engine_driven: bool | None,
 ) -> None:
     """CUDA triples use the sliced lm_head path supported by the CUDA backend."""
     from vllm_gr.engine.arg_utils_gr import create_engine_config
@@ -897,7 +892,6 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
         trust_remote_code=False,
         beam_max_width=32,
         beam_worker_decision=None,
-        beam_engine_driven=engine_driven,
         async_scheduling=async_scheduling,
         no_beam_graph=False,
         _vllm_gr_config_input=None,
@@ -921,7 +915,7 @@ def test_cuda_constraint_table_backend_restores_vocab_slice_computation(
     assert config.vocab_offset == 151669
     assert config.vocab_slice_size == 24576
     assert config.beam_worker_decision is True
-    assert config.beam_engine_driven is expected_engine_driven
+    assert config.beam_engine_driven is None
     slice_spy.assert_called_once()
     set_slice.assert_called_once_with(151669, 24576)
 
@@ -961,19 +955,16 @@ def test_write_to_vllm_config_invalidates_parse_cache() -> None:
 @pytest.mark.parametrize("source", ["legacy", "canonical"])  # type: ignore[misc]
 @pytest.mark.parametrize("platform", ["cpu", "cuda", "npu"])  # type: ignore[misc]
 @pytest.mark.parametrize("worker_decision", [None, False, True])  # type: ignore[misc]
-@pytest.mark.parametrize("engine_driven", [None, False])  # type: ignore[misc]
 def test_engine_config_preserves_explicit_decision_controls(
     source: str,
     platform: str,
     worker_decision: bool | None,
-    engine_driven: bool | None,
 ) -> None:
     from vllm_gr.engine.arg_utils_gr import create_engine_config
 
     initial = GRConfig(
         beam_max_width=32,
         beam_worker_decision=worker_decision,
-        beam_engine_driven=engine_driven,
     )
     vllm_config = _vllm_config()
     if source == "legacy":
@@ -998,14 +989,11 @@ def test_engine_config_preserves_explicit_decision_controls(
     ):
         result = GRConfig.from_vllm_config(create_engine_config(engine_args))
     expected_worker = worker_decision
-    expected_engine = engine_driven
     if platform != "cpu":
         if expected_worker is None:
             expected_worker = True
-        if expected_worker and expected_engine is None:
-            expected_engine = True
     assert result.beam_worker_decision is expected_worker
-    assert result.beam_engine_driven is expected_engine
+    assert result.beam_engine_driven is None
 
 
 @pytest.mark.parametrize("execution", list(NPUDecodeExecution))  # type: ignore[misc]

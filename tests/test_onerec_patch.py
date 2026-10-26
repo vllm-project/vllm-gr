@@ -53,6 +53,19 @@ def _restore_modules(saved: dict[str, types.ModuleType]) -> None:
         sys.modules[name] = module
 
 
+def _legacy_phase_scrape(rows: list[tuple[str, float, float]]) -> str:
+    return "\n".join(
+        f"vllm_gr_beam_search_{name}{{{labels}}} {value}"
+        for labels, requests, prefill in rows
+        for name, value in (
+            ("requests_total", requests),
+            ("prefill_time_seconds_total", prefill),
+            ("decode_time_seconds_total", prefill * 2),
+            ("sort_time_seconds_total", prefill * 0.5),
+        )
+    )
+
+
 def _install_stub_third_party() -> dict[str, types.ModuleType]:
     """Install stub modules for third-party libs the patch chain imports.
 
@@ -398,6 +411,210 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
         ):
             with self.subTest(module=module.__name__, name=name):
                 self.assertIs(getattr(module, name), getattr(patch_mod, replacement))
+
+    def test_legacy_metrics_preserve_absence_and_match_exact_names(self) -> None:
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        cases = (
+            ("", {}),
+            ("vllm:num_requests_running 1", {}),
+            ("vllm_gr_beam_search_requests_total_created 100", {}),
+            ("vllm_gr_beam_search_requests_total NaN", {}),
+            ("vllm_gr_beam_search_requests_total inf", {}),
+            ("vllm_gr_beam_search_requests_total invalid", {}),
+            ("vllm_gr_beam_search_requests_total -1", {}),
+            ("vllm_gr_beam_search_requests_total 2", {"requests": {(): 2.0}}),
+            ("vllm_gr_beam_search_requests_total 2 1234567", {"requests": {(): 2.0}}),
+            (
+                'vllm_gr_beam_search_requests_total{engine="0"} 2\n'
+                'vllm_gr_beam_search_requests_total{engine="1"} 3',
+                {"requests": {(("engine", "0"),): 2.0, (("engine", "1"),): 3.0}},
+            ),
+            (
+                'vllm_gr_beam_search_requests_total{model_name="model A",engine="0"} 2',
+                {"requests": {(("engine", "0"), ("model_name", "model A")): 2.0}},
+            ),
+            (
+                'vllm_gr_beam_search_requests_total{engine="0"} 2\n'
+                'vllm_gr_beam_search_requests_total{engine="1"} NaN',
+                {},
+            ),
+            (
+                'vllm_gr_beam_search_requests_total{engine="0"} 2\n'
+                'vllm_gr_beam_search_requests_total{engine="0"} 3',
+                {},
+            ),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text), mock.patch.object(patch_mod.requests, "get") as get:
+                get.return_value = types.SimpleNamespace(status_code=200, text=text)
+                self.assertEqual(patch_mod._fetch_prometheus_metrics("http://server"), expected)
+                get.assert_called_once_with("http://server/metrics", timeout=5)
+
+    def test_legacy_metrics_http_failure_is_unavailable(self) -> None:
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        with mock.patch.object(patch_mod.requests, "get") as get:
+            get.return_value = types.SimpleNamespace(status_code=404)
+            self.assertEqual(patch_mod._fetch_prometheus_metrics("http://server"), {})
+            get.side_effect = OSError("connection failed")
+            self.assertEqual(patch_mod._fetch_prometheus_metrics("http://server"), {})
+
+    def test_legacy_phase_report_rejects_reset_masked_by_another_engine(self) -> None:
+        before = _legacy_phase_scrape([('engine="0"', 100, 10), ('engine="1"', 10, 1)])
+        after = _legacy_phase_scrape([('engine="0"', 120, 14), ('engine="1"', 0, 0)])
+        self.assertEqual(self._legacy_phase_report(before, after), "")
+
+    def _legacy_phase_report(self, before: str, after: str) -> str:
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        with (
+            mock.patch.object(patch_mod.requests, "get") as get,
+            mock.patch("builtins.print") as output,
+        ):
+            get.side_effect = [
+                types.SimpleNamespace(status_code=200, text=text) for text in (before, after)
+            ]
+            patch_mod._print_beam_search_delta(
+                patch_mod._fetch_prometheus_metrics("http://server"),
+                patch_mod._fetch_prometheus_metrics("http://server"),
+            )
+        return "\n".join(str(call.args[0]) for call in output.call_args_list)
+
+    def test_legacy_phase_report_aggregates_only_valid_series_deltas(self) -> None:
+        before = _legacy_phase_scrape(
+            [
+                ('engine="0",model_name="model A"', 100, 10),
+                ('engine="1",model_name="model B"', 10, 1),
+            ]
+        )
+        for requests, prefill in ((15, 2), (10, 1)):
+            # Label order and sample order are irrelevant. An idle engine is valid.
+            after = _legacy_phase_scrape(
+                [
+                    ('model_name="model B",engine="1"', requests, prefill),
+                    ('model_name="model A",engine="0"', 120, 14),
+                ]
+            )
+            with self.subTest(requests=requests):
+                text = self._legacy_phase_report(before, after)
+                self.assertIn("Avg Prefill Time (ms):                   200.00", text)
+                self.assertIn("Avg Decode Time (ms):                    400.00", text)
+                self.assertIn("Avg Sort Time (ms):                      100.000", text)
+                self.assertIn(f"Beam Search Requests:                    {requests + 10}", text)
+
+    def test_legacy_phase_report_preserves_model_label_identity(self) -> None:
+        before = _legacy_phase_scrape(
+            [
+                ('engine="0",model_name="model A"', 100, 10),
+                ('engine="0",model_name="model B"', 10, 1),
+            ]
+        )
+        after = _legacy_phase_scrape(
+            [
+                ('engine="0",model_name="model A"', 120, 14),
+                ('engine="0",model_name="model B"', 0, 0),
+            ]
+        )
+        self.assertEqual(self._legacy_phase_report(before, after), "")
+
+    def test_legacy_phase_report_rejects_changed_or_incomplete_series(self) -> None:
+        before = _legacy_phase_scrape([('engine="0"', 100, 10), ('engine="1"', 10, 1)])
+        after = _legacy_phase_scrape([('engine="0"', 120, 14), ('engine="1"', 15, 2)])
+        phase = 'vllm_gr_beam_search_decode_time_seconds_total{engine="1"}'
+        incomplete = "\n".join(line for line in after.splitlines() if not line.startswith(phase))
+        invalid_snapshots = {
+            "disappearing": _legacy_phase_scrape([('engine="0"', 120, 14)]),
+            "new": after + "\n" + _legacy_phase_scrape([('engine="2"', 1, 0.2)]),
+            "relabelled": after.replace('engine="1"', 'engine="2"'),
+            "incomplete": incomplete,
+            "phase_reset_masked_by_other_engine": incomplete + f"\n{phase} 0",
+            "nonfinite": incomplete + f"\n{phase} NaN",
+        }
+        for name, invalid in invalid_snapshots.items():
+            with self.subTest(name=name):
+                self.assertEqual(self._legacy_phase_report(before, invalid), "")
+        self.assertEqual(self._legacy_phase_report(incomplete, after), "")
+        self.assertEqual(self._legacy_phase_report(incomplete, incomplete), "")
+
+    def test_legacy_phase_report_requires_complete_monotonic_counters(self) -> None:
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        before = {
+            "requests": {(): 2.0},
+            "prefill_time": {(): 1.0},
+            "decode_time": {(): 2.0},
+            "sort_time": {(): 0.5},
+        }
+        after = {
+            "requests": {(): 4.0},
+            "prefill_time": {(): 1.4},
+            "decode_time": {(): 2.6},
+            "sort_time": {(): 0.6},
+        }
+        with mock.patch("builtins.print") as output:
+            patch_mod._print_beam_search_delta(before, after)
+        text = "\n".join(str(call.args[0]) for call in output.call_args_list)
+        self.assertIn("200.00", text)
+        self.assertIn("300.00", text)
+        self.assertIn("50.000", text)
+        for invalid in (
+            None,
+            {},
+            {"requests": {(): 4.0}},
+            before,
+            {**after, "decode_time": {(): 0.0}},
+        ):
+            with self.subTest(after=invalid), mock.patch("builtins.print") as output:
+                patch_mod._print_beam_search_delta(before, invalid)
+                output.assert_not_called()
+
+    def test_legacy_phase_report_rejects_inconsistent_beam_counters(self) -> None:
+        before = _legacy_phase_scrape([('engine="0"', 100, 10), ('engine="1"', 10, 1)])
+        after = _legacy_phase_scrape([('engine="0"', 120, 14), ('engine="1"', 15, 2)])
+        metric = "vllm_gr_beam_search_total_beams_generated_total"
+        initial = f'\n{metric}{{engine="0"}} 1000\n{metric}{{engine="1"}} 100'
+        healthy = f'\n{metric}{{engine="0"}} 1200\n{metric}{{engine="1"}} 150'
+        invalid = {
+            "masked_reset": f'\n{metric}{{engine="0"}} 1200\n{metric}{{engine="1"}} 0',
+            "new_series": healthy + f'\n{metric}{{engine="2"}} 10',
+            "disappearing_series": f'\n{metric}{{engine="0"}} 1200',
+            "relabelled_series": healthy.replace('engine="1"', 'engine="2"'),
+            "disappearing_counter": "",
+        }
+        for name, counters in invalid.items():
+            with self.subTest(name=name):
+                self.assertEqual(self._legacy_phase_report(before + initial, after + counters), "")
+        self.assertEqual(self._legacy_phase_report(before, after + healthy), "")
+        self.assertEqual(
+            self._legacy_phase_report(before + f'\n{metric}{{engine="0"}} 1000', after + healthy),
+            "",
+        )
+
+    def test_legacy_phase_report_accepts_monotonic_optional_beam_counters(self) -> None:
+        before = _legacy_phase_scrape([('engine="0"', 100, 10), ('engine="1"', 10, 1)])
+        after = _legacy_phase_scrape([('engine="0"', 120, 14), ('engine="1"', 15, 2)])
+        metric = "vllm_gr_beam_search_total_beams_generated_total"
+        expected = self._legacy_phase_report(before, after)
+        self.assertIn("Avg Prefill Time (ms):                   200.00", expected)
+        self.assertEqual(
+            self._legacy_phase_report(
+                before + f'\n{metric}{{engine="0"}} 1000\n{metric}{{engine="1"}} 100',
+                after + f'\n{metric}{{engine="1"}} 150\n{metric}{{engine="0"}} 1200',
+            ),
+            expected,
+        )
+
+    def test_missing_legacy_metrics_does_not_change_benchmark_result(self) -> None:
+        import benchmarks.open_one_rec.one_rec_patch as patch_mod
+
+        args = types.SimpleNamespace(base_url="http://server", n=2)
+        with (
+            mock.patch.object(patch_mod.requests, "get", side_effect=OSError("unavailable")),
+            mock.patch.object(patch_mod, "original_serve_main", return_value=17) as serve,
+        ):
+            self.assertEqual(patch_mod.patched_serve_main(args), 17)
+        serve.assert_called_once_with(args)
 
     def test_offline_beam_search_always_delegates_to_v1(self) -> None:
         """The former default path uses the same V1 owner as the explicit flag."""

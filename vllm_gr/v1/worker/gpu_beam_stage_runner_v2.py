@@ -30,15 +30,19 @@ from dataclasses import replace
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.engine.beam_search_v1 import GRStageKind
+from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeCaptureUnsupported
 from vllm_gr.v1.worker.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
     _StageExecutionHooks,
     should_replay_decode_graph,
 )
+
+logger = init_logger(__name__)
 
 
 def _can_fuse_prefill_state_writes(worker: Any, scheduler_output: Any, request: Any) -> bool:
@@ -265,6 +269,10 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         worker = self.worker
         batch_size = len(owner.bindings)
         cfg = _get_gr_config(worker)
+        geometry = (batch_size, owner.inputs.width)
+        if geometry in getattr(worker, "_gr_runtime_decode_capture_failures", {}):
+            owner.graph = None
+            return owner._forward()
         enabled = (
             not worker.model_config.enforce_eager
             and cfg.beam_graph_enabled
@@ -272,9 +280,36 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
             and batch_size not in getattr(worker, "_gr_decode_capture_failures", {})
         )
-        owner.graph = (
-            self.decode_graph(batch_size, owner.beam.state.beam_width) if enabled else None
-        )
+        owner.graph = self.decode_graph(batch_size, owner.inputs.width) if enabled else None
+        # Dynamic sessions own per-width buffers. Rebuild after schedule/batch
+        # changes, including the first fixed-width session following them.
+        if (
+            owner.graph is not None
+            and not owner.graph.ready
+            and (
+                owner.dynamic is not None or getattr(worker, "_gr_dynamic_graphs_discarded", False)
+            )
+        ):
+            try:
+                owner.graph.capture(owner._forward_hidden, persistent_install=False)
+            except BeamDecodeCaptureUnsupported as error:
+                # Capture has restored the model wrapper. Drain its side stream
+                # before reusing live request buffers; unhealthy devices must fail.
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("Decode capture did not leave capture mode") from error
+                torch.accelerator.synchronize(worker.device)
+                owner.graph.discard_selected()
+                failures = getattr(worker, "_gr_runtime_decode_capture_failures", None)
+                if failures is None:
+                    failures = worker._gr_runtime_decode_capture_failures = {}
+                failures[geometry] = str(error)
+                owner.graph = None
+                logger.warning(
+                    "GR runtime Decode capture unsupported; using eager for B=%d W=%d: %s",
+                    *geometry,
+                    error,
+                )
+                return owner._forward()
         if should_replay_decode_graph_v2(worker, owner.graph, batch_size=batch_size):
             return worker.model.compute_logits(owner.graph.replay())
         return owner._forward()
@@ -416,11 +451,6 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             "V2 stage execution requires GRStageMetadata.kv_blocks "
             f"(session {session_id} dispatched without scheduler block publication)"
         )
-
-
-def make_v2_stage_hooks(worker: Any) -> V2StageExecutionHooks:
-    """Construct the V2 execution hooks for one worker."""
-    return V2StageExecutionHooks(worker)
 
 
 def should_replay_decode_graph_v2(worker: Any, graph: Any, *, batch_size: int) -> bool:

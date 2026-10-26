@@ -47,18 +47,19 @@ aligned with it.
 | GR-PATCH-001 | `vllm_gr/v1/ascend_compat.py` | `apply_ascend_attention_backend_patch` | CUSTOM is registered and overridden | `_validate` behavior in `test_ascend_compat.py`; Ascend integration test | EngineCore, worker |
 | GR-PATCH-002 | `vllm_gr/v1/ascend_compat.py` | `patch_npu_worker_init_device` | active NPU platform, first installation | `test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract` | worker |
 | GR-PATCH-003 | `vllm_gr/logprobs.py` | `logprobs_patch.patch_flat_logprobs` | required frontend plan finds the method absent | `_validate_flat_logprobs_patch`; patch initialization tests | offline frontend, API server |
-| GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; `test_beam_search_v1_online_entry.py` and OneRec HTTP ST | API server |
+| GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; serving dispatch, online entry, and OneRec HTTP tests | API server |
 | GR-PATCH-005 | `vllm_gr/engine/arg_utils_gr.py` | `patch_add_cli_args` | required frontend plan finds GR EngineArgs methods absent | `_validate_engine_args_patch`; attention backend configuration tests | main, API server |
-| GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds grouped client methods incomplete | `_validate_batch_and_fork_patch`; BeamRequest, admission queue, and online entry tests | API server |
+| GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds V1 client/lifecycle methods incomplete | `_validate_batch_and_fork_patch`; V1 request, admission, rejection, and online lifecycle tests | API server |
 | GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
-| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; BeamRequest tests | EngineCore |
-| GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `scheduler_metadata.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
+| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; V1 request and admission tests | EngineCore |
+| GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `gr_async_scheduler.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
 | GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active GPU runner hooks are incomplete | `_validate_model_runner_patch`; GPU and dispatcher tests | GPU worker |
 | GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
 | GR-PATCH-016 | `vllm/utils/system_utils.py` | `npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
+| GR-PATCH-017 | `v1/worker/npu_memory_counters.py` | `install_npu_memory_counter_patch` | NPU worker initialization finds the supported native sampler and nested memory API | `tests/test_npu_memory_counters.py`; NPU worker lifecycle test | NPU worker |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -153,29 +154,20 @@ aligned with it.
 
 - Targets: GR extensions on `AsyncMPClient`, `SyncMPClient`, `InprocClient`, and `AsyncLLM`
 - Risk: Critical
-- Behavior:
-    - sends grouped Beam requests;
-    - sends Beam step updates;
-    - registers grouped output queues;
-    - preserves data-parallel affinity for Beam sessions.
-- Private/internal dependencies include:
-    - `_send_input`;
-    - `_ensure_output_queue_task`;
-    - `_ensure_stats_update_task`;
-    - `core_engines`;
-    - `reqs_in_flight`;
-    - `first_req_send_socket`;
-    - `engines_running`;
-    - `current_wave`.
-- Removal condition: vLLM exposes stable request batching, control-message, and routing extension points sufficient for the grouped Beam lifecycle.
+- Behavior: atomically submits V1 sessions, installs submit/wait/abort/release
+  frontend methods, and preserves admission rejection identities.
+- Private/internal dependencies: client `_send_input` / `_send_input_message`,
+  native output collectors, and the EngineCore utility channel for retirement.
+- `patch_batch_and_fork` is a retained installer name for this V1 pipeline;
+  it does not restore the retired frontend batch/fork protocol.
+- Removal condition: upstream exposes equivalent session submission and lifecycle hooks.
 
 ### GR-PATCH-008 — EngineCoreRequestType Extension
 
 - Target: `EngineCoreRequestType`
 - Mutation: Python Enum private-state mutation
 - Added values:
-    - `ADD_BATCH = b"\x06"`
-    - `BEAM_REQUEST_STEP_UPDATE = b"\x07"`
+    - `SUBMIT_GR_SESSION = b"\x0a"`
 - Risk: Critical
 - Current compatibility: upstream vLLM 0.22.1 uses values `0x00` through `0x05`.
 - Private dependencies:
@@ -227,13 +219,13 @@ aligned with it.
 - Targets:
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
-    - `GPUModelRunner._bookkeeping_sync`
+    - `GPUModelRunner.sample_tokens`
 - Platform: GPU
 - Risk: Critical
 - Dependencies:
     - private method signatures;
     - the 2-item `_prepare_inputs` result;
-    - the 7-item `_bookkeeping_sync` result;
+    - native execute/sample separation and asynchronous output consumption;
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
 - Removal condition: upstream provides stable hooks for grouped input preparation and output collapsing.
 
@@ -326,6 +318,44 @@ aligned with it.
 - Removal condition: upstream `_maybe_force_spawn()` covers NPU (or delegates the
   decision to the platform interface).
 
+### GR-PATCH-017 — NPU Worker Memory Counters
+
+- Source: `vllm_gr/v1/worker/npu_memory_counters.py`
+- Installer: `install_npu_memory_counter_patch`
+- Orchestration: `vllm_gr/v1/ascend_compat.py::patch_npu_worker_init_device`
+- Target: `NPUWorker.profile_memory` in `vllm_ascend.worker.worker` or
+  `vllm_ascend.worker.worker_v1`
+- Mutation: native method replacement during worker device initialization
+- Platform / process role: NPU worker
+- Risk: Medium
+- Supported runtime: `vllm-ascend==0.22.1rc1`, `torch-npu==2.10.0`.
+- Native contract: `profile_memory(self)` sets `torch_reserved` and
+  `torch_allocated` from the current device allocator counters, emits the native
+  debug log, and returns `None`.
+- Behavior: reads the public `torch_npu.npu.memory.memory_stats_as_nested_dict()`
+  once and selects `reserved_bytes.all.current` and
+  `allocated_bytes.all.current`, preserving native zero defaults for an
+  uninitialized allocator or missing counters. Allocator errors propagate.
+- Installation guards: only the two native module paths and the self-only
+  signature are accepted; custom methods, existing wrappers, missing native
+  `logger.debug`, and unavailable or non-callable nested memory APIs keep their
+  original method. Repeated installation is idempotent.
+- Compatibility fallback: a malformed nested schema or non-integer counter
+  calls the original sampler. A future native implementation with the same
+  module and signature still requires review of the two-counter contract.
+- Validation:
+    - `tests/test_npu_memory_counters.py::test_one_snapshot_preserves_counters_and_original_logger`;
+    - `tests/test_npu_memory_counters.py::test_uninitialized_and_missing_counters_match_native_zero_defaults`;
+    - `tests/test_npu_memory_counters.py::test_each_call_refreshes_fields_and_installation_is_idempotent`;
+    - `tests/test_npu_memory_counters.py::test_missing_nested_api_keeps_original_method`;
+    - `tests/test_npu_memory_counters.py::test_unknown_worker_profiles_keep_original_semantics`;
+    - `tests/test_npu_memory_counters.py::test_changed_nested_schema_falls_back_to_native`;
+    - `tests/test_npu_memory_counters.py::test_allocator_errors_are_propagated`;
+    - `tests/test_npu_memory_counters.py::test_module_import_does_not_load_npu_runtime`;
+    - `tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`.
+- Removal condition: vLLM-Ascend reads the two allocator counters without
+  flattening full memory statistics.
+
 ## Benchmark-only Runtime Mutations
 
 `benchmarks/open_one_rec/one_rec_patch.py` modifies benchmark request and serving helpers at runtime. These mutations are benchmark-only and must not be treated as production runtime patches.
@@ -340,19 +370,22 @@ The following historical implicit contracts also need review during the 0.30 mig
 
 ```text
 EngineArgs.catalog_path
-Request.is_beam
-Request.beam_width
-Request.is_beam_decode
-Request.beam_decode_steps
-Request.prefix_len
+EngineArgs._vllm_gr_config_input
 SchedulerOutput.beam_data
 SchedulerOutput._gr_request_row_configs
+SchedulerOutput.gr_stage_metadata
+SchedulerOutput.gr_retire_metadata
 Runner._current_beam_data
 Runner._current_beam_info
 Runner._beam_logprobs_cache
-BeamSearchSequence._lp_parent
-BeamSearchSequence._lp_step_data
+Runner._gr_gpu_stage_runner
+Runner._vllm_gr_config
+EngineCoreOutput.kv_transfer_params["gr_batch_result"]
 ```
+
+Device-specific compatibility hooks also retain native request/row metadata.
+The removed frontend Catalog object and per-step BeamRequest protocol are not
+part of the current frontend contract.
 
 ### Configuration keys
 

@@ -163,13 +163,14 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
         )
     if (
         request is not None
-        and str(device).split(":")[0] != "npu"
+        and device is not None
+        and str(device).split(":")[0] not in ("cuda", "npu")
         and (
             request.beam_params.dynamic_beam_widths is not None
             or request.output_options.num_return_sequences != request.beam_params.beam_width
         )
     ):
-        raise ValueError("dynamic beam widths and result widths require NPU beam_search_v1")
+        raise ValueError("dynamic beam widths and result widths require CUDA or NPU beam_search_v1")
 
 
 def validate_gr_request(request: BeamBatchRequest, *, config: Any = None) -> None:

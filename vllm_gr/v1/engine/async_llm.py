@@ -126,25 +126,6 @@ def take_admission_rejection(
     return rejections.pop(engine_request_id, None)
 
 
-def adopt_admission_rejection(engine_client, engine_request_id: str, request_id: str) -> bool:
-    """Re-file a reason parked under ``engine_request_id`` as ``request_id``.
-
-    The caller that extended the id calls this once the engine reports back on
-    it, holding both names at once, so the reason can be claimed under the name
-    the serving layer looks up. The engine's own key is dropped as it moves:
-    a reason is never left under two names, and so is still claimed once.
-    """
-    processor = getattr(engine_client, "output_processor", None)
-    rejections = getattr(processor, _ADMISSION_REJECTIONS_ATTR, None)
-    if not rejections:
-        return False
-    message = rejections.pop(engine_request_id, None)
-    if message is None:
-        return False
-    rejections[request_id] = message
-    return True
-
-
 def make_patched_process_outputs(original_process_outputs):
     """Preserve admission reasons while forwarding every output to vLLM."""
     if getattr(original_process_outputs, _PROCESS_OUTPUTS_PATCH_MARKER, False):

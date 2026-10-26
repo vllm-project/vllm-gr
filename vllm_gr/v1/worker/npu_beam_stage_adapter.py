@@ -158,7 +158,7 @@ class NPUEagerStagePlan:
         positions: torch.Tensor,
         winner_token_ids: torch.Tensor,
     ) -> None:
-        """Bind request-major winner tokens and positions without a D2H copy."""
+        """Bind winners and materialize NPU positions directly on device."""
 
         if self.execution.kind != "decode" or self.decode_positions is None:
             raise BeamExecutionContractError("Decode input binding requires a Decode plan")
@@ -177,13 +177,27 @@ class NPUEagerStagePlan:
                 "winner_token_ids and input_ids must be on the same device"
             )
         input_ids[:rows].copy_(winner_token_ids.reshape(-1))
-        positions[:rows].copy_(
-            torch.as_tensor(
-                self.decode_positions,
-                dtype=positions.dtype,
-                device=positions.device,
+        if positions.device.type == "npu":
+            # Positions are constant within each request's physical row range.
+            # Follow the execution layout (including dynamic stage widths) and
+            # merge adjacent equal requests without scanning every beam row.
+            start = 0
+            value = self.decode_positions[0]
+            for request_index in range(1, self.execution.batch_size):
+                stop = self.execution.rows_for_request(request_index).start
+                next_value = self.decode_positions[stop]
+                if next_value != value:
+                    positions[start:stop].fill_(value)
+                    start, value = stop, next_value
+            positions[start:rows].fill_(value)
+        else:
+            positions[:rows].copy_(
+                torch.as_tensor(
+                    self.decode_positions,
+                    dtype=positions.dtype,
+                    device=positions.device,
+                )
             )
-        )
 
     def remap_sampling_metadata(self, metadata: object) -> object:
         """Copy and expand request-level sampling tensors onto physical rows."""

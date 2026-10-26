@@ -388,6 +388,29 @@ def test_npu_request_accepts_matching_width_and_canonical_backend() -> None:
     assert request.beam_params.beam_width == 2
 
 
+@pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
+@pytest.mark.parametrize("widths", [None, [2], [2, 1, 2]])  # type: ignore[misc]
+def test_stage_widths_and_return_limit_reach_worker_contract(
+    device: str, widths: list[int] | None
+) -> None:
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(backend=device)})
+    engine.vllm_config.device_config = SimpleNamespace(device=device)
+    request = _prepare_request(
+        engine,
+        [1, 2],
+        BeamSearchParams(
+            beam_width=2,
+            dynamic_beam_widths=widths,
+            result_width=1,
+            max_tokens=3 if widths is None else len(widths),
+            ignore_eos=True,
+        ),
+        online=True,
+    )
+    assert request.beam_params.dynamic_beam_widths == (None if widths is None else tuple(widths))
+    assert request.output_options.num_return_sequences == 1
+
+
 def test_cuda_unconstrained_request_accepts_budget_beyond_table_depth() -> None:
     canonical = _canonical_gr_config(enabled=False)
     canonical["constrained_generation"] = False

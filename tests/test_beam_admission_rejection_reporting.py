@@ -34,7 +34,6 @@ from vllm_gr.v1.beam.batch_contracts import (
 )
 from vllm_gr.v1.engine import async_llm
 from vllm_gr.v1.engine.async_llm import (
-    adopt_admission_rejection,
     make_patched_process_outputs,
     note_admission_rejections,
     take_admission_rejection,
@@ -235,17 +234,19 @@ def test_a_finished_request_leaves_no_refusal_for_the_next_one() -> None:
         raise_if_error(processor, "cmpl-1")
 
 
-def test_adopting_a_refusal_moves_it_to_the_callers_id() -> None:
-    """The engine extends the id it is handed; the caller bridges it back."""
+def test_a_mapped_refusal_is_consumed_once_under_either_identity() -> None:
+    """The two exact identities refer to one consumable rejection."""
     processor = _Processor()
     note_admission_rejections(processor, [refusal("cmpl-1-8b31d4")])
 
-    assert adopt_admission_rejection(client(processor), "cmpl-1-8b31d4", "cmpl-1")
+    async_llm.remember_client_request_id(processor, "caller-name", "cmpl-1-8b31d4")
 
     with pytest.raises(VLLMValidationError) as caught:
-        raise_if_error(processor, "cmpl-1")
+        raise_if_error(processor, "cmpl-1", "caller-name")
 
     assert str(caught.value) == REASON
+    assert take_admission_rejection(client(processor), "cmpl-1-8b31d4") is None
+    assert take_admission_rejection(client(processor), "cmpl-1", "caller-name") is None
 
 
 def test_a_caller_name_finds_the_request_it_was_submitted_as() -> None:
@@ -281,11 +282,12 @@ def test_a_reused_caller_name_finds_the_latest_request_only() -> None:
         raise_if_error(processor, "cmpl-1", "caller-name")
 
 
-def test_adopting_what_was_never_parked_moves_nothing() -> None:
+def test_a_missing_mapped_refusal_does_not_consume_another_identity() -> None:
     processor = _Processor()
     note_admission_rejections(processor, [refusal("cmpl-1")])
 
-    assert not adopt_admission_rejection(client(processor), "cmpl-1-8b31d4", "cmpl-1")
+    async_llm.remember_client_request_id(processor, "caller-name", "cmpl-1-8b31d4")
+    assert take_admission_rejection(client(processor), "missing", "caller-name") is None
     # The reason filed under the caller's own id is left where it was.
     assert take_admission_rejection(client(processor), "cmpl-1") == REASON
 
