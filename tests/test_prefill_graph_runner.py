@@ -343,6 +343,154 @@ class MockNPUAttnBuilder:
         self.npu_causal_atten_mask = None
 
 
+def _npu_prefill_replay_harness(monkeypatch: pytest.MonkeyPatch, batch_size: int) -> Any:
+    """Exercise production staging with CPU tensors and only the NPU API mocked."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    import vllm.forward_context as forward_context
+
+    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+
+    runner: Any = MockModelRunner()
+    runner.model_config = SimpleNamespace(max_model_len=256)
+    runner.kv_cache_config = SimpleNamespace(
+        num_blocks=128,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))],
+    )
+    graph_runner = NPUPrefillGraphRunner(runner, buckets=[256])
+    buf = graph_runner.buffers[256]
+    graph_runner._prepare_capture_buffers(buf, 256, runner)
+    capture_meta = graph_runner._build_dummy_metadata(256, MockNPUAttnBuilder(), buf)
+    counts = [64] * batch_size
+    total_tokens = sum(counts)
+    meta = SimpleNamespace(
+        block_table=torch.zeros((batch_size, 16), dtype=torch.int32),
+        query_start_loc_cpu=[64 * index for index in range(batch_size + 1)],
+        seq_lens_cpu=counts,
+        num_reqs=batch_size,
+        num_actual_tokens=total_tokens,
+    )
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer": meta}),
+    )
+    updates: list[dict[str, Any]] = []
+    replays: list[bool] = []
+
+    def update_params(
+        update_stream: Any, entry: Any, qlen: Any, kvlen: Any, table: torch.Tensor
+    ) -> bool:
+        updates.append(
+            {
+                "pointer": table.data_ptr(),
+                "shape": tuple(table.shape),
+                "stride": table.stride(),
+                "contiguous": table.is_contiguous(),
+                "table": table.clone(),
+            }
+        )
+        return True
+
+    backend = ModuleType("vllm_gr.v1.attention.backends.beam_attn_npu")
+    backend.__dict__["update_graph_params"] = update_params
+    monkeypatch.setitem(sys.modules, backend.__name__, backend)
+    serving_stream = SimpleNamespace(wait_stream=lambda other: None)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(current_stream=lambda: serving_stream), raising=False
+    )
+    graph_runner._update_stream = object()
+    graph_runner.entries[256] = object()
+    buf.captured_graphs[1] = SimpleNamespace(replay=lambda: replays.append(True))
+    buf.output_bufs[1] = torch.zeros((256, 8))
+
+    def replay() -> Any:
+        return graph_runner.execute_model_prefill(
+            bucket=256,
+            input_ids=torch.arange(total_tokens, dtype=torch.int32),
+            positions=torch.arange(total_tokens, dtype=torch.int64),
+            slot_mapping=torch.arange(total_tokens, dtype=torch.int32),
+            num_scheduled_tokens=counts,
+        )
+
+    return SimpleNamespace(
+        runner=runner,
+        graph_runner=graph_runner,
+        buf=buf,
+        capture_meta=capture_meta,
+        meta=meta,
+        updates=updates,
+        replays=replays,
+        replay=replay,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore[misc]
+def test_npu_prefill_keeps_full_width_owned_block_table(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int
+) -> None:
+    harness = _npu_prefill_replay_harness(monkeypatch, batch_size)
+    owner = harness.buf.block_table_buf
+    assert owner.shape == (8, 17)
+    pointer = owner.data_ptr()
+    assert harness.capture_meta.block_table.shape == (8, 17)
+    assert harness.capture_meta.block_table.is_contiguous()
+    assert harness.capture_meta.block_table.data_ptr() == pointer
+
+    for iteration, columns in enumerate((16, 17, 16)):
+        live = torch.arange(batch_size * columns, dtype=torch.int32).reshape(batch_size, columns)
+        live += 100 * (iteration + 1)
+        harness.meta.block_table = live
+        assert harness.replay() is harness.buf.output_bufs[1]
+        update = harness.updates[-1]
+        assert update["pointer"] == pointer
+        assert update["shape"] == (batch_size, 17)
+        assert update["stride"] == (17, 1)
+        assert update["contiguous"]
+        assert torch.equal(update["table"][:, :columns], live)
+        if columns < 17:
+            assert torch.count_nonzero(update["table"][:, columns:]).item() == 0
+        assert harness.buf.block_table_buf is owner
+        assert harness.capture_meta.block_table.data_ptr() == pointer
+    assert harness.replays == [True, True, True]
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "invalid", ["dtype", "rank", "missing_rows", "excess_columns", "empty_columns"]
+)
+def test_npu_prefill_rejects_incompatible_block_table_before_update(
+    monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    harness = _npu_prefill_replay_harness(monkeypatch, 4)
+    tables = {
+        "dtype": torch.zeros((4, 16), dtype=torch.int64),
+        "rank": torch.zeros((16,), dtype=torch.int32),
+        "missing_rows": torch.zeros((3, 16), dtype=torch.int32),
+        "excess_columns": torch.zeros((4, 18), dtype=torch.int32),
+        "empty_columns": torch.zeros((4, 0), dtype=torch.int32),
+    }
+    harness.meta.block_table = tables[invalid]
+    assert harness.replay() is None
+    assert harness.updates == []
+    assert harness.replays == []
+
+
+def test_npu_prefill_copies_only_active_source_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _npu_prefill_replay_harness(monkeypatch, 4)
+    live = torch.arange(9 * 16, dtype=torch.int32).reshape(9, 16)
+    harness.meta.block_table = live
+    assert harness.replay() is harness.buf.output_bufs[1]
+    update = harness.updates[-1]
+    assert update["shape"] == (4, 17)
+    assert update["contiguous"]
+    assert torch.equal(update["table"][:, :16], live[:4])
+    assert torch.count_nonzero(update["table"][:, 16:]).item() == 0
+    assert harness.replays == [True]
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("bucket", "expected_reqs", "expected_lens", "expected_cols"),
     [

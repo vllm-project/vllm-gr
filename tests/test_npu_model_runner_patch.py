@@ -21,7 +21,6 @@ from vllm_gr.v1.beam.npu_execution_batch import (
 from vllm_gr.v1.worker import npu_model_runner_patch as npu_patch
 from vllm_gr.v1.worker.model_runner_common import InputBatchProxy
 from vllm_gr.v1.worker.npu_beam_stage_adapter import (
-    NPUEagerFirstDecodeHandoff,
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
@@ -146,9 +145,7 @@ def test_npu_prefill_cache_hit_uses_scheduled_logits_and_full_decode_positions(
     winners = torch.arange(len(cached) * 3, dtype=torch.int32).view(len(cached), 3)
     input_ids = torch.empty(len(cached) * 3, dtype=torch.int32)
     positions = torch.empty_like(input_ids)
-    NPUEagerFirstDecodeHandoff.from_prefill(plan, winners).bind_first_decode(
-        decode_plan, input_ids, positions
-    )
+    decode_plan.prepare_decode_inputs(input_ids, positions, winners)
     assert input_ids.tolist() == winners.flatten().tolist()
     assert positions.tolist() == [
         length for length in plan.execution.num_prompt_tokens_by_request for _ in range(3)
@@ -1456,27 +1453,15 @@ def test_npu_capture_logs_requested_and_retained_resources(
     assert "excludes graph and scratch memory" in messages[-1]
 
 
-def test_npu_eager_decode_binds_winners_and_sampling_rows() -> None:
-    prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
+def test_npu_eager_decode_binds_winners_and_positions() -> None:
     plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
     input_ids = torch.full((8,), -1, dtype=torch.int32)
     positions = torch.full((8,), -1, dtype=torch.int64)
     winners = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
-    handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
-
-    handoff.bind_first_decode(plan, input_ids, positions)
+    plan.prepare_decode_inputs(input_ids, positions, winners)
 
     assert input_ids.tolist() == [11, 12, 13, 21, 22, 23, -1, -1]
     assert positions.tolist() == [2, 2, 2, 3, 3, 3, -1, -1]
-    source = SimpleNamespace(
-        temperature=torch.tensor([0.5, 0.9]),
-        top_p=torch.tensor([0.8, 0.7]),
-    )
-    remapped = plan.remap_sampling_metadata(source)
-    assert remapped is not source
-    assert remapped.temperature.tolist() == pytest.approx([0.5] * 3 + [0.9] * 3)
-    assert remapped.top_p.tolist() == pytest.approx([0.8] * 3 + [0.7] * 3)
-    assert source.temperature.tolist() == pytest.approx([0.5, 0.9])
 
 
 class _NPUPositionTensor(torch.Tensor):  # type: ignore[misc]
@@ -1822,23 +1807,6 @@ def test_npu_decode_positions_dynamic_widths_match_original_across_async_steps(
         assert torch.all(actual[rows:] == -9)
 
 
-def test_npu_eager_attention_layout_keeps_request_ownership() -> None:
-    plan = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="decode"))
-    layout = plan.build_decode_attention_layout(
-        block_ids_by_request=((10, 11), (20, 21)),
-        pool_slots=(4, 7),
-    )
-
-    assert layout.row_request_indices == (0, 0, 0, 1, 1, 1)
-    assert layout.row_beam_indices == (0, 1, 2, 0, 1, 2)
-    assert layout.query_start_locations == tuple(range(7))
-    assert layout.prefix_sequence_lengths == (2, 2, 2, 3, 3, 3)
-    assert layout.suffix_sequence_lengths == (1,) * 6
-    assert layout.prefix_block_tables[:3] == ((10, 11),) * 3
-    assert layout.prefix_block_tables[3:] == ((20, 21),) * 3
-    assert layout.pool_slots == (4, 7)
-
-
 def test_npu_capability_gate_allows_graph_mode_and_remains_npu_only() -> None:
     worker = SimpleNamespace(
         device="npu",
@@ -1863,7 +1831,6 @@ def test_npu_capability_gate_allows_graph_mode_and_remains_npu_only() -> None:
 def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> None:
     scheduler_output = _eager_stage_output(kind="decode")
     plan = NPUEagerStagePlan.from_scheduler_output(scheduler_output)
-    prefill = NPUEagerStagePlan.from_scheduler_output(_eager_stage_output(kind="prefill"))
     winners = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
     input_batch = SimpleNamespace(req_ids=list(plan.execution.request_ids))
     worker = SimpleNamespace(
@@ -1877,7 +1844,6 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler() -> 
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker = worker
     stage.pending_plan = plan
-    stage.handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
     stage.latest_token_ids = winners
     runtime_output = stage._runtime_scheduler_output(scheduler_output, plan)
     worker._current_scheduler_output = runtime_output
@@ -2031,7 +1997,6 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     stage = object.__new__(NPUEagerBeamStageRunner)
     stage.worker, stage.previous = worker, prefill.execution
     stage.closed, stage.pending_plan, stage.execution_error = False, None, None
-    stage.handoff = NPUEagerFirstDecodeHandoff.from_prefill(prefill, winners)
     stage.latest_token_ids = winners
     stage.session_request = None
     stage.attention_batch = SimpleNamespace(

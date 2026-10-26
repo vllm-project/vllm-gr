@@ -266,7 +266,19 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         blocks_per_req = (max_req_len + builder.block_size - 1) // builder.block_size
         if num_blocks is None:
             num_blocks = blocks_per_req * num_reqs
-        block_table = torch.zeros((num_reqs, blocks_per_req), dtype=torch.int32, device=self.device)
+        # Use the same owned, full-width table at capture and replay. Slicing
+        # columns from a wider table makes multi-request views non-contiguous;
+        # FIA may then insert a copy that changes the captured task topology.
+        if buf.block_table_buf is None:
+            if buf.has_captured_graph(1):
+                raise RuntimeError("Captured Prefill NPU graph has no owned block table")
+            buf.block_table_buf = torch.zeros(
+                (SUPPORTED_NUM_REQS[-1], blocks_per_req), dtype=torch.int32, device=self.device
+            )
+        if buf.block_table_buf.shape[1] < blocks_per_req:
+            raise ValueError("Prefill NPU graph block table cannot cover the dummy sequence")
+        block_table = buf.block_table_buf[:num_reqs]
+        block_table.zero_()
         blk = 0
         for r in range(num_reqs):
             for c in range(blocks_per_req):
@@ -500,16 +512,27 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         # reading it, so the copy is ordered before the replay's reads.
         live_bt = meta.block_table
         bt_buf = buf.block_table_buf
-        if bt_buf is None or live_bt.shape[1] > bt_buf.shape[1]:
+        if (
+            bt_buf is None
+            or not isinstance(live_bt, torch.Tensor)
+            or live_bt.ndim != 2
+            or live_bt.dtype != torch.int32
+            or live_bt.device != bt_buf.device
+            or live_bt.layout != torch.strided
+            or live_bt.shape[0] < num_reqs
+            or not 0 < live_bt.shape[1] <= bt_buf.shape[1]
+            or not bt_buf.is_contiguous()
+        ):
             logger.warning(
-                "NPU prefill graph replay: block table shape %s exceeds the "
-                "staged buffer; falling back to eager prefill.",
-                tuple(live_bt.shape),
+                "NPU prefill graph replay: block table is incompatible with the "
+                "staged buffer; falling back to eager prefill."
             )
             return None
-        num_cols = min(live_bt.shape[1], bt_buf.shape[1])
-        bt_staged = bt_buf[: live_bt.shape[0], :num_cols]
-        bt_staged.copy_(live_bt[: live_bt.shape[0], :num_cols], non_blocking=True)
+        num_cols = live_bt.shape[1]
+        bt_staged = bt_buf[:num_reqs]
+        bt_staged[:, :num_cols].copy_(live_bt[:num_reqs], non_blocking=True)
+        if num_cols < bt_staged.shape[1]:
+            bt_staged[:, num_cols:].zero_()
 
         from vllm_gr.v1.attention.backends.beam_attn_npu import update_graph_params
 

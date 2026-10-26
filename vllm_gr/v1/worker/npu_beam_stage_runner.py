@@ -42,7 +42,6 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     GR_WORKER_RESULT_ATTR,
 )
 from vllm_gr.v1.worker.npu_beam_stage_adapter import (
-    NPUEagerFirstDecodeHandoff,
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
@@ -58,12 +57,10 @@ class NPUEagerBeamStageRunner:
         self.pending_plan: NPUEagerStagePlan | None = None
         self.execution_error: Exception | None = None
         self.logical_scheduler_output: Any = None
-        self.handoff: NPUEagerFirstDecodeHandoff | None = None
         self.prefill_candidates: Any = None
         self.latest_token_ids: torch.Tensor | None = None
         self.parent_history: torch.Tensor | None = None
         self.session_request: BeamBatchRequest | None = None
-        self.decode_candidates: Any = None
         self.logits: torch.Tensor | None = None
         self.attention_batch: NPUBeamExecutionBatch | None = None
         self.dynamic_state: Any = None
@@ -440,7 +437,6 @@ class NPUEagerBeamStageRunner:
         execution = plan.execution
         if execution.kind == "prefill":
             self.prefill_candidates = candidates
-            self.handoff = NPUEagerFirstDecodeHandoff.from_prefill(plan, candidates.token_ids)
             self.latest_token_ids = candidates.token_ids
             if is_last:
                 # Filter and rank all finite candidates before the return limit.
@@ -457,7 +453,6 @@ class NPUEagerBeamStageRunner:
                     parents,
                 )
         else:
-            self.decode_candidates = candidates
             if self.attention_batch is None:
                 raise RuntimeError("Decode decision has no persistent attention batch")
             if self._uses_dynamic_state(plan):
