@@ -132,6 +132,7 @@ state and actual CUDA replay check request order and storage reuse.
 | Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
 | Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |
 | Existing public protocol, generation steps and scheduler integration | `tests/st/test_onerec_v1_scheduler_st.py`, `tests/st/test_modelrunner_v2_stage_parity_st.py` |
+| Unconstrained B=1/4, V1/V2 Eager, default Graph and explicit FULL Prefill | `tests/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1` |
 | Real-model multi-batch execution and V1 baseline comparison | `tests/st/model_runner_policy_isolation.py` (manual CLI) |
 | Real video business accuracy and cross-B comparison | `tests/st/onerec_multibatch_accuracy.py` (manual CLI) |
 
@@ -168,6 +169,28 @@ Cross-B or Graph/Eager equality is a separate numerical investigation; it is
 not a required identity in this probe. Different shapes can change BF16
 scores and candidate order. Use the real-data evaluator below to enforce the
 benchmark's business thresholds and record cross-B differences separately.
+
+### Unconstrained generation
+
+The existing offline test also runs without a Constraint Table, using the
+configured `max_top_k` capacity. Run its six isolated engine configurations:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
+python -m pytest --run-slow -q \
+  tests/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1
+```
+
+The matrix covers V1/V2 with Eager, default Graph and an explicit FULL Prefill
+grid. Each engine processes B=1 and B=4 with W=128. The FULL cases require
+actual Prefill replay at 1024 tokens and at 4102 tokens padded to 4224;
+enabling graph mode alone does not establish FULL Prefill coverage. The test
+uses V1's GR Prefill grid and V2's native token capture list respectively.
+It checks runner identity, Decode execution, candidate structure and scores,
+request retirement and clean EngineCore shutdown. V2 graph cases also reject
+request-time capture. Results are saved in each pytest temporary directory's
+`unconstrained.json`. This is a functional check, with no cross-mode numerical
+identity or business accuracy claim.
 
 ## Reproduce the real-data accuracy run
 
