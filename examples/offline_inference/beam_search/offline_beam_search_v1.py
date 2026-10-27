@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Run or benchmark offline Beam Search V1 with a canonical Constraint Table."""
+"""Run offline SID Beam Search, optionally after thinking on the same input."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ import tempfile
 from pathlib import Path
 from statistics import mean
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
+
+import regex as re
 
 os.environ.setdefault("USE_TF", "0")
 
@@ -27,8 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--catalog",
         type=Path,
-        required=True,
-        help="Constraint triples JSON produced by tools/build_constraint_triples.py",
+        help="Constraint triples JSON; required for Beam, unused with --enable-thinking",
     )
     parser.add_argument(
         "--constraint-backend",
@@ -37,6 +38,35 @@ def parse_args() -> argparse.Namespace:
         help="Constraint Table device backend (CUDA or NPU)",
     )
     parser.add_argument("--prompt", type=Path, required=True)
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Run ordinary LLM thinking instead of constrained Beam SID generation",
+    )
+    parser.add_argument(
+        "--cot",
+        action="store_true",
+        help="Use the same complete --prompt for thinking, then constrained SID Beam Search",
+    )
+    parser.add_argument(
+        "--cot-max-tokens",
+        type=int,
+        default=1024,
+        help="Thinking budget before Beam; default policy aborts if </think> is not reached",
+    )
+    parser.add_argument(
+        "--cot-on-limit",
+        choices=("error", "truncate"),
+        default="error",
+        help="On an exhausted CoT budget: fail, or explicitly close the span and continue",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=1024, help="CoT plus final answer output budget"
+    )
+    parser.add_argument("--temperature", type=float, default=0.6, help="Thinking mode sampling")
+    parser.add_argument("--top-p", type=float, default=0.95, help="Thinking mode sampling")
+    parser.add_argument("--top-k", type=int, default=20, help="Thinking mode sampling")
+    parser.add_argument("--seed", type=int, default=0, help="Thinking mode random seed")
     parser.add_argument(
         "--execution",
         choices=("eager", "graph"),
@@ -72,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-json",
         type=Path,
-        help="Save benchmark summary and per-run timings (requires --repeat)",
+        help="Save Beam benchmark (--repeat required), or thinking output and timings",
     )
     parser.add_argument(
         "--profile-dir",
@@ -92,6 +122,23 @@ def parse_args() -> argparse.Namespace:
         help="Complete batches to profile; print only the last result (requires --profile-dir)",
     )
     args = parser.parse_args()
+    if args.cot and args.enable_thinking:
+        parser.error("--cot and --enable-thinking are separate modes; choose one")
+    if args.cot and args.cot_max_tokens <= 0:
+        parser.error("--cot-max-tokens must be positive")
+    if not args.enable_thinking and args.catalog is None:
+        parser.error("--catalog is required unless --enable-thinking is set")
+    if args.enable_thinking or args.cot:
+        if args.enable_thinking and (
+            args.dynamic_beam_widths is not None or args.result_width is not None
+        ):
+            parser.error("--enable-thinking cannot be combined with dynamic Beam options")
+        if args.max_tokens <= 0 or args.max_model_len <= 0:
+            parser.error("--max-tokens and --max-model-len must be positive")
+        if not 0.0 <= args.temperature <= 2.0 or not 0.0 < args.top_p <= 1.0:
+            parser.error("--temperature must be in [0, 2] and --top-p in (0, 1]")
+        if args.top_k < -1:
+            parser.error("--top-k must be -1, 0, or positive")
     if args.dynamic_beam_widths is not None:
         try:
             widths = [int(value.strip()) for value in args.dynamic_beam_widths.split(",")]
@@ -122,7 +169,11 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--repeat cannot be combined with --profile-dir; profile overhead affects latency"
         )
-    if args.output_json is not None and args.repeat is None:
+    if (
+        args.output_json is not None
+        and args.repeat is None
+        and not (args.enable_thinking or args.cot)
+    ):
         parser.error("--output-json requires --repeat")
     return args
 
@@ -158,13 +209,104 @@ def isolate_prompts(prompts: list[Any], suffix: str) -> list[Any]:
     ]
 
 
+def execute_beam_batch(
+    llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
+) -> list[Any]:
+    if not getattr(args, "cot", False):
+        return cast(list[Any], llm.beam_search_v1(prompts, params, output_mode="full"))
+
+    from vllm import SamplingParams
+
+    tokenizer = llm.get_tokenizer()
+    close_id = single_thinking_token(tokenizer, "</think>")
+    started = perf_counter()
+    completions = llm.generate(
+        prompts,
+        SamplingParams(
+            max_tokens=args.cot_max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+            stop_token_ids=[close_id],
+            detokenize=False,
+        ),
+        use_tqdm=False,
+    )
+    thinking_ms = (perf_counter() - started) * 1000.0
+    if len(completions) != len(prompts):
+        raise RuntimeError("CoT returned a different request count; Beam was not started")
+    separator = list(tokenizer.encode("\n\n", add_special_tokens=False))
+    beam_prompts = []
+    records = []
+    for index, (prompt, result) in enumerate(zip(prompts, completions, strict=True)):
+        # LLM.generate returns results in input order. Verify their source IDs
+        # before associating each continuation with its SID request.
+        if result.prompt_token_ids != prompt["prompt_token_ids"]:
+            raise RuntimeError(f"request {index}: CoT prompt/order mismatch; Beam was not started")
+        if len(result.outputs) != 1:
+            raise RuntimeError("CoT requires one continuation per request")
+        completion = result.outputs[0]
+        ids = list(completion.token_ids)
+        forced_close = False
+        if (
+            ids
+            and ids[-1] != close_id
+            and completion.finish_reason == "length"
+            and len(ids) == args.cot_max_tokens
+            and getattr(args, "cot_on_limit", "error") == "truncate"
+        ):
+            ids.append(close_id)
+            forced_close = True
+        if not ids or ids[-1] != close_id:
+            raise RuntimeError(
+                f"request {index}: CoT did not reach </think> "
+                f"(finish_reason={completion.finish_reason}); increase --cot-max-tokens "
+                "or check the model/prompt. Beam was not started."
+            )
+        combined = [*prompt["prompt_token_ids"], *ids, *separator]
+        if len(combined) + args.generated_steps + 2 > args.max_model_len:
+            raise ValueError("CoT plus SID generation exceeds --max-model-len")
+        # Keep the initial token-handoff feature independent of partial-prefix
+        # reuse between ordinary Decode and the GR Beam runtime.
+        beam_prompts.append(
+            dict(
+                prompt,
+                prompt_token_ids=combined,
+                cache_salt=f"{prompt.get('cache_salt', 'offline-cot')}-sid-row-{index}",
+            )
+        )
+        records.append(
+            {
+                "request": index,
+                "thinking_token_ids": ids,
+                "generated_thinking_token_ids": list(completion.token_ids),
+                "thinking_text": tokenizer.decode(ids, skip_special_tokens=False),
+                "thinking_tokens": len(ids),
+                "generated_thinking_tokens": len(completion.token_ids),
+                "thinking_truncated": forced_close,
+                "forced_close": forced_close,
+                "beam_prompt_tokens": len(combined),
+            }
+        )
+    started = perf_counter()
+    outputs: list[Any] = llm.beam_search_v1(beam_prompts, params, output_mode="full")
+    if len(outputs) != len(prompts):
+        raise RuntimeError("Beam returned a different request count after CoT")
+    args.cot_last_report = {
+        "thinking_ms": thinking_ms,
+        "beam_ms": (perf_counter() - started) * 1000.0,
+        "requests": records,
+        "kv_handoff": "token IDs only; separate cache salts for thinking and SID Prefill",
+    }
+    return outputs
+
+
 def benchmark_beam_search(
     llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
 ) -> tuple[list[Any], dict[str, Any]]:
     for iteration in range(args.warmup_runs):
-        llm.beam_search_v1(
-            isolate_prompts(prompts, f"warmup-{iteration}"), params, output_mode="full"
-        )
+        execute_beam_batch(llm, args, isolate_prompts(prompts, f"warmup-{iteration}"), params)
 
     latencies_ms: list[float] = []
     returned_beams: list[int] = []
@@ -172,7 +314,7 @@ def benchmark_beam_search(
     for iteration in range(args.repeat):
         isolated = isolate_prompts(prompts, f"benchmark-{iteration}")
         started = perf_counter()
-        outputs = llm.beam_search_v1(isolated, params, output_mode="full")
+        outputs = execute_beam_batch(llm, args, isolated, params)
         latencies_ms.append((perf_counter() - started) * 1000.0)
         if len(outputs) != len(prompts):
             raise RuntimeError(f"expected {len(prompts)} request outputs, got {len(outputs)}")
@@ -225,6 +367,16 @@ def benchmark_beam_search(
         report["dynamic_beam_widths"] = list(args.dynamic_beam_widths)
     if getattr(args, "result_width", None) is not None:
         report["result_width"] = args.result_width
+    if getattr(args, "cot", False):
+        report.update(
+            mode="cot_beam",
+            input_len=None,
+            cot_input_tokens=len(prompts[0]["prompt_token_ids"]),
+            cot_max_tokens=args.cot_max_tokens,
+            cot_on_limit=args.cot_on_limit,
+            timing_scope="CoT generation, token handoff and beam_search_v1 until outputs return; "
+            "excludes startup, warmup and printing",
+        )
     return outputs, report
 
 
@@ -232,12 +384,12 @@ def run_beam_search(
     llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
 ) -> list[Any]:
     if args.profile_dir is None:
-        outputs: list[Any] = llm.beam_search_v1(prompts, params, output_mode="full")
+        outputs: list[Any] = execute_beam_batch(llm, args, prompts, params)
         return outputs
 
     def run_once(iteration: int) -> list[Any]:
         isolated = isolate_prompts(prompts, f"profile-{iteration}")
-        result: list[Any] = llm.beam_search_v1(isolated, params, output_mode="full")
+        result: list[Any] = execute_beam_batch(llm, args, isolated, params)
         return result
 
     for iteration in range(args.profile_warmup_runs):
@@ -304,6 +456,247 @@ def make_prompt(tokenizer: Any, path: Path, input_len: int) -> list[int]:
     return [int(newline[0])] * (submitted_len - len(source)) + [int(token) for token in source]
 
 
+def _read_thinking_input(path: Path) -> str:
+    """Read plain text or unambiguously encoded ChatML, without guessing escapes."""
+    text = path.read_text(encoding="utf-8")
+    if text.lstrip().startswith('"'):
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError as exc:
+            if re.match(r'^"\s*<\|im_start\|>', text.lstrip()):
+                raise ValueError("JSON-encoded ChatML must be a complete JSON string") from exc
+        else:
+            if isinstance(decoded, str) and decoded.lstrip().startswith("<|im_start|>"):
+                text = decoded
+    if (
+        text.lstrip().startswith("<|im_start|>")
+        and "\\n" in text
+        and "\n" not in text.rstrip("\r\n")
+    ):
+        raise ValueError(
+            "ambiguous single-line ChatML with literal \\n; use real newlines or a "
+            "JSON string containing ChatML, with body backslashes escaped by JSON"
+        )
+    return text
+
+
+def _template_thinking_prompt(tokenizer: Any, text: str) -> list[int]:
+    tokens = tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}],
+        tokenize=True,
+        return_dict=False,
+        enable_thinking=True,
+        add_generation_prompt=True,
+    )
+    if not isinstance(tokens, list) or not all(isinstance(token, int) for token in tokens):
+        raise TypeError("chat template must return a flat list of token IDs")
+    if not tokens:
+        raise ValueError("chat template returned an empty prompt")
+    return tokens
+
+
+def single_thinking_token(tokenizer: Any, text: str) -> int:
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) != 1 or tokenizer.convert_ids_to_tokens(ids[0]) != text:
+        raise ValueError(f"CoT requires a dedicated {text} token in the model tokenizer")
+    return int(ids[0])
+
+
+def _reopen_empty_thinking_span(tokenizer: Any, ids: list[int]) -> list[int]:
+    rendered = tokenizer.decode(ids, skip_special_tokens=False)
+    if not re.search(r"<think>\s*</think>\s*$", rendered):
+        return ids
+    # Keep every earlier ID: an empty template span may be removed only when
+    # its opening tag is a real token boundary, not text inside another token.
+    open_id = single_thinking_token(tokenizer, "<think>")
+    try:
+        open_index = len(ids) - 1 - ids[::-1].index(open_id)
+    except ValueError as exc:
+        raise ValueError("chat template did not preserve the <think> special token") from exc
+    if not re.fullmatch(
+        r"<think>\s*</think>\s*",
+        tokenizer.decode(ids[open_index:], skip_special_tokens=False),
+    ):
+        raise ValueError("chat template did not preserve the terminal <think> token boundary")
+    return [*ids[: open_index + 1], *tokenizer.encode("\n", add_special_tokens=False)]
+
+
+def _serialized_thinking_prompt(tokenizer: Any, text: str) -> list[int]:
+    single_thinking_token(tokenizer, "<think>")
+    single_thinking_token(tokenizer, "</think>")
+    user_end = text.rfind("<|im_end|>")
+    prefix, suffix = text[:user_end], text[user_end:]
+    if user_end < 0 or not re.fullmatch(
+        r"<\|im_end\|>\s*<\|im_start\|>assistant\s*(?:<think>\s*(?:</think>\s*)?)?",
+        suffix,
+    ):
+        raise ValueError("CoT expects serialized chat ending in an empty assistant/think prefix")
+    prefix = re.sub(r"/no_think(?=\s*$)", "/think", prefix)
+    text = prefix + "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    return list(tokenizer.encode(text, add_special_tokens=False))
+
+
+def make_thinking_prompt(tokenizer: Any, path: Path) -> list[int]:
+    # Preserve the complete question and template; Beam's fixed-length prompt
+    # padding/truncation and SID boundary tokens do not apply to normal chat.
+    text = _read_thinking_input(path)
+    if text.lstrip().startswith("<|im_start|>"):
+        return _serialized_thinking_prompt(tokenizer, text)
+    return _reopen_empty_thinking_span(tokenizer, _template_thinking_prompt(tokenizer, text))
+
+
+def make_cot_prompt(tokenizer: Any, path: Path) -> list[int]:
+    """Preserve the full input; reopen only the terminal empty thinking span."""
+    single_thinking_token(tokenizer, "<think>")
+    single_thinking_token(tokenizer, "</think>")
+    ids = make_thinking_prompt(tokenizer, path)
+    # Some OneRec templates accept enable_thinking but leave the tag to the model.
+    rendered = tokenizer.decode(ids, skip_special_tokens=False)
+    if re.search(r"</think>\s*$", rendered):
+        raise ValueError("CoT cannot replace a nonempty thinking span from the chat template")
+    if not re.search(r"<think>\s*$", rendered):
+        ids.extend(tokenizer.encode("<think>\n", add_special_tokens=False))
+    if not ids:
+        raise ValueError("CoT prompt is empty")
+    return ids
+
+
+def run_thinking(args: argparse.Namespace) -> None:
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+    from vllm.inputs import tokens_input
+
+    from vllm_gr.entrypoints.gr import GRLLM
+
+    tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()), trust_remote_code=True)
+    prompt_ids = make_thinking_prompt(tokenizer, args.prompt.resolve())
+    if len(prompt_ids) + args.max_tokens > args.max_model_len:
+        raise ValueError(
+            f"thinking prompt ({len(prompt_ids)}) + --max-tokens ({args.max_tokens}) "
+            f"exceeds --max-model-len ({args.max_model_len}); the prompt was not truncated"
+        )
+    sampling = {
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "seed": args.seed,
+    }
+    params = SamplingParams(**sampling)
+    prompts = [tokens_input(list(prompt_ids)) for _ in range(args.batch_size)]
+    config = {
+        "schema_version": 1,
+        "attention_backend": "CUSTOM",
+        "constrained_generation": False,
+        "constraint_table": {"enabled": False, "backend": args.constraint_backend, "max_top_k": 1},
+    }
+    device_kwargs = {"block_size": 128} if args.constraint_backend == "npu" else {}
+    print(
+        f"mode=thinking batch_size={args.batch_size} input_tokens={len(prompt_ids)} "
+        f"max_tokens={args.max_tokens}; ordinary LLM generation, constraints disabled"
+    )
+    with GRLLM(
+        model=str(args.model.resolve()),
+        trust_remote_code=True,
+        seed=args.seed,
+        vllm_gr_config=config,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=False,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=max(args.max_model_len, args.batch_size * len(prompt_ids)),
+        max_num_seqs=max(4, args.batch_size),
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=args.execution == "eager",
+        **device_kwargs,
+        **profiler_engine_kwargs(args),
+    ) as llm:
+
+        def generate() -> list[Any]:
+            outputs: list[Any] = llm.generate(prompts, params, use_tqdm=False)
+            if len(outputs) != args.batch_size:
+                raise RuntimeError(f"expected {args.batch_size} outputs, got {len(outputs)}")
+            return outputs
+
+        latencies_ms: list[float] = []
+        generated_tokens: list[int] = []
+        if args.repeat is not None:
+            for _ in range(args.warmup_runs):
+                generate()
+            for _ in range(args.repeat):
+                started = perf_counter()
+                outputs = generate()
+                latencies_ms.append((perf_counter() - started) * 1000.0)
+                generated_tokens.append(
+                    sum(
+                        len(candidate.token_ids)
+                        for output in outputs
+                        for candidate in output.outputs
+                    )
+                )
+        elif args.profile_dir is not None:
+            for _ in range(args.profile_warmup_runs):
+                generate()
+            llm.start_profile(f"offline_thinking_{args.execution}_b{args.batch_size}")
+            try:
+                for _ in range(args.profile_runs):
+                    outputs = generate()
+            finally:
+                llm.stop_profile()
+        else:
+            outputs = generate()
+
+        results = []
+        for request_index, output in enumerate(outputs):
+            for candidate in output.outputs:
+                result = {
+                    "request": request_index,
+                    "text": candidate.text,
+                    "token_ids": list(candidate.token_ids),
+                    "generated_tokens": len(candidate.token_ids),
+                    "finish_reason": candidate.finish_reason,
+                    "stop_reason": candidate.stop_reason,
+                }
+                results.append(result)
+                print(
+                    f"request={request_index} generated_tokens={len(candidate.token_ids)} "
+                    f"finish_reason={candidate.finish_reason}\n{candidate.text}"
+                )
+
+    report = {
+        "mode": "thinking",
+        "model": str(args.model.resolve()),
+        "prompt": str(args.prompt.resolve()),
+        "execution": args.execution,
+        "batch_size": args.batch_size,
+        "input_tokens": len(prompt_ids),
+        "max_tokens": args.max_tokens,
+        "max_model_len": args.max_model_len,
+        "sampling": sampling,
+        "results": results,
+    }
+    if latencies_ms:
+        benchmark = {
+            "timing_scope": "generate API until output objects return; excludes startup and warmup",
+            "prefix_caching": False,
+            "repeat": args.repeat,
+            "warmup_runs": args.warmup_runs,
+            "mean_batch_latency_ms": mean(latencies_ms),
+            "runs": [
+                {"batch_latency_ms": latency, "generated_tokens": count}
+                for latency, count in zip(latencies_ms, generated_tokens, strict=True)
+            ],
+        }
+        report["benchmark"] = benchmark
+        print(json.dumps({"thinking_benchmark": benchmark}, ensure_ascii=False))
+    if args.output_json is not None:
+        output_path = args.output_json.resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"thinking_json={output_path}")
+
+
 def run(args: argparse.Namespace, artifact_path: Path) -> None:
     from vllm.inputs import tokens_input
 
@@ -314,6 +707,23 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
     # Candidate width K is the per-row top-k; None means it follows the beam
     # width (the pre-decoupling behaviour).
     candidate_width = args.candidate_width if args.candidate_width is not None else args.beam_width
+    cot_prompt_ids = None
+    prefill_capacity = args.batch_size * (args.input_len + 1)
+    if getattr(args, "cot", False):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()), trust_remote_code=True)
+        cot_prompt_ids = make_cot_prompt(tokenizer, args.prompt.resolve())
+        separator_len = len(tokenizer.encode("\n\n", add_special_tokens=False))
+        forced_close_reserve = int(args.cot_on_limit == "truncate")
+        longest_prompt = (
+            len(cot_prompt_ids) + args.cot_max_tokens + forced_close_reserve + separator_len + 1
+        )
+        if longest_prompt + args.generated_steps + 1 > args.max_model_len:
+            raise ValueError(
+                "full prompt plus --cot-max-tokens and SID budget exceeds --max-model-len"
+            )
+        prefill_capacity = args.batch_size * longest_prompt
 
     artifact_digest, tokenizer_digest = build_artifact(
         args.model.resolve(),
@@ -328,7 +738,7 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         "max_width": args.beam_width,
         "max_decode_steps": args.generated_steps,
     }
-    vllm_gr_config = {
+    vllm_gr_config: dict[str, Any] = {
         "schema_version": 1,
         "attention_backend": "CUSTOM",
         "beam": beam_config,
@@ -373,7 +783,7 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         max_model_len=args.max_model_len,
         # The V1 input processor appends the begin token to every prompt, so a
         # B-wide Prefill schedules B * (input_len + 1) tokens, not B * input_len.
-        max_num_batched_tokens=max(args.max_model_len, args.batch_size * (args.input_len + 1)),
+        max_num_batched_tokens=max(args.max_model_len, prefill_capacity),
         max_num_seqs=max(args.beam_width, args.batch_size),
         max_logprobs=candidate_width,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -381,7 +791,11 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
         **profiler_engine_kwargs(args),
     ) as llm:
         tokenizer = llm.get_tokenizer()
-        prompt_token_ids = make_prompt(tokenizer, args.prompt.resolve(), args.input_len)
+        if cot_prompt_ids is not None:
+            prompt_token_ids = cot_prompt_ids
+            print(f"mode=cot_beam input_tokens={len(prompt_token_ids)}; --input-len is not used")
+        else:
+            prompt_token_ids = make_prompt(tokenizer, args.prompt.resolve(), args.input_len)
         # Keep prefix caching enabled, but prevent duplicate batch rows from
         # sharing the same prompt block before their atomic Prefill completes.
         request_prompts = [
@@ -396,6 +810,13 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
             outputs, benchmark = benchmark_beam_search(llm, args, request_prompts, params)
         else:
             outputs = run_beam_search(llm, args, request_prompts, params)
+        if getattr(args, "cot", False):
+            print(json.dumps({"cot_beam": args.cot_last_report}, ensure_ascii=False))
+            if any(row["thinking_truncated"] for row in args.cot_last_report["requests"]):
+                print(
+                    "CoT budget exhausted: explicitly truncated (--cot-on-limit=truncate); "
+                    "this is not a naturally completed thinking span"
+                )
         if is_npu and args.execution == "graph":
             stats = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
             print(
@@ -446,17 +867,43 @@ def run(args: argparse.Namespace, artifact_path: Path) -> None:
                         ensure_ascii=False,
                     )
                 )
+        if getattr(args, "cot", False) and args.output_json is not None:
+            report = {
+                "mode": "cot_beam",
+                "cot": args.cot_last_report,
+                "benchmark": benchmark,
+                "results": [
+                    [
+                        {"tokens": list(seq.tokens), "cumulative_logprob": float(seq.cum_logprob)}
+                        for seq in output.sequences
+                    ]
+                    for output in outputs
+                ],
+            }
+            path = args.output_json.resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
 
 
 def main() -> None:
     args = parse_args()
-    for path in (args.model, args.catalog, args.prompt):
+    paths = (
+        (args.model, args.prompt)
+        if args.enable_thinking
+        else (args.model, args.catalog, args.prompt)
+    )
+    for path in paths:
         if not path.exists():
             raise FileNotFoundError(path)
-    if args.input_len + args.generated_steps + 1 > args.max_model_len:
-        raise ValueError("prompt and generated tokens exceed --max-model-len")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
+    if args.enable_thinking:
+        run_thinking(args)
+        return
+    if not args.cot and args.input_len + args.generated_steps + 1 > args.max_model_len:
+        raise ValueError("prompt and generated tokens exceed --max-model-len")
     if args.print_beams <= 0:
         raise ValueError("--print-beams must be positive")
 
