@@ -326,7 +326,7 @@ def test_startup_batch_plan_is_selected_by_entry_not_environment(
 
 @pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
 def test_missing_decode_graph_is_lazy_only_for_v1(v2: bool) -> None:
-    graph = SimpleNamespace(ready=False, replay=Mock(return_value="hidden"))
+    graph = SimpleNamespace(ready=False, capture_error=None, replay=Mock(return_value="hidden"))
     graph.capture = Mock(side_effect=lambda *args, **kwargs: setattr(graph, "ready", True))
     worker = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=False),

@@ -215,6 +215,8 @@ aligned with it.
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
     - `GPUModelRunner.sample_tokens`
+    - `GPUModelRunner.capture_model`
+    - `GPUModelRunner.load_model` / `shutdown`
 - Platform: GPU
 - Risk: Critical
 - Dependencies:
@@ -222,6 +224,16 @@ aligned with it.
     - the 2-item `_prepare_inputs` result;
     - native execute/sample separation and asynchronous output consumption;
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
+- Native reuse: CUDA `_determine_batch_execution_and_padding` and
+  `_bookkeeping_sync` retain their native identities. Beam stages select and
+  replay their own native `CUDAGraphWrapper` registry. The removed legacy
+  dispatcher and dummy capture path have no serving entry point.
+- Decode ownership: `BeamDecodeGraph` owns exact-signature runtime refusals,
+  native entries, and captured views. `discard_selected()` removes a single
+  shape and its refusal; `clear()` also invalidates worker startup publication.
+  CUDA V1 and V2 call `close_beam_decode_runtime()` before full model loads and
+  shutdown; V2 also uninstalls its Prefill manager and releases captured input
+  storage. In-place weight updates retain their existing lifecycle.
 - Removal condition: upstream provides stable hooks for grouped input preparation and output collapsing.
 
 ### GR-PATCH-012 — NPU ModelRunner Override

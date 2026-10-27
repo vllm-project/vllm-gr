@@ -188,9 +188,9 @@ def test_dispatcher_preserves_native_hooks_and_platform_constraint_capacity(
     load_wrapper = model_runner_patch.make_load_model_with_constraint_backend
     max_batches: list[int] = []
 
-    def install_load(original: Any, *, max_batch: int = 1) -> Any:
+    def install_load(original: Any, *, max_batch: int = 1, close_runtime: Any = None) -> Any:
         max_batches.append(max_batch)
-        return load_wrapper(original, max_batch=max_batch)
+        return load_wrapper(original, max_batch=max_batch, close_runtime=close_runtime)
 
     monkeypatch.setattr(model_runner_patch, "make_load_model_with_constraint_backend", install_load)
 
@@ -397,4 +397,44 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     model_runner_patch.apply_worker_patches()
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert Runner().capture_model() == 17
-    assert events == ["native", "stages" if mode is BeamExecutionMode.V1 else "legacy"]
+    assert events == (["native", "stages"] if mode is BeamExecutionMode.V1 else ["native"])
+
+
+def test_cuda_dispatch_remains_native_and_validator_detects_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_runner_patch, "_use_v2_model_runner", lambda: False)
+    monkeypatch.setattr(model_runner_patch, "_install_active_worker_resource_hook", lambda: None)
+
+    class Runner:
+        def execute_model(self, *args: Any) -> None:
+            pass
+
+        def _prepare_inputs(self, *args: Any) -> None:
+            pass
+
+        def _bookkeeping_sync(self, *args: Any) -> None:
+            pass
+
+        def _determine_batch_execution_and_padding(self, *args: Any, **kwargs: Any) -> Any:
+            return args, kwargs
+
+    monkeypatch.setattr(
+        gpu_model_runner_patch, "discover_worker_runners", lambda: (("GPUModelRunner", Runner),)
+    )
+    monkeypatch.setattr(
+        model_runner_patch, "_get_active_platform_module", lambda: gpu_model_runner_patch
+    )
+    determine = Runner._determine_batch_execution_and_padding
+    model_runner_patch.apply_worker_patches()
+    assert Runner._determine_batch_execution_and_padding is determine
+    assert Runner()._determine_batch_execution_and_padding(4, mode="native") == (
+        (4,),
+        {"mode": "native"},
+    )
+    assert model_runner_patch.is_worker_runner_patched(Runner)
+    first = Runner.execute_model
+    model_runner_patch.apply_worker_patches()
+    assert Runner.execute_model is first
+    monkeypatch.setattr(Runner, "_determine_batch_execution_and_padding", lambda self: None)
+    assert not model_runner_patch.is_worker_runner_patched(Runner)

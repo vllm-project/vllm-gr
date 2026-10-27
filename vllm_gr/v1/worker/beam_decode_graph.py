@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -58,6 +59,7 @@ class BeamDecodeGraph:
         self.capture_inputs: Any = None
         self.capture_attention: Any = None
         self._bindings: dict[BeamDecodeGraphSignature, tuple[Any, Any, Any]] = {}
+        self.capture_failures: dict[BeamDecodeGraphSignature, str] = {}
         self.capturing = False
         self.original_model = worker.model
         runnable = worker.model
@@ -78,6 +80,13 @@ class BeamDecodeGraph:
         entry = self.wrapper.concrete_cudagraph_entries.get(self.descriptor)
         return entry is not None and entry.cudagraph is not None
 
+    @property
+    def capture_error(self) -> str | None:
+        error = self.capture_failures.get(self.signature)
+        if error is not None:
+            self._check_context()
+        return error
+
     def select(self, batch_size: int, beam_width: int) -> BeamDecodeGraph:
         signature = BeamDecodeGraphSignature(batch_size, beam_width, batch_size * beam_width)
         self.signature = signature
@@ -89,12 +98,21 @@ class BeamDecodeGraph:
         """Drop a capture whose fixed input addresses cannot be reused."""
         self.wrapper.concrete_cudagraph_entries.pop(self.descriptor, None)
         self._bindings.pop(self.signature, None)
+        self.capture_failures.pop(self.signature, None)
         self.capture_inputs = self.capture_attention = None
         self.worker._beam_graph_keys = {signature.num_model_rows for signature in self._bindings}
+
+    def refuse_capture(self, error: str) -> None:
+        """Record an exact-shape refusal after cleanup and device health checks."""
+        self.discard_selected()
+        self.context = self.worker._beam_context
+        self.capture_failures[self.signature] = error
 
     def _check_context(self) -> None:
         if self.context is not self.worker._beam_context:
             raise RuntimeError("Beam graph context changed after capture")
+        if self.worker.model is not self.original_model and self.worker.model is not self.wrapper:
+            raise RuntimeError("Beam graph model changed after capture")
 
     def install(self) -> None:
         """Take over ``worker.model`` so Beam FULL forwards route here."""
@@ -115,12 +133,14 @@ class BeamDecodeGraph:
         self.installed = False
 
     def clear(self) -> None:
-        """Discard graph entries and captured views after an aborted startup."""
+        """Retire captures and their refusal records with the captured storage."""
         for entries in self._registries.values():
             entries.clear()
         self._registries.clear()
         self.wrapper.clear_graphs()
         self._bindings.clear()
+        self.capture_failures.clear()
+        self.context = None
         self.capture_inputs = self.capture_attention = None
         self.worker._beam_graph_keys = set()
 
@@ -167,6 +187,7 @@ class BeamDecodeGraph:
             stream.synchronize()
             if not self.ready:
                 raise RuntimeError("Beam Forward did not register its startup CUDA graph")
+            self.capture_failures.pop(self.signature, None)
             self._bindings[self.signature] = (
                 self.context,
                 self.capture_inputs,
@@ -176,13 +197,10 @@ class BeamDecodeGraph:
                 signature.num_model_rows for signature in self._bindings
             }
         except Exception:
-            if self._bindings:
-                # A failed capture of another batch size must not evict graphs
-                # already bound to a successfully captured signature.
-                self.wrapper.concrete_cudagraph_entries.pop(self.descriptor, None)
-                self.capture_inputs = self.capture_attention = None
-            else:
-                self.clear()
+            # A failed shape must not retire another shape's graph or refusal.
+            self.discard_selected()
+            if not self._bindings and not self.capture_failures:
+                self.wrapper.clear_graphs()
             raise
         finally:
             self.capturing = False
@@ -224,7 +242,9 @@ class _BeamDecodeModel(CUDAGraphWrapper):
     """
 
     def __init__(self, graph: BeamDecodeGraph, runnable: Any) -> None:
-        self.graph = graph
+        # The owner already retains this wrapper. Avoid a cycle that could
+        # keep a retired model alive after the serving heap is gc.freeze()'d.
+        self.graph = weakref.proxy(graph)
         # Preserve native get_model()/unwrap() and capability discovery.
         super().__init__(
             runnable,
@@ -264,3 +284,28 @@ def get_beam_decode_graph(
         worker._beam_decode_graph = graph
     width = int(_get_gr_config(worker).beam_max_width) if beam_width is None else beam_width
     return graph.select(batch_size, width)
+
+
+def _clear_startup_capture_state(worker: Any) -> None:
+    # Startup decisions persist across graph disposal until runtime shutdown.
+    for name in (
+        "_gr_decode_capture_failures",
+        "_gr_async_decode_graph_capture_failed",
+        "_gr_async_decode_graph_capture_error",
+    ):
+        if hasattr(worker, name):
+            delattr(worker, name)
+
+
+def close_beam_decode_runtime(worker: Any) -> None:
+    """Release CUDA Decode state before a full model load or shutdown."""
+    graph = getattr(worker, "_beam_decode_graph", None)
+    if graph is not None:
+        graph.uninstall()
+        graph.clear()
+        worker._beam_decode_graph = None
+    _clear_startup_capture_state(worker)
+    worker._beam_graph_keys = set()
+    for name in ("_gr_input_buffers", "_gr_gpu_stage_runner", "_gr_dynamic_graphs_discarded"):
+        if hasattr(worker, name):
+            delattr(worker, name)

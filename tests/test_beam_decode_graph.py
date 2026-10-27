@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
@@ -143,6 +144,7 @@ def capture_graph(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Mock, Mock]:
     graph.width = 4
     graph.signature = shared.BeamDecodeGraphSignature(1, 4, 4)
     graph._bindings = {}
+    graph.capture_failures = {}
     graph._registries = {}
     graph.capture_inputs = None
     graph.capture_attention = None
@@ -244,3 +246,109 @@ def test_only_supported_capture_phase_errors_can_request_recovery(
     if phase != "restore":
         assert graph.worker.model is graph.original_model
         assert not graph.installed
+
+
+@pytest.mark.parametrize("replacement", ["_beam_context", "model"])  # type: ignore[misc]
+def test_refusal_cannot_hide_replaced_context_or_model(
+    capture_graph: tuple[Any, Mock, Mock], replacement: str
+) -> None:
+    graph, _, _ = capture_graph
+    graph.refuse_capture("unsupported")
+    assert graph.capture_error == "unsupported"
+    setattr(graph.worker, replacement, object())
+    with pytest.raises(RuntimeError, match="changed after capture"):
+        _ = graph.capture_error
+
+
+def test_shape_refusals_retire_with_graphs_and_do_not_alias(
+    capture_graph: tuple[Any, Mock, Mock],
+) -> None:
+    graph, _, _ = capture_graph
+    graph.select(2, 4).refuse_capture("unsupported 2x4")
+    graph.select(4, 2).refuse_capture("unsupported 4x2")
+    graph.select(2, 4).discard_selected()
+    assert graph.capture_error is None
+    assert graph.select(4, 2).capture_error == "unsupported 4x2"
+    graph.worker._gr_decode_capture_failures = {4: "startup refused"}
+    graph.worker._gr_async_decode_graph_capture_failed = True
+    graph.worker._gr_async_decode_graph_capture_error = "startup refused"
+    graph.clear()
+    assert not graph.capture_failures
+    assert not graph._bindings and not graph._registries
+    assert graph.context is graph.capture_inputs is graph.capture_attention is None
+    assert graph.worker._gr_decode_capture_failures == {4: "startup refused"}
+    assert graph.worker._gr_async_decode_graph_capture_failed
+    assert graph.worker._gr_async_decode_graph_capture_error == "startup refused"
+    assert graph.select(4, 2).capture_error is None
+    graph.worker._beam_decode_graph = graph
+    shared.close_beam_decode_runtime(graph.worker)
+    assert not hasattr(graph.worker, "_gr_decode_capture_failures")
+    assert not hasattr(graph.worker, "_gr_async_decode_graph_capture_failed")
+    assert not hasattr(graph.worker, "_gr_async_decode_graph_capture_error")
+
+
+def test_failed_capture_preserves_other_shape_refusal_and_success_removes_it(
+    capture_graph: tuple[Any, Mock, Mock],
+) -> None:
+    graph, _, _ = capture_graph
+    graph.refuse_capture("unsupported 1x4")
+    graph.select(2, 2)
+
+    def unsupported(capture: bool) -> None:
+        if capture:
+            raise RuntimeError("operation not supported when stream is capturing")
+
+    with pytest.raises(shared.BeamDecodeCaptureUnsupported):
+        graph.capture(unsupported, persistent_install=False)
+    assert graph.capture_error is None
+    assert graph.select(1, 4).capture_error == "unsupported 1x4"
+
+    def success(capture: bool) -> None:
+        if capture:
+            graph.wrapper.concrete_cudagraph_entries[graph.descriptor] = SimpleNamespace(
+                cudagraph=object()
+            )
+
+    graph.capture(success, persistent_install=False)
+    assert graph.ready and graph.capture_error is None
+
+
+def test_v2_clear_releases_captured_input_storage(capture_graph: tuple[Any, Mock, Mock]) -> None:
+    from vllm_gr.v1.worker.gpu_model_runner_v2_resources import V2BeamDecodeGraph
+
+    graph, _, _ = capture_graph
+    graph.__class__ = V2BeamDecodeGraph
+    graph.input_buffers = graph.worker._gr_input_buffers = object()
+    graph.refuse_capture("unsupported")
+    graph.clear()
+    assert graph.input_buffers is None
+    assert not graph.capture_failures
+
+
+def test_close_retires_partial_startup_without_a_graph_owner() -> None:
+    worker = SimpleNamespace(
+        _beam_graph_keys={4},
+        _gr_decode_capture_failures={1: "refused"},
+        _gr_async_decode_graph_capture_failed=True,
+        _gr_async_decode_graph_capture_error="refused",
+        _gr_input_buffers=object(),
+        _gr_gpu_stage_runner=object(),
+        _gr_dynamic_graphs_discarded=True,
+    )
+    shared.close_beam_decode_runtime(worker)
+    shared.close_beam_decode_runtime(worker)
+    assert vars(worker) == {"_beam_graph_keys": set()}
+
+
+def test_wrapper_does_not_keep_retired_owner_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No device work is needed to exercise the real Beam wrapper constructor.
+    monkeypatch.setattr(shared.CUDAGraphWrapper, "__init__", lambda *args, **kwargs: None)
+    graph = object.__new__(shared.BeamDecodeGraph)
+    graph.worker = SimpleNamespace(vllm_config=object())
+    graph.wrapper = shared._BeamDecodeModel(graph, object())
+    retained_wrapper = graph.wrapper
+    reference = weakref.ref(graph)
+    del graph
+    # Refcount release must suffice, including while cyclic GC is frozen.
+    assert reference() is None
+    assert retained_wrapper is not None

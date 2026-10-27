@@ -269,9 +269,6 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         batch_size = len(owner.bindings)
         cfg = _get_gr_config(worker)
         geometry = (batch_size, owner.inputs.width)
-        if geometry in getattr(worker, "_gr_runtime_decode_capture_failures", {}):
-            owner.graph = None
-            return owner._forward()
         enabled = (
             not worker.model_config.enforce_eager
             and cfg.beam_graph_enabled
@@ -280,6 +277,9 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             and batch_size not in getattr(worker, "_gr_decode_capture_failures", {})
         )
         owner.graph = self.decode_graph(batch_size, owner.inputs.width) if enabled else None
+        if owner.graph is not None and owner.graph.capture_error is not None:
+            owner.graph = None
+            return owner._forward()
         # Dynamic sessions own per-width buffers. Rebuild after schedule/batch
         # changes, including the first fixed-width session following them.
         if (
@@ -297,11 +297,7 @@ class V2StageExecutionHooks(_StageExecutionHooks):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("Decode capture did not leave capture mode") from error
                 torch.accelerator.synchronize(worker.device)
-                owner.graph.discard_selected()
-                failures = getattr(worker, "_gr_runtime_decode_capture_failures", None)
-                if failures is None:
-                    failures = worker._gr_runtime_decode_capture_failures = {}
-                failures[geometry] = str(error)
+                owner.graph.refuse_capture(str(error))
                 owner.graph = None
                 logger.warning(
                     "GR runtime Decode capture unsupported; using eager for B=%d W=%d: %s",

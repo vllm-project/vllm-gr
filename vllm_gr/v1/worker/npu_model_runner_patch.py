@@ -659,7 +659,7 @@ def _dummy_beam_forward_npu(
 ) -> None:
     """Execute one dummy forward for beam-decode ACL Graph capture (or warmup).
 
-    Mirrors the GPU ``_dummy_beam_forward`` ordering contract:
+    Prepare fixed-address inputs in the order required by native NPU capture:
     1. ``decode_step_buf`` / ``decode_step_1based_buf`` / ``xllm_block_table_buf``
        fills — device inputs refreshed outside the graph, must precede forward.
     2. ``input_ids`` / ``positions`` — runner persistent buffers.

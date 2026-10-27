@@ -343,11 +343,12 @@ def apply_worker_patches() -> None:
         if not is_worker_runner_patched(runner_class)
     ]
 
+    close_runtime = getattr(platform_module, "close_runtime", None)
     for runner_name, runner_class in runners_to_patch:
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False):
             runner_class.load_model = make_load_model_with_constraint_backend(
-                load_model, max_batch=constraint_max_batch
+                load_model, max_batch=constraint_max_batch, close_runtime=close_runtime
             )
 
         reload_patcher = getattr(platform_module, "make_patched_reload_weights", None)
@@ -368,7 +369,7 @@ def apply_worker_patches() -> None:
         shutdown = getattr(runner_class, "shutdown", None)
         if not getattr(shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False):
             runner_class.shutdown = make_shutdown_with_constraint_backend(
-                shutdown if callable(shutdown) else None
+                shutdown if callable(shutdown) else None, close_runtime=close_runtime
             )
 
         runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
@@ -400,19 +401,15 @@ def apply_worker_patches() -> None:
         if sample_tokens_patch is not None and hasattr(runner_class, "sample_tokens"):
             runner_class.sample_tokens = sample_tokens_patch(runner_class.sample_tokens)
 
-        # After native capture_model() finishes, run the startup dummy capture
-        # of the beam-decode FULL graph (only when GRConfig enables it —
-        # beam_max_width configured and not disabled; no-op otherwise).
-        beam_capture = getattr(platform_module, "capture_beam_decode_graph", None)
+        # Native capture is followed by the admitted V1 stage capture path.
+        # An ordinary engine has no Beam Decode startup work.
         prefill_capture = getattr(platform_module, "capture_prefill_graphs", None)
-        if (
-            (beam_capture is not None or prefill_capture is not None)
-            and hasattr(runner_class, "capture_model")
-            and not getattr(runner_class.capture_model, _WORKER_CAPTURE_PATCH_MARKER, False)
+        if hasattr(runner_class, "capture_model") and not getattr(
+            runner_class.capture_model, _WORKER_CAPTURE_PATCH_MARKER, False
         ):
             _orig_capture_model = runner_class.capture_model
 
-            def make_patched_capture_model(_orig, _beam_capture, _prefill_capture):
+            def make_patched_capture_model(_orig, _prefill_capture):
                 @wraps(_orig)
                 def patched_capture_model(self, *args, **kwargs):
                     res = _orig(self, *args, **kwargs)
@@ -422,22 +419,6 @@ def apply_worker_patches() -> None:
 
                     if _get_gr_config(self).beam_execution_mode is BeamExecutionMode.V1:
                         capture_async_forward(self)
-                    elif _beam_capture is not None:
-                        try:
-                            _beam_capture(self)
-                        except Exception as error:
-                            from vllm_gr.v1.worker.cudagraph_capture import (
-                                is_recoverable_capture_error,
-                            )
-
-                            if not isinstance(
-                                error, RuntimeError
-                            ) or not is_recoverable_capture_error(error):
-                                raise
-                            logger.exception(
-                                "vllm-gr: beam decode graph dummy capture failed; "
-                                "beam decode will fall back to eager"
-                            )
                     if _prefill_capture is not None:
                         try:
                             _prefill_capture(self)
@@ -464,12 +445,12 @@ def apply_worker_patches() -> None:
 
                 return patched_capture_model
 
-            patched = make_patched_capture_model(_orig_capture_model, beam_capture, prefill_capture)
+            patched = make_patched_capture_model(_orig_capture_model, prefill_capture)
             setattr(patched, _WORKER_CAPTURE_PATCH_MARKER, True)
             runner_class.capture_model = patched
 
-        # Patch _determine_batch_execution_and_padding to force FULL CUDA Graph
-        # for beam decode steps (if the platform module provides it).
+        # NPU stages still need the Beam FULL dispatch override. CUDA stages
+        # select their graph directly and preserve the native dispatcher.
         determine_patcher = getattr(
             platform_module, "make_patched_determine_batch_execution_and_padding", None
         )
@@ -484,6 +465,11 @@ def apply_worker_patches() -> None:
                 runner_class._determine_batch_execution_and_padding = determine_patcher(
                     runner_class._determine_batch_execution_and_padding
                 )
+        else:
+            # CUDA stages replay directly; ordinary dispatch remains native.
+            runner_class._vllm_gr_native_determine = getattr(
+                runner_class, "_determine_batch_execution_and_padding", None
+            )
 
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)

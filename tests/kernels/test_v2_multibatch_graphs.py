@@ -138,7 +138,9 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     worker._beam_decode_graph.clear()
     worker._gr_dynamic_graphs_discarded = True
     assert serve_decode().graph is None
-    assert list(worker._gr_runtime_decode_capture_failures) == [(1, 4)]
+    assert {(s.batch_size, s.beam_width) for s in worker._beam_decode_graph.capture_failures} == {
+        (1, 4)
+    }
 
     # A complete load replaces this runtime; the record describes graphs that
     # only the retired runtime owned and must not outlive it.  Drive the real
@@ -161,7 +163,7 @@ def test_model_reload_retries_a_refused_decode_shape(monkeypatch: pytest.MonkeyP
     make_load_model_with_constraint_backend(native_load, close_runtime=close_v2_runtime)(worker)
     assert loaded == [worker]
     assert isinstance(worker.constraint_backend, CUDAConstraintBackend)
-    assert not hasattr(worker, "_gr_runtime_decode_capture_failures")
+    assert getattr(worker, "_beam_decode_graph", None) is None
 
     # The replacement recaptures the same geometry and really replays it.
     refuse[0] = False

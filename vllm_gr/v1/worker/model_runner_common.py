@@ -1684,8 +1684,6 @@ def make_patched_execute_model(_orig_execute_model):
             raise ValueError("Legacy Beam frames have been removed; use beam.execution_mode='v1'.")
         gr_stage = getattr(self, "_gr_gpu_stage_runner", None)
         if gr_stage is not None and not gr_stage.closed:
-            if getattr(scheduler_output, "beam_data", {}):
-                raise ValueError("legacy Beam cannot use an active GR execution context")
             if gr_stage.binding.native_request_id in getattr(
                 scheduler_output, "finished_req_ids", ()
             ):
@@ -1772,11 +1770,8 @@ def is_worker_runner_patched(runner_class) -> bool:
     Dispatches between the V1 and V2 method surfaces: the V2 runner has a
     ``prepare_inputs`` method and no ``_prepare_inputs``.
 
-    The ``_determine_batch_execution_and_padding`` hook stamps the beam
-    determine marker on all V1 platforms.  On GPU it overrides the dispatch
-    result to force FULL CUDA Graph for beam decode; on NPU it is a no-op
-    wrapper that preserves the original result — but the marker must still
-    be present for the gate-check to pass.
+    CUDA preserves native bookkeeping and graph dispatch. NPU retains its
+    dispatch override because its stage still enters native execute_model.
     """
     if hasattr(runner_class, "prepare_inputs") and not hasattr(runner_class, "_prepare_inputs"):
         return is_worker_runner_v2_patched(runner_class)
@@ -1797,5 +1792,7 @@ def is_worker_runner_patched(runner_class) -> bool:
                 _WORKER_DETERMINE_PATCH_MARKER,
                 False,
             )
+            or runner_class._determine_batch_execution_and_padding
+            is getattr(runner_class, "_vllm_gr_native_determine", None)
         )
     )

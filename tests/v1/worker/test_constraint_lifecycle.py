@@ -465,10 +465,10 @@ assert 'vllm_gr.ops.cuda.rec_constrained_topk' not in sys.modules
     subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
 
 
-@pytest.mark.parametrize("v2", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("runtime_kind", ["none", "v1", "v2"])  # type: ignore[misc]
 @pytest.mark.parametrize("operation", ["reload", "shutdown"])  # type: ignore[misc]
 def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
-    v2: bool, operation: str
+    runtime_kind: str, operation: str
 ) -> None:
     from unittest.mock import Mock
 
@@ -481,7 +481,6 @@ def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
         "_gr_input_buffers": object(),
         "_gr_gpu_stage_runner": object(),
         "_gr_decode_capture_failures": {2: "refused"},
-        "_gr_runtime_decode_capture_failures": {(1, 4): "refused"},
         "_gr_async_decode_graph_capture_failed": True,
         "_gr_async_decode_graph_capture_error": "refused",
     }
@@ -491,10 +490,13 @@ def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
     def native(self: Any) -> None:
         assert self.constraint_backend is None
         assert backend.close_calls == 1
-        assert (self._beam_decode_graph is None) is v2
+        assert (self._beam_decode_graph is None) is (runtime_kind != "none")
         raise RuntimeError("native failure")
 
-    options = {"close_runtime": close_v2_runtime} if v2 else {}
+    from vllm_gr.v1.worker.beam_decode_graph import close_beam_decode_runtime
+
+    close = {"v1": close_beam_decode_runtime, "v2": close_v2_runtime}.get(runtime_kind)
+    options = {"close_runtime": close} if close is not None else {}
     wrapped = (
         make_load_model_with_constraint_backend(native, **options)
         if operation == "reload"
@@ -502,7 +504,7 @@ def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
     )
     with pytest.raises(RuntimeError, match="native failure"):
         wrapped(runner)
-    if v2:
+    if runtime_kind != "none":
         graph.uninstall.assert_called_once()
         graph.clear.assert_called_once()
         assert all(not hasattr(runner, name) for name in runtime)

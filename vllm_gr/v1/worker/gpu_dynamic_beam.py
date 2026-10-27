@@ -149,9 +149,4 @@ def discard_dynamic_graphs(worker: Any, context: Any) -> None:
     if graph is not None:
         graph.clear()
     worker._gr_dynamic_graphs_discarded = True
-    # Every cleared graph loses its refusal record too: a capture that failed
-    # against the replaced buffers must be retried, not vetoed, and reaching
-    # here already means this session owns fresh storage for its widths.
-    if hasattr(worker, "_gr_runtime_decode_capture_failures"):
-        delattr(worker, "_gr_runtime_decode_capture_failures")
     prune_stage_pools(context, ())

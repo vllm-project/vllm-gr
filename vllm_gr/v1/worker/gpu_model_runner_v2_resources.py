@@ -7,7 +7,10 @@ from typing import Any
 
 import torch
 
-from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
+from vllm_gr.v1.worker.beam_decode_graph import (
+    BeamDecodeGraph,
+    close_beam_decode_runtime,
+)
 from vllm_gr.v1.worker.gr_inputs import GRInputBuffers
 
 
@@ -42,8 +45,10 @@ class V2BeamDecodeGraph(BeamDecodeGraph):
         super()._check_context()
         if self.input_buffers is not getattr(self.worker, "_gr_input_buffers", None):
             raise RuntimeError("Beam graph input storage changed after capture")
-        if self.worker.model is not self.original_model and self.worker.model is not self.wrapper:
-            raise RuntimeError("Beam graph model changed after capture")
+
+    def clear(self) -> None:
+        super().clear()
+        self.input_buffers = None
 
     def capture(self, forward: Callable[[bool], Any], *, persistent_install: bool) -> None:
         if not self.ready:
@@ -58,23 +63,4 @@ def close_v2_runtime(runner: Any) -> None:
     )
 
     uninstall_prefill_graph_manager_v2(runner)
-    graph = getattr(runner, "_beam_decode_graph", None)
-    if graph is not None:
-        graph.uninstall()
-        graph.clear()
-        runner._beam_decode_graph = None
-    # Both capture-failure records describe graphs that only this runtime owns:
-    # the startup record is keyed by batch size, the runtime record by
-    # ``(batch, width)``.  A later runtime recaptures the same shapes, so a
-    # record left behind would veto a graph that has just been captured.
-    for name in (
-        "_gr_input_buffers",
-        "_gr_gpu_stage_runner",
-        "_gr_decode_capture_failures",
-        "_gr_runtime_decode_capture_failures",
-        "_gr_dynamic_graphs_discarded",
-        "_gr_async_decode_graph_capture_failed",
-        "_gr_async_decode_graph_capture_error",
-    ):
-        if hasattr(runner, name):
-            delattr(runner, name)
+    close_beam_decode_runtime(runner)
