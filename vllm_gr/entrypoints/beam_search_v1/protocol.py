@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest, BeamBatchResult
 
@@ -24,6 +24,11 @@ class OfflineBeamSearchRequest:
     lora_request: Any = None
     use_tqdm: bool = False
     concurrency_limit: int | None = None
+    output_mode: Literal["full", "compact"] = "compact"
+
+    def __post_init__(self) -> None:
+        if self.output_mode not in ("full", "compact"):
+            raise ValueError("output_mode must be full or compact")
 
 
 @dataclass(frozen=True, slots=True)

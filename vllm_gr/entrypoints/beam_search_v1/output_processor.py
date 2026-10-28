@@ -156,9 +156,37 @@ class BeamSearchOutputProcessor:
     ) -> list[Any]:
         output = _result_output(result)
         try:
-            prepared, original, _, end_token_id = _prompt_boundaries(
+            prepared, original, begin_token_id, end_token_id = _prompt_boundaries(
                 self.tokenizer, request, call.params, self._boundary_token_ids
             )
+
+            if call.output_mode == "compact":
+                from vllm_gr.outputs import (
+                    CompactBeamSearchOutput,
+                    CompactBeamSearchSequence,
+                )
+
+                begin = () if begin_token_id is None else (begin_token_id,)
+                end = () if end_token_id is None else (end_token_id,)
+                # The trusted terminal result already owns immutable CPU tails.
+                # Do not instantiate lazy full-output objects just to slice them.
+                return [
+                    CompactBeamSearchOutput(
+                        sequences=tuple(
+                            CompactBeamSearchSequence(
+                                token_ids=begin
+                                + sequence.token_ids
+                                + (end if sequence.finish_reason == "length" else ()),
+                                cumulative_logprob=float(sequence.cumulative_logprob),
+                                finish_reason=sequence.finish_reason,
+                                stop_reason=sequence.stop_token_id,
+                            )
+                            for sequence in item.sequences
+                        ),
+                        prompt_token_ids=tuple(original[item.item_index]),
+                    )
+                    for item in output.items
+                ]
 
             from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
 

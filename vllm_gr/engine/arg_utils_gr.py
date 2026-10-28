@@ -683,6 +683,24 @@ def create_engine_config(self, usage_context=None, headless=False):
             from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
             attention_config.backend = AttentionBackendEnum.CUSTOM
+    if (
+        _is_cuda_platform()
+        and effective_gr_config.attention_backend is GRAttentionBackend.CUSTOM
+        and effective_gr_config.beam_max_width is not None
+        and effective_gr_config.enable_short_suffix_attention
+    ):
+        # The fused suffix consumes FA2 prefix states. Resolve the default
+        # before workers select attention or capture graphs; never override
+        # an explicitly requested incompatible FlashAttention version.
+        attention_config = config.attention_config
+        if attention_config.flash_attn_version is None:
+            attention_config.flash_attn_version = 2
+        elif attention_config.flash_attn_version != 2:
+            raise ValueError(
+                "Short suffix attention requires FlashAttention 2; set "
+                "attention_config.flash_attn_version=2 or disable "
+                "beam.enable_short_suffix_attention to use another version"
+            )
     if effective_gr_config.beam_execution_mode is BeamExecutionMode.V1:
         from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
 

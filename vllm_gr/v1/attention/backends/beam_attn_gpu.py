@@ -230,6 +230,16 @@ def prefill_attention(
     output[: std_out.shape[0]] = std_out
 
 
+def short_suffix_head_size_supported(head_size: int) -> bool:
+    """Return whether FlashAttention 2 can produce prefix states for this size.
+
+    FA2 accepts head sizes that are multiples of 8 up to 256. Sizes outside the
+    FA2-aligned MMA fast path (64/128/256) still use the generic Triton merge
+    kernel, so they are not rejected; see ``merge_short_suffix_attention``.
+    """
+    return 0 < head_size <= 256 and head_size % 8 == 0
+
+
 def validate_short_suffix_attention(
     num_heads: int,
     num_kv_heads: int,
@@ -241,9 +251,14 @@ def validate_short_suffix_attention(
     sinks: torch.Tensor | None,
 ) -> None:
     """Validate static layer semantics once, before graph capture/execution."""
-    if num_kv_heads <= 0 or num_heads % num_kv_heads or head_size not in (64, 128, 256):
+    if (
+        num_kv_heads <= 0
+        or num_heads % num_kv_heads
+        or not short_suffix_head_size_supported(head_size)
+    ):
         raise ValueError(
-            "Short suffix attention requires integral GQA groups and head size 64/128/256"
+            "Short suffix attention requires integral GQA groups and a "
+            "FlashAttention-compatible head size (multiple of 8, at most 256)"
         )
     if fa_version != 2:
         raise ValueError("Short suffix attention currently requires FlashAttention 2 prefix states")

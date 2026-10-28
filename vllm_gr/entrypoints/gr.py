@@ -4,7 +4,7 @@
 """Offline vLLM entry point with persistent GR Beam Search V1 execution."""
 
 import gc
-from typing import TYPE_CHECKING, Any, NoReturn, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Union, cast, overload
 
 from vllm.entrypoints.generate.beam_search.utils import (
     BeamSearchOutput,
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from vllm.sampling_params import BeamSearchParams
 
     from vllm_gr.entrypoints.beam_search_v1.protocol import BeamSearchFrontend
+    from vllm_gr.outputs import CompactBeamSearchOutput
 
 logger = init_logger(__name__)
 
@@ -152,6 +153,7 @@ class GRLLM(LLM):
                 raise
             self._frontend_gc_registered = True
 
+    @overload
     def beam_search_v1(
         self,
         prompts: list[Union["TokensPrompt", "TextPrompt"]],
@@ -159,8 +161,40 @@ class GRLLM(LLM):
         lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
-    ) -> list["BeamSearchOutput"]:
-        """Run Beam Search through the new EngineCore-owned V1 pipeline."""
+        *,
+        output_mode: Literal["full"],
+    ) -> list["BeamSearchOutput"]: ...
+
+    @overload
+    def beam_search_v1(
+        self,
+        prompts: list[Union["TokensPrompt", "TextPrompt"]],
+        params: "BeamSearchParams",
+        lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
+        use_tqdm: bool = False,
+        concurrency_limit: int | None = None,
+        *,
+        output_mode: Literal["compact"] = "compact",
+    ) -> list["CompactBeamSearchOutput"]: ...
+
+    def beam_search_v1(
+        self,
+        prompts: list[Union["TokensPrompt", "TextPrompt"]],
+        params: "BeamSearchParams",
+        lora_request: Union[list["LoRARequest"], "LoRARequest", None] = None,
+        use_tqdm: bool = False,
+        concurrency_limit: int | None = None,
+        *,
+        output_mode: Literal["full", "compact"] = "compact",
+    ) -> list["BeamSearchOutput"] | list["CompactBeamSearchOutput"]:
+        """Run persistent Beam Search with eager generated-only output by default.
+
+        Explicit ``full`` preserves native lazy BeamSearchOutput objects. ``compact``
+        returns short token IDs, cumulative scores and stop metadata, with the
+        accepted original prompt stored once per request. It never constructs
+        full prompt-plus-tail tokens or text; callers decode the tail if needed.
+        Search, ranking and configured begin/end/stop boundaries are identical.
+        """
         from vllm_gr.config import BeamExecutionMode
         from vllm_gr.config.execution import require_beam_execution_mode
 
@@ -176,9 +210,10 @@ class GRLLM(LLM):
             lora_request=lora_request,
             use_tqdm=use_tqdm,
             concurrency_limit=concurrency_limit,
+            output_mode=output_mode,
         )
         return cast(
-            list["BeamSearchOutput"],
+            list["BeamSearchOutput"] | list["CompactBeamSearchOutput"],
             run_beam_search_v1(self._create_beam_search_v1_client(), call),
         )
 

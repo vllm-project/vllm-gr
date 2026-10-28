@@ -110,7 +110,7 @@ def main() -> None:
     def request(llm: Any, index: int) -> dict[str, Any]:
         assert llm.reset_prefix_cache()
         start = time.perf_counter_ns()
-        outputs = llm.beam_search_v1([{"prompt": prompts[index]}], params)
+        outputs = llm.beam_search_v1([{"prompt": prompts[index]}], params, output_mode="full")
         for s in outputs[0].sequences:
             _ = s.text
         elapsed = (time.perf_counter_ns() - start) / 1e6

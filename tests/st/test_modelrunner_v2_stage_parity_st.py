@@ -172,7 +172,9 @@ def _run_arm(work_dir: Path, arm: str) -> None:
             if index in (0, 3):
                 assert llm.reset_prefix_cache()
             ids = (newline * length + source)[-(length - 1) :]
-            public = llm.beam_search_v1([{"prompt_token_ids": ids}], _params(steps))[0]
+            public = llm.beam_search_v1(
+                [{"prompt_token_ids": ids}], _params(steps), output_mode="full"
+            )[0]
             snapshot = llm.collective_rpc("onerec_v2_parity_snapshot", timeout=30)[0]
             assert snapshot["retired"], "public output arrived before Worker retirement"
             assert snapshot["session_id"] not in session_ids

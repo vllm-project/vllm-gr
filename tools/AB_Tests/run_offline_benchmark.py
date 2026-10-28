@@ -52,7 +52,7 @@ def measure_e2e(llm: Any, prompt_token_ids: list[int], params: Any) -> dict[str,
     """
     started = time.perf_counter_ns()
     outputs = llm.beam_search_v1(
-        [{"prompt_token_ids": prompt_token_ids}], params, concurrency_limit=1
+        [{"prompt_token_ids": prompt_token_ids}], params, concurrency_limit=1, output_mode="full"
     )
     for output in outputs:
         for sequence in output.sequences:

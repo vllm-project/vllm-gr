@@ -166,6 +166,7 @@ def _run_case(
                 dynamic_beam_widths=None if schedule is None else list(schedule),
                 result_width=result_width,
             ),
+            output_mode="full",
         )
     finally:
         events = llm.collective_rpc("dynamic_beam_trace_stop")[0]

@@ -110,13 +110,18 @@ class BeamAttentionContext:
                 raise ValueError("Short suffix attention requires CUDA")
             if max_decode_steps < 1:
                 raise ValueError("Short suffix attention requires positive pool capacity")
-            if head_dim not in (64, 128, 256) or dtype not in (
+            from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+                short_suffix_head_size_supported,
+            )
+
+            if not short_suffix_head_size_supported(head_dim) or dtype not in (
                 torch.float16,
                 torch.bfloat16,
                 torch.float32,
             ):
                 raise ValueError(
-                    "Short suffix attention requires head size 64/128/256 and FP16/BF16/FP32"
+                    "Short suffix attention requires a FlashAttention-compatible "
+                    "head size (multiple of 8, at most 256) and FP16/BF16/FP32"
                 )
         self.enable_short_suffix_attention = enable_short_suffix_attention
         _validate_pool_dtype(dtype)

@@ -152,6 +152,8 @@ def test_runtime_slot_uses_one_compilation_and_matches_fp32_dense(
         (256, 16, 4, 256),
         (3, 8, 1, 64),
         (3, 3, 1, 64),
+        (7, 8, 4, 32),
+        (7, 8, 4, 96),
     ],
 )
 @pytest.mark.parametrize("capacity,step", [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2)])
@@ -409,7 +411,7 @@ def test_unmasked_suffix() -> None:
     torch.testing.assert_close(output, expected, atol=2e-6, rtol=2e-5)
 
 
-@pytest.mark.parametrize("dim", [64, 128, 256])
+@pytest.mark.parametrize("dim", [32, 64, 96, 128, 256])
 @pytest.mark.parametrize("step", [0, 1, 2])
 @torch.inference_mode()
 def test_fp32_large_values_and_cancellation(dim: int, step: int) -> None:

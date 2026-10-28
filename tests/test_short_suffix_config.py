@@ -83,7 +83,7 @@ def test_config_roundtrip(enabled: bool, capacity: int) -> None:
 
     assert GRConfig.from_vllm_config(worker) == legacy
     GRConfig(beam_max_width=256).write_to_vllm_config(worker)
-    assert GRConfig.from_vllm_config(worker).enable_short_suffix_attention is False
+    assert GRConfig.from_vllm_config(worker).enable_short_suffix_attention is True
 
 
 @pytest.mark.parametrize("value", [None, "1", 1])
@@ -93,11 +93,11 @@ def test_config_requires_boolean(value: Any) -> None:
 
 
 @pytest.mark.parametrize("width", [None, 128])
-def test_config_defaults_disable_short_suffix_with_or_without_beam_pool(
+def test_config_defaults_enable_short_suffix_but_no_pool_stays_dormant(
     width: int | None,
 ) -> None:
     config = GRConfig(beam_max_width=width)
-    assert config.enable_short_suffix_attention is False
+    assert config.enable_short_suffix_attention is True
     assert GRConfig().enabled is False
     worker = SimpleNamespace(additional_config={"vllm_gr_beam_max_width": width})
     assert GRConfig.from_vllm_config(worker) == config
@@ -108,7 +108,7 @@ def test_config_defaults_disable_short_suffix_with_or_without_beam_pool(
             "constraint_table": {"max_top_k": 128},
         }
     )
-    assert canonical.enable_short_suffix_attention is False
+    assert canonical.enable_short_suffix_attention is True
     assert gr_config_from_mapping(gr_config_to_mapping(canonical)) == canonical
 
 
@@ -160,21 +160,22 @@ def _short_suffix_engine_config(
 @pytest.mark.parametrize(
     ("options", "expected"),
     [
-        ({}, None),
-        ({"enabled": True}, None),
+        ({}, 2),
+        ({"enabled": True}, 2),
         ({"fa_version": 2}, 2),
-        ({"fa_version": 3}, 3),
-        ({"fa_version": 4}, 4),
         ({"enabled": True, "fa_version": 2}, 2),
         ({"enabled": False}, None),
         ({"enabled": False, "fa_version": 3}, 3),
         ({"enabled": False, "fa_version": 4}, 4),
         ({"width": None}, None),
+        ({"width": None, "fa_version": 3}, 3),
         ({"cuda": False}, None),
+        ({"cuda": False, "fa_version": 3}, 3),
         ({"custom": False}, None),
+        ({"custom": False, "fa_version": 3}, 3),
     ],
 )
-def test_engine_preserves_flash_attention_version(
+def test_engine_resolves_fa2_default_and_preserves_opt_out(
     monkeypatch: pytest.MonkeyPatch, source: str, options: dict[str, Any], expected: int | None
 ) -> None:
     from vllm_gr.engine import arg_utils_gr
@@ -183,8 +184,21 @@ def test_engine_preserves_flash_attention_version(
     assert arg_utils_gr.create_engine_config(args) is config
     assert config.attention_config.flash_attn_version == expected
     assert GRConfig.from_vllm_config(config).enable_short_suffix_attention is options.get(
-        "enabled", False
+        "enabled", True
     )
+
+
+@pytest.mark.parametrize("source", ["canonical", "legacy"])
+@pytest.mark.parametrize("fa_version", [3, 4])
+def test_fused_engine_rejects_explicit_incompatible_fa(
+    monkeypatch: pytest.MonkeyPatch, source: str, fa_version: Literal[3, 4]
+) -> None:
+    from vllm_gr.engine import arg_utils_gr
+
+    config, args = _short_suffix_engine_config(monkeypatch, source, fa_version=fa_version)
+    with pytest.raises(ValueError, match="FlashAttention 2"):
+        arg_utils_gr.create_engine_config(args)
+    assert config.attention_config.flash_attn_version == fa_version
 
 
 @pytest.mark.parametrize("source", ["canonical", "legacy"])
@@ -192,7 +206,7 @@ def test_engine_preserves_flash_attention_version(
     ("enabled", "fa_version"),
     [(None, None), (False, None), (None, 2), (True, 2), (True, None), (True, 3)],
 )
-def test_sm90_default_preserves_fa3_and_fusion_requires_explicit_fa2(
+def test_sm90_fusion_defaults_to_fa2_and_opt_out_preserves_fa3(
     monkeypatch: pytest.MonkeyPatch,
     source: str,
     enabled: bool | None,
@@ -226,9 +240,15 @@ def test_sm90_default_preserves_fa3_and_fusion_requires_explicit_fa2(
     # Exercise the installed vLLM selector: an ordinary SM90 default is FA3.
     expected = 3 if fa_version is None else fa_version
     assert beam_attn_gpu.get_flash_attn_version(head_size=128) == expected
+    if enabled is not False and fa_version not in (None, 2):
+        with pytest.raises(ValueError, match="FlashAttention 2"):
+            arg_utils_gr.create_engine_config(args)
+        return
     arg_utils_gr.create_engine_config(args)
-    assert config.attention_config.flash_attn_version == fa_version
-    assert GRConfig.from_vllm_config(config).enable_short_suffix_attention is (enabled is True)
+    resolved = 2 if enabled is not False else fa_version
+    assert config.attention_config.flash_attn_version == resolved
+    expected = 3 if resolved is None else resolved
+    assert GRConfig.from_vllm_config(config).enable_short_suffix_attention is (enabled is not False)
     kwargs: dict[str, Any] = dict(
         num_heads=16,
         head_size=128,
@@ -238,13 +258,9 @@ def test_sm90_default_preserves_fa3_and_fusion_requires_explicit_fa2(
         sliding_window=None,
         kv_cache_dtype="auto",
     )
-    if enabled is True and expected != 2:
-        with pytest.raises(ValueError, match="FlashAttention 2"):
-            beam_attn.BeamAttentionImpl(**kwargs)
-    else:
-        impl = beam_attn.BeamAttentionImpl(**kwargs)
-        assert impl.vllm_flash_attn_version == expected
-        assert impl.supports_quant_query_input is (enabled is not True)
+    impl = beam_attn.BeamAttentionImpl(**kwargs)
+    assert impl.vllm_flash_attn_version == expected
+    assert impl.supports_quant_query_input is (enabled is False)
 
 
 @pytest.mark.parametrize("capacity", [0, -1])
@@ -298,7 +314,8 @@ def test_context_accepts_positive_capacity(capacity: int, dtype: torch.dtype) ->
     "changes",
     [
         {"num_heads": 15},
-        {"head_size": 80},
+        {"head_size": 100},
+        {"head_size": 512},
         {"fa_version": 3},
         {"sliding_window": (32, 0)},
         {"softcap": 10.0},
@@ -320,6 +337,21 @@ def test_static_layer_rejections(changes: dict[str, Any]) -> None:
     validate_short_suffix_attention(**args)
     with pytest.raises(ValueError, match="Short suffix attention"):
         validate_short_suffix_attention(**(args | changes))
+
+
+@pytest.mark.parametrize("head_size", [32, 96])
+def test_static_layer_accepts_generic_kernel_head_sizes(head_size: int) -> None:
+    """Head sizes outside the FA2 MMA fast path fall back to the Triton merge."""
+    validate_short_suffix_attention(
+        num_heads=8,
+        num_kv_heads=4,
+        head_size=head_size,
+        fa_version=2,
+        sliding_window=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        sinks=None,
+    )
 
 
 def test_context_rejects_cpu_before_allocating() -> None:
@@ -670,7 +702,7 @@ def test_layer_constructor_validates_before_execution(
         "kv_cache_dtype": "auto",
         "logits_soft_cap": 10.0,
     }
-    active = cuda and width is not None and enabled is True
+    active = cuda and width is not None and enabled is not False
     if active:
         with pytest.raises(ValueError, match="softcap"):
             beam_attn.BeamAttentionImpl(**kwargs)

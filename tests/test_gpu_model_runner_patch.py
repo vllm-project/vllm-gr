@@ -770,7 +770,7 @@ def test_create_beam_context_uses_grconfig_params(device: str, enabled: bool | N
         assert call_kwargs["dtype"] is torch.float16
         assert call_kwargs["max_batch"] == 1
         assert call_kwargs["enable_short_suffix_attention"] is (
-            device == "cuda" and enabled is True
+            device == "cuda" and enabled is not False
         )
 
 

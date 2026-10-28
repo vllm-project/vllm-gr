@@ -214,10 +214,7 @@ def _run_case(
         f"prompt_lengths={[len(prompt) for prompt in prompts]}; cache_salts={cache_salts}",
         flush=True,
     )
-    outputs = llm.beam_search_v1(
-        request_prompts,
-        params,
-    )
+    outputs = llm.beam_search_v1(request_prompts, params, output_mode="full")
     _assert_public_outputs(tokenizer, prompts, outputs, legal, steps)
     assert not llm.llm_engine.has_unfinished_requests()
     assert llm.reset_prefix_cache(), "NPU session retained scheduler resources"

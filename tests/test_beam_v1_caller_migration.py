@@ -21,12 +21,15 @@ class _Engine:
     def get_tokenizer(self) -> Any:
         return SimpleNamespace(decode=lambda tokens, **kw: ":".join(map(str, tokens)))
 
-    def beam_search_v1(self, prompts: list[dict[str, str]], params: Any) -> list[Any]:
+    def beam_search_v1(
+        self, prompts: list[dict[str, str]], params: Any, *, output_mode: str
+    ) -> list[Any]:
+        assert output_mode == "compact"
         self.batches.append([p["prompt"] for p in prompts])
         return [
             SimpleNamespace(
                 sequences=[
-                    SimpleNamespace(tokens=[100, 101, 10, 20, 30, 40, 50], cum_logprob=-float(i))
+                    SimpleNamespace(token_ids=(10, 20, 30, 40, 50), cumulative_logprob=-float(i))
                     for i in range(params.beam_width - int(self.wrong_beams))
                 ]
             )
@@ -176,7 +179,8 @@ def test_onerec_benchmark_closes_engine_before_deleting_artifact(
         def reset_prefix_cache(self) -> bool:
             return True
 
-        def beam_search_v1(self, prompts: Any, params: Any) -> list[Any]:
+        def beam_search_v1(self, prompts: Any, params: Any, *, output_mode: str) -> list[Any]:
+            assert output_mode == "full"
             assert artifacts[0].is_file()
             events.append("inference")
             if failure_stage == "inference":
