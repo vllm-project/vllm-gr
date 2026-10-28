@@ -32,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+PYTHON="$("$PYTHON" -c 'import sys; print(sys.executable)')"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SMOKE_ROOT="$(mktemp -d)"
 INSTALL_DIR="$SMOKE_ROOT/site-packages"
@@ -59,11 +60,53 @@ echo "Installing wheel into isolated directory: ${wheels[0]}"
 echo "Importing installed wheel outside the source checkout"
 (
     cd "$SMOKE_ROOT"
-    PYTHONPATH="$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-    "$PYTHON" -c 'import vllm_gr; print(vllm_gr.__version__)'
+    export PYTHONPATH="$INSTALL_DIR"
+    export INSTALL_DIR
+    export VLLM_GR_EXPECTED_VERSION="${VLLM_GR_EXPECTED_VERSION:-}"
+    export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-}"
+    "$PYTHON" - <<'PY'
+import os
+from importlib import metadata
+from pathlib import Path
+
+from packaging.requirements import Requirement
+
+import vllm_gr
+
+install_dir = Path(os.environ["INSTALL_DIR"]).resolve()
+origin = Path(vllm_gr.__file__).resolve()
+if not origin.is_relative_to(install_dir):
+    raise SystemExit(f"vllm_gr imported outside wheel target: {origin}")
+
+version = metadata.version("vllm-gr")
+expected = os.environ["VLLM_GR_EXPECTED_VERSION"]
+if expected and version != expected:
+    raise SystemExit(f"expected vllm-gr {expected}, found {version}")
+if vllm_gr.__version__ != version:
+    raise SystemExit(
+        f"module/distribution version mismatch: {vllm_gr.__version__} != {version}"
+    )
+
+requirements = {
+    Requirement(value).name.lower().replace("_", "-"): str(Requirement(value).specifier)
+    for value in metadata.requires("vllm-gr") or []
+    if Requirement(value).marker is None
+}
+target = os.environ["VLLM_GR_TARGET_DEVICE"]
+if "regex" not in requirements:
+    raise SystemExit("wheel is missing its direct regex dependency")
+if target == "cuda" and requirements.get("vllm") != "==0.30.0":
+    raise SystemExit(f"CUDA wheel has wrong vLLM requirement: {requirements.get('vllm')}")
+if target in {"cpu", "npu"} and "vllm" in requirements:
+    raise SystemExit(f"{target} wheel unexpectedly depends on vLLM")
+print(f"vllm-gr {version} from {origin}")
+PY
 )
 
 echo "Running packaging metadata tests"
-"$PYTHON" -m pytest tests/packaging/test_install_metadata.py -q
+"$PYTHON" -m pytest \
+    --confcutdir=tests/packaging \
+    tests/packaging/test_install_metadata.py \
+    -q
 
 echo "Wheel smoke test completed successfully."

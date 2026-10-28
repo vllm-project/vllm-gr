@@ -21,21 +21,22 @@ pr_number="${V1_PERF_PR_NUMBER:?V1_PERF_PR_NUMBER is required}"
 output_dir="${V1_PERF_OUTPUT_DIR:?V1_PERF_OUTPUT_DIR is required}"
 temp_root="${RUNNER_TEMP:?RUNNER_TEMP is required}"
 base_root="$(mktemp -d "$temp_root/beam-v1-perf-base.XXXXXXXX")"
+base_venv="$(mktemp -d "$temp_root/beam-v1-perf-venv.XXXXXXXX")"
+candidate_venv="${VIRTUAL_ENV:?VIRTUAL_ENV must identify the verified candidate environment}"
+candidate_python="$candidate_venv/bin/python"
+base_python="$base_venv/bin/python"
 worktree_added=0
-candidate_installed=1
 
 cleanup() {
   local status=$?
   trap - EXIT
-  if (( ! candidate_installed )); then
-    cd "$candidate_root"
-    uv pip install -e '.[dev]' || status=1
-  fi
+  cd "$candidate_root" || status=1
   if (( worktree_added )); then
     git -C "$candidate_root" worktree remove --force "$base_root" || status=1
   else
     rmdir "$base_root" || status=1
   fi
+  rm -rf "$base_venv"
   exit "$status"
 }
 trap cleanup EXIT
@@ -64,6 +65,32 @@ fi
 git -C "$candidate_root" worktree add --detach "$base_root" "$base_sha"
 worktree_added=1
 
+mkdir -p "$output_dir/runtime"
+"$candidate_python" "$candidate_root/tools/ci/resolve_runtime.py" resolve \
+  --repo "$candidate_root" \
+  --device cuda \
+  --output "$output_dir/runtime/candidate-spec.json"
+"$candidate_python" "$candidate_root/tools/ci/resolve_runtime.py" verify \
+  --repo "$candidate_root" \
+  --spec "$output_dir/runtime/candidate-spec.json" \
+  --venv "$candidate_venv" \
+  --output "$output_dir/runtime/candidate-installed.json"
+
+"$candidate_python" "$candidate_root/tools/ci/resolve_runtime.py" resolve \
+  --repo "$base_root" \
+  --device cuda \
+  --output "$output_dir/runtime/base-spec.json"
+rm -rf "$base_venv"
+uv venv --seed --python "$candidate_python" "$base_venv"
+VLLM_GR_TARGET_DEVICE=cuda uv pip install \
+  --python "$base_python" \
+  -e "${base_root}[dev]"
+"$base_python" "$candidate_root/tools/ci/resolve_runtime.py" verify \
+  --repo "$base_root" \
+  --spec "$output_dir/runtime/base-spec.json" \
+  --venv "$base_venv" \
+  --output "$output_dir/runtime/base-installed.json"
+
 # Both sides run the candidate's benchmark driver, including lifetime fixes.
 # Its SID validator and prompt are still imported/read from each selected tree.
 for path in \
@@ -78,8 +105,10 @@ done
 run_pass() {
   local repo_root="$1"
   local result_dir="$2"
+  local runtime_venv="$3"
   cd "$repo_root"
-  V1_PERF_REPO_ROOT="$repo_root" V1_PERF_OUTPUT_DIR="$result_dir" \
+  PATH="$runtime_venv/bin:$PATH" VIRTUAL_ENV="$runtime_venv" \
+    V1_PERF_REPO_ROOT="$repo_root" V1_PERF_OUTPUT_DIR="$result_dir" \
     V1_PERF_DRIVER="$candidate_root/benchmarks/beam_search/v1_performance_gate.py" \
     V1_PERF_MEASURE_ONLY=1 V1_PERF_OFFLINE_ONLY=1 \
     V1_PERF_WARMUP_RUNS=10 V1_PERF_MEASURED_RUNS=20 \
@@ -88,25 +117,11 @@ run_pass() {
 
 run_abba() {
   local results="$1"
-  cd "$base_root"
-  candidate_installed=0
-  uv pip install -e '.[dev]'
-  run_pass "$base_root" "$results/base/1"
-
+  run_pass "$base_root" "$results/base/1" "$base_venv"
+  run_pass "$candidate_root" "$results/pr/1" "$candidate_venv"
+  run_pass "$candidate_root" "$results/pr/2" "$candidate_venv"
+  run_pass "$base_root" "$results/base/2" "$base_venv"
   cd "$candidate_root"
-  uv pip install -e '.[dev]'
-  candidate_installed=1
-  run_pass "$candidate_root" "$results/pr/1"
-  run_pass "$candidate_root" "$results/pr/2"
-
-  cd "$base_root"
-  candidate_installed=0
-  uv pip install -e '.[dev]'
-  run_pass "$base_root" "$results/base/2"
-
-  cd "$candidate_root"
-  uv pip install -e '.[dev]'
-  candidate_installed=1
 }
 
 mkdir -p "$output_dir"
@@ -116,7 +131,7 @@ run_abba "$output_dir"
 printf '{"pr_number":%s,"base_sha":"%s","head_sha":"%s","merge_sha":"%s"}\n' \
   "$pr_number" "$base_sha" "$head_sha" "$candidate_sha" > "$output_dir/context.json"
 
-if V1_PERF_DEFER_SUMMARY=1 python -m benchmarks.beam_search.v1_performance_ab \
+if V1_PERF_DEFER_SUMMARY=1 "$candidate_python" -m benchmarks.beam_search.v1_performance_ab \
   --base "$output_dir/base" \
   --pr "$output_dir/pr" \
   --output-dir "$output_dir/initial" \
@@ -131,7 +146,7 @@ if V1_PERF_DEFER_SUMMARY=1 python -m benchmarks.beam_search.v1_performance_ab \
 fi
 
 # Only a complete regression confined to one batch size gets a confirmation run.
-python - "$output_dir/initial/report.json" "$output_dir/initial/decision.txt" <<'PY'
+"$candidate_python" - "$output_dir/initial/report.json" "$output_dir/initial/decision.txt" <<'PY'
 import sys
 from pathlib import Path
 
@@ -159,7 +174,7 @@ fi
 
 echo "One batch size exceeded +1%; repeating the full ABBA measurement."
 run_abba "$output_dir/retry"
-python - "$output_dir" "$base_sha" "$candidate_sha" <<'PY'
+"$candidate_python" - "$output_dir" "$base_sha" "$candidate_sha" <<'PY'
 import json
 import os
 import sys

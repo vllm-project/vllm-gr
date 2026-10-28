@@ -1,7 +1,9 @@
 # vllm-gr shared requirements (all platforms).
-# vllm / torch / vllm-ascend are provided by the base environment.
+# Platform runtimes are declared by the device-specific requirements file or,
+# for vendor-managed environments, supplied by the selected base image.
 
 msgspec
+regex
 pandas>=3.0.0
 requests>=2.32.0
 scikit-learn>=1.8.0

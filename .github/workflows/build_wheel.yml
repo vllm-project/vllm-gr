@@ -48,6 +48,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
+        target-device: ["cpu", "cuda"]
 
     steps:
       - uses: actions/checkout@v4
@@ -59,18 +60,23 @@ jobs:
 
       - name: Install uv
         run: |
-          pip install uv
+          pip install uv pytest packaging regex
 
-      - name: Build Wheel
+      - name: Build and smoke-test wheel
         env:
           UV_SYSTEM_PYTHON: 1
-          VLLM_GR_TARGET_DEVICE: cpu
+          VLLM_GR_TARGET_DEVICE: ${{ matrix.target-device }}
         run: |
-          bash scripts/build_wheel.sh --python python
+          if [[ "$VLLM_GR_TARGET_DEVICE" == "cpu" ]]; then
+            export VLLM_GR_EXPECTED_VERSION=0.30.0+cpu
+          else
+            export VLLM_GR_EXPECTED_VERSION=0.30.0
+          fi
+          bash tools/run_wheel_smoke_test.sh --python python
 
       - name: Upload Wheel Artifact
         if: ${{ !env.ACT }}
         uses: actions/upload-artifact@v4
         with:
-          name: vllm-gr-wheel-py${{ matrix.python-version }}
+          name: vllm-gr-${{ matrix.target-device }}-wheel-py${{ matrix.python-version }}
           path: dist/*.whl
