@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import gc
 import json
+import math
 import os
+import sys
 import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any
@@ -61,6 +63,52 @@ def _spawn_background_task(coro: Any) -> asyncio.Task:
 _BEAMPROC_ENABLED_ENV = "VLLM_GR_BEAM_PROC_ENABLED"
 _BEAMPROC_FINAL_TIMEOUT_S_ENV = "VLLM_GR_BEAM_PROC_FINAL_TIMEOUT_S"
 _BEAMPROC_CONTEXT_TRACE_HEADER = "x-vllm-gr-beam-context"
+
+
+# Evaluate once at import; no platform/clock checks on the request hot path.
+_BEAMPROC_SHARED_CLOCK = (
+    sys.platform == "linux"
+    and time.get_clock_info("perf_counter").implementation == "clock_gettime(CLOCK_MONOTONIC)"
+)
+
+
+def _beamproc_timing_metrics(final_plan, start, end, beam_width, decode_steps):
+    timing = final_plan.get("beam_timing")
+    if not _BEAMPROC_SHARED_CLOCK or not isinstance(timing, dict):
+        return None
+    boundary = timing.get("prefill_end")
+    prefill_only = timing.get("prefill_only")
+    processed_tokens = final_plan.get("num_processed_tokens", 0)
+    if type(processed_tokens) is not int or processed_tokens < 0:
+        processed_tokens = 0
+    if (
+        timing.get("clock") != "CLOCK_MONOTONIC"
+        or type(boundary) not in (int, float)
+        or not math.isfinite(boundary)
+        or not start <= boundary <= end
+        or type(prefill_only) is not bool
+    ):
+        return None
+    return RequestStateStats(
+        beam_search_prefill_time=0.0 if prefill_only else boundary - start,
+        beam_search_decode_time=end - start if prefill_only else end - boundary,
+        num_generation_tokens=beam_width * max(decode_steps, 0),
+        num_processed_tokens=processed_tokens,
+        num_beams=beam_width,
+    )
+
+
+def _record_beam_metrics(serving, metrics):
+    if metrics is None:
+        return
+    try:
+        model_name = serving.models.model_name
+        if callable(model_name):
+            model_name = model_name()
+        model_name = str(model_name)
+    except Exception:
+        model_name = "unknown"
+    record_beam_search_metrics(metrics, engine="0", model_name=model_name)
 
 
 def _beamproc_fast_path_supported(
@@ -170,9 +218,6 @@ def _beamproc_output_client(engine_client):
 def _ensure_beamproc_apiserver_output(engine_client, root_request_id: str) -> None:
     output_client = _beamproc_output_client(engine_client)
     _install_beamproc_apiserver_output_handler(output_client)
-    ensure_output_queue_task = getattr(output_client, "_ensure_output_queue_task", None)
-    if callable(ensure_output_queue_task):
-        ensure_output_queue_task()
     try:
         from vllm_gr.v1.engine.core_client import ensure_beamproc_output_task
 
@@ -210,6 +255,20 @@ def _handle_beamproc_apiserver_output(output_client, plan: Any) -> None:
             else 0
         ),
     )
+    # The normal path has one live waiter and no buffered results. Preserve
+    # FIFO handling below for early replies or multiple registered waiters.
+    waiters = _beamproc_waiters(output_client)
+    entries = waiters.get(root_request_id)
+    if (
+        entries
+        and len(entries) == 1
+        and not entries[0][1].done()
+        and int(plan.get("beam_width") or 0) == entries[0][0]
+        and not _beamproc_plan_buffer(output_client).get(root_request_id)
+    ):
+        waiters.pop(root_request_id)
+        entries[0][1].set_result(plan)
+        return
     _cache_beamproc_apiserver_plan(output_client, plan)
     _wake_beamproc_apiserver_waiters(output_client, root_request_id)
 
@@ -277,10 +336,7 @@ def _pop_beamproc_apiserver_plan(
             if not entries:
                 buffer.pop(root_request_id, None)
             return selected
-    selected = entries.pop(0)
-    if not entries:
-        buffer.pop(root_request_id, None)
-    return selected
+    return None
 
 
 def _beamproc_waiters(engine_client) -> dict[str, list[tuple[int, asyncio.Future]]]:
@@ -413,8 +469,8 @@ async def _await_beamproc_apiserver_plan(
     beam_width: int,
     timeout_s: float,
 ) -> dict[str, Any] | None:
+    # The request path starts the receiver before sending prefill.
     output_client = _beamproc_output_client(engine_client)
-    _ensure_beamproc_apiserver_output(engine_client, root_request_id)
 
     plan = _pop_beamproc_apiserver_plan(output_client, root_request_id, beam_width)
     if plan is not None or timeout_s <= 0:
@@ -424,29 +480,39 @@ async def _await_beamproc_apiserver_plan(
     future = loop.create_future()
     waiters = _beamproc_waiters(output_client)
     waiters.setdefault(root_request_id, []).append((beam_width, future))
-    _wake_beamproc_apiserver_waiters(output_client, root_request_id)
     from vllm_gr.entrypoints.openai.beam_proc_manager import beam_proc_exit_code
 
-    try:
-        deadline = loop.time() + timeout_s
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return None
-            done, _ = await asyncio.wait(
-                (future,),
-                timeout=min(remaining, 0.1),
-            )
-            if done:
-                return future.result()
+    deadline = loop.time() + timeout_s
+    health_check = None
 
+    def check_sidecar():
+        nonlocal health_check
+        if future.done():
+            return
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            future.set_result(None)
+            return
+        try:
             exit_code = beam_proc_exit_code()
-            if exit_code is not None:
-                raise RuntimeError(
+        except Exception as exc:  # noqa: BLE001 - propagate callback failures to the request
+            future.set_exception(exc)
+            return
+        if exit_code is not None:
+            future.set_exception(
+                RuntimeError(
                     "BeamProc sidecar exited while awaiting final output "
                     f"for root={root_request_id} with status {exit_code}"
                 )
+            )
+            return
+        health_check = loop.call_later(min(remaining, 0.1), check_sidecar)
+
+    health_check = loop.call_later(min(timeout_s, 0.1), check_sidecar)
+    try:
+        return await future
     finally:
+        health_check.cancel()
         entries = waiters.get(root_request_id)
         if entries is not None:
             remaining = [
@@ -914,21 +980,7 @@ async def beam_search(
             beam_width,
         )
         try:
-            from vllm_gr.entrypoints.openai.beam_proc_manager import (
-                ensure_beam_proc_started,
-                prepare_beam_proc_catalog,
-            )
-
-            prepare_beam_proc_catalog(
-                getattr(self.models, "model_config", None),
-                tokenizer,
-                catalog_path=getattr(self.models, "catalog_path", None),
-            )
-            ensure_beam_proc_started()
-            _ensure_beamproc_apiserver_output(
-                self.engine_client,
-                beamproc_ec_root_request_id,
-            )
+            # Catalog, sidecar and final receiver are initialized in init_gr.
             prefill_internal_request_id = await _send_beamproc_prefill(
                 self.engine_client,
                 all_beams[0].get_prompt(),
@@ -994,7 +1046,13 @@ async def beam_search(
         outputs = []
         output_decode_token_ids: list[list[int]] = []
         for index, tokens_value in enumerate(final_token_ids[:beam_width]):
-            tokens = [int(token_id) for token_id in tokens_value]
+            # Numeric wire versions have already materialized Python ints.
+            # Copy for the end-token append without converting every token twice.
+            tokens = (
+                list(tokens_value)
+                if final_plan.get("version") in (2, 3)
+                else [int(token_id) for token_id in tokens_value]
+            )
             finish_reason = (
                 str(final_finish_reasons[index]) if index < len(final_finish_reasons) else "length"
             )
@@ -1044,12 +1102,10 @@ async def beam_search(
             decoded_outputs = tokenizer.batch_decode(output_decode_token_ids)
             for output, decoded_text in zip(outputs, decoded_outputs, strict=True):
                 output.text = decoded_text
-        beam_search_decode_time = time.perf_counter() - beam_search_start
-        metrics = RequestStateStats(
-            beam_search_overhead=beam_search_decode_time,
-            beam_search_decode_time=beam_search_decode_time,
-            num_generation_tokens=beam_width * max(total_decode_steps, 0),
+        metrics = _beamproc_timing_metrics(
+            final_plan, prefill_start, time.perf_counter(), beam_width, total_decode_steps
         )
+        _record_beam_metrics(self, metrics)
         yield RequestOutput(
             request_id=request_id,
             prompt=prompt_text,
@@ -1656,16 +1712,7 @@ async def beam_search(
             metrics=metrics,
         )
 
-        # Record beam search metrics for Prometheus
-        # Get the model name - it could be a property or method
-        try:
-            model_name = self.models.model_name
-            if callable(model_name):
-                model_name = model_name()
-            model_name = str(model_name)
-        except Exception:
-            model_name = "unknown"
-        record_beam_search_metrics(metrics, engine="0", model_name=model_name)
+        _record_beam_metrics(self, metrics)
 
         yield out
     finally:

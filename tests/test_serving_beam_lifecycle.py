@@ -10,7 +10,7 @@ import gc
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
@@ -309,7 +309,8 @@ class _FakeCatalog:
         valid_tokens_set: set[int],
     ) -> list[float]:
         return [
-            lp if tid in valid_tokens_set else -float("inf") for tid, lp in zip(token_ids, logprobs)
+            lp if tid in valid_tokens_set else -float("inf")
+            for tid, lp in zip(token_ids, logprobs, strict=True)
         ]
 
     def __len__(self) -> int:
@@ -830,42 +831,19 @@ def test_beamproc_unsupported_transport_refuses_python_fallback(
     assert engine.generate_calls == []
 
 
-@pytest.mark.parametrize("failure_stage", ["catalog", "startup", "receiver"])
-def test_beamproc_preflight_failure_refuses_python_fallback(
-    monkeypatch: Any,
-    failure_stage: str,
-) -> None:
-    from vllm_gr.entrypoints.openai import beam_proc_manager
-
+def test_beamproc_request_does_not_initialize_receiver(monkeypatch: Any) -> None:
     monkeypatch.setenv(serving_engine._BEAMPROC_ENABLED_ENV, "1")
-    prepare_catalog = MagicMock()
-    ensure_started = MagicMock()
-    ensure_receiver = MagicMock()
-    if failure_stage == "catalog":
-        prepare_catalog.side_effect = RuntimeError("catalog failed")
-    elif failure_stage == "startup":
-        ensure_started.side_effect = RuntimeError("startup failed")
-    else:
-        ensure_receiver.side_effect = RuntimeError("receiver failed")
-    send_prefill = AsyncMock()
-    monkeypatch.setattr(beam_proc_manager, "prepare_beam_proc_catalog", prepare_catalog)
-    monkeypatch.setattr(beam_proc_manager, "ensure_beam_proc_started", ensure_started)
-    monkeypatch.setattr(serving_engine, "_ensure_beamproc_apiserver_output", ensure_receiver)
+    setup = MagicMock(side_effect=AssertionError("startup only"))
+    monkeypatch.setattr(serving_engine, "_ensure_beamproc_apiserver_output", setup)
+    send_prefill = AsyncMock(side_effect=RuntimeError("prefill reached"))
     monkeypatch.setattr(serving_engine, "_send_beamproc_prefill", send_prefill)
     engine = _OrdinaryEngineClient(
         prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
     )
-
-    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
-        _run_search(
-            engine,
-            max_tokens=1,
-            request_id=f"{failure_stage}-required",
-        )
-
-    send_prefill.assert_not_awaited()
-    assert engine.add_batch_calls == []
-    assert engine.generate_calls == []
+    with pytest.raises(RuntimeError, match="prefill reached"):
+        _run_search(engine, max_tokens=1, request_id="startup-only")
+    setup.assert_not_called()
+    send_prefill.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
@@ -918,13 +896,21 @@ def test_beamproc_termination_aborts_before_local_cleanup(
     assert engine.generate_calls == []
 
 
-def test_rust_final_plan_preserves_per_step_logprobs(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("with_timing", [False, True])
+@pytest.mark.parametrize("version", [None, 2, 3])
+def test_rust_final_plan_preserves_per_step_logprobs(
+    monkeypatch: Any, with_timing, version
+) -> None:
     from vllm_gr.entrypoints.openai import beam_proc_manager
 
+    monkeypatch.setattr(serving_engine, "_BEAMPROC_SHARED_CLOCK", True)
+    publisher = MagicMock()
+    monkeypatch.setattr(serving_engine, "record_beam_search_metrics", publisher)
     monkeypatch.setenv(serving_engine._BEAMPROC_ENABLED_ENV, "1")
     prepare_catalog = MagicMock()
     monkeypatch.setattr(beam_proc_manager, "prepare_beam_proc_catalog", prepare_catalog)
-    monkeypatch.setattr(beam_proc_manager, "ensure_beam_proc_started", MagicMock())
+    ensure_started = MagicMock()
+    monkeypatch.setattr(beam_proc_manager, "ensure_beam_proc_started", ensure_started)
     monkeypatch.setattr(serving_engine, "_ensure_beamproc_apiserver_output", MagicMock())
     monkeypatch.setattr(serving_engine, "_cleanup_beamproc_prefill_output_state", MagicMock())
     monkeypatch.setattr(serving_engine, "_discard_beamproc_apiserver_state", MagicMock())
@@ -938,6 +924,7 @@ def test_rust_final_plan_preserves_per_step_logprobs(monkeypatch: Any) -> None:
         "_await_beamproc_apiserver_plan",
         AsyncMock(
             return_value={
+                "version": version,
                 "final_token_ids": [[11, 21]],
                 "final_token_ids_include_prompt": False,
                 "final_scores": [-0.3],
@@ -951,17 +938,36 @@ def test_rust_final_plan_preserves_per_step_logprobs(monkeypatch: Any) -> None:
         ),
     )
 
+    if with_timing:
+
+        async def timed_plan(*_args):
+            plan = serving_engine._await_beamproc_apiserver_plan.return_value.copy()
+            plan["beam_timing"] = {
+                "clock": "CLOCK_MONOTONIC",
+                "prefill_end": serving_engine.time.perf_counter(),
+                "prefill_only": False,
+            }
+            return plan
+
+        serving_engine._await_beamproc_apiserver_plan.side_effect = timed_plan
+
     outputs = _run_search(
         _OrdinaryEngineClient(prepare_outputs=[]),
         max_tokens=3,
         request_id="rust-logprobs",
     )
 
-    prepare_catalog.assert_called_once_with(
-        None,
-        ANY,
-        catalog_path="/catalog.json",
-    )
+    if with_timing:
+        publisher.assert_called_once()
+        metrics = outputs[0].metrics
+        assert publisher.call_args.args[0] is metrics
+        assert metrics.beam_search_prefill_time > 0
+        assert metrics.beam_search_decode_time >= 0
+    else:
+        publisher.assert_not_called()
+        assert outputs[0].metrics is None
+    prepare_catalog.assert_not_called()
+    ensure_started.assert_not_called()
     assert len(outputs) == 1
     choice = outputs[0].outputs[0]
     assert isinstance(choice.logprobs, FlatLogprobs)
@@ -969,3 +975,157 @@ def test_rust_final_plan_preserves_per_step_logprobs(monkeypatch: Any) -> None:
     assert choice.logprobs.end_indices == [2, 4]
     assert choice.logprobs.token_ids == [11, 12, 21, 22]
     assert choice.logprobs.logprobs == pytest.approx([-0.1, -0.2, -0.2, -0.4])
+    assert choice.token_ids == [11, 21]
+    assert choice.text == "11 21"
+    assert serving_engine._await_beamproc_apiserver_plan.return_value["final_token_ids"] == [
+        [11, 21]
+    ]
+
+
+def test_receiver_startup_installs_handler_before_task(monkeypatch):
+    from vllm_gr.v1.engine import core_client
+
+    output_client = SimpleNamespace(_ensure_output_queue_task=MagicMock())
+
+    def start(client):
+        assert callable(client.beamproc_apiserver_output_handler)
+
+    start_receiver = MagicMock(side_effect=start)
+    monkeypatch.setattr(core_client, "ensure_beamproc_output_task", start_receiver)
+    serving_engine._ensure_beamproc_apiserver_output(output_client, "startup")
+    start_receiver.assert_called_once_with(output_client)
+    output_client._ensure_output_queue_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_final_wait_uses_existing_receiver(monkeypatch):
+    setup = MagicMock(side_effect=AssertionError("receiver already started"))
+    monkeypatch.setattr(serving_engine, "_ensure_beamproc_apiserver_output", setup)
+    plan = {"beam_width": 4, "final_token_ids": [[1, 2]]}
+    output_client = SimpleNamespace(beamproc_apiserver_plans_by_root={"root": [plan]})
+
+    assert (
+        await serving_engine._await_beamproc_apiserver_plan(output_client, "root", 4, 1.0) == plan
+    )
+    setup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_final_reply_delivery_and_early_reply(monkeypatch):
+    from vllm_gr.entrypoints.openai import beam_proc_manager
+
+    monkeypatch.setattr(beam_proc_manager, "beam_proc_exit_code", lambda: None)
+    for early in (False, True):
+        client = SimpleNamespace()
+        plan = {"root_request_id": "root", "beam_width": 4, "final_token_ids": [[1]]}
+        if early:
+            serving_engine._handle_beamproc_apiserver_output(client, plan)
+        task = asyncio.create_task(
+            serving_engine._await_beamproc_apiserver_plan(client, "root", 4, 1.0)
+        )
+        await asyncio.sleep(0)
+        if not early:
+            serving_engine._handle_beamproc_apiserver_output(client, plan)
+        assert await task is plan
+        assert not serving_engine._beamproc_waiters(client)
+        assert not serving_engine._beamproc_plan_buffer(client)
+
+
+@pytest.mark.asyncio
+async def test_final_reply_width_mismatch_stays_buffered(monkeypatch):
+    from vllm_gr.entrypoints.openai import beam_proc_manager
+
+    monkeypatch.setattr(beam_proc_manager, "beam_proc_exit_code", lambda: None)
+    client = SimpleNamespace()
+    task = asyncio.create_task(
+        serving_engine._await_beamproc_apiserver_plan(client, "root", 4, 1.0)
+    )
+    await asyncio.sleep(0)
+    serving_engine._handle_beamproc_apiserver_output(
+        client, {"root_request_id": "root", "beam_width": 8, "final_token_ids": [[1]]}
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert len(serving_engine._beamproc_plan_buffer(client)["root"]) == 1
+    serving_engine._handle_beamproc_apiserver_output(
+        client, {"root_request_id": "root", "beam_width": 4, "final_token_ids": [[2]]}
+    )
+    assert (await task)["beam_width"] == 4
+    assert serving_engine._beamproc_plan_buffer(client)["root"][0]["beam_width"] == 8
+
+
+@pytest.mark.asyncio
+async def test_final_wait_timeout_and_cancellation(monkeypatch):
+    from vllm_gr.entrypoints.openai import beam_proc_manager
+
+    monkeypatch.setattr(beam_proc_manager, "beam_proc_exit_code", lambda: None)
+    client = SimpleNamespace()
+    assert await serving_engine._await_beamproc_apiserver_plan(client, "root", 4, 0.001) is None
+    assert not serving_engine._beamproc_waiters(client)
+    task = asyncio.create_task(
+        serving_engine._await_beamproc_apiserver_plan(client, "root", 4, 1.0)
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not serving_engine._beamproc_waiters(client)
+
+
+@pytest.mark.parametrize("prefill_only,expected", [(False, (2.0, 3.0)), (True, (0.0, 5.0))])
+def test_rust_timing_matches_python_phase_convention(monkeypatch, prefill_only, expected):
+    monkeypatch.setattr(serving_engine, "_BEAMPROC_SHARED_CLOCK", True)
+    plan = {
+        "num_processed_tokens": 32768,
+        "beam_timing": {
+            "clock": "CLOCK_MONOTONIC",
+            "prefill_end": 12.0,
+            "prefill_only": prefill_only,
+        },
+    }
+    metrics = serving_engine._beamproc_timing_metrics(plan, 10.0, 15.0, 128, 4)
+    assert (metrics.beam_search_prefill_time, metrics.beam_search_decode_time) == expected
+    assert metrics.num_beams == 128
+    assert metrics.num_processed_tokens == 32768
+
+
+@pytest.mark.parametrize("count", [None, -1, True, "42", 1.5])
+def test_rust_invalid_processed_count_does_not_change_timing(monkeypatch, count):
+    monkeypatch.setattr(serving_engine, "_BEAMPROC_SHARED_CLOCK", True)
+    plan = {
+        "num_processed_tokens": count,
+        "beam_timing": {"clock": "CLOCK_MONOTONIC", "prefill_end": 12.0, "prefill_only": False},
+    }
+    metrics = serving_engine._beamproc_timing_metrics(plan, 10, 15, 128, 4)
+    assert metrics.num_processed_tokens == 0
+    assert metrics.beam_search_decode_time == 3
+
+
+def test_rust_legacy_final_without_processed_count(monkeypatch):
+    monkeypatch.setattr(serving_engine, "_BEAMPROC_SHARED_CLOCK", True)
+    plan = {"beam_timing": {"clock": "CLOCK_MONOTONIC", "prefill_end": 12.0, "prefill_only": False}}
+    metrics = serving_engine._beamproc_timing_metrics(plan, 10, 15, 128, 4)
+    assert metrics.num_processed_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "timing",
+    [
+        None,
+        {},
+        {"clock": "other", "prefill_end": 12.0, "prefill_only": False},
+        *[
+            {"clock": "CLOCK_MONOTONIC", "prefill_end": value, "prefill_only": False}
+            for value in [None, float("nan"), float("inf"), 9.0, 16.0, True]
+        ],
+    ],
+)
+def test_rust_invalid_timing_is_not_published(monkeypatch, timing):
+    monkeypatch.setattr(serving_engine, "_BEAMPROC_SHARED_CLOCK", True)
+    assert serving_engine._beamproc_timing_metrics({"beam_timing": timing}, 10, 15, 128, 4) is None
+
+
+def test_rust_incompatible_clock_is_not_published(monkeypatch):
+    monkeypatch.setattr(serving_engine, "_BEAMPROC_SHARED_CLOCK", False)
+    plan = {"beam_timing": {"clock": "CLOCK_MONOTONIC", "prefill_end": 12.0, "prefill_only": False}}
+    assert serving_engine._beamproc_timing_metrics(plan, 10, 15, 128, 4) is None

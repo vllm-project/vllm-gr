@@ -28,6 +28,13 @@ VLLM_GR_BASE_VERSION = "0.22.1"
 REPO_ROOT = Path(__file__).resolve().parent
 RUST_MANIFEST = REPO_ROOT / "rust" / "Cargo.toml"
 RUST_BINARY_NAME = "beam-proc.exe" if os.name == "nt" else "beam-proc"
+RUST_LIBRARY_NAME = (
+    "ce_transport.dll"
+    if os.name == "nt"
+    else "libce_transport.dylib"
+    if sys.platform == "darwin"
+    else "libce_transport.so"
+)
 SKIP_RUST_BUILD_ENV = "VLLM_GR_SKIP_RUST_BUILD"
 
 # Module-level cache so that detect_target_device() is evaluated exactly once
@@ -44,7 +51,7 @@ class BinaryDistribution(Distribution):
 
 
 def build_rust_sidecar(build_lib: Path, target_dir: Path) -> Path | None:
-    """Compile BeamProc and copy it into the wheel's Python package."""
+    """Compile and package BeamProc and the shared-memory-enabled CE library."""
     if os.getenv(SKIP_RUST_BUILD_ENV, "").lower() in {"1", "true", "yes", "on"}:
         logger.warning("Skipping BeamProc compilation because %s is enabled", SKIP_RUST_BUILD_ENV)
         return None
@@ -67,6 +74,9 @@ def build_rust_sidecar(build_lib: Path, target_dir: Path) -> Path | None:
             str(RUST_MANIFEST),
             "--bin",
             "beam-proc",
+            "--lib",
+            "--features",
+            "iceoryx",
             "--target-dir",
             str(target_dir),
         ],
@@ -81,6 +91,10 @@ def build_rust_sidecar(build_lib: Path, target_dir: Path) -> Path | None:
     packaged_binary.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(compiled_binary, packaged_binary)
     packaged_binary.chmod(packaged_binary.stat().st_mode | 0o111)
+    compiled_library = target_dir / "release" / RUST_LIBRARY_NAME
+    if not compiled_library.is_file():
+        raise RuntimeError(f"Cargo completed without producing {compiled_library}")
+    shutil.copy2(compiled_library, packaged_binary.parent / RUST_LIBRARY_NAME)
     return packaged_binary
 
 

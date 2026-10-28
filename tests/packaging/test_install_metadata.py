@@ -155,6 +155,9 @@ def test_build_rust_sidecar_packages_release_binary(
         compiled = target_dir / "release" / gr_setup.RUST_BINARY_NAME
         compiled.parent.mkdir(parents=True)
         compiled.write_bytes(b"beam-proc")
+        assert "--lib" in command
+        assert command[command.index("--features") + 1] == "iceoryx"
+        (compiled.parent / gr_setup.RUST_LIBRARY_NAME).write_bytes(b"ce-transport")
 
     monkeypatch.setattr(gr_setup.subprocess, "run", run)
 
@@ -163,6 +166,7 @@ def test_build_rust_sidecar_packages_release_binary(
     assert packaged is not None
     assert packaged == build_lib / "vllm_gr" / "bin" / gr_setup.RUST_BINARY_NAME
     assert packaged.read_bytes() == b"beam-proc"
+    assert (packaged.parent / gr_setup.RUST_LIBRARY_NAME).read_bytes() == b"ce-transport"
     assert packaged.stat().st_mode & 0o111
 
 

@@ -168,6 +168,7 @@ def test_forward_preserves_cache_and_attention_arguments(
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", not tuple_cache)
 
     impl = object.__new__(beam_attn.BeamAttentionImpl)
+    impl.use_direct_output = False
     impl.kv_sharing_target_layer_name = None
     impl.kv_cache_dtype = "auto"
     impl.sliding_window = (6, 0)
