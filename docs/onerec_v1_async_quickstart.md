@@ -11,7 +11,7 @@ guide unchanged for the first run.
 
 ## 1. Check the environment
 
-Use a CUDA GPU, Python 3.11 or later, vLLM 0.22.1, and the matching
+Use a CUDA GPU, Python 3.11 or later, vLLM 0.30.0, and the matching
 `vllm-gr` installation. See [quickstart](quickstart.md) for installation.
 From the repository root, verify the environment:
 

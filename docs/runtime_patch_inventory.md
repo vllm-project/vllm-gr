@@ -21,10 +21,11 @@ The upstream source revisions used for compatibility analysis are:
 
 The vLLM-Ascend release branch is movable, so compatibility conclusions must retain the exact source commit.
 
-The current CUDA upgrade targets vLLM 0.30.0. The frontend entries and test references
-below have been updated for that candidate; the remaining historical API details
-are not a complete 0.30 compatibility certification. Ascend 0.30.0rc2 and optional
-integrations still require their own validation.
+The current CUDA release candidate targets vLLM 0.30.0 and has completed the
+GPU functional, packaging, and performance validation recorded under
+`update_version`. The remaining release-level precision decision is tracked in
+that upgrade archive. Ascend 0.30.0rc2 and optional integrations still require
+their own runtime validation.
 
 ## Risk Levels
 
@@ -169,7 +170,7 @@ aligned with it.
 - Added values:
     - `SUBMIT_GR_SESSION = b"\x0a"`
 - Risk: Critical
-- Current compatibility: upstream vLLM 0.22.1 uses values `0x00` through `0x05`.
+- Current compatibility: upstream vLLM 0.30.0 uses values `0x00` through `0x05`.
 - Private dependencies:
     - `_value2member_map_`;
     - `_member_map_`;
@@ -328,7 +329,9 @@ aligned with it.
 - Mutation: native method replacement during worker device initialization
 - Platform / process role: NPU worker
 - Risk: Medium
-- Supported runtime: `vllm-ascend==0.22.1rc1`, `torch-npu==2.10.0`.
+- Historical verified runtime: `vllm-ascend==0.22.1rc1`,
+  `torch-npu==2.10.0`. The 0.30.0rc2 target has not been validated, so this
+  patch has no supported runtime in the current release candidate.
 - Native contract: `profile_memory(self)` sets `torch_reserved` and
   `torch_allocated` from the current device allocator counters, emits the native
   debug log, and returns `None`.

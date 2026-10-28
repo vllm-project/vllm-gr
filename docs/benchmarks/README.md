@@ -162,14 +162,7 @@ You can refer also to [`Quickstart`](../quickstart.md) menu.
   cd vllm-gr
   ```
 
-2. **Install vLLM (base environment)**
-
-  ```bash
-  uv pip install vllm==0.22.1 \
-    --torch-backend=auto
-  ```
-
-3. **Install vllm-gr**
+2. **Install vllm-gr and its pinned vLLM runtime**
 
   ```bash
   pip install -e .
@@ -177,11 +170,16 @@ You can refer also to [`Quickstart`](../quickstart.md) menu.
   pip install -e ".[dev]"
   ```
 
-4. **Verify installation**
+3. **Verify installation**
 
   ```bash
+  python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); print("vllm-gr", m.version("vllm-gr"))'
   python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
   ```
+
+The CUDA install resolves `vllm==0.30.0`. Do not reuse a vLLM 0.22 environment
+for the current benchmark; the archived pre-upgrade results remain the source
+of truth for 0.22 comparisons.
 
 ## Open One Rec Benchmark Dataset
 

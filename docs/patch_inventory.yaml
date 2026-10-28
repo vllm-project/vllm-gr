@@ -4,6 +4,15 @@ verified_baseline:
   vllm: "0.22.1"
   vllm_ascend: "0.22.1rc1"
 
+candidate_runtime:
+  cuda:
+    vllm: "0.30.0"
+    status: validated_with_release_precision_decision_pending
+  npu:
+    vllm: "0.30.0"
+    vllm_ascend: "0.30.0rc2"
+    status: blocked_pending_runtime_validation
+
 patches:
   - id: GR-PATCH-000
     owner: vllm_gr/plugin.py
@@ -253,7 +262,7 @@ patches:
     target: NPUWorker.profile_memory in vllm_ascend.worker.worker or vllm_ascend.worker.worker_v1
     risk: medium
     contract: npu-worker-memory-counters
-    supported_runtime:
+    historical_verified_runtime:
       vllm_ascend: "0.22.1rc1"
       torch_npu: "2.10.0"
     removal_condition: vLLM-Ascend reads the two allocator counters without flattening full memory statistics

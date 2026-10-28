@@ -23,12 +23,18 @@ The current implementation targets inference scenarios and does not aim for full
 
 ## Installation
 
-**Install vLLM 0.22.1 first (and vLLM-Ascend 0.22.1rc1 on NPU), then
-`pip install vllm-gr`.** This release targets that API pair only. Platform
-dependencies are auto-detected by `setup.py` — no `[gpu]` / `[npu]` extras
+The current CUDA release candidate targets **vLLM 0.30.0**. A CUDA install of
+`vllm-gr` resolves that exact vLLM version through `requirements/cuda.txt`;
+platform dependencies are selected by `setup.py`, so no `[gpu]` extra is
 needed.
 
-For detailed instructions, see [quickstart](docs/quickstart.md) or [quick start ascend](docs/quickstart-ascend.md).
+The Ascend migration target is vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2, but
+that combination has not completed NPU runtime validation and is intentionally
+blocked by the environment guard. It is not a supported installation in this
+release candidate. See the [Ascend status](docs/quickstart-ascend.md) for the
+remaining enablement work.
+
+For the validated CUDA installation path, see [quickstart](docs/quickstart.md).
 
 ## Unified self-validation
 
@@ -56,7 +62,11 @@ documented in [benchmarks/qwen/README.md](benchmarks/qwen/README.md).
 - Please refer to [offline inference](examples/offline_inference/beam_search/README.md) for offline beam search example.
 - Please refer to [online inference](examples/online_serving/beam_search/README.md) for online inference example.
 
-## NPU Serving with Constraint Tables
+## NPU Serving Design Status
+
+The following describes the intended NPU configuration contract. It is kept as
+a design reference while the vLLM-Ascend 0.30.0rc2 runtime migration is pending;
+it is not part of the current GPU release acceptance.
 
 Use a canonical `--vllm-gr-config` file with `beam.execution_mode: v1` and
 `constraint_table.backend: npu`. Build the `.safetensors` artifact with the
@@ -68,8 +78,8 @@ then the [online V1 example](examples/online_serving/beam_search/README.md).
 The old frontend `--catalog-path` injection flow is retired; a triples JSON
 is an artifact build input, not a replacement for the canonical configuration.
 
-The [NPU quickstart](docs/quickstart-ascend.md) describes the Ascend environment
-and execution choices. Benchmark gates additionally require local dataset and
+The [NPU status page](docs/quickstart-ascend.md) records the target runtime and
+execution choices. Benchmark gates additionally require local dataset and
 catalog paths plus a resolved benchmark policy; see
 [benchmark instructions](docs/benchmarks/README.md).
 
