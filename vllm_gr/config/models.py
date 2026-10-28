@@ -190,6 +190,9 @@ class GRConfig:
     enable_short_suffix_attention: bool = False
     """Fuse CUDA suffix attention and prefix merging when explicitly enabled."""
 
+    prefill_flash_attn_version: int | str | None = "auto"
+    """CUDA prefill only: auto (default) prefers FA3; None inherits decode; or explicit 2/3."""
+
     beam_graph_widths: tuple[int, ...] | None = None
     """Additional exact NPU Decode input widths to capture at startup."""
 
@@ -213,6 +216,7 @@ class GRConfig:
             validate_constraint_backend,
             validate_enable_short_suffix_attention,
             validate_npu_decode_execution,
+            validate_prefill_flash_attn_version,
             validate_schema_version,
             validate_vocab_offset,
             validate_vocab_slice_size,
@@ -298,6 +302,7 @@ class GRConfig:
             self, "beam_execution_mode", validate_beam_execution_mode(self.beam_execution_mode)
         )
         validate_enable_short_suffix_attention(self.enable_short_suffix_attention)
+        validate_prefill_flash_attn_version(self.prefill_flash_attn_version)
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None

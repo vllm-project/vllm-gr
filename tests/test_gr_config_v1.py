@@ -502,7 +502,7 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
     assert engine_args.model == str(tmp_path)
     config = SimpleNamespace(
         additional_config={},
-        attention_config=SimpleNamespace(backend=None),
+        attention_config=SimpleNamespace(backend=None, flash_attn_version=None),
         scheduler_config=SimpleNamespace(
             async_scheduling=args.async_scheduling,
             enable_chunked_prefill=args.enable_chunked_prefill,

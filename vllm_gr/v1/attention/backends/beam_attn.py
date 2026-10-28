@@ -227,6 +227,32 @@ class BeamAttentionImpl(AttentionImpl):
                 self.alibi_slopes,
                 self.sinks,
             )
+        # Separate prefill from the version that defines decode prefix/LSE
+        # semantics. Resolve before capture; never change the global config.
+        self.prefill_flash_attn_version = self.vllm_flash_attn_version
+        if not CUDA_DEVICE and config.prefill_flash_attn_version not in (None, "auto"):
+            raise ValueError("beam.prefill_flash_attn_version is CUDA-only")
+        if CUDA_DEVICE and config.prefill_flash_attn_version is not None:
+            from vllm_gr.v1.attention.backends.beam_attn_gpu import (
+                resolve_prefill_flash_attn_version,
+            )
+
+            assert self.vllm_flash_attn_version is not None
+            self.prefill_flash_attn_version = resolve_prefill_flash_attn_version(
+                config.prefill_flash_attn_version,
+                self.vllm_flash_attn_version,
+                head_size=head_size,
+                kv_cache_dtype=kv_cache_dtype,
+                requires_alibi=self.alibi_slopes is not None,
+                has_sinks=self.sinks is not None,
+                batch_invariant=self.batch_invariant_enabled,
+            )
+            logger.info_once(
+                "Beam attention: requested prefill=%s, effective prefill FA%s, decode FA%s",
+                config.prefill_flash_attn_version,
+                self.prefill_flash_attn_version,
+                self.vllm_flash_attn_version,
+            )
         # The fused suffix consumes model-dtype queries, not quantized Q.
         self.supports_quant_query_input = not short_suffix_attention
         self.use_cascade = True
@@ -261,6 +287,12 @@ class BeamAttentionImpl(AttentionImpl):
             alibi_slopes=alibi_slopes,
             beam_pool=beam_pool,
         )
+
+    def _prefill_cascade_kwargs(self) -> dict[str, int]:
+        version = self.prefill_flash_attn_version
+        if CUDA_DEVICE and version is not None and version != self.vllm_flash_attn_version:
+            return {"prefill_flash_attn_version": version}
+        return {}
 
     def forward(
         self,
@@ -412,6 +444,7 @@ class BeamAttentionImpl(AttentionImpl):
                 s_aux=self.sinks,
                 alibi_slopes=self.alibi_slopes,
                 beam_pool=pool,
+                **self._prefill_cascade_kwargs(),
             )
 
             return output
@@ -454,6 +487,7 @@ class BeamAttentionImpl(AttentionImpl):
             vllm_flash_attn_version=self.vllm_flash_attn_version,
             s_aux=self.sinks,
             alibi_slopes=self.alibi_slopes,
+            **self._prefill_cascade_kwargs(),
         )
 
         return output
@@ -623,7 +657,7 @@ class BeamAttentionImpl(AttentionImpl):
             sliding_window_size=sliding_window_size,
             scale=self.scale,
             logits_soft_cap=self.logits_soft_cap,
-            vllm_flash_attn_version=self.vllm_flash_attn_version,
+            vllm_flash_attn_version=self.prefill_flash_attn_version,
             s_aux=self.sinks,
             alibi_slopes=self.alibi_slopes,
         )

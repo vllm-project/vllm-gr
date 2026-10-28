@@ -39,6 +39,7 @@ from vllm_gr.config.validation import (
     validate_constraint_table_path,
     validate_enable_short_suffix_attention,
     validate_npu_decode_execution,
+    validate_prefill_flash_attn_version,
     validate_schema_version,
     validate_tokenizer_digest,
     validate_vocab_offset,
@@ -52,6 +53,7 @@ CONSTRAINT_BACKEND_KEY: Final = "vllm_gr_constraint_backend"
 ATTENTION_BACKEND_KEY: Final = "vllm_gr_attention_backend"
 VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
 VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
+PREFILL_FA_VERSION_KEY: Final = "vllm_gr_prefill_flash_attn_version"
 SHORT_SUFFIX_ATTENTION_KEY: Final = "vllm_gr_enable_short_suffix_attention"
 BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
 BEAM_GRAPH_BATCH_SIZE_KEY: Final = "vllm_gr_beam_graph_batch_size"
@@ -74,6 +76,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         VOCAB_SLICE_SIZE_KEY,
         BEAM_GRAPH_ENABLED_KEY,
         SHORT_SUFFIX_ATTENTION_KEY,
+        PREFILL_FA_VERSION_KEY,
         BEAM_GRAPH_BATCH_SIZE_KEY,
         BEAM_GRAPH_WIDTHS_KEY,
         BEAM_ONLINE_BATCH_SIZES_KEY,
@@ -93,6 +96,7 @@ _BEAM_KEYS: Final = frozenset(
     {
         "graph_enabled",
         "enable_short_suffix_attention",
+        "prefill_flash_attn_version",
         "graph_batch_size",
         "graph_widths",
         "online_batch_sizes",
@@ -203,6 +207,9 @@ def gr_config_from_mapping(
     return GRConfig(
         attention_backend=validate_attention_backend(mapping.get("attention_backend")),
         beam_graph_enabled=graph_enabled,
+        prefill_flash_attn_version=validate_prefill_flash_attn_version(
+            beam_raw.get("prefill_flash_attn_version", "auto")
+        ),
         enable_short_suffix_attention=validate_enable_short_suffix_attention(
             beam_raw.get("enable_short_suffix_attention", False)
         ),
@@ -261,6 +268,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         "max_width": config.beam_max_width,
         "max_decode_steps": config.beam_max_decode_steps,
     }
+    if config.prefill_flash_attn_version != "auto":
+        beam["prefill_flash_attn_version"] = config.prefill_flash_attn_version
     if config.enable_short_suffix_attention:
         beam["enable_short_suffix_attention"] = True
     if config.beam_graph_batch_size != 1:
@@ -369,6 +378,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
     if canonical_present:
         return gr_config_from_mapping(additional_config[GR_CONFIG_KEY])
     return GRConfig(
+        prefill_flash_attn_version=validate_prefill_flash_attn_version(
+            additional_config.get(PREFILL_FA_VERSION_KEY, "auto")
+        ),
         catalog_path=validate_catalog_path(additional_config.get(CATALOG_PATH_KEY)),
         constraint_backend=validate_constraint_backend(
             additional_config.get(CONSTRAINT_BACKEND_KEY, "trie")
@@ -458,6 +470,11 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(VOCAB_SLICE_SIZE_KEY, None)
     else:
         additional_config[VOCAB_SLICE_SIZE_KEY] = vocab_slice_size
+
+    if gr_config.prefill_flash_attn_version == "auto":
+        additional_config.pop(PREFILL_FA_VERSION_KEY, None)
+    else:
+        additional_config[PREFILL_FA_VERSION_KEY] = gr_config.prefill_flash_attn_version
 
     if gr_config.enable_short_suffix_attention:
         additional_config[SHORT_SUFFIX_ATTENTION_KEY] = True

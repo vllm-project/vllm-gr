@@ -124,6 +124,55 @@ def get_flash_attn_version(
     )
 
 
+def resolve_prefill_flash_attn_version(
+    requested: int | str | None,
+    decode_version: int,
+    *,
+    head_size: int,
+    kv_cache_dtype: str,
+    requires_alibi: bool,
+    has_sinks: bool,
+    batch_invariant: bool,
+) -> int:
+    """Resolve once before graph capture, without mutating vLLM's decode config.
+
+    Auto is deliberately limited to FA2 -> FA3 on eligible devices. FA4,
+    quantized KV and special attention features need separate qualification.
+    Explicit requests fail early instead of silently benchmarking a fallback.
+    """
+    from vllm_gr.config.validation import validate_prefill_flash_attn_version
+
+    validate_prefill_flash_attn_version(requested)
+    if requested is None or requested == decode_version:
+        return decode_version
+    if requested == "auto" and decode_version != 2:
+        return decode_version
+
+    target = 3 if requested == "auto" else int(requested)
+    reason = None
+    if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+        reason = "independent prefill selection requires unquantized KV"
+    elif batch_invariant:
+        reason = "independent prefill selection is not enabled with batch invariance"
+    elif requires_alibi or has_sinks:
+        reason = "independent prefill selection does not support ALiBi or sinks"
+    elif head_size <= 0 or head_size > 256 or head_size % 8:
+        reason = "prefill head size must be a multiple of 8 in [8, 256]"
+    else:
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            fa_version_unsupported_reason,
+            is_fa_version_supported,
+        )
+
+        if not is_fa_version_supported(target):
+            reason = fa_version_unsupported_reason(target) or "backend unavailable"
+    if reason is not None:
+        if requested == "auto":
+            return decode_version
+        raise ValueError(f"Cannot select prefill FlashAttention {target}: {reason}")
+    return target
+
+
 def supports_sinks() -> bool:
     return bool(is_available() and flash_attn_supports_sinks())
 
@@ -288,12 +337,20 @@ def cascade_attention(
     s_aux: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     beam_pool: object = None,  # Per-layer pool, passed explicitly by forward()
+    prefill_flash_attn_version: int | None = None,
 ) -> None:
     if attn_metadata.std_indices is not None:
         if attn_metadata.prefix_indices is None:
             std_query = query[: attn_metadata.num_std_indices]
         else:
             std_query = query[attn_metadata.std_indices]
+        # Standard rows may share a dispatch with Beam decode rows. Apply the
+        # override only to the standard multi-token path, never prefix/suffix.
+        std_fa_version = (
+            prefill_flash_attn_version
+            if prefill_flash_attn_version is not None and attn_metadata.std_max_q_len > 1
+            else vllm_flash_attn_version
+        )
         std_out = flash_attn_varlen_func(
             q=std_query,
             k=key_cache,
@@ -308,7 +365,7 @@ def cascade_attention(
             window_size=sliding_window_size,
             block_table=attn_metadata.std_block_table,
             softcap=logits_soft_cap,
-            fa_version=vllm_flash_attn_version,
+            fa_version=std_fa_version,
             num_splits=_num_splits(0),
         )
         if attn_metadata.prefix_indices is None:
