@@ -274,8 +274,9 @@ def test_public_result_keeps_the_accepted_boundary_ids(
         assert output.outputs[0].token_ids == boundaries
         assert output.outputs[0].cumulative_logprob == -1.25
     else:
-        assert output.sequences[0].tokens == [1, 2] + boundaries
-        assert output.sequences[0].cum_logprob == -1.25
+        assert output.prompt_token_ids == (1, 2)
+        assert output.sequences[0].token_ids == tuple(boundaries)
+        assert output.sequences[0].cumulative_logprob == -1.25
     assert lookups == [token for token in (begin, end) if token is not None]
 
 

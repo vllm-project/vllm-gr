@@ -165,8 +165,8 @@ class GRConfig:
     beam_graph_batch_size: int = 1
 
     # Like beam_graph_enabled, this flag is dormant without a Beam pool.
-    enable_short_suffix_attention: bool = False
-    """Fuse CUDA suffix attention and prefix merging when explicitly enabled."""
+    enable_short_suffix_attention: bool = True
+    """Fuse CUDA suffix attention and prefix merging by default; False opts out."""
 
     beam_graph_widths: tuple[int, ...] | None = None
     """Additional exact NPU Decode input widths to capture at startup."""

@@ -116,7 +116,7 @@ def prepare(args: argparse.Namespace) -> None:
             "graph_enabled": True,
             "prefix_caching": False,
             "chunked_prefill": False,
-            "timing": "end-to-end caller time; warmup excluded; all beam text materialized offline",
+            "timing": "end-to-end caller time; warmup excluded; generated beam IDs/scores/text materialized offline (full/compact normalized)",
             "online_streaming": False,
         },
     )
@@ -188,22 +188,52 @@ def _measure_offline_batch(
 
     start = time.perf_counter_ns()
     outputs = llm.beam_search_v1(prompts, params, use_tqdm=False)
-    for output in outputs:
+    # Consume identical generated IDs, scores and decoded text on both revisions.
+    # The base runtime returns full outputs; the candidate defaults to compact.
+    # Do not import candidate-only output classes in this shared A/B driver.
+    consumed = []
+    for request_index, output in enumerate(outputs):
+        prompt_ids = prompt_token_ids[request_index] if request_index < count else []
+        candidates = []
         for sequence in output.sequences:
-            _ = sequence.text
+            if hasattr(sequence, "token_ids"):
+                tokens = list(sequence.token_ids)
+                score = float(sequence.cumulative_logprob)
+            else:
+                # Preserve legacy lazy full-text materialization, then normalize
+                # to the same generated-only result that compact consumers use.
+                _ = sequence.text
+                tokens = sequence.tokens[len(prompt_ids) :]
+                score = float(sequence.cum_logprob)
+            text = tokenizer.decode(
+                tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False
+            )
+            candidates.append((tokens, score, text))
+        consumed.append(candidates)
     torch.accelerator.synchronize()
     elapsed = (time.perf_counter_ns() - start) / 1e6
-    if len(outputs) != count or any(len(output.sequences) != beam_width for output in outputs):
-        raise RuntimeError(f"offline B={count}: incomplete V1 output")
-    for request_index, (prompt_ids, output) in enumerate(
-        zip(prompt_token_ids[:count], outputs, strict=True)
-    ):
-        for beam_index, sequence in enumerate(output.sequences):
-            tokens = list(sequence.tokens)
+    if len(consumed) != count or any(len(row) != beam_width for row in consumed):
+        raise RuntimeError("offline: incomplete V1 output")
+    for request_index, (output, candidates) in enumerate(zip(outputs, consumed, strict=True)):
+        prompt_ids = prompt_token_ids[request_index]
+        compact_prompt = getattr(output, "prompt_token_ids", None)
+        compact_prompt_matches = compact_prompt is not None and tuple(compact_prompt) == tuple(
+            prompt_ids
+        )
+        for beam_index, (sequence, (tokens, score, text)) in enumerate(
+            zip(output.sequences, candidates, strict=True)
+        ):
+            prompt_matches = (
+                compact_prompt_matches
+                if hasattr(sequence, "token_ids")
+                else list(sequence.tokens[: len(prompt_ids)]) == prompt_ids
+            )
             context = f"offline B={count} request={request_index} beam={beam_index}"
-            if tokens[: len(prompt_ids)] != prompt_ids:
+            if not prompt_matches:
                 raise RuntimeError(f"{context}: output prompt/order mismatch")
-            validate_sid_tokens(tokenizer, tokens[len(prompt_ids) :], context)
+            if not math.isfinite(score) or not isinstance(text, str):
+                raise RuntimeError(f"{context}: invalid score/text")
+            validate_sid_tokens(tokenizer, tokens, context)
     return elapsed
 
 

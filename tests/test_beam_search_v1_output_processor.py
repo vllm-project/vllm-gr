@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator
 from dataclasses import asdict, fields, replace
 from types import SimpleNamespace
 from typing import Any
@@ -68,7 +69,9 @@ def _case(
     params = SimpleNamespace(
         begin_token=begin, end_token=end, include_stop_str_in_output=include_stop
     )
-    call = OfflineBeamSearchRequest([{"prompt_token_ids": [1, 2], "prompt": "source"}], params)
+    call = OfflineBeamSearchRequest(
+        [{"prompt_token_ids": [1, 2], "prompt": "source"}], params, output_mode="full"
+    )
     lora = LoRARequest("test-lora", 1, "/tmp/test-lora")
     native = EngineCoreRequest(
         request_id="request-1",
@@ -187,7 +190,9 @@ def test_item_order_and_empty_outputs() -> None:
         request.beam_params,
         request.output_options,
     )
-    call2 = OfflineBeamSearchRequest([*call.prompts, {"prompt_token_ids": [7, 8]}], call.params)
+    call2 = OfflineBeamSearchRequest(
+        [*call.prompts, {"prompt_token_ids": [7, 8]}], call.params, output_mode="full"
+    )
     output = BeamBatchOutput((BeamRequestOutput(1, "second", first.sequences), first))
     converted = processor.process_outputs(
         call2, request2, BeamBatchResult(1, "batch", output, None)
@@ -223,3 +228,97 @@ def test_online_output_boundary_is_unchanged(include_stop: bool) -> None:
     assert output.outputs[0].token_ids == [10, 3, 4, 20]
     assert output.outputs[1].token_ids == [10, 5] + ([20] if include_stop else [])
     assert output.outputs[0].text == "10|3|4|20"
+
+
+@pytest.mark.parametrize("begin", [None, "begin"])  # type: ignore[misc]
+@pytest.mark.parametrize("end", [None, "end"])  # type: ignore[misc]
+@pytest.mark.parametrize("include_stop", [False, True])  # type: ignore[misc]
+def test_compact_matches_full_tail_scores_and_stop_metadata(
+    begin: str | None, end: str | None, include_stop: bool
+) -> None:
+    from vllm_gr.outputs import CompactBeamSearchOutput
+
+    processor, call, request, result, tokenizer = _case(begin, end, include_stop)
+    compact = processor.process_outputs(replace(call, output_mode="compact"), request, result)[0]
+    assert isinstance(compact, CompactBeamSearchOutput)
+    assert compact.prompt_token_ids == (1, 2)
+    assert tokenizer.decode_calls == 0
+    full = processor.process_outputs(call, request, result)[0]
+    for short, native in zip(compact.sequences, full.sequences, strict=True):
+        assert short.token_ids == tuple(native.tokens[2:])
+        assert short.cumulative_logprob == native.cum_logprob
+        assert short.finish_reason == native.finish_reason
+        assert short.stop_reason == native.stop_reason
+    assert compact.sequences[1].token_ids == (
+        ((10,) if begin else ()) + (5,) + ((20,) if include_stop else ())
+    )
+    # Compact values are owned, immutable CPU data, independent of accepted input mutation.
+    request.items[0].request.prompt_token_ids[0] = 999
+    assert compact.prompt_token_ids == (1, 2)
+
+
+def test_compact_does_not_copy_prompt_or_decode_text_per_beam() -> None:
+    class CountedPrompt(list[int]):
+        reads = 0
+
+        def __iter__(self) -> Iterator[int]:
+            self.reads += 1
+            return super().__iter__()
+
+    processor, call, request, result, tokenizer = _case(None, None)
+    prompt = CountedPrompt(range(1024))
+    request.items[0].request.prompt_token_ids = prompt
+    sequences = tuple(
+        BeamOutputSequence((3, 4, i), -float(i), (), "length", None) for i in range(256)
+    )
+    result = BeamBatchResult(
+        1, "request-1", BeamBatchOutput((BeamRequestOutput(0, "request-1", sequences),)), None
+    )
+    compact = processor.process_outputs(replace(call, output_mode="compact"), request, result)[0]
+    assert prompt.reads == 1
+    assert tokenizer.decode_calls == 0
+    assert len(compact.sequences) == 256
+    assert all(len(seq.token_ids) == 3 for seq in compact.sequences)
+    assert compact.sequences[255].cumulative_logprob == -255.0
+
+
+def test_compact_empty_candidates_and_request_order() -> None:
+    processor, call, request, result, tokenizer = _case(None, None)
+    second = copy.copy(request.items[0].request)
+    second.prompt_token_ids = [7, 8]
+    request = BeamBatchRequest(
+        request.protocol_version,
+        request.batch_id,
+        (*request.items, BeamBatchItem(1, second)),
+        request.beam_params,
+        request.output_options,
+    )
+    call = replace(
+        call, prompts=[*call.prompts, {"prompt_token_ids": [7, 8]}], output_mode="compact"
+    )
+    result = BeamBatchResult(
+        1,
+        "batch",
+        BeamBatchOutput((BeamRequestOutput(1, "second", ()), result.output.items[0])),
+        None,
+    )
+    out = processor.process_outputs(call, request, result)
+    assert [x.prompt_token_ids for x in out] == [(7, 8), (1, 2)]
+    assert out[0].sequences == ()
+    assert tokenizer.decode_calls == 0
+
+
+def test_invalid_output_mode_is_rejected_before_execution() -> None:
+    with pytest.raises(ValueError, match="output_mode"):
+        OfflineBeamSearchRequest([], object(), output_mode="invalid")
+
+
+def test_default_output_is_compact_without_prompt_materialization() -> None:
+    processor, call, request, result, tokenizer = _case()
+    default_call = OfflineBeamSearchRequest(call.prompts, call.params)
+    assert default_call.output_mode == "compact"
+    output = processor.process_outputs(default_call, request, result)[0]
+    assert output.prompt_token_ids == (1, 2)
+    assert output.sequences[0].token_ids == (10, 3, 4, 20)
+    assert output.sequences[0].cumulative_logprob == -1.25
+    assert tokenizer.decode_calls == 0

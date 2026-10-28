@@ -54,7 +54,7 @@ def _run_offline_beam_search_v1(
                     for index in range(batch_size)
                 ]
                 outputs = llm.beam_search_v1(
-                    [{"prompt_token_ids": ids} for ids in prompt_ids], params
+                    [{"prompt_token_ids": ids} for ids in prompt_ids], params, output_mode="full"
                 )
                 assert len(outputs) == batch_size
                 for ids, output in zip(prompt_ids, outputs, strict=True):

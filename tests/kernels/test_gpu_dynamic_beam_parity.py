@@ -90,7 +90,9 @@ def test_dynamic_matches_cpu_oracle(tmp_path):
                     temperature=0.0,
                     length_penalty=length_penalty,
                 )
-                outputs = llm.beam_search_v1([tokens_input(p) for p in prompts[:batch]], params)
+                outputs = llm.beam_search_v1(
+                    [tokens_input(p) for p in prompts[:batch]], params, output_mode="full"
+                )
                 assert len(outputs) == batch
                 for prompt, output in zip(prompts[:batch], outputs):
                     expected = oracle(model, prompt, schedule, result_width)

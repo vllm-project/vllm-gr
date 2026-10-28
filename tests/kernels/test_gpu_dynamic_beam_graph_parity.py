@@ -50,7 +50,7 @@ def test_irregular_graph_parity(tmp_path):
             captures = None
             for eager in (True, False, False):
                 worker.model_config.enforce_eager = eager
-                outputs = llm.beam_search_v1(prompts, params)
+                outputs = llm.beam_search_v1(prompts, params, output_mode="full")
                 results.append(
                     [[(tuple(s.tokens), s.cum_logprob) for s in out.sequences] for out in outputs]
                 )
@@ -115,6 +115,7 @@ def test_uniform_result_limit_keeps_fixed_adapter(tmp_path, explicit_schedule):
                         ignore_eos=True,
                         temperature=0.0,
                     ),
+                    output_mode="full",
                 )
                 owner = worker._gr_gpu_stage_runner
                 assert owner.dynamic is None

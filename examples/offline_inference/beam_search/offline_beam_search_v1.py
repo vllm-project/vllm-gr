@@ -157,7 +157,9 @@ def benchmark_beam_search(
     llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
 ) -> tuple[list[Any], dict[str, Any]]:
     for iteration in range(args.warmup_runs):
-        llm.beam_search_v1(isolate_prompts(prompts, f"warmup-{iteration}"), params)
+        llm.beam_search_v1(
+            isolate_prompts(prompts, f"warmup-{iteration}"), params, output_mode="full"
+        )
 
     latencies_ms: list[float] = []
     returned_beams: list[int] = []
@@ -165,7 +167,7 @@ def benchmark_beam_search(
     for iteration in range(args.repeat):
         isolated = isolate_prompts(prompts, f"benchmark-{iteration}")
         started = perf_counter()
-        outputs = llm.beam_search_v1(isolated, params)
+        outputs = llm.beam_search_v1(isolated, params, output_mode="full")
         latencies_ms.append((perf_counter() - started) * 1000.0)
         if len(outputs) != len(prompts):
             raise RuntimeError(f"expected {len(prompts)} request outputs, got {len(outputs)}")
@@ -225,12 +227,12 @@ def run_beam_search(
     llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
 ) -> list[Any]:
     if args.profile_dir is None:
-        outputs: list[Any] = llm.beam_search_v1(prompts, params)
+        outputs: list[Any] = llm.beam_search_v1(prompts, params, output_mode="full")
         return outputs
 
     def run_once(iteration: int) -> list[Any]:
         isolated = isolate_prompts(prompts, f"profile-{iteration}")
-        result: list[Any] = llm.beam_search_v1(isolated, params)
+        result: list[Any] = llm.beam_search_v1(isolated, params, output_mode="full")
         return result
 
     for iteration in range(args.profile_warmup_runs):

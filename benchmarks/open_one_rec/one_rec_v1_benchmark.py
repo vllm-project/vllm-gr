@@ -95,7 +95,7 @@ def run_v1_benchmark(args, tokenizer, requests):
                 if not llm.reset_prefix_cache():
                     raise RuntimeError(f"prefix cache reset failed before request {index}")
                 start = time.perf_counter_ns()
-                outputs = llm.beam_search_v1([{"prompt": prompts[row]}], params)
+                outputs = llm.beam_search_v1([{"prompt": prompts[row]}], params, output_mode="full")
                 # V1 materializes tokens/text lazily: force every beam before stopping the timer.
                 for output in outputs:
                     for sequence in output.sequences:

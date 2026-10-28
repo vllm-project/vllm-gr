@@ -19,8 +19,9 @@ SID_IDS = [10, 11, 12, 13, 14]
 SID_TEXT = "<|sid_begin|><s_a_1><s_b_2><s_c_3><|sid_end|>"
 
 
+@pytest.mark.parametrize("compact", [False, True])  # type: ignore[misc]
 def test_offline_releases_consumed_outputs_before_next_call(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compact: bool
 ) -> None:
     import torch
 
@@ -36,6 +37,7 @@ def test_offline_releases_consumed_outputs_before_next_call(
     @dataclass
     class Sequence:
         tokens: Tokens
+        cum_logprob: float = -1.0
 
         @property
         def text(self) -> str:
@@ -43,12 +45,31 @@ def test_offline_releases_consumed_outputs_before_next_call(
             return SID_TEXT
 
     @dataclass
+    class CompactSequence:
+        token_ids: Tokens
+        cumulative_logprob: float = -1.0
+
+        @property
+        def text(self) -> str:
+            raise AssertionError("compact must not materialize full text")
+
+    @dataclass
     class Output:
-        sequences: list[Sequence]
+        sequences: list[Any]
+        prompt_token_ids: tuple[int, ...]
 
     class Tokenizer:
         def encode(self, text: str, **kwargs: Any) -> list[int]:
             return [1] if text == "\n" else [2]
+
+        def decode(self, tokens: list[int], **kwargs: Any) -> str:
+            events.append("decode")
+            assert tokens == SID_IDS
+            assert kwargs == {
+                "skip_special_tokens": False,
+                "clean_up_tokenization_spaces": False,
+            }
+            return SID_TEXT
 
         def convert_ids_to_tokens(self, tokens: list[int]) -> list[str]:
             events.append("validate")
@@ -72,15 +93,21 @@ def test_offline_releases_consumed_outputs_before_next_call(
             self, prompts: list[dict[str, list[int]]], params: Any, **kwargs: Any
         ) -> list[Output]:
             events.append("infer")
+            assert "output_mode" not in kwargs
             # Include token buffers: deleting only the top-level outputs list
             # leaves loop variables retaining part of the previous batch.
             assert all(ref() is None for ref in previous)
             outputs = [
                 Output(
                     [
-                        Sequence(Tokens(prompt["prompt_token_ids"] + SID_IDS))
+                        (
+                            CompactSequence(Tokens(SID_IDS))
+                            if compact
+                            else Sequence(Tokens(prompt["prompt_token_ids"] + SID_IDS))
+                        )
                         for _ in range(self.width)
-                    ]
+                    ],
+                    tuple(prompt["prompt_token_ids"]),
                 )
                 for prompt in prompts
             ]
@@ -90,7 +117,10 @@ def test_offline_releases_consumed_outputs_before_next_call(
                 for value in (
                     output,
                     *output.sequences,
-                    *(sequence.tokens for sequence in output.sequences),
+                    *(
+                        sequence.token_ids if compact else sequence.tokens
+                        for sequence in output.sequences
+                    ),
                 )
             ]
             return outputs
@@ -130,7 +160,7 @@ def test_offline_releases_consumed_outputs_before_next_call(
         for _ in range(args.warmup_runs + args.measured_runs)
         for event in (
             ["start", "infer"]
-            + ["text"] * (count * args.beam_width)
+            + (["decode"] if compact else ["text", "decode"]) * (count * args.beam_width)
             + ["sync", "stop"]
             + ["validate"] * (count * args.beam_width)
         )
