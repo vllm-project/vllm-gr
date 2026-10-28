@@ -162,6 +162,7 @@ class BSNDRegressions(unittest.TestCase):
             sinks=None,
             alibi_slopes=None,
             vllm_flash_attn_version=None,
+            prefill_flash_attn_version=None,
             prefill_attention=lambda **kw: calls.append(("tnd", kw)),
         )
         meta = SimpleNamespace(

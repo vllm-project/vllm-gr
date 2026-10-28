@@ -323,6 +323,7 @@ def run_cascade_beam_attention(
         logits_soft_cap=logits_soft_cap,
     )
     impl.vllm_flash_attn_version = vllm_flash_attn_version
+    impl.prefill_flash_attn_version = impl.vllm_flash_attn_version
 
     BeamAttentionImpl.cascade_attention(
         output=output,
