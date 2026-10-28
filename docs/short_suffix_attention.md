@@ -2,7 +2,7 @@
 
 When explicitly enabled, incremental beam decode with one query per beam
 uses a fused Triton suffix/merge kernel for any configured positive KV pool
-capacity. It reads K/V from the existing pool, computes suffix scores in
+capacity. It reads K/V from the existing pool, accumulates suffix scores in
 FP32, and merges them
 with the prefix attention output and natural-log LSE. It writes the final
 attention output directly.
@@ -52,15 +52,41 @@ Restart the engine when changing the configuration so CUDA graphs capture
 the selected implementation. CUDA graph enablement is independent.
 There is no fixed suffix-length upper limit imposed by this optimization.
 Users select the implementation explicitly; performance gains depend on the
-actual suffix length and should be measured for their workload. Tiny pools
-retain static unrolling; larger pools loop over the actual device-side
-suffix extent, avoiding computation for unused capacity.
+actual suffix length and should be measured for their workload. Tiny
+FP16/BF16 pools preserve FA2's rounding stages; larger pools loop over the
+actual device-side suffix extent, avoiding computation for unused capacity.
 Compare both paths on the same checkout and workload, starting a fresh engine
 for each value of `beam.enable_short_suffix_attention`. Keep the model,
 input/output token interval, context length, beam width, generation length,
 warmup count, and CUDA graph settings identical.
 
 ## Numerical validation
+
+### FA2 arithmetic compatibility
+
+For FP16/BF16 inputs with configured pool capacity 1/2/3, head dimensions
+64/128/256 and at most 16 query heads per KV head, the fused path preserves
+the disabled FA2 suffix attention and CUDA merge arithmetic:
+
+- Use FA2's `kWidth=2` MMA operand layout and softmax/LSE arithmetic.
+- Round probabilities to the activation dtype before PV, and round the
+  normalized suffix output before prefix/suffix merging.
+- Preserve the CUDA merge's exponential, round-to-nearest division and FMA
+  ordering.
+
+Both rounding stages stay in registers. The kernel still reads the KV pool
+directly and produces the merged output in one launch, without packed suffix
+KV or intermediate suffix output/LSE tensors. FP32 inputs, larger capacities
+and groups above 16 retain the existing online FP32 implementation.
+
+`tests/kernels/attention/test_beam_short_suffix.py` compares this tiny-pool path
+with the actual packed FA2 suffix, GQA LSE conversion and CUDA merge using
+`atol=0, rtol=0`. It covers FP16/BF16, strided tensors, partial tiles, GQA
+layouts, runtime slots and graph replay with changing step, mask and KV data.
+Matching FA2's arithmetic is distinct from minimizing error against a dense
+reference; the independent reference checks keep their existing tolerances.
+
+### Independent dense references
 
 `tests/kernels/attention/test_beam_short_suffix.py` compares with an
 independent dense attention reference over the concatenated prefix and

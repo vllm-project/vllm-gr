@@ -239,12 +239,27 @@ VLLM_GR_TEST_MODEL="$ONEREC_MODEL" \
 python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py
 ```
 
-The same file also carries the completions-route check, which posts a 2-, 4- and
-3-prompt list and reads the session sizes off the existing stage probe:
+The same file also carries one completions-route check configured with
+`[1,2,3,4,8]`. It starts one engine and posts 1-, 2-, 3-, 4- and 8-prompt lists,
+checking actual session sizes, response indices, usage and cleanup. This covers
+common batch sizes, a non-power-of-two size and the supported batch-size limit
+without starting a second engine for a separate policy. Lightweight configuration
+and routing tests retain default `[1,2,4]` and sparse `[1,3,7]` policy coverage.
+The test configuration does not change production defaults.
 
 ```bash
-python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py   -k completion_batch
+python -m pytest --run-slow -v -s tests/st/test_onerec_v1_scheduler_st.py \
+  -k completion_batch --durations=0
 ```
+
+The HTTP case writes `completion-batch-evidence.json` in its pytest temporary
+directory: phase durations, request checks, and observed Decode/Prefill graph
+shapes. Phase timings and request rows are persisted incrementally, including
+on ordinary exceptions; a hard process kill can leave only partial evidence.
+`subprocess-evidence.json` records the outer process wall time and exit code.
+Request timing includes probes, assertions, cache resets and any first-use JIT;
+it is not a steady-state inference benchmark. Keep cache conditions consistent
+when comparing runs.
 
 | Symptom | Resolution |
 | --- | --- |

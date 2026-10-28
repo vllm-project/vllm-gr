@@ -18,7 +18,11 @@ from typing import Annotated, Literal, NoReturn, TypeGuard
 import msgspec
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_gr.config import MAX_BEAM_WIDTH, SUPPORTED_BEAM_BATCH_SIZES
+from vllm_gr.config import (
+    MAX_BEAM_WIDTH,
+    MAX_CANDIDATE_WIDTH,
+    SUPPORTED_BEAM_BATCH_SIZES,
+)
 
 BEAM_BATCH_PROTOCOL_VERSION = 1
 DEFAULT_CONSTRAINT_RESOURCE_ID = "default"
@@ -67,6 +71,15 @@ class BeamBatchParams(
     # arrays still include this field, so old strict decoders reject them even
     # for fixed-width calls. All participating processes need the same schema.
     dynamic_beam_widths: tuple[int, ...] | None = None
+    # Candidates per beam row.  None keeps the pre-decoupling behaviour
+    # (K == beam_width).  ``array_like`` structs encode positionally, so this
+    # trailing ``None`` is still written as a tenth array element even with
+    # ``omit_defaults``: an older strict decoder rejects a new payload outright
+    # rather than reading it as "unset".  A new decoder does accept old
+    # nine-element arrays through the default.  All participating processes
+    # therefore have to run the same schema version; a mixed-version rollout is
+    # not supported and needs the protocol version bumped.
+    candidate_width: int | None = None
 
 
 class BeamOutputOptions(
@@ -294,6 +307,39 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
         _fail(f"beam_params.length_penalty must be a finite number, got {params.length_penalty!r}")
     if params.catalog_strategy not in (None, "fill", "null"):
         _fail("beam_params.catalog_strategy must be 'fill', 'null', or None")
+    if params.candidate_width is not None:
+        candidate_width = _positive_int("beam_params.candidate_width", params.candidate_width)
+        if candidate_width > MAX_CANDIDATE_WIDTH:
+            _fail(
+                "beam_params.candidate_width must be <= "
+                f"{MAX_CANDIDATE_WIDTH}, got {candidate_width}"
+            )
+        if candidate_width != beam_width:
+            # Same reason as the config-level rejection: this build derives the
+            # executed top-k from the active stage width, so a request that
+            # carries a different K would be accepted here and then silently
+            # run as W.  Internal callers build BeamBatchRequest directly and
+            # never pass through GRConfig validation, so the check has to exist
+            # here too.
+            _fail(
+                f"beam_params.candidate_width must equal beam_params.beam_width "
+                f"({candidate_width} != {beam_width}): this build does not yet "
+                "sample an independent candidate width. Leave candidate_width "
+                "unset to follow the Beam width."
+            )
+    if params.candidate_width is not None and widths is not None and len(set(widths)) > 1:
+        # An explicit K is a fixed promise about the per-row candidate count,
+        # but the executed top-k is derived from the active stage width, so a
+        # shrinking schedule would sample [W, ..., 1] while the request claims
+        # one fixed K.  Non-uniform schedules therefore stay usable only with
+        # K unset, where following the stage width is the established
+        # behaviour.  Lifting this needs the engine-wiring layer to consume K.
+        _fail(
+            "beam_params.candidate_width must not be combined with a non-uniform "
+            f"dynamic_beam_widths schedule {tuple(widths)}: this build derives the "
+            "executed top-k from the active stage width. Leave candidate_width "
+            "unset to keep dynamic Beam widths."
+        )
     seen_stop_ids: set[int] = set()
     for index, token_id in enumerate(params.stop_token_ids):
         normalized = _non_negative_int(f"beam_params.stop_token_ids[{index}]", token_id)

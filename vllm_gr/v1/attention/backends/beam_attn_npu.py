@@ -655,3 +655,73 @@ def update_graph_params(
             torch.npu.graph_task_update_end(update_stream)
     entry._last_update_signature = signature
     return True
+
+
+# 20261019: Fixed-shape nonpaged FIA; no changes to latest TND task/update ordering.
+def prefill_attention_bsnd(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: BeamAttentionMetadata,
+    scale: float,
+) -> None:
+    """v4.1 BSND prefill attention: shape-bound FIA, no per-layer host update.
+
+    Q/output are laid out [B,P,Nq,D] and K/V [B,P,Nkv,D] from the current
+    layer's QKV projection; the per-request lengths live entirely in the
+    tensor shapes, so the captured graph replays without task updates.
+    Padding keys k>=L_i are causal-masked against every real query q<L_i,
+    so no dynamic padding mask is needed (pad rows are discarded downstream).
+    """
+    # 20261019: Scratch lifetime follows the captured metadata, not module globals.
+    resources = attn_metadata.bsnd_resources
+    resources.setdefault("workspaces", {})
+    resources.setdefault("lses", {})
+    num_reqs = attn_metadata.num_reqs
+    if num_reqs <= 0:
+        return
+    B = num_reqs
+    T = query.shape[0]
+    if T % B:
+        raise ValueError(f"BSND prefill token count {T} is not divisible by batch size {B}")
+    P = T // B
+    Nq = attn_metadata.num_heads
+    Nkv = attn_metadata.num_kv_heads
+    D = query.shape[-1]
+    # 20261020: GQA: Q/out [B,P,Nq,D], K/V [B,P,Nkv,D]
+    # 20261019: Ported v4 fix; historical note: 20261008 reshape can preserve a strided QKV slice; FIA requires
+    # contiguous inputs. The output must alias the caller's buffer, never a reshape copy.
+    q_bsnd = query.reshape(B, P, Nq, D).contiguous()
+    k_bsnd = key.reshape(B, P, Nkv, D).contiguous()
+    v_bsnd = value.reshape(B, P, Nkv, D).contiguous()
+    if not output.is_contiguous():
+        raise ValueError("BSND prefill requires a contiguous output buffer")
+    out_bsnd = output.view(B, P, Nq, D)
+    mask = attn_metadata.npu_causal_atten_mask if attn_metadata.causal else None
+    kw = {
+        "query": q_bsnd,
+        "key": k_bsnd,
+        "value": v_bsnd,
+        "atten_mask": mask,
+        "input_layout": "BSND",
+        "num_key_value_heads": Nkv,
+        "num_query_heads": Nq,
+        "softmax_scale": scale,
+        "sparse_mode": 3 if attn_metadata.causal else 0,
+    }
+    # Query and cache the workspace with the same BSND arguments.
+    # Include shape, dtype and scale so each (T, B) graph owns its workspace.
+    cache_key = (B, P, Nq, Nkv, D, scale, query.dtype, query.device.index)
+    workspace = resources["workspaces"].get(cache_key)
+    if workspace is None:
+        workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(**kw)
+        if workspace is None:
+            raise RuntimeError("FIA-v2 workspace sizing failed on the BSND prefill path")
+        resources["workspaces"][cache_key] = workspace
+    # Cache LSE too: reuse its address and avoid new allocations during capture.
+    lse = resources["lses"].get(cache_key)
+    if lse is None or lse.dtype != output.dtype:
+        lse = torch.empty(1, dtype=output.dtype, device=output.device)
+        resources["lses"][cache_key] = lse
+    torch_npu.npu_fused_infer_attention_score_v2.out(**kw, workspace=workspace, out=[out_bsnd, lse])

@@ -11,8 +11,14 @@ CONSTRAINT_TABLE_FORMAT = "constraint_table_v1"
 CONSTRAINT_TABLE_MAX_DECODE_STEPS = 3
 # Temporary global Beam width ceiling. Keep every configuration, request,
 # runtime contract, and fused kernel on this single limit until wider kernels
-# are implemented and qualified end to end.
+# are implemented and qualified end to end.  This constant also gates the raw
+# Beam *operators*, so raising it ships the wide-W selection paths whether or
+# not they are fixed; raise it together with those kernels, not ahead of them.
 MAX_BEAM_WIDTH = 256
+# Candidate width (top-k per beam row) is an independent dimension: the
+# RecConstrainedTopK operator caps it at 256, so 256 is the single ceiling
+# shared by every configuration, request contract, and Triton launch.
+MAX_CANDIDATE_WIDTH = 256
 # Conservative startup resource policy, including the implicit max-width bank.
 # This bounds retained width count; it is not a guarantee that graphs fit memory.
 MAX_NPU_BEAM_GRAPH_WIDTHS = 8
@@ -59,10 +65,16 @@ class ConstraintTableConfig:
     format: str = CONSTRAINT_TABLE_FORMAT
     artifact_digest: str | None = None
     tokenizer_digest: str | None = None
+    # Independent candidate width K: how many top-k candidates each beam row
+    # expands into per step.  None keeps today's behaviour (K == beam_width).
+    # K is an engine-lifetime constant because the postprocess workspace is
+    # prewarmed at a fixed address.
+    candidate_width: int | None = None
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_artifact_digest,
+            validate_candidate_width,
             validate_constraint_table_backend,
             validate_constraint_table_enabled,
             validate_constraint_table_format,
@@ -89,6 +101,11 @@ class ConstraintTableConfig:
             self,
             "max_top_k",
             validate_constraint_table_max_top_k(self.max_top_k),
+        )
+        object.__setattr__(
+            self,
+            "candidate_width",
+            validate_candidate_width(self.candidate_width),
         )
 
         if self.enabled:
@@ -136,6 +153,11 @@ class GRConfig:
     # beam_max_width is set, a FULL graph is captured at startup; requests
     # with beam_width <= beam_max_width are served (graph replay for the
     # exact-width case, eager otherwise).
+    #
+    # beam_max_width is the ROW count only. The per-row candidate count K is
+    # ``constraint_table.candidate_width`` and is independent of it: K follows
+    # beam_max_width when unset, and a beam wider than MAX_CANDIDATE_WIDTH must
+    # state K explicitly (see resolve_candidate_width).
     beam_graph_enabled: bool = True
     beam_max_width: int | None = None
     beam_max_decode_steps: int = _BEAM_MAX_DECODE_STEPS_DEFAULT
@@ -291,6 +313,40 @@ class GRConfig:
                 "constrained_generation=False cannot be combined with an enabled "
                 "constraint table or a configured vocabulary slice"
             )
+        if (
+            self.constraint_table is not None
+            and self.constraint_table.enabled
+            and self.constraint_table.candidate_width is None
+            and self.beam_max_width is not None
+            and self.beam_max_width > MAX_CANDIDATE_WIDTH
+        ):
+            # Fail at parse time instead of at the first workspace lookup: the
+            # prewarmed workspace bucket is keyed by K, and a config that only
+            # implies K == beam_max_width has no bucket to find.
+            raise ValueError(
+                f"vllm-gr beam_max_width={self.beam_max_width} exceeds the candidate "
+                f"width ceiling {MAX_CANDIDATE_WIDTH}; set "
+                "constraint_table.candidate_width to the per-row candidate count"
+            )
+        if (
+            self.constraint_table is not None
+            and self.constraint_table.candidate_width is not None
+            and self.beam_max_width is not None
+            and self.constraint_table.candidate_width != self.beam_max_width
+        ):
+            # TEMPORARY, removed by the engine-wiring layer.  Nothing in this
+            # build samples a per-row candidate count: the postprocess
+            # workspace is still keyed by the Beam width, so a K wider or
+            # narrower than W is accepted here and then silently executed as
+            # W.  Reject it at parse time rather than let a served request
+            # disagree with its own configuration.
+            raise ValueError(
+                "vllm-gr constraint_table.candidate_width="
+                f"{self.constraint_table.candidate_width} must equal beam_max_width="
+                f"{self.beam_max_width}: this build does not yet sample an "
+                "independent candidate width. Leave candidate_width unset to "
+                "follow the Beam width."
+            )
 
     @property
     def beam_graph_active(self) -> bool:
@@ -351,3 +407,29 @@ class GRConfig:
             object.__setattr__(vllm_config, "_vllm_gr_parsed_config", None)
         except (AttributeError, TypeError):
             pass
+
+
+def resolve_candidate_width(config: GRConfig) -> int:
+    """Resolve the effective per-row candidate width K.
+
+    The single derivation point: ``constraint_table.candidate_width`` wins when
+    set, otherwise K follows ``beam_max_width`` (the pre-decoupling behaviour).
+    Every workspace bucket key, admission gate, and kernel launch must call
+    this instead of spelling out ``(width, width, dtype)``.
+    """
+
+    table = config.constraint_table
+    if table is not None and table.candidate_width is not None:
+        return int(table.candidate_width)
+    if config.beam_max_width is None:
+        raise ValueError("vllm-gr cannot resolve candidate_width without beam_max_width")
+    candidate_width = int(config.beam_max_width)
+    if candidate_width > MAX_CANDIDATE_WIDTH:
+        # Following the beam width is only valid while it fits the operator
+        # ceiling; a wider beam must state its per-row candidate width.
+        raise ValueError(
+            f"vllm-gr beam_max_width={candidate_width} exceeds the candidate width "
+            f"ceiling {MAX_CANDIDATE_WIDTH}; set constraint_table.candidate_width to "
+            "the per-row candidate count"
+        )
+    return candidate_width

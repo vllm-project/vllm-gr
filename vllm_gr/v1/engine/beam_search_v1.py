@@ -173,6 +173,40 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
         raise ValueError("dynamic beam widths and result widths require CUDA or NPU beam_search_v1")
 
 
+def _reject_explicit_candidate_width_with_dynamic_schedule(
+    gr_config: Any,
+    params: BeamBatchParams,
+) -> None:
+    """An explicit K and a non-uniform dynamic schedule cannot both hold.
+
+    A configured ``constraint_table.candidate_width`` is a fixed promise about
+    the per-row candidate count, but the executed top-k is derived from the
+    active stage width.  ``[4, 2, 1]`` therefore samples 4, then 2, then 1
+    candidates per row, and the configured K is silently ignored after the
+    first stage.  Rejecting the combination keeps the fixed-K promise honest
+    until the engine-wiring layer consumes K.
+
+    The check has to live here rather than in the request contract: the
+    explicit K is a *configuration* field and the frontend never copies it into
+    ``BeamBatchParams``, so a request-only guard would never fire.  Leaving K
+    unset keeps dynamic Beam widths working exactly as before.
+    """
+
+    widths = params.dynamic_beam_widths
+    if widths is None or len(set(widths)) <= 1:
+        return
+    table = getattr(gr_config, "constraint_table", None)
+    configured = getattr(table, "candidate_width", None)
+    if configured is None:
+        return
+    raise ValueError(
+        "vllm-gr constraint_table.candidate_width="
+        f"{configured} cannot be combined with a non-uniform dynamic_beam_widths "
+        f"schedule {tuple(widths)}: this build derives the executed top-k from the "
+        "active stage width. Leave candidate_width unset to keep dynamic Beam widths."
+    )
+
+
 def validate_gr_request(request: BeamBatchRequest, *, config: Any = None) -> None:
     """Validate shared V1 semantics before native ADD or Worker allocation."""
     validate_beam_batch_request(request)
@@ -213,6 +247,7 @@ def validate_gr_request(request: BeamBatchRequest, *, config: Any = None) -> Non
             raise ValueError(
                 f"Decode steps {max_tokens} exceed runtime limit {gr_config.beam_max_decode_steps}"
             )
+        _reject_explicit_candidate_width_with_dynamic_schedule(gr_config, request.beam_params)
 
 
 @dataclass(frozen=True, slots=True)

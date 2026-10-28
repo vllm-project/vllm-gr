@@ -7,13 +7,14 @@ from typing import Any
 import pytest
 from vllm.exceptions import VLLMValidationError
 
+from vllm_gr.config import MAX_BEAM_WIDTH
 from vllm_gr.sampling_params import BeamSearchParams
 
 
 def test_beam_search_params_enforces_global_width_limit() -> None:
     assert BeamSearchParams(beam_width=256, max_tokens=1).beam_width == 256
-    with pytest.raises(VLLMValidationError, match=r"\[1, 256\]"):
-        BeamSearchParams(beam_width=257, max_tokens=1)
+    with pytest.raises(VLLMValidationError, match=rf"\[1, {MAX_BEAM_WIDTH}\]"):
+        BeamSearchParams(beam_width=MAX_BEAM_WIDTH + 1, max_tokens=1)
 
 
 def _sub_patch_preserves_greedy_validation() -> None:

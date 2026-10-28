@@ -318,6 +318,54 @@ def test_offline_inputs_preserve_caller_formed_batch_order(batch_size: int) -> N
     assert len({item.request.request_id for item in request.items}) == batch_size
 
 
+def test_explicit_candidate_width_rejects_a_non_uniform_dynamic_schedule() -> None:
+    """A configured fixed K and a shrinking schedule contradict each other.
+
+    ``constraint_table.candidate_width`` promises one per-row candidate count,
+    but the executed top-k follows the active stage width, so ``[2, 2, 1]``
+    silently ignores the configured K after the first stage.  The guard has to
+    read the *configuration* field: the frontend never copies it into
+    ``BeamBatchParams``, so a request-only check would never fire.
+    """
+
+    def _config(candidate_width: int | None) -> dict[str, Any]:
+        additional = {"vllm_gr": _canonical_gr_config()}
+        if candidate_width is not None:
+            additional["vllm_gr"]["constraint_table"]["candidate_width"] = candidate_width
+        return additional
+
+    def _submit(candidate_width: int | None, dynamic_widths: list[int] | None) -> None:
+        engine = _make_engine(additional_config=_config(candidate_width))
+        # Offline construction is synchronous; the shared fixture's AsyncMock
+        # would hand a coroutine to the engine request.
+        engine.get_supported_tasks = lambda: ("generate",)
+        engine.vllm_config.device_config = SimpleNamespace(device="cuda")
+        tokenizer = SimpleNamespace(eos_token_id=2, convert_tokens_to_ids=lambda token: 7)
+        llm = SimpleNamespace(
+            get_tokenizer=lambda: tokenizer,
+            _preprocess_cmpl=lambda prompts: prompts,
+            _lora_request_to_seq=lambda lora, size: [lora] * size,
+        )
+        request = OfflineBeamSearchRequest(
+            prompts=[[1, 2]],
+            params=BeamSearchParams(
+                beam_width=2,
+                max_tokens=3,
+                ignore_eos=True,
+                dynamic_beam_widths=dynamic_widths,
+            ),
+        )
+        BeamSearchInputProcessor(engine).process_offline_inputs(llm, request)
+
+    # Configured K plus a shrinking schedule: rejected.
+    with pytest.raises(BeamSearchRequestError, match="non-uniform"):
+        _submit(2, [2, 2, 1])
+    # Configured K plus a uniform schedule: still a fixed width, accepted.
+    _submit(2, [2, 2, 2])
+    # No configured K: dynamic schedules keep working exactly as before.
+    _submit(None, [2, 2, 1])
+
+
 def test_offline_inputs_reject_unsupported_batch_size_before_admission() -> None:
     engine = _make_engine()
     engine.get_supported_tasks = lambda: ("generate",)

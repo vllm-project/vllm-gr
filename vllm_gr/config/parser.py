@@ -28,6 +28,7 @@ from vllm_gr.config.validation import (
     validate_beam_max_width,
     validate_beam_online_batch_sizes,
     validate_beam_worker_decision,
+    validate_candidate_width,
     validate_catalog_path,
     validate_constrained_generation,
     validate_constraint_backend,
@@ -111,6 +112,7 @@ _CONSTRAINT_TABLE_KEYS: Final = frozenset(
         "artifact_digest",
         "tokenizer_digest",
         "max_top_k",
+        "candidate_width",
     }
 )
 
@@ -196,6 +198,7 @@ def gr_config_from_mapping(
         artifact_digest=validate_artifact_digest(table_raw.get("artifact_digest")),
         tokenizer_digest=validate_tokenizer_digest(table_raw.get("tokenizer_digest")),
         max_top_k=validate_constraint_table_max_top_k(table_raw["max_top_k"]),
+        candidate_width=validate_candidate_width(table_raw.get("candidate_width")),
     )
     return GRConfig(
         attention_backend=validate_attention_backend(mapping.get("attention_backend")),
@@ -275,18 +278,24 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
     if config.beam_execution_mode is not None:
         beam["execution_mode"] = config.beam_execution_mode.value
 
+    constraint_table: dict[str, object] = {
+        "enabled": table.enabled,
+        "backend": table.backend.value,
+        "path": table.path,
+        "format": table.format,
+        "artifact_digest": table.artifact_digest,
+        "tokenizer_digest": table.tokenizer_digest,
+        "max_top_k": table.max_top_k,
+    }
+    # Omitted means K == beam_max_width; keep it omitted so pre-decoupling
+    # schema-v1 artifacts round-trip byte-for-byte at the mapping level.
+    if table.candidate_width is not None:
+        constraint_table["candidate_width"] = table.candidate_width
+
     return {
         "schema_version": config.schema_version,
         "beam": beam,
-        "constraint_table": {
-            "enabled": table.enabled,
-            "backend": table.backend.value,
-            "path": table.path,
-            "format": table.format,
-            "artifact_digest": table.artifact_digest,
-            "tokenizer_digest": table.tokenizer_digest,
-            "max_top_k": table.max_top_k,
-        },
+        "constraint_table": constraint_table,
         "attention_backend": (
             config.attention_backend.value if config.attention_backend is not None else None
         ),

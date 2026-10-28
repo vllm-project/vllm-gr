@@ -218,12 +218,17 @@ and supported device features. Logical B=1..8 is supported by admission; the
 online batch/capture policy selects which exact sizes are enabled. Do not
 confuse this policy with native `max_num_seqs` capacity.
 
-Constraint Table generation supports up to three effective output steps and
-width at most 256. Unconstrained V1 generation has its own configuration and
-budget checks; it does not require a catalog artifact. NPU dynamic widths
-must satisfy their stage-specific capacity/parent bounds. These deployment
-checks are implemented in `vllm_gr/v1/engine/beam_search_v1.py`, not in a
-parallel Plan schema.
+Constraint Table generation supports up to three effective output steps and a
+per-row candidate width (`K`) of at most 256. The Beam width (`W`, rows per
+request) is a separate dimension, but its ceiling is still 256 for now: the
+global ceiling also gates the raw Beam operators, and the wide-`W` selection
+paths are only correct once their scratch tiling is fixed, so it is raised
+together with those kernels rather than ahead of them. `K` is not wired end to
+end in this build either, so a configured `K != W` is rejected at parse time.
+Unconstrained V1 generation has its own configuration and budget checks; it
+does not require a catalog artifact. NPU dynamic widths must satisfy their
+stage-specific capacity/parent bounds. These deployment checks are implemented
+in `vllm_gr/v1/engine/beam_search_v1.py`, not in a parallel Plan schema.
 
 ## CPU candidate boundary
 
@@ -234,15 +239,25 @@ Constraint Table, run logits TopK, parse physical Beam rows, or manipulate KV.
 class BeamItemCandidates:
     item_index: int
     parent_beam_indices: np.ndarray  # [P]
-    token_ids: np.ndarray            # [P, K]
-    logprobs: np.ndarray             # [P, K]
-    valid_mask: np.ndarray           # [P, K]
+    token_ids: np.ndarray  # [P, K]
+    logprobs: np.ndarray  # [P, K]
+    valid_mask: np.ndarray  # [P, K]
 ```
 
 Bootstrap uses `P=1`. Decode uses `P=num_active_beams`, with
-`P <= W`. The reference never fabricates W Prefill parent rows. Production
-Constraint execution uses `K=W`; the CPU reference permits any positive K to
-make semantics testable independently of deployment capacity.
+`P <= W`. The reference never fabricates W Prefill parent rows.
+
+`K` is modelled as an independent dimension of `W` throughout this contract,
+and `constraint_table.candidate_width` is its single source of truth (default
+`W`). The constraint layer additionally requires `1 <= K <= MAX_CANDIDATE_WIDTH`
+and keeps the fused CUDA merge gated on `K == W and W in {64, 128, 256}`; every
+other geometry takes the hierarchical selection path.
+
+> **Not yet wired end to end.** This build still samples `W` candidates per row
+> — the postprocess workspace and the constrained Top-K are sized from the Beam
+> width — so a configured `K != W` would be accepted and then silently executed
+> as `W`. The configuration layer rejects that combination until the engine and
+> worker paths consume `K`.
 
 Both candidate adapters provide FP32 local log probabilities. The selection
 core does not compute softmax.

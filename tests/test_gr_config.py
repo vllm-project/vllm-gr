@@ -4,17 +4,21 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from vllm_gr.config import (
+    MAX_BEAM_WIDTH,
+    MAX_CANDIDATE_WIDTH,
     ConstraintBackend,
     ConstraintTableConfig,
     GRAttentionBackend,
     GRConfig,
     NPUDecodeExecution,
+    resolve_candidate_width,
 )
 from vllm_gr.config.parser import (
     ATTENTION_BACKEND_KEY,
@@ -596,8 +600,77 @@ def test_npu_constraint_table_auto_promotion_respects_capacity(
 
 
 def test_beam_max_width_rejects_values_above_global_limit() -> None:
-    with pytest.raises(ValueError, match=r"beam_max_width must be <= 256"):
-        GRConfig(beam_max_width=257)
+    with pytest.raises(ValueError, match=rf"beam_max_width must be <= {MAX_BEAM_WIDTH}"):
+        GRConfig(beam_max_width=MAX_BEAM_WIDTH + 1)
+
+
+def test_candidate_width_follows_the_beam_width_until_it_cannot() -> None:
+    """K follows W, and the derivation refuses a W beyond the K ceiling.
+
+    The postprocess workspace bucket is keyed by K, so a config that only
+    implies K == beam_max_width has no bucket to find.  The global ceilings are
+    equal today (both 256), so the wide-beam case is exercised through the
+    derivation point itself rather than through construction: it has to hold
+    for whatever the ceiling becomes next.
+    """
+    table = ConstraintTableConfig(
+        max_top_k=MAX_CANDIDATE_WIDTH,
+        enabled=True,
+        path="/tmp/catalog.json",
+        artifact_digest="sha256:" + "0" * 64,
+        tokenizer_digest="sha256:" + "0" * 64,
+    )
+    # Unset K follows the Beam width.
+    follows = GRConfig(beam_max_width=128, constraint_table=table)
+    assert resolve_candidate_width(follows) == 128
+    # An explicit K equal to W is still accepted; it states today's behaviour.
+    same = GRConfig(beam_max_width=128, constraint_table=replace(table, candidate_width=128))
+    assert resolve_candidate_width(same) == 128
+
+    # A Beam wider than the candidate ceiling must state its own K.  The
+    # constructor already rejects W > MAX_BEAM_WIDTH, so build the shape the
+    # ceiling check has to see once those two limits diverge again.
+    wide = SimpleNamespace(
+        beam_max_width=MAX_CANDIDATE_WIDTH * 2,
+        constraint_table=replace(table, enabled=False),
+    )
+    with pytest.raises(ValueError, match="exceeds the candidate width ceiling"):
+        resolve_candidate_width(wide)
+    wide.constraint_table = replace(table, enabled=False, candidate_width=MAX_CANDIDATE_WIDTH)
+    assert resolve_candidate_width(wide) == MAX_CANDIDATE_WIDTH
+
+
+@pytest.mark.parametrize("candidate_width", [64, 256])  # type: ignore[misc]
+def test_non_default_candidate_width_is_rejected_until_wiring_lands(
+    candidate_width: int,
+) -> None:
+    """K != W would be accepted and then silently executed as W.
+
+    Nothing in this build samples a per-row candidate count: the postprocess
+    workspace is keyed by the Beam width, so a configured K that differs from
+    W changes no behaviour and no error.  Reject it at parse time instead of
+    serving a request that disagrees with its own configuration.  This guard
+    is removed by the engine-wiring layer, which is where K becomes live.
+    """
+    table = ConstraintTableConfig(
+        max_top_k=MAX_CANDIDATE_WIDTH,
+        enabled=True,
+        path="/tmp/catalog.json",
+        artifact_digest="sha256:" + "0" * 64,
+        tokenizer_digest="sha256:" + "0" * 64,
+    )
+    with pytest.raises(ValueError, match="must equal beam_max_width"):
+        GRConfig(
+            beam_max_width=128,
+            constraint_table=replace(table, candidate_width=candidate_width),
+        )
+    # The same K against a matching Beam width is accepted, and K == W is the
+    # only configuration that reaches a served request today.
+    matching = GRConfig(
+        beam_max_width=candidate_width,
+        constraint_table=replace(table, candidate_width=candidate_width),
+    )
+    assert resolve_candidate_width(matching) == candidate_width
 
 
 @pytest.mark.parametrize("widths", [tuple(range(1, 8)), (*range(1, 8), 128)])  # type: ignore[misc]

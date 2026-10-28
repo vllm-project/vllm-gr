@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for BeamPrefillGraphRunner."""
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,6 +16,8 @@ from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 def _force_non_npu(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm_gr.v1.worker.prefill_graph_runner as prefill_graph_runner_mod
 
+    # 20261020: Isolate unit-test bucket grids from deployment BSND capture specs.
+    monkeypatch.delenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", raising=False)
     monkeypatch.setattr(prefill_graph_common, "is_npu_platform", lambda: False)
 
     class MockCUDAProvider:
@@ -1173,7 +1176,7 @@ def test_gpu_padded_prefill_preserves_live_lengths_and_refreshes_static_buffers(
 def test_prefill_runner_init_propagates_allocation_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Static buffer allocation failures disable the runner instead of aborting startup."""
+    """Static buffer allocation failures propagate to worker startup."""
     from vllm_gr.v1.worker.prefill_graph_runner import BeamPrefillGraphRunner
 
     def fail_full(*args: Any, **kwargs: Any) -> torch.Tensor:
@@ -1257,3 +1260,78 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
         Runner().capture_model()
     assert raised.value is error
     assert events == ["native"]
+
+
+# 20261020: Test the real constructor with explicitly scoped BSND configuration.
+def test_npu_bsnd_config_defaults_off() -> None:
+    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+
+    runner = NPUPrefillGraphRunner(MockModelRunner(), buckets=[128])
+    assert runner._BSND_CAPTURE_SPECS == ()
+
+
+@pytest.mark.parametrize("specs", ["", "512,4;1024,4"])  # type: ignore[misc]
+def test_bsnd_metadata_resources_are_instance_owned(
+    monkeypatch: pytest.MonkeyPatch, specs: str
+) -> None:
+    from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
+
+    monkeypatch.setenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", specs)
+    tensor = torch.empty(0)
+    first = BeamAttentionMetadata(0, 0, tensor, 0, tensor, tensor, tensor)
+    second = BeamAttentionMetadata(0, 0, tensor, 0, tensor, tensor, tensor)
+    assert first.prefill_fia_layout == second.prefill_fia_layout == "TND"
+    assert first.bsnd_resources == second.bsnd_resources == {}
+    first.bsnd_resources["workspaces"] = {"probe": object()}
+    assert second.bsnd_resources == {}
+
+
+def test_npu_bsnd_config_validates_runner_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+
+    monkeypatch.setenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", "1024,4;512,4")
+    runner = NPUPrefillGraphRunner(MockModelRunner(), buckets=[512, 1024])
+    assert runner._BSND_CAPTURE_SPECS == ((512, 4), (1024, 4))
+    with pytest.raises(ValueError, match="1024 is not in configured prefill buckets"):
+        NPUPrefillGraphRunner(MockModelRunner(), buckets=[512])
+
+
+def test_npu_prefill_capture_skips_native_attention() -> None:
+    from vllm_gr.v1.attention.backends.beam_attn_metadata import (
+        BeamAttentionMetadataBuilder,
+    )
+    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+
+    class NativeBuilder:
+        pass
+
+    class Group:
+        def __init__(self, builder: object) -> None:
+            self.builder = builder
+
+        def get_metadata_builder(self, _index: int) -> object:
+            return self.builder
+
+    beam_builder = object.__new__(BeamAttentionMetadataBuilder)
+    beam_runner = SimpleNamespace(attn_groups=[[Group(beam_builder)]])
+    native_runner = SimpleNamespace(attn_groups=[[Group(NativeBuilder())]])
+    assert NPUPrefillGraphRunner._supports_beam_prefill_capture(beam_runner) is True
+    assert NPUPrefillGraphRunner._supports_beam_prefill_capture(native_runner) is False
+
+
+def test_npu_prefill_capture_skips_mixed_attention_groups() -> None:
+    from vllm_gr.v1.attention.backends.beam_attn_metadata import (
+        BeamAttentionMetadataBuilder,
+    )
+    from vllm_gr.v1.worker.npu_prefill_graph_runner import NPUPrefillGraphRunner
+
+    class Group:
+        def __init__(self, builder: object) -> None:
+            self.builder = builder
+
+        def get_metadata_builder(self, _index: int) -> object:
+            return self.builder
+
+    beam_builder = object.__new__(BeamAttentionMetadataBuilder)
+    runner = SimpleNamespace(attn_groups=[[Group(beam_builder), Group(object())]])
+    assert NPUPrefillGraphRunner._supports_beam_prefill_capture(runner) is False

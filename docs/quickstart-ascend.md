@@ -78,3 +78,7 @@ Notes:
   operators for those cases, and unsorted or shrunk beam selections always
   reorder through the cascade kernel (the fused `select_unshared_kv` only
   encodes full-width parents grouped by source beam).
+
+## Optional BSND Prefill graphs
+
+For full prompts without cached history, the opt-in [BSND Prefill graph path](npu_prefill_bsnd.md) avoids per-layer FIA parameter updates. It is disabled by default and requires no import overlay.

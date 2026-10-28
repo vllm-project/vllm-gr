@@ -14,6 +14,7 @@ from vllm_gr.config.models import (
     CONSTRAINT_TABLE_FORMAT,
     GR_CONFIG_SCHEMA_VERSION,
     MAX_BEAM_WIDTH,
+    MAX_CANDIDATE_WIDTH,
     SUPPORTED_BEAM_BATCH_SIZES,
     BeamExecutionMode,
     ConstraintBackend,
@@ -138,6 +139,18 @@ def validate_tokenizer_digest(value: object) -> str | None:
 
 def validate_constraint_table_max_top_k(value: object) -> int:
     return _validate_positive_int(value, "constraint_table.max_top_k")
+
+
+def validate_candidate_width(value: object) -> int | None:
+    if value is None:
+        return None
+    width = _validate_positive_int(value, "constraint_table.candidate_width")
+    if width > MAX_CANDIDATE_WIDTH:
+        raise ValueError(
+            f"vllm-gr constraint_table.candidate_width must be <= {MAX_CANDIDATE_WIDTH}, "
+            f"got {width}"
+        )
+    return width
 
 
 def validate_catalog_path(value: object) -> str | None:

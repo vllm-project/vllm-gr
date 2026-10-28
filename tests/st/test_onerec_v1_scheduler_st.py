@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# mypy: disable-error-code="misc,no-untyped-call,no-any-return,untyped-decorator"
+# mypy: disable-error-code="misc,no-untyped-call,no-any-return"
 """Real OneRec weights through the native multiprocess Scheduler/Worker pipeline.
 
 Exercise the public offline/online APIs and inspect release at return. Optional
@@ -21,12 +21,48 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from itertools import product
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+_MODULE_READY = time.monotonic()
+_MEASUREMENTS: dict[str, Any] = {"phases": {}, "rows": [], "events": []}
+_EVIDENCE_PATH: Path | None = None
+
+
+def _persist_measurements() -> None:
+    if _EVIDENCE_PATH is not None:
+        temporary = _EVIDENCE_PATH.with_suffix(".tmp")
+        temporary.write_text(json.dumps(_MEASUREMENTS, indent=2))
+        temporary.replace(_EVIDENCE_PATH)
+
+
+@contextmanager
+def _measure(name: str) -> Any:
+    started = time.monotonic()
+    _MEASUREMENTS["active_phase"] = name
+    _persist_measurements()
+    try:
+        yield
+    finally:
+        _MEASUREMENTS["phases"][name] = time.monotonic() - started
+        _persist_measurements()
+
+
+@asynccontextmanager
+async def _measured_engine(builder: Any, args: Any) -> AsyncIterator[Any]:
+    manager = builder(args)
+    with _measure("engine_startup_seconds"):
+        engine = await manager.__aenter__()
+    try:
+        yield engine
+    finally:
+        with _measure("engine_shutdown_seconds"):
+            await manager.__aexit__(*sys.exc_info())
+
 
 _BEAM_WIDTH = int(os.environ.get("VLLM_GR_TEST_WIDTH", "128"))
 _EAGER = os.environ.get("VLLM_GR_TEST_EAGER", "0") == "1"
@@ -103,7 +139,7 @@ class OneRecV1STWorkerExtension:
 
             def observed(instance: Any, *args: Any, **kwargs: Any) -> Any:
                 event = {"method": name, "start_ns": time.perf_counter_ns()}
-                event.update(describe(instance, args))
+                event.update(describe(instance, args, kwargs))
                 events.append(event)
                 result = original(instance, *args, **kwargs)
                 event["end_ns"] = time.perf_counter_ns()
@@ -115,7 +151,7 @@ class OneRecV1STWorkerExtension:
 
             setattr(cls, name, observed)
 
-        def stage(owner: Any, args: Any) -> dict[str, Any]:
+        def stage(owner: Any, args: Any, kwargs: Any) -> dict[str, Any]:
             m = next(iter(args[0].gr_stage_metadata.values()))
             return {
                 "session_id": m.session_id,
@@ -128,11 +164,11 @@ class OneRecV1STWorkerExtension:
 
         wrap(GPUBeamStageRunner, "execute", stage)
         if trace is not None:
-            wrap(GPUBeamStageRunner, "sample", lambda owner, args: {})
+            wrap(GPUBeamStageRunner, "sample", lambda owner, args, kwargs: {})
         wrap(
             GPUBeamStageRunner,
             "prepare_cpu",
-            lambda owner, args: {
+            lambda owner, args, kwargs: {
                 "session_id": args[0].session_id,
                 "stage": args[0].stage_index,
                 "predecessor_gpu_pending": not owner.last_work.query(),
@@ -141,18 +177,39 @@ class OneRecV1STWorkerExtension:
         wrap(
             AsyncGPUBeamOutput,
             "get_output",
-            lambda output, args: {
+            lambda output, args, kwargs: {
                 "session_id": output.execution.entries[0].metadata.session_id,
                 "stage": output.execution.entries[0].metadata.stage_index,
             },
         )
-        wrap(BeamDecodeGraph, "replay", lambda graph, args: {})
-        wrap(BeamDecodeGraph, "capture", lambda graph, args: {"kind": "decode"})
-        wrap(GPUBeamStageRunner, "_forward", lambda owner, args: {"kind": "decode_eager"})
+        wrap(
+            BeamDecodeGraph,
+            "replay",
+            lambda graph, args, kwargs: {
+                "batch_size": graph.signature.batch_size,
+                "beam_width": graph.signature.beam_width,
+                "num_model_rows": graph.signature.num_model_rows,
+            },
+        )
+        wrap(BeamDecodeGraph, "capture", lambda graph, args, kwargs: {"kind": "decode"})
+        wrap(
+            GPUBeamStageRunner,
+            "_forward",
+            lambda owner, args, kwargs: {"kind": "decode_eager"},
+        )
         if is_v2:
             _observe_v2_prefill(runner, events, wrap)
             return
-        wrap(GPUPrefillGraphRunner, "execute_model_prefill", lambda graph, args: {})
+        wrap(
+            GPUPrefillGraphRunner,
+            "execute_model_prefill",
+            lambda graph, args, kwargs: {
+                "bucket": kwargs["bucket"],
+                "token_counts": list(kwargs["num_scheduled_tokens"].values())
+                if isinstance(kwargs["num_scheduled_tokens"], dict)
+                else list(kwargs["num_scheduled_tokens"]),
+            },
+        )
 
         runner = getattr(self, "model_runner")
         original_forward = runner._model_forward
@@ -258,7 +315,11 @@ def _observe_v2_prefill(runner: Any, events: list[dict[str, Any]], wrap: Any) ->
         return result
 
     manager.run_fullgraph = full
-    wrap(GRPrefillCudaGraphManager, "capture", lambda manager, args: {"kind": "prefill"})
+    wrap(
+        GRPrefillCudaGraphManager,
+        "capture",
+        lambda manager, args, kwargs: {"kind": "prefill"},
+    )
 
 
 class _StageTrace:
@@ -872,9 +933,8 @@ def _completion_inputs(work_dir: Path) -> tuple[Any, ...]:
         }
         config["constrained_generation"] = False
     configured_sizes = os.environ.get("VLLM_GR_TEST_ONLINE_BATCH_SIZES")
-    sizes = (1, 2, 4) if configured_sizes is None else tuple(json.loads(configured_sizes))
-    if configured_sizes is not None:
-        config["beam"]["online_batch_sizes"] = list(sizes)
+    sizes = (1, 2, 3, 4, 8) if configured_sizes is None else tuple(json.loads(configured_sizes))
+    config["beam"]["online_batch_sizes"] = list(sizes)
     kwargs = _engine_kwargs(model, config) | dict(
         max_num_seqs=max(sizes),
         max_num_batched_tokens=4096,
@@ -1019,8 +1079,12 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
 
     from vllm_gr.plugin import initialize_runtime
 
-    initialize_runtime()
-    model, config, sizes, kwargs, prompts, legal = _completion_inputs(work_dir)
+    with _measure("runtime_init_seconds"):
+        initialize_runtime()
+    with _measure("inputs_seconds"):
+        model, config, sizes, kwargs, prompts, legal = _completion_inputs(work_dir)
+    _MEASUREMENTS["batch_sizes"] = sizes
+    _persist_measurements()
     offline = json.loads((work_dir / "completion-offline-reference.json").read_text())
     assert (offline["model"], offline["config"], offline["engine_kwargs"], offline["prompts"]) == (
         model,
@@ -1029,7 +1093,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
         prompts,
     )
     args = AsyncEngineArgs(additional_config={"vllm_gr": config}, shutdown_timeout=10, **kwargs)
-    async with build_async_engine_client_from_engine_args(args) as engine:
+    async with _measured_engine(build_async_engine_client_from_engine_args, args) as engine:
         processes = list(engine.engine_core.resources.engine_manager.processes)
         (work_dir / "completion-runtime-online.json").write_text(
             json.dumps(await engine.collective_rpc("onerec_v1_st_runtime"), indent=2)
@@ -1099,8 +1163,11 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
             _check_v2_idle(snapshot)
             _check_unconstrained_mode(snapshot)
 
-        rows = []
+        rows = _MEASUREMENTS["rows"]
         cancellations = []
+        request_started = time.monotonic()
+        _MEASUREMENTS["active_phase"] = "request_seconds"
+        _persist_measurements()
         async with _completion_http_client(app) as client:
             # A size this route forms runs as one session holding every prompt.
             for count in sizes:
@@ -1178,6 +1245,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                 ]
                 await check_released()
                 rows.append(dict(count=count, sessions=1, size=count, response=data))
+                _persist_measurements()
 
             # The native rejection path must leave the engine usable.
             before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
@@ -1319,6 +1387,9 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
             (work_dir / "completion-online-graphs.json").write_text(
                 json.dumps(await engine.collective_rpc("onerec_v1_st_graphs"), indent=2)
             )
+        _MEASUREMENTS["phases"]["request_seconds"] = time.monotonic() - request_started
+        _MEASUREMENTS["events"] = (await engine.collective_rpc("onerec_v1_st_events"))[0]
+        _persist_measurements()
         (work_dir / "completion-batch-evidence.json").write_text(json.dumps(rows, indent=2))
     shutdown = [dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in processes]
     (work_dir / "completion-batch-lifecycle.json").write_text(json.dumps(shutdown, indent=2))
@@ -1361,6 +1432,7 @@ def test_onerec_v1_completion_batch_online(
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
     )
     for mode in ("--completion-reference", "--completion-batch"):
+        process_started = time.monotonic()
         command = [
             sys.executable,
             "-m",
@@ -1377,6 +1449,15 @@ def test_onerec_v1_completion_batch_online(
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
+                (tmp_path / f"subprocess-{mode.removeprefix('--')}.json").write_text(
+                    json.dumps(
+                        dict(
+                            wall_seconds=time.monotonic() - process_started,
+                            returncode=process.returncode,
+                        ),
+                        indent=2,
+                    )
+                )
 
 
 @pytest.mark.slow
@@ -1400,6 +1481,7 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool, runner: str) -
     command = [sys.executable, "-m", "tests.st.test_onerec_v1_scheduler_st", str(tmp_path)]
     if online:
         command.append("--online")
+    process_started = time.monotonic()
     with subprocess.Popen(
         command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
     ) as process:
@@ -1409,14 +1491,44 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool, runner: str) -
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
+            (tmp_path / "subprocess-evidence.json").write_text(
+                json.dumps(
+                    dict(
+                        wall_seconds=time.monotonic() - process_started,
+                        returncode=process.returncode,
+                    ),
+                    indent=2,
+                )
+            )
 
 
 if __name__ == "__main__":
-    if "--completion-reference" in sys.argv:
-        _run_completion_reference(Path(sys.argv[1]))
-    elif "--completion-batch" in sys.argv:
-        asyncio.run(_run_online_completion_batch(Path(sys.argv[1])))
-    elif "--online" in sys.argv:
-        asyncio.run(_run_online(Path(sys.argv[1])))
+    mode = (
+        "completion-reference"
+        if "--completion-reference" in sys.argv
+        else (
+            "completion-batch"
+            if "--completion-batch" in sys.argv
+            else ("online" if "--online" in sys.argv else "offline")
+        )
+    )
+    _EVIDENCE_PATH = Path(sys.argv[1]) / f"{mode}-evidence.json"
+    _MEASUREMENTS.update(mode=mode, status="running")
+    _persist_measurements()
+    try:
+        if mode == "completion-reference":
+            _run_completion_reference(Path(sys.argv[1]))
+        elif mode == "completion-batch":
+            asyncio.run(_run_online_completion_batch(Path(sys.argv[1])))
+        elif mode == "online":
+            asyncio.run(_run_online(Path(sys.argv[1])))
+        else:
+            _run_onerec_v1_scheduler(Path(sys.argv[1]))
+    except BaseException as exc:
+        _MEASUREMENTS.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        raise
     else:
-        _run_onerec_v1_scheduler(Path(sys.argv[1]))
+        _MEASUREMENTS["status"] = "passed"
+    finally:
+        _MEASUREMENTS["module_ready_to_exit_seconds"] = time.monotonic() - _MODULE_READY
+        _persist_measurements()

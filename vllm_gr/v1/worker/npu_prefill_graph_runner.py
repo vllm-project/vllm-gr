@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -108,6 +109,12 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         )
         self._update_stream: Any = None
         self.entries: dict[int, Any] = {}
+        # 20261019: Opt-in configuration read once per runner; empty means TND only.
+        self._BSND_CAPTURE_SPECS = parse_bsnd_capture_specs(
+            os.getenv("VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS", ""), self.buckets
+        )
+        self.bsnd_entries: dict[tuple[int, int], Any] = {}
+        self._bsnd_debug_sync = False
         self._replays_by_bucket: dict[int, int] = {}
         # FIA workspace shared across every layer AND every bucket: only one
         # prefill graph executes at a time (sequential batches, sequential
@@ -176,6 +183,24 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         return builder, list(group.layer_names)
 
     @staticmethod
+    def _supports_beam_prefill_capture(runner: Any) -> bool:
+        """Only Beam builders can consume the metadata used by these graphs."""
+        from vllm_gr.v1.attention.backends.beam_attn_metadata import (
+            BeamAttentionMetadataBuilder,
+        )
+
+        attn_groups = getattr(runner, "attn_groups", None)
+        if not attn_groups:
+            return False
+        found_group = False
+        for groups in attn_groups:
+            for group in groups:
+                found_group = True
+                if not isinstance(group.get_metadata_builder(0), BeamAttentionMetadataBuilder):
+                    return False
+        return found_group
+
+    @staticmethod
     def _forward_context(runner: Any, meta_dict: dict, num_tokens: int):
         from vllm.config import CUDAGraphMode
 
@@ -200,20 +225,25 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             )
 
     def _prepare_capture_buffers(self, buf: PrefillBucketBuffers, bucket: int, runner: Any) -> None:
-        if getattr(runner, "uses_mrope", False):
-            buf.positions_buf = torch.zeros((3, bucket), dtype=torch.int64, device=self.device)
-            buf.positions_buf[:] = torch.arange(bucket, dtype=torch.int64, device=self.device)
-        elif getattr(runner, "uses_xdrope_dim", 0) > 0:
-            buf.positions_buf = torch.zeros((2, bucket), dtype=torch.int64, device=self.device)
-            buf.positions_buf[:] = torch.arange(bucket, dtype=torch.int64, device=self.device)
-        else:
-            buf.positions_buf = torch.arange(bucket, dtype=torch.int64, device=self.device)
+        # 20261019: Allocate int32 NPU slots once before any BSND/TND capture.
+        # Allocate once: replacing these tensors invalidates the earlier graph's inputs.
+        if not getattr(buf, "_npu_capture_inputs_prepared", False):
+            if getattr(runner, "uses_mrope", False):
+                position_shape = (3, bucket)
+            elif getattr(runner, "uses_xdrope_dim", 0) > 0:
+                position_shape = (2, bucket)
+            else:
+                position_shape = (bucket,)
+            buf.positions_buf = torch.empty(position_shape, dtype=torch.int64, device=self.device)
+            buf.slot_mapping_buf = torch.empty((bucket,), dtype=torch.int32, device=self.device)
+            buf._npu_capture_inputs_prepared = True
+        buf.positions_buf.copy_(torch.arange(bucket, dtype=torch.int64, device=self.device))
         buf.input_ids_buf.fill_(buf.pad_token_id)
         # NPU's ATB ReshapeAndCache op requires int32 slot mappings (the GPU
         # shared buffer is int64). Capture with valid sequential slots: the
         # probe proved all-(-1) is a degenerate setup case, and the real
         # slots are copied in by execute_model_prefill before every replay.
-        buf.slot_mapping_buf = torch.arange(bucket, dtype=torch.int32, device=self.device)
+        buf.slot_mapping_buf.copy_(torch.arange(bucket, dtype=torch.int32, device=self.device))
         # Static block-table staging buffer: a captured graph bakes the
         # pointer address, so the tensor at that address must stay stable
         # for the lifetime of the graph. The runner's live block table is
@@ -311,6 +341,10 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
             logger.info("NPU not available; skipping NPU graph capture for prefill.")
             return
 
+        if not self._supports_beam_prefill_capture(runner):
+            logger.info("Skipping Beam prefill graphs for native or mixed attention backends.")
+            return
+
         import torch_npu  # noqa: F401
 
         from vllm_gr.v1.attention.backends.beam_attn_npu import (
@@ -337,6 +371,8 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
 
         from tqdm import tqdm
 
+        # 20261019: Capture BSND first, preserving latest TND capture/update implementation.
+        self.capture_bsnd_graphs(runner)
         graph_pool = torch.npu.graph_pool_handle()
         sorted_buckets = sorted(self.buckets, reverse=True)
         for bucket in tqdm(sorted_buckets, desc="Capturing CUDA graphs (prefill, FULL)"):
@@ -372,7 +408,10 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
                             input_ids=buf.input_ids_buf, positions=buf.positions_buf
                         )
                     torch.npu.synchronize()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
+                # 20261019: Do not continue with BSND graphs after a failed device capture.
+                if self._BSND_CAPTURE_SPECS:
+                    raise
                 logger.warning(
                     "Failed to capture Prefill NPU graph for bucket %d: %r. "
                     "Falling back to eager prefill for this and all remaining "
@@ -546,3 +585,316 @@ class NPUPrefillGraphRunner(BasePrefillGraphRunner):
         graph = buf.captured_graphs[1]
         graph.replay()
         return buf.output_bufs[1]
+
+    # 20261019: BSND-only additions; latest TND replay remains update-before-replay.
+
+    def match_bsnd_bucket(self, num_reqs: int, max_len: int) -> tuple[int, int] | None:
+        # 20261019: Choose the smallest successfully captured fitting shape, not env order.
+        for T, B in self._BSND_CAPTURE_SPECS:
+            if B == num_reqs and T // B >= max_len and self.has_bsnd_captured_graph(T, B):
+                return T, B
+        return None
+
+    def has_bsnd_captured_graph(self, T: int, B: int) -> bool:
+        """BSND: True if the BSND graph for (T,B) is captured."""
+        buf = self.buffers.get(T)
+        return (
+            buf is not None
+            and getattr(buf, "bsnd_captured_graphs", {}).get(B) is not None
+            and (T, B) in self.bsnd_entries
+        )
+
+    def _build_bsnd_dummy_metadata(
+        self, T: int, B: int, builder: Any, buf: PrefillBucketBuffers
+    ) -> Any:
+        """BSND: dummy metadata for the BSND (T,B) capture: req_lens=[P]*B.
+
+        qsl_cpu = [0, P, 2P, ...]; prefill_fia_layout="BSND"; slot_mapping
+        uses the arange capture buffer (replay rewrites it per batch).
+        """
+        from vllm_gr.v1.attention.backends.beam_attn_metadata import (
+            BeamAttentionMetadata,
+        )
+
+        P = T // B
+        req_lens = [P] * B
+        qsl_cpu = [i * P for i in range(B + 1)]
+        qsl_dev = torch.tensor(qsl_cpu, dtype=torch.int32, device=self.device)
+        seq_lens_dev = torch.tensor(req_lens, dtype=torch.int32, device=self.device)
+        return BeamAttentionMetadata(
+            num_actual_tokens=T,
+            max_query_len=P,
+            query_start_loc=qsl_dev,
+            max_seq_len=P,
+            seq_lens=seq_lens_dev,
+            block_table=None,
+            slot_mapping=buf.slot_mapping_buf,
+            causal=True,
+            npu_causal_atten_mask=getattr(builder, "npu_causal_atten_mask", None),
+            is_prefill_graph_exec=True,
+            prefill_fia_layout="BSND",
+            num_reqs=B,
+            num_heads=builder.num_heads_q,
+            num_kv_heads=builder.num_kv_heads,
+            block_size=builder.block_size,
+            query_start_loc_cpu=qsl_cpu,
+            seq_lens_cpu=req_lens,
+        )
+
+    def capture_bsnd_graphs(self, runner: Any) -> None:
+        """BSND: capture the fixed BSND prefill graphs, one per (T,B) spec.
+
+        No task groups / ExternalEvents / layer registration: the fixed FIA
+        kwargs (input_layout="BSND", no seq-lens lists, no block_table) are
+        shape-bound, so replay needs no per-layer host update.
+        """
+        # 20261019: No allocation/capture when disabled; resources are graph-owned.
+        if not self._BSND_CAPTURE_SPECS or not is_prefill_graph_enabled():
+            return
+        if not is_npu_available():
+            logger.info("NPU not available; skipping BSND prefill graph capture.")
+            return
+        if not self._supports_beam_prefill_capture(runner):
+            logger.info("Skipping BSND prefill graphs for native or mixed attention backends.")
+            return
+        try:
+            builder, layer_names = self._get_attn_builder_and_layers(runner)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("BSND capture: cannot locate attention builder: %r.", e)
+            return
+
+        from tqdm import tqdm
+
+        graph_pool = torch.npu.graph_pool_handle()
+        # 20261020: Keep BSND resources on this runner-owned bucket.
+        # Do not add NPU-only fields to the common bucket definition.
+        for T, B in tqdm(
+            list(self._BSND_CAPTURE_SPECS), desc="Capturing NPU graphs (prefill BSND)"
+        ):
+            try:
+                if T not in self.buffers:
+                    logger.warning(
+                        "BSND capture: T=%d not in prefill buckets %s; skipping (T,B)=(%d,%d).",
+                        T,
+                        self.buckets,
+                        T,
+                        B,
+                    )
+                    continue
+                buf = self.buffers[T]
+                if not hasattr(buf, "bsnd_captured_graphs"):
+                    buf.bsnd_captured_graphs: dict[int, Any] = {}
+                    buf.bsnd_output_bufs: dict[int, Any] = {}
+                    buf.bsnd_compact_output_bufs: dict[int, Any] = {}
+                    buf.bsnd_static_attn_metadatas: dict[int, Any] = {}
+                self._prepare_capture_buffers(buf, T, runner)
+                meta = self._build_bsnd_dummy_metadata(T, B, builder, buf)
+                meta_dict = {name: meta for name in layer_names}
+                with torch.inference_mode():
+                    for _ in range(2):
+                        with self._forward_context(runner, meta_dict, T):
+                            runner.model(input_ids=buf.input_ids_buf, positions=buf.positions_buf)
+                    torch.npu.synchronize()
+
+                    graph = torch.npu.NPUGraph()
+                    with (
+                        self._forward_context(runner, meta_dict, T),
+                        torch.npu.graph(graph, pool=graph_pool, capture_error_mode="global"),
+                    ):
+                        output = runner.model(
+                            input_ids=buf.input_ids_buf, positions=buf.positions_buf
+                        )
+                    torch.npu.synchronize()
+                    # Persistent independent destination; no allocation or host
+                    # index conversion is needed after graph.replay().
+                    compact_output = torch.empty_like(output)
+            except Exception as e:
+                # 20261019: Propagate device/capture failures through the startup hook.
+                raise RuntimeError(f"BSND capture failed for {(T, B)}; restart required") from e
+
+            buf.bsnd_captured_graphs[B] = graph
+            buf.bsnd_output_bufs[B] = output
+            buf.bsnd_compact_output_bufs[B] = compact_output
+            buf.bsnd_static_attn_metadatas[B] = meta
+            # 20261019: Ported v4 fix; historical note: 20261008 Hold and validate the actual captured inputs.
+            capture_inputs = {
+                name: getattr(buf, name)
+                for name in ("input_ids_buf", "positions_buf", "slot_mapping_buf")
+            }
+            self.bsnd_entries[(T, B)] = {
+                "layout": "BSND",
+                "T": T,
+                "B": B,
+                "capture_inputs": capture_inputs,
+                "capture_descriptors": {
+                    name: self._bsnd_tensor_descriptor(tensor)
+                    for name, tensor in capture_inputs.items()
+                },
+            }
+            logger.info("Captured BSND prefill graph for (T=%d, B=%d).", T, B)
+
+        spec_summary = {k: 1 for k in self.bsnd_entries}
+        logger.info(f"BSND prefill graph capture completed. Captured: {spec_summary}")
+
+    @staticmethod
+    def _bsnd_tensor_descriptor(tensor: torch.Tensor) -> tuple:
+        return (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.device,
+        )
+
+    def _validate_bsnd_capture_inputs(self, buf: PrefillBucketBuffers, T: int, B: int) -> None:
+        entry = self.bsnd_entries[(T, B)]
+        for name, original in entry["capture_inputs"].items():
+            current = getattr(buf, name)
+            if (
+                current is not original
+                or self._bsnd_tensor_descriptor(current) != entry["capture_descriptors"][name]
+            ):
+                raise RuntimeError(
+                    f"BSND ({T}, {B}) captured input changed: {name}; recapture is required"
+                )
+
+    def _bsnd_debug_checkpoint(self, phase: str, T: int, B: int) -> None:
+        if self._bsnd_debug_sync:
+            logger.warning("BSND debug (%d,%d): synchronizing %s", T, B, phase)
+            torch.npu.synchronize()
+            logger.warning("BSND debug (%d,%d): %s OK", T, B, phase)
+
+    def execute_model_prefill_bsnd(
+        self,
+        T: int,
+        B: int,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        slot_mapping: torch.Tensor | None,
+        token_counts: list[int],
+    ) -> torch.Tensor | None:
+        """v4.1 replay: per-request scatter into [i*P, i*P+L_i), replay, gather.
+
+        Padding rows carry pad_token / position 0 / slot -1; the causal mask
+        already isolates them (pad key k>=L_i > q is causal-masked), so no
+        dynamic padding mask is needed. After replay, real rows are gathered
+        into a separate persistent buffer so the caller's logits index extraction
+        (cumsum-1) is unchanged.
+        """
+        buf = self.buffers.get(T)
+        if (
+            buf is None
+            or not self.has_bsnd_captured_graph(T, B)
+            or input_ids is None
+            or positions is None
+            or slot_mapping is None
+        ):
+            return None
+        # 20261019: Validate packed extents before launching any copies.
+        actual = sum(token_counts)
+        if input_ids.ndim != 1 or input_ids.shape[0] < actual:
+            return None
+        if positions.shape[-1] < actual or slot_mapping.ndim != 1 or slot_mapping.shape[0] < actual:
+            return None
+        if positions.ndim != buf.positions_buf.ndim:
+            return None
+        P = T // B
+        if len(token_counts) != B or any(c <= 0 or c > P for c in token_counts):
+            return None
+
+        # 20261019: Ported v4 fix; historical note: 20261008 Check before any device work; never replay stale pointers.
+        self._validate_bsnd_capture_inputs(buf, T, B)
+        self._bsnd_debug_checkpoint("before input preparation", T, B)
+        # 20261020: Initialize padding before copying the real request regions.
+        buf.input_ids_buf.fill_(buf.pad_token_id)
+        if buf.positions_buf.ndim == 1:
+            buf.positions_buf.fill_(0)
+        else:
+            buf.positions_buf[..., :].fill_(0)
+        buf.slot_mapping_buf.fill_(-1)
+        o = 0
+        for i, L_i in enumerate(token_counts):
+            s = i * P
+            buf.input_ids_buf[s : s + L_i].copy_(input_ids[o : o + L_i], non_blocking=True)
+            o += L_i
+        o = 0
+        for i, L_i in enumerate(token_counts):
+            s = i * P
+            if buf.positions_buf.ndim == 1:
+                buf.positions_buf[s : s + L_i].copy_(positions[o : o + L_i], non_blocking=True)
+            else:
+                buf.positions_buf[..., s : s + L_i].copy_(
+                    positions[..., o : o + L_i], non_blocking=True
+                )
+            buf.slot_mapping_buf[s : s + L_i].copy_(slot_mapping[o : o + L_i], non_blocking=True)
+            o += L_i
+
+        graph = buf.bsnd_captured_graphs[B]
+        self._bsnd_debug_checkpoint("after input preparation", T, B)
+        graph.replay()
+        self._bsnd_debug_checkpoint("after graph replay", T, B)
+
+        # Avoid Python-list advanced indexing: it may synchronously upload an
+        # index tensor after replay, waiting for the entire preceding graph.
+        out = buf.bsnd_output_bufs[B]
+        compact_output = buf.bsnd_compact_output_bufs[B]
+        self._compact_bsnd_output(out, compact_output, P, token_counts)
+        self._bsnd_debug_checkpoint("after gather", T, B)
+        return compact_output
+
+    @staticmethod
+    def _compact_bsnd_output(out, compact_output, P: int, token_counts: list[int]) -> None:
+        """Same-stream D2D copies; source and destination must not alias.
+
+        Only the first sum(token_counts) rows are valid, as in the old output.
+        This removes index H2D, not the device dependency on graph completion.
+        """
+        offset = 0
+        for row, count in enumerate(token_counts):
+            start = row * P
+            compact_output[offset : offset + count].copy_(
+                out[start : start + count], non_blocking=True
+            )
+            offset += count
+
+    def log_replay_bsnd(self, T: int, B: int, total_tokens: int) -> None:
+        """BSND replay logging (first + every 100)."""
+        key = (T, B)
+        self._replays_by_bucket.setdefault(key, 0)
+        self._replays_by_bucket[key] += 1
+        if key not in self._logged_first_replay:
+            self._logged_first_replay.add(key)
+            logger.info(
+                "BSND prefill graph replay active for (T=%d, B=%d, %d actual tokens).",
+                T,
+                B,
+                total_tokens,
+            )
+        elif self._replays_by_bucket[key] % 100 == 0:
+            logger.info(
+                "BSND prefill graph replay: (T=%d,B=%d) reached %d replays.",
+                T,
+                B,
+                self._replays_by_bucket[key],
+            )
+
+
+# 20261019: Parsing is dependency-free and deterministic; no implicit B=4 enablement.
+def parse_bsnd_capture_specs(raw: str, buckets) -> tuple[tuple[int, int], ...]:
+    specs = set()
+    for item in raw.split(";"):
+        if not item.strip():
+            continue
+        fields = item.strip().split(",")
+        if len(fields) != 2:
+            raise ValueError("BSND specs must use T,B;T,B format")
+        try:
+            total, batch = map(int, fields)
+        except ValueError as error:
+            raise ValueError("BSND T and B must be integers") from error
+        if total <= 0 or batch not in (1, 2, 4) or total % batch:
+            raise ValueError("BSND requires positive T, B in (1,2,4), and T divisible by B")
+        if total not in buckets:
+            raise ValueError(f"BSND total capacity {total} is not in configured prefill buckets")
+        specs.add((total, batch))
+    return tuple(sorted(specs))

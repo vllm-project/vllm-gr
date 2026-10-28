@@ -315,6 +315,7 @@ def test_cuda_worker_decision_respects_kernel_width_limit(
 
 
 def test_cuda_worker_decision_over_width_limit_falls_back() -> None:
+    # One past MAX_BEAM_WIDTH: the gate must reject before touching candidates.
     beam_width = 257
     context = _make_context(max_beams=beam_width)
     runner = _gate_runner(context, device_type="cuda", beam_width=beam_width)

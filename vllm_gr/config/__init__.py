@@ -8,6 +8,7 @@ from vllm_gr.config.models import (
     DEFAULT_ONLINE_BATCH_SIZES,
     GR_CONFIG_SCHEMA_VERSION,
     MAX_BEAM_WIDTH,
+    MAX_CANDIDATE_WIDTH,
     SUPPORTED_BEAM_BATCH_SIZES,
     BeamExecutionMode,
     ConstraintBackend,
@@ -16,6 +17,7 @@ from vllm_gr.config.models import (
     GRAttentionBackend,
     GRConfig,
     NPUDecodeExecution,
+    resolve_candidate_width,
 )
 from vllm_gr.config.parser import (
     GRConfigInput,
@@ -30,6 +32,7 @@ __all__ = [
     "DEFAULT_ONLINE_BATCH_SIZES",
     "GR_CONFIG_SCHEMA_VERSION",
     "MAX_BEAM_WIDTH",
+    "MAX_CANDIDATE_WIDTH",
     "SUPPORTED_BEAM_BATCH_SIZES",
     "BeamExecutionMode",
     "ConstraintBackend",
@@ -39,6 +42,7 @@ __all__ = [
     "GRConfig",
     "NPUDecodeExecution",
     "GRConfigInput",
+    "resolve_candidate_width",
     "gr_config_from_mapping",
     "gr_config_to_mapping",
     "load_gr_config",

@@ -15,6 +15,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 import vllm_gr.v1.beam as beam_package
 import vllm_gr.v1.beam.batch_contracts as contracts
+from vllm_gr.config import MAX_BEAM_WIDTH
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
@@ -182,7 +183,7 @@ def test_request_keeps_engine_core_input_generic() -> None:
     validate_beam_batch_request(request)
 
 
-@pytest.mark.parametrize("bad_value", [0, -1, True, 257])  # type: ignore[misc]
+@pytest.mark.parametrize("bad_value", [0, -1, True, 1025])  # type: ignore[misc]
 def test_request_positive_geometry_is_fail_closed(bad_value: object) -> None:
     with pytest.raises(BeamContractError, match="beam_width"):
         validate_beam_batch_request(_request(beam_params=_params(beam_width=bad_value)))
@@ -197,6 +198,24 @@ def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() 
         )
     with pytest.raises(BeamContractError, match="<="):
         validate_beam_batch_request(_request(output_options=_options(num_return_sequences=3)))
+
+
+def test_explicit_candidate_width_must_match_the_beam_width() -> None:
+    """An internal request cannot carry a K the build will not execute.
+
+    ``GRConfig`` rejects ``candidate_width != beam_max_width``, but a caller
+    that constructs ``BeamBatchRequest`` directly never passes through that
+    validation.  The executed top-k comes from the active stage width, so an
+    unchecked K here is accepted and then silently run as W.
+    """
+    with pytest.raises(BeamContractError, match="must equal beam_params.beam_width"):
+        validate_beam_batch_request(_request(beam_params=_params(candidate_width=1)))
+    with pytest.raises(BeamContractError, match="must equal beam_params.beam_width"):
+        validate_beam_batch_request(_request(beam_params=_params(beam_width=8, candidate_width=4)))
+
+    # Restating today's behaviour (K == W) and leaving K unset both pass.
+    validate_beam_batch_request(_request(beam_params=_params(candidate_width=2)))
+    validate_beam_batch_request(_request(beam_params=_params(candidate_width=None)))
 
 
 def test_limits_are_separate_from_protocol_and_check_batch_geometry() -> None:
@@ -214,8 +233,8 @@ def test_limits_are_non_wire_values_and_fail_closed() -> None:
     limits = _limits()
     assert not isinstance(limits, msgspec.Struct)
     validate_beam_batch_limits(limits)
-    with pytest.raises(BeamContractError, match="max_beam_width must be <= 256"):
-        validate_beam_batch_limits(replace(limits, max_beam_width=257))
+    with pytest.raises(BeamContractError, match=f"max_beam_width must be <= {MAX_BEAM_WIDTH}"):
+        validate_beam_batch_limits(replace(limits, max_beam_width=MAX_BEAM_WIDTH + 1))
     with pytest.raises(BeamContractError, match="positive"):
         validate_beam_batch_limits(_limits(max_num_batched_tokens=0))
 

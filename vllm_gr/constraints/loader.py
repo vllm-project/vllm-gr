@@ -15,7 +15,11 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from vllm_gr.config.models import ConstraintTableBackendEnum, ConstraintTableConfig
+from vllm_gr.config.models import (
+    MAX_CANDIDATE_WIDTH,
+    ConstraintTableBackendEnum,
+    ConstraintTableConfig,
+)
 from vllm_gr.constraints.artifact import load_constraint_table_artifact
 from vllm_gr.constraints.backend import (
     INVALID_LOGIT,
@@ -551,9 +555,10 @@ def load_constraint_backend(
 
     op: NPUConstraintOp | None = None
     if config.backend is ConstraintTableBackendEnum.CUDA:
-        if config.max_top_k > MAX_TOP_K:
+        if config.max_top_k > MAX_CANDIDATE_WIDTH:
             raise ValueError(
-                f"CUDA constraint max_top_k must be <= {MAX_TOP_K}, got {config.max_top_k}"
+                f"CUDA constraint max_top_k must be <= {MAX_CANDIDATE_WIDTH}, "
+                f"got {config.max_top_k}"
             )
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(f"CUDA constraint logits must be fp16/bf16, got {dtype}")

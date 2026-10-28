@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -114,6 +114,10 @@ class BeamAttentionMetadata:
     # fields (query_start_loc, seq_lens, block_table, slot_mapping); all the
     # grouped std_*/prefix_*/suffix_* fields stay None and must not be read.
     is_prefill_graph_exec: bool = False
+    # Only dedicated padded captures use BSND; live/native metadata stays TND.
+    prefill_fia_layout: str = "TND"
+    # Graph-owned scratch, never shared across independent model runners.
+    bsnd_resources: dict = field(default_factory=dict)
     num_reqs: int = 0
     query_start_loc_cpu: list | None = None
     seq_lens_cpu: list | None = None
@@ -891,7 +895,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 if chunk_budget <= 0:
                     break
 
-                b_uncached, b_suffix_len, b_past_suffix, b_physical = _compute_beam_bounds(
+                b_uncached, b_suffix_len, _b_past_suffix, _b_physical = _compute_beam_bounds(
                     b, prefix_len, b_cache_len, steps, chunk_budget
                 )
 
