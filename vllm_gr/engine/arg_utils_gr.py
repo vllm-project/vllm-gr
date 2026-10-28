@@ -339,10 +339,10 @@ def _explicit_gr_attention_backend(
 def _apply_npu_default_block_size(config) -> None:
     """Use an Ascend-compatible default without overriding user intent.
 
-    vLLM 0.22 resolves an unspecified block size to 16 before the Ascend
-    platform hook runs. vLLM-Ascend 0.22.1rc1 keeps that value when both
-    chunked prefill and prefix caching are disabled, although its standard
-    attention backends require a kernel block size of 128.
+    This preserves the historical vLLM-Ascend 0.22.1rc1 default while the NPU
+    0.30 migration is blocked: an unspecified block size resolved to 16 before
+    the Ascend platform hook, although its standard attention backends required
+    a kernel block size of 128. Revalidate this rule on vLLM-Ascend 0.30.0rc2.
     """
     try:
         from vllm.platforms import current_platform
@@ -669,9 +669,8 @@ def create_engine_config(self, usage_context=None, headless=False):
         or canonical_input is not None
         or retired_input_present
     ):
-        # vLLM 0.22 config classes are Pydantic dataclasses with extra fields
-        # forbidden. Keep GR-only values in VllmConfig.additional_config so
-        # that they also survive process serialization.
+        # vLLM config classes forbid undeclared fields. Keep GR-only values in
+        # VllmConfig.additional_config so they survive process serialization.
         if canonical_source:
             write_canonical_gr_config(config, effective_gr_config)
         else:

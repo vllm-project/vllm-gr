@@ -215,7 +215,7 @@ def _install_stub_vllm_benchmarks() -> dict[str, types.ModuleType]:
 
     datasets.SampleRequest = _StubSampleRequest  # type: ignore[attr-defined]
 
-    # TokenizerLike is exported from vllm.tokenizers in vLLM 0.22+ rather than
+    # The current API exports TokenizerLike from vllm.tokenizers rather than
     # transitively through vllm.benchmarks.datasets.
     tokenizers = _get_or_create("vllm.tokenizers")
     tokenizers.TokenizerLike = type("TokenizerLike", (), {})  # type: ignore[attr-defined]

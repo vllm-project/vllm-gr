@@ -21,10 +21,9 @@ The upstream source revisions used for compatibility analysis are:
 
 The vLLM-Ascend release branch is movable, so compatibility conclusions must retain the exact source commit.
 
-The current CUDA release candidate targets vLLM 0.30.0 and has completed the
-GPU functional, packaging, and performance validation recorded under
-`update_version`. The remaining release-level precision decision is tracked in
-that upgrade archive. Ascend 0.30.0rc2 and optional integrations still require
+The current CUDA release candidate targets vLLM 0.30.0 and has completed GPU
+functional, packaging, and performance validation. Its release-level precision
+decision remains open. Ascend 0.30.0rc2 and optional integrations still require
 their own runtime validation.
 
 ## Risk Levels

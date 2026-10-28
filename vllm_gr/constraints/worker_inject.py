@@ -6,7 +6,7 @@
 The driver compiles a
 :class:`~vllm_gr.constraints.compiler.ConstraintTableResource` and injects it
 into every worker via ``EngineCore.collective_rpc``
-(``vLLM 0.22.1 v1/engine/core.py``).  The worker method
+(``vLLM 0.30.0 v1/engine/core.py``). The worker method
 ``set_gr_constraint_resources`` is dynamically mounted on the worker class by
 :func:`install_worker_resource_hook`, which runs during worker ``init_device``
 (before any request can arrive).

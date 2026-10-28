@@ -3,8 +3,9 @@
 
 """Reserved NPU operator namespace.
 
-Ascend fused operators, including split-QKV-RMSNorm-RoPE, are registered by
-vLLM-Ascend 0.22.1rc1.
+Ascend fused operators are supplied by the vendor runtime. Their registration
+contract must be revalidated with the vLLM-Ascend 0.30.0rc2 target before NPU
+release enablement.
 """
 
 from vllm_gr.ops.npu.beam_ops import (

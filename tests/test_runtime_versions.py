@@ -81,7 +81,7 @@ def test_rejects_old_vllm_version() -> None:
     with (
         mock.patch(
             "vllm_gr._env_check.importlib.metadata.version",
-            return_value="0.22.1",
+            return_value="0.29.0",
         ),
         pytest.raises(RuntimeError, match="required 0.30.0"),
     ):

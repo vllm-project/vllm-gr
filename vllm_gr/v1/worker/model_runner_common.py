@@ -53,14 +53,15 @@ def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tens
     cpu_positions = None
     if hasattr(runner, "positions") and runner.positions is not None:
         if isinstance(runner.positions, torch.Tensor):
-            # vLLM-Ascend 0.22 uses a plain device tensor in PCP paths.
+            # The historical vLLM-Ascend runner uses a plain device tensor in
+            # PCP paths; retain this shape until the 0.30 NPU path is validated.
             gpu_positions = runner.positions
         else:
             gpu_positions = getattr(runner.positions, "gpu", None)
             cpu_positions = getattr(runner.positions, "cpu", None)
     if cpu_positions is None:
-        # vLLM-Ascend 0.22 keeps a dedicated pinned host buffer even when
-        # ``positions`` itself is a plain device tensor.
+        # The historical Ascend runner keeps a dedicated pinned host buffer
+        # even when ``positions`` itself is a plain device tensor.
         cpu_positions = getattr(runner, "_positions_cpu_buf", None)
     return gpu_positions, cpu_positions
 
@@ -503,7 +504,7 @@ class InputBatchProxy:
                     # gather on dim 1, so each remapped attribute comes out
                     # contiguous (stride 1).  Stacking on dim -1 then unbinding
                     # dim -1 yields strided column views (e.g. top_p with
-                    # stride 5); vLLM 0.22.1's Triton top-p kernel loads the
+                    # stride 5); vLLM 0.30's Triton top-p kernel loads the
                     # row pointer without a stride, so a non-contiguous column
                     # would silently read interleaved penalties/temperature as
                     # top_p values and corrupt filtering.

@@ -27,16 +27,16 @@ class TestRuntimeResolution(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
-        # A fixed old-release fixture stays valid when the live candidate pins change.
+        # A fixed synthetic prior-release fixture stays valid when the live candidate pins change.
         files = {
-            "setup.py": 'VLLM_GR_BASE_VERSION = "0.22.1"\n',
-            "pyproject.toml": '[tool.setuptools_scm]\nfallback_version = "0.22.1"\n',
+            "setup.py": 'VLLM_GR_BASE_VERSION = "0.29.0"\n',
+            "pyproject.toml": '[tool.setuptools_scm]\nfallback_version = "0.29.0"\n',
             "vllm_gr/_env_check.py": (
-                '_SUPPORTED_VLLM_VERSION = "0.22.1"\n'
-                '_SUPPORTED_VLLM_ASCEND_VERSION = "0.22.1rc1"\n'
+                '_SUPPORTED_VLLM_VERSION = "0.29.0"\n'
+                '_SUPPORTED_VLLM_ASCEND_VERSION = "0.29.0rc1"\n'
                 '_SUPPORTED_TRITON_ASCEND_VERSION = "3.2.1"\n'
             ),
-            "requirements/cuda.txt": "-r common.txt\nvllm==0.22.1\n",
+            "requirements/cuda.txt": "-r common.txt\nvllm==0.29.0\n",
             "requirements/common.txt": "numpy==2.2.6\n",
         }
         for name, content in files.items():
@@ -53,7 +53,7 @@ class TestRuntimeResolution(unittest.TestCase):
             stream.write('\nraise RuntimeError("setup must not execute")\n')
         result = runtime.resolve(self.repo, "gpu")
         self.assertEqual(result["device"], "cuda")
-        self.assertEqual(result["expected"], {"vllm": "0.22.1", "vllm-gr": "0.22.1"})
+        self.assertEqual(result["expected"], {"vllm": "0.29.0", "vllm-gr": "0.29.0"})
         self.assertEqual(result, runtime.resolve(self.repo, "cuda"))
 
     def test_future_candidate_drives_runtime_without_ci_pin_changes(self) -> None:
@@ -64,7 +64,7 @@ class TestRuntimeResolution(unittest.TestCase):
             "requirements/cuda.txt",
         ):
             path = self.repo / name
-            path.write_text(path.read_text().replace("0.22.1", "0.30.0"))
+            path.write_text(path.read_text().replace("0.29.0", "0.30.0"))
         self.assertEqual(runtime.resolve(self.repo, "cuda")["expected"]["vllm"], "0.30.0")
 
     def test_partial_pin_updates_fail(self) -> None:
@@ -77,7 +77,7 @@ class TestRuntimeResolution(unittest.TestCase):
             with self.subTest(name=name):
                 path = self.repo / name
                 original = path.read_text()
-                path.write_text(original.replace("0.22.1", "0.30.0"))
+                path.write_text(original.replace("0.29.0", "0.30.0"))
                 with self.assertRaisesRegex(ValueError, "must agree"):
                     runtime.resolve(self.repo, "cuda")
                 path.write_text(original)
@@ -106,8 +106,8 @@ class TestRuntimeResolution(unittest.TestCase):
 
     def test_npu_requires_and_fingerprints_vendor_image(self) -> None:
         packages = {
-            "vllm": "0.22.1+npu",
-            "vllm-ascend": "0.22.1rc1",
+            "vllm": "0.29.0+npu",
+            "vllm-ascend": "0.29.0rc1",
             "triton-ascend": "3.2.1",
             "torch-npu": "2.11.0",
         }
@@ -124,7 +124,7 @@ class TestRuntimeResolution(unittest.TestCase):
         spec = runtime.resolve(self.repo, "cuda")
         with (
             patch.object(
-                runtime, "inventory", return_value={"vllm-gr": "0.22.1", "vllm": "0.30.0"}
+                runtime, "inventory", return_value={"vllm-gr": "0.29.0", "vllm": "0.30.0"}
             ),
             patch.object(importlib.metadata, "distribution") as distribution,
             patch.object(importlib, "import_module") as importer,
@@ -132,7 +132,7 @@ class TestRuntimeResolution(unittest.TestCase):
             distribution.return_value.locate_file.return_value = Path(sys.prefix)
             report = runtime.verify(self.repo, spec, Path(sys.prefix).resolve())
         self.assertFalse(report["ok"])
-        self.assertIn("expected 0.22.1, found 0.30.0", ";".join(report["errors"]))
+        self.assertIn("expected 0.29.0, found 0.30.0", ";".join(report["errors"]))
         importer.assert_not_called()
 
     def test_verify_checks_real_import_origins_and_platform(self) -> None:
@@ -143,9 +143,9 @@ class TestRuntimeResolution(unittest.TestCase):
             for name in ("vllm", "torch", "triton")
         }
         modules["torch"].version = SimpleNamespace(cuda="13.0")
-        modules["vllm"].__version__ = "0.22.1+cu130"
+        modules["vllm"].__version__ = "0.29.0+cu130"
         modules["vllm_gr"] = SimpleNamespace(
-            __file__=str(self.repo / "vllm_gr/__init__.py"), __version__="0.22.1"
+            __file__=str(self.repo / "vllm_gr/__init__.py"), __version__="0.29.0"
         )
         modules["vllm.platforms"] = SimpleNamespace(
             current_platform=SimpleNamespace(device_type="cuda")
@@ -159,7 +159,7 @@ class TestRuntimeResolution(unittest.TestCase):
             self.assertTrue(runtime.verify(self.repo, spec, prefix)["ok"])
             modules["vllm"].__version__ = "0.30.0"
             self.assertFalse(runtime.verify(self.repo, spec, prefix)["ok"])
-            modules["vllm"].__version__ = "0.22.1+cu130"
+            modules["vllm"].__version__ = "0.29.0+cu130"
             modules["vllm_gr"].__file__ = "/another-worktree/vllm_gr/__init__.py"
             report = runtime.verify(self.repo, spec, prefix)
             self.assertFalse(report["ok"])
@@ -202,7 +202,7 @@ class TestRuntimeResolution(unittest.TestCase):
                 "_SUPPORTED_TRITON_ASCEND_VERSION: str | None = None",
             )
         )
-        self.assertEqual(runtime.resolve(self.repo, "cuda")["expected"]["vllm"], "0.22.1")
+        self.assertEqual(runtime.resolve(self.repo, "cuda")["expected"]["vllm"], "0.29.0")
         with self.assertRaisesRegex(ValueError, "_SUPPORTED_TRITON_ASCEND_VERSION"):
             runtime.resolve(self.repo, "npu")
 

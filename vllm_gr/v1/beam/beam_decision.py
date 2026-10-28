@@ -1108,9 +1108,9 @@ def _select_candidates(
     candidates per beam.
 
     ``v2_layout`` selects an explicit layout contract instead of inferring it
-    from ``shape[1]``: ``False`` is the V1 (and vLLM 0.22.1 V2) layout with the
-    sampled token in column 0; ``True`` declares a pure top-K layout with no
-    sampled column.  The flag is threaded from the V2 sample wrapper so the
+    from ``shape[1]``: ``False`` is the V1 layout with the sampled token in
+    column 0; ``True`` declares the vLLM 0.30 V2 pure top-K layout with no
+    sampled column. The flag is threaded from the V2 sample wrapper so the
     layout is never guessed from the tensor width alone.
 
     dtype: the ``.to(...)`` casts are skipped when the source tensor already

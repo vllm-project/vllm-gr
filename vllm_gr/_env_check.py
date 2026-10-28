@@ -34,10 +34,9 @@ def configure_model_runner_default() -> None:
     """Default vllm-gr processes to the V1 model runner.
 
     The GR beam-search worker patches target the V1 GPU/NPU model runner
-    lifecycle by default.  vLLM 0.22 enables ModelRunner V2 automatically for
-    supported models such as Qwen3, which bypasses those patches and can
-    silently produce incorrect beam-search results.  Set the environment
-    default before vLLM constructs its configuration.
+    lifecycle by default. vLLM can enable ModelRunner V2 automatically for
+    supported models such as Qwen3, so set the environment default before
+    vLLM constructs its configuration.
 
     An explicit ``VLLM_USE_V2_MODEL_RUNNER=1`` (or any truthy spelling) is
     preserved as an opt-in experimental path: the V2 runner is

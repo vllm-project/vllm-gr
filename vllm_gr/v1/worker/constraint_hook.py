@@ -976,7 +976,7 @@ def build_direct_constrained_sampler_output(
 def build_empty_constrained_sampler_output(device: torch.device) -> Any:
     """Return the no-token result for an intermediate chunked prefill.
 
-    vLLM 0.22 still calls ``_sample`` when the remapped constrained request has
+    vLLM 0.30 calls ``_sample`` when the remapped constrained request has
     no logits rows. Passing that zero-row tensor to the ordinary sampler trips
     its compiled logprob shape guard. An empty SamplerOutput expresses the
     actual contract: this chunk advances KV state but generates no token.
@@ -1042,7 +1042,7 @@ def try_sample_with_constraint_backend(
     rows = collect_constrained_rows(request_row_configs, beam_data)
     if not rows:
         # Intermediate chunked-prefill visits carry metadata but no logits.
-        # Do not fall through to the ordinary sampler: vLLM 0.22's compiled
+        # Do not fall through to the ordinary sampler: vLLM 0.30's compiled
         # logprob gather rejects zero rows. The scheduler needs an explicit
         # no-token result so it can continue the next prefill chunk.
         device = (
