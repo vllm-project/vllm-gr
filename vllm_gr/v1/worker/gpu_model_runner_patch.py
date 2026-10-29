@@ -41,6 +41,7 @@ from vllm_gr.v1.worker.prefill_graph_runner import (
     is_prefill_graph_enabled,
     is_prefill_phase_batch,
 )
+from vllm_gr.v1.worker.return_contracts import validate_return_tuple
 
 logger = init_logger(__name__)
 
@@ -172,17 +173,25 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
 
         logits_indices = try_prepare_gr_prefill_inputs(self, scheduler_output, num_scheduled_tokens)
         if logits_indices is None:
-            logits_indices, spec_decode_metadata = _orig_prepare_inputs(
-                self, scheduler_output, num_scheduled_tokens
+            out = _orig_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
+            validate_return_tuple(
+                out,
+                method="GPUModelRunner._prepare_inputs",
+                branch="native fallback",
+                expected_items=2,
+                patch_id="GR-PATCH-011",
+                allow_tail=True,
             )
         else:
-            spec_decode_metadata = None
+            # The fast path already wrote inputs; never run native preparation
+            # a second time. Its two-item ABI is pinned by upstream contract tests.
+            out = (logits_indices, None)
 
         # GPU attention metadata is built after _prepare_inputs returns.
         if getattr(self, "_current_beam_info", None) is not None:
             self._current_beam_info["req_ids"] = self.input_batch.req_ids
 
-        return logits_indices, spec_decode_metadata
+        return out
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)
     return patched_prepare_inputs

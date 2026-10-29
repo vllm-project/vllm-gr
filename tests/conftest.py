@@ -7,6 +7,12 @@ import pytest
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--loops", action="store", default=1, type=int, help="number to test loops")
     parser.addoption("--run-slow", action="store_true", default=False, help="run slow tests")
+    parser.addoption(
+        "--require-npu-contracts",
+        action="store_true",
+        default=False,
+        help="fail instead of skipping return-contract checks when vllm-ascend is absent",
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:

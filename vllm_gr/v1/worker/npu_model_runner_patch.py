@@ -37,6 +37,7 @@ from vllm_gr.v1.worker.prefill_graph_runner import (
     is_prefill_graph_enabled,
     is_prefill_phase_batch,
 )
+from vllm_gr.v1.worker.return_contracts import validate_return_tuple
 
 logger = init_logger(__name__)
 
@@ -102,6 +103,14 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         if not beam_data:
             return out
 
+        # Ascend's four positional fields are consumed below (GR-PATCH-012).
+        validate_return_tuple(
+            out,
+            method="NPUModelRunner._prepare_inputs",
+            branch="beam remap",
+            expected_items=4,
+            patch_id="GR-PATCH-012",
+        )
         (
             logits_indices,
             spec_decode_metadata,
@@ -321,6 +330,15 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
         finally:
             self.input_batch = orig_input_batch
 
+        # Check only after restoring the batch. Ascend's six-field layout
+        # cannot accept prefix insertions or unknown tails (GR-PATCH-012).
+        validate_return_tuple(
+            res,
+            method="NPUModelRunner._bookkeeping_sync",
+            branch="beam collapse",
+            expected_items=6,
+            patch_id="GR-PATCH-012",
+        )
         (
             logprobs_lists,
             _valid_sampled_token_ids,

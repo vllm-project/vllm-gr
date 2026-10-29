@@ -990,3 +990,58 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
     with pytest.raises(RuntimeError, match="geometry changed"):
         gpu_patch.initialize_beam_postprocess_workspaces(runner)
     assert allocate.call_count == 1
+
+
+@pytest.mark.parametrize("extra_items", [0, 1, 2])  # type: ignore[misc]
+def test_gpu_prepare_fallback_preserves_return_identity(
+    monkeypatch: pytest.MonkeyPatch, extra_items: int
+) -> None:
+    native_result = tuple(object() for _ in range(2 + extra_items))
+    runner = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["r"]), _current_beam_info={})
+    output, counts = object(), object()
+    calls = []
+
+    def native(self: Any, scheduled: Any, tokens: Any) -> tuple[object, ...]:
+        assert self._current_scheduler_output is output
+        assert "req_ids" not in self._current_beam_info
+        calls.append((self, scheduled, tokens))
+        return native_result
+
+    monkeypatch.setattr(gpu_patch, "try_prepare_gr_prefill_inputs", lambda *args: None)
+    assert gpu_patch.make_patched_prepare_inputs(native)(runner, output, counts) is native_result
+    assert calls == [(runner, output, counts)]
+    assert runner._current_beam_info["req_ids"] is runner.input_batch.req_ids
+
+
+@pytest.mark.parametrize("result", [(), (object(),), None, [object(), object()]])  # type: ignore[misc]
+def test_gpu_prepare_rejects_invalid_native_return(
+    monkeypatch: pytest.MonkeyPatch, result: Any
+) -> None:
+    runner = SimpleNamespace(_current_beam_info={})
+    monkeypatch.setattr(gpu_patch, "try_prepare_gr_prefill_inputs", lambda *args: None)
+    wrapped = gpu_patch.make_patched_prepare_inputs(lambda *args: result)
+    with pytest.raises(RuntimeError, match="expected at least 2") as exc:
+        wrapped(runner, object(), object())
+    assert "GPUModelRunner._prepare_inputs" in str(exc.value)
+    assert type(result).__name__ in str(exc.value)
+    assert "GR-PATCH-011" in str(exc.value)
+    assert runner._current_beam_info == {}
+
+
+def test_gpu_prepare_fast_path_never_calls_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["r"]), _current_beam_info={})
+    output, counts, logits = object(), object(), object()
+
+    def fast(self: Any, scheduled: Any, tokens: Any) -> object:
+        assert self is runner and scheduled is output and tokens is counts
+        assert self._current_scheduler_output is output
+        assert "req_ids" not in self._current_beam_info
+        return logits
+
+    def forbidden(*args: Any) -> None:
+        pytest.fail("native prepare must not run after fast-path buffer writes")
+
+    monkeypatch.setattr(gpu_patch, "try_prepare_gr_prefill_inputs", fast)
+    result = gpu_patch.make_patched_prepare_inputs(forbidden)(runner, output, counts)
+    assert result == (logits, None)
+    assert runner._current_beam_info["req_ids"] is runner.input_batch.req_ids

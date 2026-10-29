@@ -144,10 +144,16 @@ patches:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_gpu_model_runner_patch.py
       - tests/test_model_runner_patch.py
+      - tests/contract/test_upstream_patch_contracts.py::test_gpu_prepare_native_return_layout
     process_roles: [gpu_worker]
     target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
     risk: critical
     contract: gpu-model-runner-signatures
+    return_contract: >-
+      Native V1 prepare is validated against (logits_indices, spec_decode_metadata).
+      GR prefill keeps its two-item short circuit; native fallback validates a tuple
+      of at least two items and returns the same object without consuming any fields.
+      Tail passthrough alone does not establish newer-runtime compatibility.
     removal_condition: stable upstream grouped input and output hooks replace private runner mutation
 
   - id: GR-PATCH-012
@@ -161,10 +167,19 @@ patches:
       - tests/test_model_runner_patch.py
       - tests/test_npu_prefill_bsnd.py
       - tests/test_prefill_graph_runner.py
+      - tests/contract/test_upstream_patch_contracts.py::test_npu_native_return_layout
     process_roles: [npu_worker]
     target: vllm_ascend.worker.model_runner_v1.NPUModelRunner
     risk: critical
     contract: docs/npu_prefill_bsnd.md
+    return_contract: >-
+      Beam prepare requires exactly (logits_indices, spec_decode_metadata,
+      total_num_scheduled_tokens, num_scheduled_tokens_compressed_list), including
+      the stage runner path. Beam bookkeeping requires exactly (logprobs_lists,
+      valid_sampled_token_ids, prompt_logprobs_dict, req_ids_output_copy,
+      req_id_to_index_output_copy, invalid_req_indices) after restoring the input
+      batch. Native passthrough is unchanged. Source tests check field order;
+      NPU validation requires --require-npu-contracts and device regression tests.
     removal_condition: vLLM-Ascend exposes stable grouped input and output hooks
 
   - id: GR-PATCH-013

@@ -219,10 +219,16 @@ aligned with it.
 - Risk: Critical
 - Dependencies:
     - private method signatures;
-    - the 2-item `_prepare_inputs` result;
+    - the native V1 `_prepare_inputs` layout `(logits_indices, spec_decode_metadata)`;
+    - the GR prefill fast path synthesizes these two items and never calls native preparation;
+    - native fallback validates a tuple of at least two items, then returns the same object,
+      including any tail; this alone does not establish compatibility with a newer caller;
     - native execute/sample separation and asynchronous output consumption;
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
 - Removal condition: upstream provides stable hooks for grouped input preparation and output collapsing.
+- Return-contract validation: `tests/contract/test_upstream_patch_contracts.py` checks
+  the installed native source's two-item return annotation and field order. Wrapper
+  tests cover passthrough identity, invalid returns, and the prefill short circuit.
 
 ### GR-PATCH-012 — NPU ModelRunner Override
 
@@ -237,10 +243,22 @@ aligned with it.
 - Risk: Critical
 - Dependencies:
     - NPU-specific private method signatures;
-    - the 4-item `_prepare_inputs` result;
-    - the 6-item `_bookkeeping_sync` result;
+    - exactly four `_prepare_inputs` items: `logits_indices`, `spec_decode_metadata`,
+      `total_num_scheduled_tokens`, `num_scheduled_tokens_compressed_list`;
+    - exactly six `_bookkeeping_sync` items: `logprobs_lists`, `valid_sampled_token_ids`,
+      `prompt_logprobs_dict`, `req_ids_output_copy`, `req_id_to_index_output_copy`,
+      `invalid_req_indices`;
     - speculative decoding and token-compression state.
 - Removal condition: vLLM-Ascend exposes stable grouped input and output adaptation hooks.
+- Return guards: legacy Beam prepare and `NPUEagerBeamStageRunner.prepare_inputs`
+  validate before positional consumption; Beam bookkeeping validates after its
+  `finally` restores the input batch and before collapse. Non-tuple, shorter and
+  longer layouts raise `RuntimeError`; ordinary native passthrough is unchanged.
+  Length checks do not detect same-length field reordering.
+- Return-contract validation: `tests/contract/test_upstream_patch_contracts.py`
+  checks installed Ascend source annotations and return field order without loading
+  NPU libraries. NPU validation must pass `--require-npu-contracts` so a missing
+  Ascend package fails instead of skipping. Source checks do not replace device tests.
 
 - Optional BSND Prefill: `_model_forward` selects fixed `(T,B)` captures only for
   complete prompts without history when `VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS`

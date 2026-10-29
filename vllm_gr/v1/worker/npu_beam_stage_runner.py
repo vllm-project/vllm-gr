@@ -46,6 +46,7 @@ from vllm_gr.v1.worker.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
+from vllm_gr.v1.worker.return_contracts import validate_return_tuple
 
 
 class NPUEagerBeamStageRunner:
@@ -371,6 +372,13 @@ class NPUEagerBeamStageRunner:
         if self.worker._current_beam_info is not None:
             self.worker._current_beam_info["req_ids"] = list(execution.request_ids)
         out = original(self.worker, prepared_output, prepared_counts)
+        validate_return_tuple(
+            out,
+            method="NPUModelRunner._prepare_inputs",
+            branch=f"stage {execution.kind}",
+            expected_items=4,
+            patch_id="GR-PATCH-012",
+        )
         logits_indices, spec_metadata, total, compressed = out
         if execution.kind == "decode" and total != plan.model_token_count:
             raise RuntimeError(

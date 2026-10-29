@@ -624,12 +624,9 @@ def _decision_stub(
     monkeypatch.setattr(
         beam_decision,
         "run_beam_decision",
-        lambda runner,
-        session,
-        sampler_output,
-        is_last_step,
-        result_width,
-        v2_layout=False: decision,
+        lambda runner, session, sampler_output, is_last_step, result_width, v2_layout=False: (
+            decision
+        ),
     )
 
 
@@ -2056,7 +2053,9 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
 
     worker._update_states = npu_patch.make_patched_update_states(update).__get__(worker)
 
-    def prepare(self: Any, scheduled: Any, counts: np.ndarray) -> tuple[Any, ...]:
+    def prepare(
+        self: Any, scheduled: Any, counts: np.ndarray[Any, np.dtype[np.int32]]
+    ) -> tuple[Any, ...]:
         assert counts.dtype == np.int32
         assert torch.from_numpy(counts).tolist() == [3, 3]
         assert scheduled.total_num_scheduled_tokens == 6
@@ -3099,3 +3098,131 @@ def test_npu_dynamic_beam_admission_requires_fixed_horizon(ignore_stop_tokens: b
     else:
         with pytest.raises(ValueError, match="requires ignore_eos=True"):
             _validate_gr_generation_params(params)
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "result", [tuple(range(5)), tuple(range(7)), tuple(range(8)), None, [0] * 6]
+)
+def test_npu_bookkeeping_rejects_layout_after_restoring_batch(
+    monkeypatch: pytest.MonkeyPatch, result: Any
+) -> None:
+    batch = SimpleNamespace()
+    proxy = SimpleNamespace(_obj=batch)
+    runner = SimpleNamespace(input_batch=proxy)
+    output = SimpleNamespace(beam_data={"r": {}}, _gr_request_row_configs=[])
+    calls = []
+
+    def native(self: Any, scheduled: Any, *args: Any) -> Any:
+        assert self.input_batch is proxy
+        calls.append(scheduled)
+        return result
+
+    def forbidden(*args: Any) -> None:
+        pytest.fail("collapse must not consume an unrecognized layout")
+
+    monkeypatch.setattr(npu_patch, "_reduce_sampler_output_for_worker_decision", lambda *args: None)
+    monkeypatch.setattr(npu_patch, "_beam_collapse_bookkeeping", forbidden)
+    with pytest.raises(RuntimeError, match="expected exactly 6") as exc:
+        npu_patch.make_patched_bookkeeping_sync(native)(runner, output)
+    assert "NPUModelRunner._bookkeeping_sync" in str(exc.value)
+    assert "GR-PATCH-012" in str(exc.value)
+    assert type(result).__name__ in str(exc.value)
+    if isinstance(result, tuple):
+        assert f"{len(result)} items" in str(exc.value)
+    assert runner.input_batch is batch
+    assert calls == [output]
+
+
+@pytest.mark.parametrize("logprobs", [None, ["logprobs"]])  # type: ignore[misc]
+def test_npu_bookkeeping_preserves_untouched_field_identity(
+    monkeypatch: pytest.MonkeyPatch, logprobs: Any
+) -> None:
+    batch = SimpleNamespace()
+    runner = SimpleNamespace(input_batch=SimpleNamespace(_obj=batch))
+    prompt, invalid = object(), object()
+    native_result = (logprobs, object(), prompt, object(), object(), invalid)
+    monkeypatch.setattr(npu_patch, "_reduce_sampler_output_for_worker_decision", lambda *args: None)
+    monkeypatch.setattr(npu_patch, "_beam_collapse_bookkeeping", lambda *args: (["r"], {"r": 0}, 1))
+    result = npu_patch.make_patched_bookkeeping_sync(lambda *args: native_result)(
+        runner, SimpleNamespace(beam_data={"r": {}}, _gr_request_row_configs=[])
+    )
+    assert result[0] == (None if logprobs is None else [[]])
+    assert result[1] == [[]]
+    assert result[2] is prompt and result[5] is invalid
+    assert runner.input_batch is batch
+
+
+@pytest.mark.parametrize("path", ["legacy", "prefill", "decode"])  # type: ignore[misc]
+@pytest.mark.parametrize("result", [tuple(range(3)), tuple(range(5)), None, [0] * 4])  # type: ignore[misc]
+def test_npu_prepare_rejects_layout_before_remapping(
+    monkeypatch: pytest.MonkeyPatch, path: str, result: Any
+) -> None:
+    from vllm_gr.v1.worker import model_runner_common as common
+
+    batch = SimpleNamespace(req_ids=["r"])
+    worker = SimpleNamespace(input_batch=batch, _current_beam_info={})
+    calls = []
+
+    def native(self: Any, scheduled: Any, counts: Any) -> Any:
+        calls.append(scheduled)
+        return result
+
+    def forbidden(*args: Any) -> None:
+        pytest.fail("invalid return must be rejected before GR writes inputs")
+
+    monkeypatch.setattr(npu_patch, "_beam_remap_inputs", forbidden)
+    monkeypatch.setattr(common, "_materialize_logits_indices", forbidden)
+    monkeypatch.setattr(NPUEagerStagePlan, "prepare_decode_inputs", forbidden)
+    if path == "legacy":
+        output = SimpleNamespace(beam_data={"r": {}})
+        counts = [1]
+    else:
+        output = _eager_stage_output(kind=path)
+        stage = object.__new__(NPUEagerBeamStageRunner)
+        stage.worker = worker
+        stage.pending_plan = NPUEagerStagePlan.from_scheduler_output(output)
+        worker._gr_npu_stage_runner = stage
+        counts = np.asarray(list(output.num_scheduled_tokens.values()), dtype=np.int32)
+    with pytest.raises(RuntimeError, match="expected exactly 4") as exc:
+        npu_patch.make_patched_prepare_inputs(native)(worker, output, counts)
+    assert "NPUModelRunner._prepare_inputs" in str(exc.value)
+    assert "GR-PATCH-012" in str(exc.value)
+    assert type(result).__name__ in str(exc.value)
+    assert worker.input_batch is batch
+    assert calls == [output]
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "path", ["prepare", "bookkeeping", "bookkeeping_no_rows", "no_plan", "other_output"]
+)
+def test_npu_native_passthrough_does_not_enforce_beam_return_layout(path: str) -> None:
+    sentinel = object()
+    worker = SimpleNamespace(input_batch=SimpleNamespace(), _current_scheduler_output=object())
+    output = SimpleNamespace(beam_data={})
+
+    def native(*args: Any) -> object:
+        return sentinel
+
+    if path == "prepare":
+        result = npu_patch.make_patched_prepare_inputs(native)(worker, output, [1])
+    elif path.startswith("bookkeeping"):
+        if path == "bookkeeping_no_rows":
+            output.beam_data = {"r": {}}
+        result = npu_patch.make_patched_bookkeeping_sync(native)(worker, output)
+    else:
+        stage = object.__new__(NPUEagerBeamStageRunner)
+        stage.worker = worker
+        stage.pending_plan = None if path == "no_plan" else object()
+        result = stage.prepare_inputs(native, output, [1])
+    assert result is sentinel
+
+
+def test_npu_stage_prepare_still_rejects_wrong_physical_total() -> None:
+    output = _eager_stage_output(kind="decode")
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.pending_plan = NPUEagerStagePlan.from_scheduler_output(output)
+    stage.worker = SimpleNamespace(_current_scheduler_output=output, _current_beam_info=None)
+    with pytest.raises(RuntimeError, match=r"physical B\*W token count"):
+        stage.prepare_inputs(
+            lambda *args: (object(), None, 1, object()), output, np.ones(2, dtype=np.int32)
+        )
