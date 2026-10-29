@@ -138,6 +138,7 @@ print("yes" if json.load(open(sys.argv[1], encoding="utf-8"))["confirmation_requ
 PY
 )"
   if [[ "$needs_confirmation" == yes ]]; then
+    repeat_count=3
     run_once 2
     run_once 3
     summarize_runs 3
