@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disable-error-code="misc"
 """Test-only startup refusal; real CUDA invalidation has an isolated kernel test."""
 
 from typing import Any
@@ -24,7 +25,7 @@ def _refuse_capture(
 V2StageExecutionHooks.forward_hidden = _refuse_capture
 
 
-class FailedDecodeWorkerExtension(OneRecV2ParityWorkerExtension):  # type: ignore[misc]
+class FailedDecodeWorkerExtension(OneRecV2ParityWorkerExtension):
     def onerec_v2_parity_snapshot(self) -> dict[str, Any]:
         snapshot: dict[str, Any] = super().onerec_v2_parity_snapshot()
         if snapshot.get("retired"):

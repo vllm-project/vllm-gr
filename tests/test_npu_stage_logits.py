@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 import torch
 import torch.nn.functional as F
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -26,6 +27,11 @@ from vllm_gr.ops.npu_stage_logits import (
     install_npu_stage_weight_update_hooks,
     make_npu_stage_reload_weights,
 )
+
+
+def _make_logits_processor(vocab_size: int) -> LogitsProcessor:
+    with set_current_vllm_config(VllmConfig()):
+        return LogitsProcessor(vocab_size)
 
 
 @pytest.fixture
@@ -41,7 +47,7 @@ def context(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
             "get_ascend_config",
             lambda: SimpleNamespace(enable_reduce_sample=False),
         )
-    processor = LogitsProcessor(384)
+    processor = _make_logits_processor(384)
     monkeypatch.setattr(processor, "_gather_logits", lambda logits: logits)
     generator = torch.Generator().manual_seed(41)
     head = SimpleNamespace(
@@ -148,6 +154,30 @@ def test_steady_state_reuses_prepared_weights(
                 assert ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias).shape == (2, 128)
     assert tuple(weight.data_ptr() for weight in projection.stage_weights) == pointers
     assert projection.projection_counts == [2, 2, 2]
+
+
+def test_skip_gather_is_forwarded_for_compact_and_fallback_projection(context: Any) -> None:
+    ctx = context
+    projection = _install(ctx)
+    original = projection._original
+    calls = []
+
+    def observed_original(
+        hidden_states: torch.Tensor,
+        lm_head: Any,
+        embedding_bias: torch.Tensor | None,
+        skip_gather: bool = False,
+    ) -> torch.Tensor | None:
+        calls.append(skip_gather)
+        return original(hidden_states, lm_head, embedding_bias, skip_gather)
+
+    projection._original = observed_original
+    compact = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias, skip_gather=True)
+    assert compact.shape == (2, 128)
+    ctx.runner._gr_npu_stage_plan = None
+    fallback = ctx.processor.forward(ctx.head, ctx.hidden, ctx.head.bias, skip_gather=True)
+    assert fallback.shape == (2, 384)
+    assert calls == [True, True]
 
 
 @pytest.mark.parametrize(
@@ -266,7 +296,7 @@ def test_install_rejects_unsupported_configs_without_changing_processor(
     elif case == "no_processor":
         ctx.processors.clear()
     elif case == "multiple_processors":
-        ctx.processors.append(LogitsProcessor(384))
+        ctx.processors.append(_make_logits_processor(384))
     assert install_npu_stage_projection(ctx.runner, ctx.backend) is None
     assert ctx.processor._get_logits == original
     assert "_get_logits" not in vars(ctx.processor)
@@ -385,7 +415,7 @@ def test_ineligible_runner_is_rejected_before_projection_allocation(
     elif case == "quantized":
         ctx.head.quant_method = SimpleNamespace()
     else:
-        ctx.processors.append(LogitsProcessor(384))
+        ctx.processors.append(_make_logits_processor(384))
 
     def forbidden(*args: Any, **kwargs: Any) -> None:
         pytest.fail("An unsupported runner must not allocate compact projection weights")

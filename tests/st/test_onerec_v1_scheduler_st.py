@@ -1421,10 +1421,11 @@ def test_onerec_v1_completion_batch_online(
         env["VLLM_GR_TEST_UNCONSTRAINED"] = "1"
     if batch_sizes is not None:
         env["VLLM_GR_TEST_ONLINE_BATCH_SIZES"] = json.dumps(batch_sizes)
-        # The seven-request prompt list exceeds max_model_len in total.
-        # An explicit GR grid covers total batch tokens up to the scheduler
-        # budget; the production default remains bounded by max_model_len.
-        env["VLLM_GR_PREFILL_GRAPH_BUCKETS"] = ",".join(str(n) for n in range(128, 4097, 128))
+    # The default eight-request and custom seven-request prompt lists exceed
+    # max_model_len in total. This ST requires graph replay for every batch, so
+    # its explicit grid covers the scheduler budget; the production default
+    # remains bounded by max_model_len.
+    env["VLLM_GR_PREFILL_GRAPH_BUCKETS"] = ",".join(str(n) for n in range(128, 4097, 128))
     env.update(
         USE_TF="0",
         VLLM_USE_V2_MODEL_RUNNER=str(int(runner == "v2")),
