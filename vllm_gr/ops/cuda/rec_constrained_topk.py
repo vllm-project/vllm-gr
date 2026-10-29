@@ -8,13 +8,15 @@ import torch
 import triton
 import triton.language as tl
 
+from vllm_gr.config.models import MAX_CANDIDATE_WIDTH
 from vllm_gr.constraints.scoring import INVALID_LOGIT
 
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
 
 
-MAX_TOP_K = 256
+# Historical name for the same ceiling; kept for the existing import surface.
+MAX_TOP_K = MAX_CANDIDATE_WIDTH
 MAX_SORT_BLOCK = 65536
 
 

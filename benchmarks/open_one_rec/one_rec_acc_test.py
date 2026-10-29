@@ -104,21 +104,23 @@ def run_offline_v1_inference(
         remaining = min(batch_size, len(prompts) - offset)
         size = 4 if remaining >= 4 else 2 if remaining >= 2 else 1
         batch = prompts[offset : offset + size]
-        raw_outputs = llm.beam_search_v1([{"prompt": prompt} for prompt in batch], params)
+        raw_outputs = llm.beam_search_v1(
+            [{"prompt": prompt} for prompt in batch], params, output_mode="compact"
+        )
         if len(raw_outputs) != size:
             raise RuntimeError("V1 returned an unexpected number of items")
         for prompt, output in zip(batch, raw_outputs, strict=True):
             if len(output.sequences) != params.beam_width:
                 raise RuntimeError("V1 returned an unexpected number of beams")
-            # V1 tokens contain the original prompt plus the public SID budget.
-            # Decoding token suffixes avoids character slicing after a tokenizer
-            # round-trip (which can normalize the original prompt).
+            # Compact output excludes the original prompt. Keep the public SID
+            # budget and decode each short candidate once, without materializing
+            # full prompt-plus-tail tokens or normalizing the input text.
             completions = [
                 MockCompletionOutput(
                     tokenizer.decode(
-                        sequence.tokens[-params.max_tokens :], skip_special_tokens=False
+                        sequence.token_ids[-params.max_tokens :], skip_special_tokens=False
                     ),
-                    sequence.cum_logprob,
+                    sequence.cumulative_logprob,
                 )
                 for sequence in output.sequences
             ]

@@ -302,7 +302,7 @@ def test_worker_decision_enabled_on_cuda_without_xllm() -> None:
 
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("beam_width", "expected"),
-    [(256, True), (257, False)],
+    [(256, True), (1024, True), (1025, False)],
 )
 def test_cuda_worker_decision_respects_kernel_width_limit(
     beam_width: int,
@@ -316,7 +316,7 @@ def test_cuda_worker_decision_respects_kernel_width_limit(
 
 def test_cuda_worker_decision_over_width_limit_falls_back() -> None:
     # One past MAX_BEAM_WIDTH: the gate must reject before touching candidates.
-    beam_width = 257
+    beam_width = 1025
     context = _make_context(max_beams=beam_width)
     runner = _gate_runner(context, device_type="cuda", beam_width=beam_width)
     candidates = torch.arange(beam_width**2, dtype=torch.int32).reshape(beam_width, beam_width)

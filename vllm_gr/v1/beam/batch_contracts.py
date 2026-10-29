@@ -275,6 +275,20 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
     beam_width = _positive_int("beam_params.beam_width", params.beam_width)
     if beam_width > MAX_BEAM_WIDTH:
         _fail(f"beam_params.beam_width must be <= {MAX_BEAM_WIDTH}, got {beam_width}")
+    if beam_width > MAX_CANDIDATE_WIDTH:
+        # MAX_BEAM_WIDTH is deliberately higher than the candidate ceiling so
+        # the wide-W operators can be exercised, but nothing in this build
+        # samples a candidate width independent of the Beam width: the
+        # executed top-k is still taken from W.  A request wider than the
+        # candidate ceiling therefore describes a K the operators cannot take,
+        # and it would be accepted here and only fail at the first workspace
+        # lookup.  Internal callers build BeamBatchRequest directly and never
+        # pass through GRConfig validation, so the check has to exist here too.
+        _fail(
+            f"beam_params.beam_width must be <= {MAX_CANDIDATE_WIDTH} "
+            f"({MAX_CANDIDATE_WIDTH}) until the candidate width is wired end to end. "
+            f"got {beam_width}"
+        )
     _positive_int("beam_params.max_tokens", params.max_tokens)
     widths = params.dynamic_beam_widths
     if widths is not None:
@@ -327,19 +341,24 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
                 "sample an independent candidate width. Leave candidate_width "
                 "unset to follow the Beam width."
             )
-    if params.candidate_width is not None and widths is not None and len(set(widths)) > 1:
-        # An explicit K is a fixed promise about the per-row candidate count,
-        # but the executed top-k is derived from the active stage width, so a
-        # shrinking schedule would sample [W, ..., 1] while the request claims
-        # one fixed K.  Non-uniform schedules therefore stay usable only with
-        # K unset, where following the stage width is the established
-        # behaviour.  Lifting this needs the engine-wiring layer to consume K.
-        _fail(
-            "beam_params.candidate_width must not be combined with a non-uniform "
-            f"dynamic_beam_widths schedule {tuple(widths)}: this build derives the "
-            "executed top-k from the active stage width. Leave candidate_width "
-            "unset to keep dynamic Beam widths."
-        )
+    if params.candidate_width is not None and widths is not None:
+        # This build still takes the executed top-k from the active stage
+        # width (``BeamBatchExecutionView.candidate_top_k`` returns
+        # ``output_width``).  A uniform but narrower schedule therefore samples
+        # fewer candidates per row than the request states -- K=4 with
+        # ``(2, 2, 2)`` would run TopK=2 at every stage -- without any error.
+        # Until the engine-wiring layer forwards K to the stages, an explicit K
+        # is only honest when every stage retains exactly that many beams.
+        for index, width in enumerate(widths):
+            if width != candidate_width:
+                _fail(
+                    f"beam_params.candidate_width={candidate_width} does not match "
+                    f"dynamic_beam_widths[{index}]={width}: this build derives the "
+                    "executed top-k from the active stage width, so the candidates "
+                    "sampled per row would not be the configured K. Leave "
+                    "candidate_width unset to keep dynamic Beam widths, or set a "
+                    "schedule whose every stage width equals candidate_width."
+                )
     seen_stop_ids: set[int] = set()
     for index, token_id in enumerate(params.stop_token_ids):
         normalized = _non_negative_int(f"beam_params.stop_token_ids[{index}]", token_id)

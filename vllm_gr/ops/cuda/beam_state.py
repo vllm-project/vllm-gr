@@ -59,11 +59,20 @@ class BeamStateScratch:
     next_completed: torch.Tensor
 
     @classmethod
-    def allocate(cls, batch: int, width: int, device: torch.device) -> BeamStateScratch:
+    def allocate(
+        cls,
+        batch: int,
+        width: int,
+        device: torch.device,
+        *,
+        candidate_width: int | None = None,
+    ) -> BeamStateScratch:
         def empty(shape: tuple[int, ...], dtype: torch.dtype = torch.int32) -> torch.Tensor:
             return torch.empty(shape, dtype=dtype, device=device)
 
-        rows, candidates = (batch, width), (batch, width, width)
+        # Candidate geometry is (rows, W, K): K may differ from the beam width.
+        rows = (batch, width)
+        candidates = (batch, width, width if candidate_width is None else candidate_width)
         return cls(
             empty(rows, torch.float32),
             empty(candidates, torch.bool),
@@ -138,13 +147,13 @@ def _prepare_candidates_kernel(
     row_counts,
     row_errors,
     row_valid_counts,
-    WIDTH: tl.constexpr,
+    CANDIDATE_WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
     PREFILL: tl.constexpr,
 ):
     parent = tl.program_id(0)
     rank = tl.arange(0, BLOCK)
-    lane = rank < WIDTH
+    lane = rank < CANDIDATE_WIDTH
     if PREFILL:
         base = 0.0
         live = True
@@ -153,7 +162,7 @@ def _prepare_candidates_kernel(
         base = tl.load(beam_scores + parent)
         live = tl.load(active_mask + parent)
         step = tl.load(generated)
-    offset = parent * WIDTH + rank
+    offset = parent * CANDIDATE_WIDTH + rank
     valid = lane & live & tl.load(valid_mask + offset, mask=lane, other=False)
     token = tl.load(tokens + offset, mask=valid, other=0)
     local = tl.load(logprobs + offset, mask=valid, other=0.0)

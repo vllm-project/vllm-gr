@@ -304,6 +304,7 @@ def run(args: argparse.Namespace) -> int:
                     [{"prompt": s["prompt"]} for s in samples[offset : offset + b]],
                     params,
                     use_tqdm=False,
+                    output_mode="full",
                 )
                 assert len(outputs) == b
                 for index, output in enumerate(outputs, offset):

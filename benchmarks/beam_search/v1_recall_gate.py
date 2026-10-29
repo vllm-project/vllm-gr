@@ -104,7 +104,9 @@ def batch_ranges(count, batch_size, supported_sizes=(1, 2, 4)):
 
 def infer_batch(llm, tokenizer, token_rows, params):
     """Submit one native batch and decode only generated SID tokens."""
-    outputs = llm.beam_search_v1([{"prompt_token_ids": row} for row in token_rows], params)
+    outputs = llm.beam_search_v1(
+        [{"prompt_token_ids": row} for row in token_rows], params, output_mode="full"
+    )
     if len(outputs) != len(token_rows):
         raise RuntimeError(f"expected {len(token_rows)} outputs, got {len(outputs)}")
     predictions = []

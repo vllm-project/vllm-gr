@@ -9,12 +9,20 @@ from enum import Enum
 GR_CONFIG_SCHEMA_VERSION = 1
 CONSTRAINT_TABLE_FORMAT = "constraint_table_v1"
 CONSTRAINT_TABLE_MAX_DECODE_STEPS = 3
-# Temporary global Beam width ceiling. Keep every configuration, request,
-# runtime contract, and fused kernel on this single limit until wider kernels
-# are implemented and qualified end to end.  This constant also gates the raw
-# Beam *operators*, so raising it ships the wide-W selection paths whether or
-# not they are fixed; raise it together with those kernels, not ahead of them.
-MAX_BEAM_WIDTH = 256
+# Global Beam width ceiling.  This constant also gates the raw Beam operators,
+# so it is raised only together with the kernels that make W > 256 correct:
+# the hierarchical Top-K used to size every local list from LOCAL_TILE_SIZE
+# (256) regardless of the selection width, which left the merge stage reading
+# slots the local stage never wrote.  With _beam_selection_tiling shared by
+# allocation and launch, a list is now at least as wide as the selection, so
+# widths above the fused-kernel whitelist ({64, 128, 256}) are correct on the
+# hierarchical path.
+#
+# Configuration cannot yet express a width above MAX_CANDIDATE_WIDTH: the
+# config layer still requires K == W and caps K at 256, so the wide-W path is
+# reachable through the operators and their tests but not through a served
+# request until the engine-wiring layer samples K independently.
+MAX_BEAM_WIDTH = 1024
 # Candidate width (top-k per beam row) is an independent dimension: the
 # RecConstrainedTopK operator caps it at 256, so 256 is the single ceiling
 # shared by every configuration, request contract, and Triton launch.
@@ -187,8 +195,8 @@ class GRConfig:
     beam_graph_batch_size: int = 1
 
     # Like beam_graph_enabled, this flag is dormant without a Beam pool.
-    enable_short_suffix_attention: bool = False
-    """Fuse CUDA suffix attention and prefix merging when explicitly enabled."""
+    enable_short_suffix_attention: bool = True
+    """Fuse CUDA suffix attention and prefix merging by default; False opts out."""
 
     beam_graph_widths: tuple[int, ...] | None = None
     """Additional exact NPU Decode input widths to capture at startup."""
@@ -313,20 +321,19 @@ class GRConfig:
                 "constrained_generation=False cannot be combined with an enabled "
                 "constraint table or a configured vocabulary slice"
             )
-        if (
-            self.constraint_table is not None
-            and self.constraint_table.enabled
-            and self.constraint_table.candidate_width is None
-            and self.beam_max_width is not None
-            and self.beam_max_width > MAX_CANDIDATE_WIDTH
-        ):
-            # Fail at parse time instead of at the first workspace lookup: the
-            # prewarmed workspace bucket is keyed by K, and a config that only
-            # implies K == beam_max_width has no bucket to find.
+        if self.beam_max_width is not None and self.beam_max_width > MAX_CANDIDATE_WIDTH:
+            # Unconditional on the constraint table: this build always samples
+            # K == W, and MAX_BEAM_WIDTH is deliberately higher than the
+            # candidate ceiling so the wide-W operators can be exercised.  No
+            # production path calls resolve_candidate_width yet, so leaving this
+            # to that helper would let an unusable width through construction.
             raise ValueError(
                 f"vllm-gr beam_max_width={self.beam_max_width} exceeds the candidate "
-                f"width ceiling {MAX_CANDIDATE_WIDTH}; set "
-                "constraint_table.candidate_width to the per-row candidate count"
+                f"width ceiling {MAX_CANDIDATE_WIDTH}; this build samples one "
+                "candidate per beam row (K == W) and caps K at "
+                f"{MAX_CANDIDATE_WIDTH}, so the Beam width cannot exceed it either. "
+                "Keep beam_max_width <= "
+                f"{MAX_CANDIDATE_WIDTH} until the candidate-width wiring lands."
             )
         if (
             self.constraint_table is not None
@@ -429,7 +436,10 @@ def resolve_candidate_width(config: GRConfig) -> int:
         # ceiling; a wider beam must state its per-row candidate width.
         raise ValueError(
             f"vllm-gr beam_max_width={candidate_width} exceeds the candidate width "
-            f"ceiling {MAX_CANDIDATE_WIDTH}; set constraint_table.candidate_width to "
-            "the per-row candidate count"
+            f"ceiling {MAX_CANDIDATE_WIDTH}; this build samples one candidate per "
+            "beam row (K == W) and caps K at "
+            f"{MAX_CANDIDATE_WIDTH}, so the Beam width cannot exceed it either. "
+            "Keep beam_max_width <= "
+            f"{MAX_CANDIDATE_WIDTH} until the candidate-width wiring lands."
         )
     return candidate_width

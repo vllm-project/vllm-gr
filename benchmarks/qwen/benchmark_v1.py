@@ -400,6 +400,7 @@ def _run_once(
             params,
             use_tqdm=False,
             concurrency_limit=1,
+            output_mode="full",
         )
         request_latencies_ms.append((time.perf_counter() - request_started) * 1000.0)
         if record_outputs:

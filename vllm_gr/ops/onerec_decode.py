@@ -291,7 +291,7 @@ def _validate_group(
     sequence: torch.Tensor,
     current_step: int,
     top_k: int,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     _require_fp32("log_probs", log_probs)
     _require_fp32("top_probs", top_probs)
     _require_int32("top_tokens", top_tokens)
@@ -303,8 +303,13 @@ def _validate_group(
     if sequence.ndim != 3:
         raise ValueError("sequence must have shape [batch, beam_width, rounds]")
     batch_size, beam_width, total_rounds = sequence.shape
-    if top_tokens.shape != (batch_size * beam_width, beam_width):
-        raise ValueError("group candidates must have shape [batch * beam_width, beam_width]")
+    # Candidate width K is independent of the beam width W: (rows, columns)
+    # is (batch * W, K).
+    candidate_width = top_tokens.shape[1]
+    if top_tokens.shape != (batch_size * beam_width, candidate_width):
+        raise ValueError("group candidates must have shape [batch * beam_width, candidate_width]")
+    if candidate_width < 1:
+        raise ValueError("group candidates must have at least one column")
     if log_probs.shape[0] != batch_size * beam_width:
         raise ValueError("log_probs row count must equal batch_size * beam_width")
     if total_rounds < current_step + 1 or current_step < 0:
@@ -317,7 +322,13 @@ def _validate_group(
         top_probs=top_probs,
         sequence=sequence,
     )
-    return batch_size, beam_width, min(top_k, beam_width * beam_width), total_rounds
+    return (
+        batch_size,
+        beam_width,
+        candidate_width,
+        min(top_k, beam_width * candidate_width),
+        total_rounds,
+    )
 
 
 def _beam_search_group_torch(
@@ -328,7 +339,7 @@ def _beam_search_group_torch(
     current_step: int,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size, beam_width, effective_k, total_rounds = _validate_group(
+    batch_size, beam_width, candidate_width, effective_k, total_rounds = _validate_group(
         log_probs, top_tokens, top_probs, sequence, current_step, top_k
     )
     device = sequence.device
@@ -359,14 +370,14 @@ def _beam_search_group_torch(
 
     scores = (
         log_probs.reshape(batch_size, beam_width, 1)
-        + top_probs.reshape(batch_size, beam_width, beam_width)
+        + top_probs.reshape(batch_size, beam_width, candidate_width)
     ).reshape(batch_size, -1)
     flat = _stable_topk_indices(scores, effective_k)
     selected_scores = torch.gather(scores, 1, flat)
-    parent = torch.div(flat, beam_width, rounding_mode="floor")
-    candidate = torch.remainder(flat, beam_width)
+    parent = torch.div(flat, candidate_width, rounding_mode="floor")
+    candidate = torch.remainder(flat, candidate_width)
     request = torch.arange(batch_size, device=device)[:, None]
-    tokens = top_tokens.reshape(batch_size, beam_width, beam_width)[request, parent, candidate]
+    tokens = top_tokens.reshape(batch_size, beam_width, candidate_width)[request, parent, candidate]
 
     # Stable sort by parent retains score/flat-index TopK order per parent.
     group_order = torch.argsort(parent, dim=1, stable=True)
@@ -411,6 +422,29 @@ def beam_search_group(
     current_step: int,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select ``top_k`` survivors per request from ``[B*W, K]`` candidates.
+
+    Three widths are in play and must not be conflated:
+
+    - ``W`` (beam width) is ``sequence.shape[1]``, i.e. the number of rows per
+      request;
+    - ``K`` (candidate width) is the column extent of ``top_tokens`` /
+      ``top_probs`` and is independent of ``W``;
+    - ``top_k`` is the *survivor* count -- how many winners are kept per
+      request.
+
+    ``K != W`` is fully supported by both backends: each derives ``K`` from the
+    tensors.  ``top_k != W`` is **not**: the CUDA backend fuses the survivor
+    count into its ``W``-wide parent grouping (``out_parent_count_prefix`` is
+    one entry per beam row), so it can only emit exactly ``W`` survivors.  That
+    limitation is raised explicitly rather than silently ignored; narrowing the
+    width between stages is expressed through ``dynamic_beam_widths`` and
+    ``beam_state.select``, not through this operator.
+
+    The torch reference does honour ``top_k < W``, but its outputs then mix
+    widths (tokens/parents/scores/sequence are ``top_k`` wide while the
+    per-parent prefix stays ``W`` wide, matching the NPU contract).
+    """
     if log_probs.device.type == "cuda":
         return _beam_search_group_cuda_dispatch(
             log_probs,
@@ -443,6 +477,16 @@ def _beam_search_rec_final_select_cuda_dispatch(
     )
 
 
+class UnsupportedSurvivorCountError(NotImplementedError, ValueError):
+    """``top_k != beam_width`` on the fixed-width CUDA group operator.
+
+    It is a ``NotImplementedError`` because a narrower selection is a missing
+    capability, not a bad value.  It is also a ``ValueError`` because that is
+    what this case raised before the CUDA dispatch checked it itself, so a
+    caller written against the old exception still catches it.
+    """
+
+
 def _beam_search_group_cuda_dispatch(
     log_probs: torch.Tensor,
     top_tokens: torch.Tensor,
@@ -451,15 +495,47 @@ def _beam_search_group_cuda_dispatch(
     current_step: int,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    from vllm_gr.ops.cuda.beam_selection import beam_search_group_cuda
+    from vllm_gr.ops.cuda.beam_selection import (
+        _validate_beam_inputs,
+        beam_search_group_cuda,
+    )
 
+    # The CUDA group operator is fixed-width: it always emits exactly one
+    # survivor per beam row (``W``), and its ``candidate_width`` argument
+    # selects the column extent ``K``, which it reads from the tensors.  So
+    # ``K`` needs no plumbing here, but ``top_k`` -- the survivor count, the
+    # torch convention -- cannot be honoured.  Raise instead of dropping it:
+    # a silent ``del`` would make a narrower selection look supported while
+    # returning ``W`` winners.
+    #
+    # Validate in the order the callee did before K was read from the tensors:
+    # tensors and current_step first (the same validator, so malformed inputs
+    # get its ValueError/TypeError rather than an IndexError from ``shape[1]``),
+    # then the type of top_k (``8.0 != 8`` is False, so the width comparison
+    # alone would accept a float), then the width itself.
+    _, beam_width, candidate_width, _ = _validate_beam_inputs(
+        log_probs, top_tokens, top_probs, sequence, current_step, None
+    )
+    if current_step not in (0, 1, 2):
+        raise ValueError("CUDA BeamSearchGroup supports current_step 0, 1, or 2")
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise TypeError("top_k must be an int")
+    # A non-positive survivor count is invalid rather than merely unsupported.
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if top_k != beam_width:
+        raise UnsupportedSurvivorCountError(
+            "CUDA beam_search_group always emits beam_width survivors; "
+            f"got top_k={top_k}, beam_width={beam_width}. Narrow the width "
+            "through dynamic_beam_widths/beam_state.select instead."
+        )
     return beam_search_group_cuda(
         log_probs,
         top_tokens,
         top_probs,
         sequence,
         current_step,
-        top_k,
+        candidate_width,
     )
 
 

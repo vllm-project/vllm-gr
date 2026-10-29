@@ -1,8 +1,8 @@
 # Short suffix attention on CUDA
 
-When explicitly enabled, incremental beam decode with one query per beam
-uses a fused Triton suffix/merge kernel for any configured positive KV pool
-capacity. It reads K/V from the existing pool, accumulates suffix scores in
+Enabled by default on eligible CUDA CUSTOM Beam engines, incremental beam
+decode with one query per beam uses a fused Triton suffix/merge kernel for any
+configured positive KV pool capacity. It reads K/V from the existing pool, accumulates suffix scores in
 FP32, and merges them
 with the prefix attention output and natural-log LSE. It writes the final
 attention output directly.
@@ -17,29 +17,41 @@ so changing slots at a fixed tensor geometry reuses the compiled kernel.
 A CUDA graph captures its scalar slot argument; step and mask remain mutable
 device inputs during replay.
 
-The dispatch is restricted to pure incremental FA2 decode, head dimensions
-64/128/256, and unwindowed attention without ALiBi, softcap, or sinks.
+The dispatch is restricted to pure incremental FA2 decode and unwindowed
+attention without ALiBi, softcap, or sinks. Head dimensions of 64/128/256 use
+the FA2-aligned MMA fast path; other head sizes that FlashAttention 2 accepts
+(a multiple of 8, at most 256) use the generic Triton merge kernel.
 With the optimization disabled, configurations use the original implementation.
 The kernel itself supports FP32 for independent correctness validation, in addition
 to the FP16/BF16 activation types used by the model runner.
 
-## Explicit configuration
+## Configuration
 
-The generic implementation is the default. Enable the fused implementation
-in the engine's existing `vllm_gr_config` mapping before startup:
+The fused implementation is enabled by default for CUDA CUSTOM attention with
+an active Beam pool. To opt out, set the field explicitly in the engine's
+existing `vllm_gr_config` mapping before startup:
 
 ```python
-vllm_gr_config["beam"]["enable_short_suffix_attention"] = True
+vllm_gr_config["beam"]["enable_short_suffix_attention"] = False
 # Pass the mapping to GRLLM(..., vllm_gr_config=vllm_gr_config).
 ```
 
-Set the field to `False` (or omit it) to use packed suffix KV, FA2 and
-separate merge. The typed `GRConfig` exposes the same boolean field.
+Setting the field to `False` restores packed suffix KV and separate merging.
+Omitting it or setting it to `True` enables fusion. The typed `GRConfig`
+exposes the same boolean field; the legacy additional-config key is
+`vllm_gr_enable_short_suffix_attention`. Do not mix canonical and legacy keys.
+
+With fusion enabled on CUDA CUSTOM Beam engines, an unspecified
+`attention_config.flash_attn_version` resolves to `2`. An explicit version
+other than `2` raises an error; select FA2 or disable fusion. Opting out
+preserves normal FlashAttention version selection. NPU engines and engines
+without an active Beam pool do not activate this optimization.
 
 Enabling requires a positive pool capacity and an explicit maximum beam width.
 Model/context initialization validates CUDA, head dimensions, GQA grouping,
 dtype, FA2 prefix states and absence of window/softcap/ALiBi/sinks. Unsupported
-static configurations raise an error before execution.
+static configurations raise an error before execution; explicitly disable
+fusion for those configurations.
 
 At runtime, the GPU dispatcher uses the fused kernel only for pure beam decode
 batches with one query per beam. Mixed standard/beam batches, prefix
@@ -51,8 +63,8 @@ decode batches remain eligible: the check uses the session's flattened
 Restart the engine when changing the configuration so CUDA graphs capture
 the selected implementation. CUDA graph enablement is independent.
 There is no fixed suffix-length upper limit imposed by this optimization.
-Users select the implementation explicitly; performance gains depend on the
-actual suffix length and should be measured for their workload. Tiny
+Performance gains depend on the actual suffix length and should be measured
+for the workload. Tiny
 FP16/BF16 pools preserve FA2's rounding stages; larger pools loop over the
 actual device-side suffix extent, avoiding computation for unused capacity.
 Compare both paths on the same checkout and workload, starting a fresh engine

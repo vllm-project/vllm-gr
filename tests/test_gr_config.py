@@ -607,11 +607,12 @@ def test_beam_max_width_rejects_values_above_global_limit() -> None:
 def test_candidate_width_follows_the_beam_width_until_it_cannot() -> None:
     """K follows W, and the derivation refuses a W beyond the K ceiling.
 
-    The postprocess workspace bucket is keyed by K, so a config that only
-    implies K == beam_max_width has no bucket to find.  The global ceilings are
-    equal today (both 256), so the wide-beam case is exercised through the
-    derivation point itself rather than through construction: it has to hold
-    for whatever the ceiling becomes next.
+    ``MAX_BEAM_WIDTH`` (1024) is now deliberately higher than
+    ``MAX_CANDIDATE_WIDTH`` (256), so these two limits have diverged: the Beam
+    operators can be exercised at 512/1024, while a served configuration still
+    samples K == W and therefore cannot.  ``resolve_candidate_width`` keeps the
+    derivation honest for the day the wiring lands; the constructor guard
+    below is what actually rejects the unusable width today.
     """
     table = ConstraintTableConfig(
         max_top_k=MAX_CANDIDATE_WIDTH,
@@ -627,9 +628,9 @@ def test_candidate_width_follows_the_beam_width_until_it_cannot() -> None:
     same = GRConfig(beam_max_width=128, constraint_table=replace(table, candidate_width=128))
     assert resolve_candidate_width(same) == 128
 
-    # A Beam wider than the candidate ceiling must state its own K.  The
-    # constructor already rejects W > MAX_BEAM_WIDTH, so build the shape the
-    # ceiling check has to see once those two limits diverge again.
+    # The derivation refuses a Beam wider than the candidate ceiling unless the
+    # config states K itself.  Build the object directly: construction rejects
+    # this width before the derivation is ever reached.
     wide = SimpleNamespace(
         beam_max_width=MAX_CANDIDATE_WIDTH * 2,
         constraint_table=replace(table, enabled=False),
@@ -638,6 +639,45 @@ def test_candidate_width_follows_the_beam_width_until_it_cannot() -> None:
         resolve_candidate_width(wide)
     wide.constraint_table = replace(table, enabled=False, candidate_width=MAX_CANDIDATE_WIDTH)
     assert resolve_candidate_width(wide) == MAX_CANDIDATE_WIDTH
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "constraint_table",
+    [
+        None,
+        ConstraintTableConfig(
+            max_top_k=MAX_CANDIDATE_WIDTH,
+            enabled=False,
+            path="/tmp/catalog.json",
+            artifact_digest="sha256:" + "0" * 64,
+            tokenizer_digest="sha256:" + "0" * 64,
+        ),
+    ],
+    ids=["no-table", "disabled-table"],
+)
+def test_beam_max_width_above_the_candidate_ceiling_is_rejected_at_parse_time(
+    constraint_table: ConstraintTableConfig | None,
+) -> None:
+    """The wide-W ceiling must not be reachable through configuration.
+
+    ``MAX_BEAM_WIDTH`` is raised so the wide-``W`` kernels can be tested, but
+    every production path still samples K == W.  The rejection therefore cannot
+    depend on an *enabled* constraint table: a config with no table (or a
+    disabled one) would otherwise construct fine and only fail at the first
+    workspace lookup, and ``resolve_candidate_width`` has no production caller
+    to catch it there.
+    """
+    assert MAX_BEAM_WIDTH > MAX_CANDIDATE_WIDTH
+    with pytest.raises(ValueError, match="exceeds the candidate width ceiling"):
+        GRConfig(beam_max_width=MAX_CANDIDATE_WIDTH + 1, constraint_table=constraint_table)
+    # The ceiling itself still works.
+    accepted = GRConfig(
+        beam_max_width=MAX_CANDIDATE_WIDTH,
+        constraint_table=replace(constraint_table, candidate_width=MAX_CANDIDATE_WIDTH)
+        if constraint_table is not None
+        else None,
+    )
+    assert resolve_candidate_width(accepted) == MAX_CANDIDATE_WIDTH
 
 
 @pytest.mark.parametrize("candidate_width", [64, 256])  # type: ignore[misc]

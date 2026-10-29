@@ -729,7 +729,9 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
             if cold:
                 assert llm.reset_prefix_cache()
             ids = (newline * length + source)[-(length - 1) :]
-            public = llm.beam_search_v1([{"prompt_token_ids": ids}], _params(steps))[0]
+            public = llm.beam_search_v1(
+                [{"prompt_token_ids": ids}], _params(steps), output_mode="full"
+            )[0]
             snapshot = llm.collective_rpc("onerec_v1_st_snapshot")[0]
             sequences = _check_snapshot(snapshot, steps, legal)
             assert [

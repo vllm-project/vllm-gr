@@ -97,7 +97,8 @@ def test_dynamic_beam_example_wires_graphs_and_benchmark(
     outputs = [SimpleNamespace(sequences=[sequence, sequence]) for _ in range(2)]
     stats = {"captured_shapes": [[2, width] for width in graph_widths], "full_dispatches": 2}
 
-    def beam_search(prompts: list[Any], params: Any) -> list[Any]:
+    def beam_search(prompts: list[Any], params: Any, *, output_mode: str) -> list[Any]:
+        assert output_mode == "full"
         assert len(prompts) == 2
         assert params.dynamic_beam_widths == widths and params.result_width == 2
         return outputs
@@ -194,7 +195,7 @@ def test_npu_graph_example_requires_replay_only_for_decode(
     stats = {"captured_shapes": [[2, 128]] if captured else [], "full_dispatches": dispatches}
     llm = SimpleNamespace(
         get_tokenizer=lambda: SimpleNamespace(convert_ids_to_tokens=lambda ids: ids),
-        beam_search_v1=lambda prompts, params: outputs,
+        beam_search_v1=lambda prompts, params, *, output_mode: outputs,
         collective_rpc=lambda name: [stats],
     )
     modules: dict[str, dict[str, Any]] = {

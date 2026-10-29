@@ -15,7 +15,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 import vllm_gr.v1.beam as beam_package
 import vllm_gr.v1.beam.batch_contracts as contracts
-from vllm_gr.config import MAX_BEAM_WIDTH
+from vllm_gr.config import MAX_BEAM_WIDTH, MAX_CANDIDATE_WIDTH
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
@@ -200,6 +200,26 @@ def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() 
         validate_beam_batch_request(_request(output_options=_options(num_return_sequences=3)))
 
 
+def test_request_beam_width_is_capped_by_the_candidate_ceiling() -> None:
+    """A direct request cannot ask for a width the config layer rejects.
+
+    ``MAX_BEAM_WIDTH`` (1024) is deliberately higher than
+    ``MAX_CANDIDATE_WIDTH`` (256) so the wide-``W`` operators can be exercised,
+    but this build still samples one candidate per beam row.  A request above
+    the candidate ceiling therefore describes a K no prewarmed workspace can
+    hold; accepting it only defers the failure to the first workspace lookup.
+    """
+    assert MAX_BEAM_WIDTH > MAX_CANDIDATE_WIDTH
+
+    validate_beam_batch_request(_request(beam_params=_params(beam_width=MAX_CANDIDATE_WIDTH)))
+    with pytest.raises(BeamContractError, match="must be <= 256"):
+        validate_beam_batch_request(
+            _request(beam_params=_params(beam_width=MAX_CANDIDATE_WIDTH + 1))
+        )
+    with pytest.raises(BeamContractError, match="must be <= 256"):
+        validate_beam_batch_request(_request(beam_params=_params(beam_width=512)))
+
+
 def test_explicit_candidate_width_must_match_the_beam_width() -> None:
     """An internal request cannot carry a K the build will not execute.
 
@@ -216,6 +236,43 @@ def test_explicit_candidate_width_must_match_the_beam_width() -> None:
     # Restating today's behaviour (K == W) and leaving K unset both pass.
     validate_beam_batch_request(_request(beam_params=_params(candidate_width=2)))
     validate_beam_batch_request(_request(beam_params=_params(candidate_width=None)))
+
+
+def test_explicit_candidate_width_must_match_every_dynamic_stage_width() -> None:
+    """A stated K is only honest when every stage retains exactly K beams.
+
+    ``BeamBatchExecutionView.candidate_top_k`` still returns the active stage
+    width in this build, so a *uniform but narrower* schedule silently samples
+    fewer candidates per row than the request states: K=4 with ``(2, 2, 2)``
+    runs TopK=2 at every stage and no error is raised.  Non-uniform schedules
+    fail the same way, one stage at a time.
+    """
+    for schedule in ((2, 2, 2), (4, 2, 1)):
+        with pytest.raises(BeamContractError, match="does not match"):
+            validate_beam_batch_request(
+                _request(
+                    beam_params=_params(
+                        beam_width=4,
+                        candidate_width=4,
+                        dynamic_beam_widths=schedule,
+                    ),
+                    output_options=_options(num_return_sequences=1),
+                )
+            )
+    # A schedule whose every stage retains exactly K still works.
+    validate_beam_batch_request(
+        _request(
+            beam_params=_params(beam_width=4, candidate_width=4, dynamic_beam_widths=(4, 4, 4)),
+            output_options=_options(num_return_sequences=4),
+        )
+    )
+    # And dynamic schedules keep their original behaviour with K unset.
+    validate_beam_batch_request(
+        _request(
+            beam_params=_params(beam_width=4, dynamic_beam_widths=(4, 2, 1)),
+            output_options=_options(num_return_sequences=1),
+        )
+    )
 
 
 def test_limits_are_separate_from_protocol_and_check_batch_geometry() -> None:

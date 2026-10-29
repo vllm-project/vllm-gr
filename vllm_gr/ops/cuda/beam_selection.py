@@ -10,14 +10,13 @@ import torch
 import triton
 import triton.language as tl
 
-from vllm_gr.config.models import MAX_BEAM_WIDTH
+from vllm_gr.config.models import MAX_BEAM_WIDTH, MAX_CANDIDATE_WIDTH
 
 # Triton JIT functions intentionally use its untyped DSL values.
 # mypy: disable-error-code="misc,no-untyped-def"
 
 
 LOCAL_TILE_SIZE = 256
-MAX_CANDIDATE_WIDTH = 256
 MAX_REQUESTS = 48
 
 
@@ -371,6 +370,7 @@ def _beam_result_pack_kernel(
 @triton.jit(
     do_not_specialize=[
         "beam_width",
+        "candidate_width",
         "scratch_stride",
     ]
 )
@@ -383,16 +383,18 @@ def _group_beam_outputs_kernel(
     out_scores,
     out_grouped_flat_indices,
     beam_width,
+    candidate_width,
     scratch_stride,
     WRITE_FLAT_INDICES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     request = tl.program_id(0)
     rank = tl.arange(0, BLOCK)
+    candidate_count = beam_width * candidate_width
     selected_offset = request * scratch_stride + rank
     flat = tl.load(selected_flat_indices + selected_offset, mask=rank < beam_width, other=-1)
-    valid = (rank < beam_width) & (flat >= 0) & (flat < beam_width * beam_width)
-    parent = flat // beam_width
+    valid = (rank < beam_width) & (flat >= 0) & (flat < candidate_count)
+    parent = flat // candidate_width
 
     group_key = (parent.to(tl.int64) << 32) | rank.to(tl.int64)
     group_key = tl.where(valid, group_key, 0x7FFFFFFFFFFFFFFF)
@@ -406,14 +408,14 @@ def _group_beam_outputs_kernel(
         other=-1,
     )
     grouped_valid = grouped_valid & (grouped_flat >= 0)
-    grouped_parent = grouped_flat // beam_width
+    grouped_parent = grouped_flat // candidate_width
     grouped_score = tl.load(
         selected_scores + request * scratch_stride + safe_rank,
         mask=grouped_valid,
         other=-float("inf"),
     )
     token = tl.load(
-        top_tokens + request * beam_width * beam_width + grouped_flat,
+        top_tokens + request * candidate_count + grouped_flat,
         mask=grouped_valid,
         other=0,
     )
@@ -434,7 +436,7 @@ def _group_beam_outputs_kernel(
         )
 
 
-@triton.jit(do_not_specialize=["beam_width"])
+@triton.jit(do_not_specialize=["beam_width", "candidate_width"])
 def _bootstrap_beam_outputs_kernel(
     cumulative_logprobs,
     top_tokens,
@@ -445,6 +447,7 @@ def _bootstrap_beam_outputs_kernel(
     out_scores,
     out_flat_indices,
     beam_width,
+    candidate_width,
     HAS_VALID_MASK: tl.constexpr,
     COMPACT_INPUT: tl.constexpr,
     WRITE_FLAT_INDICES: tl.constexpr,
@@ -459,8 +462,9 @@ def _bootstrap_beam_outputs_kernel(
     # is live.  Accept both layouts so serving does not allocate/copy a dummy
     # W*W tensor merely to satisfy the bootstrap step.
     row = request if COMPACT_INPUT else request * beam_width
-    candidate = row * beam_width + rank
-    lane_valid = rank < beam_width
+    # Select across all K candidates, including unordered rows and mask holes.
+    candidate = row * candidate_width + rank
+    lane_valid = rank < candidate_width
     candidate_valid = lane_valid
     if HAS_VALID_MASK:
         candidate_valid = candidate_valid & tl.load(
@@ -468,23 +472,34 @@ def _bootstrap_beam_outputs_kernel(
             mask=lane_valid,
             other=False,
         )
-    token = tl.load(top_tokens + candidate, mask=lane_valid, other=0)
     score = tl.load(cumulative_logprobs + row) + tl.load(
         top_logprobs + candidate,
         mask=lane_valid,
         other=-float("inf"),
     )
-    score = tl.where(candidate_valid & (score == score), score, -float("inf"))
+    packed = _pack_score_flat(score, rank, candidate_valid)
+    selected = tl.sort(packed, descending=False)
+    selected_flat = (selected & 0x00000000FFFFFFFF).to(tl.int32)
+    selected_valid = (selected_flat >= 0) & (selected_flat < candidate_width)
+    token = tl.load(
+        top_tokens + row * candidate_width + selected_flat,
+        mask=selected_valid,
+        other=0,
+    )
     output = request * beam_width + rank
     tl.store(out_token_ids + output, token, mask=rank < beam_width)
     tl.store(
         out_parent_indices + output,
-        tl.where(lane_valid, request * beam_width, -1),
+        tl.where(selected_valid, request * beam_width, -1),
         mask=rank < beam_width,
     )
-    tl.store(out_scores + output, score, mask=rank < beam_width)
+    tl.store(out_scores + output, _unpack_score(selected), mask=rank < beam_width)
     if WRITE_FLAT_INDICES:
-        tl.store(out_flat_indices + output, rank, mask=rank < beam_width)
+        tl.store(
+            out_flat_indices + output,
+            tl.where(selected_valid, selected_flat, -1),
+            mask=rank < beam_width,
+        )
 
 
 @triton.jit(do_not_specialize=["beam_width", "result_width"])
@@ -676,16 +691,51 @@ class BeamSelectionScratch:
     merge_flat_indices: torch.Tensor
 
 
+def _beam_selection_tiling(
+    beam_width: int,
+    candidate_width: int,
+    selection_width: int,
+) -> tuple[int, int]:
+    """Return ``(list_count, local_block)`` for the hierarchical Top-K.
+
+    ``local_block`` is the width of one local list, so it must be at least
+    ``selection_width``: ``_local_beam_topk_kernel`` writes
+    ``selection_width`` slots into each stride-``selection_width`` list, and a
+    narrower list would leave the remaining slots untouched.  ``LOCAL_TILE_SIZE``
+    is therefore only the *minimum* list width — a selection wider than it (a
+    beam width above 256) widens the list instead of silently truncating.
+    Both call sites (allocation and launch) use this one definition so the
+    prewarmed scratch and the kernel grid can never disagree.
+    """
+    candidate_count = beam_width * candidate_width
+    tile_capacity = triton.next_power_of_2(max(LOCAL_TILE_SIZE, selection_width))
+    # ``max(..., selection_width)`` keeps the invariant when there are fewer
+    # candidates than winners (a step-0 bootstrap with K < W): the lanes past
+    # ``candidate_count`` still get written, as ``-inf``/``-1``, instead of
+    # leaving uninitialized scratch for the merge stage to read.
+    local_block = triton.next_power_of_2(max(min(candidate_count, tile_capacity), selection_width))
+    list_count = (candidate_count + local_block - 1) // local_block
+    return list_count, local_block
+
+
 def beam_selection_scratch_slots(
     beam_width: int,
     candidate_width: int,
     selection_width: int,
 ) -> int:
+    # The tiling uses integer bit arithmetic (``next_power_of_2``), so a float
+    # width would otherwise fail deep inside it with an opaque operand error.
+    for name, value in (
+        ("beam_width", beam_width),
+        ("candidate_width", candidate_width),
+        ("selection_width", selection_width),
+    ):
+        if not isinstance(value, int):
+            raise TypeError(f"{name} must be an int")
     if min(beam_width, candidate_width, selection_width) <= 0:
         raise ValueError("beam, candidate, and selection widths must be positive")
-    candidate_count = beam_width * candidate_width
-    tile_count = (candidate_count + LOCAL_TILE_SIZE - 1) // LOCAL_TILE_SIZE
-    return tile_count * selection_width
+    list_count, _ = _beam_selection_tiling(beam_width, candidate_width, selection_width)
+    return list_count * selection_width
 
 
 def allocate_beam_selection_scratch(
@@ -824,9 +874,7 @@ def _hierarchical_topk_out(
     *,
     mask_invalid_indices: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    candidate_count = beam_width * candidate_width
-    list_count = (candidate_count + LOCAL_TILE_SIZE - 1) // LOCAL_TILE_SIZE
-    local_block = triton.next_power_of_2(min(candidate_count, LOCAL_TILE_SIZE))
+    list_count, local_block = _beam_selection_tiling(beam_width, candidate_width, selection_width)
     required_slots = list_count * selection_width
     scratch_stride = _validate_scratch(
         scratch,
@@ -848,7 +896,10 @@ def _hierarchical_topk_out(
         HAS_VALID_MASK=candidate_valid_mask is not None,
         BLOCK=local_block,
         MASK_INVALID_INDICES=mask_invalid_indices,
-        num_warps=8 if local_block >= 128 else 4,
+        # A wider selection (a beam width above 256) makes one local list span
+        # more than 256 lanes; add a tier so the per-thread register load of
+        # the in-block sort does not explode.  Widths <= 256 are unchanged.
+        num_warps=16 if local_block >= 1024 else (8 if local_block >= 128 else 4),
     )
     input_scores = scratch.local_scores
     input_indices = scratch.local_flat_indices
@@ -866,7 +917,10 @@ def _hierarchical_topk_out(
             selection_width,
             scratch_stride,
             BLOCK=merge_block,
-            num_warps=8 if merge_block >= 256 else 4,
+            # Same tier rationale as the local list: one merge spans
+            # ``2 * selection_width`` lanes, i.e. 1024 at a beam width of 512
+            # and 2048 at 1024.  Widths <= 256 are unchanged.
+            num_warps=16 if merge_block >= 1024 else (8 if merge_block >= 256 else 4),
         )
         input_scores, output_scores = output_scores, input_scores
         input_indices, output_indices = output_indices, input_indices
@@ -1119,9 +1173,11 @@ def beam_search_group_cuda_out(
     candidate_valid_mask: torch.Tensor | None = None,
     out_grouped_flat_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Write fixed-width, parent-grouped Beam survivors into caller buffers."""
+    """Write W survivors; the historical CUDA ``top_k`` argument denotes K."""
 
-    batch_size, beam_width, candidate_width, max_steps = _validate_beam_inputs(
+    # Preserve the CUDA keyword: historically top_k denotes K, not survivors W.
+    candidate_width = top_k
+    batch_size, beam_width, tensor_candidate_width, max_steps = _validate_beam_inputs(
         cumulative_logprobs,
         top_tokens,
         top_logprobs,
@@ -1131,12 +1187,14 @@ def beam_search_group_cuda_out(
     )
     if current_step not in (0, 1, 2):
         raise ValueError("CUDA BeamSearchGroup supports current_step 0, 1, or 2")
-    if candidate_width != beam_width:
-        raise ValueError("BeamSearchGroup candidate width must equal beam width")
-    if isinstance(top_k, bool) or not isinstance(top_k, int):
-        raise TypeError("top_k must be an int")
-    if top_k != beam_width:
-        raise ValueError("CUDA BeamSearchGroup requires fixed top_k == beam_width")
+    # ``candidate_width`` is the per-row candidate count K (columns per beam
+    # row); it is independent of the beam width W (rows per request).  Unlike
+    # the torch entry point, this operator emits exactly W survivors, so there
+    # is no separate selection width to pass.
+    if isinstance(candidate_width, bool) or not isinstance(candidate_width, int):
+        raise TypeError("candidate_width must be an int")
+    if candidate_width != tensor_candidate_width:
+        raise ValueError("CUDA BeamSearchGroup requires candidate_width == top_tokens.shape[1]")
     device = cumulative_logprobs.device
     output_specs = (
         ("out_token_ids", out_token_ids, torch.int32, (batch_size, beam_width)),
@@ -1201,10 +1259,11 @@ def beam_search_group_cuda_out(
                 else out_parent_indices
             ),
             beam_width,
+            candidate_width,
             HAS_VALID_MASK=candidate_valid_mask is not None,
             COMPACT_INPUT=cumulative_logprobs.shape[0] == batch_size,
             WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
-            BLOCK=block,
+            BLOCK=triton.next_power_of_2(max(beam_width, candidate_width)),
             num_warps=8 if block >= 128 else 4,
         )
         _parent_count_prefix_kernel[(batch_size, beam_width)](
@@ -1254,6 +1313,7 @@ def beam_search_group_cuda_out(
         out_scores,
         (out_grouped_flat_indices if out_grouped_flat_indices is not None else out_parent_indices),
         beam_width,
+        candidate_width,
         scratch_stride,
         WRITE_FLAT_INDICES=out_grouped_flat_indices is not None,
         BLOCK=block,
@@ -1405,9 +1465,11 @@ def beam_search_group_cuda(
     top_k: int,
     candidate_valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Allocating convenience wrapper for CUDA BeamSearchGroup."""
+    """Allocate W survivors; the historical CUDA ``top_k`` argument denotes K."""
 
-    batch_size, beam_width, candidate_width, max_steps = _validate_beam_inputs(
+    # Preserve the CUDA keyword: historically top_k denotes K, not survivors W.
+    candidate_width = top_k
+    batch_size, beam_width, tensor_candidate_width, max_steps = _validate_beam_inputs(
         cumulative_logprobs,
         top_tokens,
         top_logprobs,
@@ -1417,12 +1479,14 @@ def beam_search_group_cuda(
     )
     if current_step not in (0, 1, 2):
         raise ValueError("CUDA BeamSearchGroup supports current_step 0, 1, or 2")
-    if candidate_width != beam_width:
-        raise ValueError("BeamSearchGroup candidate width must equal beam width")
-    if isinstance(top_k, bool) or not isinstance(top_k, int):
-        raise TypeError("top_k must be an int")
-    if top_k != beam_width:
-        raise ValueError("CUDA BeamSearchGroup requires fixed top_k == beam_width")
+    # ``candidate_width`` is the per-row candidate count K (columns per beam
+    # row); it is independent of the beam width W (rows per request).  Unlike
+    # the torch entry point, this operator emits exactly W survivors, so there
+    # is no separate selection width to pass.
+    if isinstance(candidate_width, bool) or not isinstance(candidate_width, int):
+        raise TypeError("candidate_width must be an int")
+    if candidate_width != tensor_candidate_width:
+        raise ValueError("CUDA BeamSearchGroup requires candidate_width == top_tokens.shape[1]")
     device = cumulative_logprobs.device
     scratch = allocate_beam_selection_scratch(
         batch_size,
@@ -1448,7 +1512,7 @@ def beam_search_group_cuda(
         top_logprobs,
         sequence,
         current_step,
-        top_k,
+        candidate_width,
         *outputs,
         scratch.local_scores,
         scratch.local_flat_indices,

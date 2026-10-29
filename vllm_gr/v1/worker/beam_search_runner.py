@@ -479,7 +479,10 @@ class BeamSearchRunner:
             w["row_counts"],
             w["row_errors"],
             w["row_valid_counts"],
-            WIDTH=width,
+            # This kernel walks one *row's* K candidates; the row count is W.
+            # The runner's legacy path feeds K == W, but the parameter is the
+            # candidate width so a wider beam does not re-couple the two.
+            CANDIDATE_WIDTH=width,
             BLOCK=block,
             PREFILL=prefill,
         )
@@ -523,6 +526,7 @@ class BeamSearchRunner:
             self._selected_parents,
             self._selected_scores,
             self._selected_flat,
+            width,
             width,
             stride,
             WRITE_FLAT_INDICES=True,

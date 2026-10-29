@@ -177,14 +177,14 @@ def _reject_explicit_candidate_width_with_dynamic_schedule(
     gr_config: Any,
     params: BeamBatchParams,
 ) -> None:
-    """An explicit K and a non-uniform dynamic schedule cannot both hold.
+    """A stated K must match every stage width that retains beams.
 
     A configured ``constraint_table.candidate_width`` is a fixed promise about
     the per-row candidate count, but the executed top-k is derived from the
     active stage width.  ``[4, 2, 1]`` therefore samples 4, then 2, then 1
-    candidates per row, and the configured K is silently ignored after the
-    first stage.  Rejecting the combination keeps the fixed-K promise honest
-    until the engine-wiring layer consumes K.
+    candidates per row, and a *uniform but narrower* schedule such as
+    ``(2, 2, 2)`` against K=4 silently samples 2 at every stage.  Both are
+    rejected until the engine-wiring layer forwards K to the stages.
 
     The check has to live here rather than in the request contract: the
     explicit K is a *configuration* field and the frontend never copies it into
@@ -193,17 +193,21 @@ def _reject_explicit_candidate_width_with_dynamic_schedule(
     """
 
     widths = params.dynamic_beam_widths
-    if widths is None or len(set(widths)) <= 1:
+    if widths is None:
         return
     table = getattr(gr_config, "constraint_table", None)
     configured = getattr(table, "candidate_width", None)
     if configured is None:
         return
+    if all(width == configured for width in widths):
+        return
     raise ValueError(
         "vllm-gr constraint_table.candidate_width="
-        f"{configured} cannot be combined with a non-uniform dynamic_beam_widths "
-        f"schedule {tuple(widths)}: this build derives the executed top-k from the "
-        "active stage width. Leave candidate_width unset to keep dynamic Beam widths."
+        f"{configured} does not match dynamic_beam_widths schedule {tuple(widths)}: "
+        "this build derives the executed top-k from the active stage width, so each "
+        "stage would sample a different number of candidates per row than the "
+        "configured K. Leave candidate_width unset to keep dynamic Beam widths, or "
+        "set a schedule whose every stage width equals candidate_width."
     )
 
 

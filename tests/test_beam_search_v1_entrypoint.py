@@ -8,7 +8,7 @@ import subprocess
 import sys
 import textwrap
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -85,7 +85,10 @@ def test_v1_flow_closes_after_execution_failure() -> None:
     assert frontend.events == ["prepare", "submit", "wait", "close"]
 
 
-def test_grllm_v1_entry_uses_new_frontend(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("output_mode", [None, "full", "compact"])  # type: ignore[misc]
+def test_grllm_v1_entry_uses_new_frontend(
+    monkeypatch: pytest.MonkeyPatch, output_mode: Literal["full", "compact"] | None
+) -> None:
     from vllm_gr.entrypoints.gr import GRLLM
 
     frontend = _Frontend()
@@ -105,11 +108,13 @@ def test_grllm_v1_entry_uses_new_frontend(monkeypatch: pytest.MonkeyPatch) -> No
         object(),
         use_tqdm=True,
         concurrency_limit=4,
+        **({"output_mode": output_mode} if output_mode is not None else {}),
     )
 
     assert isinstance(result[0], OfflineBeamSearchRequest)
     assert result[0].use_tqdm is True
     assert result[0].concurrency_limit == 4
+    assert result[0].output_mode == (output_mode or "compact")
 
 
 @pytest.mark.parametrize("fail_shutdown", [False, True])  # type: ignore[misc]

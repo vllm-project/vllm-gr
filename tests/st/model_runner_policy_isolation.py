@@ -236,6 +236,7 @@ def run(args: argparse.Namespace) -> None:
             [{"prompt_token_ids": ids} for ids in ids_list],
             _params(steps),
             use_tqdm=False,
+            output_mode="full",
         )
         assert len(outputs) == len(ids_list)
         rows = []

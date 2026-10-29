@@ -220,11 +220,20 @@ confuse this policy with native `max_num_seqs` capacity.
 
 Constraint Table generation supports up to three effective output steps and a
 per-row candidate width (`K`) of at most 256. The Beam width (`W`, rows per
-request) is a separate dimension, but its ceiling is still 256 for now: the
-global ceiling also gates the raw Beam operators, and the wide-`W` selection
-paths are only correct once their scratch tiling is fixed, so it is raised
-together with those kernels rather than ahead of them. `K` is not wired end to
-end in this build either, so a configured `K != W` is rejected at parse time.
+request) is a separate dimension with its own ceiling of 1024. The ceiling is
+raised together with the scratch-tiling fix that makes the wide-`W` selection
+path correct; it also gates the raw Beam operators, so the constant and the
+kernels move as one. Widths above 256 take the hierarchical path; the fused
+`O(W**2)` merge kernels stay gated on `K == W` and `W in {64, 128, 256}`.
+
+The raised ceiling is an *operator* ceiling, not yet a serving one. The runtime
+still samples `W` candidates per row — the postprocess workspace and the
+constrained Top-K are sized from the Beam width until the engine-wiring layer
+consumes `K` — so configuration requires `K == W` and caps `K` at 256. A
+served `beam_max_width` above 256 is therefore rejected at parse time; only the
+kernels and their tests reach widths 512 and 1024 today. Keep
+`beam_max_width <= 256` until that wiring lands.
+
 Unconstrained V1 generation has its own configuration and budget checks; it
 does not require a catalog artifact. NPU dynamic widths must satisfy their
 stage-specific capacity/parent bounds. These deployment checks are implemented

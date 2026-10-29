@@ -19,6 +19,8 @@ class CompactBeamSearchSequence:
 
     token_ids: tuple[int, ...]
     cumulative_logprob: float
+    finish_reason: str | None = None
+    stop_reason: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,3 +31,6 @@ class CompactBeamSearchOutput:
     """
 
     sequences: tuple[CompactBeamSearchSequence, ...]
+    # Accepted original input, once per request (not once per candidate).
+    # None allows older callers constructing these records by hand.
+    prompt_token_ids: tuple[int, ...] | None = None
