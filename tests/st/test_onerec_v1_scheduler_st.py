@@ -1003,7 +1003,9 @@ def _run_completion_reference(work_dir: Path) -> None:
             if count == 2 and os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
                 llm.start_profile("offline-b2")
             outputs = llm.beam_search_v1(
-                [{"prompt_token_ids": p} for p in prompts[:count]], _params(3)
+                [{"prompt_token_ids": p} for p in prompts[:count]],
+                _params(3),
+                output_mode="full",
             )
             if count == 2 and os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
                 llm.stop_profile()

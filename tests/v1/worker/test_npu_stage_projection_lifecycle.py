@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 import torch
 import torch.nn.functional as F
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -61,7 +62,8 @@ def _replace_model(runner: Any, value: float) -> None:
         head.bias.fill_(value / 2)
     head.quant_method = UnquantizedEmbeddingMethod()
     head.tp_size = 1
-    processor = LogitsProcessor(384, scale=0.7, soft_cap=13.0)
+    with set_current_vllm_config(VllmConfig()):
+        processor = LogitsProcessor(384, scale=0.7, soft_cap=13.0)
     processor._gather_logits = lambda logits: logits
     model.add_module("lm_head", head)
     model.add_module("logits_processor", processor)
