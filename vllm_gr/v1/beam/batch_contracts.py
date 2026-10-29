@@ -67,9 +67,9 @@ class BeamBatchParams(
     constraint_resource_id: str = DEFAULT_CONSTRAINT_RESOURCE_ID
     length_penalty: float = 1.0
     catalog_strategy: Literal["fill", "null"] | None = None
-    # A new decoder accepts old arrays through this trailing default. New
-    # arrays still include this field, so old strict decoders reject them even
-    # for fixed-width calls. All participating processes need the same schema.
+    # New decoders accept old arrays through the trailing defaults. New arrays
+    # still include these fields, so old strict decoders reject them even for
+    # fixed-width calls. All participating processes need the same schema.
     dynamic_beam_widths: tuple[int, ...] | None = None
     # Candidates per beam row.  None keeps the pre-decoupling behaviour
     # (K == beam_width).  ``array_like`` structs encode positionally, so this
@@ -80,6 +80,9 @@ class BeamBatchParams(
     # therefore have to run the same schema version; a mixed-version rollout is
     # not supported and needs the protocol version bumped.
     candidate_width: int | None = None
+    # Request-level per-stage candidate counts; preserve candidate_width's
+    # existing wire position by appending this field after it.
+    per_parent_beam_widths: tuple[int, ...] | None = None
 
 
 class BeamOutputOptions(
@@ -302,6 +305,32 @@ def _validate_beam_params(params: BeamBatchParams) -> None:
             normalized = _positive_int(f"beam_params.dynamic_beam_widths[{index}]", width)
             if normalized > beam_width:
                 _fail("beam_params.dynamic_beam_widths entries must not exceed beam_width")
+    per_parent_beam_widths = params.per_parent_beam_widths
+    if per_parent_beam_widths is not None:
+        if (
+            params.max_tokens not in (1, 2, 3)
+            or not isinstance(per_parent_beam_widths, tuple)
+            or len(per_parent_beam_widths) != params.max_tokens
+        ):
+            _fail("beam_params.per_parent_beam_widths must contain one immutable value per step")
+        retained_widths = widths or (beam_width,) * params.max_tokens
+        for index, per_parent_beam_width in enumerate(per_parent_beam_widths):
+            per_parent_beam_width = _positive_int(
+                f"beam_params.per_parent_beam_widths[{index}]", per_parent_beam_width
+            )
+            if per_parent_beam_width > MAX_CANDIDATE_WIDTH:
+                _fail(
+                    f"beam_params.per_parent_beam_widths entries must be <= {MAX_CANDIDATE_WIDTH}"
+                )
+        if per_parent_beam_widths[0] != retained_widths[0]:
+            _fail("the first per-parent beam width must equal the first retained width")
+        input_width = retained_widths[0]
+        for per_parent_beam_width, output_width in zip(
+            per_parent_beam_widths[1:], retained_widths[1:]
+        ):
+            if output_width > input_width * per_parent_beam_width:
+                _fail("each retained width must not exceed input_width * per_parent_beam_width")
+            input_width = output_width
     if (
         isinstance(params.temperature, bool)
         or not isinstance(params.temperature, (int, float))

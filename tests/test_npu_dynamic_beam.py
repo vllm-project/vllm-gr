@@ -68,6 +68,40 @@ def test_invalid_stage_or_result_width_is_rejected(widths: Any, result_width: An
         )
 
 
+def test_per_parent_beam_widths_is_validated_against_retained_widths() -> None:
+    params = BeamSearchParams(
+        beam_width=4,
+        max_tokens=3,
+        dynamic_beam_widths=[2, 4, 4],
+        per_parent_beam_widths=[2, 2, 1],
+        result_width=2,
+    )
+    assert params.per_parent_beam_widths == [2, 2, 1]
+
+    with pytest.raises(VLLMValidationError, match="first per-parent beam width"):
+        BeamSearchParams(
+            beam_width=4,
+            max_tokens=3,
+            dynamic_beam_widths=[2, 4, 4],
+            per_parent_beam_widths=[1, 2, 1],
+        )
+
+    with pytest.raises(VLLMValidationError, match=r"input_width \* per_parent_beam_width"):
+        BeamSearchParams(
+            beam_width=4,
+            max_tokens=3,
+            dynamic_beam_widths=[2, 4, 4],
+            per_parent_beam_widths=[2, 1, 1],
+        )
+
+    with pytest.raises(VLLMValidationError, match="per_parent_beam_widths"):
+        BeamSearchParams(
+            beam_width=1,
+            max_tokens=4,
+            per_parent_beam_widths=[1, 1, 1, 1],
+        )
+
+
 @pytest.mark.parametrize("widths", [(4, 2, 1), (1, 2, 4), (4, 4, 4), None])
 def test_schedule_geometry_uses_previous_width_for_each_request(
     widths: tuple[int, ...] | None,
@@ -100,6 +134,25 @@ def test_schedule_geometry_uses_previous_width_for_each_request(
             with pytest.raises(ValueError, match="crosses"):
                 view.localize_global_parent_rows((input_width,) + parents[1:])
         previous = view
+
+
+def test_per_parent_beam_widths_controls_per_parent_candidate_width() -> None:
+    for stage, expected in enumerate((2, 2, 1)):
+        view = BeamBatchExecutionView(
+            session_id="session",
+            dispatch_id=stage,
+            stage_index=stage,
+            kind="prefill" if stage == 0 else "decode",
+            decode_step=None if stage == 0 else stage - 1,
+            owner_generation=0,
+            request_ids=("request",),
+            num_prompt_tokens_by_request=(128,),
+            beam_width=4,
+            produces_output=True,
+            dynamic_beam_widths=(2, 4, 4),
+            per_parent_beam_widths=(2, 2, 1),
+        )
+        assert view.candidate_top_k == expected
 
 
 def _context(packed: bool) -> Any:

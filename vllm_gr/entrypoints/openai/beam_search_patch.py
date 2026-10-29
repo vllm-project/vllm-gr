@@ -55,6 +55,13 @@ async def beam_search_dispatch(
                 "Legacy GR beam_search() has been removed. Configure "
                 "beam.execution_mode='v1' and a canonical constraint artifact."
             )
+        if getattr(params, "per_parent_beam_widths", None) is not None:
+            from vllm.exceptions import VLLMValidationError
+
+            raise VLLMValidationError(
+                "per_parent_beam_widths requires GR beam_search_v1",
+                parameter="per_parent_beam_widths",
+            )
         impl = BeamSearchOnlineMixin.beam_search
     async for output in impl(
         self,
@@ -182,6 +189,13 @@ def patch_sampling():
     from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 
     from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
+
+    # Completion must accept the same list-valued extension parameters as Chat.
+    field = CompletionRequest.model_fields["vllm_xargs"]
+    annotation = ChatCompletionRequest.model_fields["vllm_xargs"].annotation
+    if field.annotation != annotation:
+        field.annotation = annotation
+        CompletionRequest.model_rebuild(force=True)
 
     ChatCompletionRequest.to_beam_search_params = to_beam_search_params
     CompletionRequest.to_beam_search_params = to_beam_search_params

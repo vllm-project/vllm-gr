@@ -163,6 +163,13 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
         )
     if (
         request is not None
+        and request.beam_params.per_parent_beam_widths is not None
+        and device is not None
+        and str(device).split(":")[0] != "cuda"
+    ):
+        raise ValueError("per_parent_beam_widths requires CUDA beam_search_v1")
+    if (
+        request is not None
         and device is not None
         and str(device).split(":")[0] not in ("cuda", "npu")
         and (
@@ -177,7 +184,10 @@ def _reject_explicit_candidate_width_with_dynamic_schedule(
     gr_config: Any,
     params: BeamBatchParams,
 ) -> None:
-    """A stated K must match every stage width that retains beams.
+    """Reject conflicting startup K and dynamic W when no request K overrides it.
+
+    An explicit request-level K schedule takes precedence over the startup
+    scalar. Without one, retain the existing startup-K/dynamic-W restriction.
 
     A configured ``constraint_table.candidate_width`` is a fixed promise about
     the per-row candidate count, but the executed top-k is derived from the
@@ -192,6 +202,8 @@ def _reject_explicit_candidate_width_with_dynamic_schedule(
     unset keeps dynamic Beam widths working exactly as before.
     """
 
+    if params.per_parent_beam_widths is not None:
+        return
     widths = params.dynamic_beam_widths
     if widths is None:
         return

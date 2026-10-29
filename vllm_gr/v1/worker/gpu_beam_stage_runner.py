@@ -1080,12 +1080,15 @@ def get_stage_runner(
         or any(table.device != worker.device for table in backend._tables())
     ):
         raise ValueError("constraint backend is not ready or its model/device binding differs")
+    required_top_k = max(m.beam_params.per_parent_beam_widths or (cfg.beam_max_width,))
     if backend is not None and (
         backend.info.max_rows
         < hooks_type.required_constraint_rows(len(m.request_ids), cfg.beam_max_width)
-        or backend.info.max_top_k < cfg.beam_max_width
+        or backend.info.max_top_k < required_top_k
     ):
-        raise ValueError("constraint backend capacity is smaller than fixed Beam width")
+        raise ValueError(
+            "constraint backend capacity is smaller than requested Beam or candidate widths"
+        )
     if (
         worker.model_config.is_encoder_decoder
         or worker.model_config.is_hybrid

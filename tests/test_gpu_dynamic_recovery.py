@@ -30,6 +30,16 @@ def test_dynamic_route_depends_only_on_search_geometry(widths, expected):
     )
 
 
+def test_per_parent_beam_widths_uses_dynamic_selection_path():
+    assert uses_dynamic_beam(
+        SimpleNamespace(
+            beam_width=128,
+            dynamic_beam_widths=(128, 128, 128),
+            per_parent_beam_widths=(64, 32, 16),
+        )
+    )
+
+
 def test_discard_dynamic_graphs_drops_runtime_capture_refusals():
     """A discarded graph takes its refusal record with it.
 

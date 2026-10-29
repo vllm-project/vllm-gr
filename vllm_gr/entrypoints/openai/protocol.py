@@ -28,4 +28,5 @@ def to_beam_search_params(self, max_tokens: int, default_sampling_params: dict) 
         catalog_strategy=extra_args.get("catalog_strategy"),
         dynamic_beam_widths=extra_args.get("dynamic_beam_widths"),
         result_width=extra_args.get("result_width"),
+        per_parent_beam_widths=extra_args.get("per_parent_beam_widths"),
     )

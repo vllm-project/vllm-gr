@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
+from vllm.exceptions import VLLMValidationError
 
 from vllm_gr.entrypoints.gr import GRLLM
 from vllm_gr.entrypoints.openai import serving_engine
@@ -20,6 +21,7 @@ from vllm_gr.entrypoints.openai.beam_search_patch import (
     patch_beam_search,
 )
 from vllm_gr.patch import _validate_openai_beam_search_patch
+from vllm_gr.sampling_params import BeamSearchParams
 
 
 def _recorder(name: str, calls: list[tuple[str, dict[str, Any]]]) -> Callable[..., Any]:
@@ -31,7 +33,7 @@ def _recorder(name: str, calls: list[tuple[str, dict[str, Any]]]) -> Callable[..
 
 
 def _dispatch(
-    additional: dict[str, Any] | None, monkeypatch: Any
+    additional: dict[str, Any] | None, monkeypatch: Any, params: Any = "params"
 ) -> list[tuple[str, dict[str, Any]]]:
     calls: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(serving_engine, "beam_search_v1", _recorder("v1", calls))
@@ -43,7 +45,7 @@ def _dispatch(
         outputs = [
             output
             async for output in beam_search_dispatch(
-                serving, "prompt", "request-id", "params", "lora", {"trace": "id"}
+                serving, "prompt", "request-id", params, "lora", {"trace": "id"}
             )
         ]
         assert len(outputs) == 1
@@ -68,8 +70,27 @@ def test_v1_dispatch_preserves_upstream_arguments(monkeypatch: Any) -> None:
 
 
 def test_non_gr_engine_uses_upstream_beam(monkeypatch: Any) -> None:
+    params = BeamSearchParams(beam_width=4, max_tokens=3)
     for additional in (None, {}, {"unrelated": True}):
-        assert _dispatch(additional, monkeypatch)[0][0] == "native"
+        assert _dispatch(additional, monkeypatch, params)[0][0] == "native"
+
+
+@pytest.mark.parametrize("additional", [None, {}, {"unrelated": True}])  # type: ignore[misc]
+def test_native_fallback_rejects_explicit_per_parent_widths(
+    additional: dict[str, Any] | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    params = BeamSearchParams(beam_width=4, max_tokens=3, per_parent_beam_widths=[4, 2, 1])
+    with pytest.raises(VLLMValidationError, match="requires GR beam_search_v1"):
+        _dispatch(additional, monkeypatch, params)
+
+
+def test_v1_dispatch_preserves_explicit_per_parent_widths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = BeamSearchParams(beam_width=4, max_tokens=3, per_parent_beam_widths=[4, 2, 1])
+    calls = _dispatch({"vllm_gr_beam_execution_mode": "v1"}, monkeypatch, params)
+    assert calls[0][0] == "v1"
+    assert calls[0][1]["params"] is params
 
 
 def test_legacy_gr_configuration_is_rejected(monkeypatch: Any) -> None:
