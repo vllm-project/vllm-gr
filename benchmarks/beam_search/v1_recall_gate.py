@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
+from contextlib import nullcontext
 from importlib.metadata import version
 from pathlib import Path
 
@@ -30,6 +31,20 @@ def sha256_file(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def candidate_checksum(samples, sample_ids):
+    """Hash decoded SID candidates in sample and beam-rank order."""
+    digest = hashlib.sha256()
+    for sample_id in sample_ids:
+        record = json.dumps(
+            [str(sample_id), samples[sample_id]["generations"]],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(record).to_bytes(8, "big"))
+        digest.update(record)
+    return "sha256:" + digest.hexdigest()
 
 
 def memory_utilization_for_budget(free_bytes, total_bytes, requested=None):
@@ -177,6 +192,11 @@ def parse_args():
     parser.add_argument("--model-revision", help="Immutable model snapshot commit")
     parser.add_argument("--dataset-path", type=Path, required=True)
     parser.add_argument("--catalog-path", type=Path, required=True, help="Constraint triples JSON")
+    parser.add_argument(
+        "--constraint-artifact",
+        type=Path,
+        help="Stable artifact path shared by repeats for this constraint group",
+    )
     task_group = parser.add_mutually_exclusive_group(required=True)
     task_group.add_argument("--task-type", choices=TASKS)
     task_group.add_argument("--task-types", choices=TASKS, nargs="+")
@@ -369,11 +389,22 @@ def main():
         include_stop_str_in_output=True,
         length_penalty=1.0,
     )
-    with tempfile.TemporaryDirectory(prefix="onerec-multibatch-") as directory:
-        artifact = Path(directory) / "constraints.safetensors"
+    artifact_scope = (
+        nullcontext(args.constraint_artifact.resolve())
+        if args.constraint_artifact is not None
+        else tempfile.TemporaryDirectory(prefix="onerec-multibatch-")
+    )
+    with artifact_scope as artifact_location:
+        artifact = (
+            Path(artifact_location) / "constraints.safetensors"
+            if args.constraint_artifact is None
+            else artifact_location
+        )
+        artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact_digest, tokenizer_digest = build_artifact(
             args.model.resolve(), args.catalog_path.resolve(), artifact
         )
+        logger.info("constraint_artifact=%s digest=%s", artifact, artifact_digest)
         config = {
             "schema_version": 1,
             "attention_backend": "CUSTOM",
@@ -495,6 +526,8 @@ def main():
                     time_per_sample=elapsed / len(samples),
                     artifact_digest=artifact_digest,
                     tokenizer_digest=tokenizer_digest,
+                    candidate_checksum=candidate_checksum(samples, item["sample_ids"]),
+                    candidate_checksum_schema="sample-id-and-ordered-decoded-sids-v1",
                 )
                 output = item["result_dir"] / (
                     f"{args.model.name}_{task}_bw{args.n}_bs{args.batch_size}_{len(samples)}.json"

@@ -19,6 +19,8 @@ for path in "$dataset/sid2pid.json" "$dataset/sid2iid.json" "$triples" "$triples
 done
 
 mkdir -p "$output_dir"
+artifact_dir="$output_dir/artifacts"
+mkdir -p "$artifact_dir"
 git rev-parse HEAD > "$output_dir/commit.txt"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv \
@@ -88,6 +90,7 @@ run_group() {
       "${model_revision_args[@]}" \
       --dataset-path "$dataset" \
       --catalog-path "$group_triples" \
+      --constraint-artifact "$artifact_dir/$group.safetensors" \
       --task-types "$@" \
       --num-prompts 1000 \
       --batch-size 4 \

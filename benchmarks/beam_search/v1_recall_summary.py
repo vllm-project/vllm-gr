@@ -36,6 +36,8 @@ def _task_result(run_dir, task):
     if len(files) != 1:
         raise ValueError(f"{run_dir.name}/{task}: expected one B=4 1000-sample metrics file")
     metrics = json.loads(files[0].read_text(encoding="utf-8"))
+    candidate_checksum = metrics.get("candidate_checksum")
+    checksum_schema = metrics.get("candidate_checksum_schema")
     if (
         metrics.get("task") != task
         or metrics.get("total_samples") != 1000
@@ -54,6 +56,17 @@ def _task_result(run_dir, task):
         or metrics["elapsed_time"] < 0
     ):
         raise ValueError(f"{run_dir.name}/{task}: incomplete or invalid accuracy result")
+    if (candidate_checksum is None) != (checksum_schema is None) or (
+        candidate_checksum is not None
+        and (
+            not isinstance(candidate_checksum, str)
+            or checksum_schema != "sample-id-and-ordered-decoded-sids-v1"
+            or not candidate_checksum.startswith("sha256:")
+            or len(candidate_checksum) != len("sha256:") + 64
+            or any(character not in "0123456789abcdef" for character in candidate_checksum[7:])
+        )
+    ):
+        raise ValueError(f"{run_dir.name}/{task}: invalid candidate checksum")
     identity = {key: metrics[key] for key in IDENTITY_KEYS if key != "engine_config"}
     identity["engine_config"] = {
         "max_model_len": metrics["engine_config"]["max_model_len"],
@@ -106,6 +119,8 @@ def _task_result(run_dir, task):
         "graph_runtime": graph_runtime,
         "engine_policy": policy,
         "runtime_provenance": metrics.get("runtime_provenance"),
+        "candidate_checksum": candidate_checksum,
+        "candidate_checksum_schema": checksum_schema,
     }
 
 
@@ -191,6 +206,15 @@ def summarize(root, repeats, baseline_path=None):
         }
         for task in TASKS
     }
+    candidate_stability = {}
+    for task in TASKS:
+        checksums = [run["tasks"][task]["candidate_checksum"] for run in runs]
+        available = all(checksum is not None for checksum in checksums)
+        candidate_stability[task] = {
+            "available": available,
+            "all_equal": available and len(set(checksums)) == 1,
+            "unique_count": len(set(checksums)) if available else None,
+        }
     total_times = _stats([run["wall_seconds"] for run in runs])
     failures = []
     baseline = None
@@ -251,6 +275,7 @@ def summarize(root, repeats, baseline_path=None):
         "total_wall_seconds": _read_seconds(root / "total_wall_seconds.txt"),
         "per_run_wall_seconds": total_times,
         "task_variability": variability,
+        "candidate_checksum_stability": candidate_stability,
         "baseline_file": str(baseline_path) if baseline_path is not None else None,
         "baseline_sid_recall32_floors": floors,
         "suspected_tasks": suspected_tasks,
@@ -340,6 +365,22 @@ def summarize(root, repeats, baseline_path=None):
                 f"| {task} | {sid['min']:.4f}% | {sid['median']:.4f}% | "
                 f"{sid['max']:.4f}% | {sid['range']:.4f} | "
                 f"{sid['sample_stddev']:.4f} | {pid['range']:.4f} |"
+            )
+        lines.extend(
+            (
+                "",
+                "Candidate checksums are diagnostic and do not affect the Recall gate result.",
+                "",
+                "| Task | Checksums recorded | All repeats equal | Unique checksums |",
+                "| --- | --- | --- | ---: |",
+            )
+        )
+        for task in TASKS:
+            stability = candidate_stability[task]
+            lines.append(
+                f"| {task} | {'yes' if stability['available'] else 'no'} | "
+                f"{'yes' if stability['all_equal'] else 'no'} | "
+                f"{stability['unique_count'] if stability['unique_count'] is not None else 'n/a'} |"
             )
     single_baseline = baseline is not None and repeats == 1
     if single_baseline:

@@ -84,6 +84,8 @@ def make_repeated_results(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                     "vllm": "test",
                     "python": "test",
                 },
+                "candidate_checksum": "sha256:" + f"{TASKS.index(task) + 1:064x}",
+                "candidate_checksum_schema": "sample-id-and-ordered-decoded-sids-v1",
                 "prefill_graph_buckets": "16,24,32,48",
                 "prefill_graph_capture_num_reqs": "4",
                 "v1_startup_capture_batch_size": "4",
@@ -164,6 +166,26 @@ def test_repeated_gate_rejects_changed_sample_identity(
     file.write_text(json.dumps(metrics), encoding="utf-8")
     with pytest.raises(ValueError, match="run 2/ad: input differs from run 1: sample_ids"):
         summarize(tmp_path, 10)
+
+
+def test_candidate_checksum_variation_is_reported_but_not_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_repeated_results(tmp_path, monkeypatch)
+    file = tmp_path / "runs" / "run-02" / "product" / "model_product_bw128_bs4_1000.json"
+    metrics = json.loads(file.read_text(encoding="utf-8"))
+    metrics["candidate_checksum"] = "sha256:" + "f" * 64
+    file.write_text(json.dumps(metrics), encoding="utf-8")
+
+    _, result, summary, failures = summarize(tmp_path, 3)
+    assert not failures
+    assert result["candidate_checksum_stability"]["product"] == {
+        "available": True,
+        "all_equal": False,
+        "unique_count": 2,
+    }
+    assert "Candidate checksums are diagnostic" in summary
+    assert "| product | yes | no | 2 |" in summary
 
 
 def test_cli_writes_repeat_artifacts_and_step_summary(

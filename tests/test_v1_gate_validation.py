@@ -9,6 +9,7 @@ import pytest
 
 from benchmarks.beam_search.v1_performance_gate import validate_online_response
 from benchmarks.beam_search.v1_recall_gate import (
+    candidate_checksum,
     eager_runtime,
     graph_delta,
     infer_batch,
@@ -54,6 +55,18 @@ def test_recall_rejects_malformed_or_truncated_beam_after_rank_32() -> None:
         output.sequences[-1].tokens = [99, *suffix]
         with pytest.raises(RuntimeError, match="SID"):
             infer_batch(llm, Tokenizer(), [[99]], params)
+
+
+def test_candidate_checksum_covers_sample_and_beam_order() -> None:
+    samples = {
+        2: {"generations": ["second-a", "second-b"]},
+        1: {"generations": ["first-a", "first-b"]},
+    }
+    checksum = candidate_checksum(samples, [1, 2])
+    assert checksum == candidate_checksum(samples, [1, 2])
+    assert checksum != candidate_checksum(samples, [2, 1])
+    samples[1]["generations"].reverse()
+    assert checksum != candidate_checksum(samples, [1, 2])
 
 
 @pytest.mark.parametrize("catalog", [{}, {"bad": 1}, {"549755813888": 1}])  # type: ignore[misc]
