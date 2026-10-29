@@ -48,6 +48,7 @@ def test_short_suffix_import_does_not_require_gluon() -> None:
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -174,7 +175,7 @@ def _short_suffix_engine_config(
         ({"custom": False}, None),
     ],
 )
-def test_engine_preserves_flash_attention_version(
+def test_engine_preserves_automatic_selection_and_explicit_version(
     monkeypatch: pytest.MonkeyPatch, source: str, options: dict[str, Any], expected: int | None
 ) -> None:
     from vllm_gr.engine import arg_utils_gr
@@ -188,15 +189,30 @@ def test_engine_preserves_flash_attention_version(
 
 
 @pytest.mark.parametrize("source", ["canonical", "legacy"])
+@pytest.mark.parametrize("fa_version", [3, 4])
+def test_fused_engine_accepts_explicit_fa(
+    monkeypatch: pytest.MonkeyPatch, source: str, fa_version: Literal[3, 4]
+) -> None:
+    from vllm_gr.engine import arg_utils_gr
+
+    config, args = _short_suffix_engine_config(monkeypatch, source, fa_version=fa_version)
+    assert arg_utils_gr.create_engine_config(args) is config
+    assert config.attention_config.flash_attn_version == fa_version
+
+
+@pytest.mark.parametrize("source", ["canonical", "legacy"])
 @pytest.mark.parametrize(
     ("enabled", "fa_version"),
     [(None, None), (False, None), (None, 2), (True, 2), (True, None), (True, 3)],
 )
-def test_sm90_default_preserves_fa3_and_fusion_requires_explicit_fa2(
+@pytest.mark.parametrize("capability,default_version", [(8, 2), (9, 3), (10, 4)])
+def test_fusion_preserves_platform_auto_selection(
     monkeypatch: pytest.MonkeyPatch,
     source: str,
     enabled: bool | None,
     fa_version: Literal[2, 3] | None,
+    capability: int,
+    default_version: int,
 ) -> None:
     import vllm.config
     from vllm.platforms.interface import DeviceCapability
@@ -216,35 +232,35 @@ def test_sm90_default_preserves_fa3_and_fusion_requires_explicit_fa2(
         SimpleNamespace(
             is_xpu=lambda: False,
             is_rocm=lambda: False,
-            get_device_capability=lambda: DeviceCapability(9, 0),
+            get_device_capability=lambda: DeviceCapability(capability, 0),
         ),
     )
-    monkeypatch.setattr(flash, "is_fa_version_supported", lambda version: version in (2, 3))
+    monkeypatch.setattr(
+        flash, "is_fa_version_supported", lambda version: version in (2, default_version)
+    )
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
     monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
     monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: beam_attn_gpu)
-    # Exercise the installed vLLM selector: an ordinary SM90 default is FA3.
-    expected = 3 if fa_version is None else fa_version
+    # Exercise the installed vLLM selector, including device fallbacks.
+    if fa_version == 3 and capability == 8:
+        pytest.skip("explicit FA3 is not supported on SM8x")
+    expected = default_version if fa_version in (None, 3) else fa_version
     assert beam_attn_gpu.get_flash_attn_version(head_size=128) == expected
     arg_utils_gr.create_engine_config(args)
     assert config.attention_config.flash_attn_version == fa_version
     assert GRConfig.from_vllm_config(config).enable_short_suffix_attention is (enabled is True)
-    kwargs: dict[str, Any] = dict(
-        num_heads=16,
-        head_size=128,
-        scale=128**-0.5,
-        num_kv_heads=8,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
-    )
-    if enabled is True and expected != 2:
-        with pytest.raises(ValueError, match="FlashAttention 2"):
-            beam_attn.BeamAttentionImpl(**kwargs)
-    else:
-        impl = beam_attn.BeamAttentionImpl(**kwargs)
-        assert impl.vllm_flash_attn_version == expected
-        assert impl.supports_quant_query_input is (enabled is not True)
+    kwargs: dict[str, Any] = {
+        "num_heads": 16,
+        "head_size": 128,
+        "scale": 128**-0.5,
+        "num_kv_heads": 8,
+        "alibi_slopes": None,
+        "sliding_window": None,
+        "kv_cache_dtype": "auto",
+    }
+    impl = beam_attn.BeamAttentionImpl(**kwargs)
+    assert impl.vllm_flash_attn_version == expected
+    assert impl.supports_quant_query_input is (enabled is not True)
 
 
 @pytest.mark.parametrize("capacity", [0, -1])
@@ -299,7 +315,7 @@ def test_context_accepts_positive_capacity(capacity: int, dtype: torch.dtype) ->
     [
         {"num_heads": 15},
         {"head_size": 80},
-        {"fa_version": 3},
+        {"fa_version": 5},
         {"sliding_window": (32, 0)},
         {"softcap": 10.0},
         {"alibi_slopes": torch.zeros(16)},
@@ -564,6 +580,13 @@ def _run_cascade(monkeypatch: pytest.MonkeyPatch, case: SimpleNamespace) -> list
 
         output.copy_(prefix + 50)
 
+    # Routing is tested on CPU; numerical/device-length repair is exercised
+    # with actual CUDA backends in test_beam_short_suffix.py.
+    def clear_empty(state: Any, cu_q: torch.Tensor, lengths: torch.Tensor) -> Any:
+        assert torch.all(lengths > 0)
+        return state
+
+    monkeypatch.setattr(beam_attn_gpu, "clear_empty_prefix_states", clear_empty)
     monkeypatch.setattr(beam_attn_gpu, "flash_attn_varlen_func", flash_attention)
     monkeypatch.setattr(beam_attn_gpu, "merge_attn_states", merge)
     monkeypatch.setattr(beam_short_suffix, "merge_short_suffix_attention", fused)

@@ -227,6 +227,11 @@ class BeamAttentionImpl(AttentionImpl):
                 self.alibi_slopes,
                 self.sinks,
             )
+            logger.info_once(
+                "Beam prefix uses FlashAttention %s with canonical out/LSE; "
+                "short-suffix fusion is enabled independently.",
+                self.vllm_flash_attn_version,
+            )
         # The fused suffix consumes model-dtype queries, not quantized Q.
         self.supports_quant_query_input = not short_suffix_attention
         self.use_cascade = True

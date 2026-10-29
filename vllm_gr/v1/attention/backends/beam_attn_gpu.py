@@ -16,6 +16,11 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 
+from vllm_gr.v1.attention.backends.beam_attention_state import (
+    AttentionState,
+    clear_empty_prefix_states,
+    normalize_flash_attn_state,
+)
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
 )
@@ -245,8 +250,10 @@ def validate_short_suffix_attention(
         raise ValueError(
             "Short suffix attention requires integral GQA groups and head size 64/128/256"
         )
-    if fa_version != 2:
-        raise ValueError("Short suffix attention currently requires FlashAttention 2 prefix states")
+    if fa_version not in (2, 3, 4):
+        raise ValueError(
+            "Short suffix attention requires an available FlashAttention 2, 3 or 4 backend"
+        )
     if (
         sliding_window not in (None, (-1, -1), [-1, -1])
         or softcap
@@ -273,6 +280,62 @@ def _is_pure_beam_decode(attn_metadata: BeamAttentionMetadata, beam_width: int) 
         and attn_metadata.num_prefix_indices == beam_width
         and attn_metadata.num_actual_tokens == beam_width
     )
+
+
+def prefix_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: BeamAttentionMetadata,
+    *,
+    scale: float,
+    fa_version: int,
+    sliding_window_size: list[int] | tuple[int, int] | None,
+    logits_soft_cap: float,
+    alibi_slopes: torch.Tensor | None = None,
+    s_aux: torch.Tensor | None = None,
+) -> AttentionState:
+    """Compute shared paged prefix attention with a backend-independent result.
+
+    The backend is resolved once at layer initialization. Suffix consumers only
+    receive canonical state tensors, never a FlashAttention version selector.
+    """
+    out, lse = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=attn_metadata.prefix_cu_seqlens_q_device,
+        seqused_k=attn_metadata.prefix_seqlens_kv_device,
+        max_seqlen_q=attn_metadata.prefix_max_q_len,
+        max_seqlen_k=attn_metadata.prefix_max_seq_len,
+        softmax_scale=scale,
+        causal=False,
+        alibi_slopes=alibi_slopes,
+        window_size=sliding_window_size,
+        block_table=attn_metadata.prefix_block_table,
+        softcap=logits_soft_cap,
+        return_softmax_lse=True,
+        fa_version=fa_version,
+        scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
+        num_splits=_num_splits(attn_metadata.max_num_splits),
+        s_aux=s_aux,
+    )
+
+    state = normalize_flash_attn_state(
+        out,
+        lse,
+        fa_version=fa_version,
+        num_kv_heads=key_cache.shape[-2],
+        max_query_len=attn_metadata.prefix_max_q_len,
+        paged_kv=attn_metadata.prefix_block_table is not None,
+    )
+    if attn_metadata.prefix_block_table is not None:
+        state = clear_empty_prefix_states(
+            state,
+            attn_metadata.prefix_cu_seqlens_q_device,
+            attn_metadata.prefix_seqlens_kv_device,
+        )
+    return state
 
 
 def cascade_attention(
@@ -322,24 +385,16 @@ def cascade_attention(
         else:
             beam_query = query[attn_metadata.prefix_indices]
 
-        prefix_out, prefix_lse = flash_attn_varlen_func(
-            q=beam_query,
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=attn_metadata.prefix_cu_seqlens_q_device,
-            seqused_k=attn_metadata.prefix_seqlens_kv_device,
-            max_seqlen_q=attn_metadata.prefix_max_q_len,
-            max_seqlen_k=attn_metadata.prefix_max_seq_len,
-            softmax_scale=scale,
-            causal=False,
-            alibi_slopes=alibi_slopes,
-            window_size=sliding_window_size,
-            block_table=attn_metadata.prefix_block_table,
-            softcap=logits_soft_cap,
-            return_softmax_lse=True,
+        prefix_out, prefix_lse = prefix_attention(
+            beam_query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            scale=scale,
             fa_version=vllm_flash_attn_version,
-            scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
-            num_splits=_num_splits(attn_metadata.max_num_splits),
+            sliding_window_size=sliding_window_size,
+            logits_soft_cap=logits_soft_cap,
+            alibi_slopes=alibi_slopes,
             s_aux=s_aux,
         )
 
@@ -481,19 +536,13 @@ def cascade_attention(
                 num_splits=_num_splits(0),
             )
 
-        # FA2 GQA de-swizzle: with grouped-query attention (group_size > 1) and a
-        # single query token, flash-attention returns softmax_lse laid out as
-        # [num_kv_heads, group_size, num_tokens] instead of [num_heads, num_tokens].
-        # Transpose back so merge_attn_states sees the per-head layout. FA3 already
-        # returns the head layout, and the prefix call (max_q > 1) is unaffected.
-        group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
-        if attn_metadata.suffix_max_q_len == 1 and group_size > 1 and vllm_flash_attn_version != 3:
-            suffix_lse = (
-                suffix_lse.view(attn_metadata.num_kv_heads, group_size, -1)
-                .transpose(1, 2)
-                .contiguous()
-                .view(attn_metadata.num_heads, -1)
-            )
+        suffix_out, suffix_lse = normalize_flash_attn_state(
+            suffix_out,
+            suffix_lse,
+            fa_version=vllm_flash_attn_version,
+            num_kv_heads=attn_metadata.num_kv_heads,
+            max_query_len=attn_metadata.suffix_max_q_len,
+        )
 
         out = torch.empty_like(beam_query)
         merge_attn_states(out, prefix_out, prefix_lse, suffix_out, suffix_lse)

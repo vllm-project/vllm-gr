@@ -502,7 +502,7 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
     assert engine_args.model == str(tmp_path)
     config = SimpleNamespace(
         additional_config={},
-        attention_config=SimpleNamespace(backend=None),
+        attention_config=SimpleNamespace(backend=None, flash_attn_version=None),
         scheduler_config=SimpleNamespace(
             async_scheduling=args.async_scheduling,
             enable_chunked_prefill=args.enable_chunked_prefill,
@@ -515,6 +515,8 @@ def test_benchmark_server_command_uses_canonical_attention_backend(
     result = arg_utils_gr.create_engine_config(engine_args)
 
     assert result.attention_config.backend is AttentionBackendEnum.CUSTOM
+    # Suffix fusion must leave hardware-dependent prefix selection automatic.
+    assert result.attention_config.flash_attn_version is None
     assert result.additional_config[GR_CONFIG_KEY]["attention_backend"] == "CUSTOM"
     assert result.additional_config[GR_CONFIG_KEY]["constraint_table"]["backend"] == device
 
