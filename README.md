@@ -28,11 +28,11 @@ The current CUDA release candidate targets **vLLM 0.30.0**. A CUDA install of
 platform dependencies are selected by `setup.py`, so no `[gpu]` extra is
 needed.
 
-The Ascend migration target is vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2, but
-that combination has not completed NPU runtime validation and is intentionally
-blocked by the environment guard. It is not a supported installation in this
-release candidate. See the [Ascend status](docs/quickstart-ascend.md) for the
-remaining enablement work.
+The Ascend path targets vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2 and completed
+NPU runtime validation on that vendor stack. The environment guard pins the
+validated vLLM-Ascend/Triton-Ascend pair; the vendor runtime comes from the
+base image. See the [Ascend installation guide](docs/quickstart-ascend.md) for
+the installation procedure, runtime requirements, and execution contract.
 
 For the validated CUDA installation path, see [quickstart](docs/quickstart.md).
 
@@ -62,11 +62,10 @@ documented in [benchmarks/qwen/README.md](benchmarks/qwen/README.md).
 - Please refer to [offline inference](examples/offline_inference/beam_search/README.md) for offline beam search example.
 - Please refer to [online inference](examples/online_serving/beam_search/README.md) for online inference example.
 
-## NPU Serving Design Status
+## NPU Serving
 
-The following describes the intended NPU configuration contract. It is kept as
-a design reference while the vLLM-Ascend 0.30.0rc2 runtime migration is pending;
-it is not part of the current GPU release acceptance.
+The following is the serving configuration contract for the validated NPU
+stack (vLLM 0.30.0 with vLLM-Ascend 0.30.0rc2).
 
 Use a canonical `--vllm-gr-config` file with `beam.execution_mode: v1` and
 `constraint_table.backend: npu`. Build the `.safetensors` artifact with the
@@ -78,8 +77,8 @@ then the [online V1 example](examples/online_serving/beam_search/README.md).
 The old frontend `--catalog-path` injection flow is retired; a triples JSON
 is an artifact build input, not a replacement for the canonical configuration.
 
-The [NPU status page](docs/quickstart-ascend.md) records the target runtime and
-execution choices. Benchmark gates additionally require local dataset and
+The [NPU installation guide](docs/quickstart-ascend.md) records the runtime
+requirements and execution choices. Benchmark gates additionally require local dataset and
 catalog paths plus a resolved benchmark policy; see
 [benchmark instructions](docs/benchmarks/README.md).
 

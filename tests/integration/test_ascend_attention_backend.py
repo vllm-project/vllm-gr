@@ -37,6 +37,7 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
     import vllm.v1.attention.selector as selector_mod
     from vllm.config import AttentionConfig, VllmConfig, set_current_vllm_config
     from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_ascend.ascend_config import clear_ascend_config, init_ascend_config
     from vllm_ascend.utils import register_ascend_customop
 
     from vllm_gr._env_check import check_ascend_environment
@@ -71,7 +72,16 @@ def test_native_backend_loads_after_normal_ascend_op_registration() -> None:
         block_size=config.cache_config.block_size,
     )
     with set_current_vllm_config(config):
-        backend = selector_mod._cached_get_attn_backend(None, selector_config)
+        # Engine startup runs NPUPlatform.check_and_update_config, whose step 5
+        # initializes the Ascend config before any backend selection; rc2's
+        # get_attn_backend_cls reads rl_config from it during FA3 validation
+        # before falling back to the registered plugin backend. Mirror that
+        # ordering, then restore the unset state for the rest of the process.
+        init_ascend_config(config)
+        try:
+            backend = selector_mod._cached_get_attn_backend(None, selector_config)
+        finally:
+            clear_ascend_config()
 
     assert backend is not BeamAttentionBackend
     assert backend.__module__.startswith("vllm_ascend.")

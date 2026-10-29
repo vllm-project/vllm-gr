@@ -106,7 +106,6 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
-            num_scheduled_tokens_compressed_list,
         ) = out
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
@@ -116,7 +115,6 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
-            num_scheduled_tokens_compressed_list,
         )
 
     setattr(patched_prepare_inputs, _WORKER_PREPARE_PATCH_MARKER, True)

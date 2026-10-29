@@ -6,6 +6,8 @@
 import logging
 from typing import Any, cast
 
+import torch
+
 from vllm_gr.config import GRAttentionBackend, GRConfig
 
 logger = logging.getLogger(__name__)
@@ -13,6 +15,7 @@ logger = logging.getLogger(__name__)
 _ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
 _ASCEND_ORIGINAL_CACHED_GET_ATTN: Any = None
 _NPU_WORKER_PATCH_APPLIED = False
+_PENALTY_WARMUP_GUARD_APPLIED = False
 
 
 def _get_current_gr_attention_backend() -> GRAttentionBackend | None:
@@ -130,6 +133,9 @@ def patch_npu_worker_init_device() -> int:
         from vllm_gr.patch import re_apply_patches
 
         re_apply_patches()
+        # The penalties warmup guard must be installed before
+        # compile_or_warm_up_model runs in this child process.
+        apply_penalties_warmup_oom_guard()
         # Mount set_gr_constraint_resources so the driver can inject constraint
         # tables via EngineCore.collective_rpc after init_device returns.
         from vllm_gr.constraints.worker_inject import load_constraint_tables_on_worker
@@ -137,13 +143,9 @@ def patch_npu_worker_init_device() -> int:
         from vllm_gr.v1.worker.model_runner_patch import (
             install_worker_utility_hooks,
         )
-        from vllm_gr.v1.worker.npu_memory_counters import (
-            install_npu_memory_counter_patch,
-        )
 
         install_worker_utility_hooks(type(self))
         install_npu_stage_weight_update_hooks(type(self))
-        install_npu_memory_counter_patch(type(self))
         result = original_init_device(self)
         # Preload constraint tables onto the device at weight-load time so the
         # runtime never does a lazy build/H2D on the first constrained step.
@@ -152,4 +154,174 @@ def patch_npu_worker_init_device() -> int:
 
     NPUWorker.init_device = _patched_init_device
     _NPU_WORKER_PATCH_APPLIED = True
+    return 1
+
+
+def apply_penalties_warmup_oom_guard() -> int:
+    """Skip the Ascend penalties Triton warmup when its dummies cannot fit.
+
+    vllm-ascend >= 0.30 runs Triton kernel warmups right after the KV cache
+    has consumed the memory budget, and the penalties stage allocates dummy
+    ``max_num_seqs x padded_vocab`` logits and bin-count tensors. Serving
+    OneRec's large vocabulary at the benchmark server's ``--max_num_seqs
+    2048`` needs ~2.7 GiB more than remains and aborts engine startup. The
+    warmup only JIT-compiles kernels for penalty sampling, which requests
+    without penalties (including every vllm-gr beam request) never execute,
+    so an OOM there skips the warmup instead of failing the engine.
+    """
+    global _PENALTY_WARMUP_GUARD_APPLIED
+    if _PENALTY_WARMUP_GUARD_APPLIED:
+        return 0
+    import sys
+
+    try:
+        # The warmup package re-exports the kernel_warmup *function*, which
+        # shadows the submodule attribute; resolve the real module instead.
+        import vllm_ascend.model_executor.warmup.kernel_warmup  # noqa: F401
+    except ImportError:
+        return 0
+    warmup_mod = sys.modules["vllm_ascend.model_executor.warmup.kernel_warmup"]
+    original = getattr(warmup_mod, "penalties_triton_warmup", None)
+    if original is None or getattr(original, "_vllm_gr_oom_guarded", False):
+        _PENALTY_WARMUP_GUARD_APPLIED = True
+        return 0
+
+    def _guarded_penalties_triton_warmup(worker: Any) -> None:
+        try:
+            return original(worker)
+        except torch.OutOfMemoryError:
+            scheduler_config = getattr(worker, "scheduler_config", None)
+            model_config = getattr(worker, "model_config", None)
+            num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+            try:
+                vocab_size = model_config.get_vocab_size()
+            except Exception:
+                vocab_size = None
+            logger.warning(
+                "Skipped the Ascend penalties Triton warmup: its %s x %s "
+                "dummy tensors do not fit beside the KV cache (NPU OOM). "
+                "Penalty sampling is not used by vllm-gr beam decoding, so "
+                "only the kernel JIT warmup is lost.",
+                num_seqs,
+                vocab_size,
+            )
+            torch.npu.empty_cache()
+
+    _guarded_penalties_triton_warmup._vllm_gr_oom_guarded = True  # type: ignore[attr-defined]
+    warmup_mod.penalties_triton_warmup = _guarded_penalties_triton_warmup
+    _PENALTY_WARMUP_GUARD_APPLIED = True
+    return 1
+
+
+def _install_init_ascend_config_sanitizer() -> None:
+    """Wrap init_ascend_config so no call site ever sees vllm-gr keys.
+
+    vllm-ascend calls init_ascend_config from both the EngineCore entrypoint
+    (patch_engine_core) and NPUWorker.__init__, and the VllmConfig may be
+    re-serialized between those sites -- restoring the GR key that the
+    entrypoint sanitizer already stripped. Wrapping the function itself makes
+    every call strip the key first, which is process-local and idempotent.
+    """
+    import sys
+
+    import vllm_ascend.ascend_config as ascend_config_mod
+
+    original = ascend_config_mod.init_ascend_config
+    if getattr(original, "_vllm_gr_sanitized", False):
+        return
+
+    def _patched_init_ascend_config(vllm_config: Any) -> Any:
+        _strip_gr_additional_config(vllm_config)
+        return original(vllm_config)
+
+    _patched_init_ascend_config._vllm_gr_sanitized = True  # type: ignore[attr-defined]
+    ascend_config_mod.init_ascend_config = _patched_init_ascend_config
+
+    # Modules imported later bind the patched function via their
+    # `from vllm_ascend.ascend_config import init_ascend_config`; only update
+    # module-global bindings that were already created with the original.
+    for module_name in (
+        "vllm_ascend.patch.platform.patch_engine_core",
+        "vllm_ascend.worker.worker",
+    ):
+        mod = sys.modules.get(module_name)
+        if mod is not None and getattr(mod, "init_ascend_config", None) is original:
+            mod.init_ascend_config = _patched_init_ascend_config
+
+
+def _strip_gr_additional_config(vllm_config: Any) -> None:
+    """Strip GR keys from ``additional_config`` before Ascend validation.
+
+    vllm-ascend's EngineCore entrypoint calls ``init_ascend_config`` in the
+    spawned child *before* the vllm-gr plugin loads, so the canonical
+    ``vllm_gr`` key (and legacy ``vllm_gr_*`` keys) would be rejected by
+    AscendConfig's pydantic ``extra="forbid"``.  The child owns a private copy
+    of the config, so removing the keys here is process-local; they are stashed
+    for ``parse_gr_config`` to merge back on the read path.
+    """
+    from vllm_gr.config.parser import (
+        GR_CONFIG_KEY,
+        GR_CONFIG_KEY_PREFIX,
+        stash_stripped_gr_additional,
+    )
+
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        return
+    gr_keys = {
+        key: value
+        for key, value in additional.items()
+        if key == GR_CONFIG_KEY
+        or (isinstance(key, str) and key.startswith(GR_CONFIG_KEY_PREFIX))
+    }
+    if not gr_keys:
+        return
+    stash_stripped_gr_additional(gr_keys)
+    for key in gr_keys:
+        del additional[key]
+
+
+def _sanitize_engine_core_entry(
+    *args,
+    dp_rank: int = 0,
+    local_dp_rank: int = 0,
+    **kwargs,
+):
+    """Outer EngineCore entrypoint that sanitizes GR keys before Ascend init.
+
+    Installed on ``EngineCoreProc.run_engine_core`` after vllm-ascend's own
+    wrapper, so this function is what multiprocessing pickles as the child's
+    target.  It strips GR keys, then delegates to vllm-ascend's entrypoint so
+    ``init_ascend_config`` still runs -- on a clean ``additional_config`` --
+    preserving the child's Ascend config singleton.
+    """
+    vllm_config = kwargs.get("vllm_config")
+    if vllm_config is not None:
+        _strip_gr_additional_config(vllm_config)
+
+    # init_ascend_config is also called from NPUWorker.__init__ on a
+    # possibly-re-serialized config; wrap it so every call strips GR keys.
+    _install_init_ascend_config_sanitizer()
+
+    from vllm_ascend.patch.platform.patch_engine_core import (
+        _run_engine_core_patch_func as ascend_entry,
+    )
+
+    return ascend_entry(*args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
+
+
+def apply_engine_core_config_sanitizer(engine_core_proc_cls: type) -> int:
+    """Wrap the EngineCore entrypoint to strip GR keys before Ascend init.
+
+    Re-asserted on every create_engine_config: each EngineArgs round-trip
+    re-runs load_general_plugins, which reinstalls vllm-gr's generic
+    run_engine_core wrapper (and vllm-ascend's) over this sanitizer. Checking
+    identity rather than a one-shot flag keeps the sanitizer outermost across
+    multiple engines in one process.
+    """
+    if not is_npu_platform():
+        return 0
+    if engine_core_proc_cls.run_engine_core is _sanitize_engine_core_entry:
+        return 0
+    engine_core_proc_cls.run_engine_core = staticmethod(_sanitize_engine_core_entry)
     return 1

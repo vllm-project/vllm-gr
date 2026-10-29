@@ -14,6 +14,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+# vllm-ascend >= 0.30 swaps LogitsProcessor for AscendLogitsProcessor, whose
+# _get_logits routes by lm_head.parallel_mode before projecting. A sliced
+# proxy keeps its complete sliced vocabulary locally (tp_size=1, no
+# vocabulary-parallel communication), so it must present the replicated mode
+# instead of the source head's sharded one. Stacks without the enum are
+# unaffected: nothing on those code paths reads the attribute.
+try:
+    from vllm_ascend.ops.vocab_parallel_embedding import VocabParallelMode
+
+    _REPLICATED_PARALLEL_MODE: Any = VocabParallelMode.REPLICATED
+except ImportError:  # non-Ascend or pre-0.30 vllm-ascend stacks
+    _REPLICATED_PARALLEL_MODE = None
+
 logger = init_logger("vllm.ops.sliced_logits")
 
 # Global configuration variables for static offset mode
@@ -34,6 +47,11 @@ class SlicedLMHeadProxy(nn.Module):
         self.num_embeddings_per_partition = sliced_num_embeddings
         self.org_vocab_size = sliced_num_embeddings
         self.tp_size = 1
+        if _REPLICATED_PARALLEL_MODE is not None:
+            # Routes AscendLogitsProcessor to its normal (no-communication)
+            # projection branch; the sharded modes would assume vocabulary
+            # parallelism the proxy does not participate in.
+            self.parallel_mode = _REPLICATED_PARALLEL_MODE
 
 
 def set_vocab_slice_config(

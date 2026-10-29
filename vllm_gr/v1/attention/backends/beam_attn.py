@@ -680,6 +680,33 @@ class BeamAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
 
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # Preserve the Ascend-compatible block size that
+        # _apply_npu_default_block_size pins onto the running config (128).
+        # vLLM 0.30's platform hook otherwise resolves an unspecified size back
+        # to a 16-multiple geometry that the Ascend kernels and prefix-caching
+        # block tables cannot represent.
+        from vllm.config.vllm import get_current_vllm_config_or_none
+
+        current = get_current_vllm_config_or_none()
+        if current is not None and cls.supports_block_size(current.cache_config.block_size):
+            return current.cache_config.block_size
+        return super().get_preferred_block_size(default_block_size)
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "",
+    ) -> tuple[int, ...]:
+        # Ascend allocates the KV cache as a (key, value) pair; the leading "2"
+        # splits the token-major NHD block view, matching vllm-ascend's default
+        # (non-LBHNC/HND) layout.
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
+
     @staticmethod
     def get_name() -> str:
         return "CUSTOM"

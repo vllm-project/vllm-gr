@@ -358,10 +358,18 @@ def test_cascade_execution_batch_matches_individual_requests(
         batch.end_session()
 
 
+@pytest.mark.parametrize("cache_layout", ["contiguous", "interleaved"])  # type: ignore[misc]
 @pytest.mark.parametrize("beam_width", [2, 4])  # type: ignore[misc]
 @pytest.mark.parametrize("decode_step", [0, 1, 3, 7])  # type: ignore[misc]
-def test_xllm_incremental_matches_cascade(beam_width: int, decode_step: int) -> None:
-    """x_attention fused path vs cascade incremental path, allclose."""
+def test_xllm_incremental_matches_cascade(
+    beam_width: int, decode_step: int, cache_layout: str
+) -> None:
+    """x_attention fused path vs cascade incremental path, allclose.
+
+    ``interleaved`` mirrors the vllm-ascend 0.30 pool allocation (K/V
+    interleaved per block, per-layer views non-contiguous), exercising the
+    pool-base gather in the xllm shared-prefix path.
+    """
     torch.manual_seed(beam_width * 100 + decode_step)
     prefix_len = 256  # 2 full blocks; no remainder-block std spill
     scale = 1.0 / math.sqrt(HEAD_DIM)
@@ -398,12 +406,26 @@ def test_xllm_incremental_matches_cascade(beam_width: int, decode_step: int) -> 
 
     # Paged shared prefix KV.
     blocks_per_req = prefix_len // BLOCK_SIZE
-    key_cache = (
-        torch.randn(blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * scale
-    ).to(DEVICE)
-    value_cache = (
-        torch.randn(blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * scale
-    ).to(DEVICE)
+    key_cache_cpu = torch.randn(
+        blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE
+    ) * scale
+    value_cache_cpu = torch.randn(
+        blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE
+    ) * scale
+    if cache_layout == "interleaved":
+        # vllm-ascend 0.30 layout: one [N, 2, block, H, D] allocation with
+        # the per-layer K/V views as its strided halves.
+        pool_kv = torch.zeros(
+            blocks_per_req, 2, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE
+        )
+        pool_kv[:, 0] = key_cache_cpu
+        pool_kv[:, 1] = value_cache_cpu
+        pool_kv = pool_kv.to(DEVICE)
+        key_cache, value_cache = pool_kv[:, 0], pool_kv[:, 1]
+        assert not key_cache.is_contiguous()
+    else:
+        key_cache = key_cache_cpu.to(DEVICE)
+        value_cache = value_cache_cpu.to(DEVICE)
     block_tables = torch.arange(blocks_per_req, dtype=torch.int32).unsqueeze(0)
 
     query = (torch.randn(beam_width, NUM_HEADS, HEAD_DIM, dtype=DTYPE) * scale).to(DEVICE)

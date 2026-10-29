@@ -77,12 +77,17 @@ def reshape_and_cache(
     v_scale: torch.Tensor | None,
 ) -> None:
     del kv_cache_dtype, k_scale, v_scale
-    torch_npu._npu_reshape_and_cache(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping,
+    # vLLM 0.30 allocates the KV cache with K/V interleaved per block, so the
+    # per-layer [B, N, H, D] key/value views are non-contiguous. The older
+    # _npu_reshape_and_cache requires contiguous caches; the paged-attention
+    # scatter used by vllm-ascend 0.30 handles the strided block layout.
+    torch_npu.npu_scatter_pa_kv_cache(
+        key=key.contiguous(),
+        value=value.contiguous(),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=slot_mapping.contiguous(),
+        cache_mode="Norm",
     )
 
 

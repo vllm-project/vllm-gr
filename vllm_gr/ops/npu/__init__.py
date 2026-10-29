@@ -3,9 +3,10 @@
 
 """Reserved NPU operator namespace.
 
-Ascend fused operators are supplied by the vendor runtime. Their registration
-contract must be revalidated with the vLLM-Ascend 0.30.0rc2 target before NPU
-release enablement.
+Ascend fused operators are supplied by the vendor runtime (xllm-ops built
+for the CANN 9.2.0 base image). Their registration contract is validated
+against the vLLM-Ascend 0.30.0rc2 stack by the xllm parity and NPU
+acceptance gates.
 """
 
 from vllm_gr.ops.npu.beam_ops import (

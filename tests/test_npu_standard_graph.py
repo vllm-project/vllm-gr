@@ -38,15 +38,6 @@ class _NativeACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[Any, Any] = {}
 
 
-@dataclass
-class _ModelGraphProxy:
-    ordinary_wrapper: Any
-
-    @property
-    def cudagraph_wrapper(self) -> Any:
-        return self.ordinary_wrapper
-
-
 class _Event:
     def __init__(self, api: _NPUAPI) -> None:
         self.api = api
@@ -166,9 +157,7 @@ class _Harness:
             capturing=True,
             cudagraph_runtime_mode=CUDAGraphMode.FULL,
             attn_metadata={},
-            model_instance=_ModelGraphProxy(
-                _NativeACLGraphWrapper(CUDAGraphMode.FULL, enable_enpu=False)
-            ),
+            model_instance=_NativeACLGraphWrapper(CUDAGraphMode.FULL, enable_enpu=False),
         )
         monkeypatch.setattr(torch, "npu", self.api, raising=False)
         monkeypatch.setattr(module, "get_forward_context", lambda: self.context)
@@ -476,7 +465,7 @@ def test_fresh_enpu_capture_defers_updates_for_exact_uncaptured_native_entry(
         wrapper.concrete_aclgraph_entries[descriptor] = _NativeACLGraphEntry(descriptor)
         # Both a wholly new owner and an existing empty registry are legal.
         graph.owner._vllm_gr_standard_fia_entries = {}
-    graph.context.model_instance = _ModelGraphProxy(wrapper)
+    graph.context.model_instance = wrapper
     graph.context.capturing = False
     graph.context.attn_metadata = {"layer.0": graph.metadata()}
     graph.update()
@@ -490,7 +479,7 @@ def test_captured_native_graph_cannot_hide_missing_standard_tasks(graph: _Harnes
     wrapper.concrete_aclgraph_entries[descriptor] = _NativeACLGraphEntry(
         descriptor, aclgraph=object()
     )
-    graph.context.model_instance = _ModelGraphProxy(wrapper)
+    graph.context.model_instance = wrapper
     graph.context.capturing = False
     graph.context.attn_metadata = {"layer.0": graph.metadata()}
     with pytest.raises(RuntimeError):
@@ -505,7 +494,7 @@ def test_uncaptured_native_entry_cannot_hide_incomplete_standard_capture(graph: 
     wrapper = _NativeACLGraphWrapper(graph.module.CUDAGraphMode.FULL)
     descriptor = graph.context.batch_descriptor
     wrapper.concrete_aclgraph_entries[descriptor] = _NativeACLGraphEntry(descriptor)
-    graph.context.model_instance = _ModelGraphProxy(wrapper)
+    graph.context.model_instance = wrapper
     graph.api.clear()
     with pytest.raises(RuntimeError):
         graph.update()
@@ -531,18 +520,16 @@ def test_missing_tasks_only_defer_for_proven_fresh_enpu_capture(
 ) -> None:
     wrapper = _NativeACLGraphWrapper(graph.module.CUDAGraphMode.FULL)
     descriptor = graph.context.batch_descriptor
-    graph.context.model_instance = _ModelGraphProxy(wrapper)
+    graph.context.model_instance = wrapper
     graph.context.capturing = False
     graph.context.attn_metadata = {"layer.0": graph.metadata()}
     if unproven_state == "missing_model":
         del graph.context.model_instance
     elif unproven_state == "unknown_wrapper":
-        graph.context.model_instance = _ModelGraphProxy(
-            SimpleNamespace(
-                runtime_mode=graph.module.CUDAGraphMode.FULL,
-                enable_enpu=True,
-                concrete_aclgraph_entries={},
-            )
+        graph.context.model_instance = SimpleNamespace(
+            runtime_mode=graph.module.CUDAGraphMode.FULL,
+            enable_enpu=True,
+            concrete_aclgraph_entries={},
         )
     elif unproven_state == "enpu_disabled":
         wrapper.enable_enpu = False
@@ -747,23 +734,23 @@ def test_workspace_pool_never_crosses_native_owners_or_wrappers(
 ) -> None:
     first = graph.capture(num_reqs=8, names=("layer.0",))
     old_owner = graph.owner
-    old_wrapper = graph.context.model_instance.cudagraph_wrapper
+    old_wrapper = graph.context.model_instance
     if isolation == "owner":
         graph.owner = SimpleNamespace()
     else:
-        graph.context.model_instance = _ModelGraphProxy(
-            _NativeACLGraphWrapper(graph.module.CUDAGraphMode.FULL, enable_enpu=False)
+        graph.context.model_instance = _NativeACLGraphWrapper(
+            graph.module.CUDAGraphMode.FULL, enable_enpu=False
         )
     second = graph.capture(num_reqs=4, names=("layer.0",))
     assert second.tasks["layer.0"].workspace is not first.tasks["layer.0"].workspace
     if isolation == "owner":
-        assert graph.context.model_instance.cudagraph_wrapper is old_wrapper
+        assert graph.context.model_instance is old_wrapper
         assert graph.owner._vllm_gr_standard_fia_workspace_pool is not (
             old_owner._vllm_gr_standard_fia_workspace_pool
         )
     else:
         assert graph.owner is old_owner
-        assert graph.context.model_instance.cudagraph_wrapper is not old_wrapper
+        assert graph.context.model_instance is not old_wrapper
         assert len(graph.owner._vllm_gr_standard_fia_workspace_pool) == 2
 
 

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -62,6 +61,8 @@ def _replace_model(runner: Any, value: float) -> None:
         head.bias.fill_(value / 2)
     head.quant_method = UnquantizedEmbeddingMethod()
     head.tp_size = 1
+    # vLLM 0.30 CustomOps read the current config at construction time (same
+    # pattern as tests/test_sliced_logits.py::_native_processor).
     with set_current_vllm_config(VllmConfig()):
         processor = LogitsProcessor(384, scale=0.7, soft_cap=13.0)
     processor._gather_logits = lambda logits: logits
@@ -73,16 +74,13 @@ def _replace_model(runner: Any, value: float) -> None:
 
 @pytest.fixture
 def lifecycle(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
-    # Earlier NPU integration tests may install the Ascend logits processor.
-    # Keep this TP=1 CPU fixture independent of its engine-global config.
-    ascend_logits = sys.modules.get("vllm_ascend.ops.vocab_parallel_embedding")
-    if ascend_logits is not None:
-        monkeypatch.setattr(ascend_logits, "lmhead_tp_enable", lambda: False)
-        monkeypatch.setattr(
-            ascend_logits,
-            "get_ascend_config",
-            lambda: SimpleNamespace(enable_reduce_sample=False),
-        )
+    # Earlier NPU integration tests register AscendLogitsProcessor as the
+    # out-of-tree LogitsProcessor, and vllm-ascend 0.30 dispatches it by
+    # lm_head.parallel_mode — an attribute this fixture's CPU fakes do not
+    # model. Construct the native processor for the worker-lifecycle logic.
+    from vllm.model_executor.custom_op import op_registry_oot
+
+    monkeypatch.delitem(op_registry_oot, "LogitsProcessor", raising=False)
     config = GRConfig(
         beam_execution_mode=BeamExecutionMode.V1,
         beam_max_width=4,

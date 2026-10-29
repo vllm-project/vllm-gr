@@ -355,10 +355,46 @@ def _legacy_keys_present(
     return sorted(key for key in KNOWN_GR_CONFIG_KEYS if key in additional_config)
 
 
+_STRIPPED_GR_ADDITIONAL: dict | None = None
+"""Process-local stash of GR keys stripped by the NPU EngineCore sanitizer.
+
+On Ascend, vllm-ascend's EngineCore entrypoint validates ``additional_config``
+with pydantic ``extra="forbid"`` *before* the vllm-gr plugin loads in the child
+process.  vllm-gr therefore strips its canonical ``vllm_gr`` key (and legacy
+``vllm_gr_*`` keys) into this process-local stash before delegating, and this
+read path merges them back so parsing is identical to the untouched
+configuration.  GPU processes never populate the stash.
+"""
+
+
+def stash_stripped_gr_additional(mapping: Mapping[object, object]) -> None:
+    """Record GR keys removed from ``additional_config`` by the NPU sanitizer."""
+    global _STRIPPED_GR_ADDITIONAL
+    _STRIPPED_GR_ADDITIONAL = dict(mapping)
+
+
+def _merged_additional_config(
+    additional_config: Mapping[object, object] | None,
+) -> Mapping[object, object] | None:
+    """Return ``additional_config`` with any NPU-stripped GR keys restored."""
+    stripped = _STRIPPED_GR_ADDITIONAL
+    if not stripped:
+        return additional_config
+    if additional_config is None:
+        return dict(stripped)
+    if not isinstance(additional_config, Mapping):
+        return additional_config
+    merged = dict(additional_config)
+    merged.update(stripped)
+    return merged
+
+
 def parse_gr_config(vllm_config: object | None) -> GRConfig:
     if vllm_config is None:
         return GRConfig()
-    additional_config = getattr(vllm_config, "additional_config", None)
+    additional_config = _merged_additional_config(
+        getattr(vllm_config, "additional_config", None)
+    )
     if additional_config is None:
         return GRConfig()
     if not isinstance(additional_config, Mapping):

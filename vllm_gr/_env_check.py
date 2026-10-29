@@ -18,8 +18,9 @@ logger = logging.getLogger("vllm_gr.env_check")
 
 _SUPPORTED_VLLM_VERSION = "0.30.0"
 _SUPPORTED_VLLM_ASCEND_VERSION = "0.30.0rc2"
-# Resolve against the actual rc2 vendor image during the NPU migration.
-_SUPPORTED_TRITON_ASCEND_VERSION: str | None = None
+# The rc2 vendor image ships triton-ascend 3.6.0+dev...; _public_version()
+# strips the "+dev..." local suffix, so pinning the public 3.6.0 matches it.
+_SUPPORTED_TRITON_ASCEND_VERSION: str | None = "3.6.0"
 
 _OPENCV_PKGS = [
     "opencv-python",
@@ -118,8 +119,10 @@ def check_ascend_environment(*, require_npu_platform: bool = False) -> dict[str,
     """
     if _SUPPORTED_TRITON_ASCEND_VERSION is None:
         raise RuntimeError(
-            "Ascend migration to vLLM 0.30.0 / vllm-ascend 0.30.0rc2 is pending. "
-            "The vendor runtime and GR NPU path must be validated before enabling NPU."
+            "Ascend support is not enabled in this build: the supported "
+            "Triton-Ascend version is unset. The GR NPU path requires the "
+            "validated vLLM-Ascend / Triton-Ascend pair; see "
+            "docs/quickstart-ascend.md for the installation procedure."
         )
     report = check_runtime_versions(require_ascend=True)
 
@@ -206,19 +209,24 @@ def check_opencv_env() -> None:
     # numpy 2.x ABI vs cv2 compiled against numpy 1.x
     import numpy as np
 
-    if np.lib.NumpyVersion(np.__version__) < "2.0.0":
-        return
+    numpy_major_2 = np.lib.NumpyVersion(np.__version__) >= "2.0.0"
 
     try:
         import cv2  # noqa: F401
     except ImportError as exc:
         msg = str(exc).lower()
         if "numpy" in msg or "multiarray" in msg:
+            if numpy_major_2:
+                raise ImportError(
+                    f"cv2 was compiled against NumPy 1.x but NumPy {np.__version__} "
+                    "is installed (ABI incompatible).\n"
+                    "Fix: pip install --force-reinstall --no-cache-dir "
+                    "opencv-python-headless>=4.13.0"
+                ) from exc
             raise ImportError(
-                f"cv2 was compiled against NumPy 1.x but NumPy {np.__version__} "
-                "is installed (ABI incompatible).\n"
-                "Fix: pip install --force-reinstall --no-cache-dir "
-                "opencv-python-headless>=4.13.0"
+                f"cv2 failed to import against NumPy {np.__version__} "
+                "(numpy ABI mismatch).\n"
+                "Fix: reinstall the cv2 provider supplied by the platform image."
             ) from exc
     except Exception:
         pass

@@ -58,8 +58,8 @@ python -m pip check
 
 Shared dependencies come from `requirements/common.txt`, while CUDA adds the
 vLLM runtime from `requirements/cuda.txt`. There is no CUDA extra. The Ascend
-0.30.0rc2 target is still pending runtime validation; see the
-[Ascend status page](quickstart-ascend.md) before attempting an NPU environment.
+path is validated on the vLLM-Ascend 0.30.0rc2 vendor image; see the
+[Ascend installation guide](quickstart-ascend.md) before attempting an NPU environment.
 
 > **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
 

@@ -26,6 +26,9 @@ from vllm_gr.v1.attention.backends import beam_attn_npu
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
 )
+from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
+    interleaved_pool_base,
+)
 from vllm_gr.v1.beam.npu_execution_batch import restore_npu_cache_pool_layout
 
 # Fail fast when the mode selects this module but the operator library is
@@ -141,6 +144,62 @@ def cache_unshared_kv(
     )
 
 
+def _npu_stream_capturing() -> bool:
+    """Whether an ACL graph capture is running on the current stream.
+
+    Mirrors the discriminator vllm-ascend's own backends use to route between
+    capture-safe and eager execution paths (``torch.npu.NPUGraph`` capture is
+    stream-capture based).
+    """
+    try:
+        return bool(torch_npu.npu.is_current_stream_capturing())
+    except Exception:
+        # Unknown capture state: assume capture so the address-stable
+        # full-pool path is taken.
+        return True
+
+
+def _gather_shared_blocks(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather only the shared-prefix blocks the block table references.
+
+    x_attention reads its shared key/value buffers through a block table,
+    so only the referenced blocks need to be contiguous. On the 0.30
+    K/V-interleaved layout the per-layer cache views are strided halves of
+    one pool, and on such non-contiguous sources ``index_select``
+    materializes the entire pool before selecting (same cost as
+    ``.contiguous()``), defeating the point of the gather. The gather
+    therefore runs against the contiguous pool base reconstructed by
+    ``interleaved_pool_base``; caches that are already contiguous take the
+    direct per-tensor ``index_select`` fallback. Either way the copy is
+    proportional to the blocks the table references rather than to the
+    pool.
+
+    The remapped table ``row * width + col`` matches the flatten order of
+    the gather, so the kernel sees exactly the blocks the original table
+    named. Table entries beyond a request's ``seqlens_kv`` are never
+    dereferenced by the kernel, so padded or stale fixed-buffer columns
+    only add harmless extra gather rows.
+    """
+    flat = block_table.reshape(-1)
+    base = interleaved_pool_base(key_cache, value_cache)
+    if base is not None:
+        gathered = base.index_select(0, flat)
+        gathered_key = gathered[:, 0].contiguous()
+        gathered_value = gathered[:, 1].contiguous()
+    else:
+        # Contiguous or non-interleaved caches: direct per-tensor gather.
+        gathered_key = key_cache.index_select(0, flat)
+        gathered_value = value_cache.index_select(0, flat)
+    remapped_table = torch.arange(
+        flat.numel(), dtype=block_table.dtype, device=block_table.device
+    ).reshape(block_table.shape)
+    return gathered_key, gathered_value, remapped_table
+
+
 def _xllm_incremental_decode(
     output: torch.Tensor,
     query: torch.Tensor,
@@ -182,8 +241,9 @@ def _xllm_incremental_decode(
     unshared_value = beam_pool.unshared_value[slot, :beam_width]
 
     # Shared prefix KV length: fixed-address device buffer when the metadata
-    # builder runs with fixed buffers (graph path); CPU-list -> fresh tensor
-    # otherwise (eager path).
+    # builder runs with fixed buffers (the NPU default whenever beam_max_width
+    # is configured, eager decodes included); CPU-list -> fresh tensor
+    # otherwise.
     seqlens_kv = getattr(attn_metadata, "prefix_seqlens_kv_device", None)
     if seqlens_kv is None:
         seqlens_kv = torch.tensor(
@@ -197,13 +257,32 @@ def _xllm_incremental_decode(
     if step_count is None:
         step_count = step + 1  # dev is 0-based; kernel takes 1-based count
 
+    # Gather only the referenced shared blocks whenever this decode is not
+    # being captured into an ACL graph. Fixed-buffer metadata does not by
+    # itself imply capture — eager NPU decodes carry fixed buffers too — so
+    # the capture state is the discriminator: taking the full-pool copy in
+    # eager makes every layer of every step pay tens of GB for the tens of
+    # blocks the table names. Under capture the full-pool ``.contiguous()``
+    # is kept: its captured shape and destination addresses must never vary
+    # between replays.
+    if attn_metadata.prefix_block_table is not None and not _npu_stream_capturing():
+        shared_key, shared_value, shared_table = _gather_shared_blocks(
+            key_cache,
+            value_cache,
+            attn_metadata.prefix_block_table,
+        )
+    else:
+        shared_key = key_cache.contiguous()
+        shared_value = value_cache.contiguous()
+        shared_table = attn_metadata.prefix_block_table
+
     out = beam_ops.x_attention(
         beam_query,
-        key_cache,
-        value_cache,
+        shared_key,
+        shared_value,
         unshared_key,
         unshared_value,
-        attn_metadata.prefix_block_table,
+        shared_table,
         seqlens_kv,
         step_count,
         0.0,  # auto 1/sqrt(head_dim), validated above

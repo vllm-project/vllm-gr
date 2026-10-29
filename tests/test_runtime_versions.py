@@ -193,12 +193,18 @@ def test_ascend_environment_rejects_wrong_triton_ascend_version(
 
 @pytest.fixture  # type: ignore[misc]
 def configured_ascend_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Exercise the backend guard without advertising an unvalidated rc2 image.
+    # Pin a mismatched Triton-Ascend version so guard tests do not depend on
+    # the shipped pin.
     monkeypatch.setattr("vllm_gr._env_check._SUPPORTED_TRITON_ASCEND_VERSION", "3.2.1")
 
 
-def test_pending_ascend_migration_fails_before_importing_vendor_runtime() -> None:
+def test_unset_triton_ascend_pin_fails_before_importing_vendor_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The shipped default pins the validated runtime, so construct the
+    # unset-pin state explicitly instead of relying on the module constant.
+    monkeypatch.setattr("vllm_gr._env_check._SUPPORTED_TRITON_ASCEND_VERSION", None)
     with mock.patch("vllm_gr._env_check.importlib.import_module") as importer:
-        with pytest.raises(RuntimeError, match="Ascend migration.*is pending"):
+        with pytest.raises(RuntimeError, match="Ascend support is not enabled.*unset"):
             check_ascend_environment()
     importer.assert_not_called()
