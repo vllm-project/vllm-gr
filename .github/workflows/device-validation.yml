@@ -1,0 +1,470 @@
+# One job owns the runner for the entire PR. Never cancel it to admit another PR.
+name: Device validation
+run-name: ci-device:v1;pr=${{ inputs.pr_number }};head=${{ inputs.head_sha }};base=${{ inputs.base_sha
+  }};merge=${{ inputs.merge_sha }};target=${{ inputs.base_ref }}
+'on':
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number; 0 for a full branch regression
+        required: true
+        type: string
+      head_sha:
+        description: Immutable PR head
+        required: true
+        type: string
+      base_sha:
+        description: Immutable target branch commit
+        required: true
+        type: string
+      merge_sha:
+        description: Immutable merge snapshot
+        required: true
+        type: string
+      base_ref:
+        description: Target branch name
+        required: true
+        type: string
+      priority:
+        description: Queue priority (high, normal, low, regression)
+        required: true
+        type: string
+      reuse_success:
+        description: Reuse exact-snapshot successful stages on explicit retry
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      pr_number:
+        description: Pull request number; 0 for a full branch regression
+        required: true
+        type: string
+      head_sha:
+        description: Immutable PR head
+        required: true
+        type: string
+      base_sha:
+        description: Immutable target branch commit
+        required: true
+        type: string
+      merge_sha:
+        description: Immutable merge snapshot
+        required: true
+        type: string
+      base_ref:
+        description: Target branch name
+        required: true
+        type: string
+      priority:
+        description: Queue priority (high, normal, low, regression)
+        required: true
+        type: string
+      reuse_success:
+        description: Reuse exact-snapshot successful stages on explicit retry
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      HF_TOKEN:
+        required: false
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+concurrency:
+  # All entry points and snapshots of one PR share the same non-preemptible lock.
+  group: ${{ inputs.pr_number != '0' && format('device-pr-{0}', inputs.pr_number) || format('device-regression-{0}', inputs.base_ref) }}
+  queue: max
+  cancel-in-progress: false
+jobs:
+  preflight:
+    name: Verify trusted device snapshot
+    runs-on: ubuntu-latest
+    steps:
+    - name: Verify queued snapshot
+      uses: actions/github-script@v7
+      env:
+        PR_NUMBER: ${{ inputs.pr_number }}
+        HEAD_SHA: ${{ inputs.head_sha }}
+        BASE_SHA: ${{ inputs.base_sha }}
+        MERGE_SHA: ${{ inputs.merge_sha }}
+        BASE_REF: ${{ inputs.base_ref }}
+      with:
+        script: |
+          const {owner, repo} = context.repo;
+          const {PR_NUMBER, HEAD_SHA, BASE_SHA, MERGE_SHA, BASE_REF} = process.env;
+          if (!/^(0|[1-9][0-9]*)$/.test(PR_NUMBER) ||
+              ![HEAD_SHA, BASE_SHA, MERGE_SHA].every(sha => /^[a-f0-9]{40}$/.test(sha))) {
+            throw new Error('Invalid queued commit identity');
+          }
+          const {data: branch} = await github.rest.repos.getBranch({owner, repo, branch: BASE_REF});
+          if (branch.commit.sha !== BASE_SHA) throw new Error('Queued base is obsolete; scheduler will replan');
+          if (PR_NUMBER !== '0') {
+            const {data: repository} = await github.rest.repos.get({owner, repo});
+            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: Number(PR_NUMBER)});
+            if (!Number.isSafeInteger(repository.id) || pr.head.repo?.id !== repository.id ||
+                pr.base.repo?.id !== repository.id) {
+              throw new Error('Fork execution is not allowed by trusted dispatch; use a reviewed repository branch');
+            }
+            if (pr.state !== 'open' || pr.draft ||
+                (process.env.REQUIRE_READY !== 'false' && !pr.labels.some(label => label.name === 'ready')) ||
+                pr.head.sha !== HEAD_SHA || pr.base.sha !== BASE_SHA || pr.base.ref !== BASE_REF ||
+                pr.merge_commit_sha !== MERGE_SHA) {
+              throw new Error('Queued PR snapshot is obsolete; scheduler will replan');
+            }
+            const {data: merge} = await github.rest.repos.getCommit({owner, repo, ref: MERGE_SHA});
+            if (merge.parents.length !== 2 || merge.parents[0].sha !== BASE_SHA || merge.parents[1].sha !== HEAD_SHA) {
+              throw new Error('Invalid merge parents');
+            }
+          } else if (HEAD_SHA !== BASE_SHA || MERGE_SHA !== BASE_SHA) {
+            throw new Error('Regression must validate one immutable branch commit');
+          }
+  validate:
+    name: Continuous device validation
+    needs: preflight
+    runs-on: ${{ fromJSON(inputs.pr_number == '0' && vars.CI_REGRESSION_RUNNER_LABELS || vars.CI_DEVICE_RUNNER_LABELS
+      || '["self-hosted"]') }}
+    timeout-minutes: 120
+    env:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      PR_NUMBER: ${{ inputs.pr_number }}
+      CI_HEAD_SHA: ${{ inputs.head_sha }}
+      CI_BASE_SHA: ${{ inputs.base_sha }}
+      CI_MERGE_SHA: ${{ inputs.merge_sha }}
+      CI_REUSE_SUCCESS: ${{ inputs.reuse_success }}
+      CI_RUNTIME_REVISION: ${{ vars.CI_RUNTIME_REVISION || '1' }}
+      CI_CHECKPOINT_ROOT: /data/actions/cache/ci-checkpoints
+      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
+    steps:
+    - name: Verify queued snapshot
+      uses: actions/github-script@v7
+      env:
+        PR_NUMBER: ${{ inputs.pr_number }}
+        HEAD_SHA: ${{ inputs.head_sha }}
+        BASE_SHA: ${{ inputs.base_sha }}
+        MERGE_SHA: ${{ inputs.merge_sha }}
+        BASE_REF: ${{ inputs.base_ref }}
+      with:
+        script: |
+          const {owner, repo} = context.repo;
+          const {PR_NUMBER, HEAD_SHA, BASE_SHA, MERGE_SHA, BASE_REF} = process.env;
+          if (!/^(0|[1-9][0-9]*)$/.test(PR_NUMBER) ||
+              ![HEAD_SHA, BASE_SHA, MERGE_SHA].every(sha => /^[a-f0-9]{40}$/.test(sha))) {
+            throw new Error('Invalid queued commit identity');
+          }
+          const {data: branch} = await github.rest.repos.getBranch({owner, repo, branch: BASE_REF});
+          if (branch.commit.sha !== BASE_SHA) throw new Error('Queued base is obsolete; scheduler will replan');
+          if (PR_NUMBER !== '0') {
+            const {data: repository} = await github.rest.repos.get({owner, repo});
+            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: Number(PR_NUMBER)});
+            if (!Number.isSafeInteger(repository.id) || pr.head.repo?.id !== repository.id ||
+                pr.base.repo?.id !== repository.id) {
+              throw new Error('Fork execution is not allowed by trusted dispatch; use a reviewed repository branch');
+            }
+            if (pr.state !== 'open' || pr.draft ||
+                (process.env.REQUIRE_READY !== 'false' && !pr.labels.some(label => label.name === 'ready')) ||
+                pr.head.sha !== HEAD_SHA || pr.base.sha !== BASE_SHA || pr.base.ref !== BASE_REF ||
+                pr.merge_commit_sha !== MERGE_SHA) {
+              throw new Error('Queued PR snapshot is obsolete; scheduler will replan');
+            }
+            const {data: merge} = await github.rest.repos.getCommit({owner, repo, ref: MERGE_SHA});
+            if (merge.parents.length !== 2 || merge.parents[0].sha !== BASE_SHA || merge.parents[1].sha !== HEAD_SHA) {
+              throw new Error('Invalid merge parents');
+            }
+          } else if (HEAD_SHA !== BASE_SHA || MERGE_SHA !== BASE_SHA) {
+            throw new Error('Regression must validate one immutable branch commit');
+          }
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.merge_sha }}
+        fetch-depth: 2
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Select worker-local lint cache
+      run: echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311" >> "$GITHUB_ENV"
+    - name: Install policy parser dependency
+      run: python -m pip install 'PyYAML>=6.0'
+    - name: Lint checked-out candidate policy
+      run: python tools/ci/resolve_benchmark_policy.py --policy-file .github/benchmark-gate.yaml --validate-only
+    - name: Fetch target branch benchmark policy runtime
+      id: benchmark-policy
+      uses: actions/github-script@v7
+      env:
+        POLICY_REF: ${{ inputs.base_sha }}
+      with:
+        script: "const fs = require('fs');\nconst path = require('path');\nconst owner = context.repo.owner;\n\
+          const repo = context.repo.repo;\nconst ref = process.env.POLICY_REF;\nconst policyRepoPath =\
+          \ '.github/benchmark-gate.yaml';\nconst resolverRepoPath =\n  'tools/ci/resolve_benchmark_policy.py';\n\
+          const policyPath = path.join(\n  process.env.RUNNER_TEMP,\n  'benchmark-gate-base.yaml',\n);\n\
+          const resolverPath = path.join(\n  process.env.RUNNER_TEMP,\n  'resolve-benchmark-policy-base.py',\n\
+          );\n\nconst fetchFile = async (repoPath) => {\n  try {\n    const response = await github.rest.repos.getContent({\n\
+          \      owner,\n      repo,\n      path: repoPath,\n      ref,\n    });\n    if (Array.isArray(response.data)\
+          \ ||\n        response.data.type !== 'file' ||\n        !response.data.content) {\n      throw\
+          \ new Error(\n        `${repoPath}@${ref} is not a readable file`,\n      );\n    }\n    return\
+          \ Buffer.from(\n      response.data.content,\n      response.data.encoding,\n    ).toString('utf8');\n\
+          \  } catch (error) {\n    if (error.status === 404) {\n      return null;\n    }\n    throw\
+          \ error;\n  }\n};\n\nconst policy = await fetchFile(policyRepoPath);\nconst resolver = await\
+          \ fetchFile(resolverRepoPath);\nconst bootstrap = resolver === null;\nif (bootstrap && context.eventName\
+          \ !== 'pull_request') {\n  throw new Error(\n    `Required policy resolver ${resolverRepoPath}\
+          \ is missing ` +\n    `from ${ref}`,\n  );\n}\nif (!bootstrap && policy === null) {\n  throw\
+          \ new Error(\n    `Required benchmark policy ${policyRepoPath} is missing ` +\n    `from ${ref}`,\n\
+          \  );\n}\nif (policy !== null) {\n  fs.writeFileSync(policyPath, policy, {encoding: 'utf8'});\n\
+          }\nif (resolver !== null) {\n  fs.writeFileSync(\n    resolverPath,\n    resolver,\n    {encoding:\
+          \ 'utf8'},\n  );\n}\n\ncore.setOutput('bootstrap', String(bootstrap));\ncore.setOutput('policy-path',\
+          \ policyPath);\ncore.setOutput('ref', ref);\ncore.setOutput(\n  'resolver-path',\n  bootstrap\
+          \ ? resolverRepoPath : resolverPath,\n);\n"
+    - name: Resolve base-owned benchmark policy
+      env:
+        BOOTSTRAP_POLICY: ${{ steps.benchmark-policy.outputs.bootstrap }}
+        POLICY_FILE: ${{ steps.benchmark-policy.outputs.policy-path }}
+        POLICY_REF: ${{ steps.benchmark-policy.outputs.ref }}
+        POLICY_RESOLVER: ${{ steps.benchmark-policy.outputs.resolver-path }}
+        POLICY_TARGET_BRANCH: ${{ inputs.base_ref }}
+      run: "device=\"gpu\"\nboard_id=\"unknown\"\nif command -v npu-smi > /dev/null 2>&1; then\n  device=\"\
+        npu\"\n  board_id=\"$(\n    python -c 'import acl; print(acl.get_soc_name())' \\\n      2>/dev/null\
+        \ || echo unknown\n  )\"\nfi\n\nif [[ \"$POLICY_TARGET_BRANCH\" == \"decode_graph\" ]]; then\n\
+        \  # Share accuracy floors while retaining the known NPU performance profile.\n  if [[ \"$device\"\
+        \ == \"npu\" && \"$board_id\" == \"Ascend910_9362\" ]]; then\n    board_id=\"decode_graph_Ascend910_9362\"\
+        \n  else\n    board_id=\"decode_graph_${device}\"\n  fi\nfi\n\nargs=(\n  --device \"$device\"\n\
+        \  --board-id \"$board_id\"\n  --source-ref \"$POLICY_REF\"\n  --github-env \"$RUNNER_TEMP/resolved-benchmark-policy.env\"\
+        \n  --github-step-summary \"$GITHUB_STEP_SUMMARY\"\n)\nif [[ \"$BOOTSTRAP_POLICY\" == \"true\"\
+        \ ]]; then\n  echo \"Base resolver is absent; using the strict migration bootstrap.\"\n  args+=(--bootstrap-strict)\n\
+        else\n  args+=(--policy-file \"$POLICY_FILE\")\nfi\npython \"$POLICY_RESOLVER\" \"${args[@]}\"\
+        \n"
+    - name: Normalize v1/v2 policy outputs
+      id: normalize-policy
+      run: python tools/ci/normalize_benchmark_policy_env.py --env-file "$RUNNER_TEMP/resolved-benchmark-policy.env"
+        --github-output "$GITHUB_OUTPUT" --github-env "$GITHUB_ENV"
+    - name: Validate queued merge contracts
+      run: 'python -m pip install pre-commit==4.6.2 pytest pytest-timeout PyYAML regex numpy
+
+        pre-commit run --all-files --show-diff-on-failure
+
+        python tools/ci/run_cpu_tests.py
+
+        node --test tools/ci/tests/*.test.cjs'
+    - name: Cache OpenOneRec dataset
+      uses: corca-ai/local-cache@v2
+      id: cache-dataset
+      with:
+        path: OpenOneRec
+        base: /data/actions/cache
+        key: ${{ github.event_name == 'pull_request' && format('dataset-openonerec-{0}', runner.os) ||
+          format('dataset-openonerec-{0}-{1}', runner.os, runner.name) }}
+    - name: Verify dataset access before preparing the device
+      if: steps.cache-dataset.outputs.cache-hit != 'true'
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: "if [[ -z \"$HF_TOKEN\" ]]; then\n  echo \"No prepared OpenOneRec cache and no dataset token.\
+        \ A maintainer must warm the existing dataset cache before device validation.\" >&2\n  exit 1\n\
+        fi\n"
+    - uses: ./.github/actions/setup-device-env
+    - name: Download OpenOneRec dataset
+      if: steps.cache-dataset.outputs.cache-hit != 'true'
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: "if [[ -z \"$HF_TOKEN\" ]]; then\n  echo \"HF_TOKEN is required for the gated OpenOneRec dataset.\"\
+        \ >&2\n  exit 1\nfi\nuv tool install hf\nmkdir -p OpenOneRec\nhf download OpenOneRec/OpenOneRec-RecIF\
+        \ \\\n  --token \"$HF_TOKEN\" \\\n  --local-dir ./OpenOneRec \\\n  --repo-type=dataset\n"
+    - name: Verify CUDA device mapping before cleanup
+      id: cuda-mapping
+      run: 'python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
+
+        echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"'
+    - name: Kill stale process on assigned device
+      run: bash scripts/kill_vllm_on_device.sh
+    - name: Device unit and end-to-end tests
+      id: device-tests
+      run: "python tools/ci/run_stage.py device-tests -- bash tools/pre_commit/run_tests.sh \\\n  --junitxml\
+        \ ci-results/device-tests.xml \\\n  --ignore=tests/ci --ignore=tests/test_ready_label_ci.py \\\
+        \n  --ignore=tests/test_benchmark_branch_policy.py \\\n  --ignore=tests/test_v1_gate_validation.py\
+        \ \\\n  --ignore=tests/test_v1_recall_summary.py \\\n  --ignore=tests/test_beam_v1_performance_ab.py --ignore=tests/test_beam_search_v1_benchmark.py"
+    - name: Build catalog
+      run: "mkdir -p generated_data\npython ./benchmarks/open_one_rec/tools/create_task_catalog.py \\\n\
+        \  -t video \\\n  -d ./OpenOneRec/benchmark_data \\\n  -o generated_data/video_catalog.json\n\
+        python ./tools/build_constraint_triples.py \\\n  --catalog generated_data/video_catalog.json \\\
+        \n  --output generated_data/video_constraint_triples.json \\\n  --begin \"<|sid_begin|>\" \\\n\
+        \  --end \"<|sid_end|>\"\n"
+    - name: Cache OneRec Recall constraint tables
+      if: 'inputs.base_ref == ''decode_graph'' &&
+
+        env.BENCHMARK_DEVICE == ''gpu'''
+      uses: corca-ai/local-cache@v2
+      id: cache-recall-constraints
+      with:
+        path: generated_data/recall_constraints
+        base: /data/actions/cache
+        key: onerec-recall-constraints-v1-${{ runner.os }}-${{ hashFiles('OpenOneRec/benchmark_data/sid2pid.json',
+          'OpenOneRec/benchmark_data/sid2iid.json') }}-${{ runner.name }}
+    - name: Build OneRec Recall constraint tables
+      if: 'inputs.base_ref == ''decode_graph'' &&
+
+        env.BENCHMARK_DEVICE == ''gpu'' && steps.cache-recall-constraints.outputs.cache-hit != ''true'''
+      run: "set -euo pipefail\nmkdir -p generated_data/recall_constraints\nfor mapping in sid2pid sid2iid;\
+        \ do\n  python benchmarks/open_one_rec/tools/convert_catalog.py \\\n    --dataset-path OpenOneRec/benchmark_data\
+        \ \\\n    --mapping-file \"$mapping.json\" \\\n    --output-path \"generated_data/recall_constraints/$mapping-catalog.json\"\
+        \n  python tools/build_constraint_triples.py \\\n    --catalog \"generated_data/recall_constraints/$mapping-catalog.json\"\
+        \ \\\n    --output \"generated_data/recall_constraints/${mapping}_triples.json\" \\\n    --begin\
+        \ '<|sid_begin|>' \\\n    --end '<|sid_end|>'\n  rm \"generated_data/recall_constraints/$mapping-catalog.json\"\
+        \ndone\n"
+    - name: Gate Beam V1 B=4 OneRec Recall on fixed samples
+      if: 'inputs.base_ref == ''decode_graph'' &&
+
+        env.BENCHMARK_DEVICE == ''gpu'''
+      env:
+        V1_RECALL_DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
+        V1_RECALL_OUTPUT_DIR: ${{ github.workspace }}/v1_recall_results
+        V1_RECALL_BASELINE_FILE: ${{ github.workspace }}/benchmarks/beam_search/v1_recall_b4_baseline.json
+      run: python tools/ci/run_stage.py recall -- bash tests/system/run_beam_v1_recall.sh
+    - name: Upload Beam V1 Recall measurements
+      if: 'always() && inputs.base_ref == ''decode_graph'' &&
+
+        env.BENCHMARK_DEVICE == ''gpu'''
+      uses: actions/upload-artifact@v4
+      with:
+        name: beam-v1-recall-${{ github.run_id }}-${{ github.run_attempt }}
+        path: v1_recall_results
+        if-no-files-found: warn
+        retention-days: 14
+    - name: Resolve Beam V1 A/B freshness
+      id: ab-freshness
+      if: inputs.pr_number != '0' && inputs.base_ref == 'decode_graph' && env.BENCHMARK_DEVICE == 'gpu'
+      uses: actions/github-script@v7
+      env:
+        CI_BASE_REF: ${{ inputs.base_ref }}
+      with:
+        script: |
+          const {owner, repo} = context.repo;
+          const pr = {number: Number(process.env.PR_NUMBER), head: {sha: process.env.CI_HEAD_SHA},
+            base: {ref: process.env.CI_BASE_REF, sha: process.env.CI_BASE_SHA}};
+          const expectedTitle = `Beam V1 A/B #${pr.number} @${process.env.CI_MERGE_SHA}`;
+          let fresh = false;
+          let passed = false;
+          try {
+            for (let page = 1; page <= 10 && !fresh; page++) {
+              const {data} = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: 'beam-performance-ab.yml', event: 'pull_request_target',
+                head_sha: pr.base.sha, per_page: 100, page,
+              });
+              for (const run of data.workflow_runs) {
+                if (run.id === context.runId || run.status !== 'completed' ||
+                    !['success', 'failure'].includes(run.conclusion) ||
+                    run.head_sha !== pr.base.sha ||
+                    run.display_title !== expectedTitle) {
+                  continue;
+                }
+                const {data: jobs} = await github.rest.actions.listJobsForWorkflowRun({
+                  owner, repo, run_id: run.id, filter: 'latest', per_page: 100,
+                });
+                const ab = jobs.jobs.find(job =>
+                  job.name === 'Beam V1 performance A/B only' &&
+                  ['success', 'failure'].includes(job.conclusion));
+                if (!ab) continue;
+                const {data: artifacts} = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner, repo, run_id: run.id, per_page: 100,
+                });
+                fresh = artifacts.artifacts.some(artifact =>
+                  artifact.name ===
+                    `beam-v1-performance-report-${run.id}-${run.run_attempt}` &&
+                  !artifact.expired);
+                passed = fresh && ab.conclusion === 'success';
+                if (fresh) break;
+              }
+              if (data.workflow_runs.length < 100) break;
+            }
+          } catch (error) {
+            core.warning(`A/B freshness lookup failed; rerunning A/B: ${error.message}`);
+            fresh = false;
+            passed = false;
+          }
+          core.setOutput('fresh', fresh ? 'true' : 'false');
+          core.setOutput('passed', passed ? 'true' : 'false');
+          core.info(fresh
+            ? `Current revision's A/B report ${passed ? 'passed' : 'failed'}; reusing it.`
+            : 'A/B report is missing or stale; rerunning after regular GPU checks.');
+    - name: Require a passing current A/B report
+      if: steps.ab-freshness.outputs.fresh == 'true' && steps.ab-freshness.outputs.passed != 'true'
+      run: |
+        echo "::error::The current revision's A/B report failed. Re-add abtest to rerun it."
+        exit 1
+    - name: Measure Beam V1 offline batch and online concurrency
+      if: |-
+        inputs.base_ref == 'decode_graph' &&
+        env.BENCHMARK_DEVICE == 'gpu' && (inputs.pr_number == '0' || steps.ab-freshness.outputs.fresh != 'true')
+      env:
+        TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
+        V1_PERF_OUTPUT_DIR: ${{ github.workspace }}/v1_performance_results
+        V1_PERF_BASE_SHA: ${{ inputs.base_sha }}
+        V1_PERF_CANDIDATE_SHA: ${{ inputs.merge_sha }}
+        V1_PERF_HEAD_SHA: ${{ inputs.head_sha }}
+        V1_PERF_PR_NUMBER: ${{ inputs.pr_number }}
+      run: |
+        if [[ "$PR_NUMBER" == '0' ]]; then
+          python tools/ci/run_stage.py performance -- bash tests/system/run_beam_v1_performance.sh
+        else
+          python tools/ci/run_stage.py performance -- bash tests/system/run_beam_v1_performance_ab.sh
+        fi
+    - name: Upload Beam V1 performance measurements
+      if: 'always() && inputs.base_ref == ''decode_graph'' &&
+
+        env.BENCHMARK_DEVICE == ''gpu'''
+      uses: actions/upload-artifact@v4
+      with:
+        name: beam-v1-performance-${{ github.run_id }}-${{ github.run_attempt }}
+        path: v1_performance_results
+        if-no-files-found: warn
+        retention-days: 14
+    - name: Upload Beam V1 A/B report for PR comment
+      if: always() && inputs.pr_number != '0' && inputs.base_ref == 'decode_graph' && env.BENCHMARK_DEVICE
+        == 'gpu' && hashFiles('v1_performance_results/report.json') != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: beam-v1-performance-report-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          v1_performance_results/context.json
+          v1_performance_results/report.json
+          v1_performance_results/report.md
+        if-no-files-found: error
+        retention-days: 14
+    - name: Execute decode benchmark gates
+      if: inputs.base_ref != 'decode_graph'
+      env:
+        DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
+        CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
+        TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
+      run: python tools/ci/run_stage.py decode -- bash tests/system/run_benchmark_and_verify.sh
+    - name: Cache Pangu 1B model
+      uses: corca-ai/local-cache@v2
+      id: cache-pangu1b
+      with:
+        path: openPangu-Embedded-1B-V1.1
+        base: /data/actions/cache
+        # Preserve the existing machine-local, read-only model cache.
+        key: pangu1b-model-${{ runner.os }}
+    - name: Download Pangu 1B model
+      if: steps.cache-pangu1b.outputs.cache-hit != 'true'
+      run: "pip install modelscope\nmodelscope download \\\n  --model FreedomIntelligence/openPangu-Embedded-1B-V1.1\
+        \ \\\n  --local_dir \"$PANGU1B_MODEL_PATH\"\n"
+    - name: Run Pangu offline accuracy gate
+      run: python tools/ci/run_stage.py pangu-offline -- bash tests/system/run_pangu1b_acc_and_verify.sh
+    - name: Pangu online accuracy and API contract
+      run: python tools/ci/run_stage.py pangu-online -- bash tests/system/run_pangu1b_online_and_verify.sh
+    - name: Check clear device
+      if: always() && steps.cuda-mapping.outcome == 'success'
+      run: bash scripts/check_vllm_on_device.sh
+    - name: Upload test and checkpoint evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: device-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ci-results/
+        retention-days: 14
+        if-no-files-found: warn
+    - name: Complete device validation
+      run: echo "All required device stages and cleanup passed."

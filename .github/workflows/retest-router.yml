@@ -1,0 +1,10 @@
+name: Retest Router (migrated)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  migrated:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Use /retest on the PR; CI Queue handles prioritized retries.'

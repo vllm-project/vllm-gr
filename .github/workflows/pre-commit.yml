@@ -1,13 +1,11 @@
 name: Pre-commit and Benchmark
 
-# Keep this metadata protocol in sync with the default-branch retest router.
+# Keep this metadata protocol in sync with the default-branch queue dispatcher.
 run-name: >-
-  ${{ github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      !(github.event.pull_request.base.ref == 'decode_graph' &&
-        github.event.action == 'labeled' &&
-        github.event.label.name == 'abtest') &&
-      contains(github.event.pull_request.labels.*.name, 'ready') &&
+  ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number != '0' &&
+      format('ci-meta:v1;run={0};pr={1};base={2};base_sha={3};merge_sha={4}',
+             github.run_id, inputs.pr_number, inputs.base_ref, inputs.base_sha, inputs.merge_sha) ||
+      github.event_name == 'pull_request' &&
       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
        github.event.label.name == 'ready') &&
       format('ci-meta:v1;run={0};pr={1};base={2};base_sha={3};merge_sha={4}',
@@ -16,6 +14,8 @@ run-name: >-
              github.event.pull_request.base.ref,
              github.event.pull_request.base.sha,
              github.sha) ||
+      ((github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+       github.event.label.name != 'ready') && format('ci-ignored:{0}', github.run_id) ||
       format('{0}:{1}@{2}', github.event_name, github.ref_name, github.sha) }}
 
 on:
@@ -29,8 +29,35 @@ on:
       - converted_to_draft
       - labeled
       - unlabeled
+  push:
+    branches: [main, decode_graph]
   workflow_dispatch:
     inputs:
+      pr_number:
+        description: PR snapshot to refresh; 0 checks the selected branch
+        required: false
+        default: '0'
+        type: string
+      head_sha:
+        description: Immutable PR head
+        required: false
+        default: ''
+        type: string
+      base_sha:
+        description: Immutable target commit
+        required: false
+        default: ''
+        type: string
+      merge_sha:
+        description: Immutable merge snapshot
+        required: false
+        default: ''
+        type: string
+      base_ref:
+        description: Target branch
+        required: false
+        default: ''
+        type: string
       rebuild_pre_commit_cache:
         description: Delete and rebuild this runner's local pre-commit cache
         required: false
@@ -38,942 +65,103 @@ on:
         type: boolean
 
 concurrency:
-  # Keep A/B-only requests out of the full validation's single pending slot.
+  # Unrelated label edits must not cancel queued or running CI for this PR.
   group: >-
     ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) ||
       github.event.pull_request.number || github.ref
     }}-${{
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-      github.event.label.name != 'ready' &&
-      (github.event.label.name != 'abtest' ||
-       github.event.action == 'unlabeled') &&
-      format('ignored-{0}', github.run_id) ||
-      (github.event.action == 'labeled' &&
-       github.event.label.name == 'abtest' && 'abtest' || 'ci')
+      github.event.label.name != 'ready' && format('ignored-{0}', github.run_id) || 'ci'
     }}
-  cancel-in-progress: >-
-    ${{ github.event_name == 'pull_request' &&
-        !(github.event.action == 'labeled' &&
-          github.event.label.name == 'abtest') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 permissions:
-  actions: read
   contents: read
+  pull-requests: read
 
 env:
   # Use PCI order; the standalone UUID check verifies actual device identity.
   CUDA_DEVICE_ORDER: PCI_BUS_ID
 
 jobs:
-  resolve-ab-freshness:
-    name: Resolve Beam V1 A/B freshness
+  fast-checks:
+    name: CPU checks
     if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.base.ref == 'decode_graph' &&
-      contains(github.event.pull_request.labels.*.name, 'ready') &&
-      !(github.event.action == 'labeled' && github.event.label.name == 'abtest') &&
-      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-       github.event.label.name == 'ready')
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      github.event.label.name == 'ready'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
-      fresh: ${{ steps.lookup.outputs.fresh }}
-      passed: ${{ steps.lookup.outputs.passed }}
+      device-required: ${{ steps.plan.outputs.device-required }}
     steps:
-      - name: Find a successful A/B run for this PR revision
-        id: lookup
+      - name: Verify queued snapshot
         uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          MERGE_SHA: ${{ inputs.merge_sha }}
+          BASE_REF: ${{ inputs.base_ref }}
         with:
           script: |
             const {owner, repo} = context.repo;
-            const pr = context.payload.pull_request;
-            const defaultTitle = `pull_request:${pr.number}/merge@${context.sha}`;
-            let fresh = false;
-            let passed = false;
-            try {
-              for (let page = 1; page <= 10 && !fresh; page++) {
-                const {data} = await github.rest.actions.listWorkflowRuns({
-                  owner, repo, workflow_id: 'pre-commit.yml', event: 'pull_request',
-                  head_sha: pr.head.sha, per_page: 100, page,
-                });
-                for (const run of data.workflow_runs) {
-                  const fullTitle =
-                    `ci-meta:v1;run=${run.id};pr=${pr.number};base=${pr.base.ref};` +
-                    `base_sha=${pr.base.sha};merge_sha=${context.sha}`;
-                  if (run.id === context.runId || run.status !== 'completed' ||
-                      !['success', 'failure'].includes(run.conclusion) ||
-                      run.head_sha !== pr.head.sha ||
-                      (run.display_title !== defaultTitle &&
-                       run.display_title !== fullTitle)) {
-                    continue;
-                  }
-                  const {data: jobs} = await github.rest.actions.listJobsForWorkflowRun({
-                    owner, repo, run_id: run.id, filter: 'latest', per_page: 100,
-                  });
-                  const ab = jobs.jobs.find(job =>
-                    job.name === 'Beam V1 performance A/B only' &&
-                    ['success', 'failure'].includes(job.conclusion));
-                  if (!ab) continue;
-                  const {data: artifacts} = await github.rest.actions.listWorkflowRunArtifacts({
-                    owner, repo, run_id: run.id, per_page: 100,
-                  });
-                  fresh = artifacts.artifacts.some(artifact =>
-                    artifact.name ===
-                      `beam-v1-performance-report-${run.id}-${run.run_attempt}` &&
-                    !artifact.expired);
-                  passed = fresh && ab.conclusion === 'success';
-                  if (fresh) break;
-                }
-                if (data.workflow_runs.length < 100) break;
-              }
-            } catch (error) {
-              core.warning(`A/B freshness lookup failed; rerunning A/B: ${error.message}`);
-              fresh = false;
-              passed = false;
+            const {PR_NUMBER, HEAD_SHA, BASE_SHA, MERGE_SHA, BASE_REF} = process.env;
+            if (!/^(0|[1-9][0-9]*)$/.test(PR_NUMBER) ||
+                ![HEAD_SHA, BASE_SHA, MERGE_SHA].every(sha => /^[a-f0-9]{40}$/.test(sha))) {
+              throw new Error('Invalid queued commit identity');
             }
-            core.setOutput('fresh', fresh ? 'true' : 'false');
-            core.setOutput('passed', passed ? 'true' : 'false');
-            core.info(fresh
-              ? `Current revision's A/B report ${passed ? 'passed' : 'failed'}; reusing it.`
-              : 'A/B report is missing or stale; rerunning after regular GPU checks.');
-
-  benchmark-policy:
-    name: Resolve benchmark policy
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.draft == false &&
-       !(github.event.pull_request.base.ref == 'decode_graph' &&
-         github.event.action == 'labeled' &&
-         github.event.label.name == 'abtest') &&
-       contains(github.event.pull_request.labels.*.name, 'ready') &&
-       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-        github.event.label.name == 'ready'))
-    # Resolve device overrides on the same runner class used by the gates.
-    runs-on: self-hosted
-    outputs:
-      policy-json: ${{ steps.normalize-policy.outputs.policy-json }}
-    steps:
+            const {data: branch} = await github.rest.repos.getBranch({owner, repo, branch: BASE_REF});
+            if (branch.commit.sha !== BASE_SHA) throw new Error('Queued base is obsolete; scheduler will replan');
+            if (PR_NUMBER !== '0') {
+              const {data: repository} = await github.rest.repos.get({owner, repo});
+              const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: Number(PR_NUMBER)});
+              if (!Number.isSafeInteger(repository.id) || pr.head.repo?.id !== repository.id ||
+                  pr.base.repo?.id !== repository.id) {
+                throw new Error('Fork execution is not allowed by trusted dispatch; use a reviewed repository branch');
+              }
+              if (pr.state !== 'open' || pr.draft ||
+                  (process.env.REQUIRE_READY !== 'false' && !pr.labels.some(label => label.name === 'ready')) ||
+                  pr.head.sha !== HEAD_SHA || pr.base.sha !== BASE_SHA || pr.base.ref !== BASE_REF ||
+                  pr.merge_commit_sha !== MERGE_SHA) {
+                throw new Error('Queued PR snapshot is obsolete; scheduler will replan');
+              }
+              const {data: merge} = await github.rest.repos.getCommit({owner, repo, ref: MERGE_SHA});
+              if (merge.parents.length !== 2 || merge.parents[0].sha !== BASE_SHA || merge.parents[1].sha !== HEAD_SHA) {
+                throw new Error('Invalid merge parents');
+              }
+            } else if (HEAD_SHA !== BASE_SHA || MERGE_SHA !== BASE_SHA) {
+              throw new Error('Regression must validate one immutable branch commit');
+            }
+        if: github.event_name == 'workflow_dispatch' && inputs.pr_number != '0'
       - uses: actions/checkout@v4
-
+        with:
+          ref: ${{ inputs.merge_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Install policy parser dependency
-        run: python -m pip install 'PyYAML>=6.0'
-
-      - name: Lint checked-out candidate policy
-        run: >-
-          python tools/ci/resolve_benchmark_policy.py
-          --policy-file .github/benchmark-gate.yaml
-          --validate-only
-
-      - name: Fetch target branch benchmark policy runtime
-        id: benchmark-policy
-        uses: actions/github-script@v7
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Plan device coverage
+        id: plan
         env:
-          POLICY_REF: >-
-            ${{ github.event.pull_request.base.sha || github.sha }}
+          CI_BASE_SHA: ${{ inputs.base_sha || github.event.pull_request.base.sha }}
+        run: python tools/ci/plan.py
+      - name: Install CPU check tools
+        run: python -m pip install pre-commit==4.6.2 pytest pytest-timeout PyYAML regex numpy
+      - uses: actions/cache@v4
         with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const ref = process.env.POLICY_REF;
-            const policyRepoPath = '.github/benchmark-gate.yaml';
-            const resolverRepoPath =
-              'tools/ci/resolve_benchmark_policy.py';
-            const policyPath = path.join(
-              process.env.RUNNER_TEMP,
-              'benchmark-gate-base.yaml',
-            );
-            const resolverPath = path.join(
-              process.env.RUNNER_TEMP,
-              'resolve-benchmark-policy-base.py',
-            );
-
-            const fetchFile = async (repoPath) => {
-              try {
-                const response = await github.rest.repos.getContent({
-                  owner,
-                  repo,
-                  path: repoPath,
-                  ref,
-                });
-                if (Array.isArray(response.data) ||
-                    response.data.type !== 'file' ||
-                    !response.data.content) {
-                  throw new Error(
-                    `${repoPath}@${ref} is not a readable file`,
-                  );
-                }
-                return Buffer.from(
-                  response.data.content,
-                  response.data.encoding,
-                ).toString('utf8');
-              } catch (error) {
-                if (error.status === 404) {
-                  return null;
-                }
-                throw error;
-              }
-            };
-
-            const policy = await fetchFile(policyRepoPath);
-            const resolver = await fetchFile(resolverRepoPath);
-            const bootstrap = resolver === null;
-            if (bootstrap && context.eventName !== 'pull_request') {
-              throw new Error(
-                `Required policy resolver ${resolverRepoPath} is missing ` +
-                `from ${ref}`,
-              );
-            }
-            if (!bootstrap && policy === null) {
-              throw new Error(
-                `Required benchmark policy ${policyRepoPath} is missing ` +
-                `from ${ref}`,
-              );
-            }
-            if (policy !== null) {
-              fs.writeFileSync(policyPath, policy, {encoding: 'utf8'});
-            }
-            if (resolver !== null) {
-              fs.writeFileSync(
-                resolverPath,
-                resolver,
-                {encoding: 'utf8'},
-              );
-            }
-
-            core.setOutput('bootstrap', String(bootstrap));
-            core.setOutput('policy-path', policyPath);
-            core.setOutput('ref', ref);
-            core.setOutput(
-              'resolver-path',
-              bootstrap ? resolverRepoPath : resolverPath,
-            );
-
-      - name: Resolve base-owned benchmark policy
-        env:
-          BOOTSTRAP_POLICY: ${{ steps.benchmark-policy.outputs.bootstrap }}
-          POLICY_FILE: ${{ steps.benchmark-policy.outputs.policy-path }}
-          POLICY_REF: ${{ steps.benchmark-policy.outputs.ref }}
-          POLICY_RESOLVER: ${{ steps.benchmark-policy.outputs.resolver-path }}
-          POLICY_TARGET_BRANCH: ${{ github.base_ref || github.ref_name }}
-        run: |
-          device="gpu"
-          board_id="unknown"
-          if command -v npu-smi > /dev/null 2>&1; then
-            device="npu"
-            board_id="$(
-              python -c 'import acl; print(acl.get_soc_name())' \
-                2>/dev/null || echo unknown
-            )"
-          fi
-
-          if [[ "$POLICY_TARGET_BRANCH" == "decode_graph" ]]; then
-            # Share accuracy floors while retaining the known NPU performance profile.
-            if [[ "$device" == "npu" && "$board_id" == "Ascend910_9362" ]]; then
-              board_id="decode_graph_Ascend910_9362"
-            else
-              board_id="decode_graph_${device}"
-            fi
-          fi
-
-          args=(
-            --device "$device"
-            --board-id "$board_id"
-            --source-ref "$POLICY_REF"
-            --github-env "$RUNNER_TEMP/resolved-benchmark-policy.env"
-            --github-step-summary "$GITHUB_STEP_SUMMARY"
-          )
-          if [[ "$BOOTSTRAP_POLICY" == "true" ]]; then
-            echo "Base resolver is absent; using the strict migration bootstrap."
-            args+=(--bootstrap-strict)
-          else
-            args+=(--policy-file "$POLICY_FILE")
-          fi
-          python "$POLICY_RESOLVER" "${args[@]}"
-
-      - name: Normalize v1/v2 policy outputs
-        id: normalize-policy
-        run: >-
-          python tools/ci/normalize_benchmark_policy_env.py
-          --env-file "$RUNNER_TEMP/resolved-benchmark-policy.env"
-          --github-output "$GITHUB_OUTPUT"
-
-  pre-commit:
-    name: Pre-commit
-    needs: benchmark-policy
-    if: needs.benchmark-policy.result == 'success'
-    runs-on: self-hosted
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
-      queue: max
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v1
-
-      - name: Cache virtual environment
-        uses: corca-ai/local-cache@v2
-        id: cache-venv
-        with:
-          path: .venv
-          base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
-
-      - name: Create virtual environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: uv venv --seed .venv
-
-      - name: Set up virtual environment
-        run: |
-          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          {
-            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
-            echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
-            echo "PRE_COMMIT_HOME=/data/actions/cache/pre-commit-${RUNNER_NAME}-py311"
-          } >> "$GITHUB_ENV"
-
-      - name: Install base environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: uv pip install vllm==0.22.1
-
-      - name: Install dependencies
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
-
-      - name: Refresh editable installation
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
-
-      - name: Verify vLLM compatibility
-        run: |
-          python -c 'import importlib.metadata as m; version = m.version("vllm").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM 0.22.1, found {version}"'
-          python -c 'import importlib.metadata as m; version = m.version("vllm-gr").partition("+")[0]; assert version == "0.22.1", f"Expected vLLM-GR 0.22.1, found {version}"'
-
-      - name: Verify CUDA device mapping before cleanup
-        id: cuda-mapping
-        run: |
-          python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-      - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
-
-      - name: Install pre-commit
-        run: uv pip install pre-commit==4.6.2
-
-      - name: Reset local pre-commit cache
-        if: >-
-          github.event_name == 'workflow_dispatch' &&
-          inputs.rebuild_pre_commit_cache
+          path: ~/.cache/pre-commit
+          key: cpu-hooks-${{ runner.os }}-py311-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Reset pre-commit cache
+        if: github.event_name == 'workflow_dispatch' && inputs.rebuild_pre_commit_cache
         run: pre-commit clean
-
-      - name: Run pre-commit
-        run: >-
-          pre-commit run
-          --show-diff-on-failure
-          --color=always
-          --all-files
-
-      - name: Check clear device
-        if: always() && steps.cuda-mapping.outcome == 'success'
-        run: bash ./scripts/check_vllm_on_device.sh
-
-  decode-benchmark:
-    name: Decode benchmark
-    needs: [benchmark-policy, pre-commit]
-    if: >-
-      needs.benchmark-policy.result == 'success' &&
-      needs.pre-commit.result == 'success'
-    runs-on: self-hosted
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
-      queue: max
-      cancel-in-progress: false
-    env:
-      BENCHMARK_POLICY_NAME: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_POLICY_NAME }}
-      BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
-      ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ACCURACY_FAILURE_MODE }}
-      P99_TTFT_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TTFT_FAILURE_MODE }}
-      P99_TPOT_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_FAILURE_MODE }}
-      ONLINE_ELAPSED_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ONLINE_ELAPSED_FAILURE_MODE }}
-      OFFLINE_ELAPSED_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).OFFLINE_ELAPSED_FAILURE_MODE }}
-      PASS_AT_1_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PASS_AT_1_THRESHOLD }}
-      PASS_AT_32_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PASS_AT_32_THRESHOLD }}
-      RECALL_AT_32_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).RECALL_AT_32_THRESHOLD }}
-      ELAPSED_TIME_ONLINE_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ELAPSED_TIME_ONLINE_THRESHOLD }}
-      ELAPSED_TIME_OFFLINE_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).ELAPSED_TIME_OFFLINE_THRESHOLD }}
-      P99_TTFT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TTFT_THRESHOLD }}
-      P99_TPOT_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).P99_TPOT_THRESHOLD }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v1
-
-      - name: Restore virtual environment
-        uses: corca-ai/local-cache@v2
-        id: cache-venv
-        with:
-          path: .venv
-          base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
-
-      - name: Require cached virtual environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+      - name: Lint and type checks
+        run: pre-commit run --all-files --show-diff-on-failure
+      - name: CPU contracts and scheduling tests
         run: |
-          echo "The pre-commit environment cache is unexpectedly unavailable." >&2
-          exit 1
-
-      - name: Set up virtual environment
-        run: |
-          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
-
-      - name: Refresh editable installation
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
-
-      - name: Verify CUDA device mapping before cleanup
-        id: cuda-mapping
-        run: |
-          python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-      - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
-
-      - name: Cache OpenOneRec dataset
-        uses: corca-ai/local-cache@v2
-        id: cache-dataset
-        with:
-          path: OpenOneRec
-          base: /data/actions/cache
-          key: dataset-openonerec-${{ runner.os }}
-
-      - name: Download OpenOneRec dataset
-        if: steps.cache-dataset.outputs.cache-hit != 'true'
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          if [[ -z "$HF_TOKEN" ]]; then
-            echo "HF_TOKEN is required for the gated OpenOneRec dataset." >&2
-            exit 1
-          fi
-          uv tool install hf
-          mkdir -p OpenOneRec
-          hf download OpenOneRec/OpenOneRec-RecIF \
-            --token "$HF_TOKEN" \
-            --local-dir ./OpenOneRec \
-            --repo-type=dataset
-
-      - name: Build catalog
-        run: |
-          mkdir -p generated_data
-          python ./benchmarks/open_one_rec/tools/create_task_catalog.py \
-            -t video \
-            -d ./OpenOneRec/benchmark_data \
-            -o generated_data/video_catalog.json
-          python ./tools/build_constraint_triples.py \
-            --catalog generated_data/video_catalog.json \
-            --output generated_data/video_constraint_triples.json \
-            --begin "<|sid_begin|>" \
-            --end "<|sid_end|>"
-
-      - name: Cache OneRec Recall constraint tables
-        if: >-
-          (github.ref_name == 'decode_graph' ||
-           github.event.pull_request.base.ref == 'decode_graph') &&
-          env.BENCHMARK_DEVICE == 'gpu'
-        uses: corca-ai/local-cache@v2
-        id: cache-recall-constraints
-        with:
-          path: generated_data/recall_constraints
-          base: /data/actions/cache
-          key: onerec-recall-constraints-v1-${{ runner.os }}-${{ hashFiles('OpenOneRec/benchmark_data/sid2pid.json', 'OpenOneRec/benchmark_data/sid2iid.json') }}
-
-      - name: Build OneRec Recall constraint tables
-        if: >-
-          (github.ref_name == 'decode_graph' ||
-           github.event.pull_request.base.ref == 'decode_graph') &&
-          env.BENCHMARK_DEVICE == 'gpu' &&
-          steps.cache-recall-constraints.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p generated_data/recall_constraints
-          for mapping in sid2pid sid2iid; do
-            python benchmarks/open_one_rec/tools/convert_catalog.py \
-              --dataset-path OpenOneRec/benchmark_data \
-              --mapping-file "$mapping.json" \
-              --output-path "generated_data/recall_constraints/$mapping-catalog.json"
-            python tools/build_constraint_triples.py \
-              --catalog "generated_data/recall_constraints/$mapping-catalog.json" \
-              --output "generated_data/recall_constraints/${mapping}_triples.json" \
-              --begin '<|sid_begin|>' \
-              --end '<|sid_end|>'
-            rm "generated_data/recall_constraints/$mapping-catalog.json"
-          done
-
-      - name: Gate Beam V1 B=4 OneRec Recall on fixed samples
-        if: >-
-          (github.ref_name == 'decode_graph' ||
-           github.event.pull_request.base.ref == 'decode_graph') &&
-          env.BENCHMARK_DEVICE == 'gpu'
-        env:
-          V1_RECALL_DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
-          V1_RECALL_OUTPUT_DIR: ${{ github.workspace }}/v1_recall_results
-          V1_RECALL_BASELINE_FILE: ${{ github.workspace }}/benchmarks/beam_search/v1_recall_b4_baseline.json
-        run: bash ./tests/system/run_beam_v1_recall.sh
-
-      - name: Upload Beam V1 Recall measurements
-        if: >-
-          always() &&
-          (github.ref_name == 'decode_graph' ||
-           github.event.pull_request.base.ref == 'decode_graph') &&
-          env.BENCHMARK_DEVICE == 'gpu'
-        uses: actions/upload-artifact@v4
-        with:
-          name: beam-v1-recall-${{ github.run_id }}-${{ github.run_attempt }}
-          path: v1_recall_results
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Execute decode benchmark gates
-        if: >-
-          github.ref_name != 'decode_graph' &&
-          github.event.pull_request.base.ref != 'decode_graph'
-        env:
-          DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
-          CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
-          TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
-        run: ./tests/system/run_benchmark_and_verify.sh
-
-      - name: Check clear device
-        if: always() && steps.cuda-mapping.outcome == 'success'
-        run: bash ./scripts/check_vllm_on_device.sh
-
-  beam-performance-ab-only:
-    name: Beam V1 performance A/B only
-    needs: [resolve-ab-freshness, pangu-online]
-    if: >-
-      !cancelled() &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.base.ref == 'decode_graph' &&
-      ((github.event.action == 'labeled' &&
-        github.event.label.name == 'abtest') ||
-       (contains(github.event.pull_request.labels.*.name, 'ready') &&
-        ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-         github.event.label.name == 'ready') &&
-        needs.resolve-ab-freshness.outputs.fresh != 'true'))
-    runs-on: self-hosted
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
-      queue: max
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v1
-
-      - name: Require a CUDA runner
-        run: nvidia-smi --query-gpu=name --format=csv,noheader
-
-      - name: Restore virtual environment
-        uses: corca-ai/local-cache@v2
-        id: cache-venv
-        with:
-          path: .venv
-          base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
-
-      - name: Create virtual environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: uv venv --seed .venv
-
-      - name: Set up virtual environment
-        run: |
-          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
-
-      - name: Install base environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: uv pip install vllm==0.22.1
-
-      - name: Refresh editable installation
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
-
-      - name: Verify CUDA device mapping before cleanup
-        id: cuda-mapping
-        run: |
-          python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-      - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
-
-      - name: Cache OpenOneRec dataset
-        uses: corca-ai/local-cache@v2
-        id: cache-dataset
-        with:
-          path: OpenOneRec
-          base: /data/actions/cache
-          key: dataset-openonerec-${{ runner.os }}
-
-      - name: Download OpenOneRec dataset
-        if: steps.cache-dataset.outputs.cache-hit != 'true'
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          if [[ -z "$HF_TOKEN" ]]; then
-            echo "HF_TOKEN is required for the gated OpenOneRec dataset." >&2
-            exit 1
-          fi
-          uv tool install hf
-          mkdir -p OpenOneRec
-          hf download OpenOneRec/OpenOneRec-RecIF \
-            --token "$HF_TOKEN" \
-            --local-dir ./OpenOneRec \
-            --repo-type=dataset
-
-      - name: Build catalog
-        run: |
-          mkdir -p generated_data
-          python ./benchmarks/open_one_rec/tools/create_task_catalog.py \
-            -t video \
-            -d ./OpenOneRec/benchmark_data \
-            -o generated_data/video_catalog.json
-          python ./tools/build_constraint_triples.py \
-            --catalog generated_data/video_catalog.json \
-            --output generated_data/video_constraint_triples.json \
-            --begin "<|sid_begin|>" \
-            --end "<|sid_end|>"
-
-      - name: Run Beam V1 performance A/B
-        env:
-          TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
-          V1_PERF_OUTPUT_DIR: ${{ github.workspace }}/v1_performance_results
-          V1_PERF_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          V1_PERF_CANDIDATE_SHA: ${{ github.sha }}
-          V1_PERF_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          V1_PERF_PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: bash ./tests/system/run_beam_v1_performance_ab.sh
-
-      - name: Upload Beam V1 performance measurements
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: beam-v1-performance-${{ github.run_id }}-${{ github.run_attempt }}
-          path: v1_performance_results
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Upload Beam V1 A/B report for PR comment
-        if: always() && hashFiles('v1_performance_results/report.json') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: beam-v1-performance-report-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            v1_performance_results/context.json
-            v1_performance_results/report.json
-            v1_performance_results/report.md
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Check clear device
-        if: always() && steps.cuda-mapping.outcome == 'success'
-        run: bash ./scripts/check_vllm_on_device.sh
-
-  pangu-offline:
-    name: Pangu offline accuracy
-    needs: [benchmark-policy, pre-commit, decode-benchmark]
-    if: >-
-      ${{ !cancelled() &&
-      needs.benchmark-policy.result == 'success' &&
-      needs.pre-commit.result == 'success' }}
-    runs-on: self-hosted
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
-      queue: max
-      cancel-in-progress: false
-    env:
-      BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
-      PANGU1B_OFFLINE_ACCURACY_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_OFFLINE_ACCURACY_THRESHOLD }}
-      PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_OFFLINE_ACCURACY_FAILURE_MODE }}
-      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v1
-
-      - name: Restore virtual environment
-        uses: corca-ai/local-cache@v2
-        id: cache-venv
-        with:
-          path: .venv
-          base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
-
-      - name: Require cached virtual environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: exit 1
-
-      - name: Set up virtual environment
-        run: |
-          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
-
-      - name: Refresh editable installation
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
-
-      - name: Verify CUDA device mapping before cleanup
-        id: cuda-mapping
-        run: |
-          python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-      - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
-
-      - name: Cache Pangu 1B model
-        uses: corca-ai/local-cache@v2
-        id: cache-pangu1b
-        with:
-          path: openPangu-Embedded-1B-V1.1
-          base: /data/actions/cache
-          key: pangu1b-model-${{ runner.os }}
-
-      - name: Download Pangu 1B model
-        if: steps.cache-pangu1b.outputs.cache-hit != 'true'
-        run: |
-          pip install modelscope
-          modelscope download \
-            --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
-            --local_dir "$PANGU1B_MODEL_PATH"
-
-      - name: Run Pangu offline accuracy gate
-        run: ./tests/system/run_pangu1b_acc_and_verify.sh
-
-      - name: Check clear device
-        if: always() && steps.cuda-mapping.outcome == 'success'
-        run: bash ./scripts/check_vllm_on_device.sh
-
-  pangu-online:
-    name: Pangu online accuracy and API contract
-    needs: [benchmark-policy, pre-commit, decode-benchmark, pangu-offline]
-    if: >-
-      ${{ !cancelled() &&
-      needs.benchmark-policy.result == 'success' &&
-      needs.pre-commit.result == 'success' }}
-    runs-on: self-hosted
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-gpu
-      queue: max
-      cancel-in-progress: false
-    env:
-      BENCHMARK_DEVICE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).BENCHMARK_DEVICE }}
-      PANGU1B_ONLINE_ACCURACY_THRESHOLD: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_ONLINE_ACCURACY_THRESHOLD }}
-      PANGU1B_ONLINE_ACCURACY_FAILURE_MODE: ${{ fromJSON(needs.benchmark-policy.outputs.policy-json).PANGU1B_ONLINE_ACCURACY_FAILURE_MODE }}
-      PANGU1B_MODEL_PATH: ${{ github.workspace }}/openPangu-Embedded-1B-V1.1
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v1
-
-      - name: Restore virtual environment
-        uses: corca-ai/local-cache@v2
-        id: cache-venv
-        with:
-          path: .venv
-          base: /data/actions/cache
-          key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py') }}
-
-      - name: Require cached virtual environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: exit 1
-
-      - name: Set up virtual environment
-        run: |
-          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
-          echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
-
-      - name: Refresh editable installation
-        run: |
-          export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
-          uv pip install -e ".[dev]"
-
-      - name: Verify CUDA device mapping before cleanup
-        id: cuda-mapping
-        run: |
-          python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
-      - name: Kill stale process on device
-        run: bash ./scripts/kill_vllm_on_device.sh
-
-      - name: Cache Pangu 1B model
-        uses: corca-ai/local-cache@v2
-        id: cache-pangu1b
-        with:
-          path: openPangu-Embedded-1B-V1.1
-          base: /data/actions/cache
-          key: pangu1b-model-${{ runner.os }}
-
-      - name: Download Pangu 1B model
-        if: steps.cache-pangu1b.outputs.cache-hit != 'true'
-        run: |
-          pip install modelscope
-          modelscope download \
-            --model FreedomIntelligence/openPangu-Embedded-1B-V1.1 \
-            --local_dir "$PANGU1B_MODEL_PATH"
-
-      - name: Run Pangu online accuracy and API contract gate
-        run: ./tests/system/run_pangu1b_online_and_verify.sh
-
-      - name: Check clear device
-        if: always() && steps.cuda-mapping.outcome == 'success'
-        run: bash ./scripts/check_vllm_on_device.sh
-
-  benchmark-blocking:
-    # Ignored label events must not replace the required check with a skipped one.
-    name: >-
-      ${{ github.event_name == 'pull_request' &&
-          (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
-          github.event.label.name != 'ready' &&
-          (github.event.label.name != 'abtest' ||
-           github.event.action == 'unlabeled') &&
-          'Ignored label event' ||
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.base.ref == 'decode_graph' &&
-          contains(github.event.pull_request.labels.*.name, 'abtest') &&
-          !(github.event.action == 'unlabeled' &&
-            github.event.label.name == 'ready') &&
-          (!contains(github.event.pull_request.labels.*.name, 'ready') ||
-           (github.event.action == 'labeled' &&
-            github.event.label.name == 'abtest')) &&
-          'Beam V1 performance A/B gate' ||
-          'Benchmark blocking gate' }}
-    needs:
-      - resolve-ab-freshness
-      - benchmark-policy
-      - pre-commit
-      - decode-benchmark
-      - beam-performance-ab-only
-      - pangu-offline
-      - pangu-online
-    if: >-
-      always() &&
-      (github.event_name != 'pull_request' ||
-       (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-       github.event.label.name == 'ready' ||
-       (github.event.label.name == 'abtest' &&
-        github.event.action == 'labeled'))
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every blocking check to pass
-        env:
-          ABTEST_ONLY: >-
-            ${{ github.event_name == 'pull_request' &&
-                github.event.pull_request.base.ref == 'decode_graph' &&
-                contains(github.event.pull_request.labels.*.name, 'abtest') &&
-                !(github.event.action == 'unlabeled' &&
-                  github.event.label.name == 'ready') &&
-                (!contains(github.event.pull_request.labels.*.name, 'ready') ||
-                 (github.event.action == 'labeled' &&
-                  github.event.label.name == 'abtest')) }}
-          ABTEST_RESULT: ${{ needs.beam-performance-ab-only.result }}
-          ABTEST_FRESH: ${{ needs.resolve-ab-freshness.outputs.fresh }}
-          ABTEST_PASSED: ${{ needs.resolve-ab-freshness.outputs.passed }}
-          ABTEST_REQUIRED: >-
-            ${{ github.event_name == 'pull_request' &&
-                github.event.pull_request.base.ref == 'decode_graph' &&
-                contains(github.event.pull_request.labels.*.name, 'ready') &&
-                !(github.event.action == 'labeled' &&
-                  github.event.label.name == 'abtest') }}
-          POLICY_RESULT: ${{ needs.benchmark-policy.result }}
-          PRE_COMMIT_RESULT: ${{ needs.pre-commit.result }}
-          DECODE_RESULT: ${{ needs.decode-benchmark.result }}
-          PANGU_OFFLINE_RESULT: ${{ needs.pangu-offline.result }}
-          PANGU_ONLINE_RESULT: ${{ needs.pangu-online.result }}
-        run: |
-          if [[ "$ABTEST_ONLY" == true ]]; then
-            echo "ABTEST_RESULT=$ABTEST_RESULT"
-            if [[ "$ABTEST_RESULT" != success ]]; then
-              if [[ "$ABTEST_RESULT" == skipped ]]; then
-                echo "::error::A/B has not run for this revision. Remove and re-add the abtest label to start it."
-              else
-                echo "::error::Beam V1 performance A/B did not pass."
-              fi
-              exit 1
-            fi
-            exit 0
-          fi
-          if [[ "$ABTEST_REQUIRED" == true ]]; then
-            if [[ "$ABTEST_FRESH" == true && "$ABTEST_PASSED" != true ]]; then
-              echo "::error::The current revision's A/B report failed. Re-add abtest to rerun it."
-              exit 1
-            fi
-            if [[ "$ABTEST_FRESH" != true && "$ABTEST_RESULT" != success ]]; then
-              echo "::error::Beam V1 performance A/B is stale or did not pass for this revision."
-              exit 1
-            fi
-          fi
-          failed=0
-          for result_name in \
-            POLICY_RESULT \
-            PRE_COMMIT_RESULT \
-            DECODE_RESULT \
-            PANGU_OFFLINE_RESULT \
-            PANGU_ONLINE_RESULT; do
-            result="${!result_name}"
-            echo "$result_name=$result"
-            if [[ "$result" != "success" ]]; then
-              echo "::error::$result_name did not pass. Skipped validation is not a pass."
-              failed=1
-            fi
-          done
-          exit "$failed"
-
-      - name: Reject cancelled workflow
-        if: cancelled()
-        run: |
-          echo "::error::Cancelled CI cannot satisfy the blocking gate."
-          exit 1
+          python tools/ci/run_cpu_tests.py
+          node --test tools/ci/tests/*.test.cjs

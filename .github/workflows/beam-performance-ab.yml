@@ -1,0 +1,170 @@
+name: Beam V1 performance A/B
+run-name: 'Beam V1 A/B #${{ github.event.pull_request.number }} @${{ github.event.pull_request.merge_commit_sha }}'
+'on':
+  pull_request_target:
+    branches:
+    - decode_graph
+    types:
+    - labeled
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: ${{ github.event.label.name == 'abtest' && format('device-pr-{0}', github.event.pull_request.number)
+    || format('ab-ignored-{0}', github.run_id) }}
+  queue: max
+  cancel-in-progress: false
+env:
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+jobs:
+  beam-performance-ab-only:
+    name: Beam V1 performance A/B only
+    if: github.event.pull_request.head.repo.id == github.event.repository.id && github.event.action == 'labeled' && github.event.label.name == 'abtest' && github.event.pull_request.draft
+      == false
+    runs-on: self-hosted
+    steps:
+    - name: Verify queued snapshot
+      uses: actions/github-script@v7
+      env:
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        REQUIRE_READY: 'false'
+      with:
+        script: |
+          const {owner, repo} = context.repo;
+          const {PR_NUMBER, HEAD_SHA, BASE_SHA, MERGE_SHA, BASE_REF} = process.env;
+          if (!/^(0|[1-9][0-9]*)$/.test(PR_NUMBER) ||
+              ![HEAD_SHA, BASE_SHA, MERGE_SHA].every(sha => /^[a-f0-9]{40}$/.test(sha))) {
+            throw new Error('Invalid queued commit identity');
+          }
+          const {data: branch} = await github.rest.repos.getBranch({owner, repo, branch: BASE_REF});
+          if (branch.commit.sha !== BASE_SHA) throw new Error('Queued base is obsolete; scheduler will replan');
+          if (PR_NUMBER !== '0') {
+            const {data: repository} = await github.rest.repos.get({owner, repo});
+            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: Number(PR_NUMBER)});
+            if (!Number.isSafeInteger(repository.id) || pr.head.repo?.id !== repository.id ||
+                pr.base.repo?.id !== repository.id) {
+              throw new Error('Fork execution is not allowed by trusted dispatch; use a reviewed repository branch');
+            }
+            if (pr.state !== 'open' || pr.draft ||
+                (process.env.REQUIRE_READY !== 'false' && !pr.labels.some(label => label.name === 'ready')) ||
+                pr.head.sha !== HEAD_SHA || pr.base.sha !== BASE_SHA || pr.base.ref !== BASE_REF ||
+                pr.merge_commit_sha !== MERGE_SHA) {
+              throw new Error('Queued PR snapshot is obsolete; scheduler will replan');
+            }
+            const {data: merge} = await github.rest.repos.getCommit({owner, repo, ref: MERGE_SHA});
+            if (merge.parents.length !== 2 || merge.parents[0].sha !== BASE_SHA || merge.parents[1].sha !== HEAD_SHA) {
+              throw new Error('Invalid merge parents');
+            }
+          } else if (HEAD_SHA !== BASE_SHA || MERGE_SHA !== BASE_SHA) {
+            throw new Error('Regression must validate one immutable branch commit');
+          }
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.merge_commit_sha }}
+        persist-credentials: false
+        fetch-depth: 2
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - uses: astral-sh/setup-uv@v1
+    - name: Require a CUDA runner
+      run: nvidia-smi --query-gpu=name --format=csv,noheader
+    - name: Restore virtual environment
+      uses: corca-ai/local-cache@v2
+      id: cache-venv
+      with:
+        path: .venv
+        base: /data/actions/cache
+        key: venv-${{ runner.os }}-vllm0.22.1-${{ hashFiles('pyproject.toml', 'requirements/*.txt', 'setup.py')
+          }}
+    - name: Create virtual environment
+      if: steps.cache-venv.outputs.cache-hit != 'true'
+      run: uv venv --seed .venv
+    - name: Set up virtual environment
+      run: |
+        echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+        echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
+        echo "CI_CUDA_MAPPING_FILE=$RUNNER_TEMP/cuda-mapping-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_ENV"
+    - name: Install base environment
+      if: steps.cache-venv.outputs.cache-hit != 'true'
+      run: uv pip install vllm==0.22.1
+    - name: Refresh editable installation
+      run: |
+        export VLLM_GR_TARGET_DEVICE="${VLLM_GR_TARGET_DEVICE:-cuda}"
+        uv pip install -e ".[dev]"
+    - name: Verify CUDA device mapping before cleanup
+      id: cuda-mapping
+      run: |
+        python tools/ci/check_cuda_device_mapping.py --output "$CI_CUDA_MAPPING_FILE"
+        echo "PYTHONPATH=$GITHUB_WORKSPACE/tools/ci${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+    - name: Kill stale process on device
+      run: bash ./scripts/kill_vllm_on_device.sh
+    - name: Cache OpenOneRec dataset
+      uses: corca-ai/local-cache@v2
+      id: cache-dataset
+      with:
+        path: OpenOneRec
+        base: /data/actions/cache
+        key: dataset-openonerec-${{ runner.os }}
+    - name: Download OpenOneRec dataset
+      if: steps.cache-dataset.outputs.cache-hit != 'true'
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: |
+        if [[ -z "$HF_TOKEN" ]]; then
+          echo "HF_TOKEN is required for the gated OpenOneRec dataset." >&2
+          exit 1
+        fi
+        uv tool install hf
+        mkdir -p OpenOneRec
+        hf download OpenOneRec/OpenOneRec-RecIF \
+          --token "$HF_TOKEN" \
+          --local-dir ./OpenOneRec \
+          --repo-type=dataset
+    - name: Build catalog
+      run: |
+        mkdir -p generated_data
+        python ./benchmarks/open_one_rec/tools/create_task_catalog.py \
+          -t video \
+          -d ./OpenOneRec/benchmark_data \
+          -o generated_data/video_catalog.json
+        python ./tools/build_constraint_triples.py \
+          --catalog generated_data/video_catalog.json \
+          --output generated_data/video_constraint_triples.json \
+          --begin "<|sid_begin|>" \
+          --end "<|sid_end|>"
+    - name: Run Beam V1 performance A/B
+      env:
+        TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
+        V1_PERF_OUTPUT_DIR: ${{ github.workspace }}/v1_performance_results
+        V1_PERF_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        V1_PERF_CANDIDATE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        V1_PERF_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        V1_PERF_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: bash ./tests/system/run_beam_v1_performance_ab.sh
+    - name: Upload Beam V1 performance measurements
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: beam-v1-performance-${{ github.run_id }}-${{ github.run_attempt }}
+        path: v1_performance_results
+        if-no-files-found: warn
+        retention-days: 14
+    - name: Upload Beam V1 A/B report for PR comment
+      if: always() && hashFiles('v1_performance_results/report.json') != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: beam-v1-performance-report-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          v1_performance_results/context.json
+          v1_performance_results/report.json
+          v1_performance_results/report.md
+        if-no-files-found: error
+        retention-days: 14
+    - name: Check clear device
+      if: always() && steps.cuda-mapping.outcome == 'success'
+      run: bash ./scripts/check_vllm_on_device.sh

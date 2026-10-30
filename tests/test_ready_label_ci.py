@@ -2,10 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exercise the workflow guards against PR lifecycle events without a runner."""
 
-import copy
-import json
 import os
-import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -14,6 +11,8 @@ from typing import Any
 
 import regex as re
 import yaml
+
+from tools.ci.run_cpu_tests import CPU_TESTS
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,7 +27,6 @@ def context(
     action: str = "synchronize",
     *,
     ready: bool = True,
-    abtest: bool = False,
     draft: bool = False,
     label: str = "",
     event: str = "pull_request",
@@ -43,16 +41,15 @@ def context(
             "sha": "merge-sha",
             "event": {
                 "action": action,
+                "repository": {"id": 1},
                 "label": {"name": label},
                 "pull_request": {
                     "number": 481,
                     "draft": draft,
-                    "labels": [
-                        {"name": name}
-                        for name, present in (("ready", ready), ("abtest", abtest))
-                        if present
-                    ],
-                    "base": {"ref": "decode_graph", "sha": "base-sha"},
+                    "labels": [{"name": "ready"}] if ready else [],
+                    "head": {"sha": "head-sha", "repo": {"id": 1}},
+                    "base": {"ref": "decode_graph", "sha": "base-sha", "repo": {"id": 1}},
+                    "merge_commit_sha": "merge-sha",
                 },
             },
         }
@@ -65,29 +62,25 @@ def evaluate(
     results: dict[str, str] | None = None,
     *,
     cancelled: bool = False,
-    ab_fresh: bool = False,
-    ab_passed: bool = False,
+    inputs: dict[str, str] | None = None,
 ) -> Any:
     # Evaluate only the small expression subset used by these tracked workflow
     # guards. Keep the expressions in YAML as the source of truth.
     expression = expression.strip().removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("github.event.pull_request.labels.*.name", "labels")
-    expression = expression.replace("needs.resolve-ab-freshness.outputs.fresh", "ab_fresh")
-    expression = expression.replace("needs.resolve-ab-freshness.outputs.passed", "ab_passed")
     expression = re.sub(r"needs\.([\w-]+)\.result", r"results['\1']", expression)
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
     expression = re.sub(r"\btrue\b", "True", expression)
     expression = re.sub(r"\bfalse\b", "False", expression)
-    return eval(  # noqa: S307 - only repository-owned workflow expressions
+    return eval(
         " ".join(expression.split()),
         {"__builtins__": {}},
         {
             "github": github,
+            "inputs": namespace(inputs or {}),
             "labels": [item["name"] for item in github.event.pull_request.labels],
             "results": results or {},
-            "ab_fresh": "True" if ab_fresh else "False",
-            "ab_passed": "True" if ab_passed else "False",
             "always": lambda: True,
             "cancelled": lambda: cancelled,
             "contains": lambda items, value: value in items,
@@ -96,10 +89,10 @@ def evaluate(
     )
 
 
-def render(template: str, github: Any) -> str:
+def render(template: str, github: Any, *, inputs: dict[str, str] | None = None) -> str:
     rendered = re.sub(
         r"\$\{\{(.*?)\}\}",
-        lambda match: str(evaluate(match.group(1), github)),
+        lambda match: str(evaluate(match.group(1), github, inputs=inputs)),
         template,
         flags=re.DOTALL,
     )
@@ -112,386 +105,336 @@ class TestReadyLabelCI(unittest.TestCase):
         self.workflows = {
             path.name: yaml.safe_load(path.read_text())
             for path in (ROOT / ".github/workflows").glob("*.yml")
-            if path.name in {"pre-commit.yml", "build_wheel.yml"}
         }
 
-    def scheduled(
-        self,
-        workflow: dict[str, Any],
-        github: Any,
-        failed: str | None = None,
-        *,
-        cancelled: bool = False,
-        ab_fresh: bool = False,
-    ) -> list[str]:
-        results: dict[str, str] = {}
-        running = []
-        pending = dict(workflow["jobs"])
-        while pending:
-            progressed = False
-            for name, job in list(pending.items()):
-                needs = job.get("needs", [])
-                if isinstance(needs, str):
-                    needs = [needs]
-                if any(need not in results for need in needs):
-                    continue
-                condition = job.get("if", "true")
-                dependencies_ok = all(results[need] == "success" for need in needs)
-                explicit_status = any(status in condition for status in ("always()", "cancelled()"))
-                enabled = (explicit_status or (dependencies_ok and not cancelled)) and evaluate(
-                    condition, github, results, cancelled=cancelled, ab_fresh=ab_fresh
-                )
-                results[name] = (
-                    ("failure" if name == failed else "success") if enabled else "skipped"
-                )
-                if enabled:
-                    running.append(name)
-                del pending[name]
-                progressed = True
-            if not progressed:
-                raise AssertionError(f"unresolved job dependencies: {set(pending)}")
-        return running
-
-    def test_pr_lifecycle(self) -> None:
-        events = [
-            ("opened", False, False, "", False),
-            ("synchronize", False, False, "", False),
-            ("reopened", False, False, "", False),
-            ("ready_for_review", False, False, "", False),
-            ("labeled", True, False, "ready", True),
-            ("synchronize", True, False, "", True),
-            ("reopened", True, False, "", True),
-            ("ready_for_review", True, False, "", True),
-            ("labeled", True, True, "ready", False),
-            ("synchronize", True, True, "", False),
-            ("converted_to_draft", True, True, "", False),
-            ("unlabeled", False, False, "ready", False),
-            ("labeled", True, False, "bug", False),
-            ("unlabeled", True, False, "bug", False),
-            ("labeled", False, False, "bug", False),
-        ]
-        for filename, workflow in self.workflows.items():
-            triggers = workflow.get("on", workflow.get(True))["pull_request"]["types"]
-            for action, ready, draft, label, expected in events:
-                with self.subTest(
-                    workflow=filename, action=action, ready=ready, draft=draft, label=label
-                ):
-                    self.assertIn(action, triggers)
-                    github = context(action, ready=ready, draft=draft, label=label)
-                    running = self.scheduled(workflow, github)
-                    validation = [job for job in running if job != "benchmark-blocking"]
-                    self.assertEqual(bool(validation), expected)
-                    if expected:
-                        self.assertEqual(set(running), set(workflow["jobs"]))
-                    if "benchmark-blocking" in workflow["jobs"]:
-                        ignored_label = action in {"labeled", "unlabeled"} and label != "ready"
-                        self.assertEqual("benchmark-blocking" in running, not ignored_label)
-                        gate_name = render(workflow["jobs"]["benchmark-blocking"]["name"], github)
-                        self.assertEqual(gate_name == "Benchmark blocking gate", not ignored_label)
-                    if "run-name" in workflow:
-                        self.assertEqual(
-                            render(workflow["run-name"], github).startswith("ci-meta:v1;"),
-                            expected,
-                        )
-
-    def test_manual_dispatch_remains_enabled_without_push(self) -> None:
-        for workflow in self.workflows.values():
-            triggers = workflow.get("on", workflow.get(True))
-            self.assertIn("workflow_dispatch", triggers)
-            self.assertNotIn("push", triggers)
-            github = context(event="workflow_dispatch", ready=False, draft=True)
-            self.assertEqual(
-                set(self.scheduled(workflow, github)),
-                set(workflow["jobs"]) - {"beam-performance-ab-only", "resolve-ab-freshness"},
-            )
-
-    def test_label_edits_do_not_cancel_unrelated_runs(self) -> None:
-        for workflow in self.workflows.values():
-            group = workflow["concurrency"]["group"]
-            normal = render(group, context())
-            for action, ready, draft, label in (
-                ("labeled", True, False, "ready"),
-                ("unlabeled", False, False, "ready"),
-                ("converted_to_draft", True, True, ""),
+    def test_cpu_lifecycle_and_priority_label_isolation(self) -> None:
+        workflow = self.workflows["pre-commit.yml"]
+        job = workflow["jobs"]["fast-checks"]
+        triggers = workflow.get("on", workflow.get(True))["pull_request"]["types"]
+        for action in (
+            "opened",
+            "synchronize",
+            "reopened",
+            "ready_for_review",
+            "converted_to_draft",
+        ):
+            self.assertIn(action, triggers)
+            for ready in (False, True):
+                for draft in (False, True):
+                    self.assertTrue(evaluate(job["if"], context(action, ready=ready, draft=draft)))
+        for action in ("labeled", "unlabeled"):
+            normal = context(action, label="ready")
+            self.assertTrue(evaluate(job["if"], normal))
+            for label in (
+                "bug",
+                "ci-priority:high",
+                "ci-priority:normal",
+                "ci-priority:low",
+                "automerge",
+                "ci-preview",
             ):
-                github = context(action, ready=ready, draft=draft, label=label)
-                self.assertEqual(render(group, github), normal)
-                self.assertTrue(evaluate(workflow["concurrency"]["cancel-in-progress"], github))
-            for action in ("labeled", "unlabeled"):
-                github = context(action, label="bug")
-                self.assertNotEqual(render(group, github), normal)
-                second = copy.deepcopy(github)
-                second.run_id += 1
-                self.assertNotEqual(render(group, second), render(group, github))
+                ignored = context(action, label=label)
+                self.assertFalse(evaluate(job["if"], ignored))
+                self.assertNotEqual(
+                    render(workflow["concurrency"]["group"], normal),
+                    render(workflow["concurrency"]["group"], ignored),
+                )
+                self.assertTrue(render(workflow["run-name"], ignored).startswith("ci-ignored:"))
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
 
-    def test_abtest_toggle_does_not_cancel_ready_validation(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
-        group = workflow["concurrency"]["group"]
-        cancel = workflow["concurrency"]["cancel-in-progress"]
-        full = context("synchronize", ready=True, abtest=True)
-        added = context("labeled", ready=True, abtest=True, label="abtest")
-        removed = context("unlabeled", ready=True, abtest=False, label="abtest")
-
-        self.assertNotEqual(render(group, added), render(group, full))
-        self.assertFalse(evaluate(cancel, added))
-        # An active old run and pending full run share the full group; the
-        # A/B label event must not replace that pending full run.
-        older = copy.deepcopy(full)
-        older.run_id -= 1
-        self.assertEqual(render(group, older), render(group, full))
-        gpu_jobs = (
-            "pre-commit",
-            "decode-benchmark",
-            "pangu-offline",
-            "pangu-online",
-            "beam-performance-ab-only",
-        )
-        for job_name in gpu_jobs:
-            gpu_lock = workflow["jobs"][job_name]["concurrency"]
-            self.assertEqual(render(gpu_lock["group"], full), render(gpu_lock["group"], added))
-            self.assertEqual(gpu_lock["queue"], "max")
-            self.assertFalse(gpu_lock["cancel-in-progress"])
-        self.assertEqual(
-            self.scheduled(workflow, added),
-            ["beam-performance-ab-only", "benchmark-blocking"],
-        )
-        self.assertNotEqual(render(group, removed), render(group, full))
-        self.assertEqual(self.scheduled(workflow, removed), [])
-        self.assertEqual(
-            render(workflow["jobs"]["benchmark-blocking"]["name"], removed),
-            "Ignored label event",
-        )
-
-    def test_failed_validation_does_not_skip_blocking_gate(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
-        if "benchmark-blocking" not in workflow["jobs"]:
-            self.skipTest("This branch uses a single validation job")
-        for failed in workflow["jobs"]["benchmark-blocking"]["needs"]:
-            with self.subTest(failed=failed):
-                self.assertIn("benchmark-blocking", self.scheduled(workflow, context(), failed))
-
-    def test_blocking_gate_still_rejects_unsuccessful_checks(self) -> None:
-        job = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]
-        success = dict.fromkeys(job["needs"], "success")
-        success["beam-performance-ab-only"] = "skipped"
-        scenarios = [(success, 0)]
-        for variable in success.keys() - {"beam-performance-ab-only", "resolve-ab-freshness"}:
-            for status in ("failure", "cancelled", "skipped"):
-                scenarios.append(({**success, variable: status}, 1))
-        for values, expected_code in scenarios:
-            with self.subTest(values=values):
-                result = self.run_gate(values, ab_fresh=True, ab_passed=True)
-                self.assertEqual(result.returncode, expected_code, result.stdout + result.stderr)
-        self.assertEqual(self.run_gate(success, ab_fresh=False).returncode, 1)
-        self.assertEqual(
-            self.run_gate({**success, "beam-performance-ab-only": "success"}).returncode,
-            0,
-        )
-
-    def test_ab_only_has_separate_check_and_does_not_run_on_drafts(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
-        gate = workflow["jobs"]["benchmark-blocking"]
+    def test_existing_wheel_ready_gate(self) -> None:
+        workflow = self.workflows["build_wheel.yml"]
+        job = workflow["jobs"]["build"]
         for ready in (False, True):
-            github = context("labeled", ready=ready, abtest=True, label="abtest")
-            running = self.scheduled(workflow, github)
-            self.assertEqual(running, ["beam-performance-ab-only", "benchmark-blocking"])
-            self.assertEqual(render(gate["name"], github), "Beam V1 performance A/B gate")
-            results = {need: "success" if need in running else "skipped" for need in gate["needs"]}
-            self.assertEqual(self.run_gate(results, github).returncode, 0)
-
-        draft = context("labeled", ready=True, abtest=True, draft=True, label="abtest")
-        running = self.scheduled(workflow, draft)
-        self.assertEqual(running, ["benchmark-blocking"])
-        self.assertEqual(render(gate["name"], draft), "Beam V1 performance A/B gate")
-        results = dict.fromkeys(gate["needs"], "skipped")
-        self.assertEqual(self.run_gate(results, draft).returncode, 1)
-
-    def test_ab_only_code_update_and_ready_removal_do_not_pass_full_gate(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
-        gate = workflow["jobs"]["benchmark-blocking"]
-        results = dict.fromkeys(gate["needs"], "skipped")
-        for github, expected_name in (
-            (
-                context("synchronize", ready=False, abtest=True),
-                "Beam V1 performance A/B gate",
-            ),
-            (
-                context("unlabeled", ready=False, abtest=True, label="ready"),
-                "Benchmark blocking gate",
-            ),
-        ):
-            self.assertEqual(self.scheduled(workflow, github), ["benchmark-blocking"])
-            self.assertEqual(render(gate["name"], github), expected_name)
-            self.assertEqual(self.run_gate(results, github).returncode, 1)
-
-        ready = context("labeled", ready=True, abtest=True, label="ready")
-        running = self.scheduled(workflow, ready)
-        self.assertIn("beam-performance-ab-only", running)
-        self.assertNotIn("beam-performance-ab-only", self.scheduled(workflow, ready, ab_fresh=True))
-        self.assertEqual(render(gate["name"], ready), "Benchmark blocking gate")
-
-    def test_ready_reuses_fresh_ab_and_reruns_stale_ab(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
-        ready = context("labeled", ready=True, label="ready")
-        for fresh in (False, True):
-            with self.subTest(fresh=fresh):
-                running = self.scheduled(workflow, ready, ab_fresh=fresh)
-                self.assertIn("resolve-ab-freshness", running)
-                self.assertEqual("beam-performance-ab-only" in running, not fresh)
-                results = {
-                    need: "success" if need in running else "skipped"
-                    for need in workflow["jobs"]["benchmark-blocking"]["needs"]
-                }
+            for draft in (False, True):
                 self.assertEqual(
-                    self.run_gate(results, ready, ab_fresh=fresh, ab_passed=fresh).returncode,
-                    0,
+                    bool(evaluate(job["if"], context(ready=ready, draft=draft))),
+                    ready and not draft,
                 )
-        fresh_results = dict.fromkeys(workflow["jobs"]["benchmark-blocking"]["needs"], "success")
-        fresh_results["beam-performance-ab-only"] = "skipped"
-        self.assertEqual(self.run_gate(fresh_results, ready, ab_fresh=True).returncode, 1)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
 
-    def test_ab_freshness_lookup_accepts_only_current_revision(self) -> None:
-        if shutil.which("node") is None:
-            self.skipTest("Node.js is required to exercise the github-script lookup")
-        step = self.workflows["pre-commit.yml"]["jobs"]["resolve-ab-freshness"]["steps"][0]
-        harness = """
-const fixture = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-const outputs = {};
-const context = {
-  repo: {owner: 'owner', repo: 'repo'},
-  payload: {pull_request: {
-    number: 481, head: {sha: 'current-head'},
-    base: {ref: 'decode_graph', sha: 'base-sha'},
-  }},
-  sha: 'current-merge', runId: 124,
-};
-const github = {rest: {actions: {
-  listWorkflowRuns: async () => ({data: {workflow_runs: [fixture.run]}}),
-  listJobsForWorkflowRun: async () => ({data: {jobs: [
-    {name: 'Beam V1 performance A/B only', conclusion: 'success'},
-  ]}}),
-  listWorkflowRunArtifacts: async () => ({data: {artifacts: [
-    {name: 'beam-v1-performance-report-123-1', expired: false},
-  ]}}),
-}}};
-const core = {
-  setOutput: (key, value) => { outputs[key] = value; },
-  warning: () => {}, info: () => {},
-};
-const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
-new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, core)
-  .then(() => process.stdout.write(JSON.stringify(outputs)))
-  .catch(error => { console.error(error); process.exitCode = 1; });
-"""
-        for current in (False, True):
-            with self.subTest(current=current):
-                revision = "current" if current else "old"
-                fixture = {
-                    "script": step["with"]["script"],
-                    "run": {
-                        "id": 123,
-                        "status": "completed",
-                        "conclusion": "success",
-                        "head_sha": f"{revision}-head",
-                        "display_title": f"pull_request:481/merge@{revision}-merge",
-                        "run_attempt": 1,
-                    },
-                }
-                result = subprocess.run(
-                    ["node", "-e", harness],
-                    input=json.dumps(fixture),
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    json.loads(result.stdout),
-                    {"fresh": str(current).lower(), "passed": str(current).lower()},
-                )
-
-    def run_gate(
-        self,
-        results: dict[str, str],
-        github: Any | None = None,
-        *,
-        ab_fresh: bool = False,
-        ab_passed: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
-        step = self.workflows["pre-commit.yml"]["jobs"]["benchmark-blocking"]["steps"][0]
-        github = github or context()
-        env = {
-            key: str(
-                evaluate(value, github, results, ab_fresh=ab_fresh, ab_passed=ab_passed)
-            ).lower()
-            for key, value in step["env"].items()
-        }
-        return subprocess.run(
-            ["bash", "-eu", "-o", "pipefail", "-c", step["run"]],
-            env={**os.environ, **env},
-            capture_output=True,
-            text=True,
-        )
-
-    def test_unready_and_draft_events_fail_required_gate(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
-        gate = workflow["jobs"]["benchmark-blocking"]
-        for github in (
-            context("opened", ready=False),
-            context("synchronize", ready=False),
-            context("unlabeled", ready=False, label="ready"),
-            context("converted_to_draft", draft=True),
-            context("labeled", draft=True, label="ready"),
-        ):
-            with self.subTest(event=github.event):
-                running = self.scheduled(workflow, github)
-                self.assertEqual(running, ["benchmark-blocking"])
-                self.assertEqual(render(gate["name"], github), "Benchmark blocking gate")
-                results = {
-                    need: "success" if need in running else "skipped" for need in gate["needs"]
-                }
-                result = self.run_gate(results)
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-
-    def test_cancellation_stops_pangu_but_keeps_cleanup_and_gate(self) -> None:
-        workflow = self.workflows["pre-commit.yml"]
-        jobs = workflow["jobs"]
-        # A cancellation can arrive while a Pangu job is already running, after
-        # its prerequisites have succeeded. GitHub re-evaluates the job guard.
-        results = dict.fromkeys(jobs["benchmark-blocking"]["needs"], "success")
-        for name in ("pangu-offline", "pangu-online"):
-            with self.subTest(job=name):
-                self.assertTrue(evaluate(jobs[name]["if"], context(), results))
-                self.assertFalse(evaluate(jobs[name]["if"], context(), results, cancelled=True))
-        # Upstream validation failures must still allow independent accuracy
-        # checks to run, and must not hide a failed final gate.
-        for failed in ("decode-benchmark", "pangu-offline"):
-            with self.subTest(failed=failed):
-                running = self.scheduled(workflow, context(), failed)
-                self.assertIn("pangu-offline", running)
-                self.assertIn("pangu-online", running)
-                self.assertIn("benchmark-blocking", running)
+    def test_one_non_preemptible_device_job(self) -> None:
+        workflow = self.workflows["device-validation.yml"]
+        self.assertEqual(set(workflow["jobs"]), {"preflight", "validate"})
+        self.assertEqual(workflow["jobs"]["preflight"]["runs-on"], "ubuntu-latest")
+        self.assertEqual(workflow["jobs"]["validate"]["needs"], "preflight")
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
         self.assertEqual(
-            self.scheduled(workflow, context(), cancelled=True), ["benchmark-blocking"]
+            set(workflow.get("on", workflow.get(True))), {"workflow_dispatch", "workflow_call"}
         )
-        reject_cancelled = jobs["benchmark-blocking"]["steps"][-1]
-        self.assertFalse(evaluate(reject_cancelled["if"], context()))
-        self.assertTrue(evaluate(reject_cancelled["if"], context(), cancelled=True))
-        rejected = subprocess.run(
-            ["bash", "-eu", "-o", "pipefail", "-c", reject_cancelled["run"]],
+        job = workflow["jobs"]["validate"]
+        self.assertNotIn("strategy", job)
+        steps = job["steps"]
+        names = [step.get("name") for step in steps]
+        required = [
+            "Device unit and end-to-end tests",
+            "Gate Beam V1 B=4 OneRec Recall on fixed samples",
+            "Measure Beam V1 offline batch and online concurrency",
+            "Run Pangu offline accuracy gate",
+            "Pangu online accuracy and API contract",
+            "Check clear device",
+            "Complete device validation",
+        ]
+        self.assertEqual([name for name in names if name in required], required)
+        self.assertEqual(names[-1], "Complete device validation")
+        device_command = next(step["run"] for step in steps if step.get("id") == "device-tests")
+        for path in CPU_TESTS:
+            self.assertIn(f"--ignore={path}", device_command)
+        self.assertNotIn("if", steps[-1])  # implicit success() rejects failures and cancellation
+        self.assertTrue(all(not step.get("continue-on-error", False) for step in steps))
+        self.assertEqual(
+            sum(step.get("uses") == "./.github/actions/setup-device-env" for step in steps), 1
+        )
+        cleanup = next(step for step in steps if step.get("name") == "Check clear device")
+        for outcome in ("success", "failure", "skipped"):
+            guard = cleanup["if"].replace("steps.cuda-mapping.outcome", repr(outcome))
+            self.assertEqual(bool(evaluate(guard, context(), cancelled=True)), outcome == "success")
+
+    def test_privileged_queue_uses_only_default_branch(self) -> None:
+        workflow = self.workflows["ci-queue.yml"]
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
+        completed = workflow.get("on", workflow.get(True))["workflow_run"]
+        self.assertIn(
+            self.workflows["device-validation-preview.yml"]["name"], completed["workflows"]
+        )
+        self.assertIn("completed", completed["types"])
+        checkout = workflow["jobs"]["dispatch"]["steps"][0]
+        self.assertEqual(checkout["with"]["ref"], "${{ github.event.repository.default_branch }}")
+        self.assertIs(checkout["with"]["persist-credentials"], False)
+        retired = self.workflows["retest-router.yml"]
+        self.assertNotIn("issue_comment", retired.get("on", retired.get(True)))
+        queue = (ROOT / "tools/ci/queue.cjs").read_text()
+        self.assertNotIn("cancelWorkflowRun", queue)
+        self.assertNotIn("pulls.merge", queue)
+
+    def test_device_lock_covers_all_snapshots_and_entry_points_of_one_pr(self) -> None:
+        workflow = self.workflows["device-validation.yml"]
+        group = workflow["concurrency"]["group"]
+        first = {
+            "pr_number": "481",
+            "base_ref": "decode_graph",
+            "head_sha": "1" * 40,
+            "base_sha": "2" * 40,
+        }
+        changed = {**first, "base_ref": "main", "head_sha": "3" * 40, "base_sha": "4" * 40}
+        original = render(group, context(event="workflow_dispatch"), inputs=first)
+        self.assertEqual(original, render(group, context(), inputs=changed))
+        self.assertNotEqual(
+            original, render(group, context(), inputs={**first, "pr_number": "482"})
+        )
+        self.assertNotEqual(
+            render(group, context(), inputs={**first, "pr_number": "0"}),
+            render(group, context(), inputs={**changed, "pr_number": "0"}),
+        )
+
+    def test_preview_priority_label_changes_cannot_replace_a_pending_preview(self) -> None:
+        group = self.workflows["device-validation-preview.yml"]["concurrency"]["group"]
+        original = render(group, context("labeled", label="ci-preview"))
+        for label in ("ci-priority:high", "ci-priority:normal", "ci-priority:low", "ready", "bug"):
+            ignored = context("labeled", label=label)
+            self.assertNotEqual(original, render(group, ignored))
+
+    def test_preview_priority_defaults_to_low_and_highest_label_wins(self) -> None:
+        priority = self.workflows["device-validation-preview.yml"]["jobs"]["preview"]["with"][
+            "priority"
+        ]
+        for labels, expected in (
+            ([], "low"),
+            (["ci-priority:low"], "low"),
+            (["ci-priority:normal", "ci-priority:low"], "normal"),
+            (["ci-priority:high", "ci-priority:normal", "ci-priority:low"], "high"),
+        ):
+            github = context("labeled", label="ci-preview")
+            github.event.pull_request.labels.extend({"name": label} for label in labels)
+            self.assertEqual(evaluate(priority, github), expected)
+
+    def test_preview_requires_an_explicit_label_and_keeps_read_only_permissions(self) -> None:
+        workflow = self.workflows["device-validation-preview.yml"]
+        self.assertTrue(all(value == "read" for value in workflow["permissions"].values()))
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
+        triggers = workflow.get("on", workflow.get(True))
+        self.assertEqual(triggers["pull_request_target"]["types"], ["labeled"])
+        job = workflow["jobs"]["preview"]
+        self.assertEqual(job["uses"], "./.github/workflows/device-validation.yml")
+        for ready in (False, True):
+            for draft in (False, True):
+                for label in ("ready", "ci-preview", "ci-priority:high"):
+                    github = context("labeled", ready=ready, draft=draft, label=label)
+                    github.event.pull_request.labels.append({"name": "ci-preview"})
+                    self.assertEqual(
+                        bool(evaluate(job["if"], github)),
+                        ready and not draft and label == "ci-preview",
+                    )
+
+    def test_snapshot_preflight_can_read_pr_metadata_through_every_entry_point(self) -> None:
+        # A reusable workflow cannot acquire permissions omitted by its caller.
+        for filename, job_name in (
+            ("device-validation.yml", "validate"),
+            ("device-validation-preview.yml", "preview"),
+        ):
+            workflow = self.workflows[filename]
+            permissions = workflow["jobs"][job_name].get("permissions", workflow["permissions"])
+            for scope in ("actions", "contents", "pull-requests"):
+                self.assertEqual(permissions.get(scope), "read", f"{filename}: {scope}")
+
+    def test_fork_entry_points_are_rejected_before_self_hosted_allocation(self) -> None:
+        for filename, job_name, label in (
+            ("device-validation-preview.yml", "preview", "ci-preview"),
+            ("beam-performance-ab.yml", "beam-performance-ab-only", "abtest"),
+        ):
+            workflow = self.workflows[filename]
+            self.assertEqual(set(workflow.get("on", workflow.get(True))), {"pull_request_target"})
+            github = context("labeled", label=label, event="pull_request_target")
+            github.event.pull_request.labels.append({"name": label})
+            job = workflow["jobs"][job_name]
+            self.assertTrue(evaluate(job["if"], github))
+            github.event.pull_request.head.repo.id = 2
+            self.assertFalse(evaluate(job["if"], github))
+            github.sha = "base-sha"
+            if job_name == "preview":
+                merge = job["with"]["merge_sha"]
+            else:
+                merge = next(
+                    step["with"]["ref"]
+                    for step in job["steps"]
+                    if step.get("uses") == "actions/checkout@v4"
+                )
+            self.assertEqual(render(merge, github), "merge-sha")
+        device = self.workflows["device-validation.yml"]["jobs"]
+        self.assertEqual(device["validate"]["needs"], "preflight")
+        self.assertEqual(device["preflight"]["runs-on"], "ubuntu-latest")
+        self.assertEqual(device["preflight"]["steps"], [device["validate"]["steps"][0]])
+
+    def test_cpu_refresh_names_the_exact_snapshot_and_checks_it_before_checkout(self) -> None:
+        workflow = self.workflows["pre-commit.yml"]
+        github = context(event="workflow_dispatch")
+        github.sha = "trusted-dispatcher-sha"
+        inputs = {
+            "pr_number": "481",
+            "head_sha": "head",
+            "base_ref": "decode_graph",
+            "base_sha": "base",
+            "merge_sha": "merge",
+        }
+        self.assertEqual(
+            render(workflow["run-name"], github, inputs=inputs),
+            "ci-meta:v1;run=123;pr=481;base=decode_graph;base_sha=base;merge_sha=merge",
+        )
+        steps = workflow["jobs"]["fast-checks"]["steps"]
+        self.assertEqual(steps[0]["name"], "Verify queued snapshot")
+        self.assertTrue(evaluate(steps[0]["if"], github, inputs=inputs))
+        self.assertFalse(evaluate(steps[0]["if"], github, inputs={"pr_number": "0"}))
+        self.assertEqual(steps[1]["uses"], "actions/checkout@v4")
+        self.assertEqual(render(steps[1]["with"]["ref"], github, inputs=inputs), "merge")
+        previous = render(workflow["concurrency"]["group"], github, inputs=inputs)
+        github.run_id += 1
+        self.assertNotEqual(
+            previous, render(workflow["concurrency"]["group"], github, inputs=inputs)
+        )
+
+    def test_queue_retains_pending_ticks_and_can_read_the_comment_inbox(self) -> None:
+        workflow = self.workflows["ci-queue.yml"]
+        self.assertEqual(workflow["permissions"]["issues"], "read")
+        self.assertEqual(workflow["concurrency"]["queue"], "max")
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
+
+    def test_preview_without_data_access_fails_before_device_setup(self) -> None:
+        steps = self.workflows["device-validation.yml"]["jobs"]["validate"]["steps"]
+        guard = next(
+            step
+            for step in steps
+            if step.get("name") == "Verify dataset access before preparing the device"
+        )
+        setup = next(
+            step for step in steps if step.get("uses") == "./.github/actions/setup-device-env"
+        )
+        self.assertLess(steps.index(guard), steps.index(setup))
+        result = subprocess.run(
+            ["bash", "-eu", "-c", guard["run"]],
+            env={**os.environ, "HF_TOKEN": ""},
             capture_output=True,
             text=True,
+            check=False,
         )
-        self.assertEqual(rejected.returncode, 1)
-        for name in ("decode-benchmark", "pangu-offline", "pangu-online"):
-            cleanup = next(
-                step for step in jobs[name]["steps"] if step.get("name") == "Check clear device"
-            )
-            # Evaluate the guard after successful device mapping, even during
-            # cancellation. Failed mapping must still prevent unsafe cleanup.
-            for outcome in ("success", "failure", "skipped"):
-                condition = cleanup["if"].replace("steps.cuda-mapping.outcome", repr(outcome))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("prepared OpenOneRec cache", result.stderr)
+
+    def test_pangu_model_cache_preserves_the_pre_queue_worker_cache(self) -> None:
+        steps = self.workflows["device-validation.yml"]["jobs"]["validate"]["steps"]
+        cache = next(step for step in steps if step.get("id") == "cache-pangu1b")
+        # These identify the already-warmed, read-only model on the same machine.
+        self.assertEqual(cache["with"]["base"], "/data/actions/cache")
+        self.assertEqual(cache["with"]["path"], "openPangu-Embedded-1B-V1.1")
+        self.assertEqual(cache["with"]["key"], "pangu1b-model-${{ runner.os }}")
+
+    def test_push_is_cpu_only_and_lint_does_not_launch_pytest(self) -> None:
+        workflow = self.workflows["pre-commit.yml"]
+        self.assertEqual(set(workflow["jobs"]), {"fast-checks"})
+        hooks = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text())
+        self.assertFalse(
+            any(hook["id"] == "run-tests" for repo in hooks["repos"] for hook in repo["hooks"])
+        )
+
+    def test_queued_snapshot_guard_executes_against_changed_inputs(self) -> None:
+        # Execute the actual workflow script against a small API double, not a copy of its logic.
+        harness = """
+const context = {repo: {owner: 'test', repo: 'repo'}};
+const scenario = process.env.SCENARIO;
+const pr = {state: 'open', draft: scenario === 'draft', labels: [{name: 'ready'}],
+  head: {sha: process.env.HEAD_SHA, repo: {id: 1}}, base: {sha: process.env.BASE_SHA, ref: process.env.BASE_REF, repo: {id: 1}},
+  merge_commit_sha: process.env.MERGE_SHA};
+if (scenario === 'head') pr.head.sha = 'a'.repeat(40);
+if (scenario === 'unready') pr.labels = [];
+if (scenario === 'fork') pr.head.repo.id = 2;
+if (scenario === 'deleted-repo') pr.head.repo = null;
+if (scenario === 'wrong-base-repo') pr.base.repo.id = 2;
+const github = {rest: {repos: {
+  get: async () => ({data: {id: 1}}),
+  getBranch: async () => ({data: {commit: {sha: scenario === 'base' ? 'a'.repeat(40) : process.env.BASE_SHA}}}),
+  getCommit: async () => ({data: {parents: scenario === 'parents' ? [] :
+    [{sha: process.env.BASE_SHA}, {sha: process.env.HEAD_SHA}]}})
+}, pulls: {get: async () => ({data: pr})}}};
+(async () => { SCRIPT })().catch((error) => { console.error(error.message); process.exitCode = 1; });
+"""
+        for filename, job in (
+            ("device-validation.yml", "preflight"),
+            ("pre-commit.yml", "fast-checks"),
+            ("beam-performance-ab.yml", "beam-performance-ab-only"),
+        ):
+            guard = self.workflows[filename]["jobs"][job]["steps"][0]
+            script = guard["with"]["script"]
+            for scenario in (
+                "valid",
+                "head",
+                "base",
+                "draft",
+                "unready",
+                "parents",
+                "fork",
+                "deleted-repo",
+                "wrong-base-repo",
+            ):
+                result = subprocess.run(
+                    ["node", "-e", harness.replace("SCRIPT", script)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env={
+                        **os.environ,
+                        "PR_NUMBER": "1",
+                        "HEAD_SHA": "1" * 40,
+                        "BASE_SHA": "2" * 40,
+                        "MERGE_SHA": "3" * 40,
+                        "BASE_REF": "decode_graph",
+                        "REQUIRE_READY": guard["env"].get("REQUIRE_READY", "true"),
+                        "SCENARIO": scenario,
+                    },
+                )
+                allowed = scenario == "valid" or (
+                    scenario == "unready" and filename == "beam-performance-ab.yml"
+                )
                 self.assertEqual(
-                    bool(evaluate(condition, context(), cancelled=True)), outcome == "success"
+                    result.returncode, int(not allowed), f"{filename}: {result.stderr}"
                 )
 
 

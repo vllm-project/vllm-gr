@@ -16,15 +16,15 @@ class TestBenchmarkBranchPolicy(unittest.TestCase):
     def test_workflow_branch_and_device_scope(self) -> None:
         root = Path(__file__).resolve().parents[1]
         policy = load_policy(root / ".github/benchmark-gate.yaml")
-        workflow = yaml.safe_load((root / ".github/workflows/pre-commit.yml").read_text())
+        workflow = yaml.safe_load((root / ".github/workflows/device-validation.yml").read_text())
         step = next(
             item
-            for item in workflow["jobs"]["benchmark-policy"]["steps"]
+            for item in workflow["jobs"]["validate"]["steps"]
             if item.get("name") == "Resolve base-owned benchmark policy"
         )
         self.assertEqual(
             step["env"]["POLICY_TARGET_BRANCH"],
-            "${{ github.base_ref || github.ref_name }}",
+            "${{ inputs.base_ref }}",
         )
         # Execute the workflow's actual selection logic with stubbed NPU probing.
         # GPU selection must not require nvidia-smi or any model-specific probe.

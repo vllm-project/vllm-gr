@@ -1,0 +1,40 @@
+# Optional label-triggered validation; workflow code comes from the trusted base.
+name: Device validation preview
+run-name: >-
+  Device PR preview #${{ github.event.pull_request.number }} @${{ github.event.pull_request.head.sha }}
+on:
+  pull_request_target:
+    branches: [main, decode_graph]
+    types: [labeled]
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+concurrency:
+  # Ignored labels must not replace a real preview waiting in this group.
+  group: >-
+    device-preview-${{ github.event.pull_request.number }}-${{
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
+      github.event.label.name == 'ci-preview' && 'ci' || format('ignored-{0}', github.run_id)
+    }}
+  queue: max
+  cancel-in-progress: false
+jobs:
+  preview:
+    if: >-
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
+      github.event.label.name == 'ci-preview' &&
+      github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'ready') &&
+      contains(github.event.pull_request.labels.*.name, 'ci-preview')
+    uses: ./.github/workflows/device-validation.yml
+    with:
+      pr_number: ${{ format('{0}', github.event.pull_request.number) }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+      base_sha: ${{ github.event.pull_request.base.sha }}
+      merge_sha: ${{ github.event.pull_request.merge_commit_sha }}
+      base_ref: ${{ github.event.pull_request.base.ref }}
+      priority: ${{ contains(github.event.pull_request.labels.*.name, 'ci-priority:high') && 'high' || contains(github.event.pull_request.labels.*.name, 'ci-priority:normal') && 'normal' || 'low' }}
+      reuse_success: ${{ github.run_attempt > 1 }}
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}

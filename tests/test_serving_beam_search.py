@@ -7,6 +7,7 @@ try:
 except ImportError:
     from vllm.sampling_params import BeamSearchParams
 
+import copy
 import multiprocessing
 import os
 import time
@@ -17,7 +18,6 @@ from typing import Any
 import psutil
 import pytest
 import torch
-from transformers import AutoTokenizer
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
@@ -31,8 +31,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 
 
-async def beam_search_test(loops: int) -> None:
-    model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
+async def beam_search_test(loops: int, prepared: tuple[Any, ...] | None = None) -> None:
     raw_gpu_memory_utilization = os.getenv("VLLM_GR_TEST_GPU_MEMORY_UTILIZATION", "0.7")
     try:
         gpu_memory_utilization = float(raw_gpu_memory_utilization)
@@ -44,12 +43,18 @@ async def beam_search_test(loops: int) -> None:
         raise ValueError("VLLM_GR_TEST_GPU_MEMORY_UTILIZATION must be in (0, 1]")
     from tests.st.test_onerec_v1_scheduler_st import _inputs
 
+    if prepared is not None:
+        model_name, _, config, source, _, _ = prepared
+        await _run_serving_v1(
+            loops, model_name, copy.deepcopy(config), gpu_memory_utilization, source
+        )
+        return
     with TemporaryDirectory(prefix="gr-online-v1-") as directory:
-        model_name, _, config, _, _, _ = _inputs(Path(directory))
-        await _run_serving_v1(loops, model_name, config, gpu_memory_utilization)
+        model_name, _, config, source, _, _ = _inputs(Path(directory))
+        await _run_serving_v1(loops, model_name, config, gpu_memory_utilization, source)
 
 
-async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
+async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization, source):
     from vllm_gr.plugin import initialize_runtime
 
     initialize_runtime()
@@ -82,13 +87,8 @@ async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
             request_logger=None,
         )
 
-        # Use the specific prompt
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        prompt_file = os.path.join(os.path.dirname(__file__), "resources/single_one_rec_prompt.txt")
-        with open(prompt_file, "r") as f:
-            prompt_text = f.read()
-        prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)[-1023:]
-        prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        # _inputs encodes the same fixture once for all fresh engine lifecycles.
+        prompt = TokensPrompt(prompt_token_ids=source[-1023:])
 
         beam_search_params: dict[str, Any] = {
             "beam_width": beam_width,
@@ -134,16 +134,16 @@ def _run_gr_beam_search_target(loops: int) -> None:
     re_apply_patches()
     assert hasattr(BeamSearchParams, "begin_token")
 
-    async def run_test() -> None:
+    async def run_test(prepared: tuple[Any, ...]) -> None:
         device = torch.cuda
         if hasattr(torch, "npu") and torch.npu.is_available():
             device = torch.npu
-        await beam_search_test(loops)
+        await beam_search_test(loops, prepared)
         device.synchronize()
         before_gpu_mem: int = device.memory_allocated()
         before_host_mem: int = psutil.Process().memory_info().rss
-        await beam_search_test(loops)
-        await beam_search_test(loops)
+        await beam_search_test(loops, prepared)
+        await beam_search_test(loops, prepared)
         device.synchronize()
         after_gpu_mem: int = device.memory_allocated()
         after_host_mem: int = psutil.Process().memory_info().rss
@@ -162,7 +162,13 @@ def _run_gr_beam_search_target(loops: int) -> None:
             # Allow 50MB tolerance
             assert after_gpu_mem - before_gpu_mem <= 50 * 1024**2
 
-    asyncio.run(run_test())
+    from tests.st.test_onerec_v1_scheduler_st import _inputs
+
+    # Compile immutable constraints once, but retain all three fresh engine
+    # lifecycles: the memory-leak regression must still exercise teardown.
+    with TemporaryDirectory(prefix="gr-online-v1-") as directory:
+        prepared = _inputs(Path(directory))
+        asyncio.run(run_test(prepared))
 
 
 @pytest.mark.slow  # type: ignore

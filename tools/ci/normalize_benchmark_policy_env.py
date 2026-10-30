@@ -142,6 +142,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", required=True, type=Path)
     parser.add_argument("--github-output", type=Path)
+    parser.add_argument("--github-env", type=Path)
     return parser.parse_args()
 
 
@@ -152,7 +153,13 @@ def main() -> int:
     if args.github_output:
         with args.github_output.open("a", encoding="utf-8") as stream:
             stream.write(f"policy-json={payload}\n")
-    else:
+    if args.github_env:
+        with args.github_env.open("a", encoding="utf-8") as stream:
+            for key, value in normalized.items():
+                if "\n" in value or "\r" in value:
+                    raise PolicyError(f"multiline environment value for {key}")
+                stream.write(f"{key}={value}\n")
+    if not args.github_output and not args.github_env:
         print(payload)
     return 0
 

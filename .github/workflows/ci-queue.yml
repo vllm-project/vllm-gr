@@ -1,0 +1,49 @@
+name: CI Queue
+on:
+  workflow_run:
+    workflows: [Pre-commit and Benchmark, Device validation, Device validation preview, Beam V1 performance A/B]
+    types: [completed]
+  pull_request_target:
+    types: [labeled, unlabeled, converted_to_draft, closed]
+  issue_comment:
+    types: [created]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: write
+  statuses: write
+  pull-requests: write
+  issues: read
+concurrency:
+  group: ci-device-queue
+  queue: max
+  cancel-in-progress: false
+jobs:
+  dispatch:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request && github.event.comment.body == '/retest')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Privileged scheduler must never check out or run pull-request code.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Admit queued PRs without preempting running work
+        uses: actions/github-script@v7
+        env:
+          CI_DEVICE_SLOTS: ${{ vars.CI_DEVICE_SLOTS || '1' }}
+          CI_REGRESSION_BRANCHES: ${{ vars.CI_REGRESSION_BRANCHES || '["decode_graph"]' }}
+          CI_ENABLE_AUTO_MERGE: ${{ vars.CI_ENABLE_AUTO_MERGE || 'false' }}
+        with:
+          script: |
+            await require('./tools/ci/queue.cjs').runQueue({
+              github, context, core,
+              slots: process.env.CI_DEVICE_SLOTS,
+              regressionBranches: JSON.parse(process.env.CI_REGRESSION_BRANCHES),
+              autoMerge: process.env.CI_ENABLE_AUTO_MERGE === 'true',
+            });
