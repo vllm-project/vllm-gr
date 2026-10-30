@@ -189,6 +189,32 @@ def test_request_positive_geometry_is_fail_closed(bad_value: object) -> None:
         validate_beam_batch_request(_request(beam_params=_params(beam_width=bad_value)))
 
 
+def test_per_parent_beam_widths_reject_more_than_three_steps_at_protocol_boundary() -> None:
+    with pytest.raises(BeamContractError, match="per_parent_beam_widths"):
+        validate_beam_batch_request(
+            _request(
+                beam_params=_params(
+                    beam_width=1,
+                    max_tokens=4,
+                    per_parent_beam_widths=(1, 1, 1, 1),
+                )
+            )
+        )
+
+
+def test_per_parent_beam_widths_require_matching_bootstrap_width() -> None:
+    with pytest.raises(BeamContractError, match="first per-parent beam width"):
+        validate_beam_batch_request(
+            _request(
+                beam_params=_params(
+                    beam_width=4,
+                    dynamic_beam_widths=(2, 4, 4),
+                    per_parent_beam_widths=(4, 2, 1),
+                )
+            )
+        )
+
+
 def test_request_rejects_non_default_resource_duplicate_stops_and_wide_output() -> None:
     with pytest.raises(BeamContractError, match="unique"):
         validate_beam_batch_request(_request(beam_params=_params(stop_token_ids=(2, 2))))
@@ -495,6 +521,19 @@ def test_production_codec_round_trips_request_and_terminal_result() -> None:
         )
         == result
     )
+
+
+def test_per_parent_widths_preserve_existing_candidate_width_wire_position() -> None:
+    params = _params(beam_width=4, candidate_width=4, per_parent_beam_widths=(4, 2, 1))
+    encoded = msgspec.msgpack.encode(params)
+    raw = msgspec.msgpack.decode(encoded)
+    assert raw[9] == 4
+    assert raw[10] == [4, 2, 1]
+    assert msgspec.msgpack.decode(encoded, type=BeamBatchParams) == params
+
+    previous = msgspec.msgpack.decode(msgspec.msgpack.encode(raw[:10]), type=BeamBatchParams)
+    assert previous.candidate_width == 4
+    assert previous.per_parent_beam_widths is None
 
 
 def test_production_codec_preserves_nested_engine_request_tensor_frames() -> None:

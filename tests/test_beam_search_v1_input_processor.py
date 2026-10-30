@@ -34,6 +34,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputSequence,
     BeamRequestOutput,
 )
+from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 
 
 def _canonical_gr_config(*, enabled: bool = True, backend: str = "cuda") -> dict[str, Any]:
@@ -370,6 +371,47 @@ def test_explicit_candidate_width_rejects_a_non_uniform_dynamic_schedule() -> No
     _submit(None, [2, 2, 1])
 
 
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("widths", [None, [4, 4, 4], [4, 2, 1]])  # type: ignore[misc]
+def test_request_k_schedule_overrides_startup_candidate_width(
+    online: bool, widths: list[int] | None
+) -> None:
+    config = _canonical_gr_config()
+    config["beam"]["max_width"] = 4
+    config["constraint_table"]["candidate_width"] = 4
+    engine = _make_engine(additional_config={"vllm_gr": config})
+    engine.vllm_config.device_config = SimpleNamespace(device="cuda")
+    request = _prepare_request(
+        engine,
+        [1, 2],
+        BeamSearchParams(
+            beam_width=4,
+            max_tokens=3,
+            ignore_eos=True,
+            dynamic_beam_widths=widths,
+            per_parent_beam_widths=[4, 2, 1],
+        ),
+        online=online,
+    )
+    for stage in range(3):
+        view = BeamBatchExecutionView(
+            session_id=request.batch_id,
+            dispatch_id=stage,
+            stage_index=stage,
+            kind="prefill" if stage == 0 else "decode",
+            decode_step=None if stage == 0 else stage - 1,
+            owner_generation=0,
+            request_ids=(request.batch_id,),
+            num_prompt_tokens_by_request=(2,),
+            beam_width=request.beam_params.beam_width,
+            produces_output=True,
+            dynamic_beam_widths=request.beam_params.dynamic_beam_widths,
+            per_parent_beam_widths=request.beam_params.per_parent_beam_widths,
+        )
+        assert view.candidate_top_k == (4, 2, 1)[stage]
+        assert view.output_width == (widths or [4, 4, 4])[stage]
+
+
 def test_offline_inputs_reject_unsupported_batch_size_before_admission() -> None:
     engine = _make_engine()
     engine.get_supported_tasks = lambda: ("generate",)
@@ -461,6 +503,47 @@ def test_stage_widths_and_return_limit_reach_worker_contract(
     )
     assert request.beam_params.dynamic_beam_widths == (None if widths is None else tuple(widths))
     assert request.output_options.num_return_sequences == 1
+
+
+def test_cuda_per_parent_beam_widths_reaches_worker_contract() -> None:
+    config = _canonical_gr_config(backend="cuda")
+    config["beam"]["max_width"] = 4
+    engine = _make_engine(additional_config={"vllm_gr": config})
+    engine.vllm_config.device_config = SimpleNamespace(device="cuda")
+    request = _prepare_request(
+        engine,
+        [1, 2],
+        BeamSearchParams(
+            beam_width=4,
+            dynamic_beam_widths=[2, 4, 4],
+            per_parent_beam_widths=[2, 2, 1],
+            result_width=2,
+            max_tokens=3,
+            ignore_eos=True,
+        ),
+        online=True,
+    )
+    assert request.beam_params.dynamic_beam_widths == (2, 4, 4)
+    assert request.beam_params.per_parent_beam_widths == (2, 2, 1)
+
+
+@pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
+def test_npu_per_parent_beam_widths_is_rejected_before_submission(online: bool) -> None:
+    engine = _make_engine(additional_config={"vllm_gr": _canonical_gr_config(backend="npu")})
+    engine.vllm_config.device_config = SimpleNamespace(device="npu")
+    with pytest.raises(BeamSearchRequestError, match="per_parent_beam_widths requires CUDA"):
+        _prepare_request(
+            engine,
+            [1, 2],
+            BeamSearchParams(
+                beam_width=2,
+                per_parent_beam_widths=[2, 2, 2],
+                max_tokens=3,
+                ignore_eos=True,
+            ),
+            online=online,
+        )
+    engine.submit_gr_session.assert_not_called()
 
 
 def test_cuda_unconstrained_request_accepts_budget_beyond_table_depth() -> None:

@@ -19,7 +19,9 @@ from vllm_gr.v1.worker.gr_inputs import GRInputBuffers
 def uses_dynamic_beam(params: Any) -> bool:
     """Only search geometry requires dynamic state; output limits do not."""
     widths = params.dynamic_beam_widths
-    return widths is not None and any(w != params.beam_width for w in widths)
+    return getattr(params, "per_parent_beam_widths", None) is not None or (
+        widths is not None and any(w != params.beam_width for w in widths)
+    )
 
 
 class GPUDynamicBeam:

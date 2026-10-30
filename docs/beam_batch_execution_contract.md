@@ -47,10 +47,11 @@ for both fixed-width and dynamic-width Beam requests. A matching
 `protocol_version == 1` alone does not establish schema compatibility.
 
 `BeamBatchParams` uses an array-like MsgPack struct with strict unknown-field
-validation. Its appended `dynamic_beam_widths` field has a default so a new
-decoder can read an older, shorter array. However, array encoding still emits
-the trailing field when its value is `None`; an old strict decoder rejects that
-new array even for a fixed-width request. Supporting rolling upgrades would
+validation. Its appended `dynamic_beam_widths`, `candidate_width`, and
+`per_parent_beam_widths` fields have defaults so a new decoder can read an older,
+shorter array. However, array encoding still emits trailing fields when their
+values are `None`; an old strict decoder rejects that new array even for a
+fixed-width request. Supporting rolling upgrades would
 require capability negotiation and compatible encoding, not just a protocol
 number change or relaxing validation.
 
@@ -72,6 +73,8 @@ class BeamBatchParams:
     length_penalty: float = 1.0
     catalog_strategy: Literal["fill", "null"] | None = None
     dynamic_beam_widths: tuple[int, ...] | None = None
+    candidate_width: int | None = None
+    per_parent_beam_widths: tuple[int, ...] | None = None
 
 
 class BeamOutputOptions:
@@ -220,19 +223,22 @@ confuse this policy with native `max_num_seqs` capacity.
 
 Constraint Table generation supports up to three effective output steps and a
 per-row candidate width (`K`) of at most 256. The Beam width (`W`, rows per
-request) is a separate dimension with its own ceiling of 1024. The ceiling is
+request) is a separate dimension with its own operator ceiling of 1024. The ceiling is
 raised together with the scratch-tiling fix that makes the wide-`W` selection
 path correct; it also gates the raw Beam operators, so the constant and the
 kernels move as one. Widths above 256 take the hierarchical path; the fused
 `O(W**2)` merge kernels stay gated on `K == W` and `W in {64, 128, 256}`.
 
-The raised ceiling is an *operator* ceiling, not yet a serving one. The runtime
-still samples `W` candidates per row — the postprocess workspace and the
-constrained Top-K are sized from the Beam width until the engine-wiring layer
-consumes `K` — so configuration requires `K == W` and caps `K` at 256. A
-served `beam_max_width` above 256 is therefore rejected at parse time; only the
-kernels and their tests reach widths 512 and 1024 today. Keep
+The raised ceiling is an *operator* ceiling, not yet a serving one. The startup
+scalar `constraint_table.candidate_width` still must equal `beam_max_width`
+at parsing and is capped at 256; it is not wired into candidate generation.
+A served `beam_max_width` above 256 is therefore rejected at parse time;
+only the kernels and their tests reach widths 512 and 1024 today. Keep
 `beam_max_width <= 256` until that wiring lands.
+
+CUDA V1 requests can independently configure each stage's per-parent `K` with
+`per_parent_beam_widths` through the dynamic execution path. Without that
+request schedule, candidate generation still follows the retained stage W.
 
 Unconstrained V1 generation has its own configuration and budget checks; it
 does not require a catalog artifact. NPU dynamic widths must satisfy their
@@ -257,16 +263,19 @@ Bootstrap uses `P=1`. Decode uses `P=num_active_beams`, with
 `P <= W`. The reference never fabricates W Prefill parent rows.
 
 `K` is modelled as an independent dimension of `W` throughout this contract,
-and `constraint_table.candidate_width` is its single source of truth (default
-`W`). The constraint layer additionally requires `1 <= K <= MAX_CANDIDATE_WIDTH`
-and keeps the fused CUDA merge gated on `K == W and W in {64, 128, 256}`; every
-other geometry takes the hierarchical selection path.
+with `1 <= K <= MAX_CANDIDATE_WIDTH`. Without `per_parent_beam_widths`,
+candidate generation uses `K=W_out`. CUDA requests may configure a per-stage
+candidate schedule: bootstrap requires `K_1=W_1`, and later stages require
+`W_i <= W_(i-1)*K_i`. Both W and K remain limited to 256 in this build.
+An explicit request schedule uses dynamic selection, which flattens the
+`P*K` candidate pool and selects W winners.
 
-> **Not yet wired end to end.** This build still samples `W` candidates per row
-> — the postprocess workspace and the constrained Top-K are sized from the Beam
-> width — so a configured `K != W` would be accepted and then silently executed
-> as `W`. The configuration layer rejects that combination until the engine and
-> worker paths consume `K`.
+An explicit `per_parent_beam_widths` schedule overrides the startup scalar
+`constraint_table.candidate_width`, including when W varies by stage. The
+startup scalar still must equal `beam_max_width` at configuration parsing;
+it is not wired into candidate generation by this change. Without a request
+K schedule, the existing behavior and startup-K/dynamic-W restrictions remain.
+Backend admission checks the actual request K schedule against `max_top_k`.
 
 Both candidate adapters provide FP32 local log probabilities. The selection
 core does not compute softmax.

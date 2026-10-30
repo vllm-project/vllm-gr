@@ -291,9 +291,9 @@ class DynamicBeamState:
     ) -> dict[str, torch.Tensor]:
         """Select the next stage width, independently of its input width.
 
-        Each parent contributes at least ``output_width`` local candidates.
-        This is required for widening: all global winners may belong to one
-        parent. Invalid candidates and invalid parent scores remain ``-inf``.
+        Each parent contributes ``candidate_width`` local candidates. The
+        complete candidate pool must contain at least ``output_width`` items.
+        Invalid candidates and invalid parent scores remain ``-inf``.
         The final return can be truncated to ``result_width`` without changing
         the full ``output_width`` survivor state used to define the schedule.
         """
@@ -314,8 +314,8 @@ class DynamicBeamState:
         ):
             raise ValueError("Beam stage index must be the next unwritten sequence position")
         candidate_width = candidates.token_ids.shape[1] if candidates.token_ids.ndim == 2 else 0
-        if candidate_width < output_width:
-            raise ValueError("each parent must supply at least output_width candidates")
+        if input_width * candidate_width < output_width:
+            raise ValueError("retained width exceeds the complete candidate pool")
         self._validate_candidates(candidates, self.batch_size * input_width, candidate_width)
         returned_width = (
             output_width if result_width is None else _positive_int("result_width", result_width)

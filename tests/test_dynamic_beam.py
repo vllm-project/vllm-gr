@@ -168,6 +168,36 @@ def test_widening_keeps_multiple_winners_from_one_parent():
     torch.testing.assert_close(result["out_log_probs"], torch.tensor([[-0.2, -0.3], [-0.3, -0.4]]))
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_decode_branch_candidates_are_independent_from_retained_widths(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    ctx = context(1, device)
+    state = DynamicBeamState(ctx, 1, 2)
+    state.initialize(
+        ConstraintOutput(
+            torch.tensor([[12, 14]], dtype=torch.int32, device=device),
+            torch.tensor([[-0.1, -0.2]], device=device),
+            torch.ones((1, 2), dtype=torch.bool, device=device),
+        ),
+        2,
+    )
+    assert state.sequence[:, :, 0].tolist() == [[12, 14]]
+
+    result = state.select(
+        ConstraintOutput(
+            torch.tensor([[21, 22], [31, 32]], dtype=torch.int32, device=device),
+            torch.tensor([[-0.1, -0.2], [-0.3, -0.4]], device=device),
+            torch.ones((2, 2), dtype=torch.bool, device=device),
+        ),
+        input_width=2,
+        output_width=4,
+        stage_index=1,
+        is_last=True,
+    )
+    assert result["out_sequence"].shape == (1, 4, 2)
+
+
 def test_initialize_treats_non_finite_scores_as_invalid():
     ctx = context(2, "cpu")
     state = DynamicBeamState(ctx, 2, 2)
