@@ -14,7 +14,7 @@ export VLLM_GR_PREFILL_GRAPH_CAPTURE_NUM_REQS=1,2,4
 unset VLLM_GR_PREFILL_GRAPH_KV_BOUND
 
 candidate_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-base_sha="${V1_PERF_BASE_SHA:?V1_PERF_BASE_SHA is required}"
+event_base_sha="${V1_PERF_BASE_SHA:?V1_PERF_BASE_SHA is required}"
 candidate_sha="${V1_PERF_CANDIDATE_SHA:?V1_PERF_CANDIDATE_SHA is required}"
 head_sha="${V1_PERF_HEAD_SHA:?V1_PERF_HEAD_SHA is required}"
 pr_number="${V1_PERF_PR_NUMBER:?V1_PERF_PR_NUMBER is required}"
@@ -43,7 +43,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-[[ "$base_sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid base SHA" >&2; exit 2; }
+[[ "$event_base_sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid event base SHA" >&2; exit 2; }
 [[ "$candidate_sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid candidate SHA" >&2; exit 2; }
 [[ "$head_sha" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid PR head SHA" >&2; exit 2; }
 [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || { echo "invalid PR number" >&2; exit 2; }
@@ -51,14 +51,19 @@ trap 'exit 143' TERM
   echo "candidate checkout does not match the PR event" >&2
   exit 2
 }
-[[ "$(git -C "$candidate_root" rev-parse 'HEAD^')" == "$base_sha" ]] || {
-  echo "PR merge commit does not use the event base" >&2
-  exit 2
-}
+base_sha="$(git -C "$candidate_root" rev-parse 'HEAD^')"
 [[ "$(git -C "$candidate_root" rev-parse 'HEAD^2')" == "$head_sha" ]] || {
   echo "PR merge commit does not use the event head" >&2
   exit 2
 }
+# GitHub can refresh refs/pull/<n>/merge after the workflow event is queued.
+# In that case the synthetic merge's first parent is newer than the event
+# payload. Compare against that actual parent so upstream changes are not
+# attributed to the PR, while requiring a fast-forward base update.
+if ! git -C "$candidate_root" merge-base --is-ancestor "$event_base_sha" "$base_sha"; then
+  echo "PR merge base is not descended from the event base" >&2
+  exit 2
+fi
 if ! git -C "$candidate_root" cat-file -e "$base_sha^{commit}" 2>/dev/null; then
   git -C "$candidate_root" fetch --no-tags origin "$base_sha"
 fi

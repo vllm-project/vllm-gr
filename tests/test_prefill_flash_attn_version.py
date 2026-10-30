@@ -116,6 +116,7 @@ def _impl() -> Any:
     impl.logits_soft_cap = 0.0
     impl.vllm_flash_attn_version = 2
     impl.prefill_flash_attn_version = 3
+    impl.head_size = 8
     impl.sinks = None
     impl.alibi_slopes = None
     return impl
@@ -137,7 +138,8 @@ def test_forward_routes_both_prefill_entries_without_changing_decode(
     monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: execution)
     impl = _impl()
     q = torch.zeros(4, 2, 8)
-    cache = torch.zeros(2, 1, 16, 2, 8)
+    key_cache = torch.zeros(2, 16, 2, 8)
+    cache = torch.cat((key_cache, torch.zeros_like(key_cache)), dim=-1).transpose(1, 2)
     output = torch.empty_like(q)
     metadata = SimpleNamespace(is_prefill_graph_exec=graph, slot_mapping=torch.arange(4))
     impl.forward(SimpleNamespace(_k_scale=None, _v_scale=None), q, q, q, cache, metadata, output)

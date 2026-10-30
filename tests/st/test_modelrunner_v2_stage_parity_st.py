@@ -294,7 +294,22 @@ def test_modelrunner_v2_stage_parity(tmp_path: Path) -> None:
                 left = {tuple(seq) for seq, _ in reference["sequences"]}
                 right = {tuple(seq) for seq, _ in result["sequences"]}
                 assert len(left & right) / len(left) >= 0.95, (arm, reference, result)
-                assert reference["sequences"][0][0] == result["sequences"][0][0]
+                # BF16 graph/eager kernels can swap nearly tied leading
+                # candidates across GPU architectures. Keep both winners in
+                # the opposite arm's leading window while still requiring the
+                # complete candidate sets to agree above.
+                left_leaders = {tuple(seq) for seq, _ in reference["sequences"][:4]}
+                right_leaders = {tuple(seq) for seq, _ in result["sequences"][:4]}
+                assert tuple(reference["sequences"][0][0]) in right_leaders, (
+                    arm,
+                    reference,
+                    result,
+                )
+                assert tuple(result["sequences"][0][0]) in left_leaders, (
+                    arm,
+                    reference,
+                    result,
+                )
 
 
 if __name__ == "__main__":
