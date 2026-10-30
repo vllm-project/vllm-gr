@@ -268,7 +268,10 @@ class V2StageExecutionHooks(_StageExecutionHooks):
         worker = self.worker
         batch_size = len(owner.bindings)
         cfg = _get_gr_config(worker)
-        geometry = (batch_size, owner.inputs.width)
+        bucket = getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0)
+        geometry = (
+            (batch_size, owner.inputs.width, bucket) if bucket else (batch_size, owner.inputs.width)
+        )
         if geometry in getattr(worker, "_gr_runtime_decode_capture_failures", {}):
             owner.graph = None
             return owner._forward()
@@ -280,13 +283,17 @@ class V2StageExecutionHooks(_StageExecutionHooks):
             and batch_size not in getattr(worker, "_gr_decode_capture_failures", {})
         )
         owner.graph = self.decode_graph(batch_size, owner.inputs.width) if enabled else None
+        if owner.graph is not None and bucket:
+            owner.graph.select(batch_size, owner.inputs.width, bucket)
         # Dynamic sessions own per-width buffers. Rebuild after schedule/batch
         # changes, including the first fixed-width session following them.
         if (
             owner.graph is not None
             and not owner.graph.ready
             and (
-                owner.dynamic is not None or getattr(worker, "_gr_dynamic_graphs_discarded", False)
+                bucket
+                or owner.dynamic is not None
+                or getattr(worker, "_gr_dynamic_graphs_discarded", False)
             )
         ):
             try:
@@ -305,7 +312,8 @@ class V2StageExecutionHooks(_StageExecutionHooks):
                 owner.graph = None
                 logger.warning(
                     "GR runtime Decode capture unsupported; using eager for B=%d W=%d: %s",
-                    *geometry,
+                    batch_size,
+                    owner.inputs.width,
                     error,
                 )
                 return owner._forward()

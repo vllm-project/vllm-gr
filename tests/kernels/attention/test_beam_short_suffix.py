@@ -14,6 +14,22 @@ Case = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tenso
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
+@pytest.fixture(scope="session", params=[2, 3, 4])
+def prefix_fa_version(request: pytest.FixtureRequest) -> int:
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    version = int(request.param)
+    if not is_fa_version_supported(version):
+        pytest.skip(f"FlashAttention {version} is not supported on this device")
+    if version == 4:
+        pytest.importorskip(
+            "vllm.vllm_flash_attn.cute.interface",
+            reason="FA4 requires compatible optional CuTe/Quack dependencies",
+            exc_type=ImportError,
+        )
+    return version
+
+
 @pytest.fixture(autouse=True)
 def disable_tf32() -> Generator[None, None, None]:
     previous = torch.backends.cuda.matmul.allow_tf32
@@ -347,10 +363,11 @@ def test_cascade_dispatch_and_fallback(
 @pytest.mark.parametrize("width", [1, 7, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
-def test_real_fa2_prefix_against_fp32_dense(
-    width: int, dtype: torch.dtype, prefix_len: int, capacity: int
+def test_real_prefix_against_fp32_dense(
+    width: int, dtype: torch.dtype, prefix_len: int, capacity: int, prefix_fa_version: int
 ) -> None:
-    """Verify actual FA2 prefix LSE layout/normalization, not just a mocked state."""
+    """Verify actual prefix LSE layout/normalization, not just a mocked state."""
+    fa_version = prefix_fa_version
     from vllm_gr.v1.attention.backends import beam_attn_gpu as gpu
 
     case = make_case(width, 16, 8, 128, capacity, dtype)
@@ -373,6 +390,7 @@ def test_real_fa2_prefix_against_fp32_dense(
         num_prefix_indices=width,
         num_actual_tokens=width,
         prefix_cu_seqlens_q_device=torch.tensor([0, width], dtype=torch.int32, device="cuda"),
+        prefix_seqlens_q_cpu=[width],
         prefix_seqlens_kv_device=torch.tensor([prefix_len], dtype=torch.int32, device="cuda"),
         prefix_max_q_len=width,
         prefix_max_seq_len=128,
@@ -388,11 +406,179 @@ def test_real_fa2_prefix_against_fp32_dense(
     for step in sorted({0, 1, capacity // 2, capacity - 1}):
         step_buf.fill_(step)
         gpu.cascade_attention(
-            output, q, key_cache, value_cache, md, (-1, -1), 128**-0.5, 0.0, 2, beam_pool=pool
+            output,
+            q,
+            key_cache,
+            value_cache,
+            md,
+            (-1, -1),
+            128**-0.5,
+            0.0,
+            fa_version,
+            beam_pool=pool,
         )
         _, _, expected = reference(q, k, v, pk[:prefix_len], pv[:prefix_len], step, active)
         atol = 2e-3 if dtype == torch.float16 else 1.6e-2
         torch.testing.assert_close(output.float(), expected, atol=atol, rtol=atol)
+
+
+@pytest.mark.parametrize("width", [1, 7, 32])
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("graph_replay", [False, True])
+@torch.inference_mode()
+def test_multi_request_prefix_state_and_graph(
+    prefix_fa_version: int, width: int, fused: bool, graph_replay: bool
+) -> None:
+    """Real FA states, paged/unequal/empty prefixes and changing device inputs.
+
+    Multiple W=1 requests expose FA2 GQA LSE permutations that B=1 cannot.
+    Test both consumers: fused suffix and the generic suffix + CUDA merge.
+    """
+    from vllm_gr.v1.attention.backends import beam_attn_gpu as gpu
+    from vllm_gr.v1.attention.backends.beam_attention_state import (
+        normalize_flash_attn_state,
+    )
+
+    batch, heads, kv_heads, dim, capacity = 3, 8, 4, 64, 3
+    rows = batch * width
+    q, k, v, _, _, active = make_case(rows, heads, kv_heads, dim, capacity, torch.bfloat16)
+    key_cache = torch.randn(24, 16, kv_heads, dim, device="cuda", dtype=q.dtype)
+    value_cache = torch.randn_like(key_cache)
+    table = torch.randperm(24, device="cuda", dtype=torch.int32).reshape(batch, 8)
+    prefix_k = key_cache[table.long()].flatten(1, 2)
+    prefix_v = value_cache[table.long()].flatten(1, 2)
+    lengths = torch.tensor([32, 37, 125], dtype=torch.int32, device="cuda")
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * width
+    step = torch.zeros(1, dtype=torch.int32, device="cuda")
+    suffix_cu_k = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
+    pool = SimpleNamespace(
+        unshared_key=k,
+        unshared_value=v,
+        num_kv_heads=kv_heads,
+        head_dim=dim,
+        max_decode_steps=capacity,
+    )
+    session = SimpleNamespace(
+        is_active=True,
+        slot=1,
+        beam_width=rows,
+        context=SimpleNamespace(decode_step_buf=step, enable_short_suffix_attention=fused),
+        suffix_k_buf=torch.zeros(rows * capacity, kv_heads, dim, device="cuda", dtype=q.dtype),
+        suffix_v_buf=torch.zeros(rows * capacity, kv_heads, dim, device="cuda", dtype=q.dtype),
+    )
+    md = SimpleNamespace(
+        std_indices=None,
+        prefix_indices=torch.arange(rows, device="cuda"),
+        num_prefix_indices=rows,
+        num_actual_tokens=rows,
+        prefix_cu_seqlens_q_device=cu_q,
+        prefix_seqlens_q_cpu=[width] * batch,
+        prefix_seqlens_kv_device=lengths,
+        prefix_max_q_len=width,
+        prefix_max_seq_len=128,
+        prefix_block_table=table,
+        prefix_scheduler_metadata=None,
+        max_num_splits=0,
+        beam_session=session,
+        is_beam_decode=True,
+        beam_active_mask=active,
+        suffix_max_q_len=1,
+        suffix_cu_seqlens_q_device=torch.arange(rows + 1, dtype=torch.int32, device="cuda"),
+        suffix_cu_seqlens_k_device=suffix_cu_k,
+        num_heads=heads,
+        num_kv_heads=kv_heads,
+    )
+    output = torch.empty_like(q)
+
+    def run() -> None:
+        gpu.cascade_attention(
+            output,
+            q,
+            key_cache,
+            value_cache,
+            md,
+            (-1, -1),
+            dim**-0.5,
+            0.0,
+            prefix_fa_version,
+            beam_pool=pool,
+        )
+
+    # Check LSE itself, independently of either suffix consumer. This catches
+    # a permutation even when prefix attention dominates the final output.
+    out, lse = gpu.flash_attn_varlen_func(
+        q=q,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_q,
+        seqused_k=lengths,
+        max_seqlen_q=width,
+        max_seqlen_k=128,
+        block_table=table,
+        causal=False,
+        softmax_scale=dim**-0.5,
+        return_softmax_lse=True,
+        fa_version=prefix_fa_version,
+    )
+    state = normalize_flash_attn_state(
+        out,
+        lse,
+        fa_version=prefix_fa_version,
+        num_kv_heads=kv_heads,
+        max_query_len=width,
+        paged_kv=True,
+    )
+    for b, length in enumerate([32, 37, 125]):
+        sl = slice(b * width, (b + 1) * width)
+        ref_out, ref_lse, _ = reference(
+            q[sl],
+            k[:, sl],
+            v[:, sl],
+            prefix_k[b, :length],
+            prefix_v[b, :length],
+            0,
+            active[sl],
+        )
+        torch.testing.assert_close(state.lse[:, sl], ref_lse, atol=2e-3, rtol=2e-3)
+        torch.testing.assert_close(state.out[sl].float(), ref_out, atol=1.6e-2, rtol=2e-2)
+
+    run()
+    graph = None
+    if graph_replay:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run()
+
+    for decode_step, prefix_lengths in [(0, [32, 37, 125]), (2, [0, 88, 1]), (1, [53, 0, 96])]:
+        step.fill_(decode_step)
+        lengths.copy_(torch.tensor(prefix_lengths, dtype=torch.int32, device="cuda"))
+        suffix_cu_k.copy_(md.suffix_cu_seqlens_q_device * (decode_step + 1))
+        active.logical_not_()
+        # Simulate an updated/reordered beam history between graph replays.
+        v.copy_(v.roll(1, dims=1))
+        if graph is None:
+            run()
+        else:
+            graph.replay()
+        for b, length in enumerate(prefix_lengths):
+            sl = slice(b * width, (b + 1) * width)
+            _, _, expected = reference(
+                q[sl],
+                k[:, sl],
+                v[:, sl],
+                prefix_k[b, :length],
+                prefix_v[b, :length],
+                decode_step,
+                active[sl],
+            )
+            assert torch.isfinite(expected).all(), ("reference", decode_step, b)
+            assert torch.isfinite(output[sl]).all(), ("output", decode_step, b)
+            torch.testing.assert_close(output[sl].float(), expected, atol=1.6e-2, rtol=2e-2)
 
 
 @torch.inference_mode()

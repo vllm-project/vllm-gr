@@ -67,6 +67,20 @@ def capture_async_forward(
         return capture_beam_decode_graph(worker)
     if device_type != "cuda":
         return False
+    # Measure (or load) the device-local prefix cost model before any Beam graph
+    # is captured: the cache write is a YAML file and the probe needs the GPU to
+    # itself. Failures degrade to "no calibration", never to a failed start-up.
+    from vllm_gr.v1.attention.backends.beam_prefix_calibrate import (
+        ensure_prefix_calibration,
+    )
+    from vllm_gr.v1.attention.backends.beam_prefix_policy import (
+        remember_worker_flash_attn_version,
+    )
+
+    # The request path may run without a vLLM config context, so persist the
+    # operator's explicit FlashAttention choice while it is still available.
+    remember_worker_flash_attn_version(worker)
+    ensure_prefix_calibration(worker)
     from vllm_gr.v1.worker.model_runner_common import _get_gr_config
 
     if getattr(_get_gr_config(worker), "beam_graph_widths", None) is not None:
@@ -192,6 +206,15 @@ def _capture_batch(
             )
             owner.prepared = owner.prepare_cpu(decode, 0)
             owner._bind_attention(decode)
+            # Keep the startup fallback graph at model capacity. Measured
+            # length buckets are captured lazily against real request buffers.
+            if getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0):
+                owner.metadata.prefix_length_bucket = 0
+                owner.metadata.prefix_max_seq_len = (
+                    (owner.inputs.max_model_len + owner.inputs.block_size - 1)
+                    // owner.inputs.block_size
+                    * owner.inputs.block_size
+                )
             owner.input_ids.zero_()
             owner.positions.zero_()
             owner.execution_mask.zero_()

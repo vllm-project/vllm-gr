@@ -37,6 +37,16 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unav
 def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, n):
     buffers = GRInputBuffers(width, 96, 16, "cuda")
     binding = SimpleNamespace(session_id="session-0", native_request_id="session-0")
+    # Prefix planning reads the KV geometry, never the tensor contents.
+    context = SimpleNamespace(
+        max_decode_steps=n,
+        dtype=torch.float16,
+        pools=[
+            SimpleNamespace(
+                unshared_key=torch.empty((1, width, 1, n, 64), device="cuda", dtype=torch.float16)
+            )
+        ],
+    )
 
     def forbidden(*args, **kwargs):
         raise AssertionError(
@@ -66,7 +76,7 @@ def test_each_decode_rebuilds_without_cache_or_device_reads(monkeypatch, width, 
             built = BeamAttentionMetadataBuilder.build_async(
                 layout=prepared.layout,
                 views=views,
-                session=SimpleNamespace(context=SimpleNamespace(max_decode_steps=n)),
+                session=SimpleNamespace(context=context),
                 mask=torch.ones(width, device="cuda", dtype=torch.bool),
                 slots=torch.full((width,), -1, device="cuda", dtype=torch.int64),
                 block_size=16,

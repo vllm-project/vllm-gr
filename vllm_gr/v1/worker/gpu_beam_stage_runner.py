@@ -327,7 +327,7 @@ class _StageExecutionHooks:
     def prepare_new_adapter(self, view: BeamBatchExecutionView) -> None:
         graph = getattr(self.worker, "_beam_decode_graph", None)
         if graph is not None:
-            graph.select(view.batch_size, view.beam_width).discard_selected()
+            graph.discard_geometry(view.batch_size, view.beam_width)
 
     def decode_graph(self, batch_size: int, beam_width: int) -> Any:
         from vllm_gr.v1.worker.beam_decode_graph import get_beam_decode_graph
@@ -346,6 +346,9 @@ class _StageExecutionHooks:
         )
         if graph_enabled:
             graph = self.decode_graph(len(owner.bindings), owner.inputs.width)
+            bucket = getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0)
+            if bucket:
+                graph.select(len(owner.bindings), owner.inputs.width, bucket)
             if not graph.ready:
                 graph.capture(
                     owner._forward_hidden,
@@ -691,6 +694,9 @@ class GPUBeamStageRunner:
             len(self.bindings),
             self.inputs.width if self.inputs is not None else self.beam.state.beam_width,
         )
+        bucket = getattr(getattr(self, "metadata", None), "prefix_length_bucket", 0)
+        if bucket:
+            graph.select(len(self.bindings), self.inputs.width, bucket)
         graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
         return graph
 
@@ -1106,7 +1112,7 @@ def get_stage_runner(
         for name in group.layer_names:
             impl = getattr(layers.get(name), "impl", None)
             if not isinstance(impl, BeamAttentionImpl):
-                raise ValueError("persistent GR requires Beam Attention on every KV layer")
+                raise ValueError("persistent GR requires Beam Attention on every KV layer")  # noqa: TRY004
             # Packed beam queries do not preserve sliding-window positions
             # across the prefix/suffix split. No window is stored as (-1, -1).
             if impl.sliding_window != (-1, -1):

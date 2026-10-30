@@ -227,6 +227,11 @@ class BeamAttentionImpl(AttentionImpl):
                 self.alibi_slopes,
                 self.sinks,
             )
+            logger.info_once(
+                "Beam prefix uses FlashAttention %s with canonical out/LSE; "
+                "short-suffix fusion is enabled independently.",
+                self.vllm_flash_attn_version,
+            )
         # Separate prefill from the version that defines decode prefix/LSE
         # semantics. Resolve before capture; never change the global config.
         self.prefill_flash_attn_version = self.vllm_flash_attn_version

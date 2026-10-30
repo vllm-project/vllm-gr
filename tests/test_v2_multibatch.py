@@ -115,5 +115,10 @@ def test_stage_replacement_and_capacity_are_runner_specific(v2: bool) -> None:
     worker = SimpleNamespace(_beam_decode_graph=graph)
     hooks = (V2StageExecutionHooks if v2 else _StageExecutionHooks)(worker)
     hooks.prepare_new_adapter(SimpleNamespace(batch_size=2, beam_width=4))
-    assert graph.select.return_value.discard_selected.call_count == (0 if v2 else 1)
+    if v2:
+        # Every V2 adapter shares the Worker storage, so captures survive.
+        graph.discard_geometry.assert_not_called()
+    else:
+        # A new V1 stage replaces the input storage: drop every length bucket.
+        graph.discard_geometry.assert_called_once_with(2, 4)
     assert hooks.required_constraint_rows(2, 4) == (8 if v2 else 4)

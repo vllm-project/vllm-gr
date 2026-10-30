@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # mypy: disallow-untyped-decorators=False
 
+import inspect
 import subprocess
 import sys
 from textwrap import dedent
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Literal
 
 import pytest
@@ -18,6 +19,18 @@ from vllm_gr.v1.attention.backends.beam_attn_gpu import (
 )
 from vllm_gr.v1.attention.backends.beam_attn_metadata import BeamAttentionMetadata
 from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+
+
+@pytest.fixture
+def flash_backend(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    # Policy tests must not import CUDA extensions on NPU or depend on local GPUs.
+    flash = ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
+    monkeypatch.setattr(flash, "is_fa_version_supported", lambda version: True, raising=False)
+    monkeypatch.setattr(
+        flash, "fa_version_unsupported_reason", lambda version: "test device", raising=False
+    )
+    monkeypatch.setitem(sys.modules, flash.__name__, flash)
+    return flash
 
 
 def test_short_suffix_import_does_not_require_gluon() -> None:
@@ -48,6 +61,7 @@ def test_short_suffix_import_does_not_require_gluon() -> None:
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -160,8 +174,8 @@ def _short_suffix_engine_config(
 @pytest.mark.parametrize(
     ("options", "expected"),
     [
-        ({}, 2),
-        ({"enabled": True}, 2),
+        ({}, None),
+        ({"enabled": True}, None),
         ({"fa_version": 2}, 2),
         ({"enabled": True, "fa_version": 2}, 2),
         ({"enabled": False}, None),
@@ -175,7 +189,7 @@ def _short_suffix_engine_config(
         ({"custom": False, "fa_version": 3}, 3),
     ],
 )
-def test_engine_resolves_fa2_default_and_preserves_opt_out(
+def test_engine_preserves_automatic_selection_and_explicit_version(
     monkeypatch: pytest.MonkeyPatch, source: str, options: dict[str, Any], expected: int | None
 ) -> None:
     from vllm_gr.engine import arg_utils_gr
@@ -190,14 +204,13 @@ def test_engine_resolves_fa2_default_and_preserves_opt_out(
 
 @pytest.mark.parametrize("source", ["canonical", "legacy"])
 @pytest.mark.parametrize("fa_version", [3, 4])
-def test_fused_engine_rejects_explicit_incompatible_fa(
+def test_fused_engine_accepts_explicit_fa(
     monkeypatch: pytest.MonkeyPatch, source: str, fa_version: Literal[3, 4]
 ) -> None:
     from vllm_gr.engine import arg_utils_gr
 
     config, args = _short_suffix_engine_config(monkeypatch, source, fa_version=fa_version)
-    with pytest.raises(ValueError, match="FlashAttention 2"):
-        arg_utils_gr.create_engine_config(args)
+    assert arg_utils_gr.create_engine_config(args) is config
     assert config.attention_config.flash_attn_version == fa_version
 
 
@@ -206,11 +219,15 @@ def test_fused_engine_rejects_explicit_incompatible_fa(
     ("enabled", "fa_version"),
     [(None, None), (False, None), (None, 2), (True, 2), (True, None), (True, 3)],
 )
-def test_sm90_fusion_defaults_to_fa2_and_opt_out_preserves_fa3(
+@pytest.mark.parametrize("capability,default_version", [(8, 2), (9, 3), (10, 4)])
+def test_fusion_preserves_platform_auto_selection(
     monkeypatch: pytest.MonkeyPatch,
     source: str,
     enabled: bool | None,
     fa_version: Literal[2, 3] | None,
+    capability: int,
+    default_version: int,
+    flash_backend: ModuleType,
 ) -> None:
     import vllm.config
     from vllm.platforms.interface import DeviceCapability
@@ -219,7 +236,6 @@ def test_sm90_fusion_defaults_to_fa2_and_opt_out_preserves_fa3(
     from vllm_gr.engine import arg_utils_gr
     from vllm_gr.v1.attention.backends import beam_attn, beam_attn_gpu
 
-    flash = pytest.importorskip("vllm.vllm_flash_attn.flash_attn_interface")
     config, args = _short_suffix_engine_config(
         monkeypatch, source, enabled=enabled, fa_version=fa_version
     )
@@ -230,34 +246,32 @@ def test_sm90_fusion_defaults_to_fa2_and_opt_out_preserves_fa3(
         SimpleNamespace(
             is_xpu=lambda: False,
             is_rocm=lambda: False,
-            get_device_capability=lambda: DeviceCapability(9, 0),
+            get_device_capability=lambda: DeviceCapability(capability, 0),
         ),
     )
-    monkeypatch.setattr(flash, "is_fa_version_supported", lambda version: version in (2, 3))
+    monkeypatch.setattr(
+        flash_backend, "is_fa_version_supported", lambda version: version in (2, default_version)
+    )
     monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
     monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
     monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: beam_attn_gpu)
-    # Exercise the installed vLLM selector: an ordinary SM90 default is FA3.
-    expected = 3 if fa_version is None else fa_version
+    # Exercise the installed vLLM selector, including device fallbacks.
+    if fa_version == 3 and capability == 8:
+        pytest.skip("explicit FA3 is not supported on SM8x")
+    expected = default_version if fa_version in (None, 3) else fa_version
     assert beam_attn_gpu.get_flash_attn_version(head_size=128) == expected
-    if enabled is not False and fa_version not in (None, 2):
-        with pytest.raises(ValueError, match="FlashAttention 2"):
-            arg_utils_gr.create_engine_config(args)
-        return
     arg_utils_gr.create_engine_config(args)
-    resolved = 2 if enabled is not False else fa_version
-    assert config.attention_config.flash_attn_version == resolved
-    expected = 3 if resolved is None else resolved
+    assert config.attention_config.flash_attn_version == fa_version
     assert GRConfig.from_vllm_config(config).enable_short_suffix_attention is (enabled is not False)
-    kwargs: dict[str, Any] = dict(
-        num_heads=16,
-        head_size=128,
-        scale=128**-0.5,
-        num_kv_heads=8,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
-    )
+    kwargs: dict[str, Any] = {
+        "num_heads": 16,
+        "head_size": 128,
+        "scale": 128**-0.5,
+        "num_kv_heads": 8,
+        "alibi_slopes": None,
+        "sliding_window": None,
+        "kv_cache_dtype": "auto",
+    }
     impl = beam_attn.BeamAttentionImpl(**kwargs)
     assert impl.vllm_flash_attn_version == expected
     assert impl.supports_quant_query_input is (enabled is False)
@@ -316,7 +330,7 @@ def test_context_accepts_positive_capacity(capacity: int, dtype: torch.dtype) ->
         {"num_heads": 15},
         {"head_size": 100},
         {"head_size": 512},
-        {"fa_version": 3},
+        {"fa_version": 5},
         {"sliding_window": (32, 0)},
         {"softcap": 10.0},
         {"alibi_slopes": torch.zeros(16)},
@@ -596,6 +610,13 @@ def _run_cascade(monkeypatch: pytest.MonkeyPatch, case: SimpleNamespace) -> list
 
         output.copy_(prefix + 50)
 
+    # Routing is tested on CPU; numerical/device-length repair is exercised
+    # with actual CUDA backends in test_beam_short_suffix.py.
+    def clear_empty(state: Any, cu_q: torch.Tensor, lengths: torch.Tensor) -> Any:
+        assert torch.all(lengths > 0)
+        return state
+
+    monkeypatch.setattr(beam_attn_gpu, "clear_empty_prefix_states", clear_empty)
     monkeypatch.setattr(beam_attn_gpu, "flash_attn_varlen_func", flash_attention)
     monkeypatch.setattr(beam_attn_gpu, "merge_attn_states", merge)
     monkeypatch.setattr(beam_short_suffix, "merge_short_suffix_attention", fused)
@@ -674,7 +695,11 @@ def test_cascade_nonpure_batches_use_generic_attention_without_overwriting_other
 @pytest.mark.parametrize("width", [None, 128])
 @pytest.mark.parametrize("enabled", [None, False, True])
 def test_layer_constructor_validates_before_execution(
-    monkeypatch: pytest.MonkeyPatch, enabled: bool | None, width: int | None, cuda: bool
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool | None,
+    width: int | None,
+    cuda: bool,
+    flash_backend: ModuleType,
 ) -> None:
     import vllm.config
 
@@ -712,3 +737,64 @@ def test_layer_constructor_validates_before_execution(
     kwargs["logits_soft_cap"] = 0.0
     impl = beam_attn.BeamAttentionImpl(**kwargs)
     assert impl.supports_quant_query_input is (not active)
+
+
+def _routing_tensor(shape: tuple[int, ...]) -> Any:
+    """Metadata-only stand-in: routing reads shape/dtype/stride, never data."""
+
+    class _Fake:
+        def __init__(self) -> None:
+            self.shape = shape
+            self.dtype = torch.bfloat16
+            self.is_cuda = True
+
+        def stride(self) -> tuple[int, ...]:
+            return (1,) * len(shape)
+
+    return _Fake()
+
+
+@pytest.mark.parametrize("fa_version", [2, 3, 4])
+def test_fused_suffix_uses_the_fa2_emulating_kernel_for_every_prefix_backend(
+    monkeypatch: pytest.MonkeyPatch, fa_version: int
+) -> None:
+    """The fused suffix kernel is chosen by shape/dtype, never by FA version.
+
+    ``validate_short_suffix_attention`` accepts FA2/FA3/FA4 prefix states, so the
+    suffix arithmetic must stay on the FA2-emulating kernel for all of them: the
+    routing function has no version knob, which this test locks down because the
+    GPU parity tests skip FA3/FA4 fused combinations on hosts without CuTe.
+    """
+    from vllm_gr.v1.attention.backends import beam_short_suffix as suffix
+
+    assert "fa_version" not in inspect.signature(suffix.merge_short_suffix_attention).parameters
+    validate_short_suffix_attention(
+        num_heads=8,
+        num_kv_heads=2,
+        head_size=128,
+        fa_version=fa_version,
+        sliding_window=None,
+        softcap=0.0,
+        alibi_slopes=None,
+        sinks=None,
+    )
+    # The Gluon-based fast kernel does not import on NPU Triton builds, so stub
+    # the module instead of importing it; the routing decision is what matters.
+    fast = ModuleType("vllm_gr.v1.attention.backends.beam_short_suffix_fa2")
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        fast, "merge_short_suffix_fa2", lambda *args: calls.append(args), raising=False
+    )
+    monkeypatch.setitem(sys.modules, fast.__name__, fast)
+    suffix.merge_short_suffix_attention(
+        output=_routing_tensor((4, 8, 128)),
+        query=_routing_tensor((4, 8, 128)),
+        prefix_output=_routing_tensor((4, 8, 128)),
+        prefix_lse=_routing_tensor((8, 4)),
+        pool_key=_routing_tensor((1, 1, 1, 3, 128)),
+        pool_value=_routing_tensor((1, 1, 1, 3, 128)),
+        slot=0,
+        decode_step=_routing_tensor((4,)),
+        scale=1.0,
+    )
+    assert len(calls) == 1
