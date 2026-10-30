@@ -104,6 +104,14 @@ class TestRuntimeResolution(unittest.TestCase):
             stream.write("\nadditional-dependency==1.0\n")
         self.assertNotEqual(original, runtime.resolve(self.repo, "cuda")["cache_key"])
 
+    def test_resolve_supports_base_commit_that_predates_runtime_tool(self) -> None:
+        (self.repo / "tools/ci/resolve_runtime.py").unlink()
+
+        spec = runtime.resolve(self.repo, "cuda")
+
+        self.assertEqual(spec["expected"], {"vllm": "0.29.0", "vllm-gr": "0.29.0"})
+        self.assertEqual(spec, runtime.resolve(self.repo, "cuda"))
+
     def test_npu_requires_and_fingerprints_vendor_image(self) -> None:
         packages = {
             "vllm": "0.29.0+npu",

@@ -83,22 +83,30 @@ def declarations(repo: Path, device: str) -> dict[str, str]:
 
 
 def source_digest(repo: Path) -> str:
-    paths = [
-        repo / name
-        for name in (
-            "setup.py",
-            "pyproject.toml",
-            "vllm_gr/_env_check.py",
-            "tools/ci/resolve_runtime.py",
-            ".pre-commit-config.yaml",
+    names = (
+        "setup.py",
+        "pyproject.toml",
+        "vllm_gr/_env_check.py",
+        "tools/ci/resolve_runtime.py",
+        ".pre-commit-config.yaml",
+    )
+    paths = {
+        name: (
+            Path(__file__).resolve()
+            if name == "tools/ci/resolve_runtime.py" and not (repo / name).is_file()
+            else repo / name
         )
-    ]
-    paths.extend(path for path in (repo / "requirements").rglob("*") if path.is_file())
-    return digest(
+        for name in names
+    }
+    paths.update(
         {
-            str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in paths
+            str(path.relative_to(repo)): path
+            for path in (repo / "requirements").rglob("*")
+            if path.is_file()
         }
+    )
+    return digest(
+        {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}
     )
 
 
