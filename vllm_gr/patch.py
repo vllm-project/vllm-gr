@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm_gr import lmcache_patch, npu_spawn_patch
+from vllm_gr import lmcache_patch, npu_spawn_patch, pangu_compat
 from vllm_gr.ops import sliced_logits_patch
 from vllm_gr.v1 import ascend_compat
 
@@ -528,6 +528,9 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
 def _apply_patches(force: bool = False) -> int:
     """Apply all runtime patches needed by vllm-gr."""
+    # ModelConfig construction happens before model loading, so preserve the
+    # official Pangu tied-weight layout at the earliest runtime boundary.
+    pangu_count = int(pangu_compat.apply_pangu_tied_embeddings_patch())
     # Install the NPU-aware spawn guard before anything can create worker
     # processes, so engine startup inherits the corrected start-method choice.
     npu_spawn_count = int(npu_spawn_patch.apply_npu_spawn_patch())
@@ -537,7 +540,7 @@ def _apply_patches(force: bool = False) -> int:
     # vllm_ascend.ops first, avoiding an import-order cycle through device_op.
     npu_worker_count = ascend_compat.patch_npu_worker_init_device()
     beam_count = _apply_gr_beam_patches(force=force)
-    return npu_spawn_count + ascend_attn_count + npu_worker_count + beam_count
+    return pangu_count + npu_spawn_count + ascend_attn_count + npu_worker_count + beam_count
 
 
 def re_apply_patches() -> int:
