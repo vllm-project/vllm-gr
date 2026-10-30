@@ -620,6 +620,7 @@ def prefill_wiring(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]
         scale=0.125,
         logits_soft_cap=0.0,
         vllm_flash_attn_version=None,
+        prefill_flash_attn_version=None,
         sinks=None,
         alibi_slopes=None,
         prefill_attention=fallback,

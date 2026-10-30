@@ -183,6 +183,7 @@ def test_cuda_forward_keeps_original_kv_gather(monkeypatch: pytest.MonkeyPatch) 
     impl.scale = 0.5
     impl.logits_soft_cap = 0.0
     impl.vllm_flash_attn_version = 3
+    impl.prefill_flash_attn_version = impl.vllm_flash_attn_version
     impl.sinks = None
     impl.alibi_slopes = None
     query = torch.zeros(4, 2, 4)

@@ -350,6 +350,7 @@ def test_forward_preserves_cache_and_attention_arguments(
     impl.scale = 0.5
     impl.logits_soft_cap = 9.0
     impl.vllm_flash_attn_version = 3
+    impl.prefill_flash_attn_version = impl.vllm_flash_attn_version
     impl.sinks = torch.empty(1)
     impl.alibi_slopes = torch.empty(2)
 
@@ -476,6 +477,7 @@ def test_forward_incremental_uses_beam_pool_and_skips_paged_cache(
     impl.scale = 0.5
     impl.logits_soft_cap = 0.0
     impl.vllm_flash_attn_version = 3
+    impl.prefill_flash_attn_version = impl.vllm_flash_attn_version
     impl.sinks = None
     impl.alibi_slopes = None
 

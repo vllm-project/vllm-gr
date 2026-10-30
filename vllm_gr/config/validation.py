@@ -245,6 +245,14 @@ def validate_vocab_slice_size(value: object) -> int | None:
         ) from exc
 
 
+def validate_prefill_flash_attn_version(value: object) -> int | str | None:
+    if value is None or (isinstance(value, str) and value == "auto"):
+        return value
+    if type(value) is int and value in (2, 3):
+        return value
+    raise ValueError("beam.prefill_flash_attn_version must be null, 'auto', 2 or 3")
+
+
 def validate_enable_short_suffix_attention(value: object) -> bool:
     if not isinstance(value, bool):
         raise TypeError("beam.enable_short_suffix_attention must be a boolean")
