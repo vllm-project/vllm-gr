@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# mypy: disallow-untyped-decorators=False
 """Paged-KV gathers on the vllm-ascend 0.30 interleaved cache layout.
 
 vllm-ascend 0.30 allocates each layer's KV pool as one
@@ -30,7 +31,7 @@ from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
 
 DEVICES = ["cpu"]
 try:
-    if torch.npu.is_available():  # type: ignore[attr-defined]
+    if torch.npu.is_available():
         DEVICES.append("npu")
 except AttributeError:
     pass
@@ -78,9 +79,7 @@ def test_extract_suffix_kv_on_interleaved_layout(device: str) -> None:
     num_blocks, block, heads, head_dim = 6, 4, 2, 8
     k, v, pool_cpu = _make_interleaved(num_blocks, block, heads, head_dim, device, seed=3)
 
-    slots = torch.tensor(
-        [0, 5, 17, 23, num_blocks * block - 1], device=device, dtype=torch.long
-    )
+    slots = torch.tensor([0, 5, 17, 23, num_blocks * block - 1], device=device, dtype=torch.long)
     out_k, out_v = extract_suffix_kv_pytorch(k, v, slots)
 
     # Reference: flat token t lives in block t // block at offset t % block,

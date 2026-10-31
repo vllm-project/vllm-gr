@@ -271,8 +271,7 @@ def _strip_gr_additional_config(vllm_config: Any) -> None:
     gr_keys = {
         key: value
         for key, value in additional.items()
-        if key == GR_CONFIG_KEY
-        or (isinstance(key, str) and key.startswith(GR_CONFIG_KEY_PREFIX))
+        if key == GR_CONFIG_KEY or (isinstance(key, str) and key.startswith(GR_CONFIG_KEY_PREFIX))
     }
     if not gr_keys:
         return

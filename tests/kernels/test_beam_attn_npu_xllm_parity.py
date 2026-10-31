@@ -406,18 +406,16 @@ def test_xllm_incremental_matches_cascade(
 
     # Paged shared prefix KV.
     blocks_per_req = prefix_len // BLOCK_SIZE
-    key_cache_cpu = torch.randn(
-        blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE
-    ) * scale
-    value_cache_cpu = torch.randn(
-        blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE
-    ) * scale
+    key_cache_cpu = (
+        torch.randn(blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * scale
+    )
+    value_cache_cpu = (
+        torch.randn(blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * scale
+    )
     if cache_layout == "interleaved":
         # vllm-ascend 0.30 layout: one [N, 2, block, H, D] allocation with
         # the per-layer K/V views as its strided halves.
-        pool_kv = torch.zeros(
-            blocks_per_req, 2, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE
-        )
+        pool_kv = torch.zeros(blocks_per_req, 2, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE)
         pool_kv[:, 0] = key_cache_cpu
         pool_kv[:, 1] = value_cache_cpu
         pool_kv = pool_kv.to(DEVICE)

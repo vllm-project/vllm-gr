@@ -392,9 +392,7 @@ def _merged_additional_config(
 def parse_gr_config(vllm_config: object | None) -> GRConfig:
     if vllm_config is None:
         return GRConfig()
-    additional_config = _merged_additional_config(
-        getattr(vllm_config, "additional_config", None)
-    )
+    additional_config = _merged_additional_config(getattr(vllm_config, "additional_config", None))
     if additional_config is None:
         return GRConfig()
     if not isinstance(additional_config, Mapping):

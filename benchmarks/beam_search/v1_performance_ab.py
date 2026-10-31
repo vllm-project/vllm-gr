@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -35,6 +36,8 @@ SETUP_KEYS = (
     "prefix_caching",
     "chunked_prefill",
 )
+RUNTIME_IDENTITY_KEYS = ("artifact_digest", "tokenizer_digest")
+CROSS_RUNTIME_SETUP_KEYS = tuple(key for key in SETUP_KEYS if key not in RUNTIME_IDENTITY_KEYS)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -42,6 +45,81 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"expected JSON object: {path}")
     return value
+
+
+def artifact_workload_digest(root: Path, setup: dict[str, Any]) -> str:
+    """Hash the constraint-table workload while ignoring tokenizer identity.
+
+    A vLLM upgrade can change the tokenizer's serialized state without changing
+    the token IDs used by this fixed workload. The artifact embeds that runtime
+    tokenizer digest in its safetensors metadata, so its whole-file digest also
+    changes. Validate both runtime identities locally, then compare the stable
+    metadata and tensor payload across the A/B environments.
+    """
+    path = root / "constraint_table.safetensors"
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ValueError(f"missing constraint_table.safetensors in {root}") from exc
+    expected_digest = setup.get("artifact_digest")
+    actual_digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    if expected_digest != actual_digest:
+        raise ValueError(f"artifact digest mismatch in {root}")
+    if len(data) < 8:
+        raise ValueError(f"invalid safetensors artifact in {root}")
+    header_size = int.from_bytes(data[:8], "little")
+    payload_start = 8 + header_size
+    if header_size <= 0 or payload_start > len(data):
+        raise ValueError(f"invalid safetensors header in {root}")
+    try:
+        header = json.loads(data[8:payload_start])
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid safetensors header in {root}") from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"invalid safetensors header in {root}")
+    metadata = header.pop("__metadata__", {})
+    if not isinstance(metadata, dict):
+        raise ValueError(f"invalid safetensors metadata in {root}")
+    if metadata.get("tokenizer_digest") != setup.get("tokenizer_digest"):
+        raise ValueError(f"tokenizer digest mismatch in {root}")
+
+    workload = hashlib.sha256()
+    stable_metadata = {key: value for key, value in metadata.items() if key != "tokenizer_digest"}
+    workload.update(
+        json.dumps(stable_metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    for name in sorted(header):
+        tensor = header[name]
+        if not isinstance(tensor, dict):
+            raise ValueError(f"invalid safetensors tensor {name!r} in {root}")
+        dtype = tensor.get("dtype")
+        shape = tensor.get("shape")
+        offsets = tensor.get("data_offsets")
+        if (
+            not isinstance(dtype, str)
+            or not isinstance(shape, list)
+            or any(
+                isinstance(size, bool) or not isinstance(size, int) or size < 0 for size in shape
+            )
+            or not isinstance(offsets, list)
+            or len(offsets) != 2
+            or any(isinstance(offset, bool) or not isinstance(offset, int) for offset in offsets)
+        ):
+            raise ValueError(f"invalid safetensors tensor {name!r} in {root}")
+        begin, end = offsets
+        if begin < 0 or end < begin or payload_start + end > len(data):
+            raise ValueError(f"invalid safetensors offsets for {name!r} in {root}")
+        descriptor = {
+            "name": name,
+            "dtype": dtype,
+            "shape": shape,
+            "size": end - begin,
+        }
+        workload.update(
+            json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        workload.update(data[payload_start + begin : payload_start + end])
+    return "sha256:" + workload.hexdigest()
 
 
 def measured_cases(
@@ -96,11 +174,18 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
             raise ValueError(f"missing A/B pass in {root}")
         if (root / "commit.txt").read_text(encoding="utf-8").strip() != expected_sha:
             raise ValueError(f"commit mismatch in {root}")
-    base_setup = read_json(base_roots[0] / "setup.json")
+    setups = {root: read_json(root / "setup.json") for root, _ in runs}
+    base_setup = setups[base_roots[0]]
     for root, _ in runs[1:]:
-        setup = read_json(root / "setup.json")
-        if any(base_setup.get(key) != setup.get(key) for key in SETUP_KEYS):
+        setup = setups[root]
+        if any(base_setup.get(key) != setup.get(key) for key in CROSS_RUNTIME_SETUP_KEYS):
             raise ValueError(f"benchmark settings differ in {root}")
+    for side_roots in (base_roots, pr_roots):
+        first_setup = setups[side_roots[0]]
+        if any(
+            first_setup.get(key) != setups[side_roots[1]].get(key) for key in RUNTIME_IDENTITY_KEYS
+        ):
+            raise ValueError(f"runtime identity changed between A/B passes in {side_roots[1]}")
     if (
         base_setup.get("model") != "OpenOneRec/OneRec-1.7B"
         or base_setup.get("revision") != "cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b"
@@ -122,6 +207,10 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
                 raise ValueError(f"inconsistent {name} across A/B runs")
             if base_file.exists() and base_file.read_bytes() != file.read_bytes():
                 raise ValueError(f"A/B runs used different {name}")
+    artifact_workloads = {artifact_workload_digest(root, setups[root]) for root, _ in runs}
+    if len(artifact_workloads) != 1:
+        raise ValueError("A/B runs used different constraint table contents")
+    constraint_workload_digest = next(iter(artifact_workloads))
 
     rows = []
     failures = []
@@ -217,6 +306,9 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
         f"Offline mean, p50, or p90 latency regression above "
         f"{MAX_OFFLINE_REGRESSION_PERCENT:.2f}% fails the gate.",
         "CV is diagnostic only; CV = population standard deviation / mean.",
+        f"Prompt token IDs and normalized constraint tensors matched across all four passes. "
+        f"Constraint workload digest: `{constraint_workload_digest}`. Runtime tokenizer and "
+        "artifact identities are verified within each side and may differ across vLLM versions.",
         "",
         "| B | Statistic | Base ms | PR ms | Change % | Gate |",
         "| ---: | --- | ---: | ---: | ---: | --- |",
@@ -246,6 +338,11 @@ def compare(base_root: Path, pr_root: Path, base_sha: str, pr_sha: str) -> tuple
             "max_regression_percent": MAX_OFFLINE_REGRESSION_PERCENT,
             "gated_modes": ["offline"],
             "gated_metrics": list(GATED_METRICS),
+            "constraint_workload_digest": constraint_workload_digest,
+            "runtime_identities": {
+                "base": {key: base_setup.get(key) for key in RUNTIME_IDENTITY_KEYS},
+                "pr": {key: setups[pr_roots[0]].get(key) for key in RUNTIME_IDENTITY_KEYS},
+            },
             "failures": failures,
             "complete": True,
         },

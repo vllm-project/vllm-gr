@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import json
 import statistics
 from pathlib import Path
@@ -17,9 +18,38 @@ BASE_SHA = "a" * 40
 PR_SHA = "b" * 40
 
 
+def write_artifact(root: Path, tokenizer_digest: str, value: int = 1) -> str:
+    payload = value.to_bytes(4, "little", signed=True)
+    header = json.dumps(
+        {
+            "__metadata__": {
+                "format": "constraint_table_v1",
+                "tokenizer_digest": tokenizer_digest,
+                "vocab_size": "16",
+            },
+            "values": {"dtype": "I32", "shape": [1], "data_offsets": [0, len(payload)]},
+        },
+        separators=(",", ":"),
+    ).encode()
+    header += b" " * (-len(header) % 8)
+    artifact = len(header).to_bytes(8, "little") + header + payload
+    (root / "constraint_table.safetensors").write_bytes(artifact)
+    return "sha256:" + hashlib.sha256(artifact).hexdigest()
+
+
+def rewrite_artifact_identity(root: Path, tokenizer_digest: str, value: int = 1) -> None:
+    setup_path = root / "setup.json"
+    setup = json.loads(setup_path.read_text())
+    setup["tokenizer_digest"] = tokenizer_digest
+    setup["artifact_digest"] = write_artifact(root, tokenizer_digest, value)
+    setup_path.write_text(json.dumps(setup), encoding="utf-8")
+
+
 def write_pass(root: Path, sha: str, offline_ms: list[float | list[float]]) -> None:
     root.mkdir()
     (root / "commit.txt").write_text(sha + "\n", encoding="utf-8")
+    tokenizer_digest = "sha256:" + "c" * 64
+    artifact_digest = write_artifact(root, tokenizer_digest)
     (root / "setup.json").write_text(
         json.dumps(
             {
@@ -34,8 +64,8 @@ def write_pass(root: Path, sha: str, offline_ms: list[float | list[float]]) -> N
                 "measured_runs": 20,
                 "max_model_len": 8192,
                 "gpu_memory_utilization": 0.7,
-                "artifact_digest": "same-artifact",
-                "tokenizer_digest": "same-tokenizer",
+                "artifact_digest": artifact_digest,
+                "tokenizer_digest": tokenizer_digest,
                 "execution_mode": "v1",
                 "graph_enabled": True,
                 "prefix_caching": False,
@@ -105,6 +135,35 @@ def test_ab_rejects_different_prompt_tokens(tmp_path: Path) -> None:
     (pr / "1" / "prompt_token_ids.json").write_text('"pr"', encoding="utf-8")
 
     with pytest.raises(ValueError, match="different prompt_token_ids.json"):
+        compare(base, pr, BASE_SHA, PR_SHA)
+
+
+def test_ab_accepts_runtime_specific_tokenizer_metadata_for_same_workload(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    pr = tmp_path / "pr"
+    write_run(base, BASE_SHA, [33.78, 56.32, 93.44])
+    write_run(pr, PR_SHA, [33.78, 56.32, 93.44])
+    for pass_name in ("1", "2"):
+        rewrite_artifact_identity(pr / pass_name, "sha256:" + "d" * 64)
+
+    result, _ = compare(base, pr, BASE_SHA, PR_SHA)
+
+    assert result["failures"] == []
+    assert result["runtime_identities"]["base"] != result["runtime_identities"]["pr"]
+    assert result["constraint_workload_digest"].startswith("sha256:")
+
+
+def test_ab_rejects_different_constraint_table_contents(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    pr = tmp_path / "pr"
+    write_run(base, BASE_SHA, [33.78, 56.32, 93.44])
+    write_run(pr, PR_SHA, [33.78, 56.32, 93.44])
+    for pass_name in ("1", "2"):
+        rewrite_artifact_identity(pr / pass_name, "sha256:" + "d" * 64, value=2)
+
+    with pytest.raises(ValueError, match="different constraint table contents"):
         compare(base, pr, BASE_SHA, PR_SHA)
 
 
