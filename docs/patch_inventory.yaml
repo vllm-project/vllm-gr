@@ -29,7 +29,7 @@ patches:
   - id: GR-PATCH-001
     owner: vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.ascend_compat.apply_ascend_attention_backend_patch
-    activation: CUSTOM is registered and its backend slot is overridden
+    activation: the vLLM attention selector is importable and the wrapper is not installed
     validator_or_test:
       - tests/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
       - tests/integration/test_ascend_attention_backend.py
@@ -46,7 +46,7 @@ patches:
     validator_or_test:
       - tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract
     process_roles: [worker]
-    target: vllm_ascend.worker.worker.NPUWorker.init_device
+    target: vllm_ascend.worker.worker_v1.NPUWorker.init_device (re-exported by worker.worker)
     risk: high
     contract: null
     removal_condition: stable NPU worker initialization installs compatibility before ModelRunner construction
@@ -150,16 +150,18 @@ patches:
     removal_condition: explicit upstream scheduler metadata hooks carry grouped Beam state
 
   - id: GR-PATCH-011
-    owner: vllm_gr/v1/worker/gpu_model_runner_patch.py
+    owner: vllm_gr/v1/worker/gpu_model_runner_patch.py and gpu_model_runner_v2_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
-    activation: GPUModelRunner is discovered for the active platform and its hooks are incomplete
+    activation: the selected CUDA ModelRunner V1 or V2 is discovered and its hooks are incomplete
     validator_or_test:
       - vllm_gr.patch._validate_model_runner_patch
       - tests/test_gpu_model_runner_patch.py
+      - tests/test_gpu_model_runner_v2_patch.py
       - tests/test_model_runner_patch.py
+      - tests/st/test_modelrunner_v2_stage_parity_st.py
     process_roles: [gpu_worker]
-    target: vllm.v1.worker.gpu_model_runner.GPUModelRunner
+    target: vllm.v1.worker.gpu_model_runner.GPUModelRunner and vllm.v1.worker.gpu.model_runner.GPUModelRunner
     risk: critical
     contract: gpu-model-runner-signatures
     removal_condition: stable upstream grouped input and output hooks replace private runner mutation

@@ -10,13 +10,6 @@ model="${VLLM_GR_TEST_MODEL:-OpenOneRec/OneRec-1.7B}"
 revision="${V1_RECALL_MODEL_REVISION:-cc4d0b5b7294ecf75e40be1c77fa6b7d284bb84b}"
 triples="${V1_RECALL_TRIPLES_PATH:-$repo_root/generated_data/recall_constraints/sid2pid_triples.json}"
 triples_iid="${V1_RECALL_TRIPLES_IID_PATH:-$repo_root/generated_data/recall_constraints/sid2iid_triples.json}"
-baseline_failure_mode="${V1_RECALL_BASELINE_FAILURE_MODE:-blocking}"
-
-if [[ "$baseline_failure_mode" != blocking && "$baseline_failure_mode" != warning ]]; then
-  echo "V1_RECALL_BASELINE_FAILURE_MODE must be blocking or warning" >&2
-  exit 1
-fi
-
 for path in "$dataset/sid2pid.json" "$dataset/sid2iid.json" "$triples" "$triples_iid"; do
   if [[ ! -f "$path" ]]; then
     echo "Missing OneRec accuracy input: $path" >&2
@@ -144,14 +137,10 @@ print("yes" if json.load(open(sys.argv[1], encoding="utf-8"))["confirmation_requ
 PY
 )"
   if [[ "$needs_confirmation" == yes ]]; then
-    if [[ "$baseline_failure_mode" == warning ]]; then
-      echo "Recall screening result is below baseline; warning mode skips confirmation repeats"
-    else
-      repeat_count=3
-      run_once 2
-      run_once 3
-      summarize_runs 3
-    fi
+    repeat_count=3
+    run_once 2
+    run_once 3
+    summarize_runs 3
   fi
 else
   for ((run = 1; run <= repeat_count; run++)); do

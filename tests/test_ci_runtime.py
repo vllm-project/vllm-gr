@@ -237,10 +237,6 @@ class TestRuntimeWorkflow(unittest.TestCase):
                 self.assertEqual(
                     steps[cache]["with"]["key"], "${{ steps.runtime.outputs.cache-key }}"
                 )
-                archive = next(
-                    step for step in steps if step.get("name") == "Upload runtime identity"
-                )
-                self.assertEqual(archive["if"], "always()")
                 self.assertIn("BENCHMARK_DEVICE", steps[resolve]["env"]["RUNTIME_DEVICE"])
         base = next(
             step

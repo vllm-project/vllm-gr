@@ -64,7 +64,7 @@ def test_interleaved_pool_base_detects_and_rejects(device: str) -> None:
     assert torch.equal(base[:, 0], k)
     assert torch.equal(base[:, 1], v)
 
-    # Contiguous caches (CUDA layout, pre-0.30 NPU, synthetic tests): no base.
+    # Contiguous CUDA and synthetic cache layouts have no interleaved base.
     kc = torch.randn(num_blocks, block, heads, head_dim, device=device)
     vc = torch.randn(num_blocks, block, heads, head_dim, device=device)
     assert interleaved_pool_base(kc, vc) is None

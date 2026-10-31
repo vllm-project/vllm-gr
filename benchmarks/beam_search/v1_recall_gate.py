@@ -33,20 +33,6 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def candidate_checksum(samples, sample_ids):
-    """Hash decoded SID candidates in sample and beam-rank order."""
-    digest = hashlib.sha256()
-    for sample_id in sample_ids:
-        record = json.dumps(
-            [str(sample_id), samples[sample_id]["generations"]],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        digest.update(len(record).to_bytes(8, "big"))
-        digest.update(record)
-    return "sha256:" + digest.hexdigest()
-
-
 def memory_utilization_for_budget(free_bytes, total_bytes, requested=None):
     """vLLM's utilization is a fraction of total VRAM, not currently free VRAM."""
     if not 0 < free_bytes <= total_bytes:
@@ -175,19 +161,6 @@ def graph_delta(before, after, expected_batches):
     }
 
 
-def eager_runtime(before, after):
-    """Reject graph activity in diagnostic Eager runs, including startup capture."""
-    required = {"beam_graph_enabled", "captured_widths", "full_dispatches", "gr_prefill_dispatches"}
-    if not before or len(before) != len(after):
-        raise RuntimeError("Eager worker count is empty or changed during Recall run")
-    for worker in [*before, *after]:
-        if not required <= worker.keys():
-            raise RuntimeError("Eager graph runtime statistics are incomplete")
-        if any(worker[key] for key in required) or worker.get("gr_prefill_captures"):
-            raise RuntimeError("Eager Recall run enabled, captured or dispatched a graph")
-    return {"execution_mode": "eager", "before": before, "after": after}
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -207,11 +180,6 @@ def parse_args():
     parser.add_argument("--n", type=int, default=128, help="Beam width")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--max-model-len", type=int, default=8192)
-    parser.add_argument(
-        "--enforce-eager",
-        action="store_true",
-        help="Run Eager accuracy diagnostics; results do not satisfy the B=4 graph gate",
-    )
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
@@ -341,7 +309,7 @@ def main():
         )
     max_prefill_budget = max(item["prefill_budget"] for item in prepared)
     custom_buckets = os.getenv("VLLM_GR_PREFILL_GRAPH_BUCKETS")
-    if custom_buckets and not args.enforce_eager:
+    if custom_buckets:
         configured = [int(value) for value in custom_buckets.split(",")]
         used = [bucket for bucket in configured if bucket < max_prefill_budget]
         covering = next((bucket for bucket in configured if bucket >= max_prefill_budget), None)
@@ -359,7 +327,7 @@ def main():
         "max_num_seqs": max(args.n, args.batch_size),
         "max_logprobs": args.n * 2,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "enforce_eager": args.enforce_eager,
+        "enforce_eager": False,
         "dtype": "auto",
         "seed": 0,
     }
@@ -412,7 +380,7 @@ def main():
             "attention_backend": "CUSTOM",
             "beam": {
                 "execution_mode": "v1",
-                "graph_enabled": not args.enforce_eager,
+                "graph_enabled": True,
                 "worker_decision": True,
                 "max_width": args.n,
                 "max_decode_steps": 3,
@@ -457,15 +425,10 @@ def main():
                             "ground_truth": original["ground_truth"],
                             "metadata": original.get("metadata", {}),
                         }
-                graph_after = graph_stats(llm)
-                graph_runtime = (
-                    eager_runtime(graph_before, graph_after)
-                    if args.enforce_eager
-                    else graph_delta(
-                        graph_before,
-                        graph_after,
-                        sum(end - start == 4 for start, end in item["batches"]),
-                    )
+                graph_runtime = graph_delta(
+                    graph_before,
+                    graph_stats(llm),
+                    sum(end - start == 4 for start, end in item["batches"]),
                 )
 
                 # Preserve the existing per-task evaluator and SID/PID definitions.
@@ -483,7 +446,6 @@ def main():
                     model=str(args.model),
                     model_revision=args.model_revision,
                     task=task,
-                    execution_mode="eager" if args.enforce_eager else "graph",
                     beam_width=args.n,
                     temperature=args.temperature,
                     batch_size=args.batch_size,
@@ -528,8 +490,6 @@ def main():
                     time_per_sample=elapsed / len(samples),
                     artifact_digest=artifact_digest,
                     tokenizer_digest=tokenizer_digest,
-                    candidate_checksum=candidate_checksum(samples, item["sample_ids"]),
-                    candidate_checksum_schema="sample-id-and-ordered-decoded-sids-v1",
                 )
                 output = item["result_dir"] / (
                     f"{args.model.name}_{task}_bw{args.n}_bs{args.batch_size}_{len(samples)}.json"

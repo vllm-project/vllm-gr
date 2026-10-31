@@ -2000,8 +2000,7 @@ def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch
 def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mirror the native first-decode call order using the real GR dispatch and
-    NPU hooks; the contract held from Ascend 0.22.1rc1 through 0.30.0rc2."""
+    """Mirror the 0.30.0rc2 first-decode call order through the real GR hooks."""
     from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
     from vllm_gr.v1.worker import model_runner_common as common

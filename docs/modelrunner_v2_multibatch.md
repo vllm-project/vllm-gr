@@ -232,5 +232,4 @@ they also reject request-time capture, Decode eager fallback and residual
 native requests or pending sampling output. The HTTP suite covers ordered
 candidates and scores, concurrent sessions, waiting/active TCP disconnects,
 recovery and EngineCore shutdown. These fixed-input checks do not replace
-business accuracy or performance acceptance. The optional V1 numerical trace
-is rejected explicitly when using V2.
+business accuracy or performance acceptance.

@@ -10,7 +10,6 @@ import statistics
 from pathlib import Path
 
 TASKS = ("video", "ad", "product", "label_cond", "interactive")
-BASELINE_FAILURE_MODES = frozenset(("blocking", "warning"))
 IDENTITY_KEYS = (
     "source_sha256",
     "sample_ids",
@@ -37,8 +36,6 @@ def _task_result(run_dir, task):
     if len(files) != 1:
         raise ValueError(f"{run_dir.name}/{task}: expected one B=4 1000-sample metrics file")
     metrics = json.loads(files[0].read_text(encoding="utf-8"))
-    candidate_checksum = metrics.get("candidate_checksum")
-    checksum_schema = metrics.get("candidate_checksum_schema")
     if (
         metrics.get("task") != task
         or metrics.get("total_samples") != 1000
@@ -57,17 +54,6 @@ def _task_result(run_dir, task):
         or metrics["elapsed_time"] < 0
     ):
         raise ValueError(f"{run_dir.name}/{task}: incomplete or invalid accuracy result")
-    if (candidate_checksum is None) != (checksum_schema is None) or (
-        candidate_checksum is not None
-        and (
-            not isinstance(candidate_checksum, str)
-            or checksum_schema != "sample-id-and-ordered-decoded-sids-v1"
-            or not candidate_checksum.startswith("sha256:")
-            or len(candidate_checksum) != len("sha256:") + 64
-            or any(character not in "0123456789abcdef" for character in candidate_checksum[7:])
-        )
-    ):
-        raise ValueError(f"{run_dir.name}/{task}: invalid candidate checksum")
     identity = {key: metrics[key] for key in IDENTITY_KEYS if key != "engine_config"}
     identity["engine_config"] = {
         "max_model_len": metrics["engine_config"]["max_model_len"],
@@ -120,8 +106,6 @@ def _task_result(run_dir, task):
         "graph_runtime": graph_runtime,
         "engine_policy": policy,
         "runtime_provenance": metrics.get("runtime_provenance"),
-        "candidate_checksum": candidate_checksum,
-        "candidate_checksum_schema": checksum_schema,
     }
 
 
@@ -140,13 +124,9 @@ def _stats(values, scale=1):
     }
 
 
-def summarize(root, repeats, baseline_path=None, baseline_failure_mode="blocking"):
+def summarize(root, repeats, baseline_path=None):
     if repeats <= 0:
         raise ValueError("repeats must be positive")
-    if baseline_failure_mode not in BASELINE_FAILURE_MODES:
-        raise ValueError(
-            "baseline_failure_mode must be one of: " + ", ".join(sorted(BASELINE_FAILURE_MODES))
-        )
     candidate = {
         "schema_version": 1,
         "commit": (root / "commit.txt").read_text(encoding="utf-8").strip(),
@@ -211,15 +191,6 @@ def summarize(root, repeats, baseline_path=None, baseline_failure_mode="blocking
         }
         for task in TASKS
     }
-    candidate_stability = {}
-    for task in TASKS:
-        checksums = [run["tasks"][task]["candidate_checksum"] for run in runs]
-        available = all(checksum is not None for checksum in checksums)
-        candidate_stability[task] = {
-            "available": available,
-            "all_equal": available and len(set(checksums)) == 1,
-            "unique_count": len(set(checksums)) if available else None,
-        }
     total_times = _stats([run["wall_seconds"] for run in runs])
     failures = []
     baseline = None
@@ -272,17 +243,6 @@ def summarize(root, repeats, baseline_path=None, baseline_failure_mode="blocking
                         f"{floors[task]:.4%} in all three measurements"
                     )
     confirmation_required = bool(suspected_tasks) and repeats < 3
-    baseline_warnings = []
-    if baseline_failure_mode == "warning":
-        if failures:
-            baseline_warnings.extend(failures)
-        elif confirmation_required:
-            for task in suspected_tasks:
-                baseline_warnings.append(
-                    f"{task}: SID Recall@32 {runs[0]['tasks'][task]['recall@32']:.4%} "
-                    f"is below committed baseline {floors[task]:.4%} in the screening "
-                    "measurement; confirmation runs were skipped"
-                )
     result = {
         "schema_version": 1,
         "repeat_count": repeats,
@@ -291,16 +251,12 @@ def summarize(root, repeats, baseline_path=None, baseline_failure_mode="blocking
         "total_wall_seconds": _read_seconds(root / "total_wall_seconds.txt"),
         "per_run_wall_seconds": total_times,
         "task_variability": variability,
-        "candidate_checksum_stability": candidate_stability,
         "baseline_file": str(baseline_path) if baseline_path is not None else None,
-        "baseline_failure_mode": baseline_failure_mode,
         "baseline_sid_recall32_floors": floors,
         "suspected_tasks": suspected_tasks,
         "confirmation_required": confirmation_required,
         "confirmation_runs": 3 if baseline is not None else None,
-        "confirmation_skipped": bool(baseline_warnings and confirmation_required),
         "baseline_failures": failures,
-        "baseline_warnings": baseline_warnings,
     }
     lines = [
         f"## Beam V1 B=4 OneRec Recall@32: {repeats} "
@@ -314,17 +270,10 @@ def summarize(root, repeats, baseline_path=None, baseline_failure_mode="blocking
         (
             "The candidate file records the initial measurement. No Recall floor is configured."
             if baseline_path is None
-            else (
-                "The committed SID baseline is each task's minimum Recall@32 "
-                "from ten calibration measurements on fixed samples. In warning "
-                "mode, a below-baseline screening measurement is reported without "
-                "running confirmations and does not fail the gate."
-                if baseline_failure_mode == "warning"
-                else "The committed SID baseline is each task's minimum Recall@32 "
-                "from ten calibration measurements on fixed samples. A result below "
-                "it triggers two fresh confirmation runs. The gate fails only if "
-                "all three measurements for the same task are below that baseline."
-            )
+            else "The committed SID baseline is each task's minimum Recall@32 "
+            "from ten calibration measurements on fixed samples. A result below "
+            "it triggers two fresh confirmation runs. The gate fails only if "
+            "all three measurements for the same task are below that baseline."
         ),
         "",
     ]
@@ -392,22 +341,6 @@ def summarize(root, repeats, baseline_path=None, baseline_failure_mode="blocking
                 f"{sid['max']:.4f}% | {sid['range']:.4f} | "
                 f"{sid['sample_stddev']:.4f} | {pid['range']:.4f} |"
             )
-        lines.extend(
-            (
-                "",
-                "Candidate checksums are diagnostic and do not affect the Recall gate result.",
-                "",
-                "| Task | Checksums recorded | All repeats equal | Unique checksums |",
-                "| --- | --- | --- | ---: |",
-            )
-        )
-        for task in TASKS:
-            stability = candidate_stability[task]
-            lines.append(
-                f"| {task} | {'yes' if stability['available'] else 'no'} | "
-                f"{'yes' if stability['all_equal'] else 'no'} | "
-                f"{stability['unique_count'] if stability['unique_count'] is not None else 'n/a'} |"
-            )
     single_baseline = baseline is not None and repeats == 1
     if single_baseline:
         lines.extend(
@@ -456,20 +389,12 @@ def summarize(root, repeats, baseline_path=None, baseline_failure_mode="blocking
         )
     if baseline_path is not None:
         status = (
-            "WARNING (non-blocking)"
-            if baseline_warnings
-            else "FAILED"
-            if failures
-            else "pending confirmation"
-            if confirmation_required
-            else "passed"
+            "FAILED" if failures else "pending confirmation" if confirmation_required else "passed"
         )
         lines.append(f"Baseline check: {status}.")
-        if confirmation_required and not baseline_warnings:
+        if confirmation_required:
             lines.append("Confirmation needed for: " + ", ".join(suspected_tasks) + ".")
-    if baseline_warnings:
-        lines.extend(("", "> [!WARNING]", *[f"> {warning}" for warning in baseline_warnings]))
-    elif failures:
+    if failures:
         lines.extend(("", *[f"- {failure}" for failure in failures]))
     return candidate, result, "\n".join(lines) + "\n", failures
 
@@ -481,15 +406,7 @@ def main():
     args = parser.parse_args()
     baseline_name = os.environ.get("V1_RECALL_BASELINE_FILE")
     baseline_path = Path(baseline_name) if baseline_name else None
-    failure_mode = os.environ.get("V1_RECALL_BASELINE_FAILURE_MODE", "blocking").strip().lower()
-    if failure_mode not in BASELINE_FAILURE_MODES:
-        raise SystemExit(
-            "V1_RECALL_BASELINE_FAILURE_MODE must be one of: "
-            + ", ".join(sorted(BASELINE_FAILURE_MODES))
-        )
-    candidate, result, summary, failures = summarize(
-        args.result_dir, args.repeats, baseline_path, failure_mode
-    )
+    candidate, result, summary, failures = summarize(args.result_dir, args.repeats, baseline_path)
     (args.result_dir / "b4_baseline_candidate.json").write_text(
         json.dumps(candidate, indent=2) + "\n", encoding="utf-8"
     )
@@ -501,10 +418,7 @@ def main():
     if path := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(summary)
-    for warning in result["baseline_warnings"]:
-        escaped = warning.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-        print(f"::warning title=Beam V1 Recall baseline::{escaped}", flush=True)
-    if failures and failure_mode == "blocking":
+    if failures:
         raise SystemExit("Recall gate failed: " + "; ".join(failures))
 
 

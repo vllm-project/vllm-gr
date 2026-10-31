@@ -45,7 +45,7 @@ aligned with it.
 | ID | Owner | Installer | Activation | Validator or test | Process role |
 | --- | --- | --- | --- | --- | --- |
 | GR-PATCH-000 | `vllm_gr/plugin.py` | `vllm_gr.plugin.register` | vLLM general-plugin loading | `test_plugin_exposes_simple_per_patch_status` | main, EngineCore, worker |
-| GR-PATCH-001 | `vllm_gr/v1/ascend_compat.py` | `apply_ascend_attention_backend_patch` | CUSTOM is registered and overridden | `_validate` behavior in `test_ascend_compat.py`; Ascend integration test | EngineCore, worker |
+| GR-PATCH-001 | `vllm_gr/v1/ascend_compat.py` | `apply_ascend_attention_backend_patch` | vLLM attention selector is importable and unwrapped | `_validate` behavior in `test_ascend_compat.py`; Ascend integration test | EngineCore, worker |
 | GR-PATCH-002 | `vllm_gr/v1/ascend_compat.py` | `patch_npu_worker_init_device` | active NPU platform, first installation | `test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract` | worker |
 | GR-PATCH-003 | `vllm_gr/logprobs.py` | `logprobs_patch.patch_flat_logprobs` | required frontend plan finds the method absent | `_validate_flat_logprobs_patch`; patch initialization tests | offline frontend, API server |
 | GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; serving dispatch, online entry, and OneRec HTTP tests | API server |
@@ -54,7 +54,7 @@ aligned with it.
 | GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
 | GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; V1 request and admission tests | EngineCore |
 | GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `gr_async_scheduler.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
-| GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active GPU runner hooks are incomplete | `_validate_model_runner_patch`; GPU and dispatcher tests | GPU worker |
+| GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py`, `gpu_model_runner_v2_patch.py` | `model_runner_patch.apply_worker_patches` | selected CUDA V1/V2 runner hooks are incomplete | `_validate_model_runner_patch`; V1/V2 GPU, dispatcher, and stage-parity tests | GPU worker |
 | GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
 | GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
@@ -80,11 +80,11 @@ aligned with it.
 - Mutation: private cached-function replacement
 - Platform: primarily NPU
 - Risk: Critical
-- Behavior: restores the GR Beam Attention backend when vLLM-Ascend clears explicit CUSTOM backend intent.
+- Behavior: resolves the GR Beam Attention backend when CUSTOM is selected
+  explicitly or restored from the serialized GR marker.
 - Dependencies:
     - `_cached_get_attn_backend` signature and cache behavior;
     - the current vLLM configuration context;
-    - KV cache layout setup;
     - CUSTOM backend registration.
 - Ordinary request impact: the selector is process-global, although the GR branch is used only for explicit Beam backend intent.
 - Removal condition: vLLM-Ascend preserves explicit CUSTOM backend intent and resolves the registered backend without a private selector override.
@@ -93,7 +93,8 @@ aligned with it.
 
 - Source: `vllm_gr/v1/ascend_compat.py`
 - Orchestration: `vllm_gr/patch.py`
-- Target: `vllm_ascend.worker.worker.NPUWorker.init_device`
+- Target: `vllm_ascend.worker.worker_v1.NPUWorker.init_device`, re-exported by
+  `vllm_ascend.worker.worker`
 - Mutation: lifecycle method wrapper
 - Platform: NPU
 - Risk: High
@@ -211,22 +212,37 @@ aligned with it.
     - the ability to attach metadata to `SchedulerOutput`.
 - Removal condition: Beam metadata can be carried through an explicit upstream scheduler extension or wrapper without replacing `schedule()` or adding undeclared attributes.
 
-### GR-PATCH-011 — GPU ModelRunner Override
+### GR-PATCH-011 — GPU ModelRunner V1/V2 Overrides
 
-- Source: `vllm_gr/v1/worker/gpu_model_runner_patch.py`
+- Sources:
+    - `vllm_gr/v1/worker/gpu_model_runner_patch.py`
+    - `vllm_gr/v1/worker/gpu_model_runner_v2_patch.py`
+    - `vllm_gr/v1/worker/gpu_model_runner_v2_graph.py`
 - Shared helpers: `vllm_gr/v1/worker/model_runner_common.py`
 - Installation and verification: `vllm_gr/v1/worker/model_runner_patch.py`
-- Targets:
+- ModelRunner V1 targets:
     - `GPUModelRunner.execute_model`
     - `GPUModelRunner._prepare_inputs`
     - `GPUModelRunner.sample_tokens`
+- ModelRunner V2 targets:
+    - `GPUModelRunner.execute_model`
+    - `GPUModelRunner.prepare_inputs`
+    - `GPUModelRunner.add_requests`
+    - `GPUModelRunner.sample_tokens`
+    - `GPUModelRunner.initialize_kv_cache`
+    - `GPUModelRunner.profile_cudagraph_memory`
+    - `GPUModelRunner.capture_model`
 - Platform: GPU
 - Risk: Critical
-- Dependencies:
+- ModelRunner V1 dependencies:
     - private method signatures;
-    - the 2-item `_prepare_inputs` result;
+    - the 3-item `_prepare_inputs` result (`logits_indices`, speculative-decode metadata, maximum sampled-token count);
     - native execute/sample separation and asynchronous output consumption;
     - InputBatch, SamplingMetadata, request-row mapping, and logprob tensor internals.
+- ModelRunner V2 dependencies:
+    - native `prepare_inputs`/`add_requests` request-state contracts;
+    - instance-local CUDA graph manager and capture registry;
+    - graph-memory profiling lifecycle and temporary KV-cache ownership.
 - Removal condition: upstream provides stable hooks for grouped input preparation and output collapsing.
 
 ### GR-PATCH-012 — NPU ModelRunner Override
@@ -242,8 +258,8 @@ aligned with it.
 - Risk: Critical
 - Dependencies:
     - NPU-specific private method signatures;
-    - the 4-item `_prepare_inputs` result;
-    - the 6-item `_bookkeeping_sync` result;
+    - the 3-item `_prepare_inputs` result (`logits_indices`, speculative-decode metadata, total scheduled tokens);
+    - the 8-item `_bookkeeping_sync` result, including async NaN counts and request-index snapshots;
     - speculative decoding and token-compression state.
 - Removal condition: vLLM-Ascend exposes stable grouped input and output adaptation hooks.
 

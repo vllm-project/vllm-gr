@@ -8,12 +8,7 @@ from typing import Any
 import pytest
 
 from benchmarks.beam_search.v1_performance_gate import validate_online_response
-from benchmarks.beam_search.v1_recall_gate import (
-    candidate_checksum,
-    eager_runtime,
-    graph_delta,
-    infer_batch,
-)
+from benchmarks.beam_search.v1_recall_gate import graph_delta, infer_batch
 from benchmarks.open_one_rec.tools.convert_catalog import process_json
 
 VALID = ["<|sid_begin|>", "<s_a_1>", "<s_b_2>", "<s_c_3>", "<|sid_end|>"]
@@ -57,18 +52,6 @@ def test_recall_rejects_malformed_or_truncated_beam_after_rank_32() -> None:
             infer_batch(llm, Tokenizer(), [[99]], params)
 
 
-def test_candidate_checksum_covers_sample_and_beam_order() -> None:
-    samples = {
-        2: {"generations": ["second-a", "second-b"]},
-        1: {"generations": ["first-a", "first-b"]},
-    }
-    checksum = candidate_checksum(samples, [1, 2])
-    assert checksum == candidate_checksum(samples, [1, 2])
-    assert checksum != candidate_checksum(samples, [2, 1])
-    samples[1]["generations"].reverse()
-    assert checksum != candidate_checksum(samples, [1, 2])
-
-
 @pytest.mark.parametrize("catalog", [{}, {"bad": 1}, {"549755813888": 1}])  # type: ignore[misc]
 def test_catalog_rejects_invalid_or_empty_input_without_overwriting_output(
     tmp_path: Path, catalog: dict[str, int]
@@ -97,44 +80,3 @@ def test_recall_graph_gate_requires_every_b4_batch_to_replay() -> None:
     after[0]["gr_prefill_dispatches"] = {"replay:4": 1, "fallback:4:no_graph": 1}
     with pytest.raises(RuntimeError, match="expected 2 replays"):
         graph_delta(before, after, 2)
-
-
-@pytest.mark.parametrize("snapshot", ["before", "after"])  # type: ignore[misc]
-@pytest.mark.parametrize(  # type: ignore[misc]
-    ("key", "value"),
-    [
-        ("beam_graph_enabled", True),
-        ("captured_widths", [128]),
-        ("full_dispatches", 1),
-        ("gr_prefill_captures", [[16, 4]]),
-        ("gr_prefill_dispatches", {"replay:4": 1}),
-        ("gr_prefill_dispatches", {"fallback:4:no_graph": 1}),
-    ],
-)
-def test_eager_recall_rejects_startup_or_inference_graph_activity(
-    snapshot: str, key: str, value: Any
-) -> None:
-    snapshots = {
-        name: [
-            {
-                "beam_graph_enabled": False,
-                "captured_widths": [],
-                "full_dispatches": 0,
-                "gr_prefill_dispatches": {},
-            }
-        ]
-        for name in ("before", "after")
-    }
-    assert eager_runtime(**snapshots)["execution_mode"] == "eager"
-    snapshots[snapshot][0][key] = value
-    with pytest.raises(RuntimeError, match="enabled, captured or dispatched"):
-        eager_runtime(**snapshots)
-
-
-def test_eager_recall_requires_complete_worker_statistics() -> None:
-    with pytest.raises(RuntimeError, match="empty or changed"):
-        eager_runtime([], [])
-    with pytest.raises(RuntimeError, match="empty or changed"):
-        eager_runtime([{}], [{}, {}])
-    with pytest.raises(RuntimeError, match="incomplete"):
-        eager_runtime([{}], [{}])

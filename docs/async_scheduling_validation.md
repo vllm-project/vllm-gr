@@ -58,22 +58,9 @@ outside this consistency guarantee. Business Recall and performance need their
 own acceptance measurements on the resulting candidate.
 
 The existing `test_onerec_v1_completion_batch_online` ST retains exact ordered
-candidate and score comparisons. Its optional diagnostics are excluded from
-performance measurements and disabled by default:
-
-- `VLLM_GR_TEST_STAGE_TRACE=1` saves inputs, logits and Beam state after each
-  stage, with CPU readback after the complete request.
-- `VLLM_GR_TEST_PREFILL_KV_TRACE=1` additionally saves real prompt KV and hidden
-  states for cold completion requests with tracing enabled. The completion ST
-  resets the prefix cache before each paired request.
-- `VLLM_GR_TEST_MODEL_IDENTITY=1` hashes loaded parameters after the B2 request.
-- `VLLM_GR_TEST_PROFILE=1` uses vLLM's native profiler around the B2 request.
-- `VLLM_GR_TEST_INDUCTOR_CONFIG` supplies a JSON compilation mapping for
-  controlled configuration experiments.
-
-Diagnostic copies and profiling can affect tuning choices. Preserve failing
-outputs, verify that each observer reproduces the original outputs, and repeat
-the final ST with these diagnostic settings unset.
+candidate and score comparisons between independent offline and online
+engines. The test observers record dispatch and lifecycle events without GPU
+tensor readback or profiler instrumentation.
 
 ## Historical correctness and lifecycle results
 

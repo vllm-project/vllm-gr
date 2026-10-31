@@ -78,13 +78,13 @@ def _run_offline_beam_search_v1(
             )
 
             processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
-            runtime = llm.collective_rpc("onerec_v1_st_runtime")[0]
+            runner = llm.collective_rpc("onerec_v1_st_runner")[0]
             expected_runner = (
                 "vllm.v1.worker.gpu.model_runner.GPUModelRunner"
                 if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0") == "1"
                 else "vllm.v1.worker.gpu_model_runner.GPUModelRunner"
             )
-            assert runtime["runner"] == expected_runner, runtime
+            assert runner == expected_runner, runner
             llm.collective_rpc("onerec_v1_st_observe")
         start = time.perf_counter()
         for _ in range(max(1, loops)):
@@ -164,7 +164,7 @@ def _run_offline_beam_search_v1(
             json.dumps(
                 dict(
                     config=config,
-                    runtime=runtime,
+                    runner=runner,
                     full_prefill=full_prefill,
                     graphs=graphs,
                     rows=rows,

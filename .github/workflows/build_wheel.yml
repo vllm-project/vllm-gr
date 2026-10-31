@@ -80,3 +80,4 @@ jobs:
         with:
           name: vllm-gr-${{ matrix.target-device }}-wheel-py${{ matrix.python-version }}
           path: dist/*.whl
+          retention-days: 3

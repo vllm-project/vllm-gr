@@ -404,15 +404,6 @@ jobs:
           --color=always
           --all-files
 
-      - name: Upload runtime identity
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gr-runtime-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
@@ -588,14 +579,6 @@ jobs:
           V1_RECALL_DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           V1_RECALL_OUTPUT_DIR: ${{ github.workspace }}/v1_recall_results
           V1_RECALL_BASELINE_FILE: ${{ github.workspace }}/benchmarks/beam_search/v1_recall_b4_baseline.json
-          # Temporary exception for the vLLM 0.30 upgrade PR. It still runs
-          # the screening measurement and preserves the complete artifact.
-          V1_RECALL_BASELINE_FAILURE_MODE: >-
-            ${{ github.event_name == 'pull_request' &&
-                github.event.pull_request.number == 529 &&
-                github.event.pull_request.head.ref == 'upgrade_version' &&
-                github.event.pull_request.head.repo.full_name == 'parallel-star8/vllm-gr' &&
-                'warning' || 'blocking' }}
         run: bash ./tests/system/run_beam_v1_recall.sh
 
       - name: Upload Beam V1 Recall measurements
@@ -620,15 +603,6 @@ jobs:
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
           TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
         run: ./tests/system/run_benchmark_and_verify.sh
-
-      - name: Upload runtime identity
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gr-runtime-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-          if-no-files-found: warn
-          retention-days: 14
 
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
@@ -775,7 +749,7 @@ jobs:
           name: beam-v1-performance-${{ github.run_id }}-${{ github.run_attempt }}
           path: v1_performance_results
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 3
 
       - name: Upload Beam V1 A/B report for PR comment
         if: always() && hashFiles('v1_performance_results/report.json') != ''
@@ -892,15 +866,6 @@ jobs:
       - name: Run Pangu offline accuracy gate
         run: ./tests/system/run_pangu1b_acc_and_verify.sh
 
-      - name: Upload runtime identity
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gr-runtime-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh
@@ -1003,15 +968,6 @@ jobs:
 
       - name: Run Pangu online accuracy and API contract gate
         run: ./tests/system/run_pangu1b_online_and_verify.sh
-
-      - name: Upload runtime identity
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/gr-runtime-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-          if-no-files-found: warn
-          retention-days: 14
 
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'

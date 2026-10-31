@@ -72,6 +72,8 @@ _UNCONSTRAINED = os.environ.get("VLLM_GR_TEST_UNCONSTRAINED", "0") == "1"
 class OneRecV1STWorkerExtension:
     """Expose a read-only test probe through the native named utility RPC."""
 
+    model_runner: Any
+
     def onerec_v1_st_snapshot(self) -> dict[str, Any]:
         return _worker_snapshot(self)
 
@@ -80,38 +82,9 @@ class OneRecV1STWorkerExtension:
 
         return get_beam_graph_runtime_stats(self)
 
-    def onerec_v1_st_runtime(self) -> dict[str, Any]:
-        """Record resolved execution settings before the first request."""
-        import torch
-        import vllm.envs as envs
-
-        runner = getattr(self, "model_runner")
-        config = runner.vllm_config
-        model = runner.get_model()
-        return {
-            "runner": f"{type(runner).__module__}.{type(runner).__name__}",
-            "model": type(model).__name__,
-            "config_hash": config.compute_hash(),
-            "model_config_hash": config.model_config.compute_hash(),
-            "dtype": str(config.model_config.dtype),
-            "seed": config.model_config.seed,
-            "scheduler": str(config.scheduler_config),
-            "cache": str(config.cache_config),
-            "kernel": str(config.kernel_config),
-            "matmul_precision": torch.get_float32_matmul_precision(),
-            "aot_compile": envs.VLLM_USE_AOT_COMPILE,
-            "mega_aot_artifact": envs.VLLM_USE_MEGA_AOT_ARTIFACT,
-            "compile_cache_dir": config.compilation_config.local_cache_dir,
-            "inductor_compile_config": dict(config.compilation_config.inductor_compile_config),
-            "compiled_modules": {
-                name: {
-                    "type": type(module).__name__,
-                    "loaded_from_disk": module.was_aot_compile_fn_loaded_from_disk,
-                }
-                for name, module in model.named_modules()
-                if hasattr(module, "was_aot_compile_fn_loaded_from_disk")
-            },
-        }
+    def onerec_v1_st_runner(self) -> str:
+        runner = self.model_runner
+        return f"{type(runner).__module__}.{type(runner).__name__}"
 
     def onerec_v1_st_observe(self) -> None:
         from vllm_gr.v1.worker.beam_decode_graph import BeamDecodeGraph
@@ -124,13 +97,9 @@ class OneRecV1STWorkerExtension:
         runner = getattr(self, "model_runner")
         is_v2 = hasattr(runner, "req_states")
         assert is_v2 == (os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0") == "1")
-        if is_v2 and os.environ.get("VLLM_GR_TEST_STAGE_TRACE") == "1":
-            raise ValueError("The optional V1 numerical trace does not support ModelRunner V2")
         assert not hasattr(self, "_onerec_events"), "observers already installed"
         events: list[dict[str, Any]] = []
         self._onerec_events = events
-        trace = _StageTrace() if os.environ.get("VLLM_GR_TEST_STAGE_TRACE") == "1" else None
-        self._onerec_trace = trace
 
         # Observe calls only; each original method executes exactly once with
         # unchanged arguments/results. These probes are excluded from timing runs.
@@ -145,8 +114,6 @@ class OneRecV1STWorkerExtension:
                 event["end_ns"] = time.perf_counter_ns()
                 if name == "execute_model_prefill":
                     event["outcome"] = instance.last_replay_reason
-                if trace is not None and name in ("execute", "sample"):
-                    trace.stage(instance, name)
                 return result
 
             setattr(cls, name, observed)
@@ -163,8 +130,6 @@ class OneRecV1STWorkerExtension:
             }
 
         wrap(GPUBeamStageRunner, "execute", stage)
-        if trace is not None:
-            wrap(GPUBeamStageRunner, "sample", lambda owner, args, kwargs: {})
         wrap(
             GPUBeamStageRunner,
             "prepare_cpu",
@@ -235,8 +200,6 @@ class OneRecV1STWorkerExtension:
                 bucket=None if graph is None else graph.match_bucket(total),
             )
             events.append(event)
-            if trace is not None:
-                trace.prefill(runner, ids, positions, total)
             result = original_forward(*args, **kwargs)
             event["dispatches"] = {
                 key: count - before.get(key, 0)
@@ -249,31 +212,6 @@ class OneRecV1STWorkerExtension:
 
     def onerec_v1_st_events(self) -> list[dict[str, Any]]:
         return self._onerec_events
-
-    def onerec_v1_st_save_trace(self, path: str) -> None:
-        """Read back only after a complete request, never between stages."""
-        if self._onerec_trace is not None:
-            self._onerec_trace.save(path)
-
-    def onerec_v1_st_model_identity(self) -> dict[str, Any]:
-        """Hash loaded parameters after the paired request, not during startup."""
-        import hashlib
-
-        import torch
-
-        model = getattr(self, "model_runner").get_model()
-        return dict(
-            parameters={
-                name: hashlib.sha256(
-                    value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-                ).hexdigest()
-                for name, value in model.named_parameters()
-            },
-            blas_backend=str(torch.backends.cuda.preferred_blas_library()),
-            bf16_reduced_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
-            bf16_split_k=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction_split_k,
-            matmul_precision=torch.get_float32_matmul_precision(),
-        )
 
 
 def _observe_v2_prefill(runner: Any, events: list[dict[str, Any]], wrap: Any) -> None:
@@ -320,143 +258,6 @@ def _observe_v2_prefill(runner: Any, events: list[dict[str, Any]], wrap: Any) ->
         "capture",
         lambda manager, args, kwargs: {"kind": "prefill"},
     )
-
-
-class _StageTrace:
-    """Opt-in GPU copies outside compiled forwards; still requires observer controls."""
-
-    def __init__(self) -> None:
-        self.rows: list[dict[str, Any]] = []
-        self.sessions: list[str] = []
-
-    def accepts(self, metadata: Any) -> bool:
-        if len(metadata.request_ids) < 2:
-            return False
-        if metadata.session_id not in self.sessions:
-            if len(self.sessions) >= 4:
-                return False
-            self.sessions.append(metadata.session_id)
-        return True
-
-    def append(self, metadata: Any, phase: str, tensors: dict[str, Any]) -> None:
-        import torch
-
-        if not self.accepts(metadata):
-            return
-        self.rows.append(
-            dict(
-                session_id=metadata.session_id,
-                stage=metadata.stage_index,
-                batch=len(metadata.request_ids),
-                phase=phase,
-                tensors={
-                    name: value.detach().clone()
-                    for name, value in tensors.items()
-                    if isinstance(value, torch.Tensor)
-                },
-            )
-        )
-
-    def prefill(self, runner: Any, ids: Any, positions: Any, total: int) -> None:
-        metadata = next(iter(runner._current_scheduler_output.gr_stage_metadata.values()))
-        count = len(metadata.request_ids)
-        self.append(
-            metadata,
-            "prefill_inputs",
-            dict(
-                input_ids=ids[:total],
-                positions=positions[..., :total],
-                query_start_loc=runner.query_start_loc.gpu[: count + 1],
-                seq_lens=runner.seq_lens[:count],
-                block_table=runner.input_batch.block_table[0].block_table.gpu[:count],
-                slot_mapping=runner.input_batch.block_table[0].slot_mapping.gpu[:total],
-            ),
-        )
-
-    def stage(self, owner: Any, phase: str) -> None:
-        metadata = owner.previous
-        if not self.accepts(metadata):
-            return
-        count = len(owner.bindings)
-        rows = count if metadata.stage_index == 0 else count * owner.beam.state.beam_width
-        if phase == "execute":
-            tensors = dict(
-                logits=owner.logits,
-                prefixes=owner.prefixes[:rows],
-                constraint_steps=owner.constraint_steps,
-                temperatures=owner.temperatures[:rows],
-            )
-            if metadata.stage_index == 0:
-                native = owner.worker.execute_model_state
-                tensors["sample_hidden_states"] = native.sample_hidden_states
-                if os.environ.get("VLLM_GR_TEST_PREFILL_KV_TRACE") == "1":
-                    tensors.update(self.prefill_result(owner.worker, native.hidden_states))
-            if metadata.stage_index > 0:
-                tensors.update(
-                    input_ids=owner.input_ids,
-                    positions=owner.positions,
-                    execution_mask=owner.execution_mask,
-                )
-                tensors.update({f"attention.{k}": v for k, v in vars(owner.metadata).items()})
-        else:
-            tensors = dict(
-                candidate_tokens=owner.tokens[:rows],
-                candidate_scores=owner.scores[:rows],
-                candidate_valid=owner.valid[:rows],
-                candidate_counts=owner.counts[:rows],
-            )
-            state = owner.beam.state
-            for name in (
-                "sequence",
-                "beam_scores",
-                "active_mask",
-                "num_generated_tokens",
-                "history_token_ids",
-                "history_parent_ids",
-                "num_completed",
-                "completed_token_ids",
-                "completed_scores",
-                "completed_parent_ids",
-            ):
-                value = getattr(state, name, None)
-                if value is not None:
-                    tensors[f"state.{name}"] = value[:count]
-        self.append(metadata, phase, tensors)
-
-    def prefill_result(self, runner: Any, result: Any) -> dict[str, Any]:
-        import torch
-
-        scheduled = runner._current_scheduler_output
-        tensors = {"hidden": result}
-        if os.environ.get("VLLM_GR_TEST_PREFILL_KV_TRACE") == "1":
-            # Completion pairing resets prefix cache before each request.
-            # Gather only real prompt tokens, never padding or unused pages.
-            counts = list(scheduled.num_scheduled_tokens.values())
-            block_size = runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
-            blocks = runner.input_batch.block_table[0].block_table.gpu
-            for layer, cache in enumerate(runner.kv_caches):
-                view = cache.transpose(1, 2)
-                tensors[f"kv.{layer}"] = torch.cat(
-                    [
-                        view.index_select(
-                            0, blocks[i, : (n + block_size - 1) // block_size].long()
-                        ).flatten(0, 1)[:n]
-                        for i, n in enumerate(counts)
-                    ]
-                )
-        return tensors
-
-    def save(self, path: str) -> None:
-        import torch
-
-        torch.save(
-            [
-                row | {"tensors": {k: v.cpu() for k, v in row["tensors"].items()}}
-                for row in self.rows
-            ],
-            path,
-        )
-        self.rows.clear()
 
 
 def _worker_snapshot(worker: Any) -> dict[str, Any]:
@@ -945,17 +746,6 @@ def _completion_inputs(work_dir: Path) -> tuple[Any, ...]:
         kv_cache_memory_bytes=8 * 1024**3,
         compilation_config={"cudagraph_capture_sizes": [1, 2, 16, *range(128, 4097, 128)]},
     )
-    if os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
-        kwargs["profiler_config"] = dict(
-            profiler="torch",
-            torch_profiler_dir=str(work_dir / "profiles"),
-            torch_profiler_with_stack=False,
-            ignore_frontend=True,
-        )
-    if os.environ.get("VLLM_GR_TEST_INDUCTOR_CONFIG"):
-        kwargs["compilation_config"]["inductor_compile_config"] = json.loads(
-            os.environ["VLLM_GR_TEST_INDUCTOR_CONFIG"]
-        )
     prompts = [
         tokenizer.encode(f"slot {i}", add_special_tokens=False) + newline * (i * 16) + source[-256:]
         for i in range(max(sizes))
@@ -993,30 +783,15 @@ def _run_completion_reference(work_dir: Path) -> None:
     rows = []
     with GRLLM(vllm_gr_config=config, shutdown_timeout=10, **kwargs) as llm:
         processes = list(llm.llm_engine.engine_core.resources.engine_manager.processes)
-        (work_dir / "completion-runtime-offline.json").write_text(
-            json.dumps(llm.collective_rpc("onerec_v1_st_runtime"), indent=2)
-        )
         llm.collective_rpc("onerec_v1_st_observe")
         for count in sizes:
             assert llm.reset_prefix_cache()
             before = len(llm.collective_rpc("onerec_v1_st_events")[0])
-            if count == 2 and os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
-                llm.start_profile("offline-b2")
             outputs = llm.beam_search_v1(
                 [{"prompt_token_ids": p} for p in prompts[:count]],
                 _params(3),
                 output_mode="full",
             )
-            if count == 2 and os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
-                llm.stop_profile()
-            if count == 2 and os.environ.get("VLLM_GR_TEST_MODEL_IDENTITY") == "1":
-                (work_dir / "model-identity-offline.json").write_text(
-                    json.dumps(llm.collective_rpc("onerec_v1_st_model_identity"), indent=2)
-                )
-            if os.environ.get("VLLM_GR_TEST_STAGE_TRACE") == "1":
-                llm.collective_rpc(
-                    "onerec_v1_st_save_trace", args=(str(work_dir / f"trace-offline-{count}.pt"),)
-                )
             _check_completion_prefill(llm.collective_rpc("onerec_v1_st_events")[0][before:], count)
             assert len(outputs) == count
             for prompt, output in zip(prompts[:count], outputs, strict=True):
@@ -1099,9 +874,6 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
     args = AsyncEngineArgs(additional_config={"vllm_gr": config}, shutdown_timeout=10, **kwargs)
     async with _measured_engine(build_async_engine_client_from_engine_args, args) as engine:
         processes = list(engine.engine_core.resources.engine_manager.processes)
-        (work_dir / "completion-runtime-online.json").write_text(
-            json.dumps(await engine.collective_rpc("onerec_v1_st_runtime"), indent=2)
-        )
         models = OpenAIServingModels(
             engine_client=engine,
             base_model_paths=[BaseModelPath(name=model, model_path=model)],
@@ -1177,24 +949,10 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
             for count in sizes:
                 assert await engine.reset_prefix_cache()
                 before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
-                if count == 2 and os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
-                    await engine.start_profile("online-b2")
                 response = await client.post(
                     "/v1/completions", json={**body, "prompt": prompts[:count]}
                 )
                 data = check_response(response, prompts[:count])
-                if count == 2 and os.environ.get("VLLM_GR_TEST_PROFILE") == "1":
-                    await engine.stop_profile()
-                if count == 2 and os.environ.get("VLLM_GR_TEST_MODEL_IDENTITY") == "1":
-                    (work_dir / "model-identity-online.json").write_text(
-                        json.dumps(
-                            await engine.collective_rpc("onerec_v1_st_model_identity"), indent=2
-                        )
-                    )
-                if os.environ.get("VLLM_GR_TEST_STAGE_TRACE") == "1":
-                    await engine.collective_rpc(
-                        "onerec_v1_st_save_trace", args=(str(work_dir / f"trace-http-{count}.pt"),)
-                    )
                 stages = await stages_since(before)
                 assert [e["size"] for e in stages if e["stage"] == 0] == [count]
                 assert len({e["session_id"] for e in stages}) == 1
@@ -1225,11 +983,6 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                     ]
                     for output in direct
                 ]
-                if os.environ.get("VLLM_GR_TEST_STAGE_TRACE") == "1":
-                    await engine.collective_rpc(
-                        "onerec_v1_st_save_trace",
-                        args=(str(work_dir / f"trace-online-{count}.pt"),),
-                    )
                 (work_dir / f"completion-pair-{count}.json").write_text(
                     json.dumps(
                         dict(

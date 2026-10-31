@@ -212,34 +212,6 @@ class TestReadyLabelCI(unittest.TestCase):
                 set(workflow["jobs"]) - {"beam-performance-ab-only", "resolve-ab-freshness"},
             )
 
-    def test_recall_warning_mode_is_scoped_to_upgrade_pr(self) -> None:
-        steps = self.workflows["pre-commit.yml"]["jobs"]["decode-benchmark"]["steps"]
-        recall = next(
-            step
-            for step in steps
-            if step.get("name") == "Gate Beam V1 B=4 OneRec Recall on fixed samples"
-        )
-        expression = recall["env"]["V1_RECALL_BASELINE_FAILURE_MODE"]
-        upgrade_pr = context(
-            number=529,
-            head_ref="upgrade_version",
-            head_repo="parallel-star8/vllm-gr",
-        )
-        self.assertEqual(evaluate(expression, upgrade_pr), "warning")
-        self.assertEqual(evaluate(expression, context(number=529)), "blocking")
-        self.assertEqual(
-            evaluate(
-                expression,
-                context(
-                    number=529,
-                    head_ref="upgrade_version",
-                    head_repo="someone-else/vllm-gr",
-                ),
-            ),
-            "blocking",
-        )
-        self.assertEqual(evaluate(expression, context()), "blocking")
-
     def test_label_edits_do_not_cancel_unrelated_runs(self) -> None:
         for workflow in self.workflows.values():
             group = workflow["concurrency"]["group"]

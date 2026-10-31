@@ -24,7 +24,7 @@ try:
     from vllm_ascend.ops.vocab_parallel_embedding import VocabParallelMode
 
     _REPLICATED_PARALLEL_MODE: Any = VocabParallelMode.REPLICATED
-except ImportError:  # non-Ascend or pre-0.30 vllm-ascend stacks
+except ImportError:  # CUDA/CPU installations do not provide vllm-ascend
     _REPLICATED_PARALLEL_MODE = None
 
 logger = init_logger("vllm.ops.sliced_logits")
