@@ -1,15 +1,16 @@
-
 # Installation for Ascend NPU
 
 ## Prerequisites
 
-- Python 3.11 or 3.12
-- Pip 23+
-- CANN 9.2.0
-- PyTorch / torch-npu 2.10.0
-- Triton-Ascend 3.6.0
-- Conda 24.11+
+- An Ascend NPU host (verified on 910B) with the matching driver
+- A container runtime (Docker or Podman)
+- The vendor image `quay.io/ascend/vllm-ascend:v0.30.0rc2`
 - 32GB+ RAM (recommended)
+
+The vendor image already contains the complete validated runtime: Python
+3.12, CANN 9.2.0, PyTorch / torch-npu 2.10.0, Triton-Ascend 3.6.0, vLLM
+0.30.0, vLLM-Ascend 0.30.0rc2, and the matching numpy / cv2 pair. No part
+of that stack is installed by hand.
 
 ## Setup
 
@@ -20,75 +21,32 @@ git clone https://github.com/JiusiServe/vllm-gr.git
 cd vllm-gr
 ```
 
-2. **Create environment and install CANN**
+2. **Enter the validated base environment**
 
-- Follow miniconda installation procedure on [conda installation](https://www.anaconda.com/docs/getting-started/miniconda/install/linux-install) if not yet installed.
-- For details about CANN installation on various platforms, please refer to [CANN installation](https://ascend.github.io/docs/sources/ascend/quick_install.html)
-- This example was verified for 910B architecture
-
-```bash
-export MY_ENV=xGr-install # any valid env name will do
-conda create -n ${MY_ENV}  -c conda-forge python=3.11 numactl gcc=10.3.0  gxx=10.3.0
-conda activate ${MY_ENV}
-```
-
-If device is 910b install 910b ops
-
-```bash
-conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend-cann-toolkit==9.2.0 ascend-cann-910b-ops==9.2.0
-```
-
-If device is 910c install a3 ops
-
-```bash
-conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend-cann-toolkit==9.2.0 ascend-cann-a3-ops==9.2.0
-```
-
-For any other devices please follow the official [CANN installation documentation](https://ascend.github.io/docs/sources/ascend/quick_install.html).
-
-```bash
-source ${CONDA_PREFIX}/Ascend/ascend-toolkit/set_env.sh
-conda install -c https://repo.huaweicloud.com/ascend/repos/conda/ ascend-cann-nnal==9.2.0
-source ${CONDA_PREFIX}/Ascend/nnal/atb/set_env.sh
-```
-
-3. **Install vllm**
-
-follow [vllm installation](https://docs.vllm.ai/en/latest/getting_started/installation) for more details.
-
-```bash
-python -m pip install vllm==0.30.0
-```
+Run all remaining steps inside a container based on the vendor image
+`quay.io/ascend/vllm-ascend:v0.30.0rc2`. That image is the validated base
+environment of this vllm-gr release: it supplies the complete vendor stack
+(vLLM 0.30.0, vLLM-Ascend 0.30.0rc2, Triton-Ascend 3.6.0, torch /
+torch-npu 2.10.0, CANN 9.2.0) together with the matching numpy and cv2
+pair, and the NPU runtime validation of this release was performed inside
+it.
 
 This vllm-gr release supports the vLLM 0.30.0 API only.
-
-4. **Install vllm-ascend (base environment)**
-
-vllm-gr does **not** install vllm-ascend. Install the Ascend platform stack first:
-
-```bash
-python -m pip install vllm-ascend==0.30.0rc2
-```
-
-To install the matching release from source instead:
-
-```bash
-cd <working-dir>
-git clone https://github.com/vllm-project/vllm-ascend.git
-cd vllm-ascend
-git checkout v0.30.0rc2
-pip install .
-```
-
-Return to vllm-gr folder for next steps.
 
 `vllm_gr._env_check` pins the validated vendor pair (vLLM-Ascend 0.30.0rc2
 with Triton-Ascend 3.6.0) and rejects a mismatched runtime at startup, so a
 different vllm-ascend release fails fast instead of serving.
 
+Installing the vendor stack with plain pip is not a supported alternative:
+
+- Triton-Ascend is not published on PyPI.
+- The torch build used by the image has no public PyPI distribution.
+- Every opencv 4.13+ wheel declares `numpy>=2`, while triton-ascend
+  declares `numpy==1.26.4`; no single pip resolution can satisfy both.
+
 See the [vllm-ascend v0.30.0rc2 installation reference](https://github.com/vllm-project/vllm-ascend/tree/v0.30.0rc2).
 
-5. **Install xllm-ops**
+3. **Install xllm-ops**
 
 ```bash
 # Clone the xllm-ops repository
@@ -99,7 +57,7 @@ cd xllm-ops
 git submodule init
 git submodule update
 
-# Load the CANN environment
+# Load the CANN environment supplied by the base image
 source "${ASCEND_TOOLKIT_HOME}/set_env.sh"
 
 # Build the operator subset vllm-gr calls. CANN 9.2.0's op store ships a
@@ -121,7 +79,7 @@ bash build_and_run.sh
 
 Return to the vllm-gr directory before continuing.
 
-6. **Install vllm-gr**
+4. **Install vllm-gr**
 
 ```bash
 VLLM_GR_TARGET_DEVICE=npu pip install -e . --no-build-isolation
@@ -134,19 +92,39 @@ VLLM_GR_TARGET_DEVICE=npu pip install -e ".[dev]" --no-build-isolation
 ```
 
 `requirements/npu.txt` installs the shared dependencies only; the vendor
-runtime comes from steps 3 and 4. Confirm that the complete Ascend runtime
+runtime comes from the base image. Confirm that the complete Ascend runtime
 pair was resolved correctly:
 
 ```bash
 python -c 'import importlib.metadata as m; print("vllm", m.version("vllm")); print("vllm-ascend", m.version("vllm-ascend")); print("vllm-gr", m.version("vllm-gr"))'
-python -m pip check
 ```
 
-7. **Verify installation**
+5. **Verify installation**
 
 ```bash
 python -c "import vllm_gr; print(vllm_gr.__version__)"
+python -c "from vllm_gr._env_check import check_environment; print(check_environment())"
 ```
+
+## Dependency checking on Ascend
+
+`python -m pip check` is not a validity criterion on this platform. The
+validated image is assembled stepwise, so pip never re-validates the final
+combination, and two classes of pre-existing reports are expected:
+
+- Declaration conflict: the image's opencv-python-headless 4.13 declares
+  `numpy>=2` while triton-ascend 3.6.0 declares `numpy==1.26.4`. The
+  conflict is metadata-only at runtime: the image's cv2 binary is built
+  against numpy 2 headers and is ABI-compatible with the installed numpy
+  1.26.4, and vllm loads cv2 lazily with a placeholder fallback.
+- Metadata drift: the image's vllm-ascend metadata declares slightly older
+  companions (triton-ascend 3.2.2, torch-npu 2.10.0.post4) than the image
+  actually ships (3.6.0, post7).
+
+On Ascend the acceptance criterion for a vllm-gr environment is therefore
+that it runs correctly inside the validated vendor image, not pip-level
+dependency consistency; the latter is unreachable while Triton-Ascend is
+not published on PyPI.
 
 ## Quick Start
 
